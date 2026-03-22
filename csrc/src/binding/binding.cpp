@@ -1484,6 +1484,56 @@ NB_MODULE(_surogate, m) {
         "  prefill_chunk_size: Prefill chunk size (0 = disabled)\n"
         "  repetition_penalty: Repetition penalty (1.0 = disabled)\n\n"
         "Returns (tokens, logprobs, prompt_lens, completion_lens) — all lists of length M*N.")
+        .def("open_generation_session", [](MultiGPUPyTrainer* trainer,
+                const std::vector<std::vector<int32_t>>& prompts,
+                int max_gen_len,
+                float temperature,
+                int eos_token_id,
+                bool use_lora,
+                bool use_cuda_graphs,
+                int top_k,
+                float top_p,
+                float min_p,
+                int prefill_chunk_size,
+                float repetition_penalty) {
+            return trainer->open_generation_session(
+                prompts, max_gen_len, temperature, eos_token_id, use_lora,
+                use_cuda_graphs, top_k, top_p, min_p, prefill_chunk_size, repetition_penalty);
+        },
+        nb::arg("prompts"),
+        nb::arg("max_gen_len") = 512,
+        nb::arg("temperature") = 1.0f,
+        nb::arg("eos_token_id") = 2,
+        nb::arg("use_lora") = true,
+        nb::arg("use_cuda_graphs") = false,
+        nb::arg("top_k") = 0,
+        nb::arg("top_p") = 1.0f,
+        nb::arg("min_p") = 0.0f,
+        nb::arg("prefill_chunk_size") = 256,
+        nb::arg("repetition_penalty") = 1.0f,
+        "Open a persistent generation session (N=1) for incremental decode.\n\n"
+        "Call step_generation_session() repeatedly, then close_generation_session().\n"
+        "Returns a uint64 session id.")
+        .def("step_generation_session", [](MultiGPUPyTrainer* trainer,
+                std::uint64_t session_id,
+                int step_tokens,
+                const std::vector<int>& force_finished_rows) {
+            auto step = trainer->step_generation_session(session_id, step_tokens, force_finished_rows);
+            return nb::make_tuple(
+                step.tokens,
+                step.completion_lens,
+                step.finished,
+                step.all_finished);
+        },
+        nb::arg("session_id"),
+        nb::arg("step_tokens"),
+        nb::arg("force_finished_rows") = std::vector<int>{},
+        "Advance a persistent generation session by up to step_tokens tokens.\n\n"
+        "force_finished_rows marks prompt rows as finished before decode (for host stop strings).\n"
+        "Returns (tokens, completion_lens, finished, all_finished).")
+        .def("close_generation_session", &MultiGPUPyTrainer::close_generation_session,
+        nb::arg("session_id"),
+        "Close and release a persistent generation session.")
         .def("set_grad_accumulation", &MultiGPUPyTrainer::set_grad_accumulation, nb::arg("n"),
              "Set the gradient accumulation step count for the next training step.\n\n"
              "Call this before the first step_with_custom_loss() of each optimizer step\n"

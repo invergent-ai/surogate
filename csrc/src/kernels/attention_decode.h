@@ -130,6 +130,39 @@ void attention_decode_flash_paged(
     int batch_size, int Hq, int Hkv, int Hs,
     cudaStream_t stream);
 
+/// Decode attention with paged KV-cache using FlashInfer kernels.
+///
+/// This path expects BF16 paged KV and dynamically builds compact FlashInfer
+/// metadata (indptr/indices/last_page_len + request indices) from:
+/// - seqused_k (current per-sequence K lengths),
+/// - dense block_table [batch_size, block_table_stride].
+///
+/// scratch_* buffers must be preallocated on device:
+/// - scratch_page_counts: [batch_size]
+/// - scratch_indptr:      [batch_size + 1]
+/// - scratch_last_page_len:[batch_size]
+/// - scratch_indices:     [batch_size * block_table_stride] (max possible)
+/// - scratch_request_indices: [batch_size]
+/// - scratch_kv_tile_indices: [batch_size]
+/// - scratch_kv_chunk_size: [1]
+void attention_decode_flashinfer_paged(
+    nv_bfloat16* out, float* lse,
+    const nv_bfloat16* q,
+    const nv_bfloat16* k_pages, const nv_bfloat16* v_pages,
+    const int32_t* seqused_k,
+    const int* block_table, int block_table_stride,
+    int page_block_size,
+    int batch_size, int Hq, int Hkv, int Hs,
+    int32_t* scratch_page_counts,
+    int32_t* scratch_indptr,
+    int32_t* scratch_last_page_len,
+    int32_t* scratch_indices,
+    int32_t* scratch_request_indices,
+    int32_t* scratch_kv_tile_indices,
+    int32_t* scratch_kv_chunk_size,
+    bool enable_pdl,
+    cudaStream_t stream);
+
 /// Mask finished sequences: replace token IDs with 0 for finished sequences.
 /// finished_gpu[i] != 0 → token_ids[i] = 0.
 /// This prevents finished sequences from generating meaningful embeddings.

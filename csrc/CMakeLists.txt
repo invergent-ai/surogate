@@ -434,6 +434,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/attention_decode.cpp
     src/kernels/attention_decode_kernels.cu
     src/kernels/attention_decode_fp8.cu
+    src/kernels/attention_decode_flashinfer.cu
     src/kernels/sampling.cu
     src/kernels/moe_cudnn.cpp
     src/kernels/block_quant.cu

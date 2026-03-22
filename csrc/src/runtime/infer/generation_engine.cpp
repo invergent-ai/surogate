@@ -4,6 +4,7 @@
 #include "runtime/infer/generation_engine.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -83,6 +84,14 @@ inline int resolve_prefill_chunk_size(
 }
 
 inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
+    const char* disable_env = std::getenv("SUROGATE_DISABLE_FP8_KV_CACHE");
+    if (disable_env && disable_env[0] != '\0' &&
+        disable_env[0] != '0' &&
+        std::strcmp(disable_env, "false") != 0 &&
+        std::strcmp(disable_env, "False") != 0 &&
+        std::strcmp(disable_env, "FALSE") != 0) {
+        return false;
+    }
     // FP8 E4M3 KV kernels require FP8-capable Tensor Cores (SM89+).
     const int sm = prop.major * 10 + prop.minor;
     return sm >= 89;
@@ -788,6 +797,586 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     arena.restore(arena_cp);
 
     return trajectories;
+}
+
+GenerationSession::GenerationSession(
+        dsl::DslRunState& run_state,
+        dsl::DslParamStore& weights,
+        const modules::ModelConfig& config,
+        const RuntimeOptions& options)
+    : mRunState(run_state)
+    , mWeights(weights)
+    , mConfig(config)
+    , mOptions(options)
+{}
+
+GenerationSession::~GenerationSession() {
+    // Lifetime is managed explicitly through close() while model/runtime
+    // references are still valid.
+}
+
+void GenerationSession::init(
+        const std::vector<std::vector<int32_t>>& prompts,
+        const GenerationEngineConfig& gen_config,
+        DeviceMemoryStack& arena,
+        dsl::GraphExecutor& graph_executor,
+        NCCLCommunicator& comm,
+        const modules::ForwardHook* hook) {
+    (void)comm;
+    if (mInitialized) {
+        throw std::runtime_error("GenerationSession::init: session already initialized");
+    }
+
+    const int M = static_cast<int>(prompts.size());
+    if (M <= 0) {
+        throw std::invalid_argument("GenerationSession::init: prompts must be non-empty");
+    }
+    if (gen_config.max_gen_len <= 0) {
+        throw std::invalid_argument("GenerationSession::init: max_gen_len must be > 0");
+    }
+
+    validate_prompt_tokens_or_throw(prompts, mConfig.VocabSize, "GenerationSession::init");
+
+    mGenConfig = gen_config;
+    mArena = &arena;
+    mGraphExecutor = &graph_executor;
+    mArenaCheckpoint = arena.checkpoint();
+    mBatchSize = M;
+    mVocabSize = mConfig.VocabSize;
+    mFallbackTokenId = is_valid_token_id(
+        static_cast<int32_t>(mGenConfig.eos_token_id), mVocabSize
+    ) ? static_cast<int32_t>(mGenConfig.eos_token_id) : int32_t{0};
+    mRngOffset = 0;
+    mGeneratedSteps = 0;
+    mAllFinished = false;
+
+    // Determine sequence budget and chunked prefill size.
+    int max_prompt_len_observed = 0;
+    int max_prefill_len_observed = 0;
+    for (const auto& p : prompts) {
+        const int plen = static_cast<int>(p.size());
+        if (plen <= 0) {
+            throw std::invalid_argument("GenerationSession::init: prompts must be non-empty");
+        }
+        max_prompt_len_observed = std::max(max_prompt_len_observed, plen);
+        max_prefill_len_observed = std::max(max_prefill_len_observed, std::max(0, plen - 1));
+    }
+    const int max_prompt_len =
+        round_up_prompt_len_bucket(max_prompt_len_observed, mGenConfig.max_gen_len, mRunState);
+    int prefill_chunk_size = resolve_prefill_chunk_size(mGenConfig, max_prefill_len_observed);
+    if (prefill_chunk_size > 0 && mRunState.Inputs.Rank >= 2) {
+        const int static_t_cap = static_cast<int>(mRunState.Inputs.Sizes[1]);
+        if (static_t_cap > 0) {
+            prefill_chunk_size = std::max(1, std::min(prefill_chunk_size, static_t_cap));
+        }
+    }
+
+    mMaxTotalLen = max_prompt_len + mGenConfig.max_gen_len;
+    const int Hkv = mConfig.NumKeyValHeads;
+    const int Hs = mConfig.head_size();
+    const int num_layers = mConfig.NumLayers;
+    constexpr int kPageBlockSize = 256;
+
+    mRunState.ensure_rope_freq_capacity(mConfig, mMaxTotalLen);
+
+    const KVDType kv_dtype =
+        supports_fp8_kv_cache(mRunState.DeviceProp) ? KVDType::FP8_E4M3 : KVDType::BF16;
+    const bool fp8_kv_cache = kv_dtype == KVDType::FP8_E4M3;
+    mPagedKV.configure(
+        M, /*N=*/1, num_layers, max_prompt_len, mGenConfig.max_gen_len,
+        Hkv, Hs, kPageBlockSize, kv_dtype);
+    mPagedKV.allocate(arena);
+
+    auto alloc = [&](std::size_t bytes, const char* name) {
+        return arena.allocate(bytes, name);
+    };
+
+    mSeqLensGpu = reinterpret_cast<int*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(int), "sess_seq_lens"));
+    mCuSeqlensQGpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(M + 1) * sizeof(int32_t), "sess_cu_q"));
+    mSeqlensKGpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(int32_t), "sess_seqused_k"));
+    mPositionIdsGpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(int32_t), "sess_pos_ids"));
+    mLastTokensGpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(int32_t), "sess_last_tokens"));
+    mLogitsGpu = reinterpret_cast<float*>(
+        alloc(static_cast<std::size_t>(M) * static_cast<std::size_t>(mVocabSize) * sizeof(float),
+              "sess_logits"));
+    mProbsGpu = mLogitsGpu;
+    mSoftmaxWsBytes = static_cast<std::size_t>(M) * 256 * 8;
+    mSoftmaxWs = alloc(mSoftmaxWsBytes, "sess_softmax_ws");
+    mSampledTokensGpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(int32_t), "sess_sampled"));
+    mLogprobsGpu = reinterpret_cast<float*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(float), "sess_logprobs"));
+    mCompletionLensGpu = reinterpret_cast<int32_t*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(int32_t), "sess_completion_lens"));
+    mActiveCountGpu = reinterpret_cast<int*>(
+        alloc(sizeof(int), "sess_active_count"));
+    mFinishedGpu = reinterpret_cast<int*>(
+        alloc(static_cast<std::size_t>(M) * sizeof(int), "sess_finished"));
+    mPrefillBlockTableGpu = reinterpret_cast<int*>(
+        alloc(static_cast<std::size_t>(mPagedKV.max_pages_per_seq) * sizeof(int), "sess_prefill_bt"));
+    CUDA_CHECK(cudaMemsetAsync(
+        mCompletionLensGpu, 0, static_cast<std::size_t>(M) * sizeof(int32_t), mRunState.MainStream));
+    CUDA_CHECK(cudaMemsetAsync(
+        mFinishedGpu, 0, static_cast<std::size_t>(M) * sizeof(int), mRunState.MainStream));
+
+    if (mGenConfig.temperature > 0.0f && mGenConfig.temperature != 1.0f) {
+        mTemperatureGpu = reinterpret_cast<float*>(
+            alloc(static_cast<std::size_t>(M) * sizeof(float), "sess_temp"));
+        std::vector<float> temp_host(static_cast<std::size_t>(M), mGenConfig.temperature);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mTemperatureGpu, temp_host.data(), static_cast<std::size_t>(M) * sizeof(float),
+            cudaMemcpyHostToDevice, mRunState.MainStream));
+    }
+
+    mPromptLensHost.resize(static_cast<std::size_t>(M), 0);
+    mSeqLensHost.resize(static_cast<std::size_t>(M), 0);
+    mFinishedHost.resize(static_cast<std::size_t>(M), 0);
+    mCompletionLensHost.resize(static_cast<std::size_t>(M), 0);
+    mSampledTokensHost.resize(static_cast<std::size_t>(M), 0);
+    std::vector<int32_t> initial_last_tokens(static_cast<std::size_t>(M), 0);
+    std::vector<int> prefill_lens_per_prompt(static_cast<std::size_t>(M), 0);
+
+    std::vector<int32_t> prefill_tokens_chunk(
+        static_cast<std::size_t>(std::max(1, prefill_chunk_size)), 0);
+    std::vector<int32_t> prefill_pos_chunk(
+        static_cast<std::size_t>(std::max(1, prefill_chunk_size)), 0);
+
+    for (int m = 0; m < M; ++m) {
+        const auto& prompt = prompts[static_cast<std::size_t>(m)];
+        const int plen = static_cast<int>(prompt.size());
+        const int prefill_len = plen - 1;
+
+        mPromptLensHost[static_cast<std::size_t>(m)] = plen;
+        prefill_lens_per_prompt[static_cast<std::size_t>(m)] = prefill_len;
+        initial_last_tokens[static_cast<std::size_t>(m)] = prompt.back();
+
+        const int full_prefix_pages = prefill_len / kPageBlockSize;
+        const int partial_prefix_tokens = prefill_len % kPageBlockSize;
+        for (int p = 0; p < full_prefix_pages; ++p) {
+            mPagedKV.set_block_table(m, p, mPagedKV.alloc_page());
+        }
+        if (partial_prefix_tokens > 0) {
+            mPagedKV.set_block_table(m, full_prefix_pages, mPagedKV.alloc_page());
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            mPrefillBlockTableGpu,
+            mPagedKV.block_table_host.data()
+                + static_cast<std::size_t>(m) * static_cast<std::size_t>(mPagedKV.max_pages_per_seq),
+            static_cast<std::size_t>(mPagedKV.max_pages_per_seq) * sizeof(int),
+            cudaMemcpyHostToDevice, mRunState.MainStream));
+
+        std::unordered_map<int, void*> prompt_recurrent_states;
+        std::unordered_map<int, std::size_t> prompt_recurrent_state_bytes;
+        std::unordered_map<int, void*> prompt_conv_states;
+        std::unordered_map<int, std::size_t> prompt_conv_state_bytes;
+
+        infer::DecodeState prompt_ds{};
+        prompt_ds.paged = true;
+        prompt_ds.fp8 = fp8_kv_cache;
+        prompt_ds.k_pages = mPagedKV.k_pages;
+        prompt_ds.v_pages = mPagedKV.v_pages;
+        prompt_ds.k_scales = mPagedKV.k_scales;
+        prompt_ds.v_scales = mPagedKV.v_scales;
+        prompt_ds.k_scales_paged_fp8 = mPagedKV.k_scales;
+        prompt_ds.v_scales_paged_fp8 = mPagedKV.v_scales;
+        prompt_ds.per_pool_bytes = mPagedKV.per_pool_bytes();
+        prompt_ds.block_table_gpu = mPrefillBlockTableGpu;
+        prompt_ds.block_table_stride = mPagedKV.max_pages_per_seq;
+        prompt_ds.page_block_size = kPageBlockSize;
+        prompt_ds.total_pages = mPagedKV.total_pages;
+        prompt_ds.num_kv_heads = Hkv;
+        prompt_ds.head_dim = Hs;
+        prompt_ds.logits_out_gpu = mLogitsGpu;
+        prompt_ds.vocab_size = mVocabSize;
+        prompt_ds.recurrent_states = &prompt_recurrent_states;
+        prompt_ds.recurrent_state_bytes = &prompt_recurrent_state_bytes;
+        prompt_ds.conv_states = &prompt_conv_states;
+        prompt_ds.conv_state_bytes = &prompt_conv_state_bytes;
+        prompt_ds.prefill_pos_offset = 0;
+
+        if (prefill_len > 0) {
+            const int chunk_size = std::max(1, prefill_chunk_size);
+            for (int chunk_start = 0; chunk_start < prefill_len; chunk_start += chunk_size) {
+                const int chunk_len = std::min(chunk_size, prefill_len - chunk_start);
+                for (int t = 0; t < chunk_len; ++t) {
+                    const int absolute_t = chunk_start + t;
+                    prefill_tokens_chunk[static_cast<std::size_t>(t)] =
+                        prompt[static_cast<std::size_t>(absolute_t)];
+                    prefill_pos_chunk[static_cast<std::size_t>(t)] = absolute_t;
+                }
+                prompt_ds.prefill_pos_offset = chunk_start;
+                graph_executor.execute_prefill(
+                    1L, static_cast<long>(chunk_len),
+                    prefill_tokens_chunk.data(), prefill_pos_chunk.data(),
+                    prompt_ds, comm, hook);
+            }
+        }
+
+        for (const auto& [layer_idx, src_ptr] : prompt_recurrent_states) {
+            if (!src_ptr) {
+                continue;
+            }
+            auto it_bytes = prompt_recurrent_state_bytes.find(layer_idx);
+            if (it_bytes == prompt_recurrent_state_bytes.end() || it_bytes->second == 0) {
+                throw std::runtime_error(
+                    "GenerationSession::init: missing recurrent state bytes for layer "
+                    + std::to_string(layer_idx));
+            }
+            const std::size_t per_seq_bytes = it_bytes->second;
+            void*& dst_base = mRecurrentStates[layer_idx];
+            auto it_global_bytes = mRecurrentStateBytes.find(layer_idx);
+            if (!dst_base) {
+                const std::size_t total_bytes = per_seq_bytes * static_cast<std::size_t>(M);
+                CUDA_CHECK(cudaMalloc(&dst_base, total_bytes));
+                CUDA_CHECK(cudaMemsetAsync(dst_base, 0, total_bytes, mRunState.MainStream));
+                mRecurrentStateBytes[layer_idx] = per_seq_bytes;
+            } else if (it_global_bytes == mRecurrentStateBytes.end()
+                       || it_global_bytes->second != per_seq_bytes) {
+                throw std::runtime_error(
+                    "GenerationSession::init: recurrent state byte-size mismatch for layer "
+                    + std::to_string(layer_idx));
+            }
+            auto* dst_ptr = static_cast<char*>(dst_base)
+                          + static_cast<std::size_t>(m) * per_seq_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(
+                dst_ptr, src_ptr, per_seq_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        }
+        for (auto& [_, ptr] : prompt_recurrent_states) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
+            }
+        }
+
+        for (const auto& [layer_idx, src_ptr] : prompt_conv_states) {
+            if (!src_ptr) {
+                continue;
+            }
+            auto it_bytes = prompt_conv_state_bytes.find(layer_idx);
+            if (it_bytes == prompt_conv_state_bytes.end() || it_bytes->second == 0) {
+                throw std::runtime_error(
+                    "GenerationSession::init: missing conv state bytes for layer "
+                    + std::to_string(layer_idx));
+            }
+            const std::size_t per_seq_bytes = it_bytes->second;
+            void*& dst_base = mConvStates[layer_idx];
+            auto it_global_bytes = mConvStateBytes.find(layer_idx);
+            if (!dst_base) {
+                const std::size_t total_bytes = per_seq_bytes * static_cast<std::size_t>(M);
+                CUDA_CHECK(cudaMalloc(&dst_base, total_bytes));
+                CUDA_CHECK(cudaMemsetAsync(dst_base, 0, total_bytes, mRunState.MainStream));
+                mConvStateBytes[layer_idx] = per_seq_bytes;
+            } else if (it_global_bytes == mConvStateBytes.end()
+                       || it_global_bytes->second != per_seq_bytes) {
+                throw std::runtime_error(
+                    "GenerationSession::init: conv state byte-size mismatch for layer "
+                    + std::to_string(layer_idx));
+            }
+            auto* dst_ptr = static_cast<char*>(dst_base)
+                          + static_cast<std::size_t>(m) * per_seq_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(
+                dst_ptr, src_ptr, per_seq_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        }
+        for (auto& [_, ptr] : prompt_conv_states) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
+            }
+        }
+
+        mSeqLensHost[static_cast<std::size_t>(m)] = prefill_len;
+    }
+
+    for (int i = 0; i < M; ++i) {
+        for (int vp = 0; vp < mPagedKV.max_pages_per_seq; ++vp) {
+            if (mPagedKV.get_block_table(i, vp) < 0) {
+                mPagedKV.alloc_suffix_page(i, vp);
+            }
+        }
+    }
+    mPagedKV.upload_block_table(mRunState.MainStream);
+
+    mDecodeState = infer::DecodeState{};
+    mDecodeState.recurrent_states = &mRecurrentStates;
+    mDecodeState.recurrent_state_bytes = &mRecurrentStateBytes;
+    mDecodeState.conv_states = &mConvStates;
+    mDecodeState.conv_state_bytes = &mConvStateBytes;
+    mDecodeState.paged = true;
+    mDecodeState.fp8 = fp8_kv_cache;
+    mDecodeState.k_pages = mPagedKV.k_pages;
+    mDecodeState.v_pages = mPagedKV.v_pages;
+    mDecodeState.k_scales = mPagedKV.k_scales;
+    mDecodeState.v_scales = mPagedKV.v_scales;
+    mDecodeState.k_scales_paged_fp8 = mPagedKV.k_scales;
+    mDecodeState.v_scales_paged_fp8 = mPagedKV.v_scales;
+    mDecodeState.per_pool_bytes = mPagedKV.per_pool_bytes();
+    mDecodeState.block_table_gpu = mPagedKV.block_table_gpu;
+    mDecodeState.block_table_stride = mPagedKV.max_pages_per_seq;
+    mDecodeState.page_block_size = kPageBlockSize;
+    mDecodeState.total_pages = mPagedKV.total_pages;
+    mDecodeState.seq_lens_gpu = mSeqLensGpu;
+    mDecodeState.cu_seqlens_q_gpu = mCuSeqlensQGpu;
+    mDecodeState.cu_seqlens_k_gpu = mSeqlensKGpu;
+    mDecodeState.num_kv_heads = Hkv;
+    mDecodeState.head_dim = Hs;
+    mDecodeState.finished_gpu = mFinishedGpu;
+    mDecodeState.logits_out_gpu = mLogitsGpu;
+    mDecodeState.vocab_size = mVocabSize;
+    mDecodeState.prefill_pos_offset = 0;
+    mDecodeState.max_seqlen_k = mMaxTotalLen;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        mLastTokensGpu, initial_last_tokens.data(),
+        static_cast<std::size_t>(M) * sizeof(int32_t),
+        cudaMemcpyHostToDevice, mRunState.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        mSeqLensGpu, mSeqLensHost.data(),
+        static_cast<std::size_t>(M) * sizeof(int),
+        cudaMemcpyHostToDevice, mRunState.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+
+    mInitialized = true;
+}
+
+GenerationSessionStepResult GenerationSession::step(
+        int max_steps,
+        dsl::GraphExecutor& graph_executor,
+        NCCLCommunicator& comm,
+        const modules::ForwardHook* hook) {
+    GenerationSessionStepResult out;
+    out.tokens.resize(static_cast<std::size_t>(mBatchSize));
+    out.completion_lens.resize(static_cast<std::size_t>(mBatchSize), 0);
+    out.finished.resize(static_cast<std::size_t>(mBatchSize), 0);
+
+    if (!mInitialized) {
+        throw std::runtime_error("GenerationSession::step: session is not initialized");
+    }
+    if (mBatchSize <= 0) {
+        out.all_finished = true;
+        return out;
+    }
+
+    const int remaining_budget = std::max(0, mGenConfig.max_gen_len - mGeneratedSteps);
+    if (remaining_budget <= 0) {
+        mAllFinished = true;
+    }
+    int steps = std::max(0, max_steps);
+    steps = std::min(steps, remaining_budget);
+
+    for (int step = 0; step < steps && !mAllFinished; ++step) {
+        const std::vector<int> finished_before = mFinishedHost;
+
+        fill_decode_cu_seqlens(
+            mCuSeqlensQGpu, mSeqlensKGpu, mSeqLensGpu, mBatchSize, mRunState.MainStream);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mPositionIdsGpu, mSeqLensGpu,
+            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        mask_finished_tokens(mLastTokensGpu, mFinishedGpu, mBatchSize, mRunState.MainStream);
+
+        graph_executor.execute_decode_step(
+            static_cast<long>(mBatchSize), mLastTokensGpu, mPositionIdsGpu,
+            mDecodeState, comm, hook, mGenConfig.use_cuda_graphs);
+        if (sanitize_logits_enabled()) {
+            sampling_sanitize_logits(mLogitsGpu, mBatchSize, mVocabSize, mRunState.MainStream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        if (mGenConfig.temperature <= 0.0f) {
+            sampling_argmax(
+                mLogitsGpu, mSampledTokensGpu, mBatchSize, mVocabSize, mRunState.MainStream);
+        } else {
+            sampling_softmax(
+                mLogitsGpu, mProbsGpu, mTemperatureGpu, mBatchSize, mVocabSize,
+                mSoftmaxWs, mSoftmaxWsBytes, mRunState.MainStream);
+            if (mGenConfig.top_k > 0 && mGenConfig.top_p < 1.0f) {
+                sampling_top_k_top_p(
+                    mProbsGpu, mSampledTokensGpu, mGenConfig.top_k, mGenConfig.top_p,
+                    mBatchSize, mVocabSize, /*deterministic=*/false,
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+            } else if (mGenConfig.top_k > 0) {
+                sampling_top_k(
+                    mProbsGpu, mSampledTokensGpu, mGenConfig.top_k,
+                    mBatchSize, mVocabSize, /*deterministic=*/false,
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+            } else if (mGenConfig.top_p < 1.0f) {
+                sampling_top_p(
+                    mProbsGpu, mSampledTokensGpu, mGenConfig.top_p,
+                    mBatchSize, mVocabSize, /*deterministic=*/false,
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+            } else if (mGenConfig.min_p > 0.0f) {
+                sampling_min_p(
+                    mProbsGpu, mSampledTokensGpu, mGenConfig.min_p,
+                    mBatchSize, mVocabSize, /*deterministic=*/false,
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+            } else {
+                sampling_from_probs(
+                    mProbsGpu, mSampledTokensGpu, mBatchSize, mVocabSize,
+                    /*deterministic=*/false, mGenConfig.seed, mRngOffset,
+                    mRunState.MainStream);
+            }
+        }
+
+        mask_finished_tokens(mSampledTokensGpu, mFinishedGpu, mBatchSize, mRunState.MainStream);
+        sampling_sanitize_token_ids(
+            mSampledTokensGpu, mBatchSize, mVocabSize, mFallbackTokenId,
+            /*invalid_count=*/nullptr, mRunState.MainStream);
+        mRngOffset++;
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            mLastTokensGpu, mSampledTokensGpu,
+            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        update_generation_state(
+            mSampledTokensGpu,
+            mFinishedGpu,
+            mSeqLensGpu,
+            mCompletionLensGpu,
+            static_cast<int32_t>(mGenConfig.eos_token_id),
+            mBatchSize,
+            mRunState.MainStream);
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            mSampledTokensHost.data(), mSampledTokensGpu,
+            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            mFinishedHost.data(), mFinishedGpu,
+            static_cast<std::size_t>(mBatchSize) * sizeof(int),
+            cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            mCompletionLensHost.data(), mCompletionLensGpu,
+            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+
+        for (int i = 0; i < mBatchSize; ++i) {
+            if (finished_before[static_cast<std::size_t>(i)] == 0) {
+                out.tokens[static_cast<std::size_t>(i)].push_back(
+                    mSampledTokensHost[static_cast<std::size_t>(i)]);
+            }
+        }
+
+        ++mGeneratedSteps;
+
+        bool any_active = false;
+        for (int i = 0; i < mBatchSize; ++i) {
+            if (mFinishedHost[static_cast<std::size_t>(i)] == 0) {
+                any_active = true;
+                break;
+            }
+        }
+        mAllFinished = !any_active;
+        if (mGeneratedSteps >= mGenConfig.max_gen_len) {
+            mAllFinished = true;
+            for (int i = 0; i < mBatchSize; ++i) {
+                mFinishedHost[static_cast<std::size_t>(i)] = 1;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                mFinishedGpu, mFinishedHost.data(),
+                static_cast<std::size_t>(mBatchSize) * sizeof(int),
+                cudaMemcpyHostToDevice, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+    }
+
+    for (int i = 0; i < mBatchSize; ++i) {
+        out.completion_lens[static_cast<std::size_t>(i)] = mCompletionLensHost[static_cast<std::size_t>(i)];
+        out.finished[static_cast<std::size_t>(i)] = mFinishedHost[static_cast<std::size_t>(i)] != 0 ? 1 : 0;
+    }
+    out.all_finished = mAllFinished;
+    return out;
+}
+
+void GenerationSession::mark_finished(const std::vector<int>& rows) {
+    if (!mInitialized || rows.empty()) {
+        return;
+    }
+    bool changed = false;
+    for (int row : rows) {
+        if (row < 0 || row >= mBatchSize) {
+            continue;
+        }
+        int& dst = mFinishedHost[static_cast<std::size_t>(row)];
+        if (dst == 0) {
+            dst = 1;
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        mFinishedGpu, mFinishedHost.data(),
+        static_cast<std::size_t>(mBatchSize) * sizeof(int),
+        cudaMemcpyHostToDevice, mRunState.MainStream));
+    bool any_active = false;
+    for (int i = 0; i < mBatchSize; ++i) {
+        if (mFinishedHost[static_cast<std::size_t>(i)] == 0) {
+            any_active = true;
+            break;
+        }
+    }
+    if (!any_active) {
+        mAllFinished = true;
+    }
+}
+
+void GenerationSession::close(dsl::GraphExecutor& graph_executor) {
+    if (!mInitialized) {
+        return;
+    }
+
+    for (auto& [_, ptr] : mRecurrentStates) {
+        if (ptr) {
+            CUDA_CHECK(cudaFree(ptr));
+        }
+    }
+    mRecurrentStates.clear();
+    mRecurrentStateBytes.clear();
+
+    for (auto& [_, ptr] : mConvStates) {
+        if (ptr) {
+            CUDA_CHECK(cudaFree(ptr));
+        }
+    }
+    mConvStates.clear();
+    mConvStateBytes.clear();
+
+    graph_executor.invalidate_decode_graph();
+
+    if (mArena) {
+        mArena->clear_prefix_boundary();
+        mArena->restore(mArenaCheckpoint);
+    }
+
+    mInitialized = false;
+    mAllFinished = true;
+    mArena = nullptr;
+    mGraphExecutor = nullptr;
+    mBatchSize = 0;
+    mGeneratedSteps = 0;
+
+    mSeqLensGpu = nullptr;
+    mCuSeqlensQGpu = nullptr;
+    mSeqlensKGpu = nullptr;
+    mPositionIdsGpu = nullptr;
+    mLastTokensGpu = nullptr;
+    mLogitsGpu = nullptr;
+    mProbsGpu = nullptr;
+    mSoftmaxWs = nullptr;
+    mSoftmaxWsBytes = 0;
+    mSampledTokensGpu = nullptr;
+    mLogprobsGpu = nullptr;
+    mCompletionLensGpu = nullptr;
+    mActiveCountGpu = nullptr;
+    mFinishedGpu = nullptr;
+    mTemperatureGpu = nullptr;
+    mPrefillBlockTableGpu = nullptr;
 }
 
 }  // namespace infer

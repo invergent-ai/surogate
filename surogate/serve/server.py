@@ -108,6 +108,7 @@ class ActiveGeneration:
     generated_ids: list[int] = field(default_factory=list)
     finished: bool = False
     finish_reason: str = "stop"
+    done_signaled: bool = False
 
 
 class ContextLengthExceededError(ValueError):
@@ -298,6 +299,12 @@ class NativeServingRuntime:
             float(os.getenv("SUROGATE_SERVE_BATCH_WAIT_MS", "2")) / 1000.0,
         )
         self._continuous_enabled = os.getenv("SUROGATE_SERVE_CONTINUOUS_BATCHING", "1") != "0"
+        self._persistent_paged_kv_enabled = (
+            os.getenv("SUROGATE_SERVE_PERSISTENT_PAGED_KV", "1") != "0"
+            and hasattr(self.trainer, "open_generation_session")
+            and hasattr(self.trainer, "step_generation_session")
+            and hasattr(self.trainer, "close_generation_session")
+        )
         self._continuous_step_tokens = max(
             1,
             int(os.getenv("SUROGATE_SERVE_CONTINUOUS_STEP_TOKENS", "32")),
@@ -337,8 +344,9 @@ class NativeServingRuntime:
         )
         self._batch_worker.start()
         logger.info(
-            "Native inference runtime ready (continuous_batching=%s step_tokens=%d idle_step_tokens=%d)",
+            "Native inference runtime ready (continuous_batching=%s persistent_paged_kv=%s step_tokens=%d idle_step_tokens=%d)",
             bool(self._continuous_enabled),
+            bool(self._persistent_paged_kv_enabled),
             int(self._continuous_step_tokens),
             int(self._continuous_idle_step_tokens),
         )
@@ -355,6 +363,12 @@ class NativeServingRuntime:
     @staticmethod
     def _log_fp8_kv_cache_default(ngpu: int) -> None:
         try:
+            disable_env = os.getenv("SUROGATE_DISABLE_FP8_KV_CACHE", "").strip()
+            if disable_env and disable_env.lower() not in {"0", "false"}:
+                logger.info(
+                    "FP8 KV-cache disabled via SUROGATE_DISABLE_FP8_KV_CACHE."
+                )
+                return
             infos = _surogate.SystemInfo.get_gpu_info()
             if not infos:
                 return
@@ -369,7 +383,7 @@ class NativeServingRuntime:
             ]
             if all(sm >= 89 for sm in sms):
                 sm_list = ", ".join(f"SM{sm}" for sm in sms)
-                logger.info("[surogate] FP8 KV-cache enabled (%s).", sm_list)
+                logger.info("FP8 KV-cache enabled (%s).", sm_list)
         except Exception:
             # Best-effort log only.
             pass
@@ -776,6 +790,81 @@ class NativeServingRuntime:
                 item.finished = True
                 item.finish_reason = "length"
 
+    def _open_persistent_continuous_session(
+        self, active: list[ActiveGeneration], params: GenerationParams
+    ) -> int:
+        prompts = [item.pending.prompt_ids for item in active]
+        session_id = self.trainer.open_generation_session(
+            prompts=prompts,
+            max_gen_len=params.max_tokens,
+            temperature=params.temperature,
+            eos_token_id=self.eos_id,
+            use_lora=False,
+            use_cuda_graphs=self.config.use_cuda_graphs,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            min_p=params.min_p,
+            prefill_chunk_size=self.config.prefill_chunk_size,
+            repetition_penalty=params.repetition_penalty,
+        )
+        return int(session_id)
+
+    def _run_persistent_continuous_step(
+        self,
+        session_id: int,
+        active: list[ActiveGeneration],
+        params: GenerationParams,
+        *,
+        step_tokens: int,
+    ) -> bool:
+        force_finished_rows = [idx for idx, item in enumerate(active) if item.finished]
+        tokens, completion_lens, finished, all_finished = self.trainer.step_generation_session(
+            session_id=session_id,
+            step_tokens=step_tokens,
+            force_finished_rows=force_finished_rows,
+        )
+
+        _ = completion_lens  # Completion lengths are implicit in generated_ids for serving output.
+
+        for row_idx, item in enumerate(active):
+            if item.finished:
+                continue
+
+            new_ids = [int(t) for t in tokens[row_idx]]
+            if new_ids:
+                item.generated_ids.extend(new_ids)
+
+            raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
+            trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
+            if stop_hit:
+                item.generated_ids = [
+                    int(t)
+                    for t in self.tokenizer.encode(trimmed_text, add_special_tokens=False)
+                ]
+                item.finished = True
+                item.finish_reason = "stop"
+                continue
+
+            if item.generated_ids and item.generated_ids[-1] == self.eos_id:
+                item.finished = True
+                item.finish_reason = "stop"
+                continue
+
+            if len(item.generated_ids) >= params.max_tokens:
+                if len(item.generated_ids) > params.max_tokens:
+                    item.generated_ids = item.generated_ids[: params.max_tokens]
+                item.finished = True
+                item.finish_reason = "length"
+                continue
+
+            if int(finished[row_idx]) != 0:
+                item.finished = True
+                item.finish_reason = (
+                    "length" if len(item.generated_ids) >= params.max_tokens else "stop"
+                )
+
+        return bool(all_finished)
+
     def _finalize_continuous_request(self, item: ActiveGeneration) -> None:
         raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
         trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
@@ -862,6 +951,83 @@ class NativeServingRuntime:
                         else:
                             i += 1
 
+            if self._persistent_paged_kv_enabled:
+                session_id: Optional[int] = None
+                err: Optional[Exception] = None
+                try:
+                    session_id = self._open_persistent_continuous_session(active, params)
+                    while True:
+                        unfinished = [a for a in active if not a.finished]
+                        if not unfinished:
+                            break
+
+                        with self._pending_cv:
+                            waiting_match = any(p.params == params for p in self._pending)
+
+                        remaining_min = min(
+                            max(1, params.max_tokens - len(a.generated_ids))
+                            for a in unfinished
+                        )
+                        remaining_max = max(
+                            max(1, params.max_tokens - len(a.generated_ids))
+                            for a in unfinished
+                        )
+                        if waiting_match:
+                            step_tokens = max(
+                                1, min(self._continuous_step_tokens, remaining_min)
+                            )
+                        else:
+                            step_tokens = max(
+                                1, min(self._continuous_idle_step_tokens, remaining_max)
+                            )
+
+                        backend_all_finished = self._run_persistent_continuous_step(
+                            session_id, active, params, step_tokens=step_tokens
+                        )
+
+                        for item in active:
+                            if item.finished and not item.done_signaled:
+                                self._finalize_continuous_request(item)
+                                item.pending.done.set()
+                                item.done_signaled = True
+
+                        if backend_all_finished and all(a.finished for a in active):
+                            break
+
+                    for item in active:
+                        if item.done_signaled:
+                            continue
+                        if not item.finished:
+                            item.finished = True
+                            if len(item.generated_ids) >= params.max_tokens:
+                                item.finish_reason = "length"
+                            elif item.generated_ids and item.generated_ids[-1] == self.eos_id:
+                                item.finish_reason = "stop"
+                            else:
+                                item.finish_reason = "stop"
+                        self._finalize_continuous_request(item)
+                        item.pending.done.set()
+                        item.done_signaled = True
+                except Exception as e:
+                    err = e
+                finally:
+                    if session_id is not None:
+                        try:
+                            self.trainer.close_generation_session(session_id)
+                        except Exception as close_exc:
+                            logger.warning(
+                                "close_generation_session(%s) failed: %s",
+                                session_id,
+                                close_exc,
+                            )
+                    if err is not None:
+                        for item in active:
+                            if item.done_signaled:
+                                continue
+                            item.pending.error = err
+                            item.pending.done.set()
+                continue
+
             while True:
                 waiting_match = False
                 with self._pending_cv:
@@ -889,16 +1055,25 @@ class NativeServingRuntime:
                         break
                     continue
 
-                max_step_tokens = (
-                    self._continuous_step_tokens
-                    if waiting_match or len(active) > 1
-                    else self._continuous_idle_step_tokens
-                )
                 remaining_min = min(
                     max(1, params.max_tokens - len(a.generated_ids))
                     for a in unfinished
                 )
-                step_tokens = max(1, min(max_step_tokens, remaining_min))
+                remaining_max = max(
+                    max(1, params.max_tokens - len(a.generated_ids))
+                    for a in unfinished
+                )
+
+                if waiting_match:
+                    # Keep short decode quanta while compatible requests are queued
+                    # so new arrivals can join quickly.
+                    step_tokens = max(
+                        1, min(self._continuous_step_tokens, remaining_min)
+                    )
+                else:
+                    # Queue is drained: prioritize throughput and avoid repeated
+                    # full-prompt re-prefill across multiple micro-steps.
+                    step_tokens = max(1, remaining_max)
 
                 err: Optional[Exception] = None
                 try:
