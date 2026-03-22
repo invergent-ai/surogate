@@ -11,5 +11,6 @@
         "limits": "cpp"
     },
     "makefile.configureOnOpen": false,
-    "C_Cpp.default.compilerPath": "/usr/bin/g++-13"
+    "C_Cpp.default.compilerPath": "/usr/bin/g++-13",
+    "chatgpt.commentCodeLensEnabled": true
 }

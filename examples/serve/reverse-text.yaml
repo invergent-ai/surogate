@@ -1,0 +1,25 @@
+host: "0.0.0.0"
+port: 8000
+log_level: "info"
+
+# HF repo id or local model path
+model: "./reverse-text-qwen3-2"
+model_id: "reverse-text-qwen3-2"
+dtype: "bf16"
+gpus: 1
+
+# Trainer allocation sizes
+batch_size: 1
+sequence_len: 2048
+min_stack_mb: 8192
+
+# Default generation settings (request values can override)
+max_gen_len: 128
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+min_p: 0.0
+repetition_penalty: 1.0
+use_lora: false
+use_cuda_graphs: true
+prefill_chunk_size: 256

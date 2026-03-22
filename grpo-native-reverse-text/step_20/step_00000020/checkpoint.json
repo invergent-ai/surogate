@@ -1,0 +1,27 @@
+{
+  "distributed": {
+    "ep_size": 1,
+    "world": 1
+  },
+  "run": {
+    "past_losses.index": 0,
+    "past_losses.size": 100,
+    "past_losses.values": [],
+    "past_norms.index": 0,
+    "past_norms.size": 100,
+    "past_norms.values": [],
+    "rng": [
+      49,
+      52,
+      50,
+      49,
+      51,
+      55,
+      55,
+      51,
+      48,
+      54
+    ],
+    "step": 20
+  }
+}
