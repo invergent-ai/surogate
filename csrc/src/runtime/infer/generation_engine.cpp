@@ -18,6 +18,7 @@
 #include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/dsl_param_store.h"
 #include "runtime/dsl/graph_executor.h"
+#include "runtime/dsl/graph_executor_utils.h"
 #include "runtime/core/model_config.h"
 #include "runtime/training/runtime_options.h"
 #include "kernels/attention_decode.h"
@@ -41,6 +42,28 @@ inline bool sanitize_logits_enabled() {
     const char* env = std::getenv("SUROGATE_SANITIZE_LOGITS");
     enabled = (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
     return enabled != 0;
+}
+
+inline bool env_flag_enabled(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+        return false;
+    }
+    return std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "False") != 0 &&
+           std::strcmp(v, "FALSE") != 0;
+}
+
+inline bool full_step_cuda_graph_mode_enabled() {
+    const char* mode = std::getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE");
+    if (mode && *mode) {
+        return env_flag_enabled("SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE");
+    }
+    // Reuse existing serving FULL-mode switch when explicit mode override
+    // isn't set.
+    const char* buckets = std::getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS");
+    return buckets && *buckets;
 }
 
 inline int round_up_prompt_len_bucket(
@@ -84,12 +107,8 @@ inline int resolve_prefill_chunk_size(
 }
 
 inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
-    const char* disable_env = std::getenv("SUROGATE_DISABLE_FP8_KV_CACHE");
-    if (disable_env && disable_env[0] != '\0' &&
-        disable_env[0] != '0' &&
-        std::strcmp(disable_env, "false") != 0 &&
-        std::strcmp(disable_env, "False") != 0 &&
-        std::strcmp(disable_env, "FALSE") != 0) {
+    // FP8 KV-cache is opt-in.
+    if (!env_flag_enabled("SUROGATE_ENABLE_FP8_KV_CACHE")) {
         return false;
     }
     // FP8 E4M3 KV kernels require FP8-capable Tensor Cores (SM89+).
@@ -787,10 +806,6 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         if (ptr) cudaFree(ptr);
     }
 
-    // Invalidate decode graph before arena restore: captured graph arguments
-    // include generation arena pointers that become stale after restore.
-    graph_executor.invalidate_decode_graph();
-
     // Clear any prefix boundary that generation may have left, so
     // arena.restore() can fully rewind the stack to pre-generation state.
     arena.clear_prefix_boundary();
@@ -849,6 +864,21 @@ void GenerationSession::init(
     mRngOffset = 0;
     mGeneratedSteps = 0;
     mAllFinished = false;
+    if (mFullStepCudaGraphExec) {
+        CUDA_CHECK(cudaGraphExecDestroy(mFullStepCudaGraphExec));
+        mFullStepCudaGraphExec = nullptr;
+    }
+    mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
+    mFullStepCudaGraphPrimed = false;
+    // FULL-mode graph capture spans the entire decode token-step body.
+    // Keep this mode conservative:
+    // - gated by serving FULL-mode env switch
+    // - requires CUDA graphs enabled
+    // - disabled for offload decode paths
+    mFullStepCudaGraphEnabled =
+        mGenConfig.use_cuda_graphs
+        && full_step_cuda_graph_mode_enabled()
+        && !(mOptions.OffloadExperts || mOptions.OffloadMaster);
 
     // Determine sequence budget and chunked prefill size.
     int max_prompt_len_observed = 0;
@@ -917,6 +947,14 @@ void GenerationSession::init(
         alloc(sizeof(int), "sess_active_count"));
     mFinishedGpu = reinterpret_cast<int*>(
         alloc(static_cast<std::size_t>(M) * sizeof(int), "sess_finished"));
+    if (mFullStepCudaGraphEnabled && mGenConfig.temperature > 0.0f) {
+        mSamplingOffsetsGpu = reinterpret_cast<uint64_t*>(
+            alloc(static_cast<std::size_t>(M) * sizeof(uint64_t), "sess_sampling_offsets"));
+        mSamplingOffsetsHost.resize(static_cast<std::size_t>(M), 0);
+    } else {
+        mSamplingOffsetsGpu = nullptr;
+        mSamplingOffsetsHost.clear();
+    }
     mPrefillBlockTableGpu = reinterpret_cast<int*>(
         alloc(static_cast<std::size_t>(mPagedKV.max_pages_per_seq) * sizeof(int), "sess_prefill_bt"));
     CUDA_CHECK(cudaMemsetAsync(
@@ -1099,6 +1137,17 @@ void GenerationSession::init(
         }
     }
     mPagedKV.upload_block_table(mRunState.MainStream);
+    if (mFullStepCudaGraphEnabled && (!mRecurrentStates.empty() || !mConvStates.empty())) {
+        // Recurrent decode state (Qwen3.5 gated-delta / Mamba conv-state) is
+        // currently unstable under full token-step capture. Fall back to
+        // regular decode graph mode to keep serving stable.
+        mFullStepCudaGraphEnabled = false;
+        mFullStepCudaGraphPrimed = false;
+        mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
+        std::fprintf(
+            stderr,
+            "[GenerationSession] disabling full-step CUDA graph mode: recurrent decode state detected.\n");
+    }
 
     mDecodeState = infer::DecodeState{};
     mDecodeState.recurrent_states = &mRecurrentStates;
@@ -1160,6 +1209,7 @@ GenerationSessionStepResult GenerationSession::step(
         return out;
     }
 
+    const std::size_t batch_size = static_cast<std::size_t>(mBatchSize);
     const int remaining_budget = std::max(0, mGenConfig.max_gen_len - mGeneratedSteps);
     if (remaining_budget <= 0) {
         mAllFinished = true;
@@ -1167,20 +1217,42 @@ GenerationSessionStepResult GenerationSession::step(
     int steps = std::max(0, max_steps);
     steps = std::min(steps, remaining_budget);
 
-    for (int step = 0; step < steps && !mAllFinished; ++step) {
-        const std::vector<int> finished_before = mFinishedHost;
+    const std::size_t needed_step_tokens = batch_size * static_cast<std::size_t>(steps);
+    if (needed_step_tokens > 0) {
+        mStepSampledTokensHost.resize(needed_step_tokens);
+        mStepFinishedBeforeHost.resize(needed_step_tokens);
+    }
 
+    bool reported_full_step_fallback = false;
+    auto disable_full_step_cuda_graph = [&]() {
+        if (mFullStepCudaGraphExec) {
+            CUDA_CHECK(cudaGraphExecDestroy(mFullStepCudaGraphExec));
+            mFullStepCudaGraphExec = nullptr;
+        }
+        mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
+        mFullStepCudaGraphPrimed = false;
+        mFullStepCudaGraphEnabled = false;
+        if (!reported_full_step_fallback) {
+            std::fprintf(
+                stderr,
+                "[GenerationSession] full-step CUDA graph fallback: recurrent decode state became active.\n");
+            reported_full_step_fallback = true;
+        }
+    };
+
+    auto run_one_decode_token_step = [&](bool decode_forward_use_cuda_graph,
+                                         const uint64_t* sampling_offset_arr) {
         fill_decode_cu_seqlens(
             mCuSeqlensQGpu, mSeqlensKGpu, mSeqLensGpu, mBatchSize, mRunState.MainStream);
         CUDA_CHECK(cudaMemcpyAsync(
             mPositionIdsGpu, mSeqLensGpu,
-            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            batch_size * sizeof(int32_t),
             cudaMemcpyDeviceToDevice, mRunState.MainStream));
         mask_finished_tokens(mLastTokensGpu, mFinishedGpu, mBatchSize, mRunState.MainStream);
 
         graph_executor.execute_decode_step(
             static_cast<long>(mBatchSize), mLastTokensGpu, mPositionIdsGpu,
-            mDecodeState, comm, hook, mGenConfig.use_cuda_graphs);
+            mDecodeState, comm, hook, decode_forward_use_cuda_graph);
         if (sanitize_logits_enabled()) {
             sampling_sanitize_logits(mLogitsGpu, mBatchSize, mVocabSize, mRunState.MainStream);
         }
@@ -1197,27 +1269,27 @@ GenerationSessionStepResult GenerationSession::step(
                 sampling_top_k_top_p(
                     mProbsGpu, mSampledTokensGpu, mGenConfig.top_k, mGenConfig.top_p,
                     mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
             } else if (mGenConfig.top_k > 0) {
                 sampling_top_k(
                     mProbsGpu, mSampledTokensGpu, mGenConfig.top_k,
                     mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
             } else if (mGenConfig.top_p < 1.0f) {
                 sampling_top_p(
                     mProbsGpu, mSampledTokensGpu, mGenConfig.top_p,
                     mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
             } else if (mGenConfig.min_p > 0.0f) {
                 sampling_min_p(
                     mProbsGpu, mSampledTokensGpu, mGenConfig.min_p,
                     mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream);
+                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
             } else {
                 sampling_from_probs(
                     mProbsGpu, mSampledTokensGpu, mBatchSize, mVocabSize,
                     /*deterministic=*/false, mGenConfig.seed, mRngOffset,
-                    mRunState.MainStream);
+                    mRunState.MainStream, sampling_offset_arr);
             }
         }
 
@@ -1225,11 +1297,10 @@ GenerationSessionStepResult GenerationSession::step(
         sampling_sanitize_token_ids(
             mSampledTokensGpu, mBatchSize, mVocabSize, mFallbackTokenId,
             /*invalid_count=*/nullptr, mRunState.MainStream);
-        mRngOffset++;
 
         CUDA_CHECK(cudaMemcpyAsync(
             mLastTokensGpu, mSampledTokensGpu,
-            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            batch_size * sizeof(int32_t),
             cudaMemcpyDeviceToDevice, mRunState.MainStream));
         update_generation_state(
             mSampledTokensGpu,
@@ -1239,29 +1310,97 @@ GenerationSessionStepResult GenerationSession::step(
             static_cast<int32_t>(mGenConfig.eos_token_id),
             mBatchSize,
             mRunState.MainStream);
+    };
+
+    int executed_steps = 0;
+    for (; executed_steps < steps && !mAllFinished; ++executed_steps) {
+        bool full_step_graph_this_step = mFullStepCudaGraphEnabled && !(hook && *hook);
+        if (full_step_graph_this_step && (!mRecurrentStates.empty() || !mConvStates.empty())) {
+            disable_full_step_cuda_graph();
+            full_step_graph_this_step = false;
+        }
+        const bool use_dynamic_sampling_offsets =
+            full_step_graph_this_step
+            && mGenConfig.temperature > 0.0f
+            && mSamplingOffsetsGpu != nullptr
+            && !mSamplingOffsetsHost.empty();
+        const uint64_t* sampling_offset_arr =
+            use_dynamic_sampling_offsets ? mSamplingOffsetsGpu : nullptr;
+
+        const std::size_t step_offset = static_cast<std::size_t>(executed_steps) * batch_size;
+        CUDA_CHECK(cudaMemcpyAsync(
+            mStepFinishedBeforeHost.data() + step_offset, mFinishedGpu,
+            batch_size * sizeof(int),
+            cudaMemcpyDeviceToHost, mRunState.MainStream));
+        if (use_dynamic_sampling_offsets) {
+            std::fill(mSamplingOffsetsHost.begin(), mSamplingOffsetsHost.end(), mRngOffset);
+            CUDA_CHECK(cudaMemcpyAsync(
+                mSamplingOffsetsGpu, mSamplingOffsetsHost.data(),
+                batch_size * sizeof(uint64_t),
+                cudaMemcpyHostToDevice, mRunState.MainStream));
+        }
+
+        if (full_step_graph_this_step) {
+            if (!mFullStepCudaGraphExec && !mFullStepCudaGraphPrimed) {
+                // Warm-up eager once so any lazy allocations happen outside capture.
+                run_one_decode_token_step(
+                    /*decode_forward_use_cuda_graph=*/false,
+                    sampling_offset_arr);
+                mFullStepCudaGraphPrimed = true;
+                if (!mRecurrentStates.empty() || !mConvStates.empty()) {
+                    disable_full_step_cuda_graph();
+                }
+            } else {
+                dsl::trace_or_execute_cuda_graph_with_stack(
+                    [&]() {
+                        run_one_decode_token_step(
+                            /*decode_forward_use_cuda_graph=*/false,
+                            sampling_offset_arr);
+                    },
+                    mRunState.MainStream,
+                    mFullStepCudaGraphExec,
+                    /*enabled=*/true,
+                    mRunState.Stack,
+                    mFullStepCudaGraphCheckpoint);
+            }
+        } else {
+            run_one_decode_token_step(
+                /*decode_forward_use_cuda_graph=*/mGenConfig.use_cuda_graphs,
+                /*sampling_offset_arr=*/nullptr);
+        }
+        mRngOffset++;
 
         CUDA_CHECK(cudaMemcpyAsync(
-            mSampledTokensHost.data(), mSampledTokensGpu,
-            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            mStepSampledTokensHost.data() + step_offset, mSampledTokensGpu,
+            batch_size * sizeof(int32_t),
             cudaMemcpyDeviceToHost, mRunState.MainStream));
+
+        ++mGeneratedSteps;
+        if (mGeneratedSteps >= mGenConfig.max_gen_len) {
+            mAllFinished = true;
+        }
+    }
+
+    if (executed_steps > 0) {
         CUDA_CHECK(cudaMemcpyAsync(
             mFinishedHost.data(), mFinishedGpu,
-            static_cast<std::size_t>(mBatchSize) * sizeof(int),
+            batch_size * sizeof(int),
             cudaMemcpyDeviceToHost, mRunState.MainStream));
         CUDA_CHECK(cudaMemcpyAsync(
             mCompletionLensHost.data(), mCompletionLensGpu,
-            static_cast<std::size_t>(mBatchSize) * sizeof(int32_t),
+            batch_size * sizeof(int32_t),
             cudaMemcpyDeviceToHost, mRunState.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
 
-        for (int i = 0; i < mBatchSize; ++i) {
-            if (finished_before[static_cast<std::size_t>(i)] == 0) {
-                out.tokens[static_cast<std::size_t>(i)].push_back(
-                    mSampledTokensHost[static_cast<std::size_t>(i)]);
+        for (int step = 0; step < executed_steps; ++step) {
+            const std::size_t step_offset = static_cast<std::size_t>(step) * batch_size;
+            for (int i = 0; i < mBatchSize; ++i) {
+                const std::size_t off = step_offset + static_cast<std::size_t>(i);
+                if (mStepFinishedBeforeHost[off] == 0) {
+                    out.tokens[static_cast<std::size_t>(i)].push_back(mStepSampledTokensHost[off]);
+                }
             }
         }
-
-        ++mGeneratedSteps;
 
         bool any_active = false;
         for (int i = 0; i < mBatchSize; ++i) {
@@ -1271,17 +1410,11 @@ GenerationSessionStepResult GenerationSession::step(
             }
         }
         mAllFinished = !any_active;
-        if (mGeneratedSteps >= mGenConfig.max_gen_len) {
-            mAllFinished = true;
-            for (int i = 0; i < mBatchSize; ++i) {
-                mFinishedHost[static_cast<std::size_t>(i)] = 1;
-            }
-            CUDA_CHECK(cudaMemcpyAsync(
-                mFinishedGpu, mFinishedHost.data(),
-                static_cast<std::size_t>(mBatchSize) * sizeof(int),
-                cudaMemcpyHostToDevice, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        }
+    }
+
+    if (mGeneratedSteps >= mGenConfig.max_gen_len) {
+        mAllFinished = true;
+        std::fill(mFinishedHost.begin(), mFinishedHost.end(), 1);
     }
 
     for (int i = 0; i < mBatchSize; ++i) {
@@ -1330,6 +1463,15 @@ void GenerationSession::close(dsl::GraphExecutor& graph_executor) {
     if (!mInitialized) {
         return;
     }
+    (void)graph_executor;
+
+    if (mFullStepCudaGraphExec) {
+        CUDA_CHECK(cudaGraphExecDestroy(mFullStepCudaGraphExec));
+        mFullStepCudaGraphExec = nullptr;
+    }
+    mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
+    mFullStepCudaGraphPrimed = false;
+    mFullStepCudaGraphEnabled = false;
 
     for (auto& [_, ptr] : mRecurrentStates) {
         if (ptr) {
@@ -1347,7 +1489,9 @@ void GenerationSession::close(dsl::GraphExecutor& graph_executor) {
     mConvStates.clear();
     mConvStateBytes.clear();
 
-    graph_executor.invalidate_decode_graph();
+    mStepSampledTokensHost.clear();
+    mStepFinishedBeforeHost.clear();
+    mSamplingOffsetsHost.clear();
 
     if (mArena) {
         mArena->clear_prefix_boundary();
@@ -1375,6 +1519,7 @@ void GenerationSession::close(dsl::GraphExecutor& graph_executor) {
     mCompletionLensGpu = nullptr;
     mActiveCountGpu = nullptr;
     mFinishedGpu = nullptr;
+    mSamplingOffsetsGpu = nullptr;
     mTemperatureGpu = nullptr;
     mPrefillBlockTableGpu = nullptr;
 }

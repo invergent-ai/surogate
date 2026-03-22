@@ -77,7 +77,8 @@ void sampling_from_probs(
     bool deterministic,
     uint64_t seed,
     uint64_t offset,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const uint64_t* offset_arr = nullptr);
 
 /// Combined softmax + sample: logits → sampled token ID (Gumbel-Max trick).
 /// Avoids materializing the full probability distribution.
@@ -98,7 +99,8 @@ void sampling_from_logits(
     bool deterministic,
     uint64_t seed,
     uint64_t offset,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const uint64_t* offset_arr = nullptr);
 
 /// Extract log-probability of the sampled token from probs.
 /// logprob[i] = log(probs[i, token_ids[i]])
@@ -151,7 +153,8 @@ void sampling_top_k(
     bool deterministic,
     uint64_t seed,
     uint64_t offset,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const uint64_t* offset_arr = nullptr);
 
 /// Top-P (nucleus) sampling from probability distribution.
 ///
@@ -168,7 +171,8 @@ void sampling_top_p(
     bool deterministic,
     uint64_t seed,
     uint64_t offset,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const uint64_t* offset_arr = nullptr);
 
 /// Combined Top-K + Top-P sampling.
 void sampling_top_k_top_p(
@@ -181,7 +185,8 @@ void sampling_top_k_top_p(
     bool deterministic,
     uint64_t seed,
     uint64_t offset,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const uint64_t* offset_arr = nullptr);
 
 /// Min-P sampling from probability distribution.
 ///
@@ -198,7 +203,8 @@ void sampling_min_p(
     bool deterministic,
     uint64_t seed,
     uint64_t offset,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const uint64_t* offset_arr = nullptr);
 
 /// Apply repetition penalty to logits based on tokens already generated.
 ///

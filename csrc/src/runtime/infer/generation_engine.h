@@ -9,10 +9,13 @@
 #ifndef SUROGATE_SRC_RUNTIME_INFER_GENERATION_ENGINE_H
 #define SUROGATE_SRC_RUNTIME_INFER_GENERATION_ENGINE_H
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
 #include <vector>
+
+#include <cuda_runtime.h>
 
 #include "runtime/infer/kv_cache.h"
 #include "runtime/infer/decode_context.h"
@@ -174,6 +177,10 @@ private:
     GenerationEngineConfig mGenConfig{};
     uint64_t mRngOffset = 0;
     int mGeneratedSteps = 0;
+    bool mFullStepCudaGraphEnabled = false;
+    bool mFullStepCudaGraphPrimed = false;
+    cudaGraphExec_t mFullStepCudaGraphExec = nullptr;
+    DeviceMemoryStack::Checkpoint mFullStepCudaGraphCheckpoint{};
 
     int mBatchSize = 0;
     int mMaxTotalLen = 0;
@@ -196,6 +203,7 @@ private:
     int32_t* mCompletionLensGpu = nullptr;
     int* mActiveCountGpu = nullptr;
     int* mFinishedGpu = nullptr;
+    uint64_t* mSamplingOffsetsGpu = nullptr;
     float* mTemperatureGpu = nullptr;
     int* mPrefillBlockTableGpu = nullptr;
 
@@ -204,6 +212,9 @@ private:
     std::vector<int> mFinishedHost;
     std::vector<int32_t> mCompletionLensHost;
     std::vector<int32_t> mSampledTokensHost;
+    std::vector<int32_t> mStepSampledTokensHost;
+    std::vector<int> mStepFinishedBeforeHost;
+    std::vector<uint64_t> mSamplingOffsetsHost;
 
     infer::DecodeState mDecodeState{};
 

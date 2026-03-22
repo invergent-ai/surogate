@@ -108,6 +108,50 @@ inline std::uint64_t bt_cache_key(long B, long T) {
          | static_cast<std::uint64_t>(static_cast<std::uint32_t>(T));
 }
 
+inline void hash_mix_u64(std::uint64_t& h, std::uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+}
+
+inline std::uint64_t hash_layer_ptr_map(const std::unordered_map<int, void*>* map_ptr) {
+    if (!map_ptr || map_ptr->empty()) {
+        return 0;
+    }
+    std::vector<std::pair<int, std::uint64_t>> items;
+    items.reserve(map_ptr->size());
+    for (const auto& [layer, ptr] : *map_ptr) {
+        items.emplace_back(layer, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ptr)));
+    }
+    std::sort(items.begin(), items.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const auto& [layer, ptr] : items) {
+        hash_mix_u64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(layer)));
+        hash_mix_u64(h, ptr);
+    }
+    return h;
+}
+
+inline std::uint64_t hash_layer_size_map(const std::unordered_map<int, std::size_t>* map_ptr) {
+    if (!map_ptr || map_ptr->empty()) {
+        return 0;
+    }
+    std::vector<std::pair<int, std::uint64_t>> items;
+    items.reserve(map_ptr->size());
+    for (const auto& [layer, bytes] : *map_ptr) {
+        items.emplace_back(layer, static_cast<std::uint64_t>(bytes));
+    }
+    std::sort(items.begin(), items.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const auto& [layer, bytes] : items) {
+        hash_mix_u64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(layer)));
+        hash_mix_u64(h, bytes);
+    }
+    return h;
+}
+
 inline void sync_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
     if (!stream_is_capturing(stream)) {
         CUDA_CHECK(cudaEventSynchronize(event));
@@ -274,6 +318,15 @@ GraphExecutor::GraphExecutor(const Module& module,
 }
 
 GraphExecutor::~GraphExecutor() {
+    // Clean up decode CUDA graph cache.
+    for (auto& [_, entry] : mDecodeGraphCache) {
+        if (entry.Exec) {
+            (void)cudaGraphExecDestroy(entry.Exec);
+            entry.Exec = nullptr;
+        }
+        entry.HasSignature = false;
+    }
+    mDecodeGraphCache.clear();
     // Clean up CUDA graphs
     if (mForwardGraph) {
         cudaGraphExecDestroy(mForwardGraph);
@@ -331,13 +384,16 @@ void GraphExecutor::reset_cuda_graphs() {
     }
     // Reset per-layer graphs in run state
     mRunState.reset_cuda_graphs();
-    // Reset decode graph
-    if (mDecodeGraphExec) {
-        (void)cudaGraphExecDestroy(mDecodeGraphExec);
-        mDecodeGraphExec = nullptr;
+    // Reset decode graph cache
+    for (auto& [_, entry] : mDecodeGraphCache) {
+        if (entry.Exec) {
+            (void)cudaGraphExecDestroy(entry.Exec);
+            entry.Exec = nullptr;
+        }
+        entry.Primed = false;
+        entry.HasSignature = false;
     }
-    mDecodeGraphB = 0;
-    mDecodeGraphPrimed = false;
+    mDecodeGraphCache.clear();
     // Reset split-attention segment graphs
     if (mCompiledExecutor) {
         mCompiledExecutor->reset_segment_graphs();
@@ -1991,12 +2047,8 @@ void GraphExecutor::execute_decode_step(long B,
             // Offload decode currently performs stream-ordered residency updates
             // that make graph replay non-deterministic across token steps.
             // Capture and launch a fresh decode graph per step, then destroy it.
-            if (mDecodeGraphExec) {
-                CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
-                mDecodeGraphExec = nullptr;
-            }
-            mDecodeGraphB = 0;
-            mDecodeGraphPrimed = false;
+            cudaGraphExec_t decode_graph_exec = nullptr;
+            DeviceMemoryStack::Checkpoint decode_graph_checkpoint{};
 
             if (auto* provider = mWeights.qlora_provider()) {
                 provider->prepare_for_decode_graph_capture(rs.MainStream);
@@ -2009,32 +2061,73 @@ void GraphExecutor::execute_decode_step(long B,
                         *mDecodeCompiledForward, comm, /*full=*/false, hook);
                 },
                 rs.MainStream,
-                mDecodeGraphExec,
+                decode_graph_exec,
                 /*enabled=*/true,
                 rs.Stack,
-                mDecodeGraphCheckpoint);
-            if (mDecodeGraphExec) {
-                CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
-                mDecodeGraphExec = nullptr;
+                decode_graph_checkpoint);
+            if (decode_graph_exec) {
+                CUDA_CHECK(cudaGraphExecDestroy(decode_graph_exec));
+                decode_graph_exec = nullptr;
             }
-            mDecodeGraphB = 0;
-            mDecodeGraphPrimed = false;
         } else {
-            // Invalidate cached graph if batch size changed.
-            if (mDecodeGraphExec && mDecodeGraphB != B) {
-                CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
-                mDecodeGraphExec = nullptr;
-                mDecodeGraphB = 0;
-                mDecodeGraphPrimed = false;
+            const DecodeGraphSignature decode_signature = [&]() {
+                DecodeGraphSignature sig{};
+                sig.Batch = B;
+                sig.InputsData = rs.Inputs.Data;
+                sig.PositionIDsData = rs.PositionIDs.Data;
+                sig.SeqLensGpu = decode_state.seq_lens_gpu;
+                sig.CuSeqlensQGpu = decode_state.cu_seqlens_q_gpu;
+                sig.CuSeqlensKGpu = decode_state.cu_seqlens_k_gpu;
+                sig.FinishedGpu = decode_state.finished_gpu;
+                sig.LogitsOutGpu = decode_state.logits_out_gpu;
+                sig.KData = decode_state.k_data;
+                sig.VData = decode_state.v_data;
+                sig.KPages = decode_state.k_pages;
+                sig.VPages = decode_state.v_pages;
+                sig.KScales = decode_state.k_scales;
+                sig.VScales = decode_state.v_scales;
+                sig.KScalesFp8 = decode_state.k_scales_fp8;
+                sig.VScalesFp8 = decode_state.v_scales_fp8;
+                sig.KScalesPagedFp8 = decode_state.k_scales_paged_fp8;
+                sig.VScalesPagedFp8 = decode_state.v_scales_paged_fp8;
+                sig.BlockTableGpu = decode_state.block_table_gpu;
+                sig.RecurrentStateHash = hash_layer_ptr_map(decode_state.recurrent_states);
+                sig.RecurrentStateBytesHash = hash_layer_size_map(decode_state.recurrent_state_bytes);
+                sig.ConvStateHash = hash_layer_ptr_map(decode_state.conv_states);
+                sig.ConvStateBytesHash = hash_layer_size_map(decode_state.conv_state_bytes);
+                sig.BlockTableStride = decode_state.block_table_stride;
+                sig.PageBlockSize = decode_state.page_block_size;
+                sig.TotalPages = decode_state.total_pages;
+                sig.MaxSeqLen = decode_state.max_seq_len;
+                sig.MaxSeqlenK = decode_state.max_seqlen_k;
+                sig.NumKvHeads = decode_state.num_kv_heads;
+                sig.HeadDim = decode_state.head_dim;
+                sig.VocabSize = decode_state.vocab_size;
+                sig.PrefillPosOffset = decode_state.prefill_pos_offset;
+                sig.PerBufferBytes = decode_state.per_buffer_bytes;
+                sig.PerPoolBytes = decode_state.per_pool_bytes;
+                sig.Paged = decode_state.paged;
+                sig.Fp8 = decode_state.fp8;
+                sig.PrefillMode = decode_state.prefill_mode;
+                return sig;
+            }();
+
+            auto& decode_entry = mDecodeGraphCache[B];
+            if (decode_entry.Exec &&
+                (!decode_entry.HasSignature || !(decode_entry.Signature == decode_signature))) {
+                CUDA_CHECK(cudaGraphExecDestroy(decode_entry.Exec));
+                decode_entry.Exec = nullptr;
+                decode_entry.Primed = false;
+                decode_entry.HasSignature = false;
             }
 
-            if (!mDecodeGraphExec && !mDecodeGraphPrimed) {
+            if (!decode_entry.Exec && !decode_entry.Primed) {
                 // Warm-up eager decode once before graph capture so capture-unsafe
                 // lazy allocations (e.g. recurrent state cudaMalloc) happen outside
                 // stream capture.
                 mCompiledExecutor->execute_forward(
                     *mDecodeCompiledForward, comm, /*full=*/false, hook);
-                mDecodeGraphPrimed = true;
+                decode_entry.Primed = true;
             } else {
                 trace_or_execute_cuda_graph_with_stack(
                     [&]() {
@@ -2042,11 +2135,14 @@ void GraphExecutor::execute_decode_step(long B,
                             *mDecodeCompiledForward, comm, /*full=*/false, hook);
                     },
                     rs.MainStream,
-                    mDecodeGraphExec,
+                    decode_entry.Exec,
                     /*enabled=*/true,
                     rs.Stack,
-                    mDecodeGraphCheckpoint);
-                mDecodeGraphB = B;
+                    decode_entry.Checkpoint);
+                if (decode_entry.Exec) {
+                    decode_entry.Signature = decode_signature;
+                    decode_entry.HasSignature = true;
+                }
             }
         }
     } else {
@@ -2065,12 +2161,15 @@ void GraphExecutor::execute_decode_step(long B,
 }
 
 void GraphExecutor::invalidate_decode_graph() {
-    if (mDecodeGraphExec) {
-        CUDA_CHECK(cudaGraphExecDestroy(mDecodeGraphExec));
-        mDecodeGraphExec = nullptr;
+    for (auto& [_, entry] : mDecodeGraphCache) {
+        if (entry.Exec) {
+            CUDA_CHECK(cudaGraphExecDestroy(entry.Exec));
+            entry.Exec = nullptr;
+        }
+        entry.Primed = false;
+        entry.HasSignature = false;
     }
-    mDecodeGraphB = 0;
-    mDecodeGraphPrimed = false;
+    mDecodeGraphCache.clear();
     // Keep compiled decode/prefill graphs cached. They are shape-specialized IR
     // artifacts and do not capture per-call arena pointers.
 }

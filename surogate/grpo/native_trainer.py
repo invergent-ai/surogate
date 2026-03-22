@@ -311,12 +311,8 @@ class NativeGRPOTrainer:
     @staticmethod
     def _log_fp8_kv_cache_default(label: str, ngpu: int) -> None:
         try:
-            disable_env = os.getenv("SUROGATE_DISABLE_FP8_KV_CACHE", "").strip()
-            if disable_env and disable_env.lower() not in {"0", "false"}:
-                logger.info(
-                    "FP8 KV-cache disabled via SUROGATE_DISABLE_FP8_KV_CACHE (%s).",
-                    label,
-                )
+            enable_env = os.getenv("SUROGATE_ENABLE_FP8_KV_CACHE", "").strip()
+            if (not enable_env) or enable_env.lower() in {"0", "false"}:
                 return
             infos = _surogate.SystemInfo.get_gpu_info()
             if not infos:

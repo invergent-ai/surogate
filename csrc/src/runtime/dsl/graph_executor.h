@@ -412,10 +412,95 @@ private:
     // ========================================================================
     // Decode CUDA graph capture (Phase 4)
     // ========================================================================
-    cudaGraphExec_t mDecodeGraphExec = nullptr;
-    DeviceMemoryStack::Checkpoint mDecodeGraphCheckpoint{};
-    long mDecodeGraphB = 0;
-    bool mDecodeGraphPrimed = false;
+    struct DecodeGraphSignature {
+        long Batch = 0;
+        const void* InputsData = nullptr;
+        const void* PositionIDsData = nullptr;
+        const void* SeqLensGpu = nullptr;
+        const void* CuSeqlensQGpu = nullptr;
+        const void* CuSeqlensKGpu = nullptr;
+        const void* FinishedGpu = nullptr;
+        const void* LogitsOutGpu = nullptr;
+        const void* KData = nullptr;
+        const void* VData = nullptr;
+        const void* KPages = nullptr;
+        const void* VPages = nullptr;
+        const void* KScales = nullptr;
+        const void* VScales = nullptr;
+        const void* KScalesFp8 = nullptr;
+        const void* VScalesFp8 = nullptr;
+        const void* KScalesPagedFp8 = nullptr;
+        const void* VScalesPagedFp8 = nullptr;
+        const void* BlockTableGpu = nullptr;
+        std::uint64_t RecurrentStateHash = 0;
+        std::uint64_t RecurrentStateBytesHash = 0;
+        std::uint64_t ConvStateHash = 0;
+        std::uint64_t ConvStateBytesHash = 0;
+        int BlockTableStride = 0;
+        int PageBlockSize = 0;
+        int TotalPages = 0;
+        int MaxSeqLen = 0;
+        int MaxSeqlenK = 0;
+        int NumKvHeads = 0;
+        int HeadDim = 0;
+        int VocabSize = 0;
+        int PrefillPosOffset = 0;
+        std::size_t PerBufferBytes = 0;
+        std::size_t PerPoolBytes = 0;
+        bool Paged = false;
+        bool Fp8 = false;
+        bool PrefillMode = false;
+
+        bool operator==(const DecodeGraphSignature& rhs) const {
+            return Batch == rhs.Batch
+                && InputsData == rhs.InputsData
+                && PositionIDsData == rhs.PositionIDsData
+                && SeqLensGpu == rhs.SeqLensGpu
+                && CuSeqlensQGpu == rhs.CuSeqlensQGpu
+                && CuSeqlensKGpu == rhs.CuSeqlensKGpu
+                && FinishedGpu == rhs.FinishedGpu
+                && LogitsOutGpu == rhs.LogitsOutGpu
+                && KData == rhs.KData
+                && VData == rhs.VData
+                && KPages == rhs.KPages
+                && VPages == rhs.VPages
+                && KScales == rhs.KScales
+                && VScales == rhs.VScales
+                && KScalesFp8 == rhs.KScalesFp8
+                && VScalesFp8 == rhs.VScalesFp8
+                && KScalesPagedFp8 == rhs.KScalesPagedFp8
+                && VScalesPagedFp8 == rhs.VScalesPagedFp8
+                && BlockTableGpu == rhs.BlockTableGpu
+                && RecurrentStateHash == rhs.RecurrentStateHash
+                && RecurrentStateBytesHash == rhs.RecurrentStateBytesHash
+                && ConvStateHash == rhs.ConvStateHash
+                && ConvStateBytesHash == rhs.ConvStateBytesHash
+                && BlockTableStride == rhs.BlockTableStride
+                && PageBlockSize == rhs.PageBlockSize
+                && TotalPages == rhs.TotalPages
+                && MaxSeqLen == rhs.MaxSeqLen
+                && MaxSeqlenK == rhs.MaxSeqlenK
+                && NumKvHeads == rhs.NumKvHeads
+                && HeadDim == rhs.HeadDim
+                && VocabSize == rhs.VocabSize
+                && PrefillPosOffset == rhs.PrefillPosOffset
+                && PerBufferBytes == rhs.PerBufferBytes
+                && PerPoolBytes == rhs.PerPoolBytes
+                && Paged == rhs.Paged
+                && Fp8 == rhs.Fp8
+                && PrefillMode == rhs.PrefillMode;
+        }
+    };
+
+    struct DecodeGraphCacheEntry {
+        cudaGraphExec_t Exec = nullptr;
+        DeviceMemoryStack::Checkpoint Checkpoint{};
+        bool Primed = false;
+        bool HasSignature = false;
+        DecodeGraphSignature Signature{};
+    };
+    // Full-mode decode graph cache keyed by decode batch size (B).
+    std::unordered_map<long, DecodeGraphCacheEntry> mDecodeGraphCache;
 
     // ========================================================================
     // Compiled execution (operations pre-compiled into direct function calls)

@@ -109,6 +109,7 @@ class ActiveGeneration:
     finished: bool = False
     finish_reason: str = "stop"
     done_signaled: bool = False
+    is_padding: bool = False
 
 
 class ContextLengthExceededError(ValueError):
@@ -182,7 +183,6 @@ class NativeServingRuntime:
         )
         self.eos_id = self.tokenizer.eos_token_id or 151643
 
-        logger.info(f"Building DSL IR for {model_dir}")
         ir_json = build_dsl_ir_for_model(model_dir)
         jit_manifests = compile_jit_kernels(ir_json)
         requested_batch_size = max(1, int(config.batch_size))
@@ -332,6 +332,14 @@ class NativeServingRuntime:
         configured_cap = max(1, int(self._runtime_batch_size))
         env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
         self._max_batch_sequences = max(1, min(configured_cap, env_cap))
+        self._full_cuda_graph_bucket_sizes = self._resolve_full_cuda_graph_bucket_sizes(
+            self._max_batch_sequences
+        )
+        self._full_cuda_graph_padding_enabled = (
+            bool(self.config.use_cuda_graphs)
+            and bool(self._persistent_paged_kv_enabled)
+            and bool(self._full_cuda_graph_bucket_sizes)
+        )
         if self._max_batch_sequences <= 1:
             logger.warning(
                 "Serve runtime running with batch_size=1; concurrent requests will be serialized. "
@@ -344,11 +352,13 @@ class NativeServingRuntime:
         )
         self._batch_worker.start()
         logger.info(
-            "Native inference runtime ready (continuous_batching=%s persistent_paged_kv=%s step_tokens=%d idle_step_tokens=%d)",
+            "Native inference runtime ready (continuous_batching=%s persistent_paged_kv=%s step_tokens=%d idle_step_tokens=%d full_cuda_graph_padding=%s buckets=%s)",
             bool(self._continuous_enabled),
             bool(self._persistent_paged_kv_enabled),
             int(self._continuous_step_tokens),
             int(self._continuous_idle_step_tokens),
+            bool(self._full_cuda_graph_padding_enabled),
+            self._full_cuda_graph_bucket_sizes if self._full_cuda_graph_bucket_sizes else "[]",
         )
 
     @staticmethod
@@ -363,11 +373,8 @@ class NativeServingRuntime:
     @staticmethod
     def _log_fp8_kv_cache_default(ngpu: int) -> None:
         try:
-            disable_env = os.getenv("SUROGATE_DISABLE_FP8_KV_CACHE", "").strip()
-            if disable_env and disable_env.lower() not in {"0", "false"}:
-                logger.info(
-                    "FP8 KV-cache disabled via SUROGATE_DISABLE_FP8_KV_CACHE."
-                )
+            enable_env = os.getenv("SUROGATE_ENABLE_FP8_KV_CACHE", "").strip()
+            if (not enable_env) or enable_env.lower() in {"0", "false"}:
                 return
             infos = _surogate.SystemInfo.get_gpu_info()
             if not infos:
@@ -668,6 +675,95 @@ class NativeServingRuntime:
     def _prompt_capacity(self, params: GenerationParams) -> int:
         return max(1, self._max_batch_sequences // max(1, params.n))
 
+    @staticmethod
+    def _resolve_full_cuda_graph_bucket_sizes(prompt_cap: int) -> list[int]:
+        raw = os.getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS", "").strip()
+        if not raw:
+            return []
+
+        raw_lower = raw.lower()
+        if raw_lower == "auto":
+            buckets: list[int] = []
+            b = 1
+            while b < prompt_cap:
+                buckets.append(b)
+                b *= 2
+            buckets.append(prompt_cap)
+            return buckets
+
+        parsed: list[int] = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = int(token)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS entry=%r (expected int or 'auto').",
+                    token,
+                )
+                continue
+            if value <= 0:
+                continue
+            parsed.append(value)
+
+        if not parsed:
+            return []
+
+        buckets = sorted({value for value in parsed if value <= prompt_cap})
+        if not buckets:
+            logger.warning(
+                "SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS=%r has no values within prompt cap=%d; disabling padding.",
+                raw,
+                prompt_cap,
+            )
+            return []
+        return buckets
+
+    def _select_full_cuda_graph_bucket(self, batch_size: int) -> int:
+        for bucket in self._full_cuda_graph_bucket_sizes:
+            if bucket >= batch_size:
+                return bucket
+        return batch_size
+
+    def _append_full_cuda_graph_padding_rows(
+        self,
+        active: list[ActiveGeneration],
+        params: GenerationParams,
+    ) -> None:
+        if not self._full_cuda_graph_padding_enabled:
+            return
+
+        current_size = len(active)
+        target_size = self._select_full_cuda_graph_bucket(current_size)
+        if target_size <= current_size:
+            return
+
+        padding = target_size - current_size
+        for _ in range(padding):
+            pad_pending = PendingGeneration(
+                # Keep row prompt valid/non-empty for open_generation_session().
+                prompt_ids=[int(self.eos_id)],
+                stop_strings=[],
+                params=params,
+            )
+            active.append(
+                ActiveGeneration(
+                    pending=pad_pending,
+                    finished=True,
+                    finish_reason="stop",
+                    done_signaled=True,
+                    is_padding=True,
+                )
+            )
+
+        logger.debug(
+            "Padded persistent session from %d to %d rows for full CUDA-graph bucketing.",
+            current_size,
+            target_size,
+        )
+
     def _fit_prompt_and_max_tokens(
         self,
         prompt_ids: list[int],
@@ -955,6 +1051,7 @@ class NativeServingRuntime:
                 session_id: Optional[int] = None
                 err: Optional[Exception] = None
                 try:
+                    self._append_full_cuda_graph_padding_rows(active, params)
                     session_id = self._open_persistent_continuous_session(active, params)
                     while True:
                         unfinished = [a for a in active if not a.finished]

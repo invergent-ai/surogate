@@ -148,11 +148,12 @@ void sampling_from_probs(
         bool deterministic,
         uint64_t seed,
         uint64_t offset,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const uint64_t* offset_arr) {
 
     int32_t* indices_null = nullptr;
     uint64_t* seed_arr_null = nullptr;
-    uint64_t* offset_arr_null = nullptr;
+    uint64_t* offset_arr_in = const_cast<uint64_t*>(offset_arr);
     auto err = flashinfer::sampling::SamplingFromProb<float, int32_t>(
         probs,
         output,
@@ -162,7 +163,7 @@ void sampling_from_probs(
         deterministic,
         seed_arr_null,
         seed,
-        offset_arr_null,
+        offset_arr_in,
         offset,
         stream);
 
@@ -184,11 +185,12 @@ void sampling_from_logits(
         bool deterministic,
         uint64_t seed,
         uint64_t offset,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const uint64_t* offset_arr) {
 
     int32_t* indices_null = nullptr;
     uint64_t* seed_arr_null = nullptr;
-    uint64_t* offset_arr_null = nullptr;
+    uint64_t* offset_arr_in = const_cast<uint64_t*>(offset_arr);
     auto err = flashinfer::sampling::SamplingFromLogits<float, int32_t>(
         logits,
         output,
@@ -198,7 +200,7 @@ void sampling_from_logits(
         deterministic,
         seed_arr_null,
         seed,
-        offset_arr_null,
+        offset_arr_in,
         offset,
         stream);
 
@@ -221,19 +223,20 @@ void sampling_top_k(
         bool deterministic,
         uint64_t seed,
         uint64_t offset,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const uint64_t* offset_arr) {
 
     int32_t* indices_null = nullptr;
     float* top_k_arr_null = nullptr;
     uint64_t* seed_arr_null = nullptr;
-    uint64_t* offset_arr_null = nullptr;
+    uint64_t* offset_arr_in = const_cast<uint64_t*>(offset_arr);
     auto err = flashinfer::sampling::TopKSamplingFromProb<float, int32_t>(
         probs, output, indices_null, top_k_arr_null,
         static_cast<uint32_t>(batch_size),
         static_cast<uint32_t>(top_k),
         static_cast<uint32_t>(vocab_size),
         deterministic,
-        seed_arr_null, seed, offset_arr_null, offset,
+        seed_arr_null, seed, offset_arr_in, offset,
         stream);
     if (err != cudaSuccess) {
         throw std::runtime_error(
@@ -254,19 +257,20 @@ void sampling_top_p(
         bool deterministic,
         uint64_t seed,
         uint64_t offset,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const uint64_t* offset_arr) {
 
     int32_t* indices_null = nullptr;
     float* top_p_arr_null = nullptr;
     uint64_t* seed_arr_null = nullptr;
-    uint64_t* offset_arr_null = nullptr;
+    uint64_t* offset_arr_in = const_cast<uint64_t*>(offset_arr);
     auto err = flashinfer::sampling::TopPSamplingFromProb<float, int32_t>(
         probs, output, indices_null, top_p_arr_null,
         static_cast<uint32_t>(batch_size),
         top_p,
         static_cast<uint32_t>(vocab_size),
         deterministic,
-        seed_arr_null, seed, offset_arr_null, offset,
+        seed_arr_null, seed, offset_arr_in, offset,
         stream);
     if (err != cudaSuccess) {
         throw std::runtime_error(
@@ -288,13 +292,14 @@ void sampling_top_k_top_p(
         bool deterministic,
         uint64_t seed,
         uint64_t offset,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const uint64_t* offset_arr) {
 
     int32_t* indices_null = nullptr;
     int32_t* top_k_arr_null = nullptr;
     float* top_p_arr_null = nullptr;
     uint64_t* seed_arr_null = nullptr;
-    uint64_t* offset_arr_null = nullptr;
+    uint64_t* offset_arr_in = const_cast<uint64_t*>(offset_arr);
     auto err = flashinfer::sampling::TopKTopPSamplingFromProb<float, int32_t>(
         probs, top_k_arr_null, top_p_arr_null, output, indices_null,
         static_cast<uint32_t>(batch_size),
@@ -302,7 +307,7 @@ void sampling_top_k_top_p(
         top_p,
         static_cast<uint32_t>(vocab_size),
         deterministic,
-        seed_arr_null, seed, offset_arr_null, offset,
+        seed_arr_null, seed, offset_arr_in, offset,
         stream);
     if (err != cudaSuccess) {
         throw std::runtime_error(
@@ -323,19 +328,20 @@ void sampling_min_p(
         bool deterministic,
         uint64_t seed,
         uint64_t offset,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const uint64_t* offset_arr) {
 
     int32_t* indices_null = nullptr;
     float* min_p_arr_null = nullptr;
     uint64_t* seed_arr_null = nullptr;
-    uint64_t* offset_arr_null = nullptr;
+    uint64_t* offset_arr_in = const_cast<uint64_t*>(offset_arr);
     auto err = flashinfer::sampling::MinPSamplingFromProb<float, int32_t>(
         probs, min_p_arr_null, output, indices_null,
         static_cast<uint32_t>(batch_size),
         min_p,
         static_cast<uint32_t>(vocab_size),
         deterministic,
-        seed_arr_null, seed, offset_arr_null, offset,
+        seed_arr_null, seed, offset_arr_in, offset,
         stream);
     if (err != cudaSuccess) {
         throw std::runtime_error(
