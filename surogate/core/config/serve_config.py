@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional
 
 from surogate.utils.dict import DictDefault
 
@@ -31,11 +31,13 @@ class ServeConfig:
     dtype: Literal["bf16", "fp32"] = "bf16"
     # Number of GPUs to initialize for the runtime.
     gpus: int = 1
-    # Maximum runtime batch capacity used by serving scheduler/generation.
-    batch_size: int = 8
-    # Runtime sequence length cap used to size model buffers. If None, defaults
-    # to the model's max supported context length.
-    sequence_len: Optional[int] = None
+    # vLLM-style batch capacity (maximum number of sequences per batch).
+    max_num_seqs: int = 8
+    # vLLM-style token budget for one scheduler step / runtime buffer sizing.
+    max_num_batched_tokens: int = 512
+    # Maximum context length for serving requests. If None, defaults to the
+    # model's max supported context length.
+    max_model_len: Optional[int] = None
     # Whether Hugging Face remote code is trusted during model/tokenizer load.
     trust_remote_code: bool = True
     # Optional explicit floor for runtime stack arena size in MiB.
@@ -62,8 +64,12 @@ class ServeConfig:
     use_cuda_graphs: bool = True
     # Prefill chunk size for long-prompt chunked prefill (0 disables chunking).
     prefill_chunk_size: int = 256
+    # Tracks config keys explicitly set via YAML/CLI overrides.
+    _explicit_fields: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __init__(self, cfg: DictDefault):
+        self._explicit_fields = {str(key).replace("-", "_") for key in cfg.keys()}
+
         self.host = cfg.get("host", self.host)
         self.port = int(cfg.get("port", self.port))
         self.log_level = cfg.get("log_level", self.log_level)
@@ -73,9 +79,12 @@ class ServeConfig:
         self.model_id = cfg.get("model_id", self.model_id)
         self.dtype = cfg.get("dtype", self.dtype)
         self.gpus = int(cfg.get("gpus", self.gpus))
-        self.batch_size = int(cfg.get("batch_size", self.batch_size))
-        sequence_len_raw = cfg.get("sequence_len", self.sequence_len)
-        self.sequence_len = None if sequence_len_raw is None else int(sequence_len_raw)
+        self.max_num_seqs = int(cfg.get("max_num_seqs", self.max_num_seqs))
+        self.max_num_batched_tokens = int(
+            cfg.get("max_num_batched_tokens", self.max_num_batched_tokens)
+        )
+        max_model_len_raw = cfg.get("max_model_len", self.max_model_len)
+        self.max_model_len = None if max_model_len_raw is None else int(max_model_len_raw)
         self.trust_remote_code = bool(
             cfg.get("trust_remote_code", self.trust_remote_code)
         )
@@ -108,8 +117,12 @@ class ServeConfig:
             raise ValueError("ServeConfig: `dtype` must be one of: bf16, fp32")
         if self.port <= 0:
             raise ValueError("ServeConfig: `port` must be > 0")
-        if self.sequence_len is not None and self.sequence_len <= 0:
-            raise ValueError("ServeConfig: `sequence_len` must be > 0 when set")
+        if self.max_num_seqs <= 0:
+            raise ValueError("ServeConfig: `max_num_seqs` must be > 0")
+        if self.max_num_batched_tokens <= 0:
+            self.max_num_batched_tokens = 512
+        if self.max_model_len is not None and self.max_model_len <= 0:
+            raise ValueError("ServeConfig: `max_model_len` must be > 0 when set")
         if self.max_gen_len <= 0:
             raise ValueError("ServeConfig: `max_gen_len` must be > 0")
         if self.gpu_memory_utilization <= 0.0 or self.gpu_memory_utilization > 1.0:
@@ -128,3 +141,50 @@ class ServeConfig:
             self.min_p = 0.0
         if self.repetition_penalty <= 0.0:
             self.repetition_penalty = 1.0
+
+    def is_explicit(self, field_name: str) -> bool:
+        return field_name in self._explicit_fields
+
+    def apply_generation_config_defaults(
+        self, generation_cfg: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not isinstance(generation_cfg, dict):
+            return {}
+
+        mapping = (
+            ("max_new_tokens", "max_gen_len", int),
+            ("temperature", "temperature", float),
+            ("top_k", "top_k", int),
+            ("top_p", "top_p", float),
+            ("min_p", "min_p", float),
+            ("repetition_penalty", "repetition_penalty", float),
+        )
+        applied: dict[str, Any] = {}
+        for source, target, caster in mapping:
+            if self.is_explicit(target):
+                continue
+            raw_value = generation_cfg.get(source)
+            if raw_value is None:
+                continue
+            try:
+                value = caster(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            if target == "max_gen_len":
+                if value <= 0:
+                    continue
+            elif target == "top_k":
+                value = max(0, value)
+            elif target == "top_p":
+                if value <= 0.0:
+                    value = 1.0
+            elif target == "min_p":
+                value = max(0.0, value)
+            elif target == "repetition_penalty":
+                if value <= 0.0:
+                    value = 1.0
+
+            setattr(self, target, value)
+            applied[target] = value
+        return applied

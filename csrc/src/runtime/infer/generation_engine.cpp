@@ -652,6 +652,7 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
     int active_count_host = total_batch;
     const int stop_check_start = std::max(16, gen_config.max_gen_len / 2);
     const int stop_check_interval = std::max(16, gen_config.max_gen_len / 8);
+    bool decode_cuda_graphs_primed = !gen_config.use_cuda_graphs;
 
     for (int step = 0; step < gen_config.max_gen_len; ++step) {
 
@@ -672,7 +673,12 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         // ----------------------------------------------------------------
         graph_executor.execute_decode_step(
             static_cast<long>(total_batch), last_tokens_gpu, position_ids_gpu,
-            decode_state, comm, hook, gen_config.use_cuda_graphs);
+            decode_state, comm, hook,
+            gen_config.use_cuda_graphs && decode_cuda_graphs_primed);
+        if (!decode_cuda_graphs_primed && gen_config.use_cuda_graphs) {
+            // Warm-up eager once so lazy allocations happen before first capture.
+            decode_cuda_graphs_primed = true;
+        }
         if (sanitize_logits_enabled()) {
             // Match HF remove_invalid_values behavior when explicitly enabled.
             sampling_sanitize_logits(logits_gpu, total_batch, V, mRunState.MainStream);
@@ -870,6 +876,7 @@ void GenerationSession::init(
     }
     mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
     mFullStepCudaGraphPrimed = false;
+    mDecodeCudaGraphPrimed = !mGenConfig.use_cuda_graphs;
     // FULL-mode graph capture spans the entire decode token-step body.
     // Keep this mode conservative:
     // - gated by serving FULL-mode env switch
@@ -1338,9 +1345,15 @@ GenerationSessionStepResult GenerationSession::step(
                     mFullStepCudaGraphCheckpoint);
             }
         } else {
+            const bool use_decode_graph_this_step =
+                mGenConfig.use_cuda_graphs && mDecodeCudaGraphPrimed;
             run_one_decode_token_step(
-                /*decode_forward_use_cuda_graph=*/mGenConfig.use_cuda_graphs,
+                /*decode_forward_use_cuda_graph=*/use_decode_graph_this_step,
                 /*sampling_offset_arr=*/nullptr);
+            if (!mDecodeCudaGraphPrimed && mGenConfig.use_cuda_graphs) {
+                // Prime decode graphs with one eager step to avoid capture-time allocations.
+                mDecodeCudaGraphPrimed = true;
+            }
         }
         mRngOffset++;
 
@@ -1446,6 +1459,7 @@ void GenerationSession::close(dsl::GraphExecutor& graph_executor) {
     mFullStepCudaGraphCheckpoint = DeviceMemoryStack::Checkpoint{};
     mFullStepCudaGraphPrimed = false;
     mFullStepCudaGraphEnabled = false;
+    mDecodeCudaGraphPrimed = false;
 
     for (auto& [_, ptr] : mRecurrentStates) {
         if (ptr) {

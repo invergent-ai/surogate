@@ -172,6 +172,7 @@ class NativeServingRuntime:
         self.model_id = config.model_id or config.model or "native"
 
         model_dir = self._resolve_model_dir(config.model or "")
+        self._apply_model_generation_config_defaults(model_dir, config)
         qlora_config, prequant_method, is_moe_model, model_max_len = (
             self._resolve_prequant_qlora_config(model_dir)
         )
@@ -185,12 +186,18 @@ class NativeServingRuntime:
 
         ir_json = build_dsl_ir_for_model(model_dir)
         jit_manifests = compile_jit_kernels(ir_json)
-        requested_batch_size = max(1, int(config.batch_size))
-        requested_seq_len = self._resolve_effective_sequence_len(
+        requested_batch_size = max(1, int(config.max_num_seqs))
+        requested_seq_len = self._resolve_effective_max_model_len(
             config,
             model_max_len=model_max_len,
             tokenizer=self.tokenizer,
         )
+        trainer_seq_len = self._resolve_runtime_seq_len_budget(
+            config,
+            requested_seq_len=requested_seq_len,
+            requested_batch_size=requested_batch_size,
+        )
+        self._max_context_len = int(requested_seq_len)
 
         # Prequant NVFP4 on Blackwell is most stable/fast with cuDNN FP4 backend.
         # Allow override via env for A/B testing.
@@ -243,6 +250,17 @@ class NativeServingRuntime:
                     "Prequant recipe override disabled by SUROGATE_SERVE_PREQUANT_RECIPE=0; using bf16 recipe."
                 )
         options.use_cuda_graphs = bool(config.use_cuda_graphs)
+        if (
+            options.use_cuda_graphs
+            and prequant_method in {"prequant_nvfp4", "prequant_fp8", "prequant_mxfp4"}
+            and os.getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE") is None
+        ):
+            os.environ["SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE"] = "0"
+            logger.info(
+                "Defaulting SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE=0 for prequant serving "
+                "with CUDA graphs (decode graphs stay enabled). Set "
+                "SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE=1 to force full-step capture."
+            )
         options.doc_masking = True
         options.recompute = "true"
         if hasattr(options, "selective_expert_dequant"):
@@ -259,7 +277,7 @@ class NativeServingRuntime:
         options.lmhead_chunks = self._resolve_lmhead_chunks(
             config,
             effective_seq_len=requested_seq_len,
-            batch_size=requested_batch_size,
+            max_num_seqs=requested_batch_size,
         )
         options.min_stack_mb = self._resolve_min_stack_mb(config)
         logger.info(
@@ -273,7 +291,7 @@ class NativeServingRuntime:
         model_weights_path = get_model_weights_path(model_dir)
         (
             self._runtime_batch_size,
-            self._runtime_seq_len,
+            self._trainer_seq_len,
             self.trainer,
         ) = self._build_trainer(
             model_dir=model_dir,
@@ -282,13 +300,15 @@ class NativeServingRuntime:
             qlora_config=qlora_config,
             model_weights_path=model_weights_path,
             batch_size=requested_batch_size,
-            seq_len=requested_seq_len,
+            seq_len=trainer_seq_len,
         )
+        self._runtime_seq_len = int(self._max_context_len)
         self._log_fp8_kv_cache_default(config.gpus)
         logger.info(
-            "Serve startup capacity: batch_size=%d seq_len=%d",
+            "Serve startup capacity: max_num_seqs=%d max_model_len=%d runtime_seq_len=%d",
             self._runtime_batch_size,
             self._runtime_seq_len,
+            self._trainer_seq_len,
         )
         self._pending_lock = threading.Lock()
         self._pending_cv = threading.Condition(self._pending_lock)
@@ -343,8 +363,8 @@ class NativeServingRuntime:
         )
         if self._max_batch_sequences <= 1:
             logger.warning(
-                "Serve runtime running with batch_size=1; concurrent requests will be serialized. "
-                "Set --batch_size>1 to improve throughput."
+                "Serve runtime running with max_num_seqs=1; concurrent requests will be serialized. "
+                "Set --max_num_seqs>1 to improve throughput."
             )
         self._batch_worker = threading.Thread(
             target=self._generation_worker_loop,
@@ -412,7 +432,7 @@ class NativeServingRuntime:
         options.lmhead_chunks = self._resolve_lmhead_chunks(
             config,
             effective_seq_len=seq_len,
-            batch_size=batch_size,
+            max_num_seqs=batch_size,
         )
         logger.info(
             "Serve runtime init with batch_size=%d seq_len=%d lmhead_chunks=%d",
@@ -540,7 +560,7 @@ class NativeServingRuntime:
         config: ServeConfig,
         *,
         effective_seq_len: int,
-        batch_size: Optional[int] = None,
+        max_num_seqs: Optional[int] = None,
     ) -> int:
         # Training runtime persists an output buffer shaped [B*T/lmhead_chunks, V].
         # Keep per-chunk token count small for inference startup memory stability.
@@ -548,20 +568,23 @@ class NativeServingRuntime:
             128,
             int(os.getenv("SUROGATE_SERVE_LMHEAD_TOKENS_PER_CHUNK", "1024")),
         )
-        bsz = max(1, int(config.batch_size if batch_size is None else batch_size))
+        bsz = max(
+            1,
+            int(config.max_num_seqs if max_num_seqs is None else max_num_seqs),
+        )
         total_tokens = max(1, bsz * int(effective_seq_len))
         chunks = max(1, math.ceil(total_tokens / tokens_per_chunk))
         return int(chunks)
 
     @staticmethod
-    def _resolve_effective_sequence_len(
+    def _resolve_effective_max_model_len(
         config: ServeConfig,
         *,
         model_max_len: Optional[int],
         tokenizer: Any,
     ) -> int:
-        if config.sequence_len is not None:
-            return max(1, int(config.sequence_len))
+        if config.max_model_len is not None:
+            return max(1, int(config.max_model_len))
 
         inferred_model_max_len = NativeServingRuntime._normalize_context_len(model_max_len)
         if inferred_model_max_len is None:
@@ -570,14 +593,104 @@ class NativeServingRuntime:
             )
         if inferred_model_max_len is None:
             raise ValueError(
-                "ServeConfig: `sequence_len` is not set and model max context length "
-                "could not be inferred. Set --sequence_len explicitly."
+                "ServeConfig: `max_model_len` is not set and model max context length "
+                "could not be inferred. Set --max_model_len explicitly."
             )
         logger.info(
-            "Serve sequence_len not set; defaulting to model max context length=%d.",
+            "Serve max_model_len not set; defaulting to model max context length=%d.",
             inferred_model_max_len,
         )
         return inferred_model_max_len
+
+    @staticmethod
+    def _resolve_runtime_seq_len_budget(
+        config: ServeConfig,
+        *,
+        requested_seq_len: int,
+        requested_batch_size: int,
+    ) -> int:
+        # Decouple model buffer sizing from max context length:
+        # max_model_len controls API/context limits, while runtime_seq_len controls
+        # [B, T, ...] persistent buffers in the trainer. This mirrors vLLM's
+        # max_num_batched_tokens behavior and prevents large-context OOM at startup.
+        env_raw = os.getenv("SUROGATE_SERVE_MAX_BATCHED_TOKENS", "").strip()
+        if env_raw:
+            try:
+                max_batched_tokens = int(env_raw)
+            except ValueError:
+                logger.warning(
+                    "Invalid SUROGATE_SERVE_MAX_BATCHED_TOKENS=%r; falling back to config value=%d.",
+                    env_raw,
+                    int(config.max_num_batched_tokens),
+                )
+                max_batched_tokens = int(config.max_num_batched_tokens)
+        else:
+            max_batched_tokens = int(config.max_num_batched_tokens)
+
+        if max_batched_tokens <= 0:
+            return max(1, int(requested_seq_len))
+
+        requested_seq_len = max(1, int(requested_seq_len))
+        requested_batch_size = max(1, int(requested_batch_size))
+        prefill_chunk = max(0, int(config.prefill_chunk_size))
+        per_seq_budget = max(
+            1,
+            (max_batched_tokens + requested_batch_size - 1) // requested_batch_size,
+        )
+        runtime_seq_len = min(
+            requested_seq_len,
+            max(2, prefill_chunk, per_seq_budget),
+        )
+        if runtime_seq_len < requested_seq_len:
+            logger.info(
+                "Runtime seq_len budgeted to %d (context_len=%d, batch_size=%d, max_batched_tokens=%d, per_seq_budget=%d, prefill_chunk_size=%d).",
+                runtime_seq_len,
+                requested_seq_len,
+                requested_batch_size,
+                max_batched_tokens,
+                per_seq_budget,
+                prefill_chunk,
+            )
+        return int(runtime_seq_len)
+
+    @staticmethod
+    def _load_model_generation_config(model_dir: str) -> tuple[Optional[str], dict[str, Any]]:
+        generation_cfg_path = os.path.join(model_dir, "generation_config.json")
+        if not os.path.isfile(generation_cfg_path):
+            return None, {}
+        try:
+            with open(generation_cfg_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load generation_config.json at %s: %s",
+                generation_cfg_path,
+                exc,
+            )
+            return generation_cfg_path, {}
+        if not isinstance(payload, dict):
+            logger.warning(
+                "Ignoring generation_config.json at %s: expected JSON object.",
+                generation_cfg_path,
+            )
+            return generation_cfg_path, {}
+        return generation_cfg_path, payload
+
+    @staticmethod
+    def _apply_model_generation_config_defaults(model_dir: str, config: ServeConfig) -> None:
+        generation_cfg_path, generation_cfg = NativeServingRuntime._load_model_generation_config(
+            model_dir
+        )
+        if not generation_cfg:
+            return
+        applied = config.apply_generation_config_defaults(generation_cfg)
+        if applied:
+            applied_str = ", ".join(f"{k}={v}" for k, v in sorted(applied.items()))
+            logger.info(
+                "Loaded generation defaults from %s (%s).",
+                generation_cfg_path,
+                applied_str,
+            )
 
     @staticmethod
     def _resolve_model_dir(model: str) -> str:

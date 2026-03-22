@@ -179,6 +179,7 @@ private:
     int mGeneratedSteps = 0;
     bool mFullStepCudaGraphEnabled = false;
     bool mFullStepCudaGraphPrimed = false;
+    bool mDecodeCudaGraphPrimed = false;
     cudaGraphExec_t mFullStepCudaGraphExec = nullptr;
     DeviceMemoryStack::Checkpoint mFullStepCudaGraphCheckpoint{};
 
