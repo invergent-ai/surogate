@@ -171,14 +171,11 @@ class NativeServingRuntime:
         self.model_id = config.model_id or config.model or "native"
 
         model_dir = self._resolve_model_dir(config.model or "")
-<<<<<<< HEAD
         qlora_config, prequant_method, is_moe_model = self._resolve_prequant_qlora_config(
             model_dir
         )
         self._is_moe_model = bool(is_moe_model)
-=======
-        qlora_config, prequant_method = self._resolve_prequant_qlora_config(model_dir)
->>>>>>> f3dc563b176f3d9451f44613dcb6e6ee4c5fa4e6
+
         logger.info(f"Loading tokenizer for {model_dir}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, trust_remote_code=config.trust_remote_code
@@ -533,11 +530,7 @@ class NativeServingRuntime:
             elif quant_method == "prequant_mxfp4":
                 qlora = _surogate.QLoRAConfig.prequant_mxfp4()
             else:
-<<<<<<< HEAD
                 return None, None, bool(model_info.is_moe_model)
-=======
-                return None, None
->>>>>>> f3dc563b176f3d9451f44613dcb6e6ee4c5fa4e6
 
             if modules_to_not_convert:
                 qlora.modules_to_not_convert = list(modules_to_not_convert)
@@ -545,22 +538,14 @@ class NativeServingRuntime:
                 "Detected pre-quantized model (%s); enabling prequant serve loading path.",
                 quant_method,
             )
-<<<<<<< HEAD
             return qlora, quant_method, bool(model_info.is_moe_model)
-=======
-            return qlora, quant_method
->>>>>>> f3dc563b176f3d9451f44613dcb6e6ee4c5fa4e6
         except Exception as exc:
             logger.warning(
                 "Prequant auto-detection failed for %s (%s). Proceeding without prequant config.",
                 model_dir,
                 exc,
             )
-<<<<<<< HEAD
             return None, None, False
-=======
-            return None, None
->>>>>>> f3dc563b176f3d9451f44613dcb6e6ee4c5fa4e6
 
     @staticmethod
     def _resolve_lmhead_chunks(

@@ -57,8 +57,6 @@ class ServeConfig:
     min_p: float = 0.0
     # Default repetition penalty (> 0).
     repetition_penalty: float = 1.0
-    # Enable LoRA adapter path for serving when available.
-    use_lora: bool = False
     # Enable CUDA graph execution in inference path.
     use_cuda_graphs: bool = True
     # Prefill chunk size for long-prompt chunked prefill (0 disables chunking).
@@ -94,7 +92,6 @@ class ServeConfig:
         self.repetition_penalty = float(
             cfg.get("repetition_penalty", self.repetition_penalty)
         )
-        self.use_lora = bool(cfg.get("use_lora", self.use_lora))
         self.use_cuda_graphs = bool(cfg.get("use_cuda_graphs", self.use_cuda_graphs))
         self.prefill_chunk_size = int(
             cfg.get("prefill_chunk_size", self.prefill_chunk_size)
