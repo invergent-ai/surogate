@@ -308,16 +308,61 @@ void flush_compact_states_to_slots_impl(
     }
     cudaStream_t stream = run_state->MainStream;
     const int B = std::min(compact_B, static_cast<int>(active_slot_ids.size()));
+    const int expected_device = run_state ? run_state->DeviceId : -1;
+    auto is_valid_device_ptr = [expected_device](const void* p) -> bool {
+        if (!p) return false;
+        int current_device = -1;
+        if (cudaGetDevice(&current_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            current_device = -1;
+        }
+        cudaPointerAttributes attrs{};
+        const cudaError_t st =
+            cudaPointerGetAttributes(&attrs, const_cast<void*>(p));
+        if (st != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+#if CUDART_VERSION >= 10000
+        if (attrs.type == cudaMemoryTypeManaged) {
+            return true;
+        }
+        if (attrs.type != cudaMemoryTypeDevice) {
+            return false;
+        }
+        if (expected_device >= 0 && attrs.device >= 0 && attrs.device != expected_device) {
+            return false;
+        }
+        if (current_device >= 0 && attrs.device >= 0 && attrs.device != current_device) {
+            return false;
+        }
+        return true;
+#else
+        if (attrs.memoryType != cudaMemoryTypeDevice) {
+            return false;
+        }
+        return true;
+#endif
+    };
 
     auto flush_state_map = [&](const std::unordered_map<int, void*>& compact_states,
                                const std::unordered_map<int, std::size_t>& compact_state_bytes,
+                               const std::unordered_map<int, std::size_t>& compact_state_capacity_bytes,
                                std::vector<std::unordered_map<int, void*>>& slot_states,
                                std::vector<std::unordered_map<int, std::size_t>>& slot_state_bytes) {
         for (const auto& [layer_idx, src_base_void] : compact_states) {
             if (!src_base_void) continue;
+            if (!is_valid_device_ptr(src_base_void)) continue;
             auto it_b = compact_state_bytes.find(layer_idx);
             if (it_b == compact_state_bytes.end() || it_b->second == 0) continue;
             const std::size_t per_seq_bytes = it_b->second;
+            auto it_cap = compact_state_capacity_bytes.find(layer_idx);
+            if (it_cap == compact_state_capacity_bytes.end() || it_cap->second == 0) continue;
+            if (per_seq_bytes > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(std::max(1, B)))) {
+                continue;
+            }
+            const std::size_t required_bytes = static_cast<std::size_t>(B) * per_seq_bytes;
+            if (required_bytes > it_cap->second) continue;
             const char* src_base = static_cast<const char*>(src_base_void);
             for (int i = 0; i < B; ++i) {
                 const int slot_id = active_slot_ids[static_cast<std::size_t>(i)];
@@ -335,6 +380,10 @@ void flush_compact_states_to_slots_impl(
                     }
                     bytes_map.erase(it_slot_b);
                 }
+                if (dst_ptr && !is_valid_device_ptr(dst_ptr)) {
+                    dst_ptr = nullptr;
+                    bytes_map.erase(layer_idx);
+                }
                 if (!dst_ptr) {
                     CUDA_CHECK(cudaMalloc(&dst_ptr, per_seq_bytes));
                 }
@@ -349,11 +398,13 @@ void flush_compact_states_to_slots_impl(
     flush_state_map(
         state.compact_recurrent_states,
         state.compact_recurrent_state_bytes,
+        state.compact_recurrent_state_capacity_bytes,
         state.slot_recurrent_states,
         state.slot_recurrent_state_bytes);
     flush_state_map(
         state.compact_conv_states,
         state.compact_conv_state_bytes,
+        state.compact_conv_state_capacity_bytes,
         state.slot_conv_states,
         state.slot_conv_state_bytes);
 }
@@ -797,6 +848,7 @@ void ContinuousGenerationEngine::rebuild_compact_batch() {
     decode_state_.logits_out_gpu = logits_gpu_;
     decode_state_.vocab_size = vocab_size_;
     decode_state_.max_seqlen_k = max_seq_len_;  // conservative upper bound
+    decode_state_.strict_state_buffers = state.pinned;
 
     // Invalidate full-step graph (batch composition changed).
     if (full_step_graph_exec_) {
@@ -829,7 +881,12 @@ void ContinuousGenerationEngine::run_one_decode_step(
 
     // 2. Model forward.
     // Use the inner decode CUDA graph when full-step graph is NOT active.
-    const bool use_inner_graph = use_cuda_graphs_ && !full_step_primed_;
+    const bool has_recurrent_state =
+        decode_state_.recurrent_states && !decode_state_.recurrent_states->empty();
+    const bool has_conv_state =
+        decode_state_.conv_states && !decode_state_.conv_states->empty();
+    const bool is_hybrid_state = has_recurrent_state || has_conv_state;
+    const bool use_inner_graph = use_cuda_graphs_ && !full_step_primed_ && !is_hybrid_state;
     graph_executor.execute_decode_step(
         static_cast<long>(Bp), last_tokens_gpu_, position_ids_gpu_,
         decode_state_, comm, hook, use_inner_graph);
@@ -1709,6 +1766,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.recurrent_state_bytes = &state.compact_recurrent_state_bytes;
     ds.conv_states = &state.compact_conv_states;
     ds.conv_state_bytes = &state.compact_conv_state_bytes;
+    ds.strict_state_buffers = state.pinned;
     // Compute total Q tiles for FlashInfer grid dispatch.
     // CTA_TILE_Q=16 (fixed, matches dispatch in attention_flat_paged.cu).
     constexpr int kCtaTileQ = 16;

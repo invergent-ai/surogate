@@ -318,10 +318,31 @@ class NativeServingRuntime:
         )
         options.min_stack_mb = self._resolve_min_stack_mb(config)
         self._auto_min_stack_mb = int(options.min_stack_mb)
-        self._continuous_min_activation_mb = max(
-            64,
-            int(os.getenv("SUROGATE_SERVE_CONTINUOUS_MIN_ACTIVATION_MB", "256")),
-        )
+        min_activation_env = os.getenv("SUROGATE_SERVE_CONTINUOUS_MIN_ACTIVATION_MB", "").strip()
+        if min_activation_env:
+            try:
+                continuous_min_activation_mb = int(min_activation_env)
+            except ValueError:
+                logger.warning(
+                    "Invalid SUROGATE_SERVE_CONTINUOUS_MIN_ACTIVATION_MB=%r; falling back to auto default.",
+                    min_activation_env,
+                )
+                continuous_min_activation_mb = 0
+        else:
+            continuous_min_activation_mb = 0
+        if continuous_min_activation_mb <= 0:
+            has_chunk_gdr = (
+                '"chunk_gated_delta_rule"' in ir_json
+                or '"gated_delta_rule"' in ir_json
+            )
+            continuous_min_activation_mb = 2048 if has_chunk_gdr else 256
+            if has_chunk_gdr:
+                logger.info(
+                    "Detected gated-delta-rule ops in IR; using higher continuous activation reserve=%d MiB. "
+                    "Override with SUROGATE_SERVE_CONTINUOUS_MIN_ACTIVATION_MB if needed.",
+                    continuous_min_activation_mb,
+                )
+        self._continuous_min_activation_mb = max(64, int(continuous_min_activation_mb))
         logger.info(
             "Serving runtime stack floor=%d MiB lmhead_chunks=%d offload_grads=%s (gpu_memory_utilization=%.2f)",
             int(options.min_stack_mb),
