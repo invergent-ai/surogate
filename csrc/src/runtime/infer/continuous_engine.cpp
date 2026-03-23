@@ -41,6 +41,18 @@ inline bool sanitize_logits_enabled() {
     return cached != 0;
 }
 
+inline bool flat_cuda_graphs_enabled() {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+    const char* env = std::getenv("SUROGATE_SERVE_FLAT_CUDA_GRAPHS");
+    if (!env || env[0] == '\0') {
+        cached = 0;  // default off for stability
+        return false;
+    }
+    cached = (env[0] != '0') ? 1 : 0;
+    return cached != 0;
+}
+
 inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
     const char* env = std::getenv("SUROGATE_ENABLE_FP8_KV_CACHE");
     if (!env || !*env || *env == '0') return false;
@@ -1537,20 +1549,26 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
             "ContinuousGenerationEngine::flat_step: selected tokens exceed flat-step budget");
     }
 
-    // Pad total_tokens to a cached bucket to avoid graph recompilation.
+    // Keep both logical token count and padded execution token count.
+    // Logical count drives flat-token metadata (q_indptr, KV writes, FlashInfer plan).
+    // Padded count drives compiled graph shape (B=1, T=padded_total_tokens).
+    const int actual_total_tokens = total_tokens;
+    int padded_total_tokens = actual_total_tokens;
     const bool has_prefill = has_prefill_slots;
     if (has_prefill) {
         // Round up to next multiple of 64 to reduce unique graph shapes.
-        total_tokens = ((total_tokens + 63) / 64) * 64;
-        total_tokens = std::min(total_tokens, max_batched_tokens_);
+        padded_total_tokens = ((actual_total_tokens + 63) / 64) * 64;
+        padded_total_tokens = std::min(padded_total_tokens, max_batched_tokens_);
     }
-    const bool pure_decode = !has_prefill && (total_tokens == batch_size);
+    const bool pure_decode = !has_prefill && (actual_total_tokens == batch_size);
 
-    // Build host arrays (padded to total_tokens, padding gets token_id=0, pos=0)
-    std::vector<int32_t> h_token_ids(total_tokens, 0);
-    std::vector<int32_t> h_position_ids(total_tokens, 0);
-    std::vector<int32_t> h_token_to_req(total_tokens, 0);
-    std::vector<int32_t> h_kv_write_pos(total_tokens, -1);  // -1 = no KV write for padding
+    // Build host arrays (padded to padded_total_tokens, padding gets token_id=0, pos=0).
+    std::vector<int32_t> h_token_ids(padded_total_tokens, 0);
+    std::vector<int32_t> h_position_ids(padded_total_tokens, 0);
+    std::vector<int32_t> h_token_to_req(padded_total_tokens, 0);
+    // Keep padding write positions non-negative to avoid invalid kernel indexing
+    // if any path accidentally touches padded lanes.
+    std::vector<int32_t> h_kv_write_pos(padded_total_tokens, 0);
     std::vector<int32_t> h_q_indptr(batch_size + 1, 0);
     std::vector<int32_t> h_seq_lens_k(batch_size, 0);
 
@@ -1592,6 +1610,10 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         }
     }
     h_q_indptr[batch_size] = static_cast<int32_t>(tok_offset);
+    if (tok_offset != actual_total_tokens) {
+        throw std::runtime_error(
+            "ContinuousGenerationEngine::flat_step: token packing mismatch in flat batch");
+    }
 
     // Build block table (compact, batch_size rows)
     const auto MPS = static_cast<std::size_t>(max_pages_per_seq_);
@@ -1606,7 +1628,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
 
     // === Phase 4: Upload to GPU ===
     // Allocate GPU buffers from arena (or reuse pre-allocated ones)
-    const auto TT = static_cast<std::size_t>(total_tokens);
+    const auto TT = static_cast<std::size_t>(padded_total_tokens);
     const auto BS = static_cast<std::size_t>(batch_size);
     const std::size_t token_bytes = TT * sizeof(int32_t);
 
@@ -1673,7 +1695,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     DecodeState ds{};
     ds.flat_token_mode = true;
     ds.flat_batch_size = batch_size;
-    ds.flat_total_tokens = total_tokens;
+    ds.flat_total_tokens = actual_total_tokens;
     ds.q_indptr_host = h_q_indptr.data();
     // Compute max Q length across requests (for recurrent op padding).
     {
@@ -1751,7 +1773,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         flat_attention_plan(
             h_q_indptr.data(), h_seq_lens_k.data(), h_block_table.data(),
             max_pages_per_seq_, kPageBlockSize,
-            batch_size, total_tokens,
+            batch_size, actual_total_tokens,
             config_->NumQueryHeads, config_->NumKeyValHeads, config_->head_size(),
             ds.flat_page_indptr_gpu, ds.flat_page_indices_gpu, ds.flat_last_page_len_gpu,
             ds.flat_plan_int_ws_gpu, ds.flat_plan_float_ws_gpu,
@@ -1786,11 +1808,12 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     } else {
         // Mixed prefill+decode: flat-token execution with piecewise CUDA graphs.
         // Non-attention segments are captured/replayed; attention runs eagerly.
+        const bool use_flat_graphs = use_cuda_graphs_ && flat_cuda_graphs_enabled();
         graph_executor.execute_flat_tokens(
-            static_cast<long>(total_tokens),
+            static_cast<long>(padded_total_tokens),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
-            ds, comm, hook, use_cuda_graphs_);
+            ds, comm, hook, use_flat_graphs);
     }
 
     // After the first forward pass, pre-grow all compact state buffers to

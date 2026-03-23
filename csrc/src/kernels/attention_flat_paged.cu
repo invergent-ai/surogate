@@ -165,6 +165,9 @@ __global__ void kv_cache_store_flat_paged_bf16_kernel(
 
     const int req_idx = token_to_req[token_idx];
     const int write_pos = kv_write_pos[token_idx];
+    if (req_idx < 0 || write_pos < 0) {
+        return;
+    }
     const int H_total = Hq + 2 * Hkv;
     const int page_elems = page_block_size * Hkv * Hs;
 
@@ -173,6 +176,9 @@ __global__ void kv_cache_store_flat_paged_bf16_kernel(
     const nv_bfloat16 v_val = qkv_rope[src_base + (Hq + Hkv + head_idx) * Hs + dim_idx];
 
     const int vp = write_pos / page_block_size;
+    if (vp < 0 || vp >= block_table_stride) {
+        return;
+    }
     const int po = write_pos % page_block_size;
     const int pp = block_table[req_idx * block_table_stride + vp];
     const long dst = static_cast<long>(pp) * page_elems + po * Hkv * Hs + head_idx * Hs + dim_idx;
@@ -222,6 +228,13 @@ void flat_attention_plan(
         // Output plan info:
         void* plan_info_opaque,
         cudaStream_t stream) {
+    if (!h_q_indptr || batch_size < 0 || total_q_tokens < 0) {
+        throw std::runtime_error("flat_attention_plan: invalid inputs");
+    }
+    if (h_q_indptr[batch_size] != total_q_tokens) {
+        throw std::runtime_error(
+            "flat_attention_plan: q_indptr total does not match total_q_tokens");
+    }
     auto& plan_info = *reinterpret_cast<flashinfer::PrefillPlanInfo*>(plan_info_opaque);
     // Build page metadata on CPU.
     std::vector<int32_t> h_page_indptr(batch_size + 1, 0);

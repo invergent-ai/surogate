@@ -382,7 +382,14 @@ class NativeServingRuntime:
         configured_cap = max(1, int(self._runtime_batch_size))
         env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
         self._max_batch_sequences = max(1, min(configured_cap, env_cap))
-        prefill_budget_default = max(4096, int(config.max_num_batched_tokens))
+        # Use realized runtime token capacity (after auto-tuning and OOM fallback)
+        # as the default prefill admission budget. This keeps TTFT low by
+        # admitting enough new prompts per loop, especially when runtime
+        # max_batched_tokens was auto-expanded beyond config defaults.
+        prefill_budget_default = max(
+            1,
+            int(self._runtime_batch_size) * int(self._trainer_seq_len),
+        )
         self._prefill_budget_tokens = max(
             1,
             int(
@@ -406,14 +413,15 @@ class NativeServingRuntime:
         )
         self._decode_pending_step_tokens = max(
             1,
-            int(os.getenv("SUROGATE_SERVE_DECODE_PENDING_STEP_TOKENS", "4")),
+            int(os.getenv("SUROGATE_SERVE_DECODE_PENDING_STEP_TOKENS", "1")),
         )
+        decode_busy_default = max(1, min(8, int(self._continuous_step_tokens)))
         self._decode_busy_step_tokens = max(
             1,
             int(
                 os.getenv(
                     "SUROGATE_SERVE_DECODE_BUSY_STEP_TOKENS",
-                    str(self._continuous_step_tokens),
+                    str(decode_busy_default),
                 )
             ),
         )
@@ -484,42 +492,76 @@ class NativeServingRuntime:
     ) -> tuple[int, int, Any]:
         batch_size = max(1, int(batch_size))
         seq_len = max(1, int(seq_len))
-        options.lmhead_chunks = self._resolve_lmhead_chunks(
-            config,
-            effective_seq_len=seq_len,
-            max_num_seqs=batch_size,
-        )
-        logger.info(
-            "Serve runtime init with batch_size=%d seq_len=%d lmhead_chunks=%d",
-            batch_size,
-            seq_len,
-            int(options.lmhead_chunks),
-        )
-        trainer = None
-        try:
-            trainer = _surogate.SurogateTrainer(
-                ngpu=config.gpus,
-                config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.dtype),
-                options=options,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                grad_accum=1,
-                memcpy_all_gather=True,
-                memcpy_send_recv=True,
-                qlora_config=qlora_config,
+
+        # Try the requested runtime seq_len first, then progressively smaller
+        # capacities on CUDA OOM to keep serving online automatically.
+        seq_candidates: list[int] = []
+        for frac in (1.0, 0.75, 0.625, 0.5, 0.375, 0.25):
+            cand = int(seq_len * frac)
+            cand = max(64, (cand // 64) * 64)
+            if cand > 0:
+                seq_candidates.append(cand)
+        seq_candidates.append(64)
+        seq_candidates = sorted(set(seq_candidates), reverse=True)
+
+        last_oom: Optional[RuntimeError] = None
+        for seq_try in seq_candidates:
+            options.lmhead_chunks = self._resolve_lmhead_chunks(
+                config,
+                effective_seq_len=seq_try,
+                max_num_seqs=batch_size,
             )
-            logger.info(f"Importing weights from {model_weights_path}")
-            trainer.import_weights(model_weights_path)
-            return batch_size, seq_len, trainer
-        except RuntimeError as exc:
-            if trainer is not None:
-                del trainer
-            if self._is_cuda_oom_error(exc):
-                raise RuntimeError(
-                    "Serve startup failed due to CUDA OOM "
-                    f"(batch_size={batch_size}, seq_len={seq_len}). "
-                ) from exc
-            raise
+            logger.info(
+                "Serve runtime init with batch_size=%d seq_len=%d lmhead_chunks=%d",
+                batch_size,
+                seq_try,
+                int(options.lmhead_chunks),
+            )
+            trainer = None
+            try:
+                trainer = _surogate.SurogateTrainer(
+                    ngpu=config.gpus,
+                    config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.dtype),
+                    options=options,
+                    batch_size=batch_size,
+                    seq_len=seq_try,
+                    grad_accum=1,
+                    memcpy_all_gather=True,
+                    memcpy_send_recv=True,
+                    qlora_config=qlora_config,
+                )
+                logger.info(f"Importing weights from {model_weights_path}")
+                trainer.import_weights(model_weights_path)
+                if seq_try != seq_len:
+                    logger.warning(
+                        "Serve startup auto-reduced runtime seq_len from %d to %d after CUDA OOM.",
+                        seq_len,
+                        seq_try,
+                    )
+                return batch_size, seq_try, trainer
+            except RuntimeError as exc:
+                if trainer is not None:
+                    del trainer
+                if not self._is_cuda_oom_error(exc):
+                    raise
+                last_oom = exc
+                logger.warning(
+                    "CUDA OOM at startup with batch_size=%d seq_len=%d; retrying with smaller seq_len.",
+                    batch_size,
+                    seq_try,
+                )
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        raise RuntimeError(
+            "Serve startup failed due to CUDA OOM after runtime seq_len fallback attempts "
+            f"(batch_size={batch_size}, requested_seq_len={seq_len}, tried={seq_candidates})."
+        ) from last_oom
 
     @staticmethod
     def _resolve_min_stack_mb(config: ServeConfig) -> int:
@@ -686,7 +728,7 @@ class NativeServingRuntime:
             if auto_tune_tokens and not config.is_explicit("max_num_batched_tokens"):
                 tokens_per_seq = max(
                     64,
-                    int(os.getenv("SUROGATE_SERVE_AUTO_TOKENS_PER_SEQ", "256")),
+                    int(os.getenv("SUROGATE_SERVE_AUTO_TOKENS_PER_SEQ", "512")),
                 )
                 auto_budget = requested_batch_size * tokens_per_seq
                 auto_budget = max(4096, min(32768, auto_budget))
