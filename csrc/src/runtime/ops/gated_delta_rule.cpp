@@ -59,21 +59,121 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
             std::string(op_name) + ": expected q/k/v rank 4 and g/beta rank 3");
     }
 
-    const long B = q.Sizes[0];
-    const long T = q.Sizes[1];
+    // In flat-token mode: tensor shape is [1, total_tokens, H, K].
+    // We need to reshape to [flat_batch_size, max_q_len, H, K] for the
+    // recurrent/chunk kernels to process each sequence independently.
+    const bool flat_mode = mDecodeState && mDecodeState->flat_token_mode
+                        && mDecodeState->flat_batch_size > 1;
+
+    long B = q.Sizes[0];
+    long T = q.Sizes[1];
     const long H = q.Sizes[2];
     const long K = q.Sizes[3];
-    const long V = v.Sizes[3];
+    const long V_dim = v.Sizes[3];
+
+    // Flat-token reshape: scatter [1, total_tokens, ...] → [B_real, max_q_len, ...]
+    // and allocate padded buffers for the kernel.
+    long B_real = B;
+    long T_padded = T;
+    Tensor q_padded, k_padded, v_padded, g_padded, beta_padded;
+    bool did_flat_reshape = false;
+
+    if (flat_mode) {
+        B_real = mDecodeState->flat_batch_size;
+        T_padded = mDecodeState->flat_max_q_len;
+        const auto* indptr = mDecodeState->q_indptr_host;
+        cudaStream_t stream = mRunState.MainStream;
+
+        // Allocate padded buffers
+        q_padded = mRunState.temp_alloc(q.DType, {B_real, T_padded, H, K}, "gdr_q_pad");
+        mTemps.push_back(q_padded);
+        k_padded = mRunState.temp_alloc(k.DType, {B_real, T_padded, H, K}, "gdr_k_pad");
+        mTemps.push_back(k_padded);
+        v_padded = mRunState.temp_alloc(v.DType, {B_real, T_padded, H, V_dim}, "gdr_v_pad");
+        mTemps.push_back(v_padded);
+        g_padded = mRunState.temp_alloc(g_input.DType, {B_real, T_padded, H}, "gdr_g_pad");
+        mTemps.push_back(g_padded);
+        beta_padded = mRunState.temp_alloc(beta.DType, {B_real, T_padded, H}, "gdr_beta_pad");
+        mTemps.push_back(beta_padded);
+
+        // Zero-fill padded buffers (padding tokens must be zero).
+        CUDA_CHECK(cudaMemsetAsync(q_padded.Data, 0, q_padded.nelem() * 2, stream));
+        CUDA_CHECK(cudaMemsetAsync(k_padded.Data, 0, k_padded.nelem() * 2, stream));
+        CUDA_CHECK(cudaMemsetAsync(v_padded.Data, 0, v_padded.nelem() * 2, stream));
+        CUDA_CHECK(cudaMemsetAsync(g_padded.Data, 0, g_padded.nelem() * 2, stream));
+        CUDA_CHECK(cudaMemsetAsync(beta_padded.Data, 0, beta_padded.nelem() * 2, stream));
+
+        // Scatter: copy each request's tokens from flat to padded.
+        const std::size_t elem_bytes_4d = static_cast<std::size_t>(H * K) * 2;  // bf16
+        const std::size_t elem_bytes_v = static_cast<std::size_t>(H * V_dim) * 2;
+        const std::size_t elem_bytes_3d = static_cast<std::size_t>(H) * 2;
+
+        for (long i = 0; i < B_real; ++i) {
+            const int q_start = indptr[i];
+            const int q_len = indptr[i + 1] - indptr[i];
+            if (q_len <= 0) continue;
+
+            // q: [total_tokens, H, K] → [B_real, T_padded, H, K]
+            const auto src_off_4d = static_cast<std::size_t>(q_start) * elem_bytes_4d;
+            const auto dst_off_4d = static_cast<std::size_t>(i) * static_cast<std::size_t>(T_padded) * elem_bytes_4d;
+            const auto copy_bytes_4d = static_cast<std::size_t>(q_len) * elem_bytes_4d;
+            CUDA_CHECK(cudaMemcpyAsync(
+                reinterpret_cast<char*>(q_padded.Data) + dst_off_4d,
+                reinterpret_cast<const char*>(q.Data) + src_off_4d,
+                copy_bytes_4d, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                reinterpret_cast<char*>(k_padded.Data) + dst_off_4d,
+                reinterpret_cast<const char*>(k.Data) + src_off_4d,
+                copy_bytes_4d, cudaMemcpyDeviceToDevice, stream));
+
+            // v: [total_tokens, H, V_dim]
+            const auto src_off_v = static_cast<std::size_t>(q_start) * elem_bytes_v;
+            const auto dst_off_v = static_cast<std::size_t>(i) * static_cast<std::size_t>(T_padded) * elem_bytes_v;
+            CUDA_CHECK(cudaMemcpyAsync(
+                reinterpret_cast<char*>(v_padded.Data) + dst_off_v,
+                reinterpret_cast<const char*>(v.Data) + src_off_v,
+                static_cast<std::size_t>(q_len) * elem_bytes_v, cudaMemcpyDeviceToDevice, stream));
+
+            // g, beta: [total_tokens, H]
+            const auto src_off_3d = static_cast<std::size_t>(q_start) * elem_bytes_3d;
+            const auto dst_off_3d = static_cast<std::size_t>(i) * static_cast<std::size_t>(T_padded) * elem_bytes_3d;
+            const auto copy_bytes_3d = static_cast<std::size_t>(q_len) * elem_bytes_3d;
+            CUDA_CHECK(cudaMemcpyAsync(
+                reinterpret_cast<char*>(g_padded.Data) + dst_off_3d,
+                reinterpret_cast<const char*>(g_input.Data) + src_off_3d,
+                copy_bytes_3d, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                reinterpret_cast<char*>(beta_padded.Data) + dst_off_3d,
+                reinterpret_cast<const char*>(beta.Data) + src_off_3d,
+                copy_bytes_3d, cudaMemcpyDeviceToDevice, stream));
+        }
+
+        // Override B and T for the rest of the function.
+        B = B_real;
+        T = T_padded;
+        did_flat_reshape = true;
+    }
+
+    // Use padded tensors if we reshaped, otherwise use originals.
+    Tensor& q_eff_tensor = did_flat_reshape ? q_padded : q;
+    Tensor& k_eff_tensor = did_flat_reshape ? k_padded : k;
+    Tensor& v_eff_tensor = did_flat_reshape ? v_padded : v;
+    Tensor& g_eff_tensor = did_flat_reshape ? g_padded : g_input;
+    Tensor& beta_eff_tensor = did_flat_reshape ? beta_padded : beta;
+
+    const long V = V_dim;  // alias for the rest of the function
     const std::size_t recurrent_state_bytes =
         static_cast<std::size_t>(B * H * K * V) * sizeof(nv_bfloat16);
     const std::size_t recurrent_state_per_seq_bytes =
         recurrent_state_bytes / static_cast<std::size_t>(std::max<long>(1, B));
 
-    if (!tensor_shape_matches(k, B, T, H, K)) {
-        throw std::runtime_error(std::string(op_name) + ": k shape must match q");
-    }
-    if (v.Sizes[0] != B || v.Sizes[1] != T || v.Sizes[2] != H) {
-        throw std::runtime_error(std::string(op_name) + ": v must share B/T/H with q");
+    if (!did_flat_reshape) {
+        if (!tensor_shape_matches(k, B, T, H, K)) {
+            throw std::runtime_error(std::string(op_name) + ": k shape must match q");
+        }
+        if (v.Sizes[0] != B || v.Sizes[1] != T || v.Sizes[2] != H) {
+            throw std::runtime_error(std::string(op_name) + ": v must share B/T/H with q");
+        }
     }
     const bool decode_recurrent_mode = mDecodeState && mDecodeState->recurrent_states;
     const bool strict_recurrent_state =
@@ -176,22 +276,22 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     // Keep this in front of both recurrent and chunk paths so decode parity
     // matches full-chunk execution.
     const bool use_l2norm = op.attrs.use_qk_l2norm_in_kernel;
-    void* q_eff = q.Data;
-    void* k_eff = k.Data;
+    void* q_eff = q_eff_tensor.Data;
+    void* k_eff = k_eff_tensor.Data;
     if (use_l2norm) {
         const int NT_l2 = cdiv(static_cast<int>(T), BT);
-        Tensor q_norm = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_q_norm");
+        Tensor q_norm = mRunState.temp_alloc(q_eff_tensor.DType, {B, T, H, K}, "gated_delta_rule_q_norm");
         mTemps.push_back(q_norm);
         Tensor q_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_q_rstd");
         mTemps.push_back(q_rstd);
-        Tensor k_norm = mRunState.temp_alloc(k.DType, {B, T, H, K}, "gated_delta_rule_k_norm");
+        Tensor k_norm = mRunState.temp_alloc(k_eff_tensor.DType, {B, T, H, K}, "gated_delta_rule_k_norm");
         mTemps.push_back(k_norm);
         Tensor k_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_k_rstd");
         mTemps.push_back(k_rstd);
 
         // L2 norm Q: (x, y, rstd, T)
         {
-            void* x = q.Data; void* y = q_norm.Data; void* r = q_rstd.Data;
+            void* x = q_eff_tensor.Data; void* y = q_norm.Data; void* r = q_rstd.Data;
             int32_t T_val = static_cast<int32_t>(T);
             void* args[] = { &x, &y, &r, &T_val };
             mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT_l2), static_cast<unsigned>(BH), 1},
@@ -199,7 +299,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         }
         // L2 norm K: same kernel (D=K)
         {
-            void* x = k.Data; void* y = k_norm.Data; void* r = k_rstd.Data;
+            void* x = k_eff_tensor.Data; void* y = k_norm.Data; void* r = k_rstd.Data;
             int32_t T_val = static_cast<int32_t>(T);
             void* args[] = { &x, &y, &r, &T_val };
             mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT_l2), static_cast<unsigned>(BH), 1},
@@ -230,8 +330,11 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         }
         void* ht_ptr = final_state_ptr->Data;
         int32_t T_val = static_cast<int32_t>(T);
+        void* v_data = v_eff_tensor.Data;
+        void* g_data = g_eff_tensor.Data;
+        void* beta_data = beta_eff_tensor.Data;
         void* args[] = {
-            &q_eff, &k_eff, &v.Data, &g_input.Data, &beta.Data,
+            &q_eff, &k_eff, &v_data, &g_data, &beta_data,
             &out_ptr->Data, &h0_ptr, &ht_ptr, &scale, &T_val
         };
         mGdrKernels.recurrent_fwd(
@@ -330,7 +433,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
 
     // 1. cumsum_fwd: (g_input, g_cum, T) grid=(NT, B*H)
     {
-        void* g_in_ptr = g_input.Data;
+        void* g_in_ptr = g_eff_tensor.Data;
         void* g_out_ptr = g_cum.Data;
         int32_t T_val = static_cast<int32_t>(T);
         void* args[] = { &g_in_ptr, &g_out_ptr, &T_val };
@@ -341,7 +444,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     // 2. kkt_fwd: (k, g_cum, beta, A, T) grid=(NT, B*H)
     {
         void* g_ptr = g_cum.Data;
-        void* beta_ptr = beta.Data;
+        void* beta_ptr = beta_eff_tensor.Data;
         void* A_ptr = A.Data;
         int32_t T_val = static_cast<int32_t>(T);
         void* args[] = { &k_eff, &g_ptr, &beta_ptr, &A_ptr, &T_val };
@@ -361,8 +464,8 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
 
     // 4. wy_fwd: (k, v, beta, w, u, Ai, g_cum, T) grid=(NT, B*H)
     {
-        void* v_ptr = v.Data;
-        void* beta_ptr = beta.Data;
+        void* v_ptr = v_eff_tensor.Data;
+        void* beta_ptr = beta_eff_tensor.Data;
         void* w_ptr = w.Data;
         void* u_ptr = u.Data;
         void* Ai_ptr = Ai.Data;
@@ -405,6 +508,31 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
 
     CUDA_CHECK(cudaGetLastError());
 
+    // Flat-token mode: gather output from padded [B, T_padded, H, V] back to
+    // flat [1, total_tokens, H, V] for the rest of the graph.
+    if (did_flat_reshape) {
+        const auto* indptr = mDecodeState->q_indptr_host;
+        const int total_tokens = mDecodeState->flat_total_tokens;
+        // Allocate the flat output tensor matching the original graph shape.
+        Tensor flat_out = mRunState.temp_alloc(out_ptr->DType,
+            {1, static_cast<long>(total_tokens), H, V}, "gdr_flat_out");
+        mTemps.push_back(flat_out);
+        const std::size_t elem_bytes = static_cast<std::size_t>(H * V) * 2;  // bf16
+        for (long i = 0; i < B_real; ++i) {
+            const int q_start = indptr[i];
+            const int q_len = indptr[i + 1] - indptr[i];
+            if (q_len <= 0) continue;
+            const auto src_off = static_cast<std::size_t>(i) * static_cast<std::size_t>(T_padded) * elem_bytes;
+            const auto dst_off = static_cast<std::size_t>(q_start) * elem_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(
+                reinterpret_cast<char*>(flat_out.Data) + dst_off,
+                reinterpret_cast<const char*>(out_ptr->Data) + src_off,
+                static_cast<std::size_t>(q_len) * elem_bytes,
+                cudaMemcpyDeviceToDevice, stream));
+        }
+        out_ptr = &mTemps.back();
+    }
+
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         store_tensor(op.outputs[0], *out_ptr);
     }
@@ -418,6 +546,30 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         auto& states = *mDecodeState->recurrent_states;
         auto it_state = states.find(layer_idx_for_state);
         void* saved = (it_state != states.end()) ? it_state->second : nullptr;
+
+        // Reallocate if the buffer is too small for the current batch.
+        // The saved buffer was sized for a previous B; if B grew we must reallocate.
+        if (saved) {
+            // Check current buffer capacity vs required size.
+            // The saved buffer holds B_old * per_seq_bytes. We need B * per_seq_bytes.
+            // Track capacity via recurrent_state_bytes map (stores per_seq not total).
+            // We need to compare total: saved_capacity vs recurrent_state_bytes.
+            // Use a simple heuristic: if the compact capacity is tracked, verify it.
+            // Otherwise, always reallocate to be safe.
+            auto& cap_map = *mDecodeState->recurrent_state_bytes;
+            auto it_cap = cap_map.find(layer_idx_for_state);
+            // The map stores per-seq bytes but we need B * per_seq.
+            // We must also track B. Since we can't, just reallocate every time B > 1
+            // and the buffer might be undersized. A more robust approach: use
+            // a capacity map that stores total bytes.
+            // For now, free+realloc when not strict (acceptable overhead).
+            if (!strict_recurrent_state) {
+                CUDA_CHECK(cudaFree(saved));
+                saved = nullptr;
+                states[layer_idx_for_state] = nullptr;
+            }
+        }
+
         if (!saved) {
             if (strict_recurrent_state) {
                 throw std::runtime_error(
@@ -425,7 +577,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
                     + ": strict decode recurrent state missing for layer "
                     + std::to_string(layer_idx_for_state));
             }
-            // First time: allocate persistent GPU buffer (NOT from stack)
+            // Allocate persistent GPU buffer for B sequences.
             CUDA_CHECK(cudaMalloc(&saved, recurrent_state_bytes));
             states[layer_idx_for_state] = saved;
         }

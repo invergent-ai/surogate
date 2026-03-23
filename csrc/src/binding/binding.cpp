@@ -1579,10 +1579,10 @@ NB_MODULE(_surogate, m) {
                 std::uint64_t engine_id,
                 const std::vector<std::vector<int32_t>>& new_prompts,
                 int max_gen_len, float temperature, int32_t eos_token_id,
-                int top_k, float top_p, float min_p) {
+                int top_k, float top_p, float min_p, int prefill_chunk_size) {
             auto r = trainer->engine_flat_step(
                 engine_id, new_prompts, max_gen_len, temperature, eos_token_id,
-                top_k, top_p, min_p);
+                top_k, top_p, min_p, prefill_chunk_size);
             return nb::make_tuple(
                 r.new_slot_ids, r.active_slot_ids, r.sampled_tokens,
                 r.finished, r.completion_lens);
@@ -1595,6 +1595,7 @@ NB_MODULE(_surogate, m) {
         nb::arg("top_k") = 0,
         nb::arg("top_p") = 1.0f,
         nb::arg("min_p") = 0.0f,
+        nb::arg("prefill_chunk_size") = 256,
         "Flat-token step: prefill new prompts + decode active sequences in one forward pass.\n"
         "Returns (new_slot_ids, active_slot_ids, sampled_tokens, finished, completion_lens).")
         .def("engine_release_slot", &MultiGPUPyTrainer::engine_release_slot,

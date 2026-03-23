@@ -1994,6 +1994,32 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
 
     DslRunState& rs = mRunState;
     const std::size_t token_bytes = static_cast<std::size_t>(total_tokens) * sizeof(std::int32_t);
+    const std::size_t inputs_capacity = rs.Inputs.bytes();
+    if (token_bytes > inputs_capacity) {
+        throw std::runtime_error(
+            "GraphExecutor::execute_flat_tokens: token_ids exceed Inputs capacity (token_bytes="
+            + std::to_string(token_bytes)
+            + ", inputs_capacity=" + std::to_string(inputs_capacity) + ")");
+    }
+    if (rs.PositionIDs.Rank == 3 && rs.PositionIDs.Sizes[0] == 3) {
+        const std::size_t plane_elems =
+            static_cast<std::size_t>(rs.PositionIDs.Sizes[1]) * static_cast<std::size_t>(rs.PositionIDs.Sizes[2]);
+        const std::size_t plane_bytes = plane_elems * sizeof(std::int32_t);
+        if (token_bytes > plane_bytes) {
+            throw std::runtime_error(
+                "GraphExecutor::execute_flat_tokens: position_ids exceed mRoPE plane capacity (token_bytes="
+                + std::to_string(token_bytes)
+                + ", plane_bytes=" + std::to_string(plane_bytes) + ")");
+        }
+    } else {
+        const std::size_t position_capacity = rs.PositionIDs.bytes();
+        if (token_bytes > position_capacity) {
+            throw std::runtime_error(
+                "GraphExecutor::execute_flat_tokens: position_ids exceed PositionIDs capacity (token_bytes="
+                + std::to_string(token_bytes)
+                + ", position_capacity=" + std::to_string(position_capacity) + ")");
+        }
+    }
 
     const bool hook_active = hook && *hook;
     modules::ForwardHookRuntimeContext hook_runtime_ctx{};
@@ -2020,15 +2046,16 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
     if (need_fp4_prime) prime_fp4_weight_cache({}, false);
     if (need_fp8_prime || need_fp4_prime) mWeightCachesPrimed = true;
 
-    // Copy token IDs and position IDs to device (D2D — already on GPU).
-    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_gpu, token_bytes,
-                               cudaMemcpyDeviceToDevice, rs.MainStream));
-    // Position IDs: D2D copy. For mRoPE models, execute_prefill's
-    // copy_position_ids_to_device handles 3-plane replication from CPU.
-    // Here we have GPU data — just copy flat [total_tokens] to the first plane.
-    // The mRoPE dispatch reads pos_planes from the tensor rank and handles it.
-    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_gpu, token_bytes,
-                               cudaMemcpyDeviceToDevice, rs.MainStream));
+    // Copy token IDs and position IDs to device if they are not already bound.
+    if (token_ids_gpu != reinterpret_cast<const std::int32_t*>(rs.Inputs.Data)) {
+        CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_gpu, token_bytes,
+                                   cudaMemcpyDefault, rs.MainStream));
+    }
+    // For mRoPE [3, B, T], copying flat [total_tokens] into plane 0 is sufficient.
+    if (position_ids_gpu != reinterpret_cast<const std::int32_t*>(rs.PositionIDs.Data)) {
+        CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_gpu, token_bytes,
+                                   cudaMemcpyDefault, rs.MainStream));
+    }
 
     // Initialize targets to -100 (masked).
     if (rs.Targets.Data) {

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -84,16 +85,76 @@ inline int resolve_prefill_chunk_size(
     return std::max(1, chunk);
 }
 
+inline bool is_valid_token_id(const int32_t tok, const int vocab_size) {
+    return tok >= 0 && tok < vocab_size;
+}
+
+inline int32_t resolve_fallback_token_id(const int32_t preferred, const int vocab_size) {
+    if (is_valid_token_id(preferred, vocab_size)) {
+        return preferred;
+    }
+    return 0;
+}
+
+inline void try_free_device_buffer(void*& ptr) {
+    if (!ptr) return;
+    const cudaError_t free_st = cudaFree(ptr);
+    if (free_st != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+    ptr = nullptr;
+}
+
 inline void ensure_device_buffer_capacity(
         void*& ptr,
         std::size_t required_bytes,
-        std::size_t& capacity_bytes) {
+        std::size_t& capacity_bytes,
+        int expected_device_id) {
+    auto is_valid_device_ptr = [expected_device_id](void* p) -> bool {
+        if (!p) return false;
+        int current_device = -1;
+        if (cudaGetDevice(&current_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            current_device = -1;
+        }
+        cudaPointerAttributes attrs{};
+        const cudaError_t st = cudaPointerGetAttributes(&attrs, p);
+        if (st != cudaSuccess) {
+            (void)cudaGetLastError();  // clear "invalid value" from pointer query
+            return false;
+        }
+#if CUDART_VERSION >= 10000
+        if (attrs.type == cudaMemoryTypeManaged) {
+            return true;
+        }
+        if (attrs.type != cudaMemoryTypeDevice) {
+            return false;
+        }
+        if (expected_device_id >= 0 && attrs.device >= 0 && attrs.device != expected_device_id) {
+            return false;
+        }
+        if (current_device >= 0 && attrs.device >= 0 && attrs.device != current_device) {
+            return false;
+        }
+        return true;
+#else
+        if (attrs.memoryType != cudaMemoryTypeDevice) {
+            return false;
+        }
+        return true;
+#endif
+    };
+
     if (ptr && capacity_bytes >= required_bytes) {
-        return;
+        if (is_valid_device_ptr(ptr)) {
+            return;
+        }
+        // Stale pointer: drop cached metadata and reallocate below.
+        ptr = nullptr;
+        capacity_bytes = 0;
     }
     if (ptr) {
-        CUDA_CHECK(cudaFree(ptr));
-        ptr = nullptr;
+        try_free_device_buffer(ptr);
         capacity_bytes = 0;
     }
     if (required_bytes == 0) {
@@ -312,7 +373,8 @@ void build_compact_states_from_slots_impl(
                 continue;
             }
             if (it->second) {
-                CUDA_CHECK(cudaFree(it->second));
+                void* stale_ptr = it->second;
+                try_free_device_buffer(stale_ptr);
             }
             compact_state_bytes.erase(layer_idx);
             compact_state_capacity_bytes.erase(layer_idx);
@@ -322,11 +384,39 @@ void build_compact_states_from_slots_impl(
         for (const auto& [layer_idx, per_seq_bytes] : layer_per_seq_bytes) {
             void*& dst_base = compact_states[layer_idx];
             std::size_t& cap_bytes = compact_state_capacity_bytes[layer_idx];
+            if (Bp > 0 && per_seq_bytes > (std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(Bp))) {
+                throw std::runtime_error(
+                    "ContinuousGenerationEngine: compact state size overflow for layer "
+                    + std::to_string(layer_idx));
+            }
             const std::size_t required_bytes =
                 static_cast<std::size_t>(Bp) * per_seq_bytes;
-            ensure_device_buffer_capacity(dst_base, required_bytes, cap_bytes);
+            ensure_device_buffer_capacity(
+                dst_base,
+                required_bytes,
+                cap_bytes,
+                run_state ? run_state->DeviceId : -1);
             compact_state_bytes[layer_idx] = per_seq_bytes;
-            CUDA_CHECK(cudaMemsetAsync(dst_base, 0, required_bytes, stream));
+            cudaError_t memset_st = cudaMemsetAsync(dst_base, 0, required_bytes, stream);
+            if (memset_st == cudaErrorInvalidValue) {
+                (void)cudaGetLastError();
+                // Cached pointer likely stale/cross-device. Drop and reallocate once.
+                dst_base = nullptr;
+                cap_bytes = 0;
+                ensure_device_buffer_capacity(
+                    dst_base,
+                    required_bytes,
+                    cap_bytes,
+                    run_state ? run_state->DeviceId : -1);
+                memset_st = cudaMemsetAsync(dst_base, 0, required_bytes, stream);
+            }
+            if (memset_st != cudaSuccess) {
+                throw std::runtime_error(
+                    "ContinuousGenerationEngine: compact state memset failed for layer "
+                    + std::to_string(layer_idx)
+                    + ", bytes=" + std::to_string(required_bytes)
+                    + ", error=" + std::string(cudaGetErrorString(memset_st)));
+            }
         }
 
         for (int i = 0; i < B; ++i) {
@@ -431,10 +521,14 @@ void ContinuousGenerationEngine::init(
         return arena.allocate(bytes, name);
     };
 
-    last_tokens_gpu_ = reinterpret_cast<int32_t*>(alloc(S * sizeof(int32_t), "ce_last_tokens"));
+    // Size token_ids and position_ids for max(slots, batched_tokens) since
+    // flat_step uploads total_tokens which can exceed max_slots during prefill.
+    const auto token_buf_size = std::max(S, static_cast<std::size_t>(
+        run_state.Inputs.Sizes[0] * (run_state.Inputs.Rank >= 2 ? run_state.Inputs.Sizes[1] : 1)));
+    last_tokens_gpu_ = reinterpret_cast<int32_t*>(alloc(token_buf_size * sizeof(int32_t), "ce_last_tokens"));
     seq_lens_gpu_ = reinterpret_cast<int*>(alloc(S * sizeof(int), "ce_seq_lens"));
     finished_gpu_ = reinterpret_cast<int*>(alloc(S * sizeof(int), "ce_finished"));
-    position_ids_gpu_ = reinterpret_cast<int32_t*>(alloc(S * sizeof(int32_t), "ce_pos_ids"));
+    position_ids_gpu_ = reinterpret_cast<int32_t*>(alloc(token_buf_size * sizeof(int32_t), "ce_pos_ids"));
     cu_seqlens_q_gpu_ = reinterpret_cast<int32_t*>(alloc((S + 1) * sizeof(int32_t), "ce_cu_q"));
     seqused_k_gpu_ = reinterpret_cast<int32_t*>(alloc(S * sizeof(int32_t), "ce_seqused_k"));
     block_table_gpu_ = reinterpret_cast<int*>(alloc(S * MPS * sizeof(int), "ce_block_table"));
@@ -1288,15 +1382,11 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     if (!initialized_) return result;
     cudaStream_t stream = run_state_->MainStream;
     auto& state = ensure_engine_state_storage(this, max_slots_);
+    const int V = vocab_size_;
+    fallback_token_id_ = resolve_fallback_token_id(config.eos_token_id, V);
 
     // === Phase 1: Allocate slots + pages for new prompts ===
     result.new_slot_ids.resize(new_prompts.size(), -1);
-    struct NewSeq {
-        int slot_id;
-        int prompt_len;       // full prompt length
-        int prefill_len;      // prompt_len - 1 (tokens to prefill)
-    };
-    std::vector<NewSeq> new_seqs;
     for (std::size_t i = 0; i < new_prompts.size(); ++i) {
         const auto& prompt = new_prompts[i];
         const int plen = static_cast<int>(prompt.size());
@@ -1319,12 +1409,13 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         slot.min_p = config.min_p;
         slot.page_ids = page_pool_.allocate_pages(pages_needed);
         slot.seq_len = 0;
-        slot.last_token = prompt.back();
+        slot.last_token = 0;
         slot.generated_count = 0;
         slot.finished = false;
+        slot.prompt = prompt;           // store full prompt for chunked prefill
+        slot.prefill_progress = 0;      // nothing prefilled yet
 
         result.new_slot_ids[i] = sid;
-        new_seqs.push_back({sid, plen, plen - 1});
     }
 
     // === Phase 2: Collect all active slots ===
@@ -1343,9 +1434,13 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         state, run_state_, batch_size, batch_size, active_sids, max_slots_);
 
     // === Phase 3: Build flat token arrays ===
-    // For each request: prefill tokens + 1 decode token (or just 1 decode token for existing)
-    // New request contributes prompt_len tokens (prefill_len + 1 decode token = prompt_len)
-    // Existing request contributes 1 decode token
+    // Each slot contributes tokens based on its state:
+    //   - Prefilling slot: up to prefill_chunk_size tokens from the prompt
+    //   - Decode slot: 1 token (last_token)
+    // This implements chunked prefill: new prompts are processed incrementally
+    // across multiple flat_steps instead of all-at-once.
+
+    const int chunk_size = config.prefill_chunk_size;
 
     // Compute per-request Q lengths and total tokens
     std::vector<int> q_lens(batch_size, 0);
@@ -1353,21 +1448,37 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     for (int i = 0; i < batch_size; ++i) {
         const int sid = active_sids[i];
         const auto& slot = slots_[static_cast<std::size_t>(sid)];
-        bool is_new = false;
-        for (const auto& ns : new_seqs) {
-            if (ns.slot_id == sid) { is_new = true; q_lens[i] = ns.prompt_len; break; }
-        }
-        if (!is_new) {
+        if (slot.prefilling()) {
+            // Chunked prefill: emit up to chunk_size tokens
+            const int remaining = static_cast<int>(slot.prompt.size()) - slot.prefill_progress;
+            q_lens[i] = std::min(remaining, chunk_size);
+        } else {
             q_lens[i] = 1;  // decode: single token
         }
         total_tokens += q_lens[i];
     }
 
+    // Clamp total_tokens to max_batched_tokens to prevent buffer overflow.
+    if (total_tokens > max_batched_tokens_) {
+        // Trim prefill chunks to fit within the budget.
+        int excess = total_tokens - max_batched_tokens_;
+        for (int i = batch_size - 1; i >= 0 && excess > 0; --i) {
+            const int sid = active_sids[i];
+            const auto& slot = slots_[static_cast<std::size_t>(sid)];
+            if (slot.prefilling() && q_lens[i] > 1) {
+                const int reduce = std::min(q_lens[i] - 1, excess);
+                q_lens[i] -= reduce;
+                excess -= reduce;
+                total_tokens -= reduce;
+            }
+        }
+    }
+
     // Build host arrays
-    std::vector<int32_t> h_token_ids(total_tokens);
-    std::vector<int32_t> h_position_ids(total_tokens);
-    std::vector<int32_t> h_token_to_req(total_tokens);
-    std::vector<int32_t> h_kv_write_pos(total_tokens);
+    std::vector<int32_t> h_token_ids(total_tokens, 0);
+    std::vector<int32_t> h_position_ids(total_tokens, 0);
+    std::vector<int32_t> h_token_to_req(total_tokens, 0);
+    std::vector<int32_t> h_kv_write_pos(total_tokens, 0);
     std::vector<int32_t> h_q_indptr(batch_size + 1, 0);
     std::vector<int32_t> h_seq_lens_k(batch_size, 0);
 
@@ -1375,33 +1486,32 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     for (int i = 0; i < batch_size; ++i) {
         h_q_indptr[i] = static_cast<int32_t>(tok_offset);
         const int sid = active_sids[i];
-        const auto& slot = slots_[static_cast<std::size_t>(sid)];
+        auto& slot = slots_[static_cast<std::size_t>(sid)];
 
-        // Find if this is a new sequence
-        const std::vector<int32_t>* prompt_ptr = nullptr;
-        for (std::size_t ni = 0; ni < new_prompts.size(); ++ni) {
-            if (result.new_slot_ids[ni] == sid) {
-                prompt_ptr = &new_prompts[ni];
-                break;
-            }
-        }
-
-        if (prompt_ptr) {
-            // New request: all prompt tokens (prefill + last token for decode)
-            const auto& prompt = *prompt_ptr;
-            const int plen = static_cast<int>(prompt.size());
-            for (int t = 0; t < plen; ++t) {
-                h_token_ids[tok_offset + t] = prompt[t];
-                h_position_ids[tok_offset + t] = t;
+        if (slot.prefilling()) {
+            // Chunked prefill: emit tokens [prefill_progress .. prefill_progress + q_len)
+            const int start = slot.prefill_progress;
+            const int q_len = q_lens[i];
+            for (int t = 0; t < q_len; ++t) {
+                const int32_t tok = slot.prompt[start + t];
+                h_token_ids[tok_offset + t] = is_valid_token_id(tok, V)
+                    ? tok
+                    : fallback_token_id_;
+                h_position_ids[tok_offset + t] = start + t;
                 h_token_to_req[tok_offset + t] = static_cast<int32_t>(i);
-                h_kv_write_pos[tok_offset + t] = t;  // write at positions 0..plen-1
+                h_kv_write_pos[tok_offset + t] = start + t;
             }
-            // After this forward pass, seq_len = plen (all tokens written to KV)
-            h_seq_lens_k[i] = static_cast<int32_t>(plen);
-            tok_offset += plen;
+            // seq_lens_k = tokens already in KV + tokens we're adding now
+            h_seq_lens_k[i] = static_cast<int32_t>(slot.seq_len + q_len);
+            tok_offset += q_len;
         } else {
-            // Existing request: 1 decode token
-            h_token_ids[tok_offset] = slot.last_token;
+            // Decode: 1 token
+            int32_t decode_tok = slot.last_token;
+            if (!is_valid_token_id(decode_tok, V)) {
+                decode_tok = fallback_token_id_;
+                slot.last_token = decode_tok;
+            }
+            h_token_ids[tok_offset] = decode_tok;
             h_position_ids[tok_offset] = static_cast<int32_t>(slot.seq_len);
             h_token_to_req[tok_offset] = static_cast<int32_t>(i);
             h_kv_write_pos[tok_offset] = static_cast<int32_t>(slot.seq_len);
@@ -1426,12 +1536,48 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // Allocate GPU buffers from arena (or reuse pre-allocated ones)
     const auto TT = static_cast<std::size_t>(total_tokens);
     const auto BS = static_cast<std::size_t>(batch_size);
+    const std::size_t token_bytes = TT * sizeof(int32_t);
 
-    // Use pre-allocated buffers where possible, temp_alloc for variable-size
-    CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu_, h_token_ids.data(),
-        TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(position_ids_gpu_, h_position_ids.data(),
-        TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // Upload flat token/position IDs directly into run-state inputs consumed by
+    // GraphExecutor::execute_flat_tokens. This avoids an extra D2D staging copy.
+    if (!run_state_->Inputs.Data || token_bytes > run_state_->Inputs.bytes()) {
+        throw std::runtime_error("ContinuousGenerationEngine::flat_step: input token buffer exceeds run-state capacity");
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        run_state_->Inputs.Data,
+        h_token_ids.data(),
+        token_bytes,
+        cudaMemcpyHostToDevice,
+        stream));
+
+    if (!run_state_->PositionIDs.Data) {
+        throw std::runtime_error("ContinuousGenerationEngine::flat_step: position_ids buffer is null");
+    }
+    if (run_state_->PositionIDs.Rank == 3 && run_state_->PositionIDs.Sizes[0] == 3) {
+        const std::size_t plane_elems =
+            static_cast<std::size_t>(run_state_->PositionIDs.Sizes[1]) *
+            static_cast<std::size_t>(run_state_->PositionIDs.Sizes[2]);
+        const std::size_t plane_bytes = plane_elems * sizeof(int32_t);
+        if (token_bytes > plane_bytes) {
+            throw std::runtime_error("ContinuousGenerationEngine::flat_step: position_ids exceed mRoPE plane capacity");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            run_state_->PositionIDs.Data,
+            h_position_ids.data(),
+            token_bytes,
+            cudaMemcpyHostToDevice,
+            stream));
+    } else {
+        if (token_bytes > run_state_->PositionIDs.bytes()) {
+            throw std::runtime_error("ContinuousGenerationEngine::flat_step: position_ids exceed run-state capacity");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            run_state_->PositionIDs.Data,
+            h_position_ids.data(),
+            token_bytes,
+            cudaMemcpyHostToDevice,
+            stream));
+    }
 
     // Use pre-allocated flat-step buffers (no per-step cudaMallocAsync).
     int32_t* d_token_to_req = flat_token_to_req_gpu_;
@@ -1456,6 +1602,15 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.flat_token_mode = true;
     ds.flat_batch_size = batch_size;
     ds.flat_total_tokens = total_tokens;
+    ds.q_indptr_host = h_q_indptr.data();
+    // Compute max Q length across requests (for recurrent op padding).
+    {
+        int mql = 0;
+        for (int i = 0; i < batch_size; ++i) {
+            mql = std::max(mql, static_cast<int>(h_q_indptr[i + 1] - h_q_indptr[i]));
+        }
+        ds.flat_max_q_len = mql;
+    }
     ds.recurrent_states = &state.compact_recurrent_states;
     ds.recurrent_state_bytes = &state.compact_recurrent_state_bytes;
     ds.conv_states = &state.compact_conv_states;
@@ -1510,7 +1665,6 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.head_dim = config_->head_size();
     // With the gather optimization in the LM head, logits are only computed for
     // [batch_size, V] (not total_tokens). Use the pre-allocated logits buffer.
-    const int V = vocab_size_;
     ds.logits_out_gpu = logits_gpu_;  // pre-allocated [max_slots * V]
     ds.vocab_size = V;
 
@@ -1536,8 +1690,8 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // === Phase 6: Execute flat-token forward pass ===
     graph_executor.execute_flat_tokens(
         static_cast<long>(total_tokens),
-        last_tokens_gpu_,       // token_ids on GPU
-        position_ids_gpu_,      // position_ids on GPU
+        reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
+        reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
         ds, comm, hook);
 
     // Persist decode-updated recurrent/conv compact state back into slot-local storage.
@@ -1548,6 +1702,9 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // With the LM head gather optimization, logits_gpu_ already contains
     // [batch_size, V] logits (gathered from last-token hidden states).
     float* compact_logits = logits_gpu_;
+    if (sanitize_logits_enabled()) {
+        sampling_sanitize_logits(compact_logits, batch_size, V, stream);
+    }
 
     // Sample from compact logits
     if (config.temperature <= 0.0f) {
@@ -1579,6 +1736,8 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
                 false, 42, 0, stream);
         }
     }
+    sampling_sanitize_token_ids(sampled_tokens_gpu_, batch_size, V,
+        fallback_token_id_, nullptr, stream);
 
     // D2H readback
     std::vector<int32_t> h_sampled(BS);
@@ -1597,26 +1756,41 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     for (int i = 0; i < batch_size; ++i) {
         const int sid = active_sids[i];
         auto& slot = slots_[static_cast<std::size_t>(sid)];
-        const int32_t tok = h_sampled[i];
+        int32_t tok = h_sampled[i];
+        if (!is_valid_token_id(tok, V)) {
+            tok = fallback_token_id_;
+        }
 
-        // For new sequences: set seq_len to prompt_len (KV fully populated)
-        bool is_new = false;
-        for (const auto& ns : new_seqs) {
-            if (ns.slot_id == sid) {
-                slot.seq_len = ns.prompt_len;  // all prefill tokens now in KV
-                is_new = true;
-                break;
+        if (slot.prefilling()) {
+            // Chunked prefill: advance progress, update seq_len.
+            slot.prefill_progress += q_lens[i];
+            slot.seq_len = slot.prefill_progress;
+
+            if (!slot.prefilling()) {
+                // Prefill just completed! The sampled token is the first real
+                // generated token. Record it.
+                slot.last_token = tok;
+                slot.generated_count = 1;
+                slot.prompt.clear();  // free prompt memory
+                slot.prompt.shrink_to_fit();
+
+                if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
+                    slot.finished = true;
+                }
+            } else {
+                // Still prefilling. The sampled token is meaningless (it's a
+                // continuation prediction for the partial prompt). Don't count it.
+                slot.generated_count = 0;
             }
-        }
+        } else {
+            // Decode step: one new token generated.
+            slot.seq_len += 1;
+            slot.last_token = tok;
+            slot.generated_count += 1;
 
-        if (!is_new) {
-            slot.seq_len += 1;  // decode appended one token to KV
-        }
-        slot.last_token = tok;
-        slot.generated_count += 1;
-
-        if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
-            slot.finished = true;
+            if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
+                slot.finished = true;
+            }
         }
 
         result.active_slot_ids[i] = sid;

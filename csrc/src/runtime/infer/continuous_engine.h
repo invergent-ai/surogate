@@ -43,7 +43,7 @@ namespace infer {
 /// Per-sequence state within the continuous engine.
 struct SequenceSlot {
     bool active = false;
-    int seq_len = 0;              // current KV-cache length (after prefill)
+    int seq_len = 0;              // current KV-cache length (tokens in KV cache)
     int generated_count = 0;      // number of output tokens generated
     int max_gen_len = 0;          // generation budget
     int32_t last_token = 0;       // most recent token (feed to next decode step)
@@ -56,6 +56,11 @@ struct SequenceSlot {
     uint64_t rng_offset = 0;
     std::vector<int> page_ids;    // allocated pages from the pool
     int compact_idx = -1;         // position in the compact batch (-1 = not in batch)
+
+    // Chunked prefill state
+    std::vector<int32_t> prompt;  // full prompt token IDs (kept until prefill done)
+    int prefill_progress = 0;     // tokens prefilled so far (0..prompt.size())
+    bool prefilling() const { return prefill_progress < static_cast<int>(prompt.size()); }
 };
 
 /// Result from step(max_tokens).
@@ -133,6 +138,7 @@ public:
         int top_k = 0;
         float top_p = 1.0f;
         float min_p = 0.0f;
+        int prefill_chunk_size = 256;  // max prefill tokens per request per step
     };
     struct FlatStepResult {
         std::vector<int> new_slot_ids;           // slot IDs for new prompts (-1 if failed)

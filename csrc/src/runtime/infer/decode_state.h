@@ -110,6 +110,10 @@ struct DecodeState {
     int flat_batch_size = 0;            // Number of requests in the flat batch
     int flat_total_tokens = 0;          // Total Q tokens across all requests
 
+    // Host-side Q indptr for recurrent op reshaping [flat_batch_size + 1]
+    const int32_t* q_indptr_host = nullptr;
+    int flat_max_q_len = 0;             // max(q_lens) across requests
+
     // Per-token → request mapping [flat_total_tokens]
     int32_t* token_to_req_gpu = nullptr;
     // Per-token KV write position [flat_total_tokens]

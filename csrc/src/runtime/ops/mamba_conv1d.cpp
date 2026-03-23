@@ -76,16 +76,28 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
     if (mDecodeState && mDecodeState->conv_states && layer_idx >= 0 && kernel > 1) {
         auto& conv_states = *mDecodeState->conv_states;
         const bool strict_conv_state = mDecodeState->strict_state_buffers;
+        const bool flat_mode = mDecodeState->flat_token_mode
+                            && mDecodeState->flat_batch_size > 1
+                            && mDecodeState->q_indptr_host != nullptr;
+        const int state_B = flat_mode ? mDecodeState->flat_batch_size : B;
         const int state_len = kernel - 1;
         const std::size_t state_elems =
-            static_cast<std::size_t>(B) * static_cast<std::size_t>(conv_dim) * static_cast<std::size_t>(state_len);
+            static_cast<std::size_t>(state_B)
+            * static_cast<std::size_t>(conv_dim)
+            * static_cast<std::size_t>(state_len);
         const std::size_t state_bytes = state_elems * get_dtype_size(x.DType);
-        const std::size_t per_seq_bytes =
-            state_bytes / static_cast<std::size_t>(std::max(1, B));
+        const std::size_t per_seq_bytes = static_cast<std::size_t>(conv_dim)
+                                        * static_cast<std::size_t>(state_len)
+                                        * get_dtype_size(x.DType);
 
         auto it_state = conv_states.find(layer_idx);
         void* state_ptr = (it_state != conv_states.end()) ? it_state->second : nullptr;
         bool need_realloc = (state_ptr == nullptr);
+        // In flat mode the op tensor has B=1, but the persistent conv-state must
+        // track one row per request. Force reallocation to the requested flat batch.
+        if (flat_mode && !strict_conv_state) {
+            need_realloc = true;
+        }
         if (mDecodeState->conv_state_bytes) {
             auto& conv_state_bytes = *mDecodeState->conv_state_bytes;
             auto it = conv_state_bytes.find(layer_idx);
@@ -119,9 +131,68 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         }
 
         Tensor conv_state = Tensor::from_pointer(
-            static_cast<std::byte*>(state_ptr), /*device=*/0, x.DType, std::vector<long>{B, conv_dim, state_len});
-        mamba_causal_conv1d_update(*out_ptr, conv_state, x, weight, bias,
-                                   B, T, conv_dim, kernel, silu, mRunState.MainStream);
+            static_cast<std::byte*>(state_ptr), x.Device, x.DType,
+            std::vector<long>{state_B, conv_dim, state_len});
+
+        if (flat_mode) {
+            const int B_real = mDecodeState->flat_batch_size;
+            const int T_total = T;
+            const int T_padded = std::max(1, mDecodeState->flat_max_q_len);
+            const int32_t* indptr = mDecodeState->q_indptr_host;
+            const std::size_t elem_bytes = get_dtype_size(x.DType);
+            const std::size_t src_pitch = static_cast<std::size_t>(T_total) * elem_bytes;
+            const std::size_t dst_pitch = static_cast<std::size_t>(T_padded) * elem_bytes;
+
+            Tensor x_padded = mRunState.temp_alloc(x.DType, {B_real, conv_dim, T_padded}, "mamba_conv1d_flat_x");
+            mTemps.push_back(x_padded);
+            Tensor out_padded = mRunState.temp_alloc(x.DType, {B_real, conv_dim, T_padded}, "mamba_conv1d_flat_out");
+            mTemps.push_back(out_padded);
+
+            CUDA_CHECK(cudaMemsetAsync(x_padded.Data, 0, x_padded.bytes(), mRunState.MainStream));
+            CUDA_CHECK(cudaMemsetAsync(out_padded.Data, 0, out_padded.bytes(), mRunState.MainStream));
+
+            // Scatter flat [1, conv_dim, total_tokens] into padded [B_real, conv_dim, T_padded].
+            for (int i = 0; i < B_real; ++i) {
+                const int q_start = indptr[i];
+                const int q_len = indptr[i + 1] - indptr[i];
+                if (q_len <= 0) continue;
+                auto* dst_base = reinterpret_cast<char*>(x_padded.Data)
+                               + static_cast<std::size_t>(i) * static_cast<std::size_t>(conv_dim) * dst_pitch;
+                const auto* src_base = reinterpret_cast<const char*>(x.Data)
+                                     + static_cast<std::size_t>(q_start) * elem_bytes;
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    dst_base, dst_pitch,
+                    src_base, src_pitch,
+                    static_cast<std::size_t>(q_len) * elem_bytes,
+                    static_cast<std::size_t>(conv_dim),
+                    cudaMemcpyDeviceToDevice,
+                    mRunState.MainStream));
+            }
+
+            mamba_causal_conv1d_update(out_padded, conv_state, x_padded, weight, bias,
+                                       B_real, T_padded, conv_dim, kernel, silu, mRunState.MainStream);
+
+            // Gather padded output back to flat [1, conv_dim, total_tokens].
+            for (int i = 0; i < B_real; ++i) {
+                const int q_start = indptr[i];
+                const int q_len = indptr[i + 1] - indptr[i];
+                if (q_len <= 0) continue;
+                auto* dst_base = reinterpret_cast<char*>(out_ptr->Data)
+                               + static_cast<std::size_t>(q_start) * elem_bytes;
+                const auto* src_base = reinterpret_cast<const char*>(out_padded.Data)
+                                     + static_cast<std::size_t>(i) * static_cast<std::size_t>(conv_dim) * dst_pitch;
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    dst_base, src_pitch,
+                    src_base, dst_pitch,
+                    static_cast<std::size_t>(q_len) * elem_bytes,
+                    static_cast<std::size_t>(conv_dim),
+                    cudaMemcpyDeviceToDevice,
+                    mRunState.MainStream));
+            }
+        } else {
+            mamba_causal_conv1d_update(*out_ptr, conv_state, x, weight, bias,
+                                       B, T, conv_dim, kernel, silu, mRunState.MainStream);
+        }
         store_tensor(op.outputs[0], *out_ptr);
         return;
     }

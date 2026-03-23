@@ -183,6 +183,24 @@ class NativeServingRuntime:
             model_dir, trust_remote_code=config.trust_remote_code
         )
         self.eos_id = self.tokenizer.eos_token_id or 151643
+        try:
+            self._token_id_limit = max(1, int(len(self.tokenizer)))
+        except Exception:
+            self._token_id_limit = 0
+        self._fallback_token_id = getattr(self.tokenizer, "unk_token_id", None)
+        if (
+            self._fallback_token_id is None
+            or self._fallback_token_id < 0
+            or (
+                self._token_id_limit > 0
+                and int(self._fallback_token_id) >= self._token_id_limit
+            )
+        ):
+            if self._token_id_limit > 0 and 0 <= int(self.eos_id) < self._token_id_limit:
+                self._fallback_token_id = int(self.eos_id)
+            else:
+                self._fallback_token_id = 0
+        self._invalid_token_count = 0
 
         ir_json = build_dsl_ir_for_model(model_dir)
         jit_manifests = compile_jit_kernels(ir_json)
@@ -752,7 +770,8 @@ class NativeServingRuntime:
         pl = int(prompt_len)
         cl = int(completion_len)
         raw_ids = [int(t) for t in token_row[pl : pl + cl]]
-        raw_text = self.tokenizer.decode(raw_ids, skip_special_tokens=True)
+        raw_ids, _ = self._sanitize_token_ids(raw_ids)
+        raw_text = self._safe_decode(raw_ids)
 
         trimmed_text, stop_hit = _apply_stop(raw_text, stop_strings)
         if stop_hit:
@@ -777,6 +796,42 @@ class NativeServingRuntime:
             prompt_tokens=pl,
             completion_tokens=len(out_ids),
         )
+
+    def _sanitize_token_ids(self, token_ids: Sequence[int]) -> tuple[list[int], bool]:
+        if not token_ids:
+            return [], False
+        cleaned: list[int] = []
+        changed = False
+        limit = int(self._token_id_limit)
+        fallback = int(self._fallback_token_id)
+        for tok in token_ids:
+            t = int(tok)
+            valid = t >= 0 and (limit <= 0 or t < limit)
+            if valid:
+                cleaned.append(t)
+                continue
+            changed = True
+            cleaned.append(fallback)
+        if changed:
+            self._invalid_token_count += 1
+            if self._invalid_token_count <= 5 or self._invalid_token_count % 100 == 0:
+                logger.warning(
+                    "Sanitized invalid token ids in serving output "
+                    "(count=%d, total_sanitizations=%d).",
+                    len(token_ids),
+                    self._invalid_token_count,
+                )
+        return cleaned, changed
+
+    def _safe_decode(self, token_ids: Sequence[int]) -> str:
+        if not token_ids:
+            return ""
+        cleaned, _ = self._sanitize_token_ids(token_ids)
+        try:
+            return self.tokenizer.decode(cleaned, skip_special_tokens=True)
+        except Exception:
+            logger.exception("Tokenizer decode failed after token sanitization.")
+            return ""
 
     # (Old session-based methods removed — continuous engine is the only path.)
 
@@ -809,14 +864,15 @@ class NativeServingRuntime:
     # have been removed — the continuous engine is the only serving path.
 
     def _finalize_continuous_request(self, item: ActiveGeneration) -> None:
-        raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
+        clean_ids, had_invalid = self._sanitize_token_ids(item.generated_ids)
+        raw_text = self._safe_decode(clean_ids)
         trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
         if stop_hit:
             out_ids = self.tokenizer.encode(trimmed_text, add_special_tokens=False)
             finish_reason = "stop"
         else:
-            out_ids = item.generated_ids
-            finish_reason = item.finish_reason
+            out_ids = clean_ids
+            finish_reason = "length" if had_invalid else item.finish_reason
 
         item.pending.result = [
             GeneratedChoice(
@@ -880,7 +936,11 @@ class NativeServingRuntime:
             # Token budget: max tokens per flat-step forward pass.
             token_budget = self.config.max_num_batched_tokens
 
+            import time as _time
+            _step_count = 0
+
             while not self._shutdown:
+                _t_loop_start = _time.perf_counter()
                 # --- Phase 1: Collect new requests within token budget ---
                 free_slots = self._max_batch_sequences - len(slot_map)
                 active_decode_count = sum(
@@ -903,15 +963,17 @@ class NativeServingRuntime:
                     if prompt_len + max_tokens > self._runtime_seq_len:
                         max_tokens = max(1, self._runtime_seq_len - prompt_len)
 
-                    # Check if this prompt fits in the remaining token budget.
-                    if prefill_tokens_used + prompt_len > remaining_budget:
+                    # With chunked prefill, each new prompt only costs
+                    # min(prompt_len, chunk_size) tokens per step, not the full prompt.
+                    prefill_chunk = min(prompt_len, 256)  # matches prefill_chunk_size
+                    if prefill_tokens_used + prefill_chunk > remaining_budget:
                         deferred.append(item)
                         continue
 
                     new_prompts.append(prompt_ids)
                     new_max_tokens.append(max_tokens)
                     pending_items.append(item)
-                    prefill_tokens_used += prompt_len
+                    prefill_tokens_used += prefill_chunk
 
                 # Re-queue deferred items.
                 if deferred:
@@ -934,6 +996,7 @@ class NativeServingRuntime:
                     else next(iter(slot_map.values())).pending.params
                 )
 
+                _t_sched = _time.perf_counter()
                 # --- Phase 2: Flat-token step (prefill + decode in one pass) ---
                 try:
                     new_sids, active_sids, sampled, finished_flags, comp_lens = (
@@ -946,6 +1009,7 @@ class NativeServingRuntime:
                             top_k=first_params.top_k,
                             top_p=first_params.top_p,
                             min_p=first_params.min_p,
+                            prefill_chunk_size=256,
                         )
                     )
                 except Exception as exc:
@@ -961,6 +1025,7 @@ class NativeServingRuntime:
                     logger.exception("engine_flat_step failed")
                     continue
 
+                _t_fwd = _time.perf_counter()
                 # Map new slot IDs to pending items
                 for item, sid in zip(pending_items, new_sids):
                     if sid < 0:
@@ -977,13 +1042,17 @@ class NativeServingRuntime:
                     item = slot_map.get(sid)
                     if item is None or item.finished:
                         continue
-                    item.generated_ids.append(int(tok))
+                    # clen == 0 means the slot is still prefilling (chunked prefill).
+                    # The sampled token is a partial-prompt continuation prediction
+                    # that we must discard — don't append to generated_ids.
+                    if clen == 0:
+                        continue
+                    safe_tok, tok_replaced = self._sanitize_token_ids([int(tok)])
+                    item.generated_ids.append(int(safe_tok[0]))
 
-                    should_finish = bool(fin)
+                    should_finish = bool(fin) or tok_replaced
                     if not should_finish and item.pending.stop_strings:
-                        partial_text = self.tokenizer.decode(
-                            item.generated_ids, skip_special_tokens=True
-                        )
+                        partial_text = self._safe_decode(item.generated_ids)
                         _, stop_hit = _apply_stop(
                             partial_text, item.pending.stop_strings
                         )
@@ -995,12 +1064,10 @@ class NativeServingRuntime:
 
                     if should_finish:
                         item.finished = True
-                        if int(tok) == self.eos_id:
+                        if int(item.generated_ids[-1]) == self.eos_id:
                             item.finish_reason = "stop"
                         elif item.pending.stop_strings:
-                            partial_text = self.tokenizer.decode(
-                                item.generated_ids, skip_special_tokens=True
-                            )
+                            partial_text = self._safe_decode(item.generated_ids)
                             _, stop_hit = _apply_stop(
                                 partial_text, item.pending.stop_strings
                             )
@@ -1018,6 +1085,21 @@ class NativeServingRuntime:
                     except Exception:
                         logger.exception("engine_release_slot(%d) failed", sid)
                     slot_map.pop(sid, None)
+
+                _t_end = _time.perf_counter()
+                _step_count += 1
+                if _step_count <= 30 or _step_count % 50 == 0:
+                    _sched_ms = (_t_sched - _t_loop_start) * 1000
+                    _fwd_ms = (_t_fwd - _t_sched) * 1000
+                    _post_ms = (_t_end - _t_fwd) * 1000
+                    _total_ms = (_t_end - _t_loop_start) * 1000
+                    _n_new = len(new_prompts)
+                    _n_active = len(active_sids) if 'active_sids' in dir() else 0
+                    import sys
+                    print(
+                        f"[LOOP] step={_step_count} sched={_sched_ms:.1f}ms fwd={_fwd_ms:.1f}ms post={_post_ms:.1f}ms total={_total_ms:.1f}ms new={_n_new} active={_n_active}",
+                        file=sys.stderr, flush=True,
+                    )
 
         except Exception:
             logger.exception("continuous engine loop crashed")

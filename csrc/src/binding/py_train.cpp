@@ -2540,7 +2540,7 @@ MultiGPUPyTrainer::FlatStepResult MultiGPUPyTrainer::engine_flat_step(
         std::uint64_t engine_id,
         const std::vector<std::vector<int32_t>>& new_prompts,
         int max_gen_len, float temperature, int32_t eos_token_id,
-        int top_k, float top_p, float min_p) {
+        int top_k, float top_p, float min_p, int prefill_chunk_size) {
     infer::ContinuousGenerationEngine* eng = nullptr;
     {
         std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
@@ -2565,6 +2565,7 @@ MultiGPUPyTrainer::FlatStepResult MultiGPUPyTrainer::engine_flat_step(
         cfg.top_k = top_k;
         cfg.top_p = top_p;
         cfg.min_p = min_p;
+        cfg.prefill_chunk_size = prefill_chunk_size;
 
         auto r = eng->flat_step(new_prompts, cfg, *ge, *ctx.Communicator);
         result.new_slot_ids = std::move(r.new_slot_ids);
