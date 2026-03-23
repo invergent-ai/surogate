@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,6 +56,329 @@ std::vector<int> build_graph_buckets(int max_slots) {
     return buckets;
 }
 
+inline int static_prefill_t_cap(const dsl::DslRunState& run_state) {
+    if (run_state.Inputs.Rank >= 2 && run_state.Inputs.Sizes.size() >= 2) {
+        const int static_t_cap = static_cast<int>(run_state.Inputs.Sizes[1]);
+        if (static_t_cap > 0) {
+            return static_t_cap;
+        }
+    }
+    return 0;
+}
+
+inline int resolve_prefill_chunk_size(
+        int requested_chunk_size,
+        int max_prefill_len,
+        const dsl::DslRunState& run_state) {
+    if (max_prefill_len <= 0) {
+        return 0;
+    }
+    int chunk = (requested_chunk_size > 0)
+        ? std::min(requested_chunk_size, max_prefill_len)
+        : max_prefill_len;
+    const int static_t_cap = static_prefill_t_cap(run_state);
+    if (static_t_cap > 0) {
+        chunk = std::min(chunk, static_t_cap);
+    }
+    return std::max(1, chunk);
+}
+
+inline void ensure_device_buffer_capacity(
+        void*& ptr,
+        std::size_t required_bytes,
+        std::size_t& capacity_bytes) {
+    if (ptr && capacity_bytes >= required_bytes) {
+        return;
+    }
+    if (ptr) {
+        CUDA_CHECK(cudaFree(ptr));
+        ptr = nullptr;
+        capacity_bytes = 0;
+    }
+    if (required_bytes == 0) {
+        return;
+    }
+    CUDA_CHECK(cudaMalloc(&ptr, required_bytes));
+    capacity_bytes = required_bytes;
+}
+
+struct EngineStateStorage {
+    std::vector<std::unordered_map<int, void*>> slot_recurrent_states;
+    std::vector<std::unordered_map<int, std::size_t>> slot_recurrent_state_bytes;
+    std::vector<std::unordered_map<int, void*>> slot_conv_states;
+    std::vector<std::unordered_map<int, std::size_t>> slot_conv_state_bytes;
+
+    std::unordered_map<int, void*> compact_recurrent_states;
+    std::unordered_map<int, std::size_t> compact_recurrent_state_bytes;
+    std::unordered_map<int, std::size_t> compact_recurrent_state_capacity_bytes;
+    std::unordered_map<int, void*> compact_conv_states;
+    std::unordered_map<int, std::size_t> compact_conv_state_bytes;
+    std::unordered_map<int, std::size_t> compact_conv_state_capacity_bytes;
+};
+
+std::mutex g_engine_state_mu;
+std::unordered_map<const ContinuousGenerationEngine*, std::unique_ptr<EngineStateStorage>>
+    g_engine_state;
+
+EngineStateStorage& ensure_engine_state_storage(
+        const ContinuousGenerationEngine* engine,
+        int max_slots) {
+    std::lock_guard<std::mutex> lock(g_engine_state_mu);
+    auto& ptr = g_engine_state[engine];
+    if (!ptr) {
+        ptr = std::make_unique<EngineStateStorage>();
+    }
+    const std::size_t slots = static_cast<std::size_t>(std::max(0, max_slots));
+    ptr->slot_recurrent_states.resize(slots);
+    ptr->slot_recurrent_state_bytes.resize(slots);
+    ptr->slot_conv_states.resize(slots);
+    ptr->slot_conv_state_bytes.resize(slots);
+    return *ptr;
+}
+
+EngineStateStorage* get_engine_state_storage(const ContinuousGenerationEngine* engine) {
+    std::lock_guard<std::mutex> lock(g_engine_state_mu);
+    auto it = g_engine_state.find(engine);
+    if (it == g_engine_state.end()) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
+void erase_engine_state_storage(const ContinuousGenerationEngine* engine) {
+    std::lock_guard<std::mutex> lock(g_engine_state_mu);
+    g_engine_state.erase(engine);
+}
+
+void free_slot_states_impl(EngineStateStorage& state, int slot_id) {
+    auto free_state_map = [&](std::vector<std::unordered_map<int, void*>>& slot_states,
+                              std::vector<std::unordered_map<int, std::size_t>>& slot_state_bytes) {
+        const std::size_t idx = static_cast<std::size_t>(slot_id);
+        if (idx >= slot_states.size() || idx >= slot_state_bytes.size()) {
+            return;
+        }
+        auto& slot_map = slot_states[idx];
+        for (auto& [_, ptr] : slot_map) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
+                ptr = nullptr;
+            }
+        }
+        slot_map.clear();
+        slot_state_bytes[idx].clear();
+    };
+    if (slot_id < 0) {
+        return;
+    }
+    free_state_map(state.slot_recurrent_states, state.slot_recurrent_state_bytes);
+    free_state_map(state.slot_conv_states, state.slot_conv_state_bytes);
+}
+
+void clear_state_storage_impl(EngineStateStorage& state) {
+    for (std::size_t slot_id = 0; slot_id < state.slot_recurrent_states.size(); ++slot_id) {
+        free_slot_states_impl(state, static_cast<int>(slot_id));
+    }
+    auto free_compact_map = [](std::unordered_map<int, void*>& compact_states,
+                               std::unordered_map<int, std::size_t>& compact_state_bytes,
+                               std::unordered_map<int, std::size_t>& compact_state_capacity_bytes) {
+        for (auto& [_, ptr] : compact_states) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
+                ptr = nullptr;
+            }
+        }
+        compact_states.clear();
+        compact_state_bytes.clear();
+        compact_state_capacity_bytes.clear();
+    };
+    free_compact_map(
+        state.compact_recurrent_states,
+        state.compact_recurrent_state_bytes,
+        state.compact_recurrent_state_capacity_bytes);
+    free_compact_map(
+        state.compact_conv_states,
+        state.compact_conv_state_bytes,
+        state.compact_conv_state_capacity_bytes);
+}
+
+void flush_compact_states_to_slots_impl(
+        EngineStateStorage& state,
+        dsl::DslRunState* run_state,
+        int compact_B,
+        const std::vector<int>& active_slot_ids,
+        int max_slots,
+        const std::vector<SequenceSlot>& slots) {
+    if (compact_B <= 0 || active_slot_ids.empty() || !run_state) {
+        return;
+    }
+    cudaStream_t stream = run_state->MainStream;
+    const int B = std::min(compact_B, static_cast<int>(active_slot_ids.size()));
+
+    auto flush_state_map = [&](const std::unordered_map<int, void*>& compact_states,
+                               const std::unordered_map<int, std::size_t>& compact_state_bytes,
+                               std::vector<std::unordered_map<int, void*>>& slot_states,
+                               std::vector<std::unordered_map<int, std::size_t>>& slot_state_bytes) {
+        for (const auto& [layer_idx, src_base_void] : compact_states) {
+            if (!src_base_void) continue;
+            auto it_b = compact_state_bytes.find(layer_idx);
+            if (it_b == compact_state_bytes.end() || it_b->second == 0) continue;
+            const std::size_t per_seq_bytes = it_b->second;
+            const char* src_base = static_cast<const char*>(src_base_void);
+            for (int i = 0; i < B; ++i) {
+                const int slot_id = active_slot_ids[static_cast<std::size_t>(i)];
+                if (slot_id < 0 || slot_id >= max_slots) continue;
+                if (static_cast<std::size_t>(slot_id) >= slots.size()) continue;
+                if (!slots[static_cast<std::size_t>(slot_id)].active) continue;
+                auto& slot_map = slot_states[static_cast<std::size_t>(slot_id)];
+                auto& bytes_map = slot_state_bytes[static_cast<std::size_t>(slot_id)];
+                void*& dst_ptr = slot_map[layer_idx];
+                auto it_slot_b = bytes_map.find(layer_idx);
+                if (it_slot_b != bytes_map.end() && it_slot_b->second != per_seq_bytes) {
+                    if (dst_ptr) {
+                        CUDA_CHECK(cudaFree(dst_ptr));
+                        dst_ptr = nullptr;
+                    }
+                    bytes_map.erase(it_slot_b);
+                }
+                if (!dst_ptr) {
+                    CUDA_CHECK(cudaMalloc(&dst_ptr, per_seq_bytes));
+                }
+                bytes_map[layer_idx] = per_seq_bytes;
+                const char* src_ptr = src_base + static_cast<std::size_t>(i) * per_seq_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, per_seq_bytes,
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    };
+
+    flush_state_map(
+        state.compact_recurrent_states,
+        state.compact_recurrent_state_bytes,
+        state.slot_recurrent_states,
+        state.slot_recurrent_state_bytes);
+    flush_state_map(
+        state.compact_conv_states,
+        state.compact_conv_state_bytes,
+        state.slot_conv_states,
+        state.slot_conv_state_bytes);
+}
+
+void build_compact_states_from_slots_impl(
+        EngineStateStorage& state,
+        dsl::DslRunState* run_state,
+        int compact_B,
+        int compact_B_padded,
+        const std::vector<int>& active_slot_ids,
+        int max_slots) {
+    if (compact_B_padded <= 0 || !run_state) {
+        return;
+    }
+    cudaStream_t stream = run_state->MainStream;
+    const int B = compact_B;
+    const int Bp = compact_B_padded;
+
+    auto build_state_map = [&](std::vector<std::unordered_map<int, void*>>& slot_states,
+                               std::vector<std::unordered_map<int, std::size_t>>& slot_state_bytes,
+                               std::unordered_map<int, void*>& compact_states,
+                               std::unordered_map<int, std::size_t>& compact_state_bytes,
+                               std::unordered_map<int, std::size_t>& compact_state_capacity_bytes) {
+        std::unordered_map<int, std::size_t> layer_per_seq_bytes;
+        for (int i = 0; i < B; ++i) {
+            const int slot_id = active_slot_ids[static_cast<std::size_t>(i)];
+            if (slot_id < 0 || slot_id >= max_slots) continue;
+            const auto& slot_map = slot_states[static_cast<std::size_t>(slot_id)];
+            const auto& bytes_map = slot_state_bytes[static_cast<std::size_t>(slot_id)];
+            for (const auto& [layer_idx, ptr] : slot_map) {
+                if (!ptr) continue;
+                auto it_b = bytes_map.find(layer_idx);
+                if (it_b == bytes_map.end() || it_b->second == 0) continue;
+                const std::size_t per_seq_bytes = it_b->second;
+                auto it_existing = layer_per_seq_bytes.find(layer_idx);
+                if (it_existing == layer_per_seq_bytes.end()) {
+                    layer_per_seq_bytes[layer_idx] = per_seq_bytes;
+                } else if (it_existing->second != per_seq_bytes) {
+                    throw std::runtime_error(
+                        "ContinuousGenerationEngine: per-seq state byte-size mismatch for layer "
+                        + std::to_string(layer_idx));
+                }
+            }
+        }
+
+        for (auto it = compact_states.begin(); it != compact_states.end();) {
+            const int layer_idx = it->first;
+            if (layer_per_seq_bytes.find(layer_idx) != layer_per_seq_bytes.end()) {
+                ++it;
+                continue;
+            }
+            if (it->second) {
+                CUDA_CHECK(cudaFree(it->second));
+            }
+            compact_state_bytes.erase(layer_idx);
+            compact_state_capacity_bytes.erase(layer_idx);
+            it = compact_states.erase(it);
+        }
+
+        for (const auto& [layer_idx, per_seq_bytes] : layer_per_seq_bytes) {
+            void*& dst_base = compact_states[layer_idx];
+            std::size_t& cap_bytes = compact_state_capacity_bytes[layer_idx];
+            const std::size_t required_bytes =
+                static_cast<std::size_t>(Bp) * per_seq_bytes;
+            ensure_device_buffer_capacity(dst_base, required_bytes, cap_bytes);
+            compact_state_bytes[layer_idx] = per_seq_bytes;
+            CUDA_CHECK(cudaMemsetAsync(dst_base, 0, required_bytes, stream));
+        }
+
+        for (int i = 0; i < B; ++i) {
+            const int slot_id = active_slot_ids[static_cast<std::size_t>(i)];
+            if (slot_id < 0 || slot_id >= max_slots) continue;
+            auto& slot_map = slot_states[static_cast<std::size_t>(slot_id)];
+            auto& bytes_map = slot_state_bytes[static_cast<std::size_t>(slot_id)];
+            for (const auto& [layer_idx, src_ptr] : slot_map) {
+                if (!src_ptr) continue;
+                auto it_b = bytes_map.find(layer_idx);
+                auto it_comp_b = compact_state_bytes.find(layer_idx);
+                if (it_b == bytes_map.end() || it_comp_b == compact_state_bytes.end()) continue;
+                const std::size_t per_seq_bytes = it_b->second;
+                if (it_comp_b->second != per_seq_bytes) continue;
+                auto it_dst = compact_states.find(layer_idx);
+                if (it_dst == compact_states.end() || !it_dst->second) continue;
+                char* dst_ptr = static_cast<char*>(it_dst->second)
+                              + static_cast<std::size_t>(i) * per_seq_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    dst_ptr, src_ptr, per_seq_bytes, cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+
+        for (int i = 0; i < B; ++i) {
+            const int slot_id = active_slot_ids[static_cast<std::size_t>(i)];
+            if (slot_id < 0 || slot_id >= max_slots) continue;
+            auto& slot_map = slot_states[static_cast<std::size_t>(slot_id)];
+            auto& bytes_map = slot_state_bytes[static_cast<std::size_t>(slot_id)];
+            for (auto& [_, ptr] : slot_map) {
+                if (ptr) {
+                    CUDA_CHECK(cudaFree(ptr));
+                    ptr = nullptr;
+                }
+            }
+            slot_map.clear();
+            bytes_map.clear();
+        }
+    };
+
+    build_state_map(
+        state.slot_recurrent_states,
+        state.slot_recurrent_state_bytes,
+        state.compact_recurrent_states,
+        state.compact_recurrent_state_bytes,
+        state.compact_recurrent_state_capacity_bytes);
+    build_state_map(
+        state.slot_conv_states,
+        state.slot_conv_state_bytes,
+        state.compact_conv_states,
+        state.compact_conv_state_bytes,
+        state.compact_conv_state_capacity_bytes);
+}
+
 }  // namespace
 
 ContinuousGenerationEngine::~ContinuousGenerationEngine() {
@@ -61,6 +386,7 @@ ContinuousGenerationEngine::~ContinuousGenerationEngine() {
         cudaGraphExecDestroy(full_step_graph_exec_);
         full_step_graph_exec_ = nullptr;
     }
+    erase_engine_state_storage(this);
 }
 
 void ContinuousGenerationEngine::init(
@@ -98,6 +424,7 @@ void ContinuousGenerationEngine::init(
                     Hkv, Hs, kv_dtype, arena);
 
     slots_.resize(static_cast<std::size_t>(max_slots));
+    (void)ensure_engine_state_storage(this, max_slots);
     free_slot_stack_.resize(max_slots);
     for (int i = 0; i < max_slots; ++i) {
         free_slot_stack_[i] = max_slots - 1 - i;
@@ -190,9 +517,11 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
     CUDA_CHECK(cudaMemsetAsync(prefill_block_table_gpu_, 0,
         static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int), stream));
 
+    const int warmup_t_cap = std::max(32, resolve_prefill_chunk_size(
+        /*requested_chunk_size=*/2048, max_seq_len_, *run_state_));
     static constexpr int kWarmupT[] = {32, 64, 128, 255, 256, 511, 512, 1023, 1024, 2047, 2048};
     for (int t : kWarmupT) {
-        if (t > max_seq_len_) break;
+        if (t > max_seq_len_ || t > warmup_t_cap) break;
         std::vector<int32_t> dummy_tokens(static_cast<std::size_t>(t), 0);
         std::vector<int32_t> dummy_pos(static_cast<std::size_t>(t));
         for (int i = 0; i < t; ++i) dummy_pos[i] = i;
@@ -211,6 +540,12 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
 void ContinuousGenerationEngine::rebuild_compact_batch() {
     cudaStream_t stream = run_state_->MainStream;
     const auto MPS = static_cast<std::size_t>(max_pages_per_seq_);
+    auto& state = ensure_engine_state_storage(this, max_slots_);
+
+    // Persist decode-updated compact recurrent/conv state into slot-local storage
+    // before rebuilding row order.
+    flush_compact_states_to_slots_impl(
+        state, run_state_, compact_B_, active_slot_ids_, max_slots_, slots_);
 
     active_slot_ids_.clear();
     for (int i = 0; i < max_slots_; ++i) {
@@ -281,9 +616,17 @@ void ContinuousGenerationEngine::rebuild_compact_batch() {
     batch_min_p_ = first.min_p;
     greedy_ = (batch_temperature_ <= 0.0f);
 
+    // Build compact recurrent/conv state rows in the same active-slot order.
+    build_compact_states_from_slots_impl(
+        state, run_state_, compact_B_, compact_B_padded_, active_slot_ids_, max_slots_);
+
     // Build persistent DecodeState.
     const bool fp8_kv = (page_pool_.dtype() == KVDType::FP8_E4M3);
     decode_state_ = DecodeState{};
+    decode_state_.recurrent_states = &state.compact_recurrent_states;
+    decode_state_.recurrent_state_bytes = &state.compact_recurrent_state_bytes;
+    decode_state_.conv_states = &state.compact_conv_states;
+    decode_state_.conv_state_bytes = &state.compact_conv_state_bytes;
     decode_state_.paged = true;
     decode_state_.fp8 = fp8_kv;
     decode_state_.k_pages = page_pool_.k_pages();
@@ -405,6 +748,7 @@ int ContinuousGenerationEngine::add_sequence(
     if (!initialized_) {
         throw std::runtime_error("ContinuousGenerationEngine: not initialized");
     }
+    auto& state = ensure_engine_state_storage(this, max_slots_);
     if (free_slot_stack_.empty()) return -1;
 
     const int plen = static_cast<int>(prompt_ids.size());
@@ -444,6 +788,10 @@ int ContinuousGenerationEngine::add_sequence(
         bt_host.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     const bool fp8_kv = (page_pool_.dtype() == KVDType::FP8_E4M3);
+    std::unordered_map<int, void*> prompt_recurrent_states;
+    std::unordered_map<int, std::size_t> prompt_recurrent_state_bytes;
+    std::unordered_map<int, void*> prompt_conv_states;
+    std::unordered_map<int, std::size_t> prompt_conv_state_bytes;
     DecodeState prefill_ds{};
     prefill_ds.paged = true;
     prefill_ds.fp8 = fp8_kv;
@@ -462,13 +810,17 @@ int ContinuousGenerationEngine::add_sequence(
     prefill_ds.head_dim = config_->head_size();
     prefill_ds.logits_out_gpu = nullptr;
     prefill_ds.vocab_size = vocab_size_;
+    prefill_ds.recurrent_states = &prompt_recurrent_states;
+    prefill_ds.recurrent_state_bytes = &prompt_recurrent_state_bytes;
+    prefill_ds.conv_states = &prompt_conv_states;
+    prefill_ds.conv_state_bytes = &prompt_conv_state_bytes;
     prefill_ds.prefill_mode = true;
     prefill_ds.prefill_pos_offset = 0;
 
     const int prefill_len = plen - 1;
     if (prefill_len > 0) {
-        const int chunk = (prefill_chunk_size > 0)
-            ? std::min(prefill_chunk_size, prefill_len) : prefill_len;
+        const int chunk = resolve_prefill_chunk_size(
+            prefill_chunk_size, prefill_len, *run_state_);
         std::vector<int32_t> tok_buf(static_cast<std::size_t>(chunk));
         std::vector<int32_t> pos_buf(static_cast<std::size_t>(chunk));
 
@@ -481,6 +833,62 @@ int ContinuousGenerationEngine::add_sequence(
             prefill_ds.prefill_pos_offset = cs;
             graph_executor.execute_prefill(1L, static_cast<long>(cl),
                 tok_buf.data(), pos_buf.data(), prefill_ds, comm, hook);
+        }
+    }
+
+    // Persist prefill recurrent/conv state for this slot.
+    auto persist_prompt_states_for_slot =
+        [&](const std::unordered_map<int, void*>& prompt_states,
+            const std::unordered_map<int, std::size_t>& prompt_state_bytes,
+            std::vector<std::unordered_map<int, void*>>& slot_states,
+            std::vector<std::unordered_map<int, std::size_t>>& slot_state_bytes) {
+            for (const auto& [layer_idx, src_ptr] : prompt_states) {
+                if (!src_ptr) continue;
+                auto it_b = prompt_state_bytes.find(layer_idx);
+                if (it_b == prompt_state_bytes.end() || it_b->second == 0) {
+                    throw std::runtime_error(
+                        "ContinuousGenerationEngine::add_sequence: missing per-seq state bytes for layer "
+                        + std::to_string(layer_idx));
+                }
+                const std::size_t per_seq_bytes = it_b->second;
+                auto& slot_map = slot_states[static_cast<std::size_t>(slot_id)];
+                auto& bytes_map = slot_state_bytes[static_cast<std::size_t>(slot_id)];
+                void*& dst_ptr = slot_map[layer_idx];
+                auto it_slot_b = bytes_map.find(layer_idx);
+                if (it_slot_b != bytes_map.end() && it_slot_b->second != per_seq_bytes) {
+                    if (dst_ptr) {
+                        CUDA_CHECK(cudaFree(dst_ptr));
+                        dst_ptr = nullptr;
+                    }
+                    bytes_map.erase(it_slot_b);
+                }
+                if (!dst_ptr) {
+                    CUDA_CHECK(cudaMalloc(&dst_ptr, per_seq_bytes));
+                }
+                bytes_map[layer_idx] = per_seq_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    dst_ptr, src_ptr, per_seq_bytes, cudaMemcpyDeviceToDevice, stream));
+            }
+        };
+    persist_prompt_states_for_slot(
+        prompt_recurrent_states,
+        prompt_recurrent_state_bytes,
+        state.slot_recurrent_states,
+        state.slot_recurrent_state_bytes);
+    persist_prompt_states_for_slot(
+        prompt_conv_states,
+        prompt_conv_state_bytes,
+        state.slot_conv_states,
+        state.slot_conv_state_bytes);
+
+    for (auto& [_, ptr] : prompt_recurrent_states) {
+        if (ptr) {
+            CUDA_CHECK(cudaFree(ptr));
+        }
+    }
+    for (auto& [_, ptr] : prompt_conv_states) {
+        if (ptr) {
+            CUDA_CHECK(cudaFree(ptr));
         }
     }
 
@@ -508,6 +916,7 @@ std::vector<int> ContinuousGenerationEngine::add_sequences_batch(
     const int N = static_cast<int>(prompts.size());
     std::vector<int> slot_ids(N, -1);
     if (!initialized_ || N == 0) return slot_ids;
+    auto& state = ensure_engine_state_storage(this, max_slots_);
 
     // --- 1. Allocate slots and pages for all prompts ---
     std::vector<int> valid_indices;  // indices into prompts[] that succeeded
@@ -577,6 +986,10 @@ std::vector<int> ContinuousGenerationEngine::add_sequences_batch(
             cudaMemcpyHostToDevice, stream));
 
         DecodeState prefill_ds{};
+        std::unordered_map<int, void*> prompt_recurrent_states;
+        std::unordered_map<int, std::size_t> prompt_recurrent_state_bytes;
+        std::unordered_map<int, void*> prompt_conv_states;
+        std::unordered_map<int, std::size_t> prompt_conv_state_bytes;
         prefill_ds.paged = true;
         prefill_ds.fp8 = fp8_kv;
         prefill_ds.k_pages = page_pool_.k_pages();
@@ -594,12 +1007,16 @@ std::vector<int> ContinuousGenerationEngine::add_sequences_batch(
         prefill_ds.head_dim = config_->head_size();
         prefill_ds.logits_out_gpu = nullptr;
         prefill_ds.vocab_size = vocab_size_;
+        prefill_ds.recurrent_states = &prompt_recurrent_states;
+        prefill_ds.recurrent_state_bytes = &prompt_recurrent_state_bytes;
+        prefill_ds.conv_states = &prompt_conv_states;
+        prefill_ds.conv_state_bytes = &prompt_conv_state_bytes;
         prefill_ds.prefill_mode = true;
 
         // Chunked prefill: process all B_padded sequences together, chunk by chunk.
         // Padding rows [B, B_padded) get token 0 / pos 0 which is harmless.
-        const int chunk_size = (config.prefill_chunk_size > 0)
-            ? std::min(config.prefill_chunk_size, max_prefill_len) : max_prefill_len;
+        const int chunk_size = resolve_prefill_chunk_size(
+            config.prefill_chunk_size, max_prefill_len, *run_state_);
 
         std::vector<int32_t> tok_buf(static_cast<std::size_t>(B_padded) * chunk_size, 0);
         std::vector<int32_t> pos_buf(static_cast<std::size_t>(B_padded) * chunk_size, 0);
@@ -628,6 +1045,67 @@ std::vector<int> ContinuousGenerationEngine::add_sequences_batch(
                 static_cast<long>(B_padded), static_cast<long>(cl),
                 tok_buf.data(), pos_buf.data(),
                 prefill_ds, comm, hook);
+        }
+
+        auto scatter_prompt_states_to_slots =
+            [&](const std::unordered_map<int, void*>& prompt_states,
+                const std::unordered_map<int, std::size_t>& prompt_state_bytes,
+                std::vector<std::unordered_map<int, void*>>& slot_states,
+                std::vector<std::unordered_map<int, std::size_t>>& slot_state_bytes) {
+                for (const auto& [layer_idx, src_base_void] : prompt_states) {
+                    if (!src_base_void) continue;
+                    auto it_b = prompt_state_bytes.find(layer_idx);
+                    if (it_b == prompt_state_bytes.end() || it_b->second == 0) {
+                        throw std::runtime_error(
+                            "ContinuousGenerationEngine::add_sequences_batch: missing per-seq state bytes for layer "
+                            + std::to_string(layer_idx));
+                    }
+                    const std::size_t per_seq_bytes = it_b->second;
+                    const char* src_base = static_cast<const char*>(src_base_void);
+                    for (int b = 0; b < B; ++b) {
+                        const int sid = slot_ids[valid_indices[static_cast<std::size_t>(b)]];
+                        if (sid < 0 || sid >= max_slots_) continue;
+                        auto& slot_map = slot_states[static_cast<std::size_t>(sid)];
+                        auto& bytes_map = slot_state_bytes[static_cast<std::size_t>(sid)];
+                        void*& dst_ptr = slot_map[layer_idx];
+                        auto it_slot_b = bytes_map.find(layer_idx);
+                        if (it_slot_b != bytes_map.end() && it_slot_b->second != per_seq_bytes) {
+                            if (dst_ptr) {
+                                CUDA_CHECK(cudaFree(dst_ptr));
+                                dst_ptr = nullptr;
+                            }
+                            bytes_map.erase(it_slot_b);
+                        }
+                        if (!dst_ptr) {
+                            CUDA_CHECK(cudaMalloc(&dst_ptr, per_seq_bytes));
+                        }
+                        bytes_map[layer_idx] = per_seq_bytes;
+                        const char* src_ptr = src_base + static_cast<std::size_t>(b) * per_seq_bytes;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            dst_ptr, src_ptr, per_seq_bytes, cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+            };
+        scatter_prompt_states_to_slots(
+            prompt_recurrent_states,
+            prompt_recurrent_state_bytes,
+            state.slot_recurrent_states,
+            state.slot_recurrent_state_bytes);
+        scatter_prompt_states_to_slots(
+            prompt_conv_states,
+            prompt_conv_state_bytes,
+            state.slot_conv_states,
+            state.slot_conv_state_bytes);
+
+        for (auto& [_, ptr] : prompt_recurrent_states) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
+            }
+        }
+        for (auto& [_, ptr] : prompt_conv_states) {
+            if (ptr) {
+                CUDA_CHECK(cudaFree(ptr));
+            }
         }
     }
 
@@ -774,6 +1252,9 @@ void ContinuousGenerationEngine::release_slot(int slot_id) {
     if (!s.active) return;
 
     page_pool_.free_pages(s.page_ids);
+    if (auto* state = get_engine_state_storage(this)) {
+        free_slot_states_impl(*state, slot_id);
+    }
     s = SequenceSlot{};
     free_slot_stack_.push_back(slot_id);
     batch_dirty_ = true;
@@ -802,6 +1283,10 @@ void ContinuousGenerationEngine::destroy() {
             release_slot(i);
         }
     }
+    if (auto* state = get_engine_state_storage(this)) {
+        clear_state_storage_impl(*state);
+    }
+    erase_engine_state_storage(this);
     initialized_ = false;
 }
 

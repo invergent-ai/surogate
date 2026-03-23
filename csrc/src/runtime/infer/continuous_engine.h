@@ -132,7 +132,6 @@ private:
     /// Rebuild compact batch arrays from active slots.
     /// Only called when batch_dirty_ is true.
     void rebuild_compact_batch();
-
     /// Run one decode token step on the current compact batch (GPU-only, no sync).
     void run_one_decode_step(dsl::GraphExecutor& graph_executor,
                              NCCLCommunicator& comm,

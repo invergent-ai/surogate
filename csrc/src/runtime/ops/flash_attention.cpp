@@ -130,7 +130,7 @@ void log_fp8_direct_decode_fallback_once(const int head_dim) {
     if (printed.compare_exchange_strong(expected, true)) {
         std::fprintf(
             stderr,
-            "FP8 paged direct decode unsupported for head_dim=%d; falling back to BF16 dequant decode.\n",
+            "FP8 paged direct decode unavailable for head_dim=%d; falling back to BF16 dequant decode.\n",
             head_dim);
         std::fflush(stderr);
     }
@@ -223,57 +223,26 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                 const auto* v_pages_layer = reinterpret_cast<const __nv_fp8_e4m3*>(
                     reinterpret_cast<const std::byte*>(mDecodeState->v_pages) + layer_offset);
 
-                const bool flashinfer_head_ok = flashinfer_decode_head_supported(Hs);
-                if (flashinfer_device_ok && flashinfer_head_ok) {
-                    // Native FP8 FlashInfer: reads FP8 KV pages directly,
-                    // dequants on-the-fly in registers.  No temp BF16 buffers.
-                    Tensor fi_page_counts = mRunState.temp_alloc(
-                        ETensorDType::INT32, {static_cast<long>(ds_batch)}, "fi_fp8_page_counts");
-                    Tensor fi_indptr = mRunState.temp_alloc(
-                        ETensorDType::INT32, {static_cast<long>(ds_batch + 1)}, "fi_fp8_indptr");
-                    Tensor fi_last_page_len = mRunState.temp_alloc(
-                        ETensorDType::INT32, {static_cast<long>(ds_batch)}, "fi_fp8_last_page_len");
-                    Tensor fi_indices = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {static_cast<long>(ds_batch) * static_cast<long>(mDecodeState->block_table_stride)},
-                        "fi_fp8_indices");
-                    Tensor fi_request_indices = mRunState.temp_alloc(
-                        ETensorDType::INT32, {static_cast<long>(ds_batch)}, "fi_fp8_request_indices");
-                    Tensor fi_kv_tile_indices = mRunState.temp_alloc(
-                        ETensorDType::INT32, {static_cast<long>(ds_batch)}, "fi_fp8_kv_tile_indices");
-                    Tensor fi_kv_chunk_size = mRunState.temp_alloc(
-                        ETensorDType::INT32, {1}, "fi_fp8_kv_chunk_size");
-                    mTemps.push_back(fi_page_counts);
-                    mTemps.push_back(fi_indptr);
-                    mTemps.push_back(fi_last_page_len);
-                    mTemps.push_back(fi_indices);
-                    mTemps.push_back(fi_request_indices);
-                    mTemps.push_back(fi_kv_tile_indices);
-                    mTemps.push_back(fi_kv_chunk_size);
-
-                    attention_decode_flashinfer_paged_fp8(
+                bool used_fp8_direct = false;
+                if (flashinfer_decode_head_supported(Hs)) {
+                    // Native FP8 direct decode that applies per-position/per-head scales.
+                    used_fp8_direct = attention_decode_paged_fp8_direct(
                         out.get<nv_bfloat16>(), lse.get<float>(),
                         q_bf16,
                         k_pages_layer, v_pages_layer,
+                        mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
+                        mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
                         k_lens_gpu_i32,
                         mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
                         mDecodeState->page_block_size,
                         ds_batch, Hq, Hkv, Hs,
-                        fi_page_counts.get<int32_t>(),
-                        fi_indptr.get<int32_t>(),
-                        fi_last_page_len.get<int32_t>(),
-                        fi_indices.get<int32_t>(),
-                        fi_request_indices.get<int32_t>(),
-                        fi_kv_tile_indices.get<int32_t>(),
-                        fi_kv_chunk_size.get<int32_t>(),
-                        flashinfer_decode_pdl_enabled(),
                         mRunState.MainStream);
+                }
+
+                if (used_fp8_direct) {
                     log_fp8_direct_decode_enabled_once(mRunState.DeviceProp, Hs);
                 } else {
                     // Fallback: dequant FP8 to BF16 + FlashAttention.
-                    if (flashinfer_device_ok && !flashinfer_head_ok) {
-                        log_flashinfer_decode_head_fallback_once(Hs);
-                    }
                     log_fp8_direct_decode_fallback_once(Hs);
                     const int msk = mDecodeState->max_seqlen_k;
                     Tensor k_tmp = mRunState.temp_alloc(ETensorDType::BF16,

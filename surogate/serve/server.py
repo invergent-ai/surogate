@@ -630,12 +630,9 @@ class NativeServingRuntime:
             requested_seq_len,
             max(2, per_seq_budget),
         )
-        # Ensure at least prefill_chunk fits for B=1 prefill.
-        # The runtime needs Inputs tensor to hold max(B*T_decode, 1*T_prefill).
-        # Since B*T_decode = max_num_seqs*1 and 1*T_prefill = prefill_chunk,
-        # we need runtime_seq_len >= prefill_chunk / max_num_seqs... but the
-        # prefill path recompiles with its own (B=1, T) so this is fine.
-        # Just ensure runtime_seq_len >= 2 for decode.
+        # Prefill chunks are capped by the runtime static T capacity in the
+        # continuous engine. This keeps prefill copy/graph shapes within the
+        # trainer's allocated input buffers even when max_model_len is large.
         if runtime_seq_len < requested_seq_len:
             logger.info(
                 "Runtime seq_len budgeted to %d (context_len=%d, batch_size=%d, max_batched_tokens=%d, per_seq_budget=%d, prefill_chunk_size=%d).",
