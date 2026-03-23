@@ -249,6 +249,17 @@ class NativeServingRuntime:
                 logger.info(
                     "Prequant recipe override disabled by SUROGATE_SERVE_PREQUANT_RECIPE=0; using bf16 recipe."
                 )
+        # Auto-enable FP8 KV-cache for prequant FP8 models (halves KV memory).
+        if (
+            prequant_method == "prequant_fp8"
+            and not os.getenv("SUROGATE_ENABLE_FP8_KV_CACHE")
+        ):
+            os.environ["SUROGATE_ENABLE_FP8_KV_CACHE"] = "1"
+            logger.info(
+                "Auto-enabled FP8 KV-cache for prequant FP8 model. "
+                "Set SUROGATE_ENABLE_FP8_KV_CACHE=0 to disable."
+            )
+
         options.use_cuda_graphs = bool(config.use_cuda_graphs)
         if (
             options.use_cuda_graphs
@@ -314,17 +325,6 @@ class NativeServingRuntime:
         self._pending_cv = threading.Condition(self._pending_lock)
         self._pending: list[PendingGeneration] = []
         self._shutdown = False
-        self._batch_wait_s = max(
-            0.0,
-            float(os.getenv("SUROGATE_SERVE_BATCH_WAIT_MS", "2")) / 1000.0,
-        )
-        self._continuous_enabled = os.getenv("SUROGATE_SERVE_CONTINUOUS_BATCHING", "1") != "0"
-        self._persistent_paged_kv_enabled = (
-            os.getenv("SUROGATE_SERVE_PERSISTENT_PAGED_KV", "1") != "0"
-            and hasattr(self.trainer, "open_generation_session")
-            and hasattr(self.trainer, "step_generation_session")
-            and hasattr(self.trainer, "close_generation_session")
-        )
         self._continuous_step_tokens = max(
             1,
             int(os.getenv("SUROGATE_SERVE_CONTINUOUS_STEP_TOKENS", "32")),
@@ -348,38 +348,24 @@ class NativeServingRuntime:
                 moe_step_cap,
                 bool(self._offload_experts),
             )
-        # Trainer capacity is bounded by loaded runtime batch size (total decode sequences B).
         configured_cap = max(1, int(self._runtime_batch_size))
         env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
         self._max_batch_sequences = max(1, min(configured_cap, env_cap))
-        self._full_cuda_graph_bucket_sizes = self._resolve_full_cuda_graph_bucket_sizes(
-            self._max_batch_sequences,
-            enable_auto_when_cuda_graphs=bool(self.config.use_cuda_graphs),
-        )
-        self._full_cuda_graph_padding_enabled = (
-            bool(self.config.use_cuda_graphs)
-            and bool(self._persistent_paged_kv_enabled)
-            and bool(self._full_cuda_graph_bucket_sizes)
-        )
         if self._max_batch_sequences <= 1:
             logger.warning(
                 "Serve runtime running with max_num_seqs=1; concurrent requests will be serialized. "
                 "Set --max_num_seqs>1 to improve throughput."
             )
         self._batch_worker = threading.Thread(
-            target=self._generation_worker_loop,
-            name="surogate-generate-batcher",
+            target=self._continuous_engine_loop,
+            name="surogate-continuous-engine",
             daemon=True,
         )
         self._batch_worker.start()
         logger.info(
-            "Native inference runtime ready (continuous_batching=%s persistent_paged_kv=%s step_tokens=%d idle_step_tokens=%d full_cuda_graph_padding=%s buckets=%s)",
-            bool(self._continuous_enabled),
-            bool(self._persistent_paged_kv_enabled),
+            "Native inference runtime ready (step_tokens=%d idle_step_tokens=%d)",
             int(self._continuous_step_tokens),
             int(self._continuous_idle_step_tokens),
-            bool(self._full_cuda_graph_padding_enabled),
-            self._full_cuda_graph_bucket_sizes if self._full_cuda_graph_bucket_sizes else "[]",
         )
 
     @staticmethod
@@ -637,10 +623,19 @@ class NativeServingRuntime:
             1,
             (max_batched_tokens + requested_batch_size - 1) // requested_batch_size,
         )
+        # Runtime buffer sizing: use per_seq_budget (not prefill_chunk).
+        # Prefill compiles its own graph at B=1,T=chunk_size which doesn't
+        # need the full [max_num_seqs, chunk_size] persistent buffer.
         runtime_seq_len = min(
             requested_seq_len,
-            max(2, prefill_chunk, per_seq_budget),
+            max(2, per_seq_budget),
         )
+        # Ensure at least prefill_chunk fits for B=1 prefill.
+        # The runtime needs Inputs tensor to hold max(B*T_decode, 1*T_prefill).
+        # Since B*T_decode = max_num_seqs*1 and 1*T_prefill = prefill_chunk,
+        # we need runtime_seq_len >= prefill_chunk / max_num_seqs... but the
+        # prefill path recompiles with its own (B=1, T) so this is fine.
+        # Just ensure runtime_seq_len >= 2 for decode.
         if runtime_seq_len < requested_seq_len:
             logger.info(
                 "Runtime seq_len budgeted to %d (context_len=%d, batch_size=%d, max_batched_tokens=%d, per_seq_budget=%d, prefill_chunk_size=%d).",
@@ -786,105 +781,7 @@ class NativeServingRuntime:
             completion_tokens=len(out_ids),
         )
 
-    def _prompt_capacity(self, params: GenerationParams) -> int:
-        return max(1, self._max_batch_sequences // max(1, params.n))
-
-    @staticmethod
-    def _resolve_full_cuda_graph_bucket_sizes(
-        prompt_cap: int, *, enable_auto_when_cuda_graphs: bool = False
-    ) -> list[int]:
-        raw = os.getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS", "").strip()
-        if not raw and enable_auto_when_cuda_graphs:
-            raw = "auto"
-            os.environ["SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS"] = raw
-            logger.info(
-                "Defaulting SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS=auto because use_cuda_graphs is enabled."
-            )
-        if not raw:
-            return []
-
-        raw_lower = raw.lower()
-        if raw_lower == "auto":
-            buckets: list[int] = []
-            b = 1
-            while b < prompt_cap:
-                buckets.append(b)
-                b *= 2
-            buckets.append(prompt_cap)
-            return buckets
-
-        parsed: list[int] = []
-        for token in raw.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            try:
-                value = int(token)
-            except ValueError:
-                logger.warning(
-                    "Ignoring invalid SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS entry=%r (expected int or 'auto').",
-                    token,
-                )
-                continue
-            if value <= 0:
-                continue
-            parsed.append(value)
-
-        if not parsed:
-            return []
-
-        buckets = sorted({value for value in parsed if value <= prompt_cap})
-        if not buckets:
-            logger.warning(
-                "SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS=%r has no values within prompt cap=%d; disabling padding.",
-                raw,
-                prompt_cap,
-            )
-            return []
-        return buckets
-
-    def _select_full_cuda_graph_bucket(self, batch_size: int) -> int:
-        for bucket in self._full_cuda_graph_bucket_sizes:
-            if bucket >= batch_size:
-                return bucket
-        return batch_size
-
-    def _append_full_cuda_graph_padding_rows(
-        self,
-        active: list[ActiveGeneration],
-        params: GenerationParams,
-    ) -> None:
-        if not self._full_cuda_graph_padding_enabled:
-            return
-
-        current_size = len(active)
-        target_size = self._select_full_cuda_graph_bucket(current_size)
-        if target_size <= current_size:
-            return
-
-        padding = target_size - current_size
-        for _ in range(padding):
-            pad_pending = PendingGeneration(
-                # Keep row prompt valid/non-empty for open_generation_session().
-                prompt_ids=[int(self.eos_id)],
-                stop_strings=[],
-                params=params,
-            )
-            active.append(
-                ActiveGeneration(
-                    pending=pad_pending,
-                    finished=True,
-                    finish_reason="stop",
-                    done_signaled=True,
-                    is_padding=True,
-                )
-            )
-
-        logger.debug(
-            "Padded persistent session from %d to %d rows for full CUDA-graph bucketing.",
-            current_size,
-            target_size,
-        )
+    # (Old session-based methods removed — continuous engine is the only path.)
 
     def _fit_prompt_and_max_tokens(
         self,
@@ -910,178 +807,9 @@ class NativeServingRuntime:
             )
         return out_prompt, requested_max_tokens
 
-    def _run_generation_batch(self, batch: list[PendingGeneration]) -> None:
-        params = batch[0].params
-        prompts = [item.prompt_ids for item in batch]
-        tokens, _, prompt_lens, completion_lens = self.trainer.generate(
-            prompts=prompts,
-            num_completions=params.n,
-            max_gen_len=params.max_tokens,
-            temperature=params.temperature,
-            eos_token_id=self.eos_id,
-            use_lora=False,
-            use_cuda_graphs=self.config.use_cuda_graphs,
-            top_k=params.top_k,
-            top_p=params.top_p,
-            min_p=params.min_p,
-            prefill_chunk_size=self.config.prefill_chunk_size,
-            repetition_penalty=params.repetition_penalty,
-        )
-
-        for b_idx, item in enumerate(batch):
-            choices: list[GeneratedChoice] = []
-            for c_idx in range(params.n):
-                row_idx = b_idx * params.n + c_idx
-                choices.append(
-                    self._build_choice(
-                        tokens[row_idx],
-                        int(prompt_lens[row_idx]),
-                        int(completion_lens[row_idx]),
-                        index=c_idx,
-                        max_tokens=params.max_tokens,
-                        stop_strings=item.stop_strings,
-                    )
-                )
-            item.result = choices
-
-    def _run_continuous_step(
-        self,
-        active: list[ActiveGeneration],
-        params: GenerationParams,
-        *,
-        step_tokens: int,
-    ) -> None:
-        prompts = [
-            item.pending.prompt_ids + item.generated_ids
-            for item in active
-        ]
-        tokens, _, prompt_lens, completion_lens = self.trainer.generate(
-            prompts=prompts,
-            num_completions=1,
-            max_gen_len=step_tokens,
-            temperature=params.temperature,
-            eos_token_id=self.eos_id,
-            use_lora=False,
-            use_cuda_graphs=self.config.use_cuda_graphs,
-            top_k=params.top_k,
-            top_p=params.top_p,
-            min_p=params.min_p,
-            prefill_chunk_size=self.config.prefill_chunk_size,
-            repetition_penalty=params.repetition_penalty,
-        )
-
-        for row_idx, item in enumerate(active):
-            if item.finished:
-                continue
-
-            pl = int(prompt_lens[row_idx])
-            cl = int(completion_lens[row_idx])
-            if cl <= 0:
-                # Defensive: avoid spinning if backend returns no new tokens.
-                item.finished = True
-                item.finish_reason = "stop"
-                continue
-
-            new_ids = [int(t) for t in tokens[row_idx][pl : pl + cl]]
-            if new_ids:
-                item.generated_ids.extend(new_ids)
-
-            raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
-            trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
-            if stop_hit:
-                item.generated_ids = [
-                    int(t)
-                    for t in self.tokenizer.encode(trimmed_text, add_special_tokens=False)
-                ]
-                item.finished = True
-                item.finish_reason = "stop"
-                continue
-
-            if item.generated_ids and item.generated_ids[-1] == self.eos_id:
-                item.finished = True
-                item.finish_reason = "stop"
-                continue
-
-            if len(item.generated_ids) >= params.max_tokens:
-                if len(item.generated_ids) > params.max_tokens:
-                    item.generated_ids = item.generated_ids[: params.max_tokens]
-                item.finished = True
-                item.finish_reason = "length"
-
-    def _open_persistent_continuous_session(
-        self, active: list[ActiveGeneration], params: GenerationParams
-    ) -> int:
-        prompts = [item.pending.prompt_ids for item in active]
-        session_id = self.trainer.open_generation_session(
-            prompts=prompts,
-            max_gen_len=params.max_tokens,
-            temperature=params.temperature,
-            eos_token_id=self.eos_id,
-            use_lora=False,
-            use_cuda_graphs=self.config.use_cuda_graphs,
-            top_k=params.top_k,
-            top_p=params.top_p,
-            min_p=params.min_p,
-            prefill_chunk_size=self.config.prefill_chunk_size,
-            repetition_penalty=params.repetition_penalty,
-        )
-        return int(session_id)
-
-    def _run_persistent_continuous_step(
-        self,
-        session_id: int,
-        active: list[ActiveGeneration],
-        params: GenerationParams,
-        *,
-        step_tokens: int,
-    ) -> bool:
-        force_finished_rows = [idx for idx, item in enumerate(active) if item.finished]
-        tokens, completion_lens, finished, all_finished = self.trainer.step_generation_session(
-            session_id=session_id,
-            step_tokens=step_tokens,
-            force_finished_rows=force_finished_rows,
-        )
-
-        _ = completion_lens  # Completion lengths are implicit in generated_ids for serving output.
-
-        for row_idx, item in enumerate(active):
-            if item.finished:
-                continue
-
-            new_ids = [int(t) for t in tokens[row_idx]]
-            if new_ids:
-                item.generated_ids.extend(new_ids)
-
-            raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
-            trimmed_text, stop_hit = _apply_stop(raw_text, item.pending.stop_strings)
-            if stop_hit:
-                item.generated_ids = [
-                    int(t)
-                    for t in self.tokenizer.encode(trimmed_text, add_special_tokens=False)
-                ]
-                item.finished = True
-                item.finish_reason = "stop"
-                continue
-
-            if item.generated_ids and item.generated_ids[-1] == self.eos_id:
-                item.finished = True
-                item.finish_reason = "stop"
-                continue
-
-            if len(item.generated_ids) >= params.max_tokens:
-                if len(item.generated_ids) > params.max_tokens:
-                    item.generated_ids = item.generated_ids[: params.max_tokens]
-                item.finished = True
-                item.finish_reason = "length"
-                continue
-
-            if int(finished[row_idx]) != 0:
-                item.finished = True
-                item.finish_reason = (
-                    "length" if len(item.generated_ids) >= params.max_tokens else "stop"
-                )
-
-        return bool(all_finished)
+    # Old session-based methods (_run_generation_batch, _run_continuous_step,
+    # _open_persistent_continuous_session, _run_persistent_continuous_step)
+    # have been removed — the continuous engine is the only serving path.
 
     def _finalize_continuous_request(self, item: ActiveGeneration) -> None:
         raw_text = self.tokenizer.decode(item.generated_ids, skip_special_tokens=True)
@@ -1104,216 +832,202 @@ class NativeServingRuntime:
             )
         ]
 
-    def _generation_worker_loop(self) -> None:
-        while True:
-            with self._pending_cv:
-                while not self._pending and not self._shutdown:
-                    self._pending_cv.wait()
-                if self._shutdown:
-                    return
-                first = self._pending.pop(0)
+    # ------------------------------------------------------------------
+    # Continuous engine loop (iteration-level continuous batching)
+    # ------------------------------------------------------------------
 
-            # Fallback for n>1: keep the previous one-shot batch behavior.
-            if (not self._continuous_enabled) or first.params.n != 1:
-                batch: list[PendingGeneration] = [first]
-                prompt_cap = self._prompt_capacity(first.params)
-                deadline = time.perf_counter() + self._batch_wait_s
-                with self._pending_cv:
-                    while len(batch) < prompt_cap:
-                        remaining = deadline - time.perf_counter()
-                        if remaining <= 0:
-                            break
-                        if not self._pending:
-                            self._pending_cv.wait(timeout=remaining)
-                            continue
+    def _pop_one_pending(self) -> Optional[ActiveGeneration]:
+        """Pop one pending request from the queue, or None."""
+        with self._pending_cv:
+            if self._pending:
+                return ActiveGeneration(pending=self._pending.pop(0))
+        return None
 
-                        i = 0
-                        while i < len(self._pending) and len(batch) < prompt_cap:
-                            item = self._pending[i]
-                            if item.params == first.params:
-                                batch.append(self._pending.pop(i))
-                            else:
-                                i += 1
-                        if not self._pending:
-                            continue
+    def _continuous_engine_loop(self) -> None:
+        """Iteration-level continuous batching loop.
 
-                err: Optional[Exception] = None
-                try:
-                    self._run_generation_batch(batch)
-                except Exception as e:
-                    err = e
+        Each iteration:
+          1. Admit at most ONE new request (prefill it).
+          2. Decode all active sequences.
+          3. Finalize finished sequences.
 
-                for item in batch:
-                    if err is not None:
-                        item.error = err
-                    item.done.set()
-                continue
+        By admitting only 1 request per iteration, prefill is interleaved
+        with decode — early requests start generating immediately while
+        later requests are still being prefilled.
+        """
+        engine_id: Optional[int] = None
+        slot_map: dict[int, ActiveGeneration] = {}
 
-            params = first.params
-            prompt_cap = self._prompt_capacity(params)
-            active: list[ActiveGeneration] = [ActiveGeneration(pending=first)]
-            deadline = time.perf_counter() + self._batch_wait_s
-            with self._pending_cv:
-                while len(active) < prompt_cap:
-                    remaining = deadline - time.perf_counter()
-                    if remaining <= 0:
+        try:
+            engine_max_seq_len = min(
+                self._runtime_seq_len,
+                self.config.max_model_len
+                if self.config.max_model_len is not None
+                else 8192,
+            )
+            engine_id = int(
+                self.trainer.create_continuous_engine(
+                    max_num_seqs=self._max_batch_sequences,
+                    max_seq_len=engine_max_seq_len,
+                    gpu_memory_utilization=self.config.gpu_memory_utilization,
+                    use_cuda_graphs=bool(self.config.use_cuda_graphs),
+                )
+            )
+            logger.info(
+                "Continuous engine created (max_seqs=%d, max_seq_len=%d, engine_id=%d)",
+                self._max_batch_sequences,
+                engine_max_seq_len,
+                engine_id,
+            )
+
+            while not self._shutdown:
+                # --- Phase 1: Admit all pending requests ---
+                # Prefill all available requests as fast as possible to
+                # maximize decode batch size and throughput.
+                free_slots = self._max_batch_sequences - len(slot_map)
+                while free_slots > 0:
+                    new_item = self._pop_one_pending()
+                    if new_item is None:
                         break
-                    if not self._pending:
-                        self._pending_cv.wait(timeout=remaining)
-                        continue
-                    i = 0
-                    while i < len(self._pending) and len(active) < prompt_cap:
-                        queued = self._pending[i]
-                        if queued.params == params:
-                            active.append(ActiveGeneration(pending=self._pending.pop(i)))
-                        else:
-                            i += 1
-
-            if self._persistent_paged_kv_enabled:
-                session_id: Optional[int] = None
-                err: Optional[Exception] = None
-                try:
-                    self._append_full_cuda_graph_padding_rows(active, params)
-                    session_id = self._open_persistent_continuous_session(active, params)
-                    while True:
-                        unfinished = [a for a in active if not a.finished]
-                        if not unfinished:
+                    try:
+                        prompt_ids = new_item.pending.prompt_ids
+                        max_tokens = new_item.pending.params.max_tokens
+                        if len(prompt_ids) + max_tokens > self._runtime_seq_len:
+                            max_tokens = max(
+                                1, self._runtime_seq_len - len(prompt_ids)
+                            )
+                        slot_id = self.trainer.engine_add_sequence(
+                            engine_id,
+                            prompt_ids,
+                            max_gen_len=max_tokens,
+                            temperature=new_item.pending.params.temperature,
+                            eos_token_id=self.eos_id,
+                            top_k=new_item.pending.params.top_k,
+                            top_p=new_item.pending.params.top_p,
+                            min_p=new_item.pending.params.min_p,
+                            prefill_chunk_size=self.config.prefill_chunk_size,
+                        )
+                        if slot_id < 0:
+                            with self._pending_cv:
+                                self._pending.insert(0, new_item.pending)
                             break
+                        slot_map[slot_id] = new_item
+                        free_slots -= 1
+                    except Exception as exc:
+                        new_item.pending.error = exc
+                        new_item.pending.done.set()
 
-                        with self._pending_cv:
-                            waiting_match = any(p.params == params for p in self._pending)
-
-                        remaining_min = min(
-                            max(1, params.max_tokens - len(a.generated_ids))
-                            for a in unfinished
-                        )
-                        remaining_max = max(
-                            max(1, params.max_tokens - len(a.generated_ids))
-                            for a in unfinished
-                        )
-                        if waiting_match:
-                            step_tokens = max(
-                                1, min(self._continuous_step_tokens, remaining_min)
-                            )
-                        else:
-                            step_tokens = max(
-                                1, min(self._continuous_idle_step_tokens, remaining_max)
-                            )
-
-                        backend_all_finished = self._run_persistent_continuous_step(
-                            session_id, active, params, step_tokens=step_tokens
-                        )
-
-                        for item in active:
-                            if item.finished and not item.done_signaled:
-                                self._finalize_continuous_request(item)
-                                item.pending.done.set()
-                                item.done_signaled = True
-
-                        if backend_all_finished and all(a.finished for a in active):
-                            break
-
-                    for item in active:
-                        if item.done_signaled:
-                            continue
-                        if not item.finished:
-                            item.finished = True
-                            if len(item.generated_ids) >= params.max_tokens:
-                                item.finish_reason = "length"
-                            elif item.generated_ids and item.generated_ids[-1] == self.eos_id:
-                                item.finish_reason = "stop"
-                            else:
-                                item.finish_reason = "stop"
-                        self._finalize_continuous_request(item)
-                        item.pending.done.set()
-                        item.done_signaled = True
-                except Exception as e:
-                    err = e
-                finally:
-                    if session_id is not None:
-                        try:
-                            self.trainer.close_generation_session(session_id)
-                        except Exception as close_exc:
-                            logger.warning(
-                                "close_generation_session(%s) failed: %s",
-                                session_id,
-                                close_exc,
-                            )
-                    if err is not None:
-                        for item in active:
-                            if item.done_signaled:
-                                continue
-                            item.pending.error = err
-                            item.pending.done.set()
-                continue
-
-            while True:
-                waiting_match = False
-                with self._pending_cv:
-                    i = 0
-                    while i < len(self._pending):
-                        queued = self._pending[i]
-                        if queued.params != params:
-                            i += 1
-                            continue
-                        if len(active) < prompt_cap:
-                            active.append(ActiveGeneration(pending=self._pending.pop(i)))
-                            continue
-                        waiting_match = True
-                        i += 1
-
-                if not active:
-                    if not waiting_match:
-                        break
+                if not slot_map:
+                    # No active work — wait briefly for a request.
+                    with self._pending_cv:
+                        if not self._pending and not self._shutdown:
+                            self._pending_cv.wait(timeout=0.001)
                     continue
 
-                unfinished = [a for a in active if not a.finished]
-                if not unfinished:
-                    active.clear()
-                    if not waiting_match:
-                        break
-                    continue
-
-                remaining_min = min(
-                    max(1, params.max_tokens - len(a.generated_ids))
-                    for a in unfinished
-                )
-                remaining_max = max(
-                    max(1, params.max_tokens - len(a.generated_ids))
-                    for a in unfinished
-                )
-
-                if waiting_match:
-                    # Keep short decode quanta while compatible requests are queued
-                    # so new arrivals can join quickly.
-                    step_tokens = max(
-                        1, min(self._continuous_step_tokens, remaining_min)
-                    )
+                # --- Phase 2: Decode multiple tokens in C++ ---
+                # Adaptive step sizing: small when queue has waiters,
+                # large when idle (matches old session-based logic).
+                # Use small step_tokens only when there are pending requests
+                # AND free slots to admit them.  If slots are full, pending
+                # requests can't be admitted anyway — maximize decode throughput.
+                free_slots_now = self._max_batch_sequences - len(slot_map)
+                with self._pending_cv:
+                    waiting_and_admittable = bool(self._pending) and free_slots_now > 0
+                if waiting_and_admittable:
+                    step_tokens = self._continuous_step_tokens
                 else:
-                    # Queue is drained: prioritize throughput and avoid repeated
-                    # full-prompt re-prefill across multiple micro-steps.
-                    step_tokens = max(1, remaining_max)
+                    step_tokens = self._continuous_idle_step_tokens
+                # Cap by the minimum remaining budget across active seqs.
+                min_remaining = min(
+                    max(1, item.pending.params.max_tokens - len(item.generated_ids))
+                    for item in slot_map.values()
+                    if not item.finished
+                )
+                step_tokens = max(1, min(step_tokens, min_remaining))
 
-                err: Optional[Exception] = None
                 try:
-                    self._run_continuous_step(active, params, step_tokens=step_tokens)
-                except Exception as e:
-                    err = e
+                    slot_ids, tokens_per_slot, finished_flags, comp_lens = (
+                        self.trainer.engine_step(engine_id, step_tokens)
+                    )
+                except Exception as exc:
+                    for item in slot_map.values():
+                        if not item.finished:
+                            item.pending.error = exc
+                            item.pending.done.set()
+                    slot_map.clear()
+                    logger.exception("engine_step failed")
+                    continue
 
-                if err is not None:
-                    for item in active:
-                        item.pending.error = err
-                        item.pending.done.set()
-                    break
+                # --- Phase 3: Process multi-token results ---
+                release_slots: list[int] = []
+                for sid, toks, fin, clen in zip(
+                    slot_ids, tokens_per_slot, finished_flags, comp_lens
+                ):
+                    item = slot_map.get(sid)
+                    if item is None or item.finished:
+                        continue
+                    item.generated_ids.extend(int(t) for t in toks)
 
-                still_active: list[ActiveGeneration] = []
-                for item in active:
-                    if item.finished:
+                    should_finish = bool(fin)
+                    if not should_finish and item.pending.stop_strings:
+                        partial_text = self.tokenizer.decode(
+                            item.generated_ids, skip_special_tokens=True
+                        )
+                        _, stop_hit = _apply_stop(
+                            partial_text, item.pending.stop_strings
+                        )
+                        if stop_hit:
+                            should_finish = True
+                    if not should_finish:
+                        if len(item.generated_ids) >= item.pending.params.max_tokens:
+                            should_finish = True
+
+                    if should_finish:
+                        item.finished = True
+                        last_tok = item.generated_ids[-1] if item.generated_ids else -1
+                        if last_tok == self.eos_id:
+                            item.finish_reason = "stop"
+                        elif item.pending.stop_strings:
+                            partial_text = self.tokenizer.decode(
+                                item.generated_ids, skip_special_tokens=True
+                            )
+                            _, stop_hit = _apply_stop(
+                                partial_text, item.pending.stop_strings
+                            )
+                            item.finish_reason = "stop" if stop_hit else "length"
+                        else:
+                            item.finish_reason = "length"
+
                         self._finalize_continuous_request(item)
                         item.pending.done.set()
-                    else:
-                        still_active.append(item)
-                active = still_active
+                        release_slots.append(sid)
+
+                for sid in release_slots:
+                    try:
+                        self.trainer.engine_release_slot(engine_id, sid)
+                    except Exception:
+                        logger.exception("engine_release_slot(%d) failed", sid)
+                    slot_map.pop(sid, None)
+
+        except Exception:
+            logger.exception("continuous engine loop crashed")
+        finally:
+            # Cleanup: release all active slots, destroy engine.
+            if engine_id is not None:
+                for sid in list(slot_map.keys()):
+                    try:
+                        self.trainer.engine_release_slot(engine_id, sid)
+                    except Exception:
+                        pass
+                try:
+                    self.trainer.engine_destroy(engine_id)
+                except Exception:
+                    pass
+            # Signal any remaining pending requests.
+            for item in slot_map.values():
+                if not item.pending.done.is_set():
+                    item.pending.error = RuntimeError("continuous engine shut down")
+                    item.pending.done.set()
 
     def _generate(
         self,

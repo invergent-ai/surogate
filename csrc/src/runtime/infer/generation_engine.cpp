@@ -730,12 +730,14 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         rng_offset++;
 
         if (gen_config.temperature <= 0.0f) {
-            sampling_softmax(logits_gpu, probs_gpu, nullptr,
-                             total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
-                             mRunState.MainStream);
+            // Greedy: compute log-softmax directly from logits (skip materializing probs).
+            sampling_extract_logprob_from_logits(logits_gpu, sampled_tokens_gpu, logprobs_gpu,
+                                                  nullptr, total_batch, V, mRunState.MainStream);
+        } else {
+            // Non-greedy: probs already computed by sampling_softmax above.
+            sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
+                                     total_batch, V, mRunState.MainStream);
         }
-        sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
-                                 total_batch, V, mRunState.MainStream);
 
         // Store step outputs on GPU; host copies are done once after decode.
         const std::size_t step_off =

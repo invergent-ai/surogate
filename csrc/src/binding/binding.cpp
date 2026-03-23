@@ -1534,6 +1534,53 @@ NB_MODULE(_surogate, m) {
         .def("close_generation_session", &MultiGPUPyTrainer::close_generation_session,
         nb::arg("session_id"),
         "Close and release a persistent generation session.")
+        // -- Continuous generation engine (iteration-level continuous batching) --
+        .def("create_continuous_engine", &MultiGPUPyTrainer::create_continuous_engine,
+        nb::arg("max_num_seqs"), nb::arg("max_seq_len"),
+        nb::arg("gpu_memory_utilization") = 0.9f,
+        nb::arg("use_cuda_graphs") = true,
+        "Create a continuous generation engine for iteration-level batching.\n"
+        "Returns engine_id.")
+        .def("engine_add_sequences_batch", &MultiGPUPyTrainer::engine_add_sequences_batch,
+        nb::arg("engine_id"), nb::arg("prompts"),
+        nb::arg("max_gen_len") = 512,
+        nb::arg("temperature") = 1.0f,
+        nb::arg("eos_token_id") = 2,
+        nb::arg("top_k") = 0,
+        nb::arg("top_p") = 1.0f,
+        nb::arg("min_p") = 0.0f,
+        nb::arg("prefill_chunk_size") = 256,
+        "Batch-prefill multiple prompts and assign slots. Returns slot_ids (-1 for failures).")
+        .def("engine_add_sequence", &MultiGPUPyTrainer::engine_add_sequence,
+        nb::arg("engine_id"), nb::arg("prompt_ids"),
+        nb::arg("max_gen_len") = 512,
+        nb::arg("temperature") = 1.0f,
+        nb::arg("eos_token_id") = 2,
+        nb::arg("top_k") = 0,
+        nb::arg("top_p") = 1.0f,
+        nb::arg("min_p") = 0.0f,
+        nb::arg("prefill_chunk_size") = 256,
+        "Prefill a prompt and assign a slot. Returns slot_id (-1 if full).")
+        .def("engine_step", [](MultiGPUPyTrainer* trainer,
+                std::uint64_t engine_id,
+                int step_tokens) {
+            auto step = trainer->engine_step(engine_id, step_tokens);
+            return nb::make_tuple(
+                step.slot_ids,
+                step.tokens,
+                step.finished,
+                step.completion_lens);
+        },
+        nb::arg("engine_id"),
+        nb::arg("step_tokens") = 1,
+        "Decode up to step_tokens for all active sequences.\n"
+        "Returns (slot_ids, tokens_per_slot, finished, completion_lens).")
+        .def("engine_release_slot", &MultiGPUPyTrainer::engine_release_slot,
+        nb::arg("engine_id"), nb::arg("slot_id"),
+        "Release a slot and recycle its KV-cache pages.")
+        .def("engine_destroy", &MultiGPUPyTrainer::engine_destroy,
+        nb::arg("engine_id"),
+        "Destroy a continuous generation engine.")
         .def("set_grad_accumulation", &MultiGPUPyTrainer::set_grad_accumulation, nb::arg("n"),
              "Set the gradient accumulation step count for the next training step.\n\n"
              "Call this before the first step_with_custom_loss() of each optimizer step\n"

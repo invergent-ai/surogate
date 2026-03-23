@@ -389,6 +389,8 @@ target_sources(surogate-common PRIVATE
 
     # Inference (autoregressive generation engine for GRPO)
     src/runtime/infer/generation_engine.cpp
+    # Continuous generation engine (iteration-level continuous batching for serving)
+    src/runtime/infer/continuous_engine.cpp
 
     # Tokenizer (native C++ BPE, loads HuggingFace tokenizer.json)
     src/tokenizer/tokenizer.cpp

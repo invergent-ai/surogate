@@ -32,9 +32,9 @@ class ServeConfig:
     # Number of GPUs to initialize for the runtime.
     gpus: int = 1
     # vLLM-style batch capacity (maximum number of sequences per batch).
-    max_num_seqs: int = 8
+    max_num_seqs: int = 64
     # vLLM-style token budget for one scheduler step / runtime buffer sizing.
-    max_num_batched_tokens: int = 512
+    max_num_batched_tokens: int = 2048
     # Maximum context length for serving requests. If None, defaults to the
     # model's max supported context length.
     max_model_len: Optional[int] = None
@@ -63,7 +63,7 @@ class ServeConfig:
     # Enable CUDA graph execution in inference path.
     use_cuda_graphs: bool = True
     # Prefill chunk size for long-prompt chunked prefill (0 disables chunking).
-    prefill_chunk_size: int = 256
+    prefill_chunk_size: int = 2048
     # Tracks config keys explicitly set via YAML/CLI overrides.
     _explicit_fields: set[str] = field(default_factory=set, init=False, repr=False)
 

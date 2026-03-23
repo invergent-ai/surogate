@@ -34,6 +34,7 @@
 #include "runtime/dsl/dsl_param_store.h"
 #include "runtime/dsl/graph_executor.h"
 #include "runtime/infer/generation_engine.h"
+#include "runtime/infer/continuous_engine.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/optimizers/normuon.h"
@@ -2356,6 +2357,209 @@ void MultiGPUPyTrainer::close_generation_session(std::uint64_t session_id) {
         session->close(*graph_exec);
         session.reset();
     });
+}
+
+// ============================================================================
+// Continuous generation engine (iteration-level continuous batching)
+// ============================================================================
+
+std::uint64_t MultiGPUPyTrainer::create_continuous_engine(
+        int max_num_seqs, int max_seq_len,
+        float gpu_memory_utilization, bool use_cuda_graphs) {
+    if (max_num_seqs <= 0) {
+        throw std::invalid_argument("create_continuous_engine: max_num_seqs must be > 0");
+    }
+
+    auto engine = std::make_unique<infer::ContinuousGenerationEngine>();
+    std::uint64_t engine_id = 0;
+
+    // For now, use rank 0 only (single-GPU continuous engine).
+    run_work([&](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("create_continuous_engine: model is not a DslModel");
+        }
+        auto& run_state = dsl_model->dsl_run_state();
+        auto& params = dsl_model->param_store();
+        const auto& model_config = dsl_model->model_config();
+
+        // Compute page budget based on GPU memory utilization.
+        const std::size_t free_arena = run_state.Stack.unused_capacity();
+        const std::size_t usable = static_cast<std::size_t>(
+            static_cast<double>(free_arena) * gpu_memory_utilization);
+
+        const int Hkv = model_config.NumKeyValHeads;
+        const int Hs = model_config.head_size();
+        const int num_layers = model_config.NumLayers;
+        constexpr int kPageBlockSize = 256;
+        const int elem_bytes = 2;  // BF16 default
+        const std::size_t page_bytes_per_pool =
+            static_cast<std::size_t>(num_layers) * kPageBlockSize * Hkv * Hs * elem_bytes;
+        const std::size_t page_bytes_total = 2 * page_bytes_per_pool;  // K + V
+
+        // Reserve space for decode buffers (~max_num_seqs * V * 4 for logits, etc.).
+        const std::size_t decode_buffer_estimate =
+            static_cast<std::size_t>(max_num_seqs)
+            * static_cast<std::size_t>(model_config.VocabSize) * sizeof(float)
+            + static_cast<std::size_t>(max_num_seqs) * 256 * 16;  // misc buffers
+
+        const std::size_t kv_budget =
+            (usable > decode_buffer_estimate) ? (usable - decode_buffer_estimate) : 0;
+        int total_pages = static_cast<int>(kv_budget / page_bytes_total);
+        total_pages = std::max(total_pages, max_num_seqs);  // at least 1 page per seq
+
+        engine->init(
+            max_num_seqs, max_seq_len, total_pages,
+            use_cuda_graphs,
+            run_state, params, model_config, mOptions, run_state.Stack);
+
+        // Pre-warm prefill graphs for common prompt lengths to eliminate
+        // compilation latency on the first real request.
+        auto* ge = dsl_model->graph_executor();
+        if (ge) {
+            engine->warm_prefill_graphs(*ge, *ctx.Communicator);
+        }
+    }, /*idx=*/0);
+
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        engine_id = mNextContinuousEngineId++;
+        mContinuousEngines[engine_id] = std::move(engine);
+    }
+    return engine_id;
+}
+
+int MultiGPUPyTrainer::engine_add_sequence(
+        std::uint64_t engine_id,
+        const std::vector<int32_t>& prompt_ids,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p,
+        int prefill_chunk_size) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("engine_add_sequence: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    int slot_id = -1;
+    run_work([&](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("engine_add_sequence: model is not a DslModel");
+        }
+        auto* graph_exec = dsl_model->graph_executor();
+        if (!graph_exec) {
+            throw std::runtime_error("engine_add_sequence: model has no GraphExecutor");
+        }
+        slot_id = eng->add_sequence(
+            prompt_ids, max_gen_len, temperature, eos_token_id,
+            top_k, top_p, min_p, prefill_chunk_size,
+            *graph_exec, *ctx.Communicator);
+    }, /*idx=*/0);
+
+    return slot_id;
+}
+
+std::vector<int> MultiGPUPyTrainer::engine_add_sequences_batch(
+        std::uint64_t engine_id,
+        const std::vector<std::vector<int32_t>>& prompts,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p,
+        int prefill_chunk_size) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("engine_add_sequences_batch: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    std::vector<int> slot_ids;
+    run_work([&](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("engine_add_sequences_batch: model is not a DslModel");
+        }
+        auto* graph_exec = dsl_model->graph_executor();
+        if (!graph_exec) {
+            throw std::runtime_error("engine_add_sequences_batch: model has no GraphExecutor");
+        }
+        infer::ContinuousGenerationEngine::BatchAddConfig cfg;
+        cfg.max_gen_len = max_gen_len;
+        cfg.temperature = temperature;
+        cfg.eos_token_id = eos_token_id;
+        cfg.top_k = top_k;
+        cfg.top_p = top_p;
+        cfg.min_p = min_p;
+        cfg.prefill_chunk_size = prefill_chunk_size;
+        slot_ids = eng->add_sequences_batch(prompts, cfg, *graph_exec, *ctx.Communicator);
+    }, /*idx=*/0);
+
+    return slot_ids;
+}
+
+MultiGPUPyTrainer::ContinuousStepResult MultiGPUPyTrainer::engine_step(
+        std::uint64_t engine_id, int step_tokens) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("engine_step: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    ContinuousStepResult result;
+    run_work([&](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("engine_step: model is not a DslModel");
+        }
+        auto* graph_exec = dsl_model->graph_executor();
+        if (!graph_exec) {
+            throw std::runtime_error("engine_step: model has no GraphExecutor");
+        }
+        auto step = eng->step(step_tokens, *graph_exec, *ctx.Communicator);
+        result.slot_ids = std::move(step.slot_ids);
+        result.tokens = std::move(step.tokens);
+        result.finished = std::move(step.finished);
+        result.completion_lens = std::move(step.completion_lens);
+    }, /*idx=*/0);
+
+    return result;
+}
+
+void MultiGPUPyTrainer::engine_release_slot(
+        std::uint64_t engine_id, int slot_id) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) return;
+        eng = it->second.get();
+    }
+    eng->release_slot(slot_id);
+}
+
+void MultiGPUPyTrainer::engine_destroy(std::uint64_t engine_id) {
+    std::unique_ptr<infer::ContinuousGenerationEngine> eng;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) return;
+        eng = std::move(it->second);
+        mContinuousEngines.erase(it);
+    }
+    if (eng) {
+        eng->destroy();
+    }
 }
 
 int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {

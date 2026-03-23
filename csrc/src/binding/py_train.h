@@ -35,6 +35,7 @@ class CommunicatorThreadsPack;
 class NCCLCommunicator;
 namespace infer {
 class GenerationSession;
+class ContinuousGenerationEngine;
 }
 
 //! \brief A multi-GPU trainer wrapper to be used for python bindings
@@ -225,6 +226,48 @@ public:
 
     void close_generation_session(std::uint64_t session_id);
 
+    // -----------------------------------------------------------------------
+    // Continuous generation engine (iteration-level continuous batching).
+    // -----------------------------------------------------------------------
+
+    /// Create a persistent continuous engine.  Returns engine_id.
+    std::uint64_t create_continuous_engine(
+        int max_num_seqs, int max_seq_len,
+        float gpu_memory_utilization,
+        bool use_cuda_graphs);
+
+    /// Add a sequence to the engine (prefill + assign slot).  Returns slot_id.
+    int engine_add_sequence(
+        std::uint64_t engine_id,
+        const std::vector<int32_t>& prompt_ids,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p,
+        int prefill_chunk_size);
+
+    struct ContinuousStepResult {
+        std::vector<int> slot_ids;
+        std::vector<std::vector<int32_t>> tokens;  // per-slot token vectors
+        std::vector<int> finished;
+        std::vector<int> completion_lens;
+    };
+
+    /// Batch-add multiple sequences (batch prefill).
+    std::vector<int> engine_add_sequences_batch(
+        std::uint64_t engine_id,
+        const std::vector<std::vector<int32_t>>& prompts,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p,
+        int prefill_chunk_size);
+
+    /// Decode up to step_tokens for all active sequences.
+    ContinuousStepResult engine_step(std::uint64_t engine_id, int step_tokens);
+
+    /// Release a slot (frees KV pages).
+    void engine_release_slot(std::uint64_t engine_id, int slot_id);
+
+    /// Destroy the engine.
+    void engine_destroy(std::uint64_t engine_id);
+
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism
     RuntimeOptions mOptions;
@@ -271,6 +314,10 @@ private:
     std::mutex mGenerationSessionsMutex;
     std::uint64_t mNextGenerationSessionId = 1;
     std::unordered_map<std::uint64_t, std::unique_ptr<GenerationSessionBundle>> mGenerationSessions;
+
+    std::mutex mContinuousEnginesMutex;
+    std::uint64_t mNextContinuousEngineId = 1;
+    std::unordered_map<std::uint64_t, std::unique_ptr<infer::ContinuousGenerationEngine>> mContinuousEngines;
 
     std::function<void(sThreadContext& ctx)> fetch_work(sThreadContext& ctx);
     void run_work(std::function<void(sThreadContext& ctx)> work, int idx=-1);
