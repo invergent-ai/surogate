@@ -1539,6 +1539,7 @@ NB_MODULE(_surogate, m) {
         nb::arg("max_num_seqs"), nb::arg("max_seq_len"),
         nb::arg("gpu_memory_utilization") = 0.9f,
         nb::arg("use_cuda_graphs") = true,
+        nb::arg("min_activation_mb") = 512,
         "Create a continuous generation engine for iteration-level batching.\n"
         "Returns engine_id.")
         .def("engine_add_sequences_batch", &MultiGPUPyTrainer::engine_add_sequences_batch,

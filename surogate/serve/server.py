@@ -52,6 +52,9 @@ class ChatCompletionsRequest(BaseModel):
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
+    ignore_eos: bool = False
+
+    model_config = {"extra": "allow"}
 
 
 class CompletionsRequest(BaseModel):
@@ -64,6 +67,7 @@ class CompletionsRequest(BaseModel):
     stream: bool = False
     stop: Optional[str | list[str]] = None
     stream_options: Optional[StreamOptions] = None
+    ignore_eos: bool = False
 
     # Non-standard sampling knobs.
     top_k: Optional[int] = None
@@ -90,6 +94,7 @@ class GenerationParams:
     top_p: float
     min_p: float
     repetition_penalty: float
+    ignore_eos: bool = False
 
 
 @dataclass
@@ -309,6 +314,7 @@ class NativeServingRuntime:
             max_num_seqs=requested_batch_size,
         )
         options.min_stack_mb = self._resolve_min_stack_mb(config)
+        self._auto_min_stack_mb = int(options.min_stack_mb)
         logger.info(
             "Serving runtime stack floor=%d MiB lmhead_chunks=%d offload_grads=%s (gpu_memory_utilization=%.2f)",
             int(options.min_stack_mb),
@@ -490,10 +496,12 @@ class NativeServingRuntime:
                 total_mb = int(total_b // mb)
                 util = float(config.gpu_memory_utilization)
                 reserve_mb = max(0.0, (1.0 - util) * float(total_mb))
-                # Keep stack floor in a tight inference range [256, 1024] MiB.
+                # Keep stack floor large enough for flat-token activations.
+                # With prefill chunks up to 1024 tokens, the FFN intermediates
+                # and delta-rule scratch alone need ~200 MB per forward pass.
                 by_reserve = int(reserve_mb * 0.05)  # 5% of reserved headroom
-                by_free = int(max(256, free_mb * 0.10))  # never exceed 10% of currently free memory
-                auto_min_mb = max(256, min(1024, by_reserve, by_free))
+                by_free = int(max(512, free_mb * 0.15))  # up to 15% of free memory
+                auto_min_mb = max(512, min(2048, by_reserve, by_free))
                 logger.info(
                     "Auto min_stack_mb=%d MiB from free=%d MiB total=%d MiB reserve=%d MiB gpu_memory_utilization=%.2f",
                     auto_min_mb,
@@ -924,6 +932,7 @@ class NativeServingRuntime:
                     max_seq_len=engine_max_seq_len,
                     gpu_memory_utilization=self.config.gpu_memory_utilization,
                     use_cuda_graphs=bool(self.config.use_cuda_graphs),
+                    min_activation_mb=getattr(self, "_auto_min_stack_mb", 512),
                 )
             )
             logger.info(
@@ -1005,7 +1014,11 @@ class NativeServingRuntime:
                             new_prompts if new_prompts else [],
                             max_gen_len=max(new_max_tokens) if new_max_tokens else 128,
                             temperature=first_params.temperature,
-                            eos_token_id=self.eos_id,
+                            eos_token_id=-1 if any(
+                                item.pending.params.ignore_eos
+                                for item in slot_map.values()
+                                if not item.finished
+                            ) else self.eos_id,
                             top_k=first_params.top_k,
                             top_p=first_params.top_p,
                             min_p=first_params.min_p,
@@ -1050,7 +1063,8 @@ class NativeServingRuntime:
                     safe_tok, tok_replaced = self._sanitize_token_ids([int(tok)])
                     item.generated_ids.append(int(safe_tok[0]))
 
-                    should_finish = bool(fin) or tok_replaced
+                    eos_hit = bool(fin) or tok_replaced
+                    should_finish = eos_hit and not item.pending.params.ignore_eos
                     if not should_finish and item.pending.stop_strings:
                         partial_text = self._safe_decode(item.generated_ids)
                         _, stop_hit = _apply_stop(
@@ -1133,6 +1147,7 @@ class NativeServingRuntime:
         min_p: float,
         repetition_penalty: float,
         stop_strings: Sequence[str],
+        ignore_eos: bool = False,
     ) -> list[GeneratedChoice]:
         pending = PendingGeneration(
             prompt_ids=prompt_ids,
@@ -1145,6 +1160,7 @@ class NativeServingRuntime:
                 top_p=top_p,
                 min_p=min_p,
                 repetition_penalty=repetition_penalty,
+                ignore_eos=ignore_eos,
             ),
         )
         with self._pending_cv:
@@ -1202,6 +1218,7 @@ class NativeServingRuntime:
             min_p=max(0.0, min_p),
             repetition_penalty=max(1e-6, repetition_penalty),
             stop_strings=_normalize_stop(req.stop),
+            ignore_eos=bool(getattr(req, "ignore_eos", False)),
         )
 
     def generate_for_completion(self, req: CompletionsRequest) -> list[GeneratedChoice]:
@@ -1248,6 +1265,7 @@ class NativeServingRuntime:
             min_p=max(0.0, min_p),
             repetition_penalty=max(1e-6, repetition_penalty),
             stop_strings=_normalize_stop(req.stop),
+            ignore_eos=bool(getattr(req, "ignore_eos", False)),
         )
 
 

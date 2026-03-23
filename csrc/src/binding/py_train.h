@@ -234,7 +234,8 @@ public:
     std::uint64_t create_continuous_engine(
         int max_num_seqs, int max_seq_len,
         float gpu_memory_utilization,
-        bool use_cuda_graphs);
+        bool use_cuda_graphs,
+        int min_activation_mb = 512);
 
     /// Add a sequence to the engine (prefill + assign slot).  Returns slot_id.
     int engine_add_sequence(

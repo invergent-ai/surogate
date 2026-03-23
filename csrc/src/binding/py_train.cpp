@@ -2365,7 +2365,8 @@ void MultiGPUPyTrainer::close_generation_session(std::uint64_t session_id) {
 
 std::uint64_t MultiGPUPyTrainer::create_continuous_engine(
         int max_num_seqs, int max_seq_len,
-        float gpu_memory_utilization, bool use_cuda_graphs) {
+        float gpu_memory_utilization, bool use_cuda_graphs,
+        int min_activation_mb) {
     if (max_num_seqs <= 0) {
         throw std::invalid_argument("create_continuous_engine: max_num_seqs must be > 0");
     }
@@ -2397,14 +2398,18 @@ std::uint64_t MultiGPUPyTrainer::create_continuous_engine(
             static_cast<std::size_t>(num_layers) * kPageBlockSize * Hkv * Hs * elem_bytes;
         const std::size_t page_bytes_total = 2 * page_bytes_per_pool;  // K + V
 
-        // Reserve space for decode buffers (~max_num_seqs * V * 4 for logits, etc.).
+        // Reserve space for decode buffers (~max_num_seqs * V * 4 for logits, etc.)
+        // AND activation scratch (FFN intermediates, delta-rule scratch, etc.).
         const std::size_t decode_buffer_estimate =
             static_cast<std::size_t>(max_num_seqs)
             * static_cast<std::size_t>(model_config.VocabSize) * sizeof(float)
             + static_cast<std::size_t>(max_num_seqs) * 256 * 16;  // misc buffers
+        const std::size_t activation_reserve =
+            static_cast<std::size_t>(std::max(min_activation_mb, 256)) * 1024 * 1024;
+        const std::size_t total_reserve = decode_buffer_estimate + activation_reserve;
 
         const std::size_t kv_budget =
-            (usable > decode_buffer_estimate) ? (usable - decode_buffer_estimate) : 0;
+            (usable > total_reserve) ? (usable - total_reserve) : 0;
         int total_pages = static_cast<int>(kv_budget / page_bytes_total);
         total_pages = std::max(total_pages, max_num_seqs);  // at least 1 page per seq
 

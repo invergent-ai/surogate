@@ -366,19 +366,19 @@ void build_compact_states_from_slots_impl(
             }
         }
 
-        for (auto it = compact_states.begin(); it != compact_states.end();) {
+        // Don't erase compact state entries when all slots are new (empty state).
+        // Instead, keep the allocated buffers and just zero them — the recurrent
+        // ops need valid pointers to write their initial state into.
+        for (auto it = compact_states.begin(); it != compact_states.end(); ++it) {
             const int layer_idx = it->first;
-            if (layer_per_seq_bytes.find(layer_idx) != layer_per_seq_bytes.end()) {
-                ++it;
-                continue;
+            if (layer_per_seq_bytes.find(layer_idx) == layer_per_seq_bytes.end()) {
+                // No slot has state for this layer — keep buffer but ensure it's
+                // registered in layer_per_seq_bytes so it gets zeroed below.
+                auto it_b = compact_state_bytes.find(layer_idx);
+                if (it_b != compact_state_bytes.end() && it_b->second > 0) {
+                    layer_per_seq_bytes[layer_idx] = it_b->second;
+                }
             }
-            if (it->second) {
-                void* stale_ptr = it->second;
-                try_free_device_buffer(stale_ptr);
-            }
-            compact_state_bytes.erase(layer_idx);
-            compact_state_capacity_bytes.erase(layer_idx);
-            it = compact_states.erase(it);
         }
 
         for (const auto& [layer_idx, per_seq_bytes] : layer_per_seq_bytes) {
@@ -1687,12 +1687,36 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         stream);
     ds.flat_padded_batch_size = total_tiles;
 
-    // === Phase 6: Execute flat-token forward pass ===
-    graph_executor.execute_flat_tokens(
-        static_cast<long>(total_tokens),
-        reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
-        reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
-        ds, comm, hook);
+    // === Phase 6: Execute forward pass ===
+    // For pure-decode steps (all q_lens=1), use execute_decode_step which
+    // supports CUDA graph capture for much faster repeated execution.
+    // For mixed steps with prefill tokens, use flat-token eager execution.
+    const bool pure_decode = (total_tokens == batch_size);  // all q_lens=1
+    const bool use_decode_path = pure_decode && use_cuda_graphs_;
+    if (use_decode_path) {
+        // Pure decode: use execute_decode_step with exact batch size (no padding).
+        // The decode graph cache keys by B, so each unique batch size gets its
+        // own captured graph. No padding means no wasted activation memory.
+        // Keep flat_token_mode=true so recurrent ops use the same state
+        // layout as the prefill path. The decode path compiled at (B=batch_size, T=1)
+        // uses the standard attention dispatch (paged decode), which is faster
+        // than flat-token attention for pure-decode.
+        ds.flat_token_mode = true;
+        ds.prefill_mode = false;
+        ds.logits_out_gpu = logits_gpu_;
+        graph_executor.execute_decode_step(
+            static_cast<long>(batch_size),
+            reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
+            reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
+            ds, comm, hook, /*use_cuda_graph=*/false);
+    } else {
+        // Mixed prefill+decode: use flat-token eager execution.
+        graph_executor.execute_flat_tokens(
+            static_cast<long>(total_tokens),
+            reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
+            reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
+            ds, comm, hook);
+    }
 
     // Persist decode-updated recurrent/conv compact state back into slot-local storage.
     flush_compact_states_to_slots_impl(
