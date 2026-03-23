@@ -1750,13 +1750,15 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
             ds, comm, hook, state.pinned ? use_cuda_graphs_ : false);
     } else {
-        // Mixed prefill+decode: flat-token eager execution.
-        // CUDA graphs can't capture the FlashInfer PrefillPlan (host-side sync).
+        // Mixed prefill+decode: flat-token execution with CUDA graph.
+        // The FlashInfer PrefillPlan runs BEFORE execute_flat_tokens (in flat_step),
+        // so the forward pass itself is graph-capturable. The plan results are read
+        // from fixed GPU buffers (ds.flat_plan_*) that the graph references.
         graph_executor.execute_flat_tokens(
             static_cast<long>(total_tokens),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
-            ds, comm, hook, /*use_cuda_graph=*/false);
+            ds, comm, hook, state.pinned ? use_cuda_graphs_ : false);
     }
 
     // After the first forward pass, pre-grow all compact state buffers to
