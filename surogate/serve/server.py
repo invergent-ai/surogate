@@ -915,25 +915,27 @@ class NativeServingRuntime:
                         new_item.pending.done.set()
 
                 if not slot_map:
-                    # No active work — wait briefly for a request.
                     with self._pending_cv:
                         if not self._pending and not self._shutdown:
                             self._pending_cv.wait(timeout=0.001)
                     continue
 
-                # --- Phase 2: Decode multiple tokens in C++ ---
-                # Adaptive step sizing: small when queue has waiters,
-                # large when idle (matches old session-based logic).
-                # Use small step_tokens only when there are pending requests
-                # AND free slots to admit them.  If slots are full, pending
-                # requests can't be admitted anyway — maximize decode throughput.
+                # --- Phase 2: Decode ---
+                active_count = sum(
+                    1 for item in slot_map.values() if not item.finished
+                )
                 free_slots_now = self._max_batch_sequences - len(slot_map)
                 with self._pending_cv:
-                    waiting_and_admittable = bool(self._pending) and free_slots_now > 0
-                if waiting_and_admittable:
-                    step_tokens = self._continuous_step_tokens
-                else:
-                    step_tokens = self._continuous_idle_step_tokens
+                    has_pending = bool(self._pending)
+
+                # If batch is thin and we have pending requests, skip decode
+                # and loop back to prefill to fill the batch first.
+                # This avoids wasting GPU time on B=1 decode when we could
+                # be prefilling to get to B=20.
+                if has_pending and free_slots_now > 0 and active_count <= 4:
+                    continue
+
+                step_tokens = self._continuous_step_tokens
                 # Cap by the minimum remaining budget across active seqs.
                 min_remaining = min(
                     max(1, item.pending.params.max_tokens - len(item.generated_ids))

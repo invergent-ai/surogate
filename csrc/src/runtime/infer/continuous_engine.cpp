@@ -349,20 +349,10 @@ void build_compact_states_from_slots_impl(
             }
         }
 
-        for (int i = 0; i < B; ++i) {
-            const int slot_id = active_slot_ids[static_cast<std::size_t>(i)];
-            if (slot_id < 0 || slot_id >= max_slots) continue;
-            auto& slot_map = slot_states[static_cast<std::size_t>(slot_id)];
-            auto& bytes_map = slot_state_bytes[static_cast<std::size_t>(slot_id)];
-            for (auto& [_, ptr] : slot_map) {
-                if (ptr) {
-                    CUDA_CHECK(cudaFree(ptr));
-                    ptr = nullptr;
-                }
-            }
-            slot_map.clear();
-            bytes_map.clear();
-        }
+        // NOTE: Do NOT free slot-level state buffers here.
+        // Keep them allocated so the next flush (compact→slot) can reuse them
+        // without cudaMalloc.  Slot buffers are freed in free_slot_states_impl()
+        // when the slot is actually released via release_slot().
     };
 
     build_state_map(
@@ -680,11 +670,11 @@ void ContinuousGenerationEngine::run_one_decode_step(
     mask_finished_tokens(last_tokens_gpu_, finished_gpu_, Bp, stream);
 
     // 2. Model forward.
-    // When full-step graph capture is active, the inner decode graph is subsumed —
-    // pass use_cuda_graph=false to avoid nested graph capture.
+    // Use the inner decode CUDA graph when full-step graph is NOT active.
+    const bool use_inner_graph = use_cuda_graphs_ && !full_step_primed_;
     graph_executor.execute_decode_step(
         static_cast<long>(Bp), last_tokens_gpu_, position_ids_gpu_,
-        decode_state_, comm, hook, /*use_cuda_graph=*/false);
+        decode_state_, comm, hook, use_inner_graph);
 
     // 3. Sampling.
     if (sanitize_logits_enabled()) {
@@ -1167,7 +1157,15 @@ ContinuousStepResult ContinuousGenerationEngine::step(
     // Replay: subsequent steps replay at near-zero CPU overhead.
     const bool use_full_step_graph = use_cuda_graphs_ && !greedy_;  // greedy has no RNG issues
     // (For greedy, graph is also fine — enable unconditionally when cuda_graphs on.)
-    const bool try_full_step_graph = use_cuda_graphs_;
+    // Disable full-step graph for hybrid models — recurrent/conv state
+    // pointers in the DecodeState are accessed via unordered_map which
+    // the graph cannot track across replays.
+    const bool has_recurrent = !decode_state_.recurrent_states ||
+        !decode_state_.recurrent_states->empty();
+    const bool has_conv = !decode_state_.conv_states ||
+        !decode_state_.conv_states->empty();
+    const bool is_hybrid = has_recurrent || has_conv;
+    const bool try_full_step_graph = use_cuda_graphs_ && !is_hybrid;
 
     int executed = 0;
     for (; executed < max_tokens; ++executed) {
@@ -1234,11 +1232,11 @@ ContinuousStepResult ContinuousGenerationEngine::step(
         if (s.finished) any_finished = true;
     }
 
-    // If any sequence finished, the compact batch is stale.
-    if (any_finished) {
-        batch_dirty_ = true;
-        cuda_graph_primed_ = false;  // B may change
-    }
+    // Do NOT rebuild compact batch when sequences finish.
+    // Finished sequences stay in their compact positions — masked by
+    // finished_gpu_ in decode, and their recurrent/conv state slots are
+    // isolated (no cross-contamination).  Rebuild only happens on
+    // add_sequence() or release_slot() which change compact positions.
 
     return result;
 }
