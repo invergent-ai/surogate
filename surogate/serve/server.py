@@ -382,7 +382,7 @@ class NativeServingRuntime:
         configured_cap = max(1, int(self._runtime_batch_size))
         env_cap = int(os.getenv("SUROGATE_SERVE_MAX_BATCH_SEQUENCES", str(configured_cap)))
         self._max_batch_sequences = max(1, min(configured_cap, env_cap))
-        prefill_budget_default = max(1, int(config.max_num_batched_tokens))
+        prefill_budget_default = max(4096, int(config.max_num_batched_tokens))
         self._prefill_budget_tokens = max(
             1,
             int(
@@ -680,6 +680,26 @@ class NativeServingRuntime:
                 max_batched_tokens = int(config.max_num_batched_tokens)
         else:
             max_batched_tokens = int(config.max_num_batched_tokens)
+            auto_tune_tokens = os.getenv(
+                "SUROGATE_SERVE_AUTO_MAX_BATCHED_TOKENS", "1"
+            ).strip().lower() not in {"0", "false", "no"}
+            if auto_tune_tokens and not config.is_explicit("max_num_batched_tokens"):
+                tokens_per_seq = max(
+                    64,
+                    int(os.getenv("SUROGATE_SERVE_AUTO_TOKENS_PER_SEQ", "256")),
+                )
+                auto_budget = requested_batch_size * tokens_per_seq
+                auto_budget = max(4096, min(32768, auto_budget))
+                if auto_budget > max_batched_tokens:
+                    logger.info(
+                        "Auto-tuned max_batched_tokens from %d to %d "
+                        "(batch_size=%d, tokens_per_seq=%d).",
+                        max_batched_tokens,
+                        auto_budget,
+                        requested_batch_size,
+                        tokens_per_seq,
+                    )
+                    max_batched_tokens = auto_budget
 
         if max_batched_tokens <= 0:
             return max(1, int(requested_seq_len))
