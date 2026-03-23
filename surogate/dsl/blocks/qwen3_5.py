@@ -33,31 +33,31 @@ class Qwen3_5AttentionBlock:
         partial_rotary_factor: float = 0.25,
         mrope_section: tuple[int, int, int] | list[int] = (11, 11, 10),
     ):
-        self.d_model = d_model
-        self.num_query_heads = num_query_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.d_ff = d_ff
-        self.max_seq = max_seq
-        self.eps = eps
-        self.use_qkv_bias = use_qkv_bias
-        self.partial_rotary_factor = partial_rotary_factor
+        self.d_model = d_model  # Hidden dimension of the model
+        self.num_query_heads = num_query_heads  # Number of query attention heads
+        self.num_kv_heads = num_kv_heads  # Number of key/value heads (GQA); may be < num_query_heads
+        self.head_size = head_size  # Feature dimension per attention head (D)
+        self.d_ff = d_ff  # Feed-forward intermediate dimension (before SwiGLU split)
+        self.max_seq = max_seq  # Maximum sequence length for RoPE frequency cache
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
+        self.use_qkv_bias = use_qkv_bias  # Whether Q/K/V/out projections include bias terms
+        self.partial_rotary_factor = partial_rotary_factor  # Fraction of head_size to apply RoPE to
         if mrope_section is None or len(mrope_section) < 3:
             mrope_section = (11, 11, 10)
-        self.mrope_section = list(mrope_section)
+        self.mrope_section = list(mrope_section)  # MRoPE split sizes for (temporal, height, width) axes
 
-        self.C = Dim("C")
-        self.Hq = Dim("Hq")
-        self.Hkv = Dim("Hkv")
-        self.D = Dim("D")
-        self.M = Dim("M")
-        self.MaxSeq = Dim("MaxSeq")
-        self.AttnDim = self.Hq * self.D
-        self.QProjDim = 2 * self.AttnDim
-        self.KVDim = self.Hkv * self.D
-        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
-        self.MUp = 2 * self.M
-        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+        self.C = Dim("C")  # Hidden / channel dimension (= d_model)
+        self.Hq = Dim("Hq")  # Number of query heads (= num_query_heads)
+        self.Hkv = Dim("Hkv")  # Number of KV heads (= num_kv_heads)
+        self.D = Dim("D")  # Per-head feature dimension (= head_size)
+        self.M = Dim("M")  # MLP intermediate dimension after SwiGLU split (= d_ff // 2)
+        self.MaxSeq = Dim("MaxSeq")  # Max sequence length (= max_seq)
+        self.AttnDim = self.Hq * self.D  # Total attention output dim: Hq * D
+        self.QProjDim = 2 * self.AttnDim  # Q projection includes a gating channel: 2 * Hq * D
+        self.KVDim = self.Hkv * self.D  # K or V projection dimension: Hkv * D
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D  # Packed QKV concat dimension (Q gate excluded)
+        self.MUp = 2 * self.M  # Up-projection output size: gate + up channels for SwiGLU
+        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)  # Rotary embedding dimension (even, <= head_size)
 
     # Norm / MLP
     ln1_weight = Param(Tensor["C"], quantizable=False)
@@ -261,33 +261,33 @@ class Qwen3_5LinearBlock:
         chunk_size: int = 64,
         eps: float = 1e-6,
     ):
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.linear_conv_kernel_dim = linear_conv_kernel_dim
-        self.linear_key_head_dim = linear_key_head_dim
-        self.linear_value_head_dim = linear_value_head_dim
-        self.linear_num_key_heads = linear_num_key_heads
-        self.linear_num_value_heads = linear_num_value_heads
-        self.chunk_size = chunk_size
-        self.eps = eps
+        self.d_model = d_model  # Hidden dimension of the model
+        self.d_ff = d_ff  # Feed-forward intermediate dimension (before SwiGLU split)
+        self.linear_conv_kernel_dim = linear_conv_kernel_dim  # Causal conv1d kernel width applied to QKV features
+        self.linear_key_head_dim = linear_key_head_dim  # Feature dimension per key/query head
+        self.linear_value_head_dim = linear_value_head_dim  # Feature dimension per value head
+        self.linear_num_key_heads = linear_num_key_heads  # Number of key (and query) heads
+        self.linear_num_value_heads = linear_num_value_heads  # Number of value heads; must be a multiple of key heads
+        self.chunk_size = chunk_size  # Chunk size for chunk-wise GDeltaNet recurrence
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
 
         if self.linear_num_value_heads % self.linear_num_key_heads != 0:
             raise ValueError(
                 "Qwen3_5LinearBlock requires linear_num_value_heads to be divisible by linear_num_key_heads"
             )
 
-        self.C = Dim("C")
-        self.M = Dim("M")
-        self.MUp = 2 * self.M
-        self.Hk = self.linear_num_key_heads
-        self.Hv = self.linear_num_value_heads
-        self.Kd = self.linear_key_head_dim
-        self.Vd = self.linear_value_head_dim
-        self.KeyDim = self.Hk * self.Kd
-        self.ValueDim = self.Hv * self.Vd
-        self.ConvK = self.linear_conv_kernel_dim
-        self.ConvDim = self.KeyDim * 2 + self.ValueDim
-        self.HeadRepeat = self.Hv // self.Hk
+        self.C = Dim("C")  # Hidden / channel dimension (= d_model)
+        self.M = Dim("M")  # MLP intermediate dimension after SwiGLU split (= d_ff // 2)
+        self.MUp = 2 * self.M  # Up-projection output size: gate + up channels for SwiGLU
+        self.Hk = self.linear_num_key_heads  # Number of key heads
+        self.Hv = self.linear_num_value_heads  # Number of value heads
+        self.Kd = self.linear_key_head_dim  # Per-head key dimension
+        self.Vd = self.linear_value_head_dim  # Per-head value dimension
+        self.KeyDim = self.Hk * self.Kd  # Total key/query projection dimension: Hk * Kd
+        self.ValueDim = self.Hv * self.Vd  # Total value projection dimension: Hv * Vd
+        self.ConvK = self.linear_conv_kernel_dim  # Conv1d kernel width (alias for Dim use)
+        self.ConvDim = self.KeyDim * 2 + self.ValueDim  # Packed Q+K+V conv input dimension
+        self.HeadRepeat = self.Hv // self.Hk  # GQA-like repeat factor to expand K heads to match V heads
 
     # Norm / MLP
     ln1_weight = Param(Tensor["C"], quantizable=False)

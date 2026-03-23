@@ -32,33 +32,33 @@ class GptOssBlock:
         use_qkv_bias: bool = True,
         ep_size: int = 1,
     ):
-        self.d_model = d_model
-        self.num_query_heads = num_query_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.d_ff = d_ff
-        self.max_seq = max_seq
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.eps = eps
-        self.use_qkv_bias = use_qkv_bias
-        self.ep_size = ep_size
-        self.num_local_experts = num_experts // ep_size if ep_size > 1 else num_experts
+        self.d_model = d_model  # Hidden dimension of the model
+        self.num_query_heads = num_query_heads  # Number of query attention heads
+        self.num_kv_heads = num_kv_heads  # Number of key/value heads (GQA); may be < num_query_heads
+        self.head_size = head_size  # Feature dimension per attention head (D)
+        self.d_ff = d_ff  # Per-expert feed-forward intermediate dimension (before activation split)
+        self.max_seq = max_seq  # Maximum sequence length for RoPE frequency cache
+        self.num_experts = num_experts  # Total number of experts across all EP ranks
+        self.num_experts_per_tok = num_experts_per_tok  # Top-k experts selected per token
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
+        self.use_qkv_bias = use_qkv_bias  # Whether Q/K/V/out projections include bias terms
+        self.ep_size = ep_size  # Expert parallelism degree (1 = no EP, all experts local)
+        self.num_local_experts = num_experts // ep_size if ep_size > 1 else num_experts  # Number of experts owned by this EP rank
 
         # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
-        self.C = Dim("C")
-        self.Hq = Dim("Hq")
-        self.Hkv = Dim("Hkv")
-        self.D = Dim("D")
-        self.M = Dim("M")
-        self.MaxSeq = Dim("MaxSeq")
-        self.E = Dim("E")
-        self.K = Dim("K")
+        self.C = Dim("C")  # Hidden / channel dimension (= d_model)
+        self.Hq = Dim("Hq")  # Number of query heads (= num_query_heads)
+        self.Hkv = Dim("Hkv")  # Number of KV heads (= num_kv_heads)
+        self.D = Dim("D")  # Per-head feature dimension (= head_size)
+        self.M = Dim("M")  # Per-expert MLP intermediate dimension after activation split (= d_ff // 2)
+        self.MaxSeq = Dim("MaxSeq")  # Max sequence length (= max_seq)
+        self.E = Dim("E")  # Total number of experts (= num_experts)
+        self.K = Dim("K")  # Top-k experts per token (= num_experts_per_tok)
 
         # Derived dimensions (DimExpr)
-        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
-        self.AttnDim = self.Hq * self.D
-        self.MUp = 2 * self.M  # interleaved gate + up
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D  # Packed QKV projection dimension: (Hq + 2*Hkv) * D
+        self.AttnDim = self.Hq * self.D  # Total attention output dimension: Hq * D
+        self.MUp = 2 * self.M  # Expert gate+up fused projection output size (interleaved gate + up): 2 * M
 
     # LayerNorm weights
     ln1_weight = Param(Tensor["C"])

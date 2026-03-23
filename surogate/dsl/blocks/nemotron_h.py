@@ -48,16 +48,16 @@ class NemotronHMamba2Block:
         use_conv_bias: bool = True,
         use_bias: bool = False,
     ):
-        self.d_model = d_model
-        self.mamba_num_heads = mamba_num_heads
-        self.mamba_head_dim = mamba_head_dim
-        self.ssm_state_size = ssm_state_size
-        self.n_groups = n_groups
-        self.conv_kernel = conv_kernel
-        self.chunk_size = chunk_size
-        self.eps = eps
-        self.dt_min = dt_min
-        self.dt_max = dt_max
+        self.d_model = d_model  # Hidden dimension of the model
+        self.mamba_num_heads = mamba_num_heads  # Number of Mamba2 heads (H)
+        self.mamba_head_dim = mamba_head_dim  # Feature dimension per Mamba2 head (D)
+        self.ssm_state_size = ssm_state_size  # SSM state size per head (N)
+        self.n_groups = n_groups  # Number of SSM groups (each group shares B/C projections)
+        self.conv_kernel = conv_kernel  # Causal conv1d kernel width (K)
+        self.chunk_size = chunk_size  # Chunk size for chunked SSM scan
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
+        self.dt_min = dt_min  # Minimum dt value before softplus (used for initialization)
+        self.dt_max = dt_max  # Maximum dt value before softplus (used for initialization)
         dt_max_default = 1e9
         if time_step_limit is None:
             time_step_limit = (0.0, dt_max_default)
@@ -69,26 +69,26 @@ class NemotronHMamba2Block:
             if not math.isfinite(hi):
                 hi = dt_max_default
             time_step_limit = (lo, hi)
-        self.time_step_limit = time_step_limit
-        self.use_conv_bias = use_conv_bias
-        self.use_bias = use_bias
+        self.time_step_limit = time_step_limit  # (min, max) clamp range applied to dt after softplus
+        self.use_conv_bias = use_conv_bias  # Whether the causal conv1d has a bias term
+        self.use_bias = use_bias  # Whether in_proj and out_proj have bias terms
 
         # Derived dimensions - compute actual values for shape resolution
-        self.intermediate_size = mamba_num_heads * mamba_head_dim
-        self.conv_dim = self.intermediate_size + 2 * n_groups * ssm_state_size
-        self.projection_size = self.intermediate_size + self.conv_dim + mamba_num_heads
+        self.intermediate_size = mamba_num_heads * mamba_head_dim  # Total SSM hidden dim: H * D
+        self.conv_dim = self.intermediate_size + 2 * n_groups * ssm_state_size  # Conv input width: I + 2*G*N (hidden + B + C)
+        self.projection_size = self.intermediate_size + self.conv_dim + mamba_num_heads  # in_proj output width: I + conv_dim + H (gate + conv_input + dt)
 
         # Dimension aliases for Param shape annotations
         # These must be set to actual integer values for DSL shape resolution
-        self.C = d_model
-        self.I = self.intermediate_size
-        self.H = mamba_num_heads
-        self.D = mamba_head_dim
-        self.N = ssm_state_size
-        self.G = n_groups
-        self.K = conv_kernel
-        self.P = self.projection_size
-        self.D_conv = self.conv_dim
+        self.C = d_model  # Hidden / channel dimension (= d_model)
+        self.I = self.intermediate_size  # SSM intermediate dimension: H * D
+        self.H = mamba_num_heads  # Number of Mamba2 heads
+        self.D = mamba_head_dim  # Per-head feature dimension
+        self.N = ssm_state_size  # SSM state size per head
+        self.G = n_groups  # Number of SSM groups
+        self.K = conv_kernel  # Conv1d kernel width
+        self.P = self.projection_size  # in_proj output width (gate + conv_input + dt)
+        self.D_conv = self.conv_dim  # Conv1d input/output width: I + 2*G*N
 
     # Pre-block normalization (never quantized)
     norm_weight = Param(Tensor["C"], quantizable=False)
@@ -340,26 +340,26 @@ class NemotronHAttentionBlock:
         attention_bias: bool = False,
         use_rope: bool = False,
     ):
-        self.d_model = d_model
-        self.num_query_heads = num_query_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.max_seq = max_seq
-        self.eps = eps
-        self.attention_bias = attention_bias
-        self.use_rope = use_rope
+        self.d_model = d_model  # Hidden dimension of the model
+        self.num_query_heads = num_query_heads  # Number of query attention heads
+        self.num_kv_heads = num_kv_heads  # Number of key/value heads (GQA); may be < num_query_heads
+        self.head_dim = head_dim  # Feature dimension per attention head
+        self.max_seq = max_seq  # Maximum sequence length for RoPE frequency cache
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
+        self.attention_bias = attention_bias  # Whether Q/K/V/out projections include bias terms
+        self.use_rope = use_rope  # Whether to apply RoPE (Nemotron-H attention typically skips positional encoding)
 
         # Dimension aliases for Param shape annotations
         # Set to actual integer values for DSL shape resolution
-        self.C = d_model
-        self.Hq = num_query_heads
-        self.Hkv = num_kv_heads
-        self.D = head_dim
-        self.MaxSeq = max_seq
+        self.C = d_model  # Hidden / channel dimension (= d_model)
+        self.Hq = num_query_heads  # Number of query heads
+        self.Hkv = num_kv_heads  # Number of KV heads
+        self.D = head_dim  # Per-head feature dimension
+        self.MaxSeq = max_seq  # Max sequence length (= max_seq)
 
         # Derived dimensions - computed integer values
-        self.QKV = (num_query_heads + 2 * num_kv_heads) * head_dim
-        self.AttnDim = num_query_heads * head_dim
+        self.QKV = (num_query_heads + 2 * num_kv_heads) * head_dim  # Packed QKV projection dimension: (Hq + 2*Hkv) * D
+        self.AttnDim = num_query_heads * head_dim  # Total attention output dimension: Hq * D
 
     # Pre-block normalization (never quantized)
     norm_weight = Param(Tensor["C"], quantizable=False)
@@ -503,16 +503,16 @@ class NemotronHMLPBlock:
         activation: str = "relu2",
         mlp_bias: bool = False,
     ):
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.eps = eps
-        self.activation = activation
-        self.mlp_bias = mlp_bias
+        self.d_model = d_model  # Hidden dimension of the model
+        self.d_ff = d_ff  # Feed-forward intermediate dimension
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
+        self.activation = activation  # Activation function: "relu2", "silu", or "gelu"
+        self.mlp_bias = mlp_bias  # Whether up/down projections include bias terms
 
         # Dimension aliases for Param shape annotations
         # Set to actual integer values for DSL shape resolution
-        self.C = d_model
-        self.M = d_ff
+        self.C = d_model  # Hidden / channel dimension (= d_model)
+        self.M = d_ff  # MLP intermediate dimension (= d_ff)
 
     # Pre-block normalization (never quantized)
     norm_weight = Param(Tensor["C"], quantizable=False)
@@ -640,27 +640,27 @@ class NemotronHMoEBlock:
         routed_scaling_factor: float = 1.0,
         ep_size: int = 1,
     ):
-        self.d_model = d_model
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.shared_expert_intermediate_size = shared_expert_intermediate_size
-        self.use_shared_expert = shared_expert_intermediate_size > 0
-        self.eps = eps
-        self.mlp_bias = mlp_bias
-        self.activation = activation
-        self.norm_topk_prob = norm_topk_prob
-        self.routed_scaling_factor = routed_scaling_factor
-        self.ep_size = ep_size
-        self.num_local_experts = num_experts // ep_size if ep_size > 1 else num_experts
+        self.d_model = d_model  # Hidden dimension of the model
+        self.moe_intermediate_size = moe_intermediate_size  # Per-expert feed-forward intermediate dimension
+        self.num_experts = num_experts  # Total number of experts across all EP ranks
+        self.num_experts_per_tok = num_experts_per_tok  # Top-k experts selected per token
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size  # Shared expert intermediate dim (0 = disabled)
+        self.use_shared_expert = shared_expert_intermediate_size > 0  # Whether a dense shared expert is added to every token
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
+        self.mlp_bias = mlp_bias  # Whether expert up/down projections include bias terms
+        self.activation = activation  # Expert activation function: "relu2" or "silu"
+        self.norm_topk_prob = norm_topk_prob  # Renormalize routing weights to sum to 1 after top-k selection
+        self.routed_scaling_factor = routed_scaling_factor  # Scalar multiplied into routing weights after top-k
+        self.ep_size = ep_size  # Expert parallelism degree (1 = no EP, all experts local)
+        self.num_local_experts = num_experts // ep_size if ep_size > 1 else num_experts  # Number of experts owned by this EP rank
 
         # Dimension aliases for Param shape annotations
         # Set to actual integer values for DSL shape resolution
-        self.C = d_model
-        self.M = moe_intermediate_size
-        self.E = num_experts
-        self.K = num_experts_per_tok
-        self.SharedM = shared_expert_intermediate_size if shared_expert_intermediate_size > 0 else moe_intermediate_size
+        self.C = d_model  # Hidden / channel dimension (= d_model)
+        self.M = moe_intermediate_size  # Per-expert intermediate dimension
+        self.E = num_experts  # Total number of experts
+        self.K = num_experts_per_tok  # Top-k experts per token
+        self.SharedM = shared_expert_intermediate_size if shared_expert_intermediate_size > 0 else moe_intermediate_size  # Shared expert intermediate dim; falls back to M if not specified
 
     # Pre-block normalization (never quantized)
     norm_weight = Param(Tensor["C"], quantizable=False)

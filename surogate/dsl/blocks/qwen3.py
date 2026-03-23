@@ -23,28 +23,28 @@ class Qwen3Block:
         use_qkv_bias: bool = False,
         use_qk_norm: bool = True,
     ):
-        self.d_model = d_model
-        self.num_query_heads = num_query_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.d_ff = d_ff
-        self.max_seq = max_seq
-        self.eps = eps
-        self.use_qkv_bias = use_qkv_bias
-        self.use_qk_norm = use_qk_norm
+        self.d_model = d_model  # Hidden dimension of the model
+        self.num_query_heads = num_query_heads  # Number of query attention heads
+        self.num_kv_heads = num_kv_heads  # Number of key/value heads (GQA); may be < num_query_heads
+        self.head_size = head_size  # Feature dimension per attention head (D)
+        self.d_ff = d_ff  # Feed-forward intermediate dimension (before SwiGLU split)
+        self.max_seq = max_seq  # Maximum sequence length for RoPE frequency cache
+        self.eps = eps  # Epsilon for RMSNorm numerical stability
+        self.use_qkv_bias = use_qkv_bias  # Whether Q/K/V/out projections include bias terms
+        self.use_qk_norm = use_qk_norm  # Whether to apply per-head RMSNorm to Q and K before RoPE
 
         # Typed dimensions - use short symbolic names that C++ ShapeEnv expects
-        self.C = Dim("C")
-        self.Hq = Dim("Hq")
-        self.Hkv = Dim("Hkv")
-        self.D = Dim("D")
-        self.M = Dim("M")
-        self.MaxSeq = Dim("MaxSeq")
+        self.C = Dim("C")  # Hidden / channel dimension (= d_model)
+        self.Hq = Dim("Hq")  # Number of query heads (= num_query_heads)
+        self.Hkv = Dim("Hkv")  # Number of KV heads (= num_kv_heads)
+        self.D = Dim("D")  # Per-head feature dimension (= head_size)
+        self.M = Dim("M")  # MLP intermediate dimension after SwiGLU split (= d_ff // 2)
+        self.MaxSeq = Dim("MaxSeq")  # Max sequence length (= max_seq)
 
         # Derived dimensions (DimExpr)
-        self.QKV = (self.Hq + 2 * self.Hkv) * self.D
-        self.AttnDim = self.Hq * self.D
-        self.MUp = 2 * self.M
+        self.QKV = (self.Hq + 2 * self.Hkv) * self.D  # Packed QKV projection dimension: (Hq + 2*Hkv) * D
+        self.AttnDim = self.Hq * self.D  # Total attention output dimension: Hq * D
+        self.MUp = 2 * self.M  # Up-projection output size: gate + up channels for SwiGLU
 
     # Parameters using class attribute style
     ln1_weight = Param(Tensor["C"])
