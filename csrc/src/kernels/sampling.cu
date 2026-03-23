@@ -564,7 +564,7 @@ __global__ void extract_logprob_from_logits_kernel(
     }
     using MaxReduce = cub::BlockReduce<float, Threads>;
     __shared__ typename MaxReduce::TempStorage max_storage;
-    const float row_max = MaxReduce(max_storage).Reduce(local_max, cub::Max());
+    const float row_max = MaxReduce(max_storage).Reduce(local_max, [](float a, float b) { return a > b ? a : b; });
 
     __shared__ float shared_max;
     __shared__ float shared_token_logit;
