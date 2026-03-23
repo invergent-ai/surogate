@@ -1,6 +1,7 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include "kernels/attention_decode.h"
+#include "kernels/attention_flat_paged.h"
 
 #include <algorithm>
 #include <array>
@@ -192,6 +193,35 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     // ========================================================================
     // KV-cache intercept (same logic as dispatch_rope)
     // ========================================================================
+    // Flat-token KV write
+    if (mDecodeState && mDecodeState->flat_token_mode && mDecodeState->paged) {
+        int layer_idx = -1;
+        std::string field;
+        parse_block_param(op.inputs[0].name, layer_idx, field);
+        if (layer_idx >= 0 && mDecodeState->token_to_req_gpu && mDecodeState->kv_write_pos_gpu) {
+            const int ds_Hkv = mDecodeState->num_kv_heads;
+            const int ds_Hs = mDecodeState->head_dim;
+            const int elem_size = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
+            const std::size_t layer_pool_bytes =
+                static_cast<std::size_t>(mDecodeState->total_pages)
+                * mDecodeState->page_block_size * ds_Hkv * ds_Hs * elem_size;
+            const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
+            auto* k_pool = reinterpret_cast<nv_bfloat16*>(
+                reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
+            auto* v_pool = reinterpret_cast<nv_bfloat16*>(
+                reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
+            kv_cache_store_flat_paged_bf16(
+                k_pool, v_pool, qkv_out.get<nv_bfloat16>(),
+                mDecodeState->token_to_req_gpu,
+                mDecodeState->kv_write_pos_gpu,
+                mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                mDecodeState->page_block_size,
+                mDecodeState->flat_total_tokens, Hq, ds_Hkv, ds_Hs,
+                mRunState.MainStream);
+        }
+        return;
+    }
+
     if (mDecodeState) {
         int layer_idx = -1;
         std::string field;

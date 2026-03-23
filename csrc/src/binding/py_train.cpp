@@ -2536,6 +2536,47 @@ MultiGPUPyTrainer::ContinuousStepResult MultiGPUPyTrainer::engine_step(
     return result;
 }
 
+MultiGPUPyTrainer::FlatStepResult MultiGPUPyTrainer::engine_flat_step(
+        std::uint64_t engine_id,
+        const std::vector<std::vector<int32_t>>& new_prompts,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("engine_flat_step: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    FlatStepResult result;
+    run_work([&](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) throw std::runtime_error("engine_flat_step: not a DslModel");
+        auto* ge = dsl_model->graph_executor();
+        if (!ge) throw std::runtime_error("engine_flat_step: no GraphExecutor");
+
+        infer::ContinuousGenerationEngine::FlatStepConfig cfg;
+        cfg.max_gen_len = max_gen_len;
+        cfg.temperature = temperature;
+        cfg.eos_token_id = eos_token_id;
+        cfg.top_k = top_k;
+        cfg.top_p = top_p;
+        cfg.min_p = min_p;
+
+        auto r = eng->flat_step(new_prompts, cfg, *ge, *ctx.Communicator);
+        result.new_slot_ids = std::move(r.new_slot_ids);
+        result.active_slot_ids = std::move(r.active_slot_ids);
+        result.sampled_tokens = std::move(r.sampled_tokens);
+        result.finished = std::move(r.finished);
+        result.completion_lens = std::move(r.completion_lens);
+    }, 0);
+
+    return result;
+}
+
 void MultiGPUPyTrainer::engine_release_slot(
         std::uint64_t engine_id, int slot_id) {
     infer::ContinuousGenerationEngine* eng = nullptr;

@@ -1575,6 +1575,28 @@ NB_MODULE(_surogate, m) {
         nb::arg("step_tokens") = 1,
         "Decode up to step_tokens for all active sequences.\n"
         "Returns (slot_ids, tokens_per_slot, finished, completion_lens).")
+        .def("engine_flat_step", [](MultiGPUPyTrainer* trainer,
+                std::uint64_t engine_id,
+                const std::vector<std::vector<int32_t>>& new_prompts,
+                int max_gen_len, float temperature, int32_t eos_token_id,
+                int top_k, float top_p, float min_p) {
+            auto r = trainer->engine_flat_step(
+                engine_id, new_prompts, max_gen_len, temperature, eos_token_id,
+                top_k, top_p, min_p);
+            return nb::make_tuple(
+                r.new_slot_ids, r.active_slot_ids, r.sampled_tokens,
+                r.finished, r.completion_lens);
+        },
+        nb::arg("engine_id"),
+        nb::arg("new_prompts"),
+        nb::arg("max_gen_len") = 512,
+        nb::arg("temperature") = 1.0f,
+        nb::arg("eos_token_id") = 2,
+        nb::arg("top_k") = 0,
+        nb::arg("top_p") = 1.0f,
+        nb::arg("min_p") = 0.0f,
+        "Flat-token step: prefill new prompts + decode active sequences in one forward pass.\n"
+        "Returns (new_slot_ids, active_slot_ids, sampled_tokens, finished, completion_lens).")
         .def("engine_release_slot", &MultiGPUPyTrainer::engine_release_slot,
         nb::arg("engine_id"), nb::arg("slot_id"),
         "Release a slot and recycle its KV-cache pages.")

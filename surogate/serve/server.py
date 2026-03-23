@@ -833,24 +833,24 @@ class NativeServingRuntime:
     # Continuous engine loop (iteration-level continuous batching)
     # ------------------------------------------------------------------
 
-    def _pop_one_pending(self) -> Optional[ActiveGeneration]:
-        """Pop one pending request from the queue, or None."""
+    def _drain_pending(self, max_new: int) -> list[ActiveGeneration]:
+        """Pop up to max_new pending requests."""
+        items: list[ActiveGeneration] = []
         with self._pending_cv:
-            if self._pending:
-                return ActiveGeneration(pending=self._pending.pop(0))
-        return None
+            while self._pending and len(items) < max_new:
+                items.append(ActiveGeneration(pending=self._pending.pop(0)))
+        return items
 
     def _continuous_engine_loop(self) -> None:
-        """Iteration-level continuous batching loop.
+        """Flat-token continuous batching: prefill + decode in ONE forward pass.
 
         Each iteration:
-          1. Admit at most ONE new request (prefill it).
-          2. Decode all active sequences.
-          3. Finalize finished sequences.
+          1. Drain pending requests (new prompts to prefill).
+          2. Call engine_flat_step(): prefills new + decodes active in one pass.
+          3. Process results, release finished slots.
 
-        By admitting only 1 request per iteration, prefill is interleaved
-        with decode — early requests start generating immediately while
-        later requests are still being prefilled.
+        No prefill bubbles — every forward pass produces decode tokens for
+        active sequences while simultaneously prefilling new arrivals.
         """
         engine_id: Optional[int] = None
         slot_map: dict[int, ActiveGeneration] = {}
@@ -871,101 +871,113 @@ class NativeServingRuntime:
                 )
             )
             logger.info(
-                "Continuous engine created (max_seqs=%d, max_seq_len=%d, engine_id=%d)",
+                "Flat-token engine created (max_seqs=%d, max_seq_len=%d, engine_id=%d)",
                 self._max_batch_sequences,
                 engine_max_seq_len,
                 engine_id,
             )
 
-            while not self._shutdown:
-                # --- Phase 1: Admit all pending requests ---
-                # Prefill all available requests as fast as possible to
-                # maximize decode batch size and throughput.
-                free_slots = self._max_batch_sequences - len(slot_map)
-                while free_slots > 0:
-                    new_item = self._pop_one_pending()
-                    if new_item is None:
-                        break
-                    try:
-                        prompt_ids = new_item.pending.prompt_ids
-                        max_tokens = new_item.pending.params.max_tokens
-                        if len(prompt_ids) + max_tokens > self._runtime_seq_len:
-                            max_tokens = max(
-                                1, self._runtime_seq_len - len(prompt_ids)
-                            )
-                        slot_id = self.trainer.engine_add_sequence(
-                            engine_id,
-                            prompt_ids,
-                            max_gen_len=max_tokens,
-                            temperature=new_item.pending.params.temperature,
-                            eos_token_id=self.eos_id,
-                            top_k=new_item.pending.params.top_k,
-                            top_p=new_item.pending.params.top_p,
-                            min_p=new_item.pending.params.min_p,
-                            prefill_chunk_size=self.config.prefill_chunk_size,
-                        )
-                        if slot_id < 0:
-                            with self._pending_cv:
-                                self._pending.insert(0, new_item.pending)
-                            break
-                        slot_map[slot_id] = new_item
-                        free_slots -= 1
-                    except Exception as exc:
-                        new_item.pending.error = exc
-                        new_item.pending.done.set()
+            # Token budget: max tokens per flat-step forward pass.
+            token_budget = self.config.max_num_batched_tokens
 
-                if not slot_map:
+            while not self._shutdown:
+                # --- Phase 1: Collect new requests within token budget ---
+                free_slots = self._max_batch_sequences - len(slot_map)
+                active_decode_count = sum(
+                    1 for item in slot_map.values() if not item.finished
+                )
+                # Reserve 1 token per active decode sequence.
+                remaining_budget = token_budget - active_decode_count
+
+                new_items = self._drain_pending(max_new=max(0, free_slots))
+
+                new_prompts: list[list[int]] = []
+                new_max_tokens: list[int] = []
+                pending_items: list[ActiveGeneration] = []
+                deferred: list[ActiveGeneration] = []
+                prefill_tokens_used = 0
+                for item in new_items:
+                    prompt_ids = item.pending.prompt_ids
+                    prompt_len = len(prompt_ids)
+                    max_tokens = item.pending.params.max_tokens
+                    if prompt_len + max_tokens > self._runtime_seq_len:
+                        max_tokens = max(1, self._runtime_seq_len - prompt_len)
+
+                    # Check if this prompt fits in the remaining token budget.
+                    if prefill_tokens_used + prompt_len > remaining_budget:
+                        deferred.append(item)
+                        continue
+
+                    new_prompts.append(prompt_ids)
+                    new_max_tokens.append(max_tokens)
+                    pending_items.append(item)
+                    prefill_tokens_used += prompt_len
+
+                # Re-queue deferred items.
+                if deferred:
+                    with self._pending_cv:
+                        for item in reversed(deferred):
+                            self._pending.insert(0, item.pending)
+
+                if not slot_map and not new_prompts:
                     with self._pending_cv:
                         if not self._pending and not self._shutdown:
                             self._pending_cv.wait(timeout=0.001)
                     continue
 
-                # --- Phase 2: Decode ---
-                active_count = sum(
-                    1 for item in slot_map.values() if not item.finished
-                )
-                free_slots_now = self._max_batch_sequences - len(slot_map)
-                with self._pending_cv:
-                    has_pending = bool(self._pending)
-
-                # If batch is thin and we have pending requests, skip decode
-                # and loop back to prefill to fill the batch first.
-                # This avoids wasting GPU time on B=1 decode when we could
-                # be prefilling to get to B=20.
-                if has_pending and free_slots_now > 0 and active_count <= 4:
+                if not slot_map and not new_prompts:
                     continue
 
-                step_tokens = self._continuous_step_tokens
-                # Cap by the minimum remaining budget across active seqs.
-                min_remaining = min(
-                    max(1, item.pending.params.max_tokens - len(item.generated_ids))
-                    for item in slot_map.values()
-                    if not item.finished
+                # Use first request's sampling params (uniform for now)
+                first_params = (
+                    pending_items[0].pending.params if pending_items
+                    else next(iter(slot_map.values())).pending.params
                 )
-                step_tokens = max(1, min(step_tokens, min_remaining))
 
+                # --- Phase 2: Flat-token step (prefill + decode in one pass) ---
                 try:
-                    slot_ids, tokens_per_slot, finished_flags, comp_lens = (
-                        self.trainer.engine_step(engine_id, step_tokens)
+                    new_sids, active_sids, sampled, finished_flags, comp_lens = (
+                        self.trainer.engine_flat_step(
+                            engine_id,
+                            new_prompts if new_prompts else [],
+                            max_gen_len=max(new_max_tokens) if new_max_tokens else 128,
+                            temperature=first_params.temperature,
+                            eos_token_id=self.eos_id,
+                            top_k=first_params.top_k,
+                            top_p=first_params.top_p,
+                            min_p=first_params.min_p,
+                        )
                     )
                 except Exception as exc:
+                    # Signal errors to pending + active
+                    for item in pending_items:
+                        item.pending.error = exc
+                        item.pending.done.set()
                     for item in slot_map.values():
                         if not item.finished:
                             item.pending.error = exc
                             item.pending.done.set()
                     slot_map.clear()
-                    logger.exception("engine_step failed")
+                    logger.exception("engine_flat_step failed")
                     continue
 
-                # --- Phase 3: Process multi-token results ---
+                # Map new slot IDs to pending items
+                for item, sid in zip(pending_items, new_sids):
+                    if sid < 0:
+                        with self._pending_cv:
+                            self._pending.insert(0, item.pending)
+                    else:
+                        slot_map[sid] = item
+
+                # --- Phase 3: Process results ---
                 release_slots: list[int] = []
-                for sid, toks, fin, clen in zip(
-                    slot_ids, tokens_per_slot, finished_flags, comp_lens
+                for sid, tok, fin, clen in zip(
+                    active_sids, sampled, finished_flags, comp_lens
                 ):
                     item = slot_map.get(sid)
                     if item is None or item.finished:
                         continue
-                    item.generated_ids.extend(int(t) for t in toks)
+                    item.generated_ids.append(int(tok))
 
                     should_finish = bool(fin)
                     if not should_finish and item.pending.stop_strings:
@@ -983,8 +995,7 @@ class NativeServingRuntime:
 
                     if should_finish:
                         item.finished = True
-                        last_tok = item.generated_ids[-1] if item.generated_ids else -1
-                        if last_tok == self.eos_id:
+                        if int(tok) == self.eos_id:
                             item.finish_reason = "stop"
                         elif item.pending.stop_strings:
                             partial_text = self.tokenizer.decode(

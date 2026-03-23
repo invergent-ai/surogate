@@ -262,6 +262,20 @@ public:
     /// Decode up to step_tokens for all active sequences.
     ContinuousStepResult engine_step(std::uint64_t engine_id, int step_tokens);
 
+    /// Flat-token step: prefill + decode in one forward pass.
+    struct FlatStepResult {
+        std::vector<int> new_slot_ids;
+        std::vector<int> active_slot_ids;
+        std::vector<int32_t> sampled_tokens;
+        std::vector<int> finished;
+        std::vector<int> completion_lens;
+    };
+    FlatStepResult engine_flat_step(
+        std::uint64_t engine_id,
+        const std::vector<std::vector<int32_t>>& new_prompts,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p);
+
     /// Release a slot (frees KV pages).
     void engine_release_slot(std::uint64_t engine_id, int slot_id);
 

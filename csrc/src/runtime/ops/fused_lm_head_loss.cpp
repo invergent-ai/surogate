@@ -17,6 +17,7 @@
 #include "runtime/dsl/graph_executor_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "kernels/attention_flat_paged.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 
@@ -38,9 +39,28 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
         Tensor& xF_flat = resolve_tensor(op.inputs[0]);
         Tensor& weight = resolve_tensor(op.inputs[1]);
 
-        const long BT = xF_flat.Sizes[0];
+        long BT = xF_flat.Sizes[0];
         const int V = static_cast<int>(weight.Sizes[0]);
         const int C = static_cast<int>(weight.Sizes[1]);
+
+        // Flat-token mode: gather last-token hidden states per request.
+        // Instead of running matmul on [total_tokens, C], gather [batch_size, C]
+        // hidden states and run a much smaller matmul.
+        if (mDecodeState->flat_token_mode &&
+            mDecodeState->flat_last_token_indices_gpu != nullptr &&
+            mDecodeState->flat_batch_size < BT) {
+            const int BS = mDecodeState->flat_batch_size;
+            // Gather BS rows from xF_flat[total_tokens, C] into logits_out_gpu
+            // (reinterpreted as BF16). The logits buffer is [max_slots * V] floats
+            // = max_slots * V * 4 bytes, more than enough for BS * C * 2 bytes.
+            void* gather_dst = mDecodeState->logits_out_gpu;
+            gather_rows_bf16(gather_dst, xF_flat.Data,
+                             mDecodeState->flat_last_token_indices_gpu,
+                             BS, C, mRunState.MainStream);
+            xF_flat.Data = reinterpret_cast<std::byte*>(gather_dst);
+            xF_flat.Sizes[0] = BS;
+            BT = BS;
+        }
 
         const bool need_lm_head =
             mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled());

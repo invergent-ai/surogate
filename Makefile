@@ -48,7 +48,7 @@ build: configure
 
 # Build Python wheel
 wheel:
-	uv build --wheel
+	uv build --wheel --out-dir dist-build
 
 wheel-dev: configure
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target _surogate

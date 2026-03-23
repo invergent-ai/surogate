@@ -21,6 +21,7 @@
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "kernels/attention_decode.h"
+#include "kernels/attention_flat_paged.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
@@ -161,6 +162,73 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     if (layer_idx < 0 && !op.inputs.empty()) {
         std::string field;
         parse_block_param(op.inputs[0].name, layer_idx, field);
+    }
+
+    // -----------------------------------------------------------------------
+    // Flat-token mode: mixed prefill+decode via FlashInfer paged prefill.
+    // Plan was pre-computed in flat_step() — no CPU sync here.
+    // For decode-only (total_q == batch_size, all q_lens=1), fall through
+    // to the regular decode path which is proven to work.
+    // -----------------------------------------------------------------------
+    // Flat-token with prefill: use FlashInfer BatchPrefillWithPagedKV.
+    // For decode-only (total_q == batch_size), fall through to regular decode path.
+    if (mDecodeState && mDecodeState->flat_token_mode && mDecodeState->paged && layer_idx >= 0
+        && mDecodeState->flat_total_tokens > mDecodeState->flat_batch_size) {
+        const int ds_Hkv = mDecodeState->num_kv_heads;
+        const int ds_Hs = mDecodeState->head_dim;
+        const int ds_batch = mDecodeState->flat_batch_size;
+        const int total_q = mDecodeState->flat_total_tokens;
+
+        // Extract Q from interleaved QKV [total_tokens, (Hq+2Hkv), Hs] → [total_tokens, Hq, Hs]
+        Tensor q_buf = mRunState.temp_alloc(ETensorDType::BF16,
+            {static_cast<long>(total_q), static_cast<long>(Hq), static_cast<long>(Hs)}, "flat_q");
+        mTemps.push_back(q_buf);
+        const auto* qkv_bf16 = qkv.get<nv_bfloat16>();
+        auto* q_bf16 = q_buf.get<nv_bfloat16>();
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            q_bf16,
+            static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),
+            qkv_bf16,
+            static_cast<std::size_t>(H) * Hs * sizeof(nv_bfloat16),
+            static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),
+            static_cast<std::size_t>(total_q),
+            cudaMemcpyDeviceToDevice, mRunState.MainStream));
+
+        const int elem_size = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
+        const std::size_t layer_pool_bytes =
+            static_cast<std::size_t>(mDecodeState->total_pages)
+            * mDecodeState->page_block_size * ds_Hkv * ds_Hs * elem_size;
+        const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
+
+        auto* k_pool = reinterpret_cast<nv_bfloat16*>(
+            reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
+        auto* v_pool = reinterpret_cast<nv_bfloat16*>(
+            reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
+
+        Tensor flat_lse = mRunState.temp_alloc(ETensorDType::FP32,
+            {static_cast<long>(total_q) * Hq}, "flat_lse");
+        mTemps.push_back(flat_lse);
+
+        // Use pre-computed plan from DecodeState (no CPU sync needed).
+        attention_flat_paged_flashinfer(
+            out.get<nv_bfloat16>(), flat_lse.get<float>(),
+            q_bf16, k_pool, v_pool,
+            mDecodeState->q_indptr_gpu,
+            mDecodeState->seq_lens_k_gpu,
+            mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+            mDecodeState->page_block_size,
+            ds_batch, total_q, mDecodeState->flat_padded_batch_size,
+            Hq, ds_Hkv, ds_Hs,
+            mDecodeState->flat_page_indptr_gpu,
+            mDecodeState->flat_page_indices_gpu,
+            mDecodeState->flat_last_page_len_gpu,
+            mDecodeState->flat_plan_int_ws_gpu,
+            mDecodeState->flat_plan_float_ws_gpu,
+            static_cast<const void*>(mDecodeState->flat_plan_info_storage),
+            nullptr, nullptr, nullptr,
+            mRunState.MainStream);
+            
+        return;
     }
 
     // -----------------------------------------------------------------------

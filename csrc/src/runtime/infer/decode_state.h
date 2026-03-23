@@ -94,6 +94,49 @@ struct DecodeState {
     int block_table_stride = 0;         // = max_pages_per_seq
     int page_block_size = 0;            // Tokens per page
     int total_pages = 0;                // Total physical pages in the pool
+
+    // ========================================================================
+    // Flat-token mode: mixed prefill+decode in a single forward pass.
+    // When flat_token_mode=true:
+    //   - mB=1, mT=total_tokens (all tokens flattened)
+    //   - dispatch_rope writes KV via kv_cache_store_flat_paged_bf16
+    //     using token_to_req_gpu and kv_write_pos_gpu
+    //   - dispatch_flash_attention uses attention_flat_paged_flashinfer
+    //     with q_indptr_gpu for per-request Q boundaries
+    //   - dispatch_fused_lm_head_loss writes logits for all total_tokens
+    //     positions; the caller samples from logits_indices_gpu
+    // ========================================================================
+    bool flat_token_mode = false;
+    int flat_batch_size = 0;            // Number of requests in the flat batch
+    int flat_total_tokens = 0;          // Total Q tokens across all requests
+
+    // Per-token → request mapping [flat_total_tokens]
+    int32_t* token_to_req_gpu = nullptr;
+    // Per-token KV write position [flat_total_tokens]
+    int32_t* kv_write_pos_gpu = nullptr;
+    // Cumulative Q token counts [flat_batch_size + 1]
+    int32_t* q_indptr_gpu = nullptr;
+    // Per-request total KV length (after this step) [flat_batch_size]
+    int32_t* seq_lens_k_gpu = nullptr;
+    // Total Q tiles for FlashInfer grid dispatch (computed on CPU from q_indptr).
+    int flat_padded_batch_size = 0;
+
+    // LM head optimization: in flat-token mode, we gather last-token hidden
+    // states per request and run a [batch_size, C] matmul instead of
+    // [total_tokens, C]. These indices mark the position in xF_flat to gather.
+    // If non-null, the LM head gathers from xF_flat at these indices first.
+    int32_t* flat_last_token_indices_gpu = nullptr;  // [flat_batch_size]
+
+    // Pre-computed FlashInfer PrefillPlan (set once per flat_step, reused across layers).
+    int32_t* flat_page_indptr_gpu = nullptr;
+    int32_t* flat_page_indices_gpu = nullptr;
+    int32_t* flat_last_page_len_gpu = nullptr;
+    void* flat_plan_int_ws_gpu = nullptr;
+    void* flat_plan_float_ws_gpu = nullptr;
+    // Opaque storage for flashinfer::PrefillPlanInfo (avoid pulling FlashInfer
+    // headers into every TU that includes decode_state.h).
+    static constexpr std::size_t kPlanInfoSize = 256;
+    alignas(8) char flat_plan_info_storage[kPlanInfoSize] = {};
 };
 
 }  // namespace infer

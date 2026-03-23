@@ -255,6 +255,25 @@ public:
                              const modules::ForwardHook* hook = nullptr,
                              bool use_cuda_graph = false);
 
+    /// Execute a flat-token forward pass: mixed prefill+decode in one call.
+    ///
+    /// All tokens from all requests are concatenated into flat arrays.
+    /// The graph is compiled with B=1, T=total_tokens and uses varlen attention
+    /// via FlashInfer BatchPrefillWithPagedKVCache.
+    ///
+    /// @param total_tokens  Total Q tokens across all requests.
+    /// @param token_ids_gpu [total_tokens] token IDs on GPU.
+    /// @param position_ids_gpu [total_tokens] position IDs on GPU.
+    /// @param decode_state  Must have flat_token_mode=true with all flat fields set.
+    /// @param comm          NCCL communicator.
+    /// @param hook          Optional LoRA forward hook.
+    void execute_flat_tokens(long total_tokens,
+                             const std::int32_t* token_ids_gpu,
+                             const std::int32_t* position_ids_gpu,
+                             infer::DecodeState& decode_state,
+                             NCCLCommunicator& comm,
+                             const modules::ForwardHook* hook = nullptr);
+
     /// Estimate the peak stack usage during backward execution.
     ///
     /// Compiles the backward graph (if not already compiled) and walks its ops to

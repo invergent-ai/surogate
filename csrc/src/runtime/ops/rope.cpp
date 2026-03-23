@@ -17,6 +17,7 @@
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "kernels/attention_decode.h"
+#include "kernels/attention_flat_paged.h"
 #include "utilities/dtype.h"
 
 namespace dsl {
@@ -49,6 +50,41 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
     rope_forward(out, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
                  static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs,
                  op.attrs.rotary_dim, mRunState.MainStream);
+
+    // ========================================================================
+    // Flat-token mode: per-token KV write to paged cache using token_to_req mapping
+    // ========================================================================
+    if (mDecodeState && mDecodeState->flat_token_mode && mDecodeState->paged) {
+        int layer_idx = -1;
+        std::string field;
+        parse_block_param(op.inputs[0].name, layer_idx, field);
+
+        if (layer_idx >= 0 && mDecodeState->token_to_req_gpu && mDecodeState->kv_write_pos_gpu) {
+            const int ds_Hkv = mDecodeState->num_kv_heads;
+            const int ds_Hs = mDecodeState->head_dim;
+            const int elem_size = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
+            const std::size_t layer_pool_bytes =
+                static_cast<std::size_t>(mDecodeState->total_pages)
+                * mDecodeState->page_block_size * ds_Hkv * ds_Hs * elem_size;
+            const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
+
+            auto* k_pool = reinterpret_cast<nv_bfloat16*>(
+                reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
+            auto* v_pool = reinterpret_cast<nv_bfloat16*>(
+                reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
+
+            kv_cache_store_flat_paged_bf16(
+                k_pool, v_pool, out.get<nv_bfloat16>(),
+                mDecodeState->token_to_req_gpu,
+                mDecodeState->kv_write_pos_gpu,
+                mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                mDecodeState->page_block_size,
+                mDecodeState->flat_total_tokens, Hq, ds_Hkv, ds_Hs,
+                mRunState.MainStream);
+        }
+        // Don't fall through to prefill or decode paths
+        return;
+    }
 
     // ========================================================================
     // Prefill mode: bulk-store ALL positions of K/V to KV-cache

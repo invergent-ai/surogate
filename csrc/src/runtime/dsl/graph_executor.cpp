@@ -1951,6 +1951,123 @@ void GraphExecutor::execute_prefill(long B, long T,
 }
 
 // ============================================================================
+// Flat-token forward: mixed prefill+decode in a single pass
+// ============================================================================
+
+void GraphExecutor::execute_flat_tokens(long total_tokens,
+                                         const std::int32_t* token_ids_gpu,
+                                         const std::int32_t* position_ids_gpu,
+                                         infer::DecodeState& decode_state,
+                                         NCCLCommunicator& comm,
+                                         const modules::ForwardHook* hook)
+{
+    if (!mCompiledExecutor) {
+        throw std::runtime_error("GraphExecutor: compiled executor not initialized");
+    }
+    if (!mCompiler) {
+        throw std::runtime_error("GraphExecutor: compiler not initialized");
+    }
+
+    // Compile with B=1, T=total_tokens. This flattens all tensor shapes to
+    // [total_tokens, C], which is what we want for flat-token processing.
+    // Reuses the prefill graph cache keyed by (1, total_tokens).
+    const long B = 1;
+    const long T = total_tokens;
+    const std::uint64_t prefill_key = bt_cache_key(B, T);
+    auto prefill_it = mPrefillCompiledForwardCache.find(prefill_key);
+    if (prefill_it == mPrefillCompiledForwardCache.end()) {
+        auto& opts = const_cast<RuntimeOptions&>(mOptions);
+        const bool saved_doc_masking = opts.DocMasking;
+        const auto saved_recompute = opts.Recompute;
+        opts.DocMasking = false;
+        opts.Recompute = RecomputeLevel::None;
+
+        auto compiled = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
+        compiled->compute_layer_segments();
+
+        opts.DocMasking = saved_doc_masking;
+        opts.Recompute = saved_recompute;
+
+        prefill_it = mPrefillCompiledForwardCache.emplace(prefill_key, std::move(compiled)).first;
+    }
+    CompiledGraph* flat_graph = prefill_it->second.get();
+
+    DslRunState& rs = mRunState;
+    const std::size_t token_bytes = static_cast<std::size_t>(total_tokens) * sizeof(std::int32_t);
+
+    const bool hook_active = hook && *hook;
+    modules::ForwardHookRuntimeContext hook_runtime_ctx{};
+    void* prev_hook_context = mHookContext;
+    if (hook_active) {
+        hook_runtime_ctx.B = B;
+        hook_runtime_ctx.T = T;
+        hook_runtime_ctx.decode_mode = true;
+        hook_runtime_ctx.prefill_mode = false;
+        mHookContext = &hook_runtime_ctx;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    }
+    auto restore_hook_context = [&]() {
+        if (!hook_active) return;
+        mHookContext = prev_hook_context;
+        mCompiledExecutor->set_hook_context(mHookContext);
+    };
+
+    try {
+    // Prime FP8/FP4 weight caches if needed.
+    const bool need_fp8_prime = mRunState.has_fp8_forward() && mFP8WeightCache.empty();
+    const bool need_fp4_prime = mRunState.has_fp4_forward() && mFP4WeightCache.empty();
+    if (need_fp8_prime) prime_fp8_weight_cache({});
+    if (need_fp4_prime) prime_fp4_weight_cache({}, false);
+    if (need_fp8_prime || need_fp4_prime) mWeightCachesPrimed = true;
+
+    // Copy token IDs and position IDs to device (D2D — already on GPU).
+    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, token_ids_gpu, token_bytes,
+                               cudaMemcpyDeviceToDevice, rs.MainStream));
+    // Position IDs: D2D copy. For mRoPE models, execute_prefill's
+    // copy_position_ids_to_device handles 3-plane replication from CPU.
+    // Here we have GPU data — just copy flat [total_tokens] to the first plane.
+    // The mRoPE dispatch reads pos_planes from the tensor rank and handles it.
+    CUDA_CHECK(cudaMemcpyAsync(rs.PositionIDs.Data, position_ids_gpu, token_bytes,
+                               cudaMemcpyDeviceToDevice, rs.MainStream));
+
+    // Initialize targets to -100 (masked).
+    if (rs.Targets.Data) {
+        std::vector<std::int32_t> targets_fill(static_cast<std::size_t>(total_tokens), -100);
+        CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets_fill.data(),
+                                   static_cast<std::size_t>(total_tokens) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, rs.MainStream));
+    }
+    if (rs.Losses.Data) fill_zero(rs.Losses, rs.MainStream);
+    if (rs.ValidTokenCount.Data) fill_zero(rs.ValidTokenCount, rs.MainStream);
+    if (rs.CorrectCount.Data) fill_zero(rs.CorrectCount, rs.MainStream);
+
+    // Set flat-token mode on decode state.
+    // flat_token_mode=true triggers the new dispatch paths in rope/attention.
+    // prefill_mode=false so the LM head produces logits (not skipped).
+    decode_state.flat_token_mode = true;
+    decode_state.prefill_mode = false;
+    mCompiledExecutor->set_decode_state(&decode_state);
+    mCompiledExecutor->set_recompute_enabled(false);
+    mCompiledExecutor->set_recompute_use_graphs(false);
+    mCompiledExecutor->set_dimensions(B, T);
+
+    static const std::vector<std::string> empty_save_list;
+    mCompiledExecutor->set_save_list(&empty_save_list);
+
+    mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
+
+    // Restore state.
+    decode_state.flat_token_mode = false;
+    mCompiledExecutor->set_decode_state(nullptr);
+    mCompiledExecutor->set_save_list(&mSaveList);
+    } catch (...) {
+        restore_hook_context();
+        throw;
+    }
+    restore_hook_context();
+}
+
+// ============================================================================
 // Decode step (single-token forward with KV-cache)
 // ============================================================================
 

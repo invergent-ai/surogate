@@ -119,6 +119,35 @@ public:
                               NCCLCommunicator& comm,
                               const modules::ForwardHook* hook = nullptr);
 
+    /// Flat-token step: prefill new prompts + decode active sequences in ONE
+    /// forward pass.  Uses execute_flat_tokens() with FlashInfer's
+    /// BatchPrefillWithPagedKVCache for unified attention.
+    ///
+    /// All tokens (prefill + decode) are concatenated into a flat array.
+    /// Each request has variable Q length (prompt_len for prefill, 1 for decode).
+    /// Returns one sampled token per request (from the last Q token's logits).
+    struct FlatStepConfig {
+        int max_gen_len = 512;
+        float temperature = 1.0f;
+        int32_t eos_token_id = 2;
+        int top_k = 0;
+        float top_p = 1.0f;
+        float min_p = 0.0f;
+    };
+    struct FlatStepResult {
+        std::vector<int> new_slot_ids;           // slot IDs for new prompts (-1 if failed)
+        std::vector<int> active_slot_ids;        // all active slots (including new)
+        std::vector<int32_t> sampled_tokens;     // one per active slot
+        std::vector<int> finished;               // 1 if finished
+        std::vector<int> completion_lens;        // total generated per slot
+    };
+    FlatStepResult flat_step(
+        const std::vector<std::vector<int32_t>>& new_prompts,
+        const FlatStepConfig& config,
+        dsl::GraphExecutor& graph_executor,
+        NCCLCommunicator& comm,
+        const modules::ForwardHook* hook = nullptr);
+
     void release_slot(int slot_id);
     int num_active() const;
     int num_free_slots() const;
@@ -194,6 +223,21 @@ private:
     cudaGraphExec_t full_step_graph_exec_ = nullptr;
     DeviceMemoryStack::Checkpoint full_step_graph_checkpoint_{};
     bool full_step_primed_ = false;
+
+    // Pre-allocated flat-step GPU buffers (avoid per-step cudaMallocAsync)
+    int max_batched_tokens_ = 0;           // token budget for flat_step
+    int32_t* flat_token_to_req_gpu_ = nullptr;  // [max_batched_tokens_]
+    int32_t* flat_kv_write_pos_gpu_ = nullptr;  // [max_batched_tokens_]
+    int32_t* flat_q_indptr_gpu_ = nullptr;      // [max_slots_ + 1]
+    int32_t* flat_last_token_indices_gpu_ = nullptr; // [max_slots_]
+    int32_t* flat_seq_lens_k_gpu_ = nullptr;    // [max_slots_]
+    int32_t* flat_page_indptr_gpu_ = nullptr;   // [max_slots_ + 1]
+    int32_t* flat_page_indices_gpu_ = nullptr;  // [max_slots_ * max_pages_per_seq_]
+    int32_t* flat_last_page_len_gpu_ = nullptr; // [max_slots_]
+    void* flat_plan_int_ws_gpu_ = nullptr;      // 16MB
+    void* flat_plan_float_ws_gpu_ = nullptr;    // 64MB
+    static constexpr std::size_t kPlanIntWsSize = 16 * 1024 * 1024;
+    static constexpr std::size_t kPlanFloatWsSize = 64 * 1024 * 1024;
 
     // Sampling config (from first active slot — uniform params)
     float batch_temperature_ = 1.0f;
