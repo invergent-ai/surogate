@@ -94,34 +94,59 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         void* state_ptr = (it_state != conv_states.end()) ? it_state->second : nullptr;
         bool need_realloc = (state_ptr == nullptr);
         // In flat mode the op tensor has B=1, but the persistent conv-state must
-        // track one row per request. Force reallocation to the requested flat batch.
-        if (flat_mode && !strict_conv_state) {
-            need_realloc = true;
-        }
-        if (mDecodeState->conv_state_bytes) {
-            auto& conv_state_bytes = *mDecodeState->conv_state_bytes;
-            auto it = conv_state_bytes.find(layer_idx);
-            if (it == conv_state_bytes.end() || it->second != per_seq_bytes) {
+        // track one row per request. Check if current capacity is sufficient.
+        if (!strict_conv_state && mDecodeState->conv_state_bytes) {
+            auto& conv_state_bytes_map = *mDecodeState->conv_state_bytes;
+            auto it = conv_state_bytes_map.find(layer_idx);
+            if (it == conv_state_bytes_map.end()) {
                 need_realloc = true;
+            } else if (it->second != per_seq_bytes) {
+                need_realloc = true;
+            } else if (flat_mode) {
+                // In flat mode, check if the buffer is large enough for state_bytes.
+                // The buffer may have been allocated for a different batch size.
+                // Use a capacity tracking map to avoid unnecessary reallocation.
+                // Convention: conv_state_bytes stores per_seq_bytes; total capacity
+                // is tracked by whether state_bytes fits in the existing allocation.
+                // We use a static thread-local map to track capacities.
+                static thread_local std::unordered_map<int, std::size_t> conv_state_capacity;
+                auto cap_it = conv_state_capacity.find(layer_idx);
+                if (cap_it == conv_state_capacity.end() || cap_it->second < state_bytes) {
+                    need_realloc = true;
+                    conv_state_capacity[layer_idx] = state_bytes;  // will be updated below
+                }
             }
         } else if (strict_conv_state) {
-            throw std::runtime_error(
-                "mamba_conv1d: strict decode conv-state requires conv_state_bytes map");
-        }
-
-        if (strict_conv_state && need_realloc) {
-            throw std::runtime_error(
-                "mamba_conv1d: strict decode conv-state missing or byte-size mismatch for layer "
-                + std::to_string(layer_idx));
+            if (mDecodeState->conv_state_bytes) {
+                auto& conv_state_bytes_map = *mDecodeState->conv_state_bytes;
+                auto it = conv_state_bytes_map.find(layer_idx);
+                if (it == conv_state_bytes_map.end() || it->second != per_seq_bytes) {
+                    throw std::runtime_error(
+                        "mamba_conv1d: strict decode conv-state missing or byte-size mismatch for layer "
+                        + std::to_string(layer_idx));
+                }
+            } else {
+                throw std::runtime_error(
+                    "mamba_conv1d: strict decode conv-state requires conv_state_bytes map");
+            }
         }
 
         if (need_realloc) {
-            if (state_ptr) {
-                CUDA_CHECK(cudaFree(state_ptr));
-                state_ptr = nullptr;
+            // Only grow — never shrink. This avoids cudaFree during CUDA graph capture.
+            // Allocate max(state_bytes, existing_capacity) to handle B changes.
+            static thread_local std::unordered_map<int, std::size_t> conv_state_capacity;
+            auto cap_it = conv_state_capacity.find(layer_idx);
+            const std::size_t existing_cap = (cap_it != conv_state_capacity.end()) ? cap_it->second : 0;
+            const std::size_t alloc_bytes = std::max(state_bytes, existing_cap);
+            if (alloc_bytes > existing_cap || !state_ptr) {
+                if (state_ptr) {
+                    CUDA_CHECK(cudaFree(state_ptr));
+                    state_ptr = nullptr;
+                }
+                CUDA_CHECK(cudaMalloc(&state_ptr, alloc_bytes));
+                conv_state_capacity[layer_idx] = alloc_bytes;
             }
-            CUDA_CHECK(cudaMalloc(&state_ptr, state_bytes));
-            CUDA_CHECK(cudaMemsetAsync(state_ptr, 0, state_bytes, mRunState.MainStream));
+            CUDA_CHECK(cudaMemsetAsync(state_ptr, 0, alloc_bytes, mRunState.MainStream));
             conv_states[layer_idx] = state_ptr;
         }
         if (mDecodeState->conv_state_bytes) {

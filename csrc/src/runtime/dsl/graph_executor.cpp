@@ -1959,7 +1959,8 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
                                          const std::int32_t* position_ids_gpu,
                                          infer::DecodeState& decode_state,
                                          NCCLCommunicator& comm,
-                                         const modules::ForwardHook* hook)
+                                         const modules::ForwardHook* hook,
+                                         bool use_cuda_graph)
 {
     if (!mCompiledExecutor) {
         throw std::runtime_error("GraphExecutor: compiled executor not initialized");
@@ -2081,7 +2082,28 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
     static const std::vector<std::string> empty_save_list;
     mCompiledExecutor->set_save_list(&empty_save_list);
 
-    mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
+    if (use_cuda_graph) {
+        auto& entry = mFlatTokenGraphCache[T];
+        if (entry.WarmupCount < 2) {
+            // Warmup: run eagerly to trigger lazy allocations (cudaMalloc etc.)
+            mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
+            entry.WarmupCount++;
+        } else {
+            // Capture or replay CUDA graph.
+            trace_or_execute_cuda_graph_with_stack(
+                [&]() {
+                    mCompiledExecutor->execute_forward(
+                        *flat_graph, comm, /*full=*/false, hook);
+                },
+                rs.MainStream,
+                entry.Exec,
+                /*enabled=*/true,
+                rs.Stack,
+                entry.Checkpoint);
+        }
+    } else {
+        mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
+    }
 
     // Restore state.
     decode_state.flat_token_mode = false;
@@ -2262,16 +2284,18 @@ void GraphExecutor::execute_decode_step(long B,
                 CUDA_CHECK(cudaGraphExecDestroy(decode_entry.Exec));
                 decode_entry.Exec = nullptr;
                 decode_entry.Primed = false;
+                decode_entry.WarmupCount = 0;
                 decode_entry.HasSignature = false;
             }
 
-            if (!decode_entry.Exec && !decode_entry.Primed) {
-                // Warm-up eager decode once before graph capture so capture-unsafe
-                // lazy allocations (e.g. recurrent state cudaMalloc) happen outside
-                // stream capture.
+            if (!decode_entry.Exec && decode_entry.WarmupCount < 2) {
+                // Warm-up eager decode TWICE before graph capture so capture-unsafe
+                // lazy allocations (e.g. conv state cudaMalloc/cudaFree resize)
+                // happen outside stream capture and stabilize.
                 mCompiledExecutor->execute_forward(
                     *mDecodeCompiledForward, comm, /*full=*/false, hook);
-                decode_entry.Primed = true;
+                decode_entry.WarmupCount++;
+                decode_entry.Primed = (decode_entry.WarmupCount >= 2);
             } else {
                 trace_or_execute_cuda_graph_with_stack(
                     [&]() {

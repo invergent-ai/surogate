@@ -48,8 +48,12 @@ inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
 }
 
 std::vector<int> build_graph_buckets(int max_slots) {
+    // Match vLLM's capture sizes: powers of 2 up to 16, then linear steps of 8.
     std::vector<int> buckets;
-    for (int b = 1; b <= max_slots; b *= 2) {
+    for (int b = 1; b <= std::min(16, max_slots); b *= 2) {
+        buckets.push_back(b);
+    }
+    for (int b = 24; b <= max_slots; b += 8) {
         buckets.push_back(b);
     }
     if (buckets.empty() || buckets.back() < max_slots) {
@@ -176,6 +180,8 @@ struct EngineStateStorage {
     std::unordered_map<int, void*> compact_conv_states;
     std::unordered_map<int, std::size_t> compact_conv_state_bytes;
     std::unordered_map<int, std::size_t> compact_conv_state_capacity_bytes;
+
+    bool pinned = false;  // true after compact buffers are pre-grown to max_slots
 };
 
 std::mutex g_engine_state_mu;
@@ -1474,11 +1480,20 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         }
     }
 
-    // Build host arrays
+    // Pad total_tokens to a cached bucket to avoid graph recompilation.
+    const int real_tokens = total_tokens;
+    const bool has_prefill = (total_tokens > batch_size);
+    if (has_prefill) {
+        // Round up to next multiple of 64 to reduce unique graph shapes.
+        total_tokens = ((total_tokens + 63) / 64) * 64;
+        total_tokens = std::min(total_tokens, max_batched_tokens_);
+    }
+
+    // Build host arrays (padded to total_tokens, padding gets token_id=0, pos=0)
     std::vector<int32_t> h_token_ids(total_tokens, 0);
     std::vector<int32_t> h_position_ids(total_tokens, 0);
     std::vector<int32_t> h_token_to_req(total_tokens, 0);
-    std::vector<int32_t> h_kv_write_pos(total_tokens, 0);
+    std::vector<int32_t> h_kv_write_pos(total_tokens, -1);  // -1 = no KV write for padding
     std::vector<int32_t> h_q_indptr(batch_size + 1, 0);
     std::vector<int32_t> h_seq_lens_k(batch_size, 0);
 
@@ -1701,21 +1716,80 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         // layout as the prefill path. The decode path compiled at (B=batch_size, T=1)
         // uses the standard attention dispatch (paged decode), which is faster
         // than flat-token attention for pure-decode.
-        ds.flat_token_mode = true;
+        ds.flat_token_mode = false;
         ds.prefill_mode = false;
         ds.logits_out_gpu = logits_gpu_;
+        // With pinned buffers, the recurrent/conv state addresses are stable —
+        // safe for CUDA graph capture. Set strict_state_buffers so ops don't
+        // try to allocate (they must use the pre-allocated buffers).
+        // Pad batch to nearest CUDA graph bucket to maximize graph reuse.
+        // Finished/padding slots are masked by the sampling kernel.
+        const int Bp = next_bucket(batch_size);
+        if (Bp > batch_size) {
+            // Zero-pad token IDs, position IDs for padding slots.
+            const auto pad_start = static_cast<std::size_t>(batch_size);
+            const auto pad_count = static_cast<std::size_t>(Bp - batch_size);
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<std::byte*>(run_state_->Inputs.Data) + pad_start * sizeof(int32_t),
+                0, pad_count * sizeof(int32_t), stream));
+            // seq_lens_k: padding slots get seq_len=1 (safe for attention).
+            std::vector<int32_t> pad_seqlens(pad_count, 1);
+            CUDA_CHECK(cudaMemcpyAsync(
+                d_seq_lens_k + batch_size, pad_seqlens.data(),
+                pad_count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            // Block table: padding rows point to page 0.
+            CUDA_CHECK(cudaMemsetAsync(
+                block_table_gpu_ + pad_start * static_cast<std::size_t>(max_pages_per_seq_),
+                0, pad_count * static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int), stream));
+        }
+        ds.flat_batch_size = Bp;
+        ds.strict_state_buffers = state.pinned;
         graph_executor.execute_decode_step(
-            static_cast<long>(batch_size),
+            static_cast<long>(Bp),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
-            ds, comm, hook, /*use_cuda_graph=*/false);
+            ds, comm, hook, state.pinned ? use_cuda_graphs_ : false);
     } else {
-        // Mixed prefill+decode: use flat-token eager execution.
+        // Mixed prefill+decode: flat-token eager execution.
+        // CUDA graphs can't capture the FlashInfer PrefillPlan (host-side sync).
         graph_executor.execute_flat_tokens(
             static_cast<long>(total_tokens),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
-            ds, comm, hook);
+            ds, comm, hook, /*use_cuda_graph=*/false);
+    }
+
+    // After the first forward pass, pre-grow all compact state buffers to
+    // max_slots_ capacity. This ensures the decode path (with CUDA graphs)
+    // never needs to allocate — all buffers are pre-allocated at fixed addresses.
+    if (!state.pinned) {
+        auto pin_buffers = [&](std::unordered_map<int, void*>& compact_states,
+                               std::unordered_map<int, std::size_t>& compact_state_bytes,
+                               std::unordered_map<int, std::size_t>& compact_state_capacity_bytes) {
+            const std::size_t max_B = static_cast<std::size_t>(max_slots_);
+            for (auto& [layer_idx, per_seq_bytes] : compact_state_bytes) {
+                if (per_seq_bytes == 0) continue;
+                const std::size_t max_bytes = max_B * per_seq_bytes;
+                auto& cap = compact_state_capacity_bytes[layer_idx];
+                if (cap < max_bytes) {
+                    void*& ptr = compact_states[layer_idx];
+                    if (ptr) {
+                        CUDA_CHECK(cudaFree(ptr));
+                        ptr = nullptr;
+                    }
+                    CUDA_CHECK(cudaMalloc(&ptr, max_bytes));
+                    CUDA_CHECK(cudaMemsetAsync(ptr, 0, max_bytes, stream));
+                    cap = max_bytes;
+                }
+            }
+        };
+        pin_buffers(state.compact_recurrent_states,
+                    state.compact_recurrent_state_bytes,
+                    state.compact_recurrent_state_capacity_bytes);
+        pin_buffers(state.compact_conv_states,
+                    state.compact_conv_state_bytes,
+                    state.compact_conv_state_capacity_bytes);
+        state.pinned = true;
     }
 
     // Persist decode-updated recurrent/conv compact state back into slot-local storage.

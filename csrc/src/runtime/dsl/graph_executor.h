@@ -272,7 +272,8 @@ public:
                              const std::int32_t* position_ids_gpu,
                              infer::DecodeState& decode_state,
                              NCCLCommunicator& comm,
-                             const modules::ForwardHook* hook = nullptr);
+                             const modules::ForwardHook* hook = nullptr,
+                             bool use_cuda_graph = false);
 
     /// Estimate the peak stack usage during backward execution.
     ///
@@ -515,11 +516,21 @@ private:
         cudaGraphExec_t Exec = nullptr;
         DeviceMemoryStack::Checkpoint Checkpoint{};
         bool Primed = false;
+        int WarmupCount = 0;
         bool HasSignature = false;
         DecodeGraphSignature Signature{};
     };
     // Full-mode decode graph cache keyed by decode batch size (B).
     std::unordered_map<long, DecodeGraphCacheEntry> mDecodeGraphCache;
+
+    // Flat-token CUDA graph cache keyed by padded total_tokens (T).
+    // Used for mixed prefill+decode steps to eliminate kernel launch overhead.
+    struct FlatTokenGraphCacheEntry {
+        cudaGraphExec_t Exec = nullptr;
+        DeviceMemoryStack::Checkpoint Checkpoint{};
+        int WarmupCount = 0;
+    };
+    std::unordered_map<long, FlatTokenGraphCacheEntry> mFlatTokenGraphCache;
 
     // ========================================================================
     // Compiled execution (operations pre-compiled into direct function calls)
