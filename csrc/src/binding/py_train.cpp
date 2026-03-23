@@ -2393,10 +2393,16 @@ std::uint64_t MultiGPUPyTrainer::create_continuous_engine(
         const int Hs = model_config.head_size();
         const int num_layers = model_config.NumLayers;
         constexpr int kPageBlockSize = 256;
-        const int elem_bytes = 2;  // BF16 default
+        const int sm = run_state.DeviceProp.major * 10 + run_state.DeviceProp.minor;
+        const bool fp8_kv_cache = env_enabled("SUROGATE_ENABLE_FP8_KV_CACHE") && sm >= 89;
+        const int elem_bytes = fp8_kv_cache ? 1 : 2;
         const std::size_t page_bytes_per_pool =
             static_cast<std::size_t>(num_layers) * kPageBlockSize * Hkv * Hs * elem_bytes;
-        const std::size_t page_bytes_total = 2 * page_bytes_per_pool;  // K + V
+        const std::size_t fp8_scale_bytes =
+            fp8_kv_cache
+                ? static_cast<std::size_t>(2) * num_layers * kPageBlockSize * Hkv * sizeof(float)
+                : 0;  // k_scales + v_scales
+        const std::size_t page_bytes_total = 2 * page_bytes_per_pool + fp8_scale_bytes;
 
         // Reserve space for decode buffers (~max_num_seqs * V * 4 for logits, etc.)
         // AND activation scratch (FFN intermediates, delta-rule scratch, etc.).

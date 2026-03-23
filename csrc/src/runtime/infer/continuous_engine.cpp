@@ -89,6 +89,21 @@ inline int resolve_prefill_chunk_size(
     return std::max(1, chunk);
 }
 
+inline int resolve_flat_prefill_chunk_size(
+        int requested_chunk_size,
+        int token_budget,
+        const dsl::DslRunState& run_state) {
+    const int budget = std::max(1, token_budget);
+    int chunk = (requested_chunk_size <= 0)
+        ? budget
+        : std::min(requested_chunk_size, budget);
+    const int static_t_cap = static_prefill_t_cap(run_state);
+    if (static_t_cap > 0) {
+        chunk = std::min(chunk, static_t_cap);
+    }
+    return std::max(1, chunk);
+}
+
 inline bool is_valid_token_id(const int32_t tok, const int vocab_size) {
     return tok >= 0 && tok < vocab_size;
 }
@@ -1426,10 +1441,10 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
 
     // === Phase 2: Select active slots under token budget ===
     // Always schedule all decode slots (1 token each), then add prefill slots
-    // round-robin up to the flat-step token budget. This avoids forcing dozens
-    // of prefilling requests down to q_len=1, which hurts throughput.
-    const int chunk_size = std::max(
-        1, resolve_prefill_chunk_size(config.prefill_chunk_size, max_seq_len_, *run_state_));
+    // up to the flat-step token budget. Prefill admission is sequential and
+    // token-budgeted (mini-sglang style), not round-robin micro-chunking.
+    const int chunk_size = resolve_flat_prefill_chunk_size(
+        config.prefill_chunk_size, max_batched_tokens_, *run_state_);
     const int token_budget = std::max(1, max_batched_tokens_);
 
     std::vector<int> decode_sids;
@@ -1455,30 +1470,25 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
 
     int remaining_budget = token_budget - static_cast<int>(active_sids.size());
     if (remaining_budget > 0 && !prefill_sids.empty()) {
-        const int prefill_count = static_cast<int>(prefill_sids.size());
-        prefill_rr_cursor_ = ((prefill_rr_cursor_ % prefill_count) + prefill_count) % prefill_count;
-        const int start = prefill_rr_cursor_;
-
-        int scanned = 0;
-        while (scanned < prefill_count && remaining_budget > 0) {
-            const int idx = (start + scanned) % prefill_count;
-            const int sid = prefill_sids[static_cast<std::size_t>(idx)];
+        for (int sid : prefill_sids) {
+            if (remaining_budget <= 0) {
+                break;
+            }
             const auto& slot = slots_[static_cast<std::size_t>(sid)];
             const int remaining_prompt =
                 static_cast<int>(slot.prompt.size()) - slot.prefill_progress;
-            if (remaining_prompt > 0) {
-                const int desired = std::min(remaining_prompt, chunk_size);
-                const int admitted = std::min(desired, remaining_budget);
-                if (admitted > 0) {
-                    active_sids.push_back(sid);
-                    prefill_q_lens.push_back(admitted);
-                    remaining_budget -= admitted;
-                }
+            if (remaining_prompt <= 0) {
+                continue;
             }
-            ++scanned;
+            const int desired = std::min(remaining_prompt, chunk_size);
+            const int admitted = std::min(desired, remaining_budget);
+            if (admitted <= 0) {
+                continue;
+            }
+            active_sids.push_back(sid);
+            prefill_q_lens.push_back(admitted);
+            remaining_budget -= admitted;
         }
-
-        prefill_rr_cursor_ = (start + 1) % prefill_count;
     }
 
     const int batch_size = static_cast<int>(active_sids.size());
@@ -1510,6 +1520,16 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
             q_lens[i] = 1;
         }
         total_tokens += q_lens[i];
+    }
+
+    const int static_t_cap = static_prefill_t_cap(*run_state_);
+    if (has_prefill_slots && static_t_cap > 0) {
+        for (int q : q_lens) {
+            if (q > static_t_cap) {
+                throw std::runtime_error(
+                    "ContinuousGenerationEngine::flat_step: prefill q_len exceeds static runtime T cap");
+            }
+        }
     }
 
     if (total_tokens > token_budget) {
