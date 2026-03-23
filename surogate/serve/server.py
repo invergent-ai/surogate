@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import queue
 import threading
 import time
 import uuid
@@ -102,6 +103,7 @@ class PendingGeneration:
     prompt_ids: list[int]
     stop_strings: list[str]
     params: GenerationParams
+    stream_queue: Optional[queue.Queue[int | None]] = None
     done: threading.Event = field(default_factory=threading.Event)
     result: Optional[list[GeneratedChoice]] = None
     error: Optional[Exception] = None
@@ -942,29 +944,28 @@ class NativeServingRuntime:
                 engine_id,
             )
 
-            # Token budget: max tokens per flat-step forward pass.
-            token_budget = self.config.max_num_batched_tokens
-
             import time as _time
             _step_count = 0
+            loop_trace = os.getenv("SUROGATE_SERVE_LOOP_TRACE", "").strip().lower() not in {
+                "",
+                "0",
+                "false",
+                "no",
+            }
+            prefill_chunk_size = max(0, int(self.config.prefill_chunk_size))
 
             while not self._shutdown:
                 _t_loop_start = _time.perf_counter()
-                # --- Phase 1: Collect new requests within token budget ---
+                # --- Phase 1: Collect new requests — admit all pending up to free slots ---
+                # The C++ flat_step handles token budget clamping internally by
+                # trimming prefill chunk sizes to fit max_batched_tokens.
                 free_slots = self._max_batch_sequences - len(slot_map)
-                active_decode_count = sum(
-                    1 for item in slot_map.values() if not item.finished
-                )
-                # Reserve 1 token per active decode sequence.
-                remaining_budget = token_budget - active_decode_count
-
                 new_items = self._drain_pending(max_new=max(0, free_slots))
 
                 new_prompts: list[list[int]] = []
                 new_max_tokens: list[int] = []
                 pending_items: list[ActiveGeneration] = []
                 deferred: list[ActiveGeneration] = []
-                prefill_tokens_used = 0
                 for item in new_items:
                     prompt_ids = item.pending.prompt_ids
                     prompt_len = len(prompt_ids)
@@ -972,17 +973,9 @@ class NativeServingRuntime:
                     if prompt_len + max_tokens > self._runtime_seq_len:
                         max_tokens = max(1, self._runtime_seq_len - prompt_len)
 
-                    # With chunked prefill, each new prompt only costs
-                    # min(prompt_len, chunk_size) tokens per step, not the full prompt.
-                    prefill_chunk = min(prompt_len, 256)  # matches prefill_chunk_size
-                    if prefill_tokens_used + prefill_chunk > remaining_budget:
-                        deferred.append(item)
-                        continue
-
                     new_prompts.append(prompt_ids)
                     new_max_tokens.append(max_tokens)
                     pending_items.append(item)
-                    prefill_tokens_used += prefill_chunk
 
                 # Re-queue deferred items.
                 if deferred:
@@ -1014,15 +1007,17 @@ class NativeServingRuntime:
                             new_prompts if new_prompts else [],
                             max_gen_len=max(new_max_tokens) if new_max_tokens else 128,
                             temperature=first_params.temperature,
-                            eos_token_id=-1 if any(
-                                item.pending.params.ignore_eos
-                                for item in slot_map.values()
-                                if not item.finished
+                            eos_token_id=-1 if (
+                                any(item.pending.params.ignore_eos
+                                    for item in slot_map.values()
+                                    if not item.finished)
+                                or any(item.pending.params.ignore_eos
+                                       for item in pending_items)
                             ) else self.eos_id,
                             top_k=first_params.top_k,
                             top_p=first_params.top_p,
                             min_p=first_params.min_p,
-                            prefill_chunk_size=256,
+                            prefill_chunk_size=prefill_chunk_size,
                         )
                     )
                 except Exception as exc:
@@ -1030,10 +1025,14 @@ class NativeServingRuntime:
                     for item in pending_items:
                         item.pending.error = exc
                         item.pending.done.set()
+                        if item.pending.stream_queue is not None:
+                            item.pending.stream_queue.put(None)
                     for item in slot_map.values():
                         if not item.finished:
                             item.pending.error = exc
                             item.pending.done.set()
+                            if item.pending.stream_queue is not None:
+                                item.pending.stream_queue.put(None)
                     slot_map.clear()
                     logger.exception("engine_flat_step failed")
                     continue
@@ -1061,7 +1060,10 @@ class NativeServingRuntime:
                     if clen == 0:
                         continue
                     safe_tok, tok_replaced = self._sanitize_token_ids([int(tok)])
-                    item.generated_ids.append(int(safe_tok[0]))
+                    emitted_tok = int(safe_tok[0])
+                    item.generated_ids.append(emitted_tok)
+                    if item.pending.stream_queue is not None:
+                        item.pending.stream_queue.put(emitted_tok)
 
                     eos_hit = bool(fin) or tok_replaced
                     should_finish = eos_hit and not item.pending.params.ignore_eos
@@ -1091,6 +1093,8 @@ class NativeServingRuntime:
 
                         self._finalize_continuous_request(item)
                         item.pending.done.set()
+                        if item.pending.stream_queue is not None:
+                            item.pending.stream_queue.put(None)
                         release_slots.append(sid)
 
                 for sid in release_slots:
@@ -1102,7 +1106,7 @@ class NativeServingRuntime:
 
                 _t_end = _time.perf_counter()
                 _step_count += 1
-                if _step_count <= 30 or _step_count % 50 == 0:
+                if loop_trace and (_step_count <= 30 or _step_count % 50 == 0):
                     _sched_ms = (_t_sched - _t_loop_start) * 1000
                     _fwd_ms = (_t_fwd - _t_sched) * 1000
                     _post_ms = (_t_end - _t_fwd) * 1000
@@ -1134,8 +1138,10 @@ class NativeServingRuntime:
                 if not item.pending.done.is_set():
                     item.pending.error = RuntimeError("continuous engine shut down")
                     item.pending.done.set()
+                    if item.pending.stream_queue is not None:
+                        item.pending.stream_queue.put(None)
 
-    def _generate(
+    def _enqueue_generation(
         self,
         prompt_ids: list[int],
         *,
@@ -1148,7 +1154,8 @@ class NativeServingRuntime:
         repetition_penalty: float,
         stop_strings: Sequence[str],
         ignore_eos: bool = False,
-    ) -> list[GeneratedChoice]:
+        stream_queue: Optional[queue.Queue[int | None]] = None,
+    ) -> PendingGeneration:
         pending = PendingGeneration(
             prompt_ids=prompt_ids,
             stop_strings=list(stop_strings),
@@ -1162,11 +1169,15 @@ class NativeServingRuntime:
                 repetition_penalty=repetition_penalty,
                 ignore_eos=ignore_eos,
             ),
+            stream_queue=stream_queue,
         )
         with self._pending_cv:
             self._pending.append(pending)
             self._pending_cv.notify()
+        return pending
 
+    @staticmethod
+    def _await_generation_result(pending: PendingGeneration) -> list[GeneratedChoice]:
         pending.done.wait()
         if pending.error is not None:
             raise pending.error
@@ -1174,7 +1185,9 @@ class NativeServingRuntime:
             raise RuntimeError("generation batcher produced no result")
         return pending.result
 
-    def generate_for_chat(self, req: ChatCompletionsRequest) -> list[GeneratedChoice]:
+    def _prepare_chat_generation(
+        self, req: ChatCompletionsRequest
+    ) -> tuple[list[int], GenerationParams, list[str]]:
         if req.model and req.model not in {self.model_id, self.config.model}:
             raise ValueError(f"Unknown model '{req.model}'")
         if req.n <= 0:
@@ -1207,9 +1220,7 @@ class NativeServingRuntime:
         prompt_ids, max_tokens = self._fit_prompt_and_max_tokens(
             prompt_ids, max(1, max_tokens), param_name="messages"
         )
-
-        return self._generate(
-            prompt_ids,
+        params = GenerationParams(
             n=req.n,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1217,11 +1228,13 @@ class NativeServingRuntime:
             top_p=top_p,
             min_p=max(0.0, min_p),
             repetition_penalty=max(1e-6, repetition_penalty),
-            stop_strings=_normalize_stop(req.stop),
             ignore_eos=bool(getattr(req, "ignore_eos", False)),
         )
+        return prompt_ids, params, _normalize_stop(req.stop)
 
-    def generate_for_completion(self, req: CompletionsRequest) -> list[GeneratedChoice]:
+    def _prepare_completion_generation(
+        self, req: CompletionsRequest
+    ) -> tuple[list[int], GenerationParams, list[str]]:
         if req.model and req.model not in {self.model_id, self.config.model}:
             raise ValueError(f"Unknown model '{req.model}'")
         if req.n <= 0:
@@ -1254,9 +1267,7 @@ class NativeServingRuntime:
         prompt_ids, max_tokens = self._fit_prompt_and_max_tokens(
             prompt_ids, max(1, max_tokens), param_name="prompt"
         )
-
-        return self._generate(
-            prompt_ids,
+        params = GenerationParams(
             n=req.n,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1264,8 +1275,79 @@ class NativeServingRuntime:
             top_p=top_p,
             min_p=max(0.0, min_p),
             repetition_penalty=max(1e-6, repetition_penalty),
-            stop_strings=_normalize_stop(req.stop),
             ignore_eos=bool(getattr(req, "ignore_eos", False)),
+        )
+        return prompt_ids, params, _normalize_stop(req.stop)
+
+    def _generate(
+        self,
+        prompt_ids: list[int],
+        *,
+        params: GenerationParams,
+        stop_strings: Sequence[str],
+    ) -> list[GeneratedChoice]:
+        pending = self._enqueue_generation(
+            prompt_ids,
+            n=params.n,
+            max_tokens=params.max_tokens,
+            temperature=params.temperature,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            min_p=params.min_p,
+            repetition_penalty=params.repetition_penalty,
+            stop_strings=stop_strings,
+            ignore_eos=params.ignore_eos,
+        )
+        return self._await_generation_result(pending)
+
+    def start_chat_generation(self, req: ChatCompletionsRequest) -> PendingGeneration:
+        prompt_ids, params, stop_strings = self._prepare_chat_generation(req)
+        stream_queue: queue.Queue[int | None] = queue.Queue()
+        return self._enqueue_generation(
+            prompt_ids,
+            n=params.n,
+            max_tokens=params.max_tokens,
+            temperature=params.temperature,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            min_p=params.min_p,
+            repetition_penalty=params.repetition_penalty,
+            stop_strings=stop_strings,
+            ignore_eos=params.ignore_eos,
+            stream_queue=stream_queue,
+        )
+
+    def start_completion_generation(self, req: CompletionsRequest) -> PendingGeneration:
+        prompt_ids, params, stop_strings = self._prepare_completion_generation(req)
+        stream_queue: queue.Queue[int | None] = queue.Queue()
+        return self._enqueue_generation(
+            prompt_ids,
+            n=params.n,
+            max_tokens=params.max_tokens,
+            temperature=params.temperature,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            min_p=params.min_p,
+            repetition_penalty=params.repetition_penalty,
+            stop_strings=stop_strings,
+            ignore_eos=params.ignore_eos,
+            stream_queue=stream_queue,
+        )
+
+    def generate_for_chat(self, req: ChatCompletionsRequest) -> list[GeneratedChoice]:
+        prompt_ids, params, stop_strings = self._prepare_chat_generation(req)
+        return self._generate(
+            prompt_ids,
+            params=params,
+            stop_strings=stop_strings,
+        )
+
+    def generate_for_completion(self, req: CompletionsRequest) -> list[GeneratedChoice]:
+        prompt_ids, params, stop_strings = self._prepare_completion_generation(req)
+        return self._generate(
+            prompt_ids,
+            params=params,
+            stop_strings=stop_strings,
         )
 
 
@@ -1284,29 +1366,56 @@ def _chat_stream_chunks(
     created: int,
     model_id: str,
     tokenizer: Any,
-    choices: list[GeneratedChoice],
+    pending: PendingGeneration,
     include_usage: bool,
 ):
-    usage = _usage_from_choices(choices) if include_usage else None
+    max_stream_batch = max(
+        1, int(os.getenv("SUROGATE_SERVE_STREAM_BATCH_TOKENS", "16"))
+    )
 
     async def _gen():
-        for c in choices:
-            yield _sse(
-                {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [
-                        {
-                            "index": c.index,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-            )
-            for piece in _token_text_chunks(tokenizer, c.token_ids):
+        yield _sse(
+            {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+        stream_q = pending.stream_queue
+        if stream_q is not None:
+            done = False
+            while not done:
+                tok = await asyncio.to_thread(stream_q.get)
+                if tok is None:
+                    break
+                tok_batch: list[int] = [int(tok)]
+                while len(tok_batch) < max_stream_batch:
+                    try:
+                        nxt = stream_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        done = True
+                        break
+                    tok_batch.append(int(nxt))
+                piece = tokenizer.decode(
+                    tok_batch,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                if not piece:
+                    if done:
+                        break
+                    continue
                 yield _sse(
                     {
                         "id": request_id,
@@ -1315,29 +1424,44 @@ def _chat_stream_chunks(
                         "model": model_id,
                         "choices": [
                             {
-                                "index": c.index,
+                                "index": 0,
                                 "delta": {"content": piece},
                                 "finish_reason": None,
                             }
                         ],
                     }
                 )
-            yield _sse(
-                {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [
-                        {
-                            "index": c.index,
-                            "delta": {},
-                            "finish_reason": c.finish_reason,
-                        }
-                    ],
-                }
+                if done:
+                    break
+
+        try:
+            choices = await asyncio.to_thread(
+                NativeServingRuntime._await_generation_result,
+                pending,
             )
-        if include_usage and usage is not None:
+        except Exception:
+            logger.error("chat streaming failed", exc_info=True)
+            yield b"data: [DONE]\n\n"
+            return
+
+        finish_reason = choices[0].finish_reason if choices else "stop"
+        yield _sse(
+            {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+        )
+        if include_usage:
+            usage = _usage_from_choices(choices)
             yield _sse(
                 {
                     "id": request_id,
@@ -1358,14 +1482,40 @@ def _completion_stream_chunks(
     created: int,
     model_id: str,
     tokenizer: Any,
-    choices: list[GeneratedChoice],
+    pending: PendingGeneration,
     include_usage: bool,
 ):
-    usage = _usage_from_choices(choices) if include_usage else None
+    max_stream_batch = max(
+        1, int(os.getenv("SUROGATE_SERVE_STREAM_BATCH_TOKENS", "16"))
+    )
 
     async def _gen():
-        for c in choices:
-            for piece in _token_text_chunks(tokenizer, c.token_ids):
+        stream_q = pending.stream_queue
+        if stream_q is not None:
+            done = False
+            while not done:
+                tok = await asyncio.to_thread(stream_q.get)
+                if tok is None:
+                    break
+                tok_batch: list[int] = [int(tok)]
+                while len(tok_batch) < max_stream_batch:
+                    try:
+                        nxt = stream_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        done = True
+                        break
+                    tok_batch.append(int(nxt))
+                piece = tokenizer.decode(
+                    tok_batch,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                if not piece:
+                    if done:
+                        break
+                    continue
                 yield _sse(
                     {
                         "id": request_id,
@@ -1374,29 +1524,44 @@ def _completion_stream_chunks(
                         "model": model_id,
                         "choices": [
                             {
-                                "index": c.index,
+                                "index": 0,
                                 "text": piece,
                                 "finish_reason": None,
                             }
                         ],
                     }
                 )
-            yield _sse(
-                {
-                    "id": request_id,
-                    "object": "text_completion",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [
-                        {
-                            "index": c.index,
-                            "text": "",
-                            "finish_reason": c.finish_reason,
-                        }
-                    ],
-                }
+                if done:
+                    break
+
+        try:
+            choices = await asyncio.to_thread(
+                NativeServingRuntime._await_generation_result,
+                pending,
             )
-        if include_usage and usage is not None:
+        except Exception:
+            logger.error("completion streaming failed", exc_info=True)
+            yield b"data: [DONE]\n\n"
+            return
+
+        finish_reason = choices[0].finish_reason if choices else "stop"
+        yield _sse(
+            {
+                "id": request_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "",
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+        )
+        if include_usage:
+            usage = _usage_from_choices(choices)
             yield _sse(
                 {
                     "id": request_id,
@@ -1446,17 +1611,17 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
         runtime.ensure_auth(request)
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        try:
-            choices = await asyncio.to_thread(runtime.generate_for_chat, req)
-        except ContextLengthExceededError as e:
-            return _openai_context_length_error(str(e), e.param)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        except Exception as e:
-            logger.error("chat completion failed", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e)) from e
 
         if req.stream:
+            try:
+                pending = await asyncio.to_thread(runtime.start_chat_generation, req)
+            except ContextLengthExceededError as e:
+                return _openai_context_length_error(str(e), e.param)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except Exception as e:
+                logger.error("chat completion failed", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e)) from e
             include_usage = bool(
                 req.stream_options and req.stream_options.include_usage
             )
@@ -1466,11 +1631,21 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
                     created,
                     runtime.model_id,
                     runtime.tokenizer,
-                    choices,
+                    pending,
                     include_usage,
                 ),
                 media_type="text/event-stream",
             )
+
+        try:
+            choices = await asyncio.to_thread(runtime.generate_for_chat, req)
+        except ContextLengthExceededError as e:
+            return _openai_context_length_error(str(e), e.param)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            logger.error("chat completion failed", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
         usage = _usage_from_choices(choices)
         response = {
@@ -1495,17 +1670,17 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
         runtime.ensure_auth(request)
         request_id = f"cmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        try:
-            choices = await asyncio.to_thread(runtime.generate_for_completion, req)
-        except ContextLengthExceededError as e:
-            return _openai_context_length_error(str(e), e.param)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        except Exception as e:
-            logger.error("completion failed", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e)) from e
 
         if req.stream:
+            try:
+                pending = await asyncio.to_thread(runtime.start_completion_generation, req)
+            except ContextLengthExceededError as e:
+                return _openai_context_length_error(str(e), e.param)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except Exception as e:
+                logger.error("completion failed", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e)) from e
             include_usage = bool(
                 req.stream_options and req.stream_options.include_usage
             )
@@ -1515,11 +1690,21 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
                     created,
                     runtime.model_id,
                     runtime.tokenizer,
-                    choices,
+                    pending,
                     include_usage,
                 ),
                 media_type="text/event-stream",
             )
+
+        try:
+            choices = await asyncio.to_thread(runtime.generate_for_completion, req)
+        except ContextLengthExceededError as e:
+            return _openai_context_length_error(str(e), e.param)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            logger.error("completion failed", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
         usage = _usage_from_choices(choices)
         response = {

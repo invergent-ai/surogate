@@ -1424,13 +1424,63 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         result.new_slot_ids[i] = sid;
     }
 
-    // === Phase 2: Collect all active slots ===
-    std::vector<int> active_sids;
+    // === Phase 2: Select active slots under token budget ===
+    // Always schedule all decode slots (1 token each), then add prefill slots
+    // round-robin up to the flat-step token budget. This avoids forcing dozens
+    // of prefilling requests down to q_len=1, which hurts throughput.
+    const int chunk_size = std::max(
+        1, resolve_prefill_chunk_size(config.prefill_chunk_size, max_seq_len_, *run_state_));
+    const int token_budget = std::max(1, max_batched_tokens_);
+
+    std::vector<int> decode_sids;
+    std::vector<int> prefill_sids;
+    decode_sids.reserve(static_cast<std::size_t>(max_slots_));
+    prefill_sids.reserve(static_cast<std::size_t>(max_slots_));
     for (int i = 0; i < max_slots_; ++i) {
-        if (slots_[i].active && !slots_[i].finished) {
-            active_sids.push_back(i);
+        if (!slots_[i].active || slots_[i].finished) continue;
+        if (slots_[i].prefilling()) {
+            prefill_sids.push_back(i);
+        } else {
+            decode_sids.push_back(i);
         }
     }
+
+    std::vector<int> active_sids;
+    std::vector<int> prefill_q_lens;
+    active_sids.reserve(decode_sids.size() + prefill_sids.size());
+    for (int sid : decode_sids) {
+        if (static_cast<int>(active_sids.size()) >= token_budget) break;
+        active_sids.push_back(sid);
+    }
+
+    int remaining_budget = token_budget - static_cast<int>(active_sids.size());
+    if (remaining_budget > 0 && !prefill_sids.empty()) {
+        const int prefill_count = static_cast<int>(prefill_sids.size());
+        prefill_rr_cursor_ = ((prefill_rr_cursor_ % prefill_count) + prefill_count) % prefill_count;
+        const int start = prefill_rr_cursor_;
+
+        int scanned = 0;
+        while (scanned < prefill_count && remaining_budget > 0) {
+            const int idx = (start + scanned) % prefill_count;
+            const int sid = prefill_sids[static_cast<std::size_t>(idx)];
+            const auto& slot = slots_[static_cast<std::size_t>(sid)];
+            const int remaining_prompt =
+                static_cast<int>(slot.prompt.size()) - slot.prefill_progress;
+            if (remaining_prompt > 0) {
+                const int desired = std::min(remaining_prompt, chunk_size);
+                const int admitted = std::min(desired, remaining_budget);
+                if (admitted > 0) {
+                    active_sids.push_back(sid);
+                    prefill_q_lens.push_back(admitted);
+                    remaining_budget -= admitted;
+                }
+            }
+            ++scanned;
+        }
+
+        prefill_rr_cursor_ = (start + 1) % prefill_count;
+    }
+
     const int batch_size = static_cast<int>(active_sids.size());
     if (batch_size == 0) return result;
 
@@ -1440,54 +1490,41 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         state, run_state_, batch_size, batch_size, active_sids, max_slots_);
 
     // === Phase 3: Build flat token arrays ===
-    // Each slot contributes tokens based on its state:
-    //   - Prefilling slot: up to prefill_chunk_size tokens from the prompt
-    //   - Decode slot: 1 token (last_token)
-    // This implements chunked prefill: new prompts are processed incrementally
-    // across multiple flat_steps instead of all-at-once.
-
-    const int chunk_size = config.prefill_chunk_size;
-
-    // Compute per-request Q lengths and total tokens
-    std::vector<int> q_lens(batch_size, 0);
+    // Each decode slot contributes 1 token.
+    // Each selected prefill slot contributes its assigned q_len from prefill_q_lens.
+    std::vector<int> q_lens(batch_size, 1);
+    int prefill_cursor = 0;
     int total_tokens = 0;
+    bool has_prefill_slots = false;
     for (int i = 0; i < batch_size; ++i) {
-        const int sid = active_sids[i];
+        const int sid = active_sids[static_cast<std::size_t>(i)];
         const auto& slot = slots_[static_cast<std::size_t>(sid)];
         if (slot.prefilling()) {
-            // Chunked prefill: emit up to chunk_size tokens
-            const int remaining = static_cast<int>(slot.prompt.size()) - slot.prefill_progress;
-            q_lens[i] = std::min(remaining, chunk_size);
+            has_prefill_slots = true;
+            const int q = (prefill_cursor < static_cast<int>(prefill_q_lens.size()))
+                ? prefill_q_lens[static_cast<std::size_t>(prefill_cursor)]
+                : 1;
+            q_lens[i] = std::max(1, q);
+            ++prefill_cursor;
         } else {
-            q_lens[i] = 1;  // decode: single token
+            q_lens[i] = 1;
         }
         total_tokens += q_lens[i];
     }
 
-    // Clamp total_tokens to max_batched_tokens to prevent buffer overflow.
-    if (total_tokens > max_batched_tokens_) {
-        // Trim prefill chunks to fit within the budget.
-        int excess = total_tokens - max_batched_tokens_;
-        for (int i = batch_size - 1; i >= 0 && excess > 0; --i) {
-            const int sid = active_sids[i];
-            const auto& slot = slots_[static_cast<std::size_t>(sid)];
-            if (slot.prefilling() && q_lens[i] > 1) {
-                const int reduce = std::min(q_lens[i] - 1, excess);
-                q_lens[i] -= reduce;
-                excess -= reduce;
-                total_tokens -= reduce;
-            }
-        }
+    if (total_tokens > token_budget) {
+        throw std::runtime_error(
+            "ContinuousGenerationEngine::flat_step: selected tokens exceed flat-step budget");
     }
 
     // Pad total_tokens to a cached bucket to avoid graph recompilation.
-    const int real_tokens = total_tokens;
-    const bool has_prefill = (total_tokens > batch_size);
+    const bool has_prefill = has_prefill_slots;
     if (has_prefill) {
         // Round up to next multiple of 64 to reduce unique graph shapes.
         total_tokens = ((total_tokens + 63) / 64) * 64;
         total_tokens = std::min(total_tokens, max_batched_tokens_);
     }
+    const bool pure_decode = !has_prefill && (total_tokens == batch_size);
 
     // Build host arrays (padded to total_tokens, padding gets token_id=0, pos=0)
     std::vector<int32_t> h_token_ids(total_tokens, 0);
@@ -1690,75 +1727,50 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.flat_page_indices_gpu = flat_page_indices_gpu_;
     ds.flat_last_page_len_gpu = flat_last_page_len_gpu_;
 
-    flat_attention_plan(
-        h_q_indptr.data(), h_seq_lens_k.data(), h_block_table.data(),
-        max_pages_per_seq_, kPageBlockSize,
-        batch_size, total_tokens,
-        config_->NumQueryHeads, config_->NumKeyValHeads, config_->head_size(),
-        ds.flat_page_indptr_gpu, ds.flat_page_indices_gpu, ds.flat_last_page_len_gpu,
-        ds.flat_plan_int_ws_gpu, ds.flat_plan_float_ws_gpu,
-        kPlanIntWsSize, kPlanFloatWsSize,
-        static_cast<void*>(ds.flat_plan_info_storage),
-        stream);
-    ds.flat_padded_batch_size = total_tiles;
+    if (!pure_decode) {
+        flat_attention_plan(
+            h_q_indptr.data(), h_seq_lens_k.data(), h_block_table.data(),
+            max_pages_per_seq_, kPageBlockSize,
+            batch_size, total_tokens,
+            config_->NumQueryHeads, config_->NumKeyValHeads, config_->head_size(),
+            ds.flat_page_indptr_gpu, ds.flat_page_indices_gpu, ds.flat_last_page_len_gpu,
+            ds.flat_plan_int_ws_gpu, ds.flat_plan_float_ws_gpu,
+            kPlanIntWsSize, kPlanFloatWsSize,
+            static_cast<void*>(ds.flat_plan_info_storage),
+            stream);
+        ds.flat_padded_batch_size = total_tiles;
+    }
 
     // === Phase 6: Execute forward pass ===
     // For pure-decode steps (all q_lens=1), use execute_decode_step which
     // supports CUDA graph capture for much faster repeated execution.
     // For mixed steps with prefill tokens, use flat-token eager execution.
-    const bool pure_decode = (total_tokens == batch_size);  // all q_lens=1
     const bool use_decode_path = pure_decode && use_cuda_graphs_;
     if (use_decode_path) {
-        // Pure decode: use execute_decode_step with exact batch size (no padding).
+        // Pure decode: use execute_decode_step with exact batch size.
         // The decode graph cache keys by B, so each unique batch size gets its
-        // own captured graph. No padding means no wasted activation memory.
-        // Keep flat_token_mode=true so recurrent ops use the same state
-        // layout as the prefill path. The decode path compiled at (B=batch_size, T=1)
-        // uses the standard attention dispatch (paged decode), which is faster
-        // than flat-token attention for pure-decode.
+        // own captured graph; padding to larger buckets wastes compute.
         ds.flat_token_mode = false;
         ds.prefill_mode = false;
         ds.logits_out_gpu = logits_gpu_;
         // With pinned buffers, the recurrent/conv state addresses are stable —
         // safe for CUDA graph capture. Set strict_state_buffers so ops don't
         // try to allocate (they must use the pre-allocated buffers).
-        // Pad batch to nearest CUDA graph bucket to maximize graph reuse.
-        // Finished/padding slots are masked by the sampling kernel.
-        const int Bp = next_bucket(batch_size);
-        if (Bp > batch_size) {
-            // Zero-pad token IDs, position IDs for padding slots.
-            const auto pad_start = static_cast<std::size_t>(batch_size);
-            const auto pad_count = static_cast<std::size_t>(Bp - batch_size);
-            CUDA_CHECK(cudaMemsetAsync(
-                static_cast<std::byte*>(run_state_->Inputs.Data) + pad_start * sizeof(int32_t),
-                0, pad_count * sizeof(int32_t), stream));
-            // seq_lens_k: padding slots get seq_len=1 (safe for attention).
-            std::vector<int32_t> pad_seqlens(pad_count, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                d_seq_lens_k + batch_size, pad_seqlens.data(),
-                pad_count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-            // Block table: padding rows point to page 0.
-            CUDA_CHECK(cudaMemsetAsync(
-                block_table_gpu_ + pad_start * static_cast<std::size_t>(max_pages_per_seq_),
-                0, pad_count * static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int), stream));
-        }
-        ds.flat_batch_size = Bp;
+        ds.flat_batch_size = batch_size;
         ds.strict_state_buffers = state.pinned;
         graph_executor.execute_decode_step(
-            static_cast<long>(Bp),
+            static_cast<long>(batch_size),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
             ds, comm, hook, state.pinned ? use_cuda_graphs_ : false);
     } else {
-        // Mixed prefill+decode: flat-token execution with CUDA graph.
-        // The FlashInfer PrefillPlan runs BEFORE execute_flat_tokens (in flat_step),
-        // so the forward pass itself is graph-capturable. The plan results are read
-        // from fixed GPU buffers (ds.flat_plan_*) that the graph references.
+        // Mixed prefill+decode: flat-token execution with piecewise CUDA graphs.
+        // Non-attention segments are captured/replayed; attention runs eagerly.
         graph_executor.execute_flat_tokens(
             static_cast<long>(total_tokens),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
-            ds, comm, hook, state.pinned ? use_cuda_graphs_ : false);
+            ds, comm, hook, use_cuda_graphs_);
     }
 
     // After the first forward pass, pre-grow all compact state buffers to

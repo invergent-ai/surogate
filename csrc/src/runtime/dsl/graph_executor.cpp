@@ -2082,26 +2082,24 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
     static const std::vector<std::string> empty_save_list;
     mCompiledExecutor->set_save_list(&empty_save_list);
 
-    if (use_cuda_graph) {
-        auto& entry = mFlatTokenGraphCache[T];
-        if (entry.WarmupCount < 2) {
-            // Warmup: run eagerly to trigger lazy allocations (cudaMalloc etc.)
-            mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
-            entry.WarmupCount++;
-        } else {
-            // Capture or replay CUDA graph.
-            trace_or_execute_cuda_graph_with_stack(
-                [&]() {
-                    mCompiledExecutor->execute_forward(
-                        *flat_graph, comm, /*full=*/false, hook);
-                },
-                rs.MainStream,
-                entry.Exec,
-                /*enabled=*/true,
-                rs.Stack,
-                entry.Checkpoint);
-        }
+    if (use_cuda_graph && !flat_graph->layer_segments.empty()) {
+        // Piecewise CUDA graph mode: capture/replay non-attention segments,
+        // run attention eagerly. This is the same approach as vLLM's piecewise
+        // compilation — attention needs per-step dynamic metadata (PrefillPlan)
+        // while everything else (RMSNorm, matmul, SwiGLU, RoPE) has fixed shapes
+        // and can be captured.
+        //
+        // The segment graph cache is keyed by padded T. When T changes, we need
+        // to reset the segment graphs (different activations sizes).
+        // Switch to the segment graph set for this padded T value.
+        // Each unique T gets its own set of per-layer segment graphs,
+        // so graphs captured at T=2048 aren't destroyed when T=1088.
+        mCompiledExecutor->switch_segment_graphs_for_shape(B, T, *flat_graph);
+        mCompiledExecutor->set_split_attention_graphs(true);
+        mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
+        mCompiledExecutor->set_split_attention_graphs(false);
     } else {
+        mCompiledExecutor->set_split_attention_graphs(false);
         mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
     }
 

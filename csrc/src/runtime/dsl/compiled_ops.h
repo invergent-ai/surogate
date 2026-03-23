@@ -632,6 +632,11 @@ private:
     std::vector<std::vector<SegmentGraphExec>> mBwdSegGraphs[2];
     long mSegGraphB = 0, mSegGraphT = 0;
 
+    // Per-T segment graph cache for flat-token piecewise mode.
+    // Each unique padded T gets its own set of segment graphs so they persist
+    // across steps with different T values.
+    std::unordered_map<long, std::vector<std::vector<SegmentGraphExec>>> mFwdSegGraphsByT;
+
     /// Dispatch a single forward op (extracted from the switch in execute_forward).
     void dispatch_forward_op(const CompiledOp& op, const modules::ForwardHook* hook);
     /// Dispatch a single backward op (extracted from the switch in execute_backward).
@@ -641,6 +646,13 @@ public:
     void set_split_attention_graphs(bool enabled) { mSplitAttentionGraphs = enabled; }
     void reset_segment_graphs();
     void resize_segment_graphs(const CompiledGraph& fwd_graph, const CompiledGraph& bwd_graph);
+    void resize_fwd_segment_graphs(const CompiledGraph& fwd_graph);
+    bool seg_graph_dimensions_changed(long B, long T) const {
+        return B != mSegGraphB || T != mSegGraphT;
+    }
+    /// Switch mFwdSegGraphs to the cached set for the given (B, T).
+    /// Creates and initializes a new set if one doesn't exist for this T.
+    void switch_segment_graphs_for_shape(long B, long T, const CompiledGraph& graph);
     /// Total bytes of persistent saved buffers (untracked by TensorAllocator).
     size_t saved_buffers_total_bytes() const {
         size_t total = 0;

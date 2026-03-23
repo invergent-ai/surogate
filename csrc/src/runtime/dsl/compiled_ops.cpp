@@ -4983,6 +4983,64 @@ void CompiledExecutor::reset_segment_graphs() {
     mSegGraphT = 0;
 }
 
+void CompiledExecutor::switch_segment_graphs_for_shape(long B, long T,
+                                                        const CompiledGraph& graph) {
+    // If already pointing at the right T, nothing to do.
+    if (B == mSegGraphB && T == mSegGraphT) return;
+
+    // Save current segment graphs back to the per-T cache (if any).
+    if (mSegGraphT != 0 && !mFwdSegGraphs.empty()) {
+        mFwdSegGraphsByT[mSegGraphT] = std::move(mFwdSegGraphs);
+    }
+
+    // Load or create segment graphs for the new T.
+    auto it = mFwdSegGraphsByT.find(T);
+    if (it != mFwdSegGraphsByT.end()) {
+        mFwdSegGraphs = std::move(it->second);
+        mFwdSegGraphsByT.erase(it);
+    } else {
+        // First time seeing this T — create empty segment graph storage.
+        mFwdSegGraphs.clear();
+        const auto& segs = graph.layer_segments;
+        mFwdSegGraphs.resize(segs.size());
+        for (std::size_t L = 0; L < segs.size(); ++L) {
+            mFwdSegGraphs[L].resize(segs[L].size());
+        }
+    }
+    mSegGraphB = B;
+    mSegGraphT = T;
+}
+
+void CompiledExecutor::resize_fwd_segment_graphs(const CompiledGraph& fwd_graph) {
+    auto resize = [](std::vector<std::vector<SegmentGraphExec>>& layers,
+                     const std::vector<std::vector<GraphSegment>>& segs) {
+        layers.resize(segs.size());
+        for (std::size_t L = 0; L < segs.size(); ++L) {
+            layers[L].resize(segs[L].size());
+        }
+    };
+    // Destroy existing segment graphs before resizing.
+    auto destroy = [](std::vector<std::vector<SegmentGraphExec>>& layers) {
+        for (auto& layer : layers) {
+            for (auto& sg : layer) {
+                if (sg.exec) {
+                    cudaGraphExecDestroy(sg.exec);
+                    sg.exec = nullptr;
+                }
+                sg.tensor_snapshot.clear();
+                sg.named_snapshot.clear();
+                sg.saved_snapshot.clear();
+                sg.post_checkpoint = {};
+                sg.checkpoint = {};
+            }
+        }
+    };
+    destroy(mFwdSegGraphs);
+    resize(mFwdSegGraphs, fwd_graph.layer_segments);
+    mSegGraphB = mB;
+    mSegGraphT = mT;
+}
+
 void CompiledExecutor::resize_segment_graphs(const CompiledGraph& fwd_graph,
                                               const CompiledGraph& bwd_graph) {
     auto resize = [](std::vector<std::vector<SegmentGraphExec>>& layers,

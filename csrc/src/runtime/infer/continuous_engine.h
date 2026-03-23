@@ -232,6 +232,7 @@ private:
 
     // Pre-allocated flat-step GPU buffers (avoid per-step cudaMallocAsync)
     int max_batched_tokens_ = 0;           // token budget for flat_step
+    int prefill_rr_cursor_ = 0;            // fairness cursor for budgeted prefill admission
     int32_t* flat_token_to_req_gpu_ = nullptr;  // [max_batched_tokens_]
     int32_t* flat_kv_write_pos_gpu_ = nullptr;  // [max_batched_tokens_]
     int32_t* flat_q_indptr_gpu_ = nullptr;      // [max_slots_ + 1]
