@@ -15,8 +15,9 @@ title: "DSL Language"
 9. [HuggingFace Integration](#9-huggingface-integration)
 10. [Activation Slots](#10-activation-slots)
 11. [Compilation Pipeline](#11-compilation-pipeline)
-12. [Diagnostics](#12-diagnostics)
-13. [Examples](#13-examples)
+12. [Inference Fusion Passes](#12-inference-fusion-passes)
+13. [Diagnostics](#13-diagnostics)
+14. [Examples](#14-examples)
 
 ---
 
@@ -481,6 +482,11 @@ class Qwen3Model:
         # ...
     }
 
+    # Inference fusion passes (optional, per compilation mode)
+    _inference_opts_ = {
+        "decode": ["gdn_qkvzba_fuse"],
+    }
+
     @forward
     def forward(
         self,
@@ -611,6 +617,9 @@ with graph() as g:
 # Matrix multiply
 y = g.matmul(a, b, transpose="NT", accumulate=False, alpha=1.0, beta=0.0)
 
+# Matmul with semantic role (for inference fusion pass matching)
+y = g.matmul(a, "weight", transpose="NT", role="mlp_up_proj")
+
 # Matmul with fused bias
 y = g.matmul_bias(a, b, bias, transpose="NT")
 
@@ -640,6 +649,7 @@ y, mean, rstd = g.layernorm(x, "weight", "bias", eps=1e-5)
 
 ```python
 y = g.swiglu(x)                    # SwiGLU: silu(gate) * up
+y = g.swiglu(x, role="mlp_activation")  # With semantic role
 y = g.silu(x)                      # SiLU (Swish)
 y = g.relu(x)                      # ReLU
 y = g.relu2(x)                     # ReLU squared
@@ -1106,11 +1116,122 @@ spec = registry.get_any("SomeComponent")
 
 ---
 
-## 12. Diagnostics
+## 12. Inference Fusion Passes
+
+The DSL supports declarative inference-only graph optimizations via a fusion pass registry. Models declare which passes to apply per compilation mode, and the C++ graph compiler runs them in declaration order, gated by kernel capabilities.
+
+### 12.1 Model Declaration
+
+Models declare inference optimizations via the `_inference_opts_` class attribute:
+
+```python
+@model
+@hf_config(...)
+class Qwen3_5CausalModel:
+    # Fusion passes applied during inference graph compilation.
+    # Key: compilation mode ("decode", "prefill", "flat_tokens")
+    # Value: ordered list of fusion pass IDs
+    _inference_opts_ = {
+        "decode": ["gdn_qkvzba_fuse"],
+    }
+```
+
+The attribute is serialized into the IR JSON and read by the C++ graph compiler. Passes only run for the specified mode (e.g., `"decode"` passes only run when `GraphCompileMode::InferenceDecode` is active). Training compilation (`GraphCompileMode::Default`) skips all passes.
+
+### 12.2 Semantic Roles
+
+Operations in block `@forward` methods can carry a `role=` attribute to enable semantic pattern matching by fusion passes:
+
+```python
+@forward
+def forward(self, x, residual, position_ids):
+    with graph() as g:
+        # ...
+        up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT",
+                           role="mlp_up_proj", out_name="mlp_up_flat")
+        act = g.swiglu(mlp_up, role="mlp_activation", out_name="swiglu")
+        out_flat = g.matmul(act_flat, "mlp_down_weight", transpose="NT",
+                            role="mlp_down_proj", out_name="mlp_down_flat")
+```
+
+Roles flow through the IR as operation attributes. Fusion passes match on roles instead of weight-name heuristics, making them architecture-agnostic.
+
+Standard role vocabulary:
+
+| Role | Meaning |
+|------|---------|
+| `mlp_up_proj` | MLP up-projection matmul (gate+up for SwiGLU) |
+| `mlp_activation` | MLP activation function (swiglu, silu, gelu, relu2) |
+| `mlp_down_proj` | MLP down-projection matmul |
+| `moe_gate_up` | MoE gate+up grouped GEMM |
+| `moe_down` | MoE down grouped GEMM |
+| `gdn_in_proj_qkv` | GatedDeltaNet QKV projection (Qwen3.5 linear blocks) |
+| `gdn_in_proj_z` | GatedDeltaNet Z projection |
+| `gdn_in_proj_b` | GatedDeltaNet Beta projection |
+| `gdn_in_proj_a` | GatedDeltaNet Alpha projection |
+
+### 12.3 Fusion Pass Registry
+
+Fusion passes are self-contained C++ files under `csrc/src/runtime/dsl/fusions/`. Each pass self-registers at static init time:
+
+```cpp
+// csrc/src/runtime/dsl/fusions/gdn_qkvzba_fuse.cpp
+static FusionPassRegistrar _reg({
+    .id = "gdn_qkvzba_fuse",
+    .description = "Fuse Qwen3.5 GDN 4-matmul projections into 2 merged matmuls",
+    .required_kernels = {"jit:gdn_fused_proj_contiguous"},
+    .run = run_gdn_qkvzba_fuse,
+});
+```
+
+### 12.4 Kernel Capability Gating
+
+Each pass declares `required_kernels` — a list of capability IDs that must all be present for the pass to fire. Capabilities use string namespaces:
+
+| Namespace | Example | Meaning |
+|-----------|---------|---------|
+| `compiled:` | `compiled:qkv_qk_norm_rope` | Built-in C++ CompiledOpType |
+| `jit:` | `jit:gdn_fused_proj_contiguous` | JIT-compiled Triton/CuTe kernel loaded via manifest |
+| `arch:` | `arch:sm90+` | GPU architecture requirement |
+
+The `FusionContext` is populated at graph compile time from:
+- Compiled-in ops (always available)
+- GPU SM version (detected via `cudaGetDeviceProperties`)
+- JIT kernel manifests from `RuntimeOptions.JitKernelManifests`
+
+If any required kernel is missing, the pass is silently skipped.
+
+### 12.5 Debug Logging
+
+Set `SUROGATE_FUSION_DEBUG=1` to see which passes run and their results:
+
+```
+[fusion] gdn_qkvzba_fuse: pattern matched (qkv=5, z=12[v13], b=14[v15], a=16[v17])
+[fusion] gdn_qkvzba_fuse: rewrote 42 ops (removed 3)
+```
+
+### 12.6 Adding a New Fusion Pass
+
+1. Create `csrc/src/runtime/dsl/fusions/my_pass.cpp`
+2. Implement `bool run(Graph& graph, const FusionContext& ctx)` — returns true if graph was modified
+3. Register with `FusionPassRegistrar` at file scope
+4. Add the `.cpp` to `csrc/CMakeLists.txt`
+5. Add the pass ID to `_inference_opts_` in the target model(s)
+6. If the pass requires a JIT kernel, add compilation in `surogate/kernels/jit_compile.py`
+
+### 12.7 Current Passes
+
+| Pass | File | Models | Effect |
+|------|------|--------|--------|
+| `gdn_qkvzba_fuse` | `fusions/gdn_qkvzba_fuse.cpp` | Qwen3.5 (Causal) | Merges 4 GDN matmuls into 2 via cached weight concat + zero-copy split. Saves 2 kernel launches per linear-attention layer per decode step. |
+
+---
+
+## 13. Diagnostics
 
 The compiler emits structured diagnostics using error codes (`E…`) and warning codes (`W…`).
 
-### 12.1 How Diagnostics Are Reported
+### 13.1 How Diagnostics Are Reported
 
 - `compile_model(...)` / `compile_model_for_hf(...)` return JSON with:
   - `success: true|false`
@@ -1118,7 +1239,7 @@ The compiler emits structured diagnostics using error codes (`E…`) and warning
   - `warnings: [{code, message, location?}]` (when present)
 - Set `raise_on_error=True` to raise a `DSLError` instead of returning a JSON error payload.
 
-### 12.2 Currently Emitted Codes (Python Compiler)
+### 13.2 Currently Emitted Codes (Python Compiler)
 
 | Code | Meaning                    | Typical trigger                                                                            |
 | ---- | -------------------------- | ------------------------------------------------------------------------------------------ |
@@ -1135,15 +1256,15 @@ The compiler emits structured diagnostics using error codes (`E…`) and warning
 | W001 | User definition shadows primitive | Model/block/module name collides with a registered primitive name  |
 | W004 | Unused saved tensor               | `@save(...)` lists a tensor name not present in the compiled graph |
 
-### 12.3 Reserved Codes
+### 13.3 Reserved Codes
 
 Additional codes (`E004–E007`, `E009`, `E011`, `E014–E027`, `W002`, `W003`, `W005`) are defined in `surogate/dsl/errors.py` but are not yet emitted by the Python compiler in v0.1.0.
 
 ---
 
-## 13. Examples
+## 14. Examples
 
-### 13.1 Simple Linear Module
+### 14.1 Simple Linear Module
 
 ```python
 from surogate.dsl import module, forward, save, Param, Tensor, graph, Dim, B, T
@@ -1175,7 +1296,7 @@ class Linear:
             return y
 ```
 
-### 13.2 RMSNorm Module
+### 14.2 RMSNorm Module
 
 ```python
 from surogate.dsl import module, forward, Param, Tensor, graph
@@ -1197,7 +1318,7 @@ class RMSNorm:
             return y
 ```
 
-### 13.3 SwiGLU MLP Module
+### 14.3 SwiGLU MLP Module
 
 ```python
 from surogate.dsl import module, forward, save, Param, Tensor, graph, Dim, B, T
@@ -1230,7 +1351,7 @@ class SwiGLUMLP:
             return out
 ```
 
-### 13.4 Complete Model Example
+### 14.4 Complete Model Example
 
 See [Section 6](#6-model-definitions) for a full Qwen3Model example.
 

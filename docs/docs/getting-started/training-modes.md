@@ -123,10 +123,25 @@ Surogate supports:
 - **Typical data:** Prompts + reward environments (math, code, custom verifiers)
 - **Typical run shape:** Iterative rollout → reward → gradient loop
 
-GRPO coordinates three components in a single command:
+Surogate provides two GRPO entrypoints:
+
+- **Native trainer** (single config, no vLLM):
 
 ```bash
-surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
+surogate grpo-native config.yaml
+```
+
+- **vLLM pipeline** (train + infer + orchestrator configs):
+
+```bash
+# Terminal 1
+surogate grpo-infer infer.yaml
+
+# Terminal 2
+surogate grpo-orch orch.yaml
+
+# Terminal 3
+surogate grpo-train train.yaml
 ```
 
 ### When to use it
@@ -136,7 +151,7 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 
 ### Tradeoffs
 - Requires a reward environment (built-in or custom).
-- More complex pipeline than SFT (inference server + orchestrator + trainer).
+- Native mode is simpler to run (one process), while the vLLM pipeline is more flexible for distributed setups.
 - Training dynamics are less predictable — requires monitoring importance ratios and masking fractions.
 
 ---

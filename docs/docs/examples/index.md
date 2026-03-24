@@ -16,12 +16,28 @@ Fine-tuning examples for chat and instruction models.
 - **[Qwen 3 QLoRA (FP4/FP8)](examples/sft/qwen3-qlora.md)**: Memory-efficient fine-tuning using quantization on modern GPUs.
 - **[Qwen 3 MoE (QLoRA)](examples/sft/qwen3moe-lora.md)**: Fine-tuning Mixture-of-Experts models.
 
+## Reinforcement Learning (GRPO)
+
+GRPO examples for reward-based RL fine-tuning.
+
+- **[Reverse-text GRPO walkthrough](examples/grpo/grpo.md)**: End-to-end SFT warmup + GRPO fine-tuning.
+- Native GRPO YAMLs: `examples/grpo-native/reverse-text.yaml`, `examples/grpo-native/qwen3-lora.yaml`.
+
 ## How to use these examples
 
 All examples are provided as YAML configuration files. You can run them using the Surogate CLI:
 
 ```bash
+# PT / SFT
 surogate [pt|sft] path/to/example.yaml
+
+# GRPO (vLLM pipeline)
+CUDA_VISIBLE_DEVICES=0 surogate grpo-infer infer.yaml
+surogate grpo-orch orch.yaml
+CUDA_VISIBLE_DEVICES=1 surogate grpo-train train.yaml
+
+# GRPO (native single process)
+surogate grpo-native path/to/native-grpo.yaml
 ```
 
 For more details on configuration options, see the [Configuration Guide](../guides/configuration.md).

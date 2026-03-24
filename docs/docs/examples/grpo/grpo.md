@@ -18,12 +18,25 @@ After training is complete, the fine-tuned model will be saved in the `././rever
 ## Reinforcement Learning with GRPO
 For the RL we will only do 20 steps at 8x16 rollouts, for a total batch size of 128 and sequence length 128. Because of the small context, training should be extremely quick.
 
-Also, we will use the [Co-locate mode](../../guides/rl-training.md#co-locate-mode-details) of Surogate, which will start a single process for vLLM, orchestrator and trainer, and everybody will share the same weights to reduce GPU memory usage.
+For the vLLM pipeline variant, run inference, orchestrator, and trainer as separate processes.
 
-Run the following command:
+Run the following commands:
 
 ```shell
-surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
+# Terminal 1: vLLM inference
+CUDA_VISIBLE_DEVICES=0 surogate grpo-infer examples/grpo/infer.yaml
+
+# Terminal 2: Orchestrator
+surogate grpo-orch examples/grpo/orch.yaml
+
+# Terminal 3: Trainer
+CUDA_VISIBLE_DEVICES=1 surogate grpo-train examples/grpo/train.yaml
+```
+
+If you want the native single-process trainer (no vLLM/orchestrator split), run:
+
+```shell
+surogate grpo-native examples/grpo-native/reverse-text.yaml
 ```
 
 After training is complete, the LoRA adapter will be saved in the `./outputs/final_adapter` folder. 

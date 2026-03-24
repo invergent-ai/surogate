@@ -13,7 +13,6 @@ COMMAND_MAPPING: Dict[str, str] = {
     'sft': 'surogate.cli.sft',
     'pt': 'surogate.cli.pt',
     'serve': 'surogate.cli.serve',
-    'grpo': 'surogate.cli.grpo',
     'grpo-train': 'surogate.cli.grpo_train',
     'grpo-infer': 'surogate.cli.grpo_infer',
     'grpo-orch': 'surogate.cli.grpo_orch',
@@ -53,10 +52,6 @@ def parse_args():
     # native serving command
     from surogate.cli.serve import prepare_command_parser as serve_prepare_command_parser
     serve_prepare_command_parser(subparsers.add_parser('serve', help="Native OpenAI-compatible inference serving"))
-
-    # grpo command (unified co-locate mode)
-    from surogate.cli.grpo import prepare_command_parser as grpo_prepare_command_parser
-    grpo_prepare_command_parser(subparsers.add_parser('grpo', help="GRPO RL (unified co-locate mode)"))
 
     # grpo-infer command
     from surogate.cli.grpo_infer import prepare_command_parser as grpo_infer_prepare_command_parser

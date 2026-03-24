@@ -1,52 +1,42 @@
 # RL Training (GRPO)
 
-Surogate supports reinforcement learning fine-tuning via GRPO (Group Relative Policy Optimization). The pipeline coordinates a vLLM inference server, a GRPO orchestrator, and the Surogate trainer.
+Surogate supports reinforcement learning fine-tuning via GRPO (Group Relative Policy Optimization) in two modes:
+
+- **Native trainer** (`surogate grpo-native`): single-process loop with built-in generation
+- **vLLM pipeline** (`surogate grpo-infer` / `grpo-orch` / `grpo-train`): inference server + orchestrator + trainer
 
 This gives you:
 
 - Surogate's near-SOL training throughput (LoRA, QLoRA, FP8)
-- Async RL pipeline (rollouts, reward computation, sample packing)
-- vLLM for fast inference and generation
-- Optional zero-copy GPU weight sharing between trainer and inference (co-locate mode)
+- Native single-process GRPO with one YAML config file
+- Async RL pipeline mode (rollouts, reward computation, sample packing) via vLLM
+- vLLM pipeline mode for distributed/separate-process RL training
 - Training & Evaluation with [Environments](./rl-environments.md)
   
 ## Architecture
 
-GRPO training supports two deployment modes: **co-locate** (single command, recommended) and **multi-process** (three separate processes).
+### Native trainer (single process, no vLLM)
 
-### Co-locate mode (single command)
+The native trainer runs generation, reward scoring, and optimization in one process:
 
-The recommended way to run GRPO. A single `surogate grpo` command starts all three components in one process with zero-copy GPU weight sharing:
-
-```
-surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
+```bash
+surogate grpo-native config.yaml
 ```
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│  surogate grpo (single process)                           │
+│  surogate grpo-native (single process)                    │
 │                                                           │
-│  1. vLLM server (background thread, engine in subprocess) │
-│     └─ Owns quantized base weights on GPU                 │
-│     └─ Serves /v1/chat/completions                        │
-│                                                           │
-│  2. Trainer (background thread)                           │
-│     └─ Borrows vLLM's quantized weights (zero-copy IPC)   │
-│     └─ Dequantizes on-the-fly for forward/backward        │
-│                                                           │
-│  3. Orchestrator (main async event loop)                  │
-│     └─ Sends rollout requests to vLLM via HTTP            │
-│     └─ Computes rewards and advantages                    │
-│     └─ Sends training batches via filesystem transport    │
-│     └─ Signals LoRA weight updates to vLLM                │
+│  1. Native generation via C++ engine                      │
+│  2. Reward scoring (verifiers or callback)                │
+│  3. Advantage computation                                 │
+│  4. GRPO backward + optimizer step                        │
 └───────────────────────────────────────────────────────────┘
 ```
 
-**How weight sharing works**: At startup, vLLM loads and quantizes the base model on GPU. The trainer then receives GPU pointers to those quantized tensors via CUDA IPC — no copy, no duplicate memory. Only the base weights (linear layers) are shared; small non-quantized weights (norms, embeddings) are loaded separately from disk. LoRA adapter updates are small (~10 MB) and go through the filesystem.
+Native mode uses one config file (`NativeGRPOConfig`) and does not require `vllm`.
 
-**Automatic memory management**: The trainer's GPU memory footprint (LoRA parameters, activations, dequantization buffers) is estimated automatically, and `gpu_memory_utilization` is computed so vLLM uses the remaining GPU memory for its KV cache. No manual tuning needed.
-
-### Multi-process mode (three processes)
+### vLLM pipeline mode (three processes)
 
 The original three-process architecture, useful for multi-node setups or when inference and training run on different GPUs:
 
@@ -64,7 +54,27 @@ The original three-process architecture, useful for multi-node setups or when in
 
 The three processes communicate via a shared filesystem directory (`output_dir`).
 
-## Quick Start (co-locate mode)
+## Quick Start (native trainer)
+
+This walkthrough uses the native reverse-text config in `examples/grpo-native/reverse-text.yaml`:
+
+```bash
+surogate grpo-native examples/grpo-native/reverse-text.yaml
+```
+
+If you use `uv`:
+
+```bash
+uv run surogate grpo-native examples/grpo-native/reverse-text.yaml
+```
+
+Native trainer highlights:
+
+1. One config file (`generation`, `reward`, `sampling`, `loss`, `eval`)
+2. No vLLM server or orchestrator process
+3. Built-in adaptive generation batch fallback via `generation.max_prompts_per_batch` + `generation.adaptive_batch_on_oom`
+
+## Quick Start (vLLM multi-process mode)
 
 This walkthrough uses the **reverse-text** example — a lightweight task that runs on a single GPU.
 
@@ -140,25 +150,7 @@ sampling:
   max_tokens: 128
 ```
 
-### 2. Run with a single command
-
-```bash
-surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
-```
-
-That's it. The command:
-
-1. Starts the vLLM inference server in the background
-2. Extracts GPU weight pointers via CUDA IPC for zero-copy sharing
-3. Starts the Surogate trainer (borrows vLLM's weights)
-4. Runs the orchestrator, which coordinates rollouts and training steps
-5. Shuts down cleanly when `max_steps` is reached
-
-You do **not** need to set `gpu_memory_utilization` in co-locate mode — it is computed automatically based on the trainer's memory requirements.
-
-## Quick Start (multi-process mode)
-
-If you prefer separate processes (e.g., inference and training on different GPUs), use the three individual commands:
+### 2. Run with three commands
 
 ```bash
 # Terminal 1: Start vLLM inference server (GPU 0)
@@ -190,9 +182,20 @@ surogate grpo-orch orch.yaml
 CUDA_VISIBLE_DEVICES=0 surogate grpo-train train.yaml
 ```
 
-For single-GPU setups, co-locate mode is generally better since it shares base weights and computes memory splits automatically.
+For single-GPU setups, use conservative `gpu_memory_utilization` in `infer.yaml` so inference and training can coexist.
 
 ## How the Training Loop Works
+
+### Native trainer loop
+
+Each native GRPO step performs:
+
+1. Generate `generation.num_completions` completions per prompt
+2. Score rollouts via `reward` (verifiers or callback function)
+3. Compute advantages
+4. Run GRPO backward pass and optimizer update
+
+### vLLM pipeline loop
 
 Each training step performs:
 
@@ -228,7 +231,7 @@ grad[t] = -coeff[t] * keep_mask[t] / loss_scale
 
 Tokens are masked (excluded) when their importance ratio falls outside `[token_mask_low, token_mask_high]`, or when sequence-level ratios exceed the geometric or sequence mask thresholds.
 
-## Asynchronous Off-Policy Training
+## Asynchronous Off-Policy Training (vLLM pipeline)
 
 Surogate implements asynchronous off-policy training: inference generates rollouts from a policy that may lag behind the trainer by up to `max_async_level` steps (call this $k$). With $k=1$ and equal trainer/inference step times, neither component idles. The default is `max_async_level: 1`; increase it to `2` when weight broadcasts have higher latency (e.g., over a network).
 
@@ -258,53 +261,6 @@ $$
 $$
 
 where $\mu$ is the rollout policy, $\pi_\theta$ is the current trainer policy, $\hat{A}_{i,t}$ is the token-level advantage, and $\delta$ is the importance-sampling clip ratio (`token_mask_high`). The token masking thresholds (`token_mask_low`, `token_mask_high`, `geo_mask_low`, `geo_mask_high`) guard against tokens or sequences with extreme importance ratios caused by the off-policy gap.
-
-## Co-locate Mode Details
-
-### How weight sharing works
-
-In co-locate mode, the base model is loaded only once:
-
-1. vLLM starts first and loads the model (quantized weights go to GPU)
-2. The trainer receives GPU pointers to vLLM's quantized tensors via CUDA IPC
-3. Both vLLM and the trainer read from the same GPU memory — zero copy, zero duplication
-4. Only LoRA adapter updates (~10 MB) are written to disk and reloaded by vLLM
-
-This saves roughly 50% of GPU memory for the base model. For example, a Qwen3-8B model in NF4 takes ~4.5 GB — in co-locate mode this is shared instead of duplicated.
-
-### Automatic gpu_memory_utilization
-
-In co-locate mode, `gpu_memory_utilization` is computed automatically by estimating the trainer's GPU memory needs:
-
-| Component              | Estimate                                                        |
-| ---------------------- | --------------------------------------------------------------- |
-| LoRA parameters        | Weight + master copy + gradient + 8-bit optimizer (6 bytes/param) |
-| Activations            | Working set (6 BF16 tensors/layer) + logits + residual checkpoints |
-| Dequantization buffers | 3 concurrent BF16 buffers (max weight size)                     |
-| Embeddings + LM head   | vocab_size * hidden_size * 2 bytes (BF16, loaded from disk)     |
-| Fixed overhead         | 2.5 GB (CUDA context, cuDNN workspace, allocator fragmentation) |
-
-The remaining GPU memory (minus a 10% safety margin) is assigned to vLLM. You can override this by setting `gpu_memory_utilization` explicitly in `infer.yaml`.
-
-### Multi-GPU co-locate
-
-Both the trainer and vLLM use data parallelism (`tp=1, dp=N`). Each GPU has a full model replica, and weight sharing is 1:1 per GPU:
-
-```yaml
-# train.yaml
-gpus: 2
-
-# infer.yaml
-dp: 2
-```
-
-### Supported quantization formats
-
-Co-locate weight sharing works with all quantization formats since it operates on raw GPU pointers:
-
-- **BnB NF4** — Packed uint8 data + FP32 scales
-- **FP8** (E4M3) — FP8 data + FP32 block scales
-- **NVFP4** — Packed FP4 data + FP8 scales + FP32 global scale
 
 ## QLoRA for RL Training
 
@@ -381,7 +337,7 @@ noise_scheduler:
 - Tasks where reward signal diversity is low (many rollouts get the same reward)
 - Pre-quantized models (NVFP4, FP8) where quantization already introduces noise — QeRL amplifies this effect in a controlled way
 
-QeRL works with both co-locate and multi-process modes.
+QeRL works with both native trainer mode and the vLLM pipeline.
 
 ### On-Policy Distillation
 
@@ -397,7 +353,10 @@ The `teacher_tau * (teacher_logprob - trainer_logprob)` term is positive when th
 
 #### Enabling distillation
 
-Set `teacher_tau > 0` in `train.yaml` and configure the teacher in `orch.yaml`. The orchestrator computes teacher log-probabilities and delivers them alongside advantages in each micro-batch — no changes to the trainer command are needed.
+Set `teacher_tau > 0` in your GRPO loss config:
+
+- **vLLM pipeline**: set `teacher_tau` in `train.yaml` and configure `teacher_model` in `orch.yaml`
+- **Native trainer**: set `loss.teacher_tau` and `teacher_model` in the same native config file
 
 **`train.yaml`** — add `teacher_tau` to the loss block:
 
@@ -490,6 +449,8 @@ The importance ratio masks are critical for training stability:
 - **Geometric masks** (`geo_mask_low`/`geo_mask_high`): Filter entire sequences based on the geometric mean of token ratios. Catches sequences where many tokens have drifted moderately.
 - If you see high `is_masked_frac` in logs (>50%), your policy is drifting too fast. Reduce the learning rate or increase `kl_tau`.
 
+In native trainer mode, masking is controlled by `loss.ipo_mask_low` and `loss.ipo_mask_high`.
+
 ### KL Penalty
 
 Setting `kl_tau > 0` adds a KL penalty that keeps the policy close to the reference (inference) policy. This prevents reward hacking but slows learning. Start with `kl_tau: 0.0` and increase if the policy diverges.
@@ -499,6 +460,10 @@ Setting `kl_tau > 0` adds a KL penalty that keeps the policy close to the refere
 Unlike SFT where gradient accumulation increases effective batch size, in RL training it controls how many packed micro-batches are processed per optimizer step. With `gradient_accumulation_steps: 1` and packed sequences, each step processes one densely-packed sequence.
 
 ## Monitoring
+
+Native trainer commonly logs metrics like `reward/mean`, `train/policy_loss`, `train/mismatch_kl`, `train/grad_norm`, `sampling/temperature`, and `time/step`.
+
+### vLLM pipeline metrics
 
 The trainer logs these GRPO-specific metrics at each step:
 
@@ -522,7 +487,81 @@ A healthy training run shows:
 
 ## Configuration Reference
 
-### Inference config
+### Native trainer config (`grpo-native`)
+
+The native trainer uses a single YAML file (`NativeGRPOConfig`) and inherits all core SFT fields (model, LoRA, QLoRA, optimizer, precision, multi-GPU).
+
+Key native fields:
+
+| Key                      | Default | Description                                                          |
+| ------------------------ | ------- | -------------------------------------------------------------------- |
+| `model`                  | (required) | HuggingFace model ID or local path                               |
+| `output_dir`             | `output` | Output directory for checkpoints/logs/final export                 |
+| `gpus`                   | `1`     | Number of GPUs                                                       |
+| `max_steps`              | `-1`    | Training steps                                                       |
+| `problems_per_step`      | `8`     | Number of unique prompts sampled per optimizer step                  |
+| `save_steps`             | `0`     | Save checkpoint every N steps (`0` disables periodic checkpointing)  |
+| `checkpoint_dir`         | `null`  | Checkpoint root directory override                                   |
+| `resume_from_checkpoint` | `null`  | Path to checkpoint directory to resume from                          |
+| `doc_masking`            | `true`  | Enable document-level attention masking for packed RL micro-batches  |
+| `teacher_model`          | `null`  | Optional teacher model path for distillation (`loss.teacher_tau > 0`) |
+
+**Generation** (`generation.*`):
+
+| Key                               | Default | Description                                                                           |
+| --------------------------------- | ------- | ------------------------------------------------------------------------------------- |
+| `generation.num_completions`      | `4`     | Number of completions per prompt                                                      |
+| `generation.max_gen_len`          | `512`   | Max generated tokens per completion                                                   |
+| `generation.top_p`                | `1.0`   | Nucleus sampling                                                                      |
+| `generation.top_k`                | `0`     | Top-k cutoff (`0` disables top-k filtering)                                           |
+| `generation.min_p`                | `0.0`   | Minimum-probability sampling floor                                                    |
+| `generation.prefill_chunk_size`   | `256`   | Prefill chunk size (`0` disables chunked prefill)                                     |
+| `generation.max_prompts_per_batch` | `0`     | Max prompts per native `generate()` call (`0` = all prompts, fastest/highest VRAM) |
+| `generation.adaptive_batch_on_oom` | `true`  | Automatically retry generation with smaller prompt batches on OOM                   |
+
+**Sampling** (`sampling.*`):
+
+| Key                              | Default | Description                                                               |
+| -------------------------------- | ------- | ------------------------------------------------------------------------- |
+| `sampling.temperature`           | `1.0`   | Constant sampling temperature                                             |
+| `sampling.temp_scheduler.type`   | `null`  | Temperature schedule type (`linear`, `cosine`) when scheduler is enabled |
+| `sampling.temp_scheduler.start_temperature` | `null` | Temperature at step 0 when scheduler is enabled |
+| `sampling.temp_scheduler.end_temperature`   | `null` | Temperature at final step when scheduler is enabled |
+| `sampling.temp_scheduler.total_steps`       | `null` | Steps for schedule completion (falls back to training max steps) |
+
+**Reward** (`reward.*`):
+
+| Key                            | Default     | Description                                                          |
+| ------------------------------ | ----------- | -------------------------------------------------------------------- |
+| `reward.mode`                  | `verifiers` | Reward source: `verifiers` or `callback`                            |
+| `reward.env[]`                 | `null`      | Verifiers environments (required for `mode: verifiers`)             |
+| `reward.reward_fn_import_path` | `null`      | Import path to callback reward function (required for `mode: callback`) |
+| `reward.dataset_path`          | `null`      | JSONL path with `prompt` field (callback mode input prompts)        |
+| `reward.prompts`               | `null`      | Inline list of prompts (callback mode input prompts)                |
+| `reward.multiturn`             | `false`     | Enable multi-turn verifiers rollout extraction path                 |
+
+**Loss** (`loss.*`):
+
+| Key                  | Default | Description                                  |
+| -------------------- | ------- | -------------------------------------------- |
+| `loss.kl_tau`        | `1e-3`  | KL regularization coefficient                 |
+| `loss.adv_tau`       | `1.0`   | Advantage scaling                             |
+| `loss.teacher_tau`   | `0.0`   | Teacher distillation scaling                  |
+| `loss.ipo_mask_low`  | `0.2`   | Lower IPO mask threshold                      |
+| `loss.ipo_mask_high` | `0.2`   | Upper IPO mask threshold                      |
+
+**Evaluation** (`eval.*`):
+
+| Key                         | Default | Description                                      |
+| --------------------------- | ------- | ------------------------------------------------ |
+| `eval.env[]`                | `null`  | Eval environments                                |
+| `eval.num_examples`         | `100`   | Number of eval examples per environment          |
+| `eval.rollouts_per_example` | `1`     | Rollouts per eval example                        |
+| `eval.interval`             | `10`    | Evaluate every N training steps                  |
+| `eval.temperature`          | `0.0`   | Eval temperature (`0.0` = greedy)                |
+| `eval.max_gen_len`          | `null`  | Eval max generation length (falls back to train) |
+
+### vLLM inference config
 
 Key inference options:
 
@@ -542,13 +581,13 @@ Key inference options:
 | `max_loras`               | `8`            | Max simultaneously loaded LoRA adapters                |
 | `max_cpu_loras`           | `100`          | Max LoRA adapters cached on CPU                        |
 | `enable_prefix_caching`   | `null`         | Enable prefix caching (null = vLLM default)            |
-| `gpu_memory_utilization`  | `0.9`          | Fraction of GPU memory for KV cache (auto in co-locate mode) |
+| `gpu_memory_utilization`  | `0.9`          | Fraction of GPU memory for KV cache |
 | `weight_broadcast_type`   | `"filesystem"` | How to receive weight updates (`filesystem` or `nccl`) |
 | `reasoning_parser`        | `null`         | Parser for extracting reasoning content                |
 | `enable_auto_tool_choice` | `false`        | Enable auto tool choice                                |
 | `rope_scaling`            | `null`         | RoPE scaling configuration dict                        |
 
-### Orchestrator config
+### vLLM orchestrator config
 
 Key orchestrator settings:
 
@@ -681,7 +720,7 @@ Key orchestrator settings:
 | `weight_broadcast.port`    | `29501`        | (nccl only) NCCL rendezvous port                 |
 | `weight_broadcast.timeout` | `1200`         | (nccl only) NCCL timeout in seconds              |
 
-### Trainer config (inherited from SFT)
+### vLLM trainer config (inherited from SFT)
 
 GRPO trainer configs inherit all fields from `SFTConfig`. The most relevant ones for RL training:
 
@@ -740,7 +779,7 @@ How the orchestrator delivers batches to the trainer.
 | Value          | Description                                                    |
 | -------------- | -------------------------------------------------------------- |
 | `"filesystem"` | (default) IPC via shared filesystem. Simple and reliable       |
-| `"zmq"`        | IPC via ZeroMQ sockets. Lower latency for co-located processes |
+| `"zmq"`        | IPC via ZeroMQ sockets. Lower latency for same-host processes   |
 
 #### `max_async_level`
 
