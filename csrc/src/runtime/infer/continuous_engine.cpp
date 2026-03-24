@@ -942,26 +942,34 @@ void ContinuousGenerationEngine::run_one_decode_step(
     if (greedy_) {
         sampling_argmax(logits_gpu_, sampled_tokens_gpu_, Bp, V, stream);
     } else {
-        const float* temp_ptr = (batch_temperature_ == 1.0f)
-            ? nullptr : temperature_gpu_;
-        sampling_softmax(logits_gpu_, probs_gpu_, temp_ptr,
-                         Bp, V, softmax_ws_, softmax_ws_bytes_, stream);
-
-        if (batch_top_k_ > 0 && batch_top_p_ < 1.0f) {
-            sampling_top_k_top_p(probs_gpu_, sampled_tokens_gpu_,
-                batch_top_k_, batch_top_p_, Bp, V, false, 42, 0, stream);
-        } else if (batch_top_k_ > 0) {
-            sampling_top_k(probs_gpu_, sampled_tokens_gpu_, batch_top_k_,
-                Bp, V, false, 42, 0, stream);
-        } else if (batch_top_p_ < 1.0f) {
-            sampling_top_p(probs_gpu_, sampled_tokens_gpu_, batch_top_p_,
-                Bp, V, false, 42, 0, stream);
-        } else if (batch_min_p_ > 0.0f) {
-            sampling_min_p(probs_gpu_, sampled_tokens_gpu_, batch_min_p_,
-                Bp, V, false, 42, 0, stream);
-        } else {
-            sampling_from_probs(probs_gpu_, sampled_tokens_gpu_, Bp, V,
+        const bool unconstrained_sampling =
+            (batch_top_k_ <= 0) && (batch_top_p_ >= 1.0f) && (batch_min_p_ <= 0.0f);
+        if (unconstrained_sampling && batch_temperature_ == 1.0f) {
+            // Fuse softmax + categorical sampling for the common serving default path.
+            sampling_from_logits(logits_gpu_, sampled_tokens_gpu_, Bp, V,
                 false, 42, 0, stream);
+        } else {
+            const float* temp_ptr = (batch_temperature_ == 1.0f)
+                ? nullptr : temperature_gpu_;
+            sampling_softmax(logits_gpu_, probs_gpu_, temp_ptr,
+                             Bp, V, softmax_ws_, softmax_ws_bytes_, stream);
+
+            if (batch_top_k_ > 0 && batch_top_p_ < 1.0f) {
+                sampling_top_k_top_p(probs_gpu_, sampled_tokens_gpu_,
+                    batch_top_k_, batch_top_p_, Bp, V, false, 42, 0, stream);
+            } else if (batch_top_k_ > 0) {
+                sampling_top_k(probs_gpu_, sampled_tokens_gpu_, batch_top_k_,
+                    Bp, V, false, 42, 0, stream);
+            } else if (batch_top_p_ < 1.0f) {
+                sampling_top_p(probs_gpu_, sampled_tokens_gpu_, batch_top_p_,
+                    Bp, V, false, 42, 0, stream);
+            } else if (batch_min_p_ > 0.0f) {
+                sampling_min_p(probs_gpu_, sampled_tokens_gpu_, batch_min_p_,
+                    Bp, V, false, 42, 0, stream);
+            } else {
+                sampling_from_probs(probs_gpu_, sampled_tokens_gpu_, Bp, V,
+                    false, 42, 0, stream);
+            }
         }
     }
 
@@ -2028,30 +2036,38 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     if (config.temperature <= 0.0f) {
         sampling_argmax(compact_logits, sampled_tokens_gpu_, batch_size, V, stream);
     } else {
-        float* temp_arr = nullptr;
-        if (config.temperature != 1.0f) {
-            temp_arr = temperature_gpu_;  // pre-allocated [max_slots_]
-            std::vector<float> h_temp(BS, config.temperature);
-            CUDA_CHECK(cudaMemcpyAsync(temp_arr, h_temp.data(), BS * sizeof(float),
-                cudaMemcpyHostToDevice, stream));
-        }
-        sampling_softmax(compact_logits, compact_logits, temp_arr,
-                         batch_size, V, softmax_ws_, softmax_ws_bytes_, stream);
-        if (config.top_k > 0 && config.top_p < 1.0f) {
-            sampling_top_k_top_p(compact_logits, sampled_tokens_gpu_,
-                config.top_k, config.top_p, batch_size, V, false, 42, 0, stream);
-        } else if (config.top_k > 0) {
-            sampling_top_k(compact_logits, sampled_tokens_gpu_, config.top_k,
-                batch_size, V, false, 42, 0, stream);
-        } else if (config.top_p < 1.0f) {
-            sampling_top_p(compact_logits, sampled_tokens_gpu_, config.top_p,
-                batch_size, V, false, 42, 0, stream);
-        } else if (config.min_p > 0.0f) {
-            sampling_min_p(compact_logits, sampled_tokens_gpu_, config.min_p,
-                batch_size, V, false, 42, 0, stream);
-        } else {
-            sampling_from_probs(compact_logits, sampled_tokens_gpu_, batch_size, V,
+        const bool unconstrained_sampling =
+            (config.top_k <= 0) && (config.top_p >= 1.0f) && (config.min_p <= 0.0f);
+        if (unconstrained_sampling && config.temperature == 1.0f) {
+            // Fuse softmax + categorical sampling for default decode settings.
+            sampling_from_logits(compact_logits, sampled_tokens_gpu_, batch_size, V,
                 false, 42, 0, stream);
+        } else {
+            float* temp_arr = nullptr;
+            if (config.temperature != 1.0f) {
+                temp_arr = temperature_gpu_;  // pre-allocated [max_slots_]
+                std::vector<float> h_temp(BS, config.temperature);
+                CUDA_CHECK(cudaMemcpyAsync(temp_arr, h_temp.data(), BS * sizeof(float),
+                    cudaMemcpyHostToDevice, stream));
+            }
+            sampling_softmax(compact_logits, compact_logits, temp_arr,
+                             batch_size, V, softmax_ws_, softmax_ws_bytes_, stream);
+            if (config.top_k > 0 && config.top_p < 1.0f) {
+                sampling_top_k_top_p(compact_logits, sampled_tokens_gpu_,
+                    config.top_k, config.top_p, batch_size, V, false, 42, 0, stream);
+            } else if (config.top_k > 0) {
+                sampling_top_k(compact_logits, sampled_tokens_gpu_, config.top_k,
+                    batch_size, V, false, 42, 0, stream);
+            } else if (config.top_p < 1.0f) {
+                sampling_top_p(compact_logits, sampled_tokens_gpu_, config.top_p,
+                    batch_size, V, false, 42, 0, stream);
+            } else if (config.min_p > 0.0f) {
+                sampling_min_p(compact_logits, sampled_tokens_gpu_, config.min_p,
+                    batch_size, V, false, 42, 0, stream);
+            } else {
+                sampling_from_probs(compact_logits, sampled_tokens_gpu_, batch_size, V,
+                    false, 42, 0, stream);
+            }
         }
     }
     sampling_sanitize_token_ids(sampled_tokens_gpu_, batch_size, V,

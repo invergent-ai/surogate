@@ -692,30 +692,39 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
         if (gen_config.temperature <= 0.0f) {
             sampling_argmax(logits_gpu, sampled_tokens_gpu, total_batch, V, mRunState.MainStream);
         } else {
-            sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
-                             total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
-                             mRunState.MainStream);
-            if (gen_config.top_k > 0 && gen_config.top_p < 1.0f) {
-                sampling_top_k_top_p(probs_gpu, sampled_tokens_gpu,
-                                     gen_config.top_k, gen_config.top_p,
-                                     total_batch, V, /*deterministic=*/false,
+            const bool unconstrained_sampling =
+                (gen_config.top_k <= 0) && (gen_config.top_p >= 1.0f) && (gen_config.min_p <= 0.0f);
+            if (unconstrained_sampling && gen_config.temperature == 1.0f) {
+                // Fuse softmax + categorical sampling for the default generation path.
+                sampling_from_logits(logits_gpu, sampled_tokens_gpu, total_batch, V,
+                                     /*deterministic=*/false,
                                      gen_config.seed, rng_offset, mRunState.MainStream);
-            } else if (gen_config.top_k > 0) {
-                sampling_top_k(probs_gpu, sampled_tokens_gpu, gen_config.top_k,
-                               total_batch, V, /*deterministic=*/false,
-                               gen_config.seed, rng_offset, mRunState.MainStream);
-            } else if (gen_config.top_p < 1.0f) {
-                sampling_top_p(probs_gpu, sampled_tokens_gpu, gen_config.top_p,
-                               total_batch, V, /*deterministic=*/false,
-                               gen_config.seed, rng_offset, mRunState.MainStream);
-            } else if (gen_config.min_p > 0.0f) {
-                sampling_min_p(probs_gpu, sampled_tokens_gpu, gen_config.min_p,
-                               total_batch, V, /*deterministic=*/false,
-                               gen_config.seed, rng_offset, mRunState.MainStream);
             } else {
-                sampling_from_probs(probs_gpu, sampled_tokens_gpu, total_batch, V,
-                                    /*deterministic=*/false, gen_config.seed, rng_offset,
-                                    mRunState.MainStream);
+                sampling_softmax(logits_gpu, probs_gpu, temperature_gpu,
+                                 total_batch, V, grpo_softmax_ws, grpo_softmax_ws_bytes,
+                                 mRunState.MainStream);
+                if (gen_config.top_k > 0 && gen_config.top_p < 1.0f) {
+                    sampling_top_k_top_p(probs_gpu, sampled_tokens_gpu,
+                                         gen_config.top_k, gen_config.top_p,
+                                         total_batch, V, /*deterministic=*/false,
+                                         gen_config.seed, rng_offset, mRunState.MainStream);
+                } else if (gen_config.top_k > 0) {
+                    sampling_top_k(probs_gpu, sampled_tokens_gpu, gen_config.top_k,
+                                   total_batch, V, /*deterministic=*/false,
+                                   gen_config.seed, rng_offset, mRunState.MainStream);
+                } else if (gen_config.top_p < 1.0f) {
+                    sampling_top_p(probs_gpu, sampled_tokens_gpu, gen_config.top_p,
+                                   total_batch, V, /*deterministic=*/false,
+                                   gen_config.seed, rng_offset, mRunState.MainStream);
+                } else if (gen_config.min_p > 0.0f) {
+                    sampling_min_p(probs_gpu, sampled_tokens_gpu, gen_config.min_p,
+                                   total_batch, V, /*deterministic=*/false,
+                                   gen_config.seed, rng_offset, mRunState.MainStream);
+                } else {
+                    sampling_from_probs(probs_gpu, sampled_tokens_gpu, total_batch, V,
+                                        /*deterministic=*/false, gen_config.seed, rng_offset,
+                                        mRunState.MainStream);
+                }
             }
         }
         mask_finished_tokens(sampled_tokens_gpu, grpo_finished_gpu, total_batch, mRunState.MainStream);
@@ -733,6 +742,11 @@ std::vector<Trajectory> GenerationEngine::generate_grpo(
             // Greedy: compute log-softmax directly from logits (skip materializing probs).
             sampling_extract_logprob_from_logits(logits_gpu, sampled_tokens_gpu, logprobs_gpu,
                                                   nullptr, total_batch, V, mRunState.MainStream);
+        } else if (gen_config.top_k <= 0 && gen_config.top_p >= 1.0f &&
+                   gen_config.min_p <= 0.0f && gen_config.temperature == 1.0f) {
+            // sampling_from_logits path above does not materialize probs.
+            sampling_extract_logprob_from_logits(logits_gpu, sampled_tokens_gpu, logprobs_gpu,
+                                                 nullptr, total_batch, V, mRunState.MainStream);
         } else {
             // Non-greedy: probs already computed by sampling_softmax above.
             sampling_extract_logprob(probs_gpu, sampled_tokens_gpu, logprobs_gpu,
@@ -1246,34 +1260,43 @@ GenerationSessionStepResult GenerationSession::step(
             sampling_argmax(
                 mLogitsGpu, mSampledTokensGpu, mBatchSize, mVocabSize, mRunState.MainStream);
         } else {
-            sampling_softmax(
-                mLogitsGpu, mProbsGpu, mTemperatureGpu, mBatchSize, mVocabSize,
-                mSoftmaxWs, mSoftmaxWsBytes, mRunState.MainStream);
-            if (mGenConfig.top_k > 0 && mGenConfig.top_p < 1.0f) {
-                sampling_top_k_top_p(
-                    mProbsGpu, mSampledTokensGpu, mGenConfig.top_k, mGenConfig.top_p,
-                    mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
-            } else if (mGenConfig.top_k > 0) {
-                sampling_top_k(
-                    mProbsGpu, mSampledTokensGpu, mGenConfig.top_k,
-                    mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
-            } else if (mGenConfig.top_p < 1.0f) {
-                sampling_top_p(
-                    mProbsGpu, mSampledTokensGpu, mGenConfig.top_p,
-                    mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
-            } else if (mGenConfig.min_p > 0.0f) {
-                sampling_min_p(
-                    mProbsGpu, mSampledTokensGpu, mGenConfig.min_p,
-                    mBatchSize, mVocabSize, /*deterministic=*/false,
-                    mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
-            } else {
-                sampling_from_probs(
-                    mProbsGpu, mSampledTokensGpu, mBatchSize, mVocabSize,
+            const bool unconstrained_sampling =
+                (mGenConfig.top_k <= 0) && (mGenConfig.top_p >= 1.0f) && (mGenConfig.min_p <= 0.0f);
+            if (unconstrained_sampling && mGenConfig.temperature == 1.0f) {
+                sampling_from_logits(
+                    mLogitsGpu, mSampledTokensGpu, mBatchSize, mVocabSize,
                     /*deterministic=*/false, mGenConfig.seed, mRngOffset,
                     mRunState.MainStream, sampling_offset_arr);
+            } else {
+                sampling_softmax(
+                    mLogitsGpu, mProbsGpu, mTemperatureGpu, mBatchSize, mVocabSize,
+                    mSoftmaxWs, mSoftmaxWsBytes, mRunState.MainStream);
+                if (mGenConfig.top_k > 0 && mGenConfig.top_p < 1.0f) {
+                    sampling_top_k_top_p(
+                        mProbsGpu, mSampledTokensGpu, mGenConfig.top_k, mGenConfig.top_p,
+                        mBatchSize, mVocabSize, /*deterministic=*/false,
+                        mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
+                } else if (mGenConfig.top_k > 0) {
+                    sampling_top_k(
+                        mProbsGpu, mSampledTokensGpu, mGenConfig.top_k,
+                        mBatchSize, mVocabSize, /*deterministic=*/false,
+                        mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
+                } else if (mGenConfig.top_p < 1.0f) {
+                    sampling_top_p(
+                        mProbsGpu, mSampledTokensGpu, mGenConfig.top_p,
+                        mBatchSize, mVocabSize, /*deterministic=*/false,
+                        mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
+                } else if (mGenConfig.min_p > 0.0f) {
+                    sampling_min_p(
+                        mProbsGpu, mSampledTokensGpu, mGenConfig.min_p,
+                        mBatchSize, mVocabSize, /*deterministic=*/false,
+                        mGenConfig.seed, mRngOffset, mRunState.MainStream, sampling_offset_arr);
+                } else {
+                    sampling_from_probs(
+                        mProbsGpu, mSampledTokensGpu, mBatchSize, mVocabSize,
+                        /*deterministic=*/false, mGenConfig.seed, mRngOffset,
+                        mRunState.MainStream, sampling_offset_arr);
+                }
             }
         }
 
