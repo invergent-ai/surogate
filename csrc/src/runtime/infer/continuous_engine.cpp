@@ -589,6 +589,7 @@ ContinuousGenerationEngine::~ContinuousGenerationEngine() {
         cudaFreeHost(pinned_sampled_);
         pinned_sampled_ = nullptr;
     }
+    pinned_.free_all();
     if (sampled_ready_event_) {
         cudaEventDestroy(sampled_ready_event_);
         sampled_ready_event_ = nullptr;
@@ -681,6 +682,29 @@ void ContinuousGenerationEngine::init(
     CUDA_CHECK(cudaMallocHost(&pinned_sampled_, S * sizeof(int32_t)));
     CUDA_CHECK(cudaEventCreateWithFlags(&sampled_ready_event_, cudaEventDisableTiming));
 
+    // Pinned staging buffers for H2D copies in flat_step / rebuild_compact_batch.
+    // With pageable std::vector memory, cudaMemcpyAsync synchronizes (~631μs/call).
+    // With pinned memory, it returns in ~5μs — eliminating ~6s of host overhead.
+    {
+        const auto TK = token_buf_size;  // max(slots, batched_tokens)
+        CUDA_CHECK(cudaMallocHost(&pinned_.token_ids, TK * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.position_ids, TK * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.token_to_req, TK * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.kv_write_pos, TK * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.q_indptr, (S + 1) * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.seq_lens_current, S * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.seq_lens_k, S * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.finished_flags, S * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.block_table, S * MPS * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.last_token_indices, S * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.compact_last_tokens, S * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.compact_seq_lens, S * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.compact_finished, S * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.compact_temp, S * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&pinned_.compact_block_table, S * MPS * sizeof(int)));
+        pinned_.allocated = true;
+    }
+
     run_state.ensure_rope_freq_capacity(config, max_seq_len);
 
     // Pre-allocate flat-step buffers (avoid per-step cudaMallocAsync).
@@ -765,12 +789,14 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
     warmup_ds.prefill_mode = true;
     warmup_ds.prefill_pos_offset = 0;
 
-    // Zero the prefill block table so warmup writes are harmless.
+    // Zero GPU buffers so warmup writes are harmless.
     cudaStream_t stream = run_state_->MainStream;
     CUDA_CHECK(cudaMemsetAsync(prefill_block_table_gpu_, 0,
         static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(block_table_gpu_, 0,
+        static_cast<std::size_t>(max_slots_) * max_pages_per_seq_ * sizeof(int), stream));
 
-    // Warm prefill graphs for common prompt lengths.
+    // Warm prefill graphs for common prompt lengths (legacy execute_prefill path).
     static constexpr int kWarmupT[] = {32, 64, 128, 255, 256, 511, 512, 1023, 1024, 2047, 2048};
     for (int t : kWarmupT) {
         if (t > max_seq_len_) break;
@@ -783,8 +809,121 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
             dummy_tokens.data(), dummy_pos.data(),
             warmup_ds, comm);
     }
-
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // ========================================================================
+    // Warm flat-token path with ALL prefill bucket sizes.
+    // This is the path used during actual serving (flat_step → execute_flat_tokens).
+    // Without this, every new padded T value triggers ~72 segment CUDA graph
+    // captures during inference (~1000 cudaGraphInstantiate + ~4000 cudaMalloc).
+    // ========================================================================
+    if (use_cuda_graphs_ && !prefill_token_buckets_.empty()) {
+        auto& state = ensure_engine_state_storage(this, max_slots_);
+        const int Hq_model = config_->NumQueryHeads;
+        const int Hkv_model = config_->NumKeyValHeads;
+        const int group_size = (Hkv_model > 0) ? (Hq_model / Hkv_model) : 1;
+        constexpr int kCtaTileQ = 16;
+
+        for (int bucket_t : prefill_token_buckets_) {
+            if (bucket_t <= 0 || bucket_t > max_batched_tokens_) continue;
+
+            // Build minimal flat-token DecodeState: 1 request with q_len=bucket_t.
+            const int batch_size = 1;
+
+            // Zero-fill pinned staging buffers for this warmup call.
+            std::memset(pinned_.token_ids, 0, static_cast<std::size_t>(bucket_t) * sizeof(int32_t));
+            std::memset(pinned_.position_ids, 0, static_cast<std::size_t>(bucket_t) * sizeof(int32_t));
+            std::memset(pinned_.token_to_req, 0, static_cast<std::size_t>(bucket_t) * sizeof(int32_t));
+            std::memset(pinned_.kv_write_pos, 0, static_cast<std::size_t>(bucket_t) * sizeof(int32_t));
+
+            // q_indptr: [0, bucket_t]
+            pinned_.q_indptr[0] = 0;
+            pinned_.q_indptr[1] = static_cast<int32_t>(bucket_t);
+
+            // seq_lens: 0 (no prior KV)
+            pinned_.seq_lens_current[0] = 0;
+            pinned_.seq_lens_k[0] = static_cast<int32_t>(bucket_t);
+            pinned_.finished_flags[0] = 0;
+            std::memset(pinned_.block_table, 0, static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int));
+
+            // Upload to GPU
+            const auto TT = static_cast<std::size_t>(bucket_t);
+            CUDA_CHECK(cudaMemcpyAsync(run_state_->Inputs.Data, pinned_.token_ids,
+                TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(run_state_->PositionIDs.Data, pinned_.position_ids,
+                TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(flat_token_to_req_gpu_, pinned_.token_to_req,
+                TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(flat_kv_write_pos_gpu_, pinned_.kv_write_pos,
+                TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(flat_q_indptr_gpu_, pinned_.q_indptr,
+                2 * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu_, pinned_.seq_lens_current,
+                sizeof(int), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(flat_seq_lens_k_gpu_, pinned_.seq_lens_k,
+                sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(block_table_gpu_, pinned_.block_table,
+                static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int),
+                cudaMemcpyHostToDevice, stream));
+
+            // Last-token index
+            pinned_.last_token_indices[0] = static_cast<int32_t>(bucket_t - 1);
+            CUDA_CHECK(cudaMemcpyAsync(flat_last_token_indices_gpu_, pinned_.last_token_indices,
+                sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+            DecodeState ds{};
+            ds.flat_token_mode = true;
+            ds.flat_batch_size = batch_size;
+            ds.flat_total_tokens = bucket_t;
+            ds.q_indptr_host = pinned_.q_indptr;
+            ds.flat_max_q_len = bucket_t;
+            ds.recurrent_states = &state.compact_recurrent_states;
+            ds.recurrent_state_bytes = &state.compact_recurrent_state_bytes;
+            ds.conv_states = &state.compact_conv_states;
+            ds.conv_state_bytes = &state.compact_conv_state_bytes;
+            ds.strict_state_buffers = true;  // enable piecewise graph capture
+            const int packed_len = bucket_t * group_size;
+            ds.flat_padded_batch_size = (packed_len + kCtaTileQ - 1) / kCtaTileQ;
+            ds.flat_last_token_indices_gpu = flat_last_token_indices_gpu_;
+            ds.token_to_req_gpu = flat_token_to_req_gpu_;
+            ds.kv_write_pos_gpu = flat_kv_write_pos_gpu_;
+            ds.q_indptr_gpu = flat_q_indptr_gpu_;
+            ds.seq_lens_gpu = seq_lens_gpu_;
+            ds.cu_seqlens_q_gpu = flat_q_indptr_gpu_;
+            ds.cu_seqlens_k_gpu = flat_seq_lens_k_gpu_;
+            ds.seq_lens_k_gpu = flat_seq_lens_k_gpu_;
+            ds.max_seqlen_k = bucket_t;
+            ds.paged = true;
+            ds.fp8 = fp8_kv;
+            ds.k_pages = page_pool_.k_pages();
+            ds.v_pages = page_pool_.v_pages();
+            ds.k_scales = page_pool_.k_scales();
+            ds.v_scales = page_pool_.v_scales();
+            ds.k_scales_paged_fp8 = page_pool_.k_scales();
+            ds.v_scales_paged_fp8 = page_pool_.v_scales();
+            ds.per_pool_bytes = page_pool_.full_pool_bytes();
+            ds.block_table_gpu = block_table_gpu_;
+            ds.block_table_stride = max_pages_per_seq_;
+            ds.page_block_size = kPageBlockSize;
+            ds.total_pages = page_pool_.total_pages();
+            ds.num_kv_heads = config_->NumKeyValHeads;
+            ds.head_dim = config_->head_size();
+            ds.logits_out_gpu = logits_gpu_;
+            ds.vocab_size = vocab_size_;
+            ds.flat_plan_int_ws_gpu = flat_plan_int_ws_gpu_;
+            ds.flat_plan_float_ws_gpu = flat_plan_float_ws_gpu_;
+            ds.flat_page_indptr_gpu = flat_page_indptr_gpu_;
+            ds.flat_page_indices_gpu = flat_page_indices_gpu_;
+            ds.flat_last_page_len_gpu = flat_last_page_len_gpu_;
+
+            graph_executor.execute_flat_tokens(
+                static_cast<long>(bucket_t),
+                reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
+                reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
+                ds, comm, nullptr, /*use_cuda_graph=*/true);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,13 +961,18 @@ void ContinuousGenerationEngine::rebuild_compact_batch() {
 
     const auto Bp = static_cast<std::size_t>(compact_B_padded_);
 
-    // Build compact host arrays and upload.
-    // These are the one-time-per-batch-change uploads.
-    std::vector<int32_t> h_last_tokens(Bp, 0);
-    std::vector<int> h_seq_lens(Bp, 0);
-    std::vector<int> h_finished(Bp, 0);
-    std::vector<float> h_temp(Bp, 1.0f);
-    std::vector<int> h_block_table(Bp * MPS, 0);
+    // Build compact host arrays and upload — use pinned staging buffers.
+    int32_t* h_last_tokens = pinned_.compact_last_tokens;
+    int*     h_seq_lens = pinned_.compact_seq_lens;
+    int*     h_finished = pinned_.compact_finished;
+    float*   h_temp = pinned_.compact_temp;
+    int*     h_block_table_compact = pinned_.compact_block_table;
+    std::memset(h_last_tokens, 0, Bp * sizeof(int32_t));
+    std::memset(h_seq_lens, 0, Bp * sizeof(int));
+    std::memset(h_finished, 0, Bp * sizeof(int));
+    // Init temperature to 1.0f
+    for (std::size_t i = 0; i < Bp; ++i) h_temp[i] = 1.0f;
+    std::memset(h_block_table_compact, 0, Bp * MPS * sizeof(int));
 
     int max_seqlen_k = 0;
     for (int i = 0; i < compact_B_; ++i) {
@@ -840,7 +984,7 @@ void ContinuousGenerationEngine::rebuild_compact_batch() {
         max_seqlen_k = std::max(max_seqlen_k, s.seq_len + 1);
         const auto row = static_cast<std::size_t>(i) * MPS;
         for (std::size_t p = 0; p < s.page_ids.size(); ++p) {
-            h_block_table[row + p] = s.page_ids[p];
+            h_block_table_compact[row + p] = s.page_ids[p];
         }
     }
     // Pad [compact_B_, compact_B_padded_) with finished=1.
@@ -848,15 +992,15 @@ void ContinuousGenerationEngine::rebuild_compact_batch() {
         h_finished[i] = 1;
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu_, h_last_tokens.data(),
+    CUDA_CHECK(cudaMemcpyAsync(last_tokens_gpu_, h_last_tokens,
         Bp * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu_, h_seq_lens.data(),
+    CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu_, h_seq_lens,
         Bp * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(finished_gpu_, h_finished.data(),
+    CUDA_CHECK(cudaMemcpyAsync(finished_gpu_, h_finished,
         Bp * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(temperature_gpu_, h_temp.data(),
+    CUDA_CHECK(cudaMemcpyAsync(temperature_gpu_, h_temp,
         Bp * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(block_table_gpu_, h_block_table.data(),
+    CUDA_CHECK(cudaMemcpyAsync(block_table_gpu_, h_block_table_compact,
         Bp * MPS * sizeof(int), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemsetAsync(completion_lens_gpu_, 0,
         Bp * sizeof(int32_t), stream));
@@ -904,12 +1048,19 @@ void ContinuousGenerationEngine::rebuild_compact_batch() {
     decode_state_.max_seqlen_k = max_seq_len_;  // conservative upper bound
     decode_state_.strict_state_buffers = state.pinned;
 
-    // Invalidate full-step graph (batch composition changed).
-    if (full_step_graph_exec_) {
+    // Only invalidate full-step graph if the padded batch SIZE changed.
+    // When individual slots change (new request, finished request) but the
+    // padded batch size stays the same, the graph is still valid — the H2D
+    // uploads above update GPU buffer CONTENTS (seq_lens, block_table, etc.)
+    // which are read by kernels at replay time. The CUDA graph captures kernel
+    // launch configurations (grid dims, pointers), not data contents.
+    // This is the same principle vLLM uses for stable CUDA graph replay.
+    if (full_step_graph_exec_ && compact_B_padded_ != prev_compact_B_padded_) {
         CUDA_CHECK(cudaGraphExecDestroy(full_step_graph_exec_));
         full_step_graph_exec_ = nullptr;
+        full_step_primed_ = false;
     }
-    full_step_primed_ = false;
+    prev_compact_B_padded_ = compact_B_padded_;
 
     batch_dirty_ = false;
 }
@@ -1456,7 +1607,8 @@ ContinuousStepResult ContinuousGenerationEngine::step(
                 full_step_graph_exec_,
                 /*enabled=*/true,
                 run_state_->Stack,
-                full_step_graph_checkpoint_);
+                full_step_graph_checkpoint_,
+                "full_step");
         } else {
             // Eager execution (first step primes lazy allocations).
             run_one_decode_step(graph_executor, comm, hook);
@@ -1538,6 +1690,17 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     fallback_token_id_ = resolve_fallback_token_id(config.eos_token_id, V);
     bool compact_batch_needs_rebuild = false;
 
+    // CPU-side phase timing
+    static const bool flat_step_profile = std::getenv("SUROGATE_FLAT_STEP_PROFILE") != nullptr;
+    static int flat_step_profile_count = 0;
+    using hrc = std::chrono::high_resolution_clock;
+    auto t_start = hrc::now();
+    auto t_phase = t_start;
+    auto us_since = [](auto start) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(hrc::now() - start).count();
+    };
+    long p1_us = 0, p2_us = 0, p3_us = 0, p4_us = 0, p5_us = 0, p5b_us = 0, p6_us = 0, p7_us = 0, p8_us = 0;
+
     // === Phase 1: Allocate slots + pages for new prompts ===
     result.new_slot_ids.resize(new_prompts.size(), -1);
     for (std::size_t i = 0; i < new_prompts.size(); ++i) {
@@ -1572,6 +1735,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         compact_batch_needs_rebuild = true;
     }
 
+    if (flat_step_profile) { p1_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 2: Select active slots under token budget ===
     // Always schedule all decode slots (1 token each), then add prefill slots
     // up to the flat-step token budget. Prefill admission is sequential and
@@ -1644,6 +1808,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         active_sids,
         max_slots_);
 
+    if (flat_step_profile) { p2_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 3: Build flat token arrays ===
     // Each decode slot contributes 1 token.
     // Each selected prefill slot contributes its assigned q_len from prefill_q_lens.
@@ -1710,20 +1875,27 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     const bool pure_decode = !has_prefill && (actual_total_tokens == batch_size);
     const int exec_batch_size = pure_decode ? padded_total_tokens : batch_size;
 
-    // Build host arrays (padded to padded_total_tokens, padding gets token_id=0, pos=0).
-    std::vector<int32_t> h_token_ids(padded_total_tokens, 0);
-    std::vector<int32_t> h_position_ids(padded_total_tokens, 0);
-    std::vector<int32_t> h_token_to_req(padded_total_tokens, 0);
-    // Keep padding write positions non-negative to avoid invalid kernel indexing
-    // if any path accidentally touches padded lanes.
-    std::vector<int32_t> h_kv_write_pos(padded_total_tokens, 0);
-    std::vector<int32_t> h_q_indptr(batch_size + 1, 0);
-    // Current seq lens (before KV append) for decode rope writes.
-    std::vector<int> h_seq_lens_current(exec_batch_size, 0);
-    // KV sequence lens after this forward pass (for decode/prefill attention metadata).
-    std::vector<int32_t> h_seq_lens_k(exec_batch_size, 0);
-    // Decode padding mask (padded lanes are marked finished=1 to skip KV writes).
-    std::vector<int> h_finished_flags(exec_batch_size, 0);
+    // Build host arrays using pinned staging buffers (zero-copy cudaMemcpyAsync).
+    // Pageable std::vector memory forces cudaMemcpyAsync to synchronize (~631μs/call).
+    // Pinned memory makes it truly async (~5μs/call).
+    int32_t* h_token_ids = pinned_.token_ids;
+    int32_t* h_position_ids = pinned_.position_ids;
+    int32_t* h_token_to_req = pinned_.token_to_req;
+    int32_t* h_kv_write_pos = pinned_.kv_write_pos;
+    int32_t* h_q_indptr = pinned_.q_indptr;
+    int*     h_seq_lens_current = pinned_.seq_lens_current;
+    int32_t* h_seq_lens_k = pinned_.seq_lens_k;
+    int*     h_finished_flags = pinned_.finished_flags;
+
+    // Zero-initialize (pinned memory persists across calls)
+    std::memset(h_token_ids, 0, padded_total_tokens * sizeof(int32_t));
+    std::memset(h_position_ids, 0, padded_total_tokens * sizeof(int32_t));
+    std::memset(h_token_to_req, 0, padded_total_tokens * sizeof(int32_t));
+    std::memset(h_kv_write_pos, 0, padded_total_tokens * sizeof(int32_t));
+    std::memset(h_q_indptr, 0, (batch_size + 1) * sizeof(int32_t));
+    std::memset(h_seq_lens_current, 0, exec_batch_size * sizeof(int));
+    std::memset(h_seq_lens_k, 0, exec_batch_size * sizeof(int32_t));
+    std::memset(h_finished_flags, 0, exec_batch_size * sizeof(int));
 
     int tok_offset = 0;
     for (int i = 0; i < batch_size; ++i) {
@@ -1778,9 +1950,10 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         }
     }
 
-    // Build block table (compact, batch_size rows)
+    // Build block table (compact, batch_size rows) — use pinned staging
     const auto MPS = static_cast<std::size_t>(max_pages_per_seq_);
-    std::vector<int> h_block_table(static_cast<std::size_t>(exec_batch_size) * MPS, 0);
+    int* h_block_table = pinned_.block_table;
+    std::memset(h_block_table, 0, static_cast<std::size_t>(exec_batch_size) * MPS * sizeof(int));
     for (int i = 0; i < batch_size; ++i) {
         const auto& pages = slots_[static_cast<std::size_t>(active_sids[i])].page_ids;
         const auto row = static_cast<std::size_t>(i) * MPS;
@@ -1789,6 +1962,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         }
     }
 
+    if (flat_step_profile) { p3_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 4: Upload to GPU ===
     // Allocate GPU buffers from arena (or reuse pre-allocated ones)
     const auto TT = static_cast<std::size_t>(padded_total_tokens);
@@ -1803,7 +1977,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     }
     CUDA_CHECK(cudaMemcpyAsync(
         run_state_->Inputs.Data,
-        h_token_ids.data(),
+        h_token_ids,
         token_bytes,
         cudaMemcpyHostToDevice,
         stream));
@@ -1821,7 +1995,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         }
         CUDA_CHECK(cudaMemcpyAsync(
             run_state_->PositionIDs.Data,
-            h_position_ids.data(),
+            h_position_ids,
             token_bytes,
             cudaMemcpyHostToDevice,
             stream));
@@ -1831,7 +2005,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         }
         CUDA_CHECK(cudaMemcpyAsync(
             run_state_->PositionIDs.Data,
-            h_position_ids.data(),
+            h_position_ids,
             token_bytes,
             cudaMemcpyHostToDevice,
             stream));
@@ -1843,30 +2017,31 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     int32_t* d_q_indptr = flat_q_indptr_gpu_;
     int32_t* d_seq_lens_k = flat_seq_lens_k_gpu_;
 
-    CUDA_CHECK(cudaMemcpyAsync(d_token_to_req, h_token_to_req.data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_token_to_req, h_token_to_req,
         TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_kv_write_pos, h_kv_write_pos.data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_kv_write_pos, h_kv_write_pos,
         TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_q_indptr, h_q_indptr.data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_q_indptr, h_q_indptr,
         (BS + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu_, h_seq_lens_current.data(),
+    CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu_, h_seq_lens_current,
         BS_exec * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_seq_lens_k, h_seq_lens_k.data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_seq_lens_k, h_seq_lens_k,
         BS_exec * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     if (pure_decode) {
-        CUDA_CHECK(cudaMemcpyAsync(finished_gpu_, h_finished_flags.data(),
+        CUDA_CHECK(cudaMemcpyAsync(finished_gpu_, h_finished_flags,
             BS_exec * sizeof(int), cudaMemcpyHostToDevice, stream));
     }
-    CUDA_CHECK(cudaMemcpyAsync(block_table_gpu_, h_block_table.data(),
+    CUDA_CHECK(cudaMemcpyAsync(block_table_gpu_, h_block_table,
         BS_exec * MPS * sizeof(int), cudaMemcpyHostToDevice, stream));
 
+    if (flat_step_profile) { p4_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 5: Build DecodeState for flat-token mode ===
     const bool fp8_kv = (page_pool_.dtype() == KVDType::FP8_E4M3);
     DecodeState ds{};
     ds.flat_token_mode = true;
     ds.flat_batch_size = batch_size;
     ds.flat_total_tokens = actual_total_tokens;
-    ds.q_indptr_host = h_q_indptr.data();
+    ds.q_indptr_host = h_q_indptr;
     // Compute max Q length across requests (for recurrent op padding).
     {
         int mql = 0;
@@ -1895,11 +2070,11 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.flat_padded_batch_size = total_tiles;
 
     // Compute last-token indices for LM head gather optimization.
-    std::vector<int32_t> h_last_token_indices(BS);
+    int32_t* h_last_token_indices = pinned_.last_token_indices;
     for (int i = 0; i < batch_size; ++i) {
         h_last_token_indices[i] = h_q_indptr[i + 1] - 1;
     }
-    CUDA_CHECK(cudaMemcpyAsync(flat_last_token_indices_gpu_, h_last_token_indices.data(),
+    CUDA_CHECK(cudaMemcpyAsync(flat_last_token_indices_gpu_, h_last_token_indices,
         BS * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     ds.flat_last_token_indices_gpu = flat_last_token_indices_gpu_;
 
@@ -1910,9 +2085,9 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.cu_seqlens_q_gpu = d_q_indptr;
     ds.cu_seqlens_k_gpu = d_seq_lens_k;
     ds.seq_lens_k_gpu = d_seq_lens_k;
-    ds.max_seqlen_k = h_seq_lens_k.empty()
+    ds.max_seqlen_k = (exec_batch_size == 0)
         ? 0
-        : *std::max_element(h_seq_lens_k.begin(), h_seq_lens_k.end());
+        : *std::max_element(h_seq_lens_k, h_seq_lens_k + exec_batch_size);
     ds.paged = true;
     ds.fp8 = fp8_kv;
     ds.k_pages = page_pool_.k_pages();
@@ -1933,6 +2108,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.logits_out_gpu = logits_gpu_;  // pre-allocated [max_slots * V]
     ds.vocab_size = V;
 
+    if (flat_step_profile) { p5_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 5b: Run FlashInfer PrefillPlan (once, reused across all layers) ===
     ds.flat_plan_int_ws_gpu = flat_plan_int_ws_gpu_;
     ds.flat_plan_float_ws_gpu = flat_plan_float_ws_gpu_;
@@ -1942,7 +2118,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
 
     if (!pure_decode) {
         flat_attention_plan(
-            h_q_indptr.data(), h_seq_lens_k.data(), h_block_table.data(),
+            h_q_indptr, h_seq_lens_k, h_block_table,
             max_pages_per_seq_, kPageBlockSize,
             batch_size, actual_total_tokens,
             config_->NumQueryHeads, config_->NumKeyValHeads, config_->head_size(),
@@ -1954,6 +2130,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         ds.flat_padded_batch_size = total_tiles;
     }
 
+    if (flat_step_profile) { p5b_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 6: Execute forward pass ===
     // For pure-decode steps (all q_lens=1), use execute_decode_step which
     // supports CUDA graph capture for much faster repeated execution.
@@ -2034,6 +2211,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     flush_compact_states_to_slots_impl(
         state, run_state_, batch_size, active_sids, max_slots_, slots_);
 
+    if (flat_step_profile) { p6_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 7: Sample from logits ===
     // With the LM head gather optimization, logits_gpu_ already contains
     // [batch_size, V] logits (gathered from last-token hidden states).
@@ -2084,11 +2262,14 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         fallback_token_id_, nullptr, stream);
 
     // === D2H readback ===
+    long p7_launch_us = 0;
+    if (flat_step_profile) { p7_launch_us = us_since(t_phase); }
     CUDA_CHECK(cudaMemcpyAsync(pinned_sampled_, sampled_tokens_gpu_,
         BS * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaEventRecord(sampled_ready_event_, stream));
     CUDA_CHECK(cudaEventSynchronize(sampled_ready_event_));
 
+    if (flat_step_profile) { p7_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 8: Update slot state from pinned readback ===
     result.active_slot_ids.resize(batch_size);
     result.sampled_tokens.resize(batch_size);
@@ -2139,6 +2320,20 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
 
     if (compact_batch_needs_rebuild) {
         batch_dirty_ = true;
+    }
+
+    if (flat_step_profile) {
+        p8_us = us_since(t_phase);
+        const long total_us = us_since(t_start);
+        if (flat_step_profile_count < 50) {
+            std::fprintf(stderr,
+                "[FLAT_STEP] #%d total=%ldus "
+                "P1_alloc=%ld P2_select=%ld P3_build=%ld P4_upload=%ld "
+                "P5_state=%ld P5b_plan=%ld P6_forward=%ld P7_launch=%ld P7_sync=%ld P8_update=%ld\n",
+                flat_step_profile_count, total_us,
+                p1_us, p2_us, p3_us, p4_us, p5_us, p5b_us, p6_us, p7_launch_us, p7_us, p8_us);
+        }
+        flat_step_profile_count++;
     }
 
     return result;

@@ -3144,6 +3144,25 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Main dispatch loop - no string comparisons, direct function pointer dispatch
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const char* fwd_profile_env = std::getenv("SUROGATE_OP_PROFILE");
+    // Disable profiling during CUDA graph capture — cudaEventSynchronize is
+    // illegal on events recorded in a capturing stream.
+    const bool fwd_op_profile = [&]() {
+        if (!fwd_profile_env || std::string(fwd_profile_env) == "0") return false;
+        if (mCapturing) return false;
+        cudaStreamCaptureStatus prof_cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(mRunState.MainStream, &prof_cap) == cudaSuccess &&
+            prof_cap != cudaStreamCaptureStatusNone) return false;
+        return true;
+    }();
+    std::unordered_map<std::string, double> fwd_profile_total_ms;
+    std::unordered_map<std::string, std::size_t> fwd_profile_counts;
+    cudaEvent_t fwd_prof_start = nullptr;
+    cudaEvent_t fwd_prof_end = nullptr;
+    if (fwd_op_profile) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&fwd_prof_start, cudaEventDefault));
+        CUDA_CHECK(cudaEventCreateWithFlags(&fwd_prof_end, cudaEventDefault));
+    }
     const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
     const bool debug_nonfinite_forward = (debug_nonfinite_mode & 0x1) != 0;
     const char* watch_tensor_env = std::getenv("SUROGATE_DEBUG_WATCH_TENSOR");
@@ -3449,7 +3468,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                         };
                         trace_or_execute_cuda_graph_with_stack(
                             run, mRunState.MainStream, sg.exec, true,
-                            mRunState.Stack, sg.checkpoint);
+                            mRunState.Stack, sg.checkpoint,
+                            "segment");
                         if (is_capture) {
                             // Save post-dispatch stack state. On replay,
                             // trace_or_execute restores to sg.checkpoint (pre-alloc)
@@ -3516,6 +3536,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         // tensor persistence, pruning, etc.
         if (idx < mSegmentDispatchedUntil) {
             goto skip_dispatch;
+        }
+
+        if (fwd_op_profile) {
+            CUDA_CHECK(cudaEventRecord(fwd_prof_start, mRunState.MainStream));
         }
 
         try {
@@ -3752,6 +3776,16 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             throw std::runtime_error(oss.str());
         }
 
+        if (fwd_op_profile) {
+            CUDA_CHECK(cudaEventRecord(fwd_prof_end, mRunState.MainStream));
+            CUDA_CHECK(cudaEventSynchronize(fwd_prof_end));
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, fwd_prof_start, fwd_prof_end));
+            const std::string op_name = op_type_to_string(op.type);
+            fwd_profile_total_ms[op_name] += static_cast<double>(elapsed_ms);
+            fwd_profile_counts[op_name] += 1;
+        }
+
         skip_dispatch:
 
         // Handle layer end
@@ -3782,6 +3816,30 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             handle_layer_end(op.layer_end);
         }
+    }
+
+    if (fwd_op_profile && !fwd_profile_total_ms.empty()) {
+        double total_ms = 0.0;
+        for (const auto& [name, ms] : fwd_profile_total_ms) total_ms += ms;
+        std::vector<std::pair<std::string, double>> totals(fwd_profile_total_ms.begin(), fwd_profile_total_ms.end());
+        std::sort(totals.begin(), totals.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::cerr << "[OP PROFILE][forward] B=" << mB << " T=" << mT
+                  << " total=" << total_ms << "ms:\n";
+        for (const auto& [name, ms] : totals) {
+            const std::size_t count = fwd_profile_counts[name];
+            const double avg_ms = count > 0 ? (ms / static_cast<double>(count)) : 0.0;
+            const double pct = total_ms > 0.0 ? (ms / total_ms * 100.0) : 0.0;
+            std::cerr << "  " << name
+                      << " total=" << ms << "ms"
+                      << " count=" << count
+                      << " avg=" << avg_ms << "ms"
+                      << " (" << pct << "%)\n";
+        }
+    }
+    if (fwd_op_profile) {
+        if (fwd_prof_start) cudaEventDestroy(fwd_prof_start);
+        if (fwd_prof_end) cudaEventDestroy(fwd_prof_end);
     }
 
     // Free temporaries

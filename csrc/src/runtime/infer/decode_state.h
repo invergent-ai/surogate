@@ -96,6 +96,26 @@ struct DecodeState {
     int total_pages = 0;                // Total physical pages in the pool
 
     // ========================================================================
+    // Pre-allocated FlashInfer scratch buffers for CUDA-graph-safe decode.
+    // When non-null, dispatch_flash_attention uses these instead of
+    // temp_alloc() — eliminating cudaMalloc during stream capture and
+    // enabling full-step CUDA graph capture for decode.
+    // Allocated once by GenerationEngine at decode init based on max_batch.
+    // ========================================================================
+    struct FlashInferScratch {
+        int32_t* page_counts = nullptr;      // [max_batch]
+        int32_t* indptr = nullptr;           // [max_batch + 1]
+        int32_t* last_page_len = nullptr;    // [max_batch]
+        int32_t* indices = nullptr;          // [max_batch * block_table_stride]
+        int32_t* request_indices = nullptr;  // [max_batch]
+        int32_t* kv_tile_indices = nullptr;  // [max_batch]
+        int32_t* kv_chunk_size = nullptr;    // [1]
+
+        bool is_allocated() const { return page_counts != nullptr; }
+    };
+    FlashInferScratch fi_scratch;
+
+    // ========================================================================
     // Flat-token mode: mixed prefill+decode in a single forward pass.
     // When flat_token_mode=true:
     //   - mB=1, mT=total_tokens (all tokens flattened)

@@ -1254,15 +1254,23 @@ void CompiledGraph::compute_layer_segments(std::uint8_t mode_raw) {
             // capture-unsafe (dynamic cu_seqlens, JIT kernel loading,
             // cuBLAS host-sync calls, etc.)
             //
-            // For InferenceDecode (T=1), Qwen3_5Decay is a simple element-wise
-            // CUDA kernel (graph-safe), and ChunkGatedDeltaRule uses the
-            // pre-loaded recurrent_fwd Triton kernel (graph-safe after init).
-            // Keeping them graph-breaking for decode forces ~18 piecewise graph
-            // segments per forward pass, which is the primary throughput gap
-            // vs vLLM (3.15x with CUDA graphs vs without).
+            // For InferenceDecode (T=1):
+            // - FlashAttention is graph-safe when using paged FlashInfer with
+            //   pre-allocated scratch buffers (DecodeState::fi_scratch).
+            //   The FlashInfer kernels read from fixed GPU pointers whose
+            //   contents are updated via H2D copy before graph replay.
+            // - Qwen3_5Decay is a simple element-wise CUDA kernel (graph-safe).
+            // - ChunkGatedDeltaRule uses the pre-loaded recurrent_fwd Triton
+            //   kernel (graph-safe after init).
+            //
+            // This enables full-step CUDA graph capture for decode, matching
+            // vLLM's FULL mode (~3x throughput vs piecewise graphs).
             const bool is_inference_decode = (mode == GraphCompileMode::InferenceDecode);
             const bool graph_breaking =
-                ty == CompiledOpType::FlashAttention ||
+                // FlashAttention: graph-safe in decode (pre-allocated scratch),
+                // graph-breaking in prefill/training (dynamic cu_seqlens).
+                (!is_inference_decode && ty == CompiledOpType::FlashAttention) ||
+                // Backward ops: always graph-breaking (training only).
                 ty == CompiledOpType::FlashAttentionBackward ||
                 (!is_inference_decode && (
                     ty == CompiledOpType::ChunkGatedDeltaRule ||

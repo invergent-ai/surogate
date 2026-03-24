@@ -225,6 +225,54 @@ private:
     int32_t* pinned_sampled_ = nullptr;      // cudaMallocHost'd pinned buffer
     cudaEvent_t sampled_ready_event_ = nullptr;  // recorded after D2H copy
     bool has_pending_sampled_ = false;        // true if event needs sync
+
+    // ========================================================================
+    // Pinned host staging buffers for H2D copies in flat_step().
+    // With pageable memory, cudaMemcpyAsync secretly synchronizes (~631μs/call).
+    // With pinned memory, it returns in ~5μs — eliminating ~6s of host overhead.
+    // Allocated once at init, reused every step.
+    // ========================================================================
+    struct PinnedStaging {
+        int32_t* token_ids = nullptr;        // [max_batched_tokens]
+        int32_t* position_ids = nullptr;     // [max_batched_tokens]
+        int32_t* token_to_req = nullptr;     // [max_batched_tokens]
+        int32_t* kv_write_pos = nullptr;     // [max_batched_tokens]
+        int32_t* q_indptr = nullptr;         // [max_slots + 1]
+        int*     seq_lens_current = nullptr; // [max_slots]
+        int32_t* seq_lens_k = nullptr;       // [max_slots]
+        int*     finished_flags = nullptr;   // [max_slots]
+        int*     block_table = nullptr;      // [max_slots * max_pages_per_seq]
+        int32_t* last_token_indices = nullptr; // [max_slots]
+        // rebuild_compact_batch buffers
+        int32_t* compact_last_tokens = nullptr; // [max_slots]
+        int*     compact_seq_lens = nullptr;    // [max_slots]
+        int*     compact_finished = nullptr;    // [max_slots]
+        float*   compact_temp = nullptr;        // [max_slots]
+        int*     compact_block_table = nullptr; // [max_slots * max_pages_per_seq]
+
+        bool allocated = false;
+
+        void free_all() {
+            if (!allocated) return;
+            cudaFreeHost(token_ids);
+            cudaFreeHost(position_ids);
+            cudaFreeHost(token_to_req);
+            cudaFreeHost(kv_write_pos);
+            cudaFreeHost(q_indptr);
+            cudaFreeHost(seq_lens_current);
+            cudaFreeHost(seq_lens_k);
+            cudaFreeHost(finished_flags);
+            cudaFreeHost(block_table);
+            cudaFreeHost(last_token_indices);
+            cudaFreeHost(compact_last_tokens);
+            cudaFreeHost(compact_seq_lens);
+            cudaFreeHost(compact_finished);
+            cudaFreeHost(compact_temp);
+            cudaFreeHost(compact_block_table);
+            allocated = false;
+        }
+    };
+    PinnedStaging pinned_;
     int pending_batch_size_ = 0;
     std::vector<int> pending_active_sids_;
     std::vector<int> pending_q_lens_;         // per-slot q_lens from previous step
@@ -241,6 +289,7 @@ private:
     cudaGraphExec_t full_step_graph_exec_ = nullptr;
     DeviceMemoryStack::Checkpoint full_step_graph_checkpoint_{};
     bool full_step_primed_ = false;
+    int prev_compact_B_padded_ = 0;  // track padded batch size for graph invalidation
 
     // Pre-allocated flat-step GPU buffers (avoid per-step cudaMallocAsync)
     int max_batched_tokens_ = 0;           // token budget for flat_step

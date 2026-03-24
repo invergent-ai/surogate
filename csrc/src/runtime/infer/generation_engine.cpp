@@ -1191,6 +1191,30 @@ void GenerationSession::init(
     mDecodeState.prefill_pos_offset = 0;
     mDecodeState.max_seqlen_k = mMaxTotalLen;
 
+    // Pre-allocate FlashInfer scratch buffers for CUDA-graph-safe decode.
+    // These persistent buffers replace per-dispatch temp_alloc() calls,
+    // eliminating cudaMalloc during stream capture and enabling full-step
+    // CUDA graph capture (matching vLLM FULL mode).
+    {
+        auto& fis = mDecodeState.fi_scratch;
+        const auto mb = static_cast<std::size_t>(M);
+        const auto stride = static_cast<std::size_t>(mPagedKV.max_pages_per_seq);
+        fis.page_counts = reinterpret_cast<int32_t*>(
+            alloc(mb * sizeof(int32_t), "fi_page_counts"));
+        fis.indptr = reinterpret_cast<int32_t*>(
+            alloc((mb + 1) * sizeof(int32_t), "fi_indptr"));
+        fis.last_page_len = reinterpret_cast<int32_t*>(
+            alloc(mb * sizeof(int32_t), "fi_last_page_len"));
+        fis.indices = reinterpret_cast<int32_t*>(
+            alloc(mb * stride * sizeof(int32_t), "fi_indices"));
+        fis.request_indices = reinterpret_cast<int32_t*>(
+            alloc(mb * sizeof(int32_t), "fi_request_indices"));
+        fis.kv_tile_indices = reinterpret_cast<int32_t*>(
+            alloc(mb * sizeof(int32_t), "fi_kv_tile_indices"));
+        fis.kv_chunk_size = reinterpret_cast<int32_t*>(
+            alloc(1 * sizeof(int32_t), "fi_kv_chunk_size"));
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(
         mLastTokensGpu, initial_last_tokens.data(),
         static_cast<std::size_t>(M) * sizeof(int32_t),

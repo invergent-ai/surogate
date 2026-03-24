@@ -6,6 +6,8 @@
 #ifndef SUROGATE_SRC_DSL_GRAPH_EXECUTOR_UTILS_H
 #define SUROGATE_SRC_DSL_GRAPH_EXECUTOR_UTILS_H
 
+#include <atomic>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -81,7 +83,8 @@ template<typename Function>
 inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStream_t stream,
                                                     cudaGraphExec_t& instance, bool enabled,
                                                     DeviceMemoryStack& stack,
-                                                    DeviceMemoryStack::Checkpoint& checkpoint) {
+                                                    DeviceMemoryStack::Checkpoint& checkpoint,
+                                                    const char* caller_tag = nullptr) {
     if (!enabled) {
         function();
         return;
@@ -96,6 +99,14 @@ inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStre
 
     // Capture path: save checkpoint before capture so we know where to restore to.
     checkpoint = stack.checkpoint();
+
+    // Debug: trace graph instantiations to find what causes ~1000 graph compilations during serving.
+    static const bool trace_graph_capture = std::getenv("SUROGATE_TRACE_GRAPH_CAPTURE") != nullptr;
+    static std::atomic<int> graph_capture_count{0};
+    if (trace_graph_capture) {
+        int n = graph_capture_count.fetch_add(1);
+        std::fprintf(stderr, "[GRAPH_CAPTURE] #%d tag=%s\n", n, caller_tag ? caller_tag : "unknown");
+    }
 
     cudaGraph_t graph = nullptr;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));

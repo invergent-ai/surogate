@@ -1050,7 +1050,7 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
     };
 
     trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mForwardGraph, use_graphs,
-                                           rs.Stack, mForwardCheckpoint);
+                                           rs.Stack, mForwardCheckpoint, "training_forward");
     // On CUDA graph replay, run_ops isn't executed, so saved tensors are stale.
     // Refresh them here to reflect the current forward activations.
     if (use_graphs && !capturing) {
@@ -1119,7 +1119,7 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
     };
 
     trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mBackwardGraph[graph_idx], use_graphs,
-                                           rs.Stack, mBackwardCheckpoint[graph_idx]);
+                                           rs.Stack, mBackwardCheckpoint[graph_idx], "training_backward");
     mCompiledExecutor->set_capturing(false);
 }
 
@@ -2239,7 +2239,8 @@ void GraphExecutor::execute_decode_step(long B,
                 decode_graph_exec,
                 /*enabled=*/true,
                 rs.Stack,
-                decode_graph_checkpoint);
+                decode_graph_checkpoint,
+                "decode_offload");
             if (decode_graph_exec) {
                 CUDA_CHECK(cudaGraphExecDestroy(decode_graph_exec));
                 decode_graph_exec = nullptr;
@@ -2315,7 +2316,8 @@ void GraphExecutor::execute_decode_step(long B,
                     decode_entry.Exec,
                     /*enabled=*/true,
                     rs.Stack,
-                    decode_entry.Checkpoint);
+                    decode_entry.Checkpoint,
+                    "decode_cached");
                 if (decode_entry.Exec) {
                     decode_entry.Signature = decode_signature;
                     decode_entry.HasSignature = true;

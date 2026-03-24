@@ -216,6 +216,47 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                 * mDecodeState->page_block_size * Hkv * Hs * elem_size;
             const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
 
+            // Helper: resolve FlashInfer scratch buffers — use pre-allocated
+            // from DecodeState when available (CUDA-graph-safe), else temp_alloc.
+            const auto& fi = mDecodeState->fi_scratch;
+            const bool fi_preallocated = fi.is_allocated();
+
+            auto fi_alloc_or_prealloc = [&](int32_t*& out_ptr, int32_t* prealloc, long count, const char* name) {
+                if (prealloc) {
+                    out_ptr = prealloc;
+                } else {
+                    Tensor t = mRunState.temp_alloc(ETensorDType::INT32, {count}, name);
+                    mTemps.push_back(t);
+                    out_ptr = t.get<int32_t>();
+                }
+            };
+
+            // Scratch pointers resolved once per dispatch (pre-allocated or temp).
+            int32_t* s_page_counts = nullptr;
+            int32_t* s_indptr = nullptr;
+            int32_t* s_last_page_len = nullptr;
+            int32_t* s_indices = nullptr;
+            int32_t* s_request_indices = nullptr;
+            int32_t* s_kv_tile_indices = nullptr;
+            int32_t* s_kv_chunk_size = nullptr;
+
+            auto resolve_fi_scratch = [&]() {
+                fi_alloc_or_prealloc(s_page_counts, fi.page_counts,
+                    static_cast<long>(ds_batch), "flashinfer_page_counts");
+                fi_alloc_or_prealloc(s_indptr, fi.indptr,
+                    static_cast<long>(ds_batch + 1), "flashinfer_indptr");
+                fi_alloc_or_prealloc(s_last_page_len, fi.last_page_len,
+                    static_cast<long>(ds_batch), "flashinfer_last_page_len");
+                fi_alloc_or_prealloc(s_indices, fi.indices,
+                    static_cast<long>(ds_batch) * mDecodeState->block_table_stride, "flashinfer_indices");
+                fi_alloc_or_prealloc(s_request_indices, fi.request_indices,
+                    static_cast<long>(ds_batch), "flashinfer_request_indices");
+                fi_alloc_or_prealloc(s_kv_tile_indices, fi.kv_tile_indices,
+                    static_cast<long>(ds_batch), "flashinfer_kv_tile_indices");
+                fi_alloc_or_prealloc(s_kv_chunk_size, fi.kv_chunk_size,
+                    1, "flashinfer_kv_chunk_size");
+            };
+
             if (mDecodeState->fp8) {
                 // Use effective K lengths for this step (seq_lens + 1 after KV append).
                 const int32_t* k_lens_gpu_i32 = mDecodeState->cu_seqlens_k_gpu
@@ -237,41 +278,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                         "flash_attention: FP8 paged decode unsupported head_dim; supported: 64/96/128/256");
                 }
 
-                Tensor fi_page_counts = mRunState.temp_alloc(
-                    ETensorDType::INT32,
-                    {static_cast<long>(ds_batch)},
-                    "flashinfer_page_counts");
-                Tensor fi_indptr = mRunState.temp_alloc(
-                    ETensorDType::INT32,
-                    {static_cast<long>(ds_batch + 1)},
-                    "flashinfer_indptr");
-                Tensor fi_last_page_len = mRunState.temp_alloc(
-                    ETensorDType::INT32,
-                    {static_cast<long>(ds_batch)},
-                    "flashinfer_last_page_len");
-                Tensor fi_indices = mRunState.temp_alloc(
-                    ETensorDType::INT32,
-                    {static_cast<long>(ds_batch) * mDecodeState->block_table_stride},
-                    "flashinfer_indices");
-                Tensor fi_request_indices = mRunState.temp_alloc(
-                    ETensorDType::INT32,
-                    {static_cast<long>(ds_batch)},
-                    "flashinfer_request_indices");
-                Tensor fi_kv_tile_indices = mRunState.temp_alloc(
-                    ETensorDType::INT32,
-                    {static_cast<long>(ds_batch)},
-                    "flashinfer_kv_tile_indices");
-                Tensor fi_kv_chunk_size = mRunState.temp_alloc(
-                    ETensorDType::INT32,
-                    {1},
-                    "flashinfer_kv_chunk_size");
-                mTemps.push_back(fi_page_counts);
-                mTemps.push_back(fi_indptr);
-                mTemps.push_back(fi_last_page_len);
-                mTemps.push_back(fi_indices);
-                mTemps.push_back(fi_request_indices);
-                mTemps.push_back(fi_kv_tile_indices);
-                mTemps.push_back(fi_kv_chunk_size);
+                resolve_fi_scratch();
 
                 attention_decode_flashinfer_paged_fp8(
                     out.get<nv_bfloat16>(),
@@ -287,13 +294,13 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     Hq,
                     Hkv,
                     Hs,
-                    fi_page_counts.get<int32_t>(),
-                    fi_indptr.get<int32_t>(),
-                    fi_last_page_len.get<int32_t>(),
-                    fi_indices.get<int32_t>(),
-                    fi_request_indices.get<int32_t>(),
-                    fi_kv_tile_indices.get<int32_t>(),
-                    fi_kv_chunk_size.get<int32_t>(),
+                    s_page_counts,
+                    s_indptr,
+                    s_last_page_len,
+                    s_indices,
+                    s_request_indices,
+                    s_kv_tile_indices,
+                    s_kv_chunk_size,
                     flashinfer_decode_pdl_enabled(),
                     mRunState.MainStream,
                     q_stride_n);
@@ -310,41 +317,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                         ? mDecodeState->cu_seqlens_k_gpu
                         : reinterpret_cast<const int32_t*>(mDecodeState->seq_lens_gpu);
 
-                    Tensor fi_page_counts = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {static_cast<long>(ds_batch)},
-                        "flashinfer_page_counts");
-                    Tensor fi_indptr = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {static_cast<long>(ds_batch + 1)},
-                        "flashinfer_indptr");
-                    Tensor fi_last_page_len = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {static_cast<long>(ds_batch)},
-                        "flashinfer_last_page_len");
-                    Tensor fi_indices = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {static_cast<long>(ds_batch) * mDecodeState->block_table_stride},
-                        "flashinfer_indices");
-                    Tensor fi_request_indices = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {static_cast<long>(ds_batch)},
-                        "flashinfer_request_indices");
-                    Tensor fi_kv_tile_indices = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {static_cast<long>(ds_batch)},
-                        "flashinfer_kv_tile_indices");
-                    Tensor fi_kv_chunk_size = mRunState.temp_alloc(
-                        ETensorDType::INT32,
-                        {1},
-                        "flashinfer_kv_chunk_size");
-                    mTemps.push_back(fi_page_counts);
-                    mTemps.push_back(fi_indptr);
-                    mTemps.push_back(fi_last_page_len);
-                    mTemps.push_back(fi_indices);
-                    mTemps.push_back(fi_request_indices);
-                    mTemps.push_back(fi_kv_tile_indices);
-                    mTemps.push_back(fi_kv_chunk_size);
+                    resolve_fi_scratch();
 
                     attention_decode_flashinfer_paged(
                         out.get<nv_bfloat16>(),
@@ -360,13 +333,13 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                         Hq,
                         Hkv,
                         Hs,
-                        fi_page_counts.get<int32_t>(),
-                        fi_indptr.get<int32_t>(),
-                        fi_last_page_len.get<int32_t>(),
-                        fi_indices.get<int32_t>(),
-                        fi_request_indices.get<int32_t>(),
-                        fi_kv_tile_indices.get<int32_t>(),
-                        fi_kv_chunk_size.get<int32_t>(),
+                        s_page_counts,
+                        s_indptr,
+                        s_last_page_len,
+                        s_indices,
+                        s_request_indices,
+                        s_kv_tile_indices,
+                        s_kv_chunk_size,
                         flashinfer_decode_pdl_enabled(),
                         mRunState.MainStream,
                         q_stride_n);
