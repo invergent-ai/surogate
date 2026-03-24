@@ -106,5 +106,6 @@ Options:
 
 ## See also
 
+- [Quickstart: Native Serving](../getting-started/quickstart-serving.md)
 - [Config reference](config.md)
 - [Back to docs index](../index.mdx)

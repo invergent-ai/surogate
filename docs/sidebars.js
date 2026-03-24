@@ -26,6 +26,7 @@ module.exports = {
         'getting-started/quickstart-pretraining',
         'getting-started/quickstart-sft',
         'getting-started/quickstart-grpo',
+        'getting-started/quickstart-serving',
       ],
     },
     {
@@ -98,5 +99,4 @@ module.exports = {
     },
   ],
 };
-
 
