@@ -311,6 +311,15 @@ class NativeServingRuntime:
             )
         # Serve uses generate-only paths. Keep training-specific buffers lightweight.
         options.offload_grads = True
+        dynamic_token_capacity = max(
+            int(requested_batch_size),
+            int(config.prefill_chunk_size) if int(config.prefill_chunk_size) > 0 else int(config.max_num_batched_tokens),
+        )
+        if hasattr(options, "dynamic_token_buffers"):
+            options.dynamic_token_buffers = True
+        if hasattr(options, "max_token_capacity"):
+            options.max_token_capacity = int(dynamic_token_capacity)
+        self._dynamic_token_capacity = int(dynamic_token_capacity)
         options.lmhead_chunks = self._resolve_lmhead_chunks(
             config,
             effective_seq_len=requested_seq_len,
@@ -344,10 +353,11 @@ class NativeServingRuntime:
                 )
         self._continuous_min_activation_mb = max(64, int(continuous_min_activation_mb))
         logger.info(
-            "Serving runtime stack floor=%d MiB lmhead_chunks=%d offload_grads=%s (gpu_memory_utilization=%.2f)",
+            "Serving runtime stack floor=%d MiB lmhead_chunks=%d offload_grads=%s dynamic_token_capacity=%d (gpu_memory_utilization=%.2f)",
             int(options.min_stack_mb),
             int(options.lmhead_chunks),
             bool(options.offload_grads),
+            int(self._dynamic_token_capacity),
             float(config.gpu_memory_utilization),
         )
 
@@ -409,7 +419,8 @@ class NativeServingRuntime:
         # max_batched_tokens was auto-expanded beyond config defaults.
         prefill_budget_default = max(
             1,
-            int(self._runtime_batch_size) * int(self._trainer_seq_len),
+            int(getattr(self, "_dynamic_token_capacity", 0))
+            or (int(self._runtime_batch_size) * int(self._trainer_seq_len)),
         )
         self._prefill_budget_tokens = max(
             1,
@@ -436,13 +447,16 @@ class NativeServingRuntime:
             1,
             int(os.getenv("SUROGATE_SERVE_DECODE_PENDING_STEP_TOKENS", "1")),
         )
-        decode_busy_default = max(1, min(8, int(self._continuous_step_tokens)))
+        # Default to 1 token per decode step: returns to the scheduling loop
+        # after every token, allowing immediate prefill of new requests.
+        # Higher values batch more decode tokens per step (less scheduling
+        # overhead) but delay prefill of incoming requests, increasing TTFT.
         self._decode_busy_step_tokens = max(
             1,
             int(
                 os.getenv(
                     "SUROGATE_SERVE_DECODE_BUSY_STEP_TOKENS",
-                    str(decode_busy_default),
+                    "1",
                 )
             ),
         )
@@ -755,8 +769,8 @@ class NativeServingRuntime:
                 auto_budget = max(4096, min(32768, auto_budget))
                 if auto_budget > max_batched_tokens:
                     logger.info(
-                        "Auto-tuned max_batched_tokens from %d to %d "
-                        "(batch_size=%d, tokens_per_seq=%d).",
+                        "Auto-tuned runtime buffer capacity from %d to %d tokens "
+                        "(batch_size=%d, tokens_per_seq=%d). ",
                         max_batched_tokens,
                         auto_budget,
                         requested_batch_size,
@@ -1066,6 +1080,7 @@ class NativeServingRuntime:
                     gpu_memory_utilization=self.config.gpu_memory_utilization,
                     use_cuda_graphs=bool(self.config.use_cuda_graphs),
                     min_activation_mb=int(self._continuous_min_activation_mb),
+                    max_num_batched_tokens=int(self.config.max_num_batched_tokens),
                 )
             )
             logger.info(
@@ -1086,9 +1101,13 @@ class NativeServingRuntime:
             prefill_chunk_size = max(0, int(self.config.prefill_chunk_size))
             prefilling_slots: set[int] = set()
 
+            _step_pending = False  # True if a flat_step_launch is awaiting collect
+
             while not self._shutdown:
                 _t_loop_start = _time.perf_counter()
-                # --- Phase 1: Drain new requests under slot + prefill token budgets ---
+
+                # --- Phase 0: Drain new requests FIRST (overlaps with GPU work) ---
+                # This runs while the GPU may still be executing the previous step.
                 free_slots = self._max_batch_sequences - len(slot_map)
                 prefill_items = self._drain_pending_for_prefill(
                     max_new=max(0, min(free_slots, self._prefill_max_new_sequences)),
@@ -1105,6 +1124,123 @@ class NativeServingRuntime:
                         max_tokens = max(1, self._runtime_seq_len - prompt_len)
                     new_prompts.append(prompt_ids)
                     new_max_tokens.append(max_tokens)
+
+                # --- Phase 1: Collect previous step results (blocks on GPU sync) ---
+                # By doing Phase 0 first, the GPU had time to finish while we
+                # drained requests. The sync should return faster.
+                active_sids: list[int] = []
+                sampled_rows: list[list[int]] = []
+                finished_flags: list[int] = []
+                comp_lens: list[int] = []
+                used_flat_step = False
+
+                if _step_pending:
+                    try:
+                        new_sids_prev, active_sids, sampled, finished_flags, comp_lens = (
+                            self.trainer.engine_flat_step_collect(engine_id)
+                        )
+                        used_flat_step = True
+                        sampled_rows = [[int(tok)] for tok in sampled]
+                        # Process previous step's new_sids (slot mapping)
+                        # (already done in the launch iteration — new_sids
+                        # are from the PREVIOUS prefill_items which were
+                        # already added to slot_map)
+                    except Exception as exc:
+                        for item in slot_map.values():
+                            if not item.finished:
+                                item.pending.error = exc
+                                item.pending.done.set()
+                                if item.pending.stream_queue is not None:
+                                    item.pending.stream_queue.put(None)
+                        prefilling_slots.clear()
+                        slot_map.clear()
+                        logger.exception("engine_flat_step_collect failed")
+                        _step_pending = False
+                        continue
+
+                    _step_pending = False
+
+                    # Process results from the collected step (moved from below)
+                    _t_fwd = _time.perf_counter()
+                    release_slots: list[int] = []
+                    release_set: set[int] = set()
+                    for sid, row_tokens, fin, clen in zip(
+                        active_sids, sampled_rows, finished_flags, comp_lens
+                    ):
+                        item = slot_map.get(sid)
+                        if item is None or item.finished:
+                            continue
+                        if int(clen) == 0 and not bool(fin):
+                            prefilling_slots.add(sid)
+                            continue
+                        prefilling_slots.discard(sid)
+                        for raw_tok in row_tokens:
+                            safe_tok, tok_replaced = self._sanitize_token_ids([int(raw_tok)])
+                            emitted_tok = int(safe_tok[0])
+                            item.generated_ids.append(emitted_tok)
+                            if item.pending.stream_queue is not None:
+                                item.pending.stream_queue.put(emitted_tok)
+                            eos_hit = (
+                                (emitted_tok == self.eos_id and not item.pending.params.ignore_eos)
+                                or tok_replaced
+                            )
+                            should_finish = eos_hit
+                            if not should_finish and item.pending.stop_strings:
+                                partial_text = self._safe_decode(item.generated_ids)
+                                _, stop_hit = _apply_stop(
+                                    partial_text, item.pending.stop_strings
+                                )
+                                if stop_hit:
+                                    should_finish = True
+                            if not should_finish and (
+                                len(item.generated_ids) >= item.pending.params.max_tokens
+                            ):
+                                should_finish = True
+                            if not should_finish:
+                                continue
+                            item.finished = True
+                            if item.generated_ids and int(item.generated_ids[-1]) == self.eos_id:
+                                item.finish_reason = "stop"
+                            elif item.pending.stop_strings:
+                                partial_text = self._safe_decode(item.generated_ids)
+                                _, stop_hit = _apply_stop(
+                                    partial_text, item.pending.stop_strings
+                                )
+                                item.finish_reason = "stop" if stop_hit else "length"
+                            else:
+                                item.finish_reason = "length"
+                            self._finalize_continuous_request(item)
+                            item.pending.done.set()
+                            if item.pending.stream_queue is not None:
+                                item.pending.stream_queue.put(None)
+                            if sid not in release_set:
+                                release_set.add(sid)
+                                release_slots.append(sid)
+                            break
+                        if (
+                            not item.finished
+                            and bool(fin)
+                            and not item.pending.params.ignore_eos
+                        ):
+                            item.finished = True
+                            if item.generated_ids and int(item.generated_ids[-1]) == self.eos_id:
+                                item.finish_reason = "stop"
+                            else:
+                                item.finish_reason = "length"
+                            self._finalize_continuous_request(item)
+                            item.pending.done.set()
+                            if item.pending.stream_queue is not None:
+                                item.pending.stream_queue.put(None)
+                            if sid not in release_set:
+                                release_set.add(sid)
+                                release_slots.append(sid)
+                    for sid in release_slots:
+                        prefilling_slots.discard(sid)
+                        try:
+                            self.trainer.engine_release_slot(engine_id, sid)
+                        except Exception:
+                            logger.exception("engine_release_slot(%d) failed", sid)
+                        slot_map.pop(sid, None)
 
                 if not slot_map:
                     prefilling_slots.clear()
@@ -1134,31 +1270,37 @@ class NativeServingRuntime:
 
                 _t_sched = _time.perf_counter()
 
-                # --- Phase 2: Run flat-step for prefill activity, decode-step otherwise ---
-                run_flat_step = bool(new_prompts) or bool(prefilling_slots)
-                used_flat_step = False
-                active_sids: list[int] = []
-                sampled_rows: list[list[int]] = []
-                finished_flags: list[int] = []
-                comp_lens: list[int] = []
+                # --- Phase 2: Launch flat-step (non-blocking with deferred sync) ---
+                run_flat_step = bool(slot_map) or bool(new_prompts)
 
                 if run_flat_step:
                     try:
-                        new_sids, active_sids, sampled, finished_flags, comp_lens = (
-                            self.trainer.engine_flat_step(
-                                engine_id,
-                                new_prompts,
-                                max_gen_len=_max_gen,
-                                temperature=first_params.temperature,
-                                eos_token_id=_eos,
-                                top_k=first_params.top_k,
-                                top_p=first_params.top_p,
-                                min_p=first_params.min_p,
-                                prefill_chunk_size=prefill_chunk_size,
-                            )
+                        new_sids = self.trainer.engine_flat_step_launch(
+                            engine_id,
+                            new_prompts,
+                            max_gen_len=_max_gen,
+                            temperature=first_params.temperature,
+                            eos_token_id=_eos,
+                            top_k=first_params.top_k,
+                            top_p=first_params.top_p,
+                            min_p=first_params.min_p,
+                            prefill_chunk_size=prefill_chunk_size,
                         )
-                        used_flat_step = True
-                        sampled_rows = [[int(tok)] for tok in sampled]
+                        _step_pending = True
+
+                        # Map new prompt items to slot_map immediately
+                        # (new_sids available synchronously from Phase 1)
+                        failed_prefills: list[ActiveGeneration] = []
+                        for item, sid in zip(prefill_items, new_sids):
+                            if sid < 0:
+                                failed_prefills.append(item)
+                            else:
+                                slot_map[sid] = item
+                        if failed_prefills:
+                            with self._pending_cv:
+                                for item in reversed(failed_prefills):
+                                    self._pending.appendleft(item.pending)
+
                     except Exception as exc:
                         for item in prefill_items:
                             item.pending.error = exc
@@ -1187,132 +1329,8 @@ class NativeServingRuntime:
                             for item in reversed(failed_prefills):
                                 self._pending.appendleft(item.pending)
 
-                elif slot_map:
-                    pending_backlog = self._has_pending_requests()
-                    step_tokens = (
-                        self._decode_pending_step_tokens
-                        if pending_backlog
-                        else self._decode_busy_step_tokens
-                    )
-                    step_tokens = max(1, min(step_tokens, self._continuous_idle_step_tokens))
-                    try:
-                        active_sids, sampled_rows, finished_flags, comp_lens = (
-                            self.trainer.engine_step(
-                                engine_id,
-                                step_tokens=step_tokens,
-                            )
-                        )
-                    except Exception as exc:
-                        for item in slot_map.values():
-                            if not item.finished:
-                                item.pending.error = exc
-                                item.pending.done.set()
-                                if item.pending.stream_queue is not None:
-                                    item.pending.stream_queue.put(None)
-                        prefilling_slots.clear()
-                        slot_map.clear()
-                        logger.exception("engine_step failed")
-                        continue
-
-                _t_fwd = _time.perf_counter()
-
-                # --- Phase 3: Process decode tokens and release completed slots ---
-                release_slots: list[int] = []
-                release_set: set[int] = set()
-
-                for sid, row_tokens, fin, clen in zip(
-                    active_sids, sampled_rows, finished_flags, comp_lens
-                ):
-                    item = slot_map.get(sid)
-                    if item is None or item.finished:
-                        continue
-
-                    if used_flat_step:
-                        # flat_step returns completion_len==0 while request is still prefilling.
-                        if int(clen) == 0 and not bool(fin):
-                            prefilling_slots.add(sid)
-                            continue
-                        prefilling_slots.discard(sid)
-                    else:
-                        prefilling_slots.discard(sid)
-
-                    for raw_tok in row_tokens:
-                        safe_tok, tok_replaced = self._sanitize_token_ids([int(raw_tok)])
-                        emitted_tok = int(safe_tok[0])
-                        item.generated_ids.append(emitted_tok)
-                        if item.pending.stream_queue is not None:
-                            item.pending.stream_queue.put(emitted_tok)
-
-                        eos_hit = (
-                            (emitted_tok == self.eos_id and not item.pending.params.ignore_eos)
-                            or tok_replaced
-                        )
-                        should_finish = eos_hit
-                        if not should_finish and item.pending.stop_strings:
-                            partial_text = self._safe_decode(item.generated_ids)
-                            _, stop_hit = _apply_stop(
-                                partial_text, item.pending.stop_strings
-                            )
-                            if stop_hit:
-                                should_finish = True
-                        if not should_finish and (
-                            len(item.generated_ids) >= item.pending.params.max_tokens
-                        ):
-                            should_finish = True
-
-                        if not should_finish:
-                            continue
-
-                        item.finished = True
-                        if item.generated_ids and int(item.generated_ids[-1]) == self.eos_id:
-                            item.finish_reason = "stop"
-                        elif item.pending.stop_strings:
-                            partial_text = self._safe_decode(item.generated_ids)
-                            _, stop_hit = _apply_stop(
-                                partial_text, item.pending.stop_strings
-                            )
-                            item.finish_reason = "stop" if stop_hit else "length"
-                        else:
-                            item.finish_reason = "length"
-
-                        self._finalize_continuous_request(item)
-                        item.pending.done.set()
-                        if item.pending.stream_queue is not None:
-                            item.pending.stream_queue.put(None)
-                        if sid not in release_set:
-                            release_set.add(sid)
-                            release_slots.append(sid)
-                        break
-
-                    # Engine-side EOS/max_gen_len safeguard for slots that
-                    # finished without host-side stop/max checks.
-                    if (
-                        not item.finished
-                        and bool(fin)
-                        and not item.pending.params.ignore_eos
-                    ):
-                        item.finished = True
-                        if item.generated_ids and int(item.generated_ids[-1]) == self.eos_id:
-                            item.finish_reason = "stop"
-                        else:
-                            item.finish_reason = "length"
-                        self._finalize_continuous_request(item)
-                        item.pending.done.set()
-                        if item.pending.stream_queue is not None:
-                            item.pending.stream_queue.put(None)
-                        if sid not in release_set:
-                            release_set.add(sid)
-                            release_slots.append(sid)
-
-                for sid in release_slots:
-                    prefilling_slots.discard(sid)
-                    try:
-                        self.trainer.engine_release_slot(engine_id, sid)
-                    except Exception:
-                        logger.exception("engine_release_slot(%d) failed", sid)
-                    slot_map.pop(sid, None)
-
                 _t_end = _time.perf_counter()
+                _t_fwd = _t_sched  # no separate forward timing in async mode
                 _step_count += 1
                 if loop_trace and (_step_count <= 30 or _step_count % 50 == 0):
                     _sched_ms = (_t_sched - _t_loop_start) * 1000
