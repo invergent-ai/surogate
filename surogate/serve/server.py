@@ -1321,9 +1321,29 @@ class NativeServingRuntime:
                     _total_ms = (_t_end - _t_loop_start) * 1000
                     _n_new = len(new_prompts)
                     _n_active = len(active_sids)
+                    _n_slot_map = len(slot_map)
+                    _n_prefilling = len(prefilling_slots)
+                    _n_released = len(release_slots)
+                    with self._pending_cv:
+                        _n_pending = len(self._pending)
+                    _eng_active = -1
+                    _eng_free_slots = -1
+                    _eng_free_pages = -1
+                    if engine_id is not None:
+                        try:
+                            _eng_active, _eng_free_slots, _eng_free_pages = (
+                                self.trainer.engine_get_stats(engine_id)
+                            )
+                        except Exception:
+                            pass
                     import sys
                     print(
-                        f"[LOOP] step={_step_count} sched={_sched_ms:.1f}ms fwd={_fwd_ms:.1f}ms post={_post_ms:.1f}ms total={_total_ms:.1f}ms new={_n_new} active={_n_active}",
+                        f"[LOOP] step={_step_count} sched={_sched_ms:.1f}ms "
+                        f"fwd={_fwd_ms:.1f}ms post={_post_ms:.1f}ms total={_total_ms:.1f}ms "
+                        f"new={_n_new} active={_n_active} slot_map={_n_slot_map} "
+                        f"prefilling={_n_prefilling} released={_n_released} pending={_n_pending} "
+                        f"eng_active={_eng_active} free_slots={_eng_free_slots} "
+                        f"free_pages={_eng_free_pages}",
                         file=sys.stderr, flush=True,
                     )
 

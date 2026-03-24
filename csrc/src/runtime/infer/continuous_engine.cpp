@@ -1516,6 +1516,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     auto& state = ensure_engine_state_storage(this, max_slots_);
     const int V = vocab_size_;
     fallback_token_id_ = resolve_fallback_token_id(config.eos_token_id, V);
+    bool compact_batch_needs_rebuild = false;
 
     // === Phase 1: Allocate slots + pages for new prompts ===
     result.new_slot_ids.resize(new_prompts.size(), -1);
@@ -1548,6 +1549,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         slot.prefill_progress = 0;      // nothing prefilled yet
 
         result.new_slot_ids[i] = sid;
+        compact_batch_needs_rebuild = true;
     }
 
     // === Phase 2: Select active slots under token budget ===
@@ -2072,12 +2074,13 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     for (int i = 0; i < batch_size; ++i) {
         const int sid = active_sids[i];
         auto& slot = slots_[static_cast<std::size_t>(sid)];
+        const bool was_prefilling = slot.prefilling();
         int32_t tok = h_sampled[i];
         if (!is_valid_token_id(tok, V)) {
             tok = fallback_token_id_;
         }
 
-        if (slot.prefilling()) {
+        if (was_prefilling) {
             // Chunked prefill: advance progress, update seq_len.
             slot.prefill_progress += q_lens[i];
             slot.seq_len = slot.prefill_progress;
@@ -2089,6 +2092,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
                 slot.generated_count = 1;
                 slot.prompt.clear();  // free prompt memory
                 slot.prompt.shrink_to_fit();
+                compact_batch_needs_rebuild = true;
 
                 if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
                     slot.finished = true;
@@ -2113,6 +2117,12 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         result.sampled_tokens[i] = tok;
         result.finished[i] = slot.finished ? 1 : 0;
         result.completion_lens[i] = slot.generated_count;
+    }
+
+    // If flat_step changed decode membership (new slots or prefill->decode
+    // transitions), rebuild compact decode state before the next engine_step.
+    if (compact_batch_needs_rebuild) {
+        batch_dirty_ = true;
     }
 
     return result;

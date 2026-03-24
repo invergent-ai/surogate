@@ -2589,6 +2589,25 @@ MultiGPUPyTrainer::FlatStepResult MultiGPUPyTrainer::engine_flat_step(
     return result;
 }
 
+MultiGPUPyTrainer::ContinuousEngineStats MultiGPUPyTrainer::engine_get_stats(
+        std::uint64_t engine_id) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("engine_get_stats: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    ContinuousEngineStats stats;
+    stats.active = eng->num_active();
+    stats.free_slots = eng->num_free_slots();
+    stats.free_pages = eng->num_free_pages();
+    return stats;
+}
+
 void MultiGPUPyTrainer::engine_release_slot(
         std::uint64_t engine_id, int slot_id) {
     infer::ContinuousGenerationEngine* eng = nullptr;

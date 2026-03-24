@@ -1599,6 +1599,14 @@ NB_MODULE(_surogate, m) {
         nb::arg("prefill_chunk_size") = 256,
         "Flat-token step: prefill new prompts + decode active sequences in one forward pass.\n"
         "Returns (new_slot_ids, active_slot_ids, sampled_tokens, finished, completion_lens).")
+        .def("engine_get_stats", [](MultiGPUPyTrainer* trainer,
+                std::uint64_t engine_id) {
+            auto stats = trainer->engine_get_stats(engine_id);
+            return nb::make_tuple(stats.active, stats.free_slots, stats.free_pages);
+        },
+        nb::arg("engine_id"),
+        "Get lightweight continuous-engine stats.\n"
+        "Returns (active_slots, free_slots, free_pages).")
         .def("engine_release_slot", &MultiGPUPyTrainer::engine_release_slot,
         nb::arg("engine_id"), nb::arg("slot_id"),
         "Release a slot and recycle its KV-cache pages.")

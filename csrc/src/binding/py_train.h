@@ -277,6 +277,14 @@ public:
         int max_gen_len, float temperature, int32_t eos_token_id,
         int top_k, float top_p, float min_p, int prefill_chunk_size = 256);
 
+    /// Lightweight runtime stats for a continuous engine.
+    struct ContinuousEngineStats {
+        int active = 0;
+        int free_slots = 0;
+        int free_pages = 0;
+    };
+    ContinuousEngineStats engine_get_stats(std::uint64_t engine_id);
+
     /// Release a slot (frees KV pages).
     void engine_release_slot(std::uint64_t engine_id, int slot_id);
 
