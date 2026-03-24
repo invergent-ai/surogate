@@ -2082,7 +2082,11 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
     static const std::vector<std::string> empty_save_list;
     mCompiledExecutor->set_save_list(&empty_save_list);
 
-    if (use_cuda_graph && !flat_graph->layer_segments.empty()) {
+    const bool allow_piecewise_graph =
+        use_cuda_graph
+        && decode_state.strict_state_buffers
+        && !flat_graph->layer_segments.empty();
+    if (allow_piecewise_graph) {
         // Piecewise CUDA graph mode: capture/replay non-attention segments,
         // run attention eagerly. This is the same approach as vLLM's piecewise
         // compilation — attention needs per-step dynamic metadata (PrefillPlan)

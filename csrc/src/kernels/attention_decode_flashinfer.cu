@@ -91,6 +91,7 @@ void dispatch_flashinfer_paged_decode(
         int32_t* kv_tile_indices,
         int32_t* kv_chunk_size,
         int batch_size, int Hq, int Hkv, int page_block_size,
+        int q_stride_n,
         bool enable_pdl,
         cudaStream_t stream) {
     using Params = flashinfer::BatchDecodeParams<nv_bfloat16, nv_bfloat16, nv_bfloat16, int32_t>;
@@ -121,7 +122,7 @@ void dispatch_flashinfer_paged_decode(
     params.maybe_alibi_slopes = nullptr;
     params.padded_batch_size = static_cast<uint32_t>(batch_size);
     params.num_qo_heads = static_cast<uint32_t>(Hq);
-    params.q_stride_n = static_cast<int32_t>(Hq * HeadDim);
+    params.q_stride_n = static_cast<int32_t>(q_stride_n > 0 ? q_stride_n : Hq * HeadDim);
     params.q_stride_h = static_cast<int32_t>(HeadDim);
     params.window_left = -1;
     params.logits_soft_cap = 0.0f;
@@ -164,6 +165,7 @@ void dispatch_flashinfer_paged_decode_fp8(
         int32_t* kv_tile_indices,
         int32_t* kv_chunk_size,
         int batch_size, int Hq, int Hkv, int page_block_size,
+        int q_stride_n,
         bool enable_pdl,
         cudaStream_t stream) {
     using Params = flashinfer::BatchDecodeParams<nv_bfloat16, __nv_fp8_e4m3, nv_bfloat16, int32_t>;
@@ -194,7 +196,7 @@ void dispatch_flashinfer_paged_decode_fp8(
     params.maybe_alibi_slopes = nullptr;
     params.padded_batch_size = static_cast<uint32_t>(batch_size);
     params.num_qo_heads = static_cast<uint32_t>(Hq);
-    params.q_stride_n = static_cast<int32_t>(Hq * HeadDim);
+    params.q_stride_n = static_cast<int32_t>(q_stride_n > 0 ? q_stride_n : Hq * HeadDim);
     params.q_stride_h = static_cast<int32_t>(HeadDim);
     params.window_left = -1;
     params.logits_soft_cap = 0.0f;
@@ -237,7 +239,8 @@ void attention_decode_flashinfer_paged(
         int32_t* scratch_kv_tile_indices,
         int32_t* scratch_kv_chunk_size,
         bool enable_pdl,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int q_stride_n) {
     if (batch_size <= 0 || Hs <= 0) {
         return;
     }
@@ -277,25 +280,25 @@ void attention_decode_flashinfer_paged(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else if (Hs == 96) {
         dispatch_flashinfer_paged_decode<96>(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else if (Hs == 128) {
         dispatch_flashinfer_paged_decode<128>(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else if (Hs == 256) {
         dispatch_flashinfer_paged_decode<256>(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else {
         throw std::runtime_error(
             "attention_decode_flashinfer_paged: unsupported head_size (supported: 64/96/128/256)");
@@ -321,7 +324,8 @@ void attention_decode_flashinfer_paged_fp8(
         int32_t* scratch_kv_tile_indices,
         int32_t* scratch_kv_chunk_size,
         bool enable_pdl,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int q_stride_n) {
     if (batch_size <= 0 || Hs <= 0) return;
 
     build_flashinfer_decode_metadata_kernel<<<1, 1, 0, stream>>>(
@@ -343,25 +347,25 @@ void attention_decode_flashinfer_paged_fp8(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else if (Hs == 96) {
         dispatch_flashinfer_paged_decode_fp8<96>(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else if (Hs == 128) {
         dispatch_flashinfer_paged_decode_fp8<128>(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else if (Hs == 256) {
         dispatch_flashinfer_paged_decode_fp8<256>(
             out, lse, q, k_pages, v_pages,
             scratch_indptr, scratch_indices, scratch_last_page_len,
             scratch_request_indices, scratch_kv_tile_indices, scratch_kv_chunk_size,
-            batch_size, Hq, Hkv, page_block_size, enable_pdl, stream);
+            batch_size, Hq, Hkv, page_block_size, q_stride_n, enable_pdl, stream);
     } else {
         throw std::runtime_error(
             "attention_decode_flashinfer_paged_fp8: unsupported head_size (supported: 64/96/128/256)");

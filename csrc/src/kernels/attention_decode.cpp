@@ -30,11 +30,15 @@ void set_decode_common(surogate_flash::Flash_fwd_params& params,
                        const nv_bfloat16* q, nv_bfloat16* out, float* lse,
                        const int32_t* cu_seqlens_q, const int32_t* seqused_k,
                        int max_seqlen_k, int batch_size,
-                       int Hq, int Hkv, int Hs) {
+                       int Hq, int Hkv, int Hs,
+                       int q_stride_n) {
+    if (q_stride_n <= 0) {
+        q_stride_n = Hq * Hs;
+    }
     // Q: batch-stride mode [B, Hq, Hs]
     params.q_ptr = const_cast<void*>(static_cast<const void*>(q));
-    params.q_batch_stride = Hq * Hs;
-    params.q_row_stride = Hq * Hs;
+    params.q_batch_stride = q_stride_n;
+    params.q_row_stride = q_stride_n;
     params.q_head_stride = Hs;
 
     // Output: batch-stride mode [B, Hq, Hs]
@@ -101,13 +105,14 @@ void attention_decode_flash(
         const int32_t* cu_seqlens_q, const int32_t* seqused_k,
         int max_seqlen_k, int kv_stride_seqlen,
         int batch_size, int Hq, int Hkv, int Hs,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int q_stride_n) {
 
     surogate_flash::Flash_fwd_params params;
     std::memset(&params, 0, sizeof(params));
 
     set_decode_common(params, q, out, lse, cu_seqlens_q, seqused_k,
-                      max_seqlen_k, batch_size, Hq, Hkv, Hs);
+                      max_seqlen_k, batch_size, Hq, Hkv, Hs, q_stride_n);
 
     // K/V: padded batch mode [B, max_seq_len_k, Hkv, Hs]
     params.k_ptr = const_cast<void*>(static_cast<const void*>(k_cache));
@@ -135,13 +140,14 @@ void attention_decode_flash_paged(
         int page_block_size,
         int max_seqlen_k,
         int batch_size, int Hq, int Hkv, int Hs,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int q_stride_n) {
 
     surogate_flash::Flash_fwd_params params;
     std::memset(&params, 0, sizeof(params));
 
     set_decode_common(params, q, out, lse, cu_seqlens_q, seqused_k,
-                      max_seqlen_k, batch_size, Hq, Hkv, Hs);
+                      max_seqlen_k, batch_size, Hq, Hkv, Hs, q_stride_n);
 
     // K/V: paged mode — batch_stride = page stride
     const int page_elems = page_block_size * Hkv * Hs;

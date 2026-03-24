@@ -4,6 +4,7 @@
 // Flat-token attention with paged KV-cache via FlashInfer.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -31,13 +32,13 @@ static_assert(sizeof(flashinfer::PrefillPlanInfo) <= infer::DecodeState::kPlanIn
 
 namespace {
 
-template <int HeadDim>
+template <typename KVType, int HeadDim>
 void dispatch_flat_paged_attention(
         nv_bfloat16* out,
         float* lse,
         const nv_bfloat16* q,
-        const nv_bfloat16* k_pages,
-        const nv_bfloat16* v_pages,
+        const KVType* k_pages,
+        const KVType* v_pages,
         const int32_t* q_indptr,
         const int32_t* page_indptr,
         const int32_t* page_indices,
@@ -60,21 +61,21 @@ void dispatch_flat_paged_attention(
     if (Hkv <= 0 || Hq <= 0 || (Hq % Hkv) != 0) {
         throw std::runtime_error("attention_flat_paged: invalid head config for GQA");
     }
-    using Params = flashinfer::BatchPrefillPagedParams<nv_bfloat16, nv_bfloat16, nv_bfloat16, int32_t>;
+    using Params = flashinfer::BatchPrefillPagedParams<nv_bfloat16, KVType, nv_bfloat16, int32_t>;
     using AttentionVariant = flashinfer::DefaultAttention<
         /*use_custom_mask=*/false,
         /*use_sliding_window=*/false,
         /*use_logits_soft_cap=*/false,
         /*use_alibi=*/false>;
 
-    flashinfer::paged_kv_t<nv_bfloat16, int32_t> paged_kv(
+    flashinfer::paged_kv_t<KVType, int32_t> paged_kv(
         static_cast<uint32_t>(Hkv),
         static_cast<uint32_t>(page_block_size),
         static_cast<uint32_t>(HeadDim),
         static_cast<uint32_t>(batch_size),
         flashinfer::QKVLayout::kNHD,
-        const_cast<nv_bfloat16*>(k_pages),
-        const_cast<nv_bfloat16*>(v_pages),
+        const_cast<KVType*>(k_pages),
+        const_cast<KVType*>(v_pages),
         const_cast<int32_t*>(page_indices),
         const_cast<int32_t*>(page_indptr),
         const_cast<int32_t*>(last_page_len));
@@ -204,6 +205,80 @@ void kv_cache_store_flat_paged_bf16(
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void kv_cache_store_flat_paged_fp8_unit_scale_kernel(
+        __nv_fp8_e4m3* __restrict__ k_pages_fp8,
+        __nv_fp8_e4m3* __restrict__ v_pages_fp8,
+        float* __restrict__ k_scales,
+        float* __restrict__ v_scales,
+        const nv_bfloat16* __restrict__ qkv_rope,
+        const int32_t* __restrict__ token_to_req,
+        const int32_t* __restrict__ kv_write_pos,
+        const int* __restrict__ block_table,
+        int block_table_stride,
+        int page_block_size,
+        int Hq, int Hkv, int Hs) {
+    const int token_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int dim_idx = threadIdx.x;
+    if (dim_idx >= Hs) return;
+
+    const int req_idx = token_to_req[token_idx];
+    const int write_pos = kv_write_pos[token_idx];
+    if (req_idx < 0 || write_pos < 0) return;
+
+    const int vp = write_pos / page_block_size;
+    if (vp < 0 || vp >= block_table_stride) return;
+    const int po = write_pos % page_block_size;
+    const int pp = block_table[req_idx * block_table_stride + vp];
+
+    const int H_total = Hq + 2 * Hkv;
+    const long src_base = static_cast<long>(token_idx) * H_total * Hs;
+    const nv_bfloat16 k_bf = qkv_rope[src_base + (Hq + head_idx) * Hs + dim_idx];
+    const nv_bfloat16 v_bf = qkv_rope[src_base + (Hq + Hkv + head_idx) * Hs + dim_idx];
+
+    const int page_elems = page_block_size * Hkv * Hs;
+    const long dst = static_cast<long>(pp) * page_elems + po * Hkv * Hs + head_idx * Hs + dim_idx;
+    __nv_fp8_e4m3 qk;
+    __nv_fp8_e4m3 qv;
+    qk.__x = __nv_cvt_float_to_fp8(
+        __bfloat162float(k_bf),
+        __nv_saturation_t::__NV_SATFINITE,
+        __nv_fp8_interpretation_t::__NV_E4M3);
+    qv.__x = __nv_cvt_float_to_fp8(
+        __bfloat162float(v_bf),
+        __nv_saturation_t::__NV_SATFINITE,
+        __nv_fp8_interpretation_t::__NV_E4M3);
+    k_pages_fp8[dst] = qk;
+    v_pages_fp8[dst] = qv;
+
+    if (dim_idx == 0 && k_scales && v_scales) {
+        const long scale_idx = static_cast<long>(pp) * page_block_size * Hkv
+            + static_cast<long>(po) * Hkv + head_idx;
+        k_scales[scale_idx] = 1.0f;
+        v_scales[scale_idx] = 1.0f;
+    }
+}
+
+void kv_cache_store_flat_paged_fp8(
+        __nv_fp8_e4m3* k_pages_fp8, __nv_fp8_e4m3* v_pages_fp8,
+        float* k_scales, float* v_scales,
+        const nv_bfloat16* qkv_rope,
+        const int32_t* token_to_req,
+        const int32_t* kv_write_pos,
+        const int* block_table, int block_table_stride,
+        int page_block_size,
+        int total_tokens, int Hq, int Hkv, int Hs,
+        cudaStream_t stream) {
+    if (total_tokens <= 0) return;
+    dim3 grid(static_cast<unsigned int>(total_tokens), static_cast<unsigned int>(Hkv));
+    dim3 block(static_cast<unsigned int>(Hs));
+    kv_cache_store_flat_paged_fp8_unit_scale_kernel<<<grid, block, 0, stream>>>(
+        k_pages_fp8, v_pages_fp8, k_scales, v_scales, qkv_rope,
+        token_to_req, kv_write_pos, block_table, block_table_stride,
+        page_block_size, Hq, Hkv, Hs);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ============================================================================
 // PrefillPlan: run once per flat_step, results cached across layers
 // ============================================================================
@@ -308,10 +383,11 @@ void flat_attention_plan(
 // Flat-token attention: uses pre-computed plan (no per-layer sync)
 // ============================================================================
 
-void attention_flat_paged_flashinfer(
+template <typename KVType>
+void attention_flat_paged_flashinfer_impl(
         nv_bfloat16* out, float* lse,
         const nv_bfloat16* q,
-        const nv_bfloat16* k_pages, const nv_bfloat16* v_pages,
+        const KVType* k_pages, const KVType* v_pages,
         const int32_t* q_indptr_gpu,
         const int32_t* seq_lens_k,
         const int* block_table, int block_table_stride,
@@ -332,6 +408,11 @@ void attention_flat_paged_flashinfer(
         int32_t* /*scratch_qo_tile_indices*/,
         int32_t* /*scratch_kv_chunk_size*/,
         cudaStream_t stream) {
+    (void)seq_lens_k;
+    (void)block_table;
+    (void)block_table_stride;
+    (void)padded_batch_size_hint;
+
     if (batch_size <= 0 || total_q_tokens <= 0 || Hs <= 0) return;
     const auto& plan_info = *reinterpret_cast<const flashinfer::PrefillPlanInfo*>(plan_info_opaque);
     if (plan_info.split_kv) {
@@ -365,7 +446,7 @@ void attention_flat_paged_flashinfer(
     const uint32_t cta_tile_q = plan_info.cta_tile_q;
 
     if (Hs == 64) {
-        dispatch_flat_paged_attention<64>(
+        dispatch_flat_paged_attention<KVType, 64>(
             out, lse, q, k_pages, v_pages,
             q_indptr_gpu, page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
             d_request_indices, d_qo_tile_indices, d_kv_tile_indices,
@@ -374,7 +455,7 @@ void attention_flat_paged_flashinfer(
             batch_size, pbs, total_q_tokens, plan_info.split_kv,
             Hq, Hkv, page_block_size, cta_tile_q, stream);
     } else if (Hs == 96) {
-        dispatch_flat_paged_attention<96>(
+        dispatch_flat_paged_attention<KVType, 96>(
             out, lse, q, k_pages, v_pages,
             q_indptr_gpu, page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
             d_request_indices, d_qo_tile_indices, d_kv_tile_indices,
@@ -383,7 +464,7 @@ void attention_flat_paged_flashinfer(
             batch_size, pbs, total_q_tokens, plan_info.split_kv,
             Hq, Hkv, page_block_size, cta_tile_q, stream);
     } else if (Hs == 128) {
-        dispatch_flat_paged_attention<128>(
+        dispatch_flat_paged_attention<KVType, 128>(
             out, lse, q, k_pages, v_pages,
             q_indptr_gpu, page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
             d_request_indices, d_qo_tile_indices, d_kv_tile_indices,
@@ -392,7 +473,7 @@ void attention_flat_paged_flashinfer(
             batch_size, pbs, total_q_tokens, plan_info.split_kv,
             Hq, Hkv, page_block_size, cta_tile_q, stream);
     } else if (Hs == 256) {
-        dispatch_flat_paged_attention<256>(
+        dispatch_flat_paged_attention<KVType, 256>(
             out, lse, q, k_pages, v_pages,
             q_indptr_gpu, page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
             d_request_indices, d_qo_tile_indices, d_kv_tile_indices,
@@ -403,6 +484,70 @@ void attention_flat_paged_flashinfer(
     } else {
         throw std::runtime_error("attention_flat_paged: unsupported head_size");
     }
+}
+
+void attention_flat_paged_flashinfer(
+        nv_bfloat16* out, float* lse,
+        const nv_bfloat16* q,
+        const nv_bfloat16* k_pages, const nv_bfloat16* v_pages,
+        const int32_t* q_indptr_gpu,
+        const int32_t* seq_lens_k,
+        const int* block_table, int block_table_stride,
+        int page_block_size,
+        int batch_size, int total_q_tokens,
+        int padded_batch_size_hint,
+        int Hq, int Hkv, int Hs,
+        int32_t* page_indptr_gpu,
+        int32_t* page_indices_gpu,
+        int32_t* last_page_len_gpu,
+        void* int_ws_gpu,
+        void* float_ws_gpu,
+        const void* plan_info_opaque,
+        int32_t* scratch_request_indices,
+        int32_t* scratch_qo_tile_indices,
+        int32_t* scratch_kv_chunk_size,
+        cudaStream_t stream) {
+    attention_flat_paged_flashinfer_impl<nv_bfloat16>(
+        out, lse, q, k_pages, v_pages,
+        q_indptr_gpu, seq_lens_k, block_table, block_table_stride,
+        page_block_size, batch_size, total_q_tokens, padded_batch_size_hint,
+        Hq, Hkv, Hs,
+        page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
+        int_ws_gpu, float_ws_gpu, plan_info_opaque,
+        scratch_request_indices, scratch_qo_tile_indices, scratch_kv_chunk_size,
+        stream);
+}
+
+void attention_flat_paged_flashinfer_fp8(
+        nv_bfloat16* out, float* lse,
+        const nv_bfloat16* q,
+        const __nv_fp8_e4m3* k_pages, const __nv_fp8_e4m3* v_pages,
+        const int32_t* q_indptr_gpu,
+        const int32_t* seq_lens_k,
+        const int* block_table, int block_table_stride,
+        int page_block_size,
+        int batch_size, int total_q_tokens,
+        int padded_batch_size_hint,
+        int Hq, int Hkv, int Hs,
+        int32_t* page_indptr_gpu,
+        int32_t* page_indices_gpu,
+        int32_t* last_page_len_gpu,
+        void* int_ws_gpu,
+        void* float_ws_gpu,
+        const void* plan_info_opaque,
+        int32_t* scratch_request_indices,
+        int32_t* scratch_qo_tile_indices,
+        int32_t* scratch_kv_chunk_size,
+        cudaStream_t stream) {
+    attention_flat_paged_flashinfer_impl<__nv_fp8_e4m3>(
+        out, lse, q, k_pages, v_pages,
+        q_indptr_gpu, seq_lens_k, block_table, block_table_stride,
+        page_block_size, batch_size, total_q_tokens, padded_batch_size_hint,
+        Hq, Hkv, Hs,
+        page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
+        int_ws_gpu, float_ws_gpu, plan_info_opaque,
+        scratch_request_indices, scratch_qo_tile_indices, scratch_kv_chunk_size,
+        stream);
 }
 
 // ============================================================================

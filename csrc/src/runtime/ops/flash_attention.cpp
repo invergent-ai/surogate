@@ -38,21 +38,6 @@ bool env_flag_enabled(const char* name) {
            std::strcmp(v, "FALSE") != 0;
 }
 
-bool flashinfer_decode_requested() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached != 0;
-    }
-    const char* env = std::getenv("SUROGATE_USE_FLASHINFER_DECODE");
-    if (!env || !*env) {
-        // Default on; env var can explicitly disable with 0/false.
-        cached = 1;
-    } else {
-        cached = env_flag_enabled("SUROGATE_USE_FLASHINFER_DECODE") ? 1 : 0;
-    }
-    return cached != 0;
-}
-
 bool flashinfer_decode_pdl_enabled() {
     static int cached = -1;
     if (cached >= 0) {
@@ -86,19 +71,6 @@ void log_flashinfer_decode_enabled_once(const cudaDeviceProp& prop, int head_dim
     }
 }
 
-void log_flashinfer_decode_device_fallback_once(const cudaDeviceProp& prop) {
-    static std::atomic<bool> printed{false};
-    bool expected = false;
-    if (printed.compare_exchange_strong(expected, true)) {
-        const int sm = prop.major * 10 + prop.minor;
-        std::fprintf(
-            stderr,
-            "[surogate] FlashInfer decode requested, but device SM%d is unsupported; using FlashAttention decode.\n",
-            sm);
-        std::fflush(stderr);
-    }
-}
-
 void log_flashinfer_decode_head_fallback_once(const int head_dim) {
     static std::atomic<bool> printed{false};
     bool expected = false;
@@ -106,32 +78,6 @@ void log_flashinfer_decode_head_fallback_once(const int head_dim) {
         std::fprintf(
             stderr,
             "[surogate] FlashInfer decode requested, but head_dim=%d is unsupported; using FlashAttention decode.\n",
-            head_dim);
-        std::fflush(stderr);
-    }
-}
-
-void log_fp8_direct_decode_enabled_once(const cudaDeviceProp& prop, int head_dim) {
-    static std::atomic<bool> printed{false};
-    bool expected = false;
-    if (printed.compare_exchange_strong(expected, true)) {
-        const int sm = prop.major * 10 + prop.minor;
-        std::fprintf(
-            stderr,
-            "FP8 paged direct decode enabled (SM%d, head_dim=%d).\n",
-            sm,
-            head_dim);
-        std::fflush(stderr);
-    }
-}
-
-void log_fp8_direct_decode_fallback_once(const int head_dim) {
-    static std::atomic<bool> printed{false};
-    bool expected = false;
-    if (printed.compare_exchange_strong(expected, true)) {
-        std::fprintf(
-            stderr,
-            "FP8 paged direct decode unavailable for head_dim=%d; falling back to BF16 dequant decode.\n",
             head_dim);
         std::fflush(stderr);
     }
@@ -200,33 +146,56 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             * mDecodeState->page_block_size * ds_Hkv * ds_Hs * elem_size;
         const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
 
-        auto* k_pool = reinterpret_cast<nv_bfloat16*>(
-            reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
-        auto* v_pool = reinterpret_cast<nv_bfloat16*>(
-            reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
-
         Tensor flat_lse = mRunState.temp_alloc(ETensorDType::FP32,
             {static_cast<long>(total_q) * Hq}, "flat_lse");
         mTemps.push_back(flat_lse);
 
         // Use pre-computed plan from DecodeState (no CPU sync needed).
-        attention_flat_paged_flashinfer(
-            out.get<nv_bfloat16>(), flat_lse.get<float>(),
-            q_bf16, k_pool, v_pool,
-            mDecodeState->q_indptr_gpu,
-            mDecodeState->seq_lens_k_gpu,
-            mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
-            mDecodeState->page_block_size,
-            ds_batch, total_q, mDecodeState->flat_padded_batch_size,
-            Hq, ds_Hkv, ds_Hs,
-            mDecodeState->flat_page_indptr_gpu,
-            mDecodeState->flat_page_indices_gpu,
-            mDecodeState->flat_last_page_len_gpu,
-            mDecodeState->flat_plan_int_ws_gpu,
-            mDecodeState->flat_plan_float_ws_gpu,
-            static_cast<const void*>(mDecodeState->flat_plan_info_storage),
-            nullptr, nullptr, nullptr,
-            mRunState.MainStream);
+        if (mDecodeState->fp8) {
+            const auto* k_pool_fp8 = reinterpret_cast<const __nv_fp8_e4m3*>(
+                reinterpret_cast<const std::byte*>(mDecodeState->k_pages) + layer_offset);
+            const auto* v_pool_fp8 = reinterpret_cast<const __nv_fp8_e4m3*>(
+                reinterpret_cast<const std::byte*>(mDecodeState->v_pages) + layer_offset);
+            attention_flat_paged_flashinfer_fp8(
+                out.get<nv_bfloat16>(), flat_lse.get<float>(),
+                q_bf16, k_pool_fp8, v_pool_fp8,
+                mDecodeState->q_indptr_gpu,
+                mDecodeState->seq_lens_k_gpu,
+                mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                mDecodeState->page_block_size,
+                ds_batch, total_q, mDecodeState->flat_padded_batch_size,
+                Hq, ds_Hkv, ds_Hs,
+                mDecodeState->flat_page_indptr_gpu,
+                mDecodeState->flat_page_indices_gpu,
+                mDecodeState->flat_last_page_len_gpu,
+                mDecodeState->flat_plan_int_ws_gpu,
+                mDecodeState->flat_plan_float_ws_gpu,
+                static_cast<const void*>(mDecodeState->flat_plan_info_storage),
+                nullptr, nullptr, nullptr,
+                mRunState.MainStream);
+        } else {
+            auto* k_pool = reinterpret_cast<nv_bfloat16*>(
+                reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
+            auto* v_pool = reinterpret_cast<nv_bfloat16*>(
+                reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
+            attention_flat_paged_flashinfer(
+                out.get<nv_bfloat16>(), flat_lse.get<float>(),
+                q_bf16, k_pool, v_pool,
+                mDecodeState->q_indptr_gpu,
+                mDecodeState->seq_lens_k_gpu,
+                mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                mDecodeState->page_block_size,
+                ds_batch, total_q, mDecodeState->flat_padded_batch_size,
+                Hq, ds_Hkv, ds_Hs,
+                mDecodeState->flat_page_indptr_gpu,
+                mDecodeState->flat_page_indices_gpu,
+                mDecodeState->flat_last_page_len_gpu,
+                mDecodeState->flat_plan_int_ws_gpu,
+                mDecodeState->flat_plan_float_ws_gpu,
+                static_cast<const void*>(mDecodeState->flat_plan_info_storage),
+                nullptr, nullptr, nullptr,
+                mRunState.MainStream);
+        }
             
         return;
     }
@@ -258,12 +227,9 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             cudaMemcpyDeviceToDevice,
             mRunState.MainStream));
 
-        const bool use_flashinfer_decode = flashinfer_decode_requested();
-        const bool flashinfer_device_ok =
-            use_flashinfer_decode && flashinfer_decode_device_supported(mRunState.DeviceProp);
-        if (use_flashinfer_decode && !flashinfer_device_ok) {
-            log_flashinfer_decode_device_fallback_once(mRunState.DeviceProp);
-        }
+        const bool flashinfer_device_supported = flashinfer_decode_device_supported(mRunState.DeviceProp);
+        const bool flashinfer_device_ok = flashinfer_device_supported;
+        const int q_stride_n = Hq * Hs;
 
         if (mDecodeState->paged) {
             const int elem_size = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
@@ -273,15 +239,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
 
             if (mDecodeState->fp8) {
-                const std::size_t scale_layer_elems =
-                    static_cast<std::size_t>(mDecodeState->total_pages)
-                    * mDecodeState->page_block_size * Hkv;
-                const std::size_t scale_layer_offset = static_cast<std::size_t>(layer_idx) * scale_layer_elems;
-
                 // Use effective K lengths for this step (seq_lens + 1 after KV append).
-                const int* k_lens_gpu_i = mDecodeState->cu_seqlens_k_gpu
-                    ? reinterpret_cast<const int*>(mDecodeState->cu_seqlens_k_gpu)
-                    : mDecodeState->seq_lens_gpu;
                 const int32_t* k_lens_gpu_i32 = mDecodeState->cu_seqlens_k_gpu
                     ? mDecodeState->cu_seqlens_k_gpu
                     : reinterpret_cast<const int32_t*>(mDecodeState->seq_lens_gpu);
@@ -291,54 +249,77 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                 const auto* v_pages_layer = reinterpret_cast<const __nv_fp8_e4m3*>(
                     reinterpret_cast<const std::byte*>(mDecodeState->v_pages) + layer_offset);
 
-                bool used_fp8_direct = false;
-                if (flashinfer_decode_head_supported(Hs)) {
-                    // Native FP8 direct decode that applies per-position/per-head scales.
-                    used_fp8_direct = attention_decode_paged_fp8_direct(
-                        out.get<nv_bfloat16>(), lse.get<float>(),
-                        q_bf16,
-                        k_pages_layer, v_pages_layer,
-                        mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
-                        mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
-                        k_lens_gpu_i32,
-                        mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
-                        mDecodeState->page_block_size,
-                        ds_batch, Hq, Hkv, Hs,
-                        mRunState.MainStream);
+                const bool flashinfer_head_ok = flashinfer_decode_head_supported(Hs);
+                if (!flashinfer_device_supported) {
+                    throw std::runtime_error(
+                        "flash_attention: FP8 paged decode requires FlashInfer on SM80+ device");
+                }
+                if (!flashinfer_head_ok) {
+                    throw std::runtime_error(
+                        "flash_attention: FP8 paged decode unsupported head_dim; supported: 64/96/128/256");
                 }
 
-                if (used_fp8_direct) {
-                    log_fp8_direct_decode_enabled_once(mRunState.DeviceProp, Hs);
-                } else {
-                    // Fallback: dequant FP8 to BF16 + FlashAttention.
-                    log_fp8_direct_decode_fallback_once(Hs);
-                    const int msk = mDecodeState->max_seqlen_k;
-                    Tensor k_tmp = mRunState.temp_alloc(ETensorDType::BF16,
-                        {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_k");
-                    Tensor v_tmp = mRunState.temp_alloc(ETensorDType::BF16,
-                        {static_cast<long>(ds_batch) * msk * Hkv * Hs}, "fp8_dequant_v");
-                    mTemps.push_back(k_tmp);
-                    mTemps.push_back(v_tmp);
+                Tensor fi_page_counts = mRunState.temp_alloc(
+                    ETensorDType::INT32,
+                    {static_cast<long>(ds_batch)},
+                    "flashinfer_page_counts");
+                Tensor fi_indptr = mRunState.temp_alloc(
+                    ETensorDType::INT32,
+                    {static_cast<long>(ds_batch + 1)},
+                    "flashinfer_indptr");
+                Tensor fi_last_page_len = mRunState.temp_alloc(
+                    ETensorDType::INT32,
+                    {static_cast<long>(ds_batch)},
+                    "flashinfer_last_page_len");
+                Tensor fi_indices = mRunState.temp_alloc(
+                    ETensorDType::INT32,
+                    {static_cast<long>(ds_batch) * mDecodeState->block_table_stride},
+                    "flashinfer_indices");
+                Tensor fi_request_indices = mRunState.temp_alloc(
+                    ETensorDType::INT32,
+                    {static_cast<long>(ds_batch)},
+                    "flashinfer_request_indices");
+                Tensor fi_kv_tile_indices = mRunState.temp_alloc(
+                    ETensorDType::INT32,
+                    {static_cast<long>(ds_batch)},
+                    "flashinfer_kv_tile_indices");
+                Tensor fi_kv_chunk_size = mRunState.temp_alloc(
+                    ETensorDType::INT32,
+                    {1},
+                    "flashinfer_kv_chunk_size");
+                mTemps.push_back(fi_page_counts);
+                mTemps.push_back(fi_indptr);
+                mTemps.push_back(fi_last_page_len);
+                mTemps.push_back(fi_indices);
+                mTemps.push_back(fi_request_indices);
+                mTemps.push_back(fi_kv_tile_indices);
+                mTemps.push_back(fi_kv_chunk_size);
 
-                    kv_cache_dequant_paged_fp8_to_bf16(
-                        k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
-                        k_pages_layer, v_pages_layer,
-                        mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
-                        mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
-                        k_lens_gpu_i,
-                        mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
-                        mDecodeState->page_block_size,
-                        ds_batch, msk, Hkv, Hs,
-                        mRunState.MainStream);
-
-                    attention_decode_flash(
-                        out.get<nv_bfloat16>(), lse.get<float>(),
-                        q_bf16, k_tmp.get<nv_bfloat16>(), v_tmp.get<nv_bfloat16>(),
-                        mDecodeState->cu_seqlens_q_gpu,
-                        mDecodeState->cu_seqlens_k_gpu,
-                        msk, msk, ds_batch, Hq, Hkv, Hs,
-                        mRunState.MainStream);
-                }
+                attention_decode_flashinfer_paged_fp8(
+                    out.get<nv_bfloat16>(),
+                    lse.get<float>(),
+                    q_bf16,
+                    k_pages_layer,
+                    v_pages_layer,
+                    k_lens_gpu_i32,
+                    mDecodeState->block_table_gpu,
+                    mDecodeState->block_table_stride,
+                    mDecodeState->page_block_size,
+                    ds_batch,
+                    Hq,
+                    Hkv,
+                    Hs,
+                    fi_page_counts.get<int32_t>(),
+                    fi_indptr.get<int32_t>(),
+                    fi_last_page_len.get<int32_t>(),
+                    fi_indices.get<int32_t>(),
+                    fi_request_indices.get<int32_t>(),
+                    fi_kv_tile_indices.get<int32_t>(),
+                    fi_kv_chunk_size.get<int32_t>(),
+                    flashinfer_decode_pdl_enabled(),
+                    mRunState.MainStream,
+                    q_stride_n);
+                log_flashinfer_decode_enabled_once(mRunState.DeviceProp, Hs);
             } else {
                 // BF16 paged: direct paged attention
                 auto* k_pool_layer = reinterpret_cast<nv_bfloat16*>(
@@ -409,7 +390,8 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                         fi_kv_tile_indices.get<int32_t>(),
                         fi_kv_chunk_size.get<int32_t>(),
                         flashinfer_decode_pdl_enabled(),
-                        mRunState.MainStream);
+                        mRunState.MainStream,
+                        q_stride_n);
                     log_flashinfer_decode_enabled_once(mRunState.DeviceProp, Hs);
                 } else {
                     if (flashinfer_device_ok && !flashinfer_head_ok) {
@@ -424,7 +406,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                         mDecodeState->page_block_size,
                         mDecodeState->max_seqlen_k,
                         ds_batch, Hq, Hkv, Hs,
-                        mRunState.MainStream);
+                        mRunState.MainStream, q_stride_n);
                 }
             }
         } else {
@@ -472,7 +454,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     mDecodeState->cu_seqlens_q_gpu,
                     mDecodeState->cu_seqlens_k_gpu,
                     msk, msk, ds_batch, Hq, Hkv, Hs,
-                    mRunState.MainStream);
+                    mRunState.MainStream, q_stride_n);
             } else {
                 const std::size_t layer_stride_bytes =
                     static_cast<std::size_t>(ds_batch) * ds_max_seq * Hkv * Hs * sizeof(nv_bfloat16);
@@ -490,7 +472,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                     mDecodeState->cu_seqlens_k_gpu,
                     mDecodeState->max_seqlen_k, ds_max_seq,
                     ds_batch, Hq, Hkv, Hs,
-                    mRunState.MainStream);
+                    mRunState.MainStream, q_stride_n);
             }
         }
         return;

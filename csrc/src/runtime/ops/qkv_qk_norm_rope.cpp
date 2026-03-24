@@ -206,18 +206,40 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
                 static_cast<std::size_t>(mDecodeState->total_pages)
                 * mDecodeState->page_block_size * ds_Hkv * ds_Hs * elem_size;
             const std::size_t layer_offset = static_cast<std::size_t>(layer_idx) * layer_pool_bytes;
-            auto* k_pool = reinterpret_cast<nv_bfloat16*>(
-                reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
-            auto* v_pool = reinterpret_cast<nv_bfloat16*>(
-                reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
-            kv_cache_store_flat_paged_bf16(
-                k_pool, v_pool, qkv_out.get<nv_bfloat16>(),
-                mDecodeState->token_to_req_gpu,
-                mDecodeState->kv_write_pos_gpu,
-                mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
-                mDecodeState->page_block_size,
-                mDecodeState->flat_total_tokens, Hq, ds_Hkv, ds_Hs,
-                mRunState.MainStream);
+            if (mDecodeState->fp8) {
+                const std::size_t scale_layer_elems =
+                    static_cast<std::size_t>(mDecodeState->total_pages)
+                    * mDecodeState->page_block_size * ds_Hkv;
+                const std::size_t scale_layer_offset =
+                    static_cast<std::size_t>(layer_idx) * scale_layer_elems;
+                kv_cache_store_flat_paged_fp8(
+                    reinterpret_cast<__nv_fp8_e4m3*>(
+                        reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset),
+                    reinterpret_cast<__nv_fp8_e4m3*>(
+                        reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset),
+                    mDecodeState->k_scales_paged_fp8 + scale_layer_offset,
+                    mDecodeState->v_scales_paged_fp8 + scale_layer_offset,
+                    qkv_out.get<nv_bfloat16>(),
+                    mDecodeState->token_to_req_gpu,
+                    mDecodeState->kv_write_pos_gpu,
+                    mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                    mDecodeState->page_block_size,
+                    mDecodeState->flat_total_tokens, Hq, ds_Hkv, ds_Hs,
+                    mRunState.MainStream);
+            } else {
+                auto* k_pool = reinterpret_cast<nv_bfloat16*>(
+                    reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
+                auto* v_pool = reinterpret_cast<nv_bfloat16*>(
+                    reinterpret_cast<std::byte*>(mDecodeState->v_pages) + layer_offset);
+                kv_cache_store_flat_paged_bf16(
+                    k_pool, v_pool, qkv_out.get<nv_bfloat16>(),
+                    mDecodeState->token_to_req_gpu,
+                    mDecodeState->kv_write_pos_gpu,
+                    mDecodeState->block_table_gpu, mDecodeState->block_table_stride,
+                    mDecodeState->page_block_size,
+                    mDecodeState->flat_total_tokens, Hq, ds_Hkv, ds_Hs,
+                    mRunState.MainStream);
+            }
         }
         return;
     }

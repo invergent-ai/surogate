@@ -59,6 +59,17 @@ inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
     return (prop.major * 10 + prop.minor) >= 89;
 }
 
+inline bool env_flag_enabled(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+        return false;
+    }
+    return std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "False") != 0 &&
+           std::strcmp(v, "FALSE") != 0;
+}
+
 std::vector<int> build_graph_buckets(int max_slots) {
     // Match vLLM's capture sizes: powers of 2 up to 16, then linear steps of 8.
     std::vector<int> buckets;
@@ -1406,9 +1417,9 @@ ContinuousStepResult ContinuousGenerationEngine::step(
     // Disable full-step graph for hybrid models — recurrent/conv state
     // pointers in the DecodeState are accessed via unordered_map which
     // the graph cannot track across replays.
-    const bool has_recurrent = !decode_state_.recurrent_states ||
+    const bool has_recurrent = decode_state_.recurrent_states &&
         !decode_state_.recurrent_states->empty();
-    const bool has_conv = !decode_state_.conv_states ||
+    const bool has_conv = decode_state_.conv_states &&
         !decode_state_.conv_states->empty();
     const bool is_hybrid = has_recurrent || has_conv;
     const bool try_full_step_graph = use_cuda_graphs_ && !is_hybrid;
@@ -1659,6 +1670,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     const bool has_conv_state = !state.compact_conv_states.empty();
     const bool use_flat_graphs = use_cuda_graphs_
         && flat_cuda_graphs_enabled()
+        && state.pinned
         && !model_has_stateful_ssm
         && !has_recurrent_state
         && !has_conv_state;

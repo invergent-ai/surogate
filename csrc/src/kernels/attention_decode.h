@@ -45,7 +45,8 @@ void attention_decode_flash(
     const int32_t* cu_seqlens_q, const int32_t* seqused_k,
     int max_seqlen_k, int kv_stride_seqlen,
     int batch_size, int Hq, int Hkv, int Hs,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int q_stride_n = -1);
 
 /// Append new K/V tokens to the KV-cache from a RoPE'd QKV buffer.
 ///
@@ -134,7 +135,8 @@ void attention_decode_flash_paged(
     int page_block_size,
     int max_seqlen_k,
     int batch_size, int Hq, int Hkv, int Hs,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int q_stride_n = -1);
 
 /// Decode attention with paged KV-cache using FlashInfer kernels.
 ///
@@ -167,7 +169,8 @@ void attention_decode_flashinfer_paged(
     int32_t* scratch_kv_tile_indices,
     int32_t* scratch_kv_chunk_size,
     bool enable_pdl,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int q_stride_n = -1);
 
 /// Decode attention with paged FP8 KV-cache using FlashInfer (native FP8).
 ///
@@ -192,7 +195,8 @@ void attention_decode_flashinfer_paged_fp8(
     int32_t* scratch_kv_tile_indices,
     int32_t* scratch_kv_chunk_size,
     bool enable_pdl,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int q_stride_n = -1);
 
 /// Mask finished sequences: replace token IDs with 0 for finished sequences.
 /// finished_gpu[i] != 0 → token_ids[i] = 0.
@@ -263,7 +267,7 @@ void kv_cache_store_paged_bf16(
 // ============================================================================
 
 /// Bulk-store all T positions of K/V from BF16 QKV into paged FP8 KV-cache.
-/// Quantizes per-head/per-position and writes FP8 data + FP32 scales.
+/// Stores FlashInfer-compatible unit-scale FP8 pages and writes scale=1.0f.
 void kv_cache_store_paged_fp8(
     __nv_fp8_e4m3* k_pages_fp8, __nv_fp8_e4m3* v_pages_fp8,
     float* k_scales, float* v_scales,
@@ -298,7 +302,7 @@ void kv_cache_append_fp8(
     int Hq, int Hkv, int Hs,
     cudaStream_t stream);
 
-/// Append K/V to paged FP8 KV-cache (paged mode, quantizes on-the-fly).
+/// Append K/V to paged FP8 KV-cache in FlashInfer-compatible unit-scale format.
 void kv_cache_append_paged_fp8(
     __nv_fp8_e4m3* k_pages_fp8, __nv_fp8_e4m3* v_pages_fp8,
     float* k_scales, float* v_scales,
@@ -343,24 +347,6 @@ void kv_cache_dequant_paged_fp8_to_bf16(
     int page_block_size,
     int batch_size, int max_seq_len,
     int Hkv, int Hs,
-    cudaStream_t stream);
-
-/// Decode attention directly from paged FP8 KV-cache with per-token/per-head scales.
-///
-/// This path dequantizes K/V on-the-fly inside the decode kernel (single-token decode),
-/// avoiding materializing full BF16 KV buffers.
-///
-/// Returns false when the current shape/config is unsupported (caller should fallback
-/// to BF16 dequant + FlashAttention decode).
-bool attention_decode_paged_fp8_direct(
-    nv_bfloat16* out, float* lse,
-    const nv_bfloat16* q,
-    const __nv_fp8_e4m3* k_pages_fp8, const __nv_fp8_e4m3* v_pages_fp8,
-    const float* k_scales, const float* v_scales,
-    const int32_t* seqused_k,
-    const int* block_table, int block_table_stride,
-    int page_block_size,
-    int batch_size, int Hq, int Hkv, int Hs,
     cudaStream_t stream);
 
 /// Broadcast prefix KV from a source batch slot to N-1 destination slots.

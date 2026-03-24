@@ -213,7 +213,7 @@ Tensor TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAll
         return allocated;
     } catch (const cuda_error& error) {
         if(error.code == cudaErrorMemoryAllocation) {
-            print_stats();
+            // print_stats();
             std::string shape_str = "[";
             for(auto s: shape) {
                 shape_str += std::to_string(s) + ", ";
