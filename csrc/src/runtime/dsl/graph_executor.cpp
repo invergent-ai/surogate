@@ -1830,6 +1830,10 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
 // Prefill (full-sequence forward, populates KV-cache)
 // ============================================================================
 
+bool GraphExecutor::has_prefill_graph(std::uint64_t key) const {
+    return mPrefillCompiledForwardCache.count(key) > 0;
+}
+
 void GraphExecutor::execute_prefill(long B, long T,
                                      const std::int32_t* token_ids_cpu,
                                      const std::int32_t* position_ids_cpu,

@@ -231,6 +231,10 @@ public:
                          NCCLCommunicator& comm,
                          const modules::ForwardHook* hook = nullptr);
 
+    /// Check if a prefill/flat-token graph for the given (B,T) cache key
+    /// is already compiled.  Used by warmup to avoid duplicate compilations.
+    bool has_prefill_graph(std::uint64_t key) const;
+
     /// Execute a single-token decode step with KV-cache.
     ///
     /// Runs the compiled forward graph with B sequences and T=1,

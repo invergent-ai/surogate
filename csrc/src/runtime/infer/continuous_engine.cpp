@@ -758,11 +758,16 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
     CUDA_CHECK(cudaMemsetAsync(prefill_block_table_gpu_, 0,
         static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int), stream));
 
+    // Pre-compile ALL prefill token bucket sizes to eliminate graph compilation
+    // latency during serving.  Previously we only warmed a handful of sizes
+    // (32, 64, ..., 2048) which left 100+ buckets to compile on first hit —
+    // each costing 50-200ms in TTFT.
     const int warmup_t_cap = std::max(32, resolve_prefill_chunk_size(
-        /*requested_chunk_size=*/2048, max_seq_len_, *run_state_));
-    static constexpr int kWarmupT[] = {32, 64, 128, 255, 256, 511, 512, 1023, 1024, 2047, 2048};
-    for (int t : kWarmupT) {
-        if (t > max_seq_len_ || t > warmup_t_cap) break;
+        /*requested_chunk_size=*/max_batched_tokens_, max_seq_len_, *run_state_));
+
+    // Warm prefill graphs for every bucket in prefill_token_buckets_
+    for (int t : prefill_token_buckets_) {
+        if (t > max_seq_len_ || t > warmup_t_cap) continue;
         std::vector<int32_t> dummy_tokens(static_cast<std::size_t>(t), 0);
         std::vector<int32_t> dummy_pos(static_cast<std::size_t>(t));
         for (int i = 0; i < t; ++i) dummy_pos[i] = i;
@@ -772,6 +777,29 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
             dummy_tokens.data(), dummy_pos.data(),
             warmup_ds, comm);
     }
+
+    // Also warm flat-token graphs (B=1, T=total) used by execute_flat_tokens().
+    // These share the same cache keyed by (1, T), so any bucket size already
+    // warmed above is reused.  Add the decode-batch bucket sizes (1..max_slots)
+    // since flat_step total_tokens = prefill_tokens + decode_tokens.
+    for (int b : graph_buckets_) {
+        // flat_step with b decode tokens and no prefill
+        if (b > warmup_t_cap) continue;
+        const std::uint64_t key = (static_cast<std::uint64_t>(1) << 32)
+                                | static_cast<std::uint64_t>(static_cast<std::uint32_t>(b));
+        // Only compile if not already in cache (skip duplicates with prefill buckets)
+        if (graph_executor.has_prefill_graph(key)) continue;
+
+        std::vector<int32_t> dummy_tokens(static_cast<std::size_t>(b), 0);
+        std::vector<int32_t> dummy_pos(static_cast<std::size_t>(b));
+        for (int i = 0; i < b; ++i) dummy_pos[i] = i;
+
+        graph_executor.execute_prefill(
+            1L, static_cast<long>(b),
+            dummy_tokens.data(), dummy_pos.data(),
+            warmup_ds, comm);
+    }
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
