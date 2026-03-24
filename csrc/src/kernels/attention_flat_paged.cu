@@ -56,6 +56,7 @@ void dispatch_flat_paged_attention(
         int total_num_rows,
         bool split_kv,
         int Hq, int Hkv, int page_block_size,
+        int q_stride_n,
         uint32_t cta_tile_q,
         cudaStream_t stream) {
     if (Hkv <= 0 || Hq <= 0 || (Hq % Hkv) != 0) {
@@ -93,7 +94,7 @@ void dispatch_flat_paged_attention(
     // Required by FlashInfer batched prefill kernels when using default ctor.
     params.group_size = flashinfer::uint_fastdiv(static_cast<uint32_t>(Hq / Hkv));
     params.num_qo_heads = static_cast<uint32_t>(Hq);
-    params.q_stride_n = static_cast<int32_t>(Hq * HeadDim);
+    params.q_stride_n = static_cast<int32_t>(q_stride_n > 0 ? q_stride_n : Hq * HeadDim);
     params.q_stride_h = static_cast<int32_t>(HeadDim);
     params.window_left = -1;
     params.logits_soft_cap = 0.0f;
@@ -407,7 +408,8 @@ void attention_flat_paged_flashinfer_impl(
         int32_t* /*scratch_request_indices*/,
         int32_t* /*scratch_qo_tile_indices*/,
         int32_t* /*scratch_kv_chunk_size*/,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int q_stride_n) {
     (void)seq_lens_k;
     (void)block_table;
     (void)block_table_stride;
@@ -453,7 +455,7 @@ void attention_flat_paged_flashinfer_impl(
             d_o_indptr, d_kv_chunk_size, d_block_valid_mask,
             d_tmp_v, d_tmp_s, d_merge_indptr,
             batch_size, pbs, total_q_tokens, plan_info.split_kv,
-            Hq, Hkv, page_block_size, cta_tile_q, stream);
+            Hq, Hkv, page_block_size, q_stride_n, cta_tile_q, stream);
     } else if (Hs == 96) {
         dispatch_flat_paged_attention<KVType, 96>(
             out, lse, q, k_pages, v_pages,
@@ -462,7 +464,7 @@ void attention_flat_paged_flashinfer_impl(
             d_o_indptr, d_kv_chunk_size, d_block_valid_mask,
             d_tmp_v, d_tmp_s, d_merge_indptr,
             batch_size, pbs, total_q_tokens, plan_info.split_kv,
-            Hq, Hkv, page_block_size, cta_tile_q, stream);
+            Hq, Hkv, page_block_size, q_stride_n, cta_tile_q, stream);
     } else if (Hs == 128) {
         dispatch_flat_paged_attention<KVType, 128>(
             out, lse, q, k_pages, v_pages,
@@ -471,7 +473,7 @@ void attention_flat_paged_flashinfer_impl(
             d_o_indptr, d_kv_chunk_size, d_block_valid_mask,
             d_tmp_v, d_tmp_s, d_merge_indptr,
             batch_size, pbs, total_q_tokens, plan_info.split_kv,
-            Hq, Hkv, page_block_size, cta_tile_q, stream);
+            Hq, Hkv, page_block_size, q_stride_n, cta_tile_q, stream);
     } else if (Hs == 256) {
         dispatch_flat_paged_attention<KVType, 256>(
             out, lse, q, k_pages, v_pages,
@@ -480,7 +482,7 @@ void attention_flat_paged_flashinfer_impl(
             d_o_indptr, d_kv_chunk_size, d_block_valid_mask,
             d_tmp_v, d_tmp_s, d_merge_indptr,
             batch_size, pbs, total_q_tokens, plan_info.split_kv,
-            Hq, Hkv, page_block_size, cta_tile_q, stream);
+            Hq, Hkv, page_block_size, q_stride_n, cta_tile_q, stream);
     } else {
         throw std::runtime_error("attention_flat_paged: unsupported head_size");
     }
@@ -506,7 +508,8 @@ void attention_flat_paged_flashinfer(
         int32_t* scratch_request_indices,
         int32_t* scratch_qo_tile_indices,
         int32_t* scratch_kv_chunk_size,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int q_stride_n) {
     attention_flat_paged_flashinfer_impl<nv_bfloat16>(
         out, lse, q, k_pages, v_pages,
         q_indptr_gpu, seq_lens_k, block_table, block_table_stride,
@@ -515,7 +518,7 @@ void attention_flat_paged_flashinfer(
         page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
         int_ws_gpu, float_ws_gpu, plan_info_opaque,
         scratch_request_indices, scratch_qo_tile_indices, scratch_kv_chunk_size,
-        stream);
+        stream, q_stride_n);
 }
 
 void attention_flat_paged_flashinfer_fp8(
@@ -538,7 +541,8 @@ void attention_flat_paged_flashinfer_fp8(
         int32_t* scratch_request_indices,
         int32_t* scratch_qo_tile_indices,
         int32_t* scratch_kv_chunk_size,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        int q_stride_n) {
     attention_flat_paged_flashinfer_impl<__nv_fp8_e4m3>(
         out, lse, q, k_pages, v_pages,
         q_indptr_gpu, seq_lens_k, block_table, block_table_stride,
@@ -547,7 +551,7 @@ void attention_flat_paged_flashinfer_fp8(
         page_indptr_gpu, page_indices_gpu, last_page_len_gpu,
         int_ws_gpu, float_ws_gpu, plan_info_opaque,
         scratch_request_indices, scratch_qo_tile_indices, scratch_kv_chunk_size,
-        stream);
+        stream, q_stride_n);
 }
 
 // ============================================================================

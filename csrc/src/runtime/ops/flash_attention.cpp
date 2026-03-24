@@ -125,20 +125,10 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         const int ds_batch = mDecodeState->flat_batch_size;
         const int total_q = mDecodeState->flat_total_tokens;
 
-        // Extract Q from interleaved QKV [total_tokens, (Hq+2Hkv), Hs] → [total_tokens, Hq, Hs]
-        Tensor q_buf = mRunState.temp_alloc(ETensorDType::BF16,
-            {static_cast<long>(total_q), static_cast<long>(Hq), static_cast<long>(Hs)}, "flat_q");
-        mTemps.push_back(q_buf);
         const auto* qkv_bf16 = qkv.get<nv_bfloat16>();
-        auto* q_bf16 = q_buf.get<nv_bfloat16>();
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            q_bf16,
-            static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),
-            qkv_bf16,
-            static_cast<std::size_t>(H) * Hs * sizeof(nv_bfloat16),
-            static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),
-            static_cast<std::size_t>(total_q),
-            cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        // Use a strided Q view into packed QKV to avoid per-layer Q extraction copy.
+        const auto* q_bf16 = qkv_bf16;
+        const int flat_q_stride_n = H * Hs;
 
         const int elem_size = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));
         const std::size_t layer_pool_bytes =
@@ -172,7 +162,8 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                 mDecodeState->flat_plan_float_ws_gpu,
                 static_cast<const void*>(mDecodeState->flat_plan_info_storage),
                 nullptr, nullptr, nullptr,
-                mRunState.MainStream);
+                mRunState.MainStream,
+                flat_q_stride_n);
         } else {
             auto* k_pool = reinterpret_cast<nv_bfloat16*>(
                 reinterpret_cast<std::byte*>(mDecodeState->k_pages) + layer_offset);
@@ -194,7 +185,8 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                 mDecodeState->flat_plan_float_ws_gpu,
                 static_cast<const void*>(mDecodeState->flat_plan_info_storage),
                 nullptr, nullptr, nullptr,
-                mRunState.MainStream);
+                mRunState.MainStream,
+                flat_q_stride_n);
         }
             
         return;
@@ -210,26 +202,12 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     if (mDecodeState && !mDecodeState->prefill_mode && mT == 1 && layer_idx >= 0) {
         const int ds_batch = static_cast<int>(mB);
 
-        // Extract Q from interleaved QKV [B, 1, (Hq+2Hkv), Hs] → [B, Hq, Hs]
-        Tensor q_buf = mRunState.temp_alloc(ETensorDType::BF16,
-            {static_cast<long>(ds_batch), static_cast<long>(Hq), static_cast<long>(Hs)}, "decode_q");
-        mTemps.push_back(q_buf);
         const auto* qkv_bf16 = qkv.get<nv_bfloat16>();
-        auto* q_bf16 = q_buf.get<nv_bfloat16>();
-        // Single strided copy: extract Q heads from interleaved QKV.
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            q_bf16,
-            static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),     // dst pitch
-            qkv_bf16,
-            static_cast<std::size_t>(H) * Hs * sizeof(nv_bfloat16),      // src pitch
-            static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),     // width
-            static_cast<std::size_t>(ds_batch),                           // height
-            cudaMemcpyDeviceToDevice,
-            mRunState.MainStream));
+        const auto* q_bf16 = qkv_bf16;
 
         const bool flashinfer_device_supported = flashinfer_decode_device_supported(mRunState.DeviceProp);
         const bool flashinfer_device_ok = flashinfer_device_supported;
-        const int q_stride_n = Hq * Hs;
+        const int q_stride_n = H * Hs;
 
         if (mDecodeState->paged) {
             const int elem_size = mDecodeState->fp8 ? 1 : static_cast<int>(sizeof(nv_bfloat16));

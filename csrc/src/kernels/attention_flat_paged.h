@@ -61,7 +61,8 @@ void attention_flat_paged_flashinfer(
     int32_t* scratch_request_indices,
     int32_t* scratch_qo_tile_indices,
     int32_t* scratch_kv_chunk_size,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int q_stride_n = -1);
 
 /// Per-layer flat-token attention with native FP8 paged KV (FlashInfer).
 /// Requires KV pages to be stored in FlashInfer-compatible unit-scale FP8 format.
@@ -85,7 +86,8 @@ void attention_flat_paged_flashinfer_fp8(
     int32_t* scratch_request_indices,
     int32_t* scratch_qo_tile_indices,
     int32_t* scratch_kv_chunk_size,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int q_stride_n = -1);
 
 /// Write KV from flat RoPE'd QKV to paged KV-cache.
 void kv_cache_store_flat_paged_bf16(
