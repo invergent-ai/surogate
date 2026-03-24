@@ -219,6 +219,16 @@ private:
     std::vector<int32_t> sampled_tokens_host_;
     std::vector<int> finished_host_;
 
+    // Async D2H readback for flat_step (eliminates cudaStreamSynchronize).
+    // Pinned host buffer + event allow the CPU to prepare the next batch
+    // while the GPU finishes sampling + D2H copy.
+    int32_t* pinned_sampled_ = nullptr;      // cudaMallocHost'd pinned buffer
+    cudaEvent_t sampled_ready_event_ = nullptr;  // recorded after D2H copy
+    bool has_pending_sampled_ = false;        // true if event needs sync
+    int pending_batch_size_ = 0;
+    std::vector<int> pending_active_sids_;
+    std::vector<int> pending_q_lens_;         // per-slot q_lens from previous step
+
     // CUDA graph bucket sizes
     std::vector<int> graph_buckets_;
     std::vector<int> prefill_token_buckets_;

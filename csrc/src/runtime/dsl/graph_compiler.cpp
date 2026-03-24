@@ -1224,7 +1224,8 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
 }
 
 
-void CompiledGraph::compute_layer_segments() {
+void CompiledGraph::compute_layer_segments(std::uint8_t mode_raw) {
+    const auto mode = static_cast<GraphCompileMode>(mode_raw);
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
 
@@ -1252,13 +1253,23 @@ void CompiledGraph::compute_layer_segments() {
             // Graph-breaking ops: must run eagerly because they are
             // capture-unsafe (dynamic cu_seqlens, JIT kernel loading,
             // cuBLAS host-sync calls, etc.)
+            //
+            // For InferenceDecode (T=1), Qwen3_5Decay is a simple element-wise
+            // CUDA kernel (graph-safe), and ChunkGatedDeltaRule uses the
+            // pre-loaded recurrent_fwd Triton kernel (graph-safe after init).
+            // Keeping them graph-breaking for decode forces ~18 piecewise graph
+            // segments per forward pass, which is the primary throughput gap
+            // vs vLLM (3.15x with CUDA graphs vs without).
+            const bool is_inference_decode = (mode == GraphCompileMode::InferenceDecode);
             const bool graph_breaking =
                 ty == CompiledOpType::FlashAttention ||
                 ty == CompiledOpType::FlashAttentionBackward ||
-                ty == CompiledOpType::ChunkGatedDeltaRule ||
-                ty == CompiledOpType::ChunkGatedDeltaRuleBackward ||
-                ty == CompiledOpType::Qwen3_5Decay ||
-                ty == CompiledOpType::Qwen3_5DecayBackward;
+                (!is_inference_decode && (
+                    ty == CompiledOpType::ChunkGatedDeltaRule ||
+                    ty == CompiledOpType::ChunkGatedDeltaRuleBackward ||
+                    ty == CompiledOpType::Qwen3_5Decay ||
+                    ty == CompiledOpType::Qwen3_5DecayBackward
+                ));
 
             // Check if this op starts an MLP tile group
             auto tile_it = mlp_tile_starts.find(i);

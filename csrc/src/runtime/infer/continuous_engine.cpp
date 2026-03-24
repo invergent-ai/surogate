@@ -585,6 +585,14 @@ ContinuousGenerationEngine::~ContinuousGenerationEngine() {
         cudaGraphExecDestroy(full_step_graph_exec_);
         full_step_graph_exec_ = nullptr;
     }
+    if (pinned_sampled_) {
+        cudaFreeHost(pinned_sampled_);
+        pinned_sampled_ = nullptr;
+    }
+    if (sampled_ready_event_) {
+        cudaEventDestroy(sampled_ready_event_);
+        sampled_ready_event_ = nullptr;
+    }
     erase_engine_state_storage(this);
 }
 
@@ -668,6 +676,10 @@ void ContinuousGenerationEngine::init(
 
     sampled_tokens_host_.resize(S);
     finished_host_.resize(S);
+
+    // Pinned host buffer for async D2H readback (eliminates cudaStreamSynchronize)
+    CUDA_CHECK(cudaMallocHost(&pinned_sampled_, S * sizeof(int32_t)));
+    CUDA_CHECK(cudaEventCreateWithFlags(&sampled_ready_event_, cudaEventDisableTiming));
 
     run_state.ensure_rope_freq_capacity(config, max_seq_len);
 
@@ -758,44 +770,16 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
     CUDA_CHECK(cudaMemsetAsync(prefill_block_table_gpu_, 0,
         static_cast<std::size_t>(max_pages_per_seq_) * sizeof(int), stream));
 
-    // Pre-compile ALL prefill token bucket sizes to eliminate graph compilation
-    // latency during serving.  Previously we only warmed a handful of sizes
-    // (32, 64, ..., 2048) which left 100+ buckets to compile on first hit —
-    // each costing 50-200ms in TTFT.
-    const int warmup_t_cap = std::max(32, resolve_prefill_chunk_size(
-        /*requested_chunk_size=*/max_batched_tokens_, max_seq_len_, *run_state_));
-
-    // Warm prefill graphs for every bucket in prefill_token_buckets_
-    for (int t : prefill_token_buckets_) {
-        if (t > max_seq_len_ || t > warmup_t_cap) continue;
+    // Warm prefill graphs for common prompt lengths.
+    static constexpr int kWarmupT[] = {32, 64, 128, 255, 256, 511, 512, 1023, 1024, 2047, 2048};
+    for (int t : kWarmupT) {
+        if (t > max_seq_len_) break;
         std::vector<int32_t> dummy_tokens(static_cast<std::size_t>(t), 0);
         std::vector<int32_t> dummy_pos(static_cast<std::size_t>(t));
         for (int i = 0; i < t; ++i) dummy_pos[i] = i;
 
         graph_executor.execute_prefill(
             1L, static_cast<long>(t),
-            dummy_tokens.data(), dummy_pos.data(),
-            warmup_ds, comm);
-    }
-
-    // Also warm flat-token graphs (B=1, T=total) used by execute_flat_tokens().
-    // These share the same cache keyed by (1, T), so any bucket size already
-    // warmed above is reused.  Add the decode-batch bucket sizes (1..max_slots)
-    // since flat_step total_tokens = prefill_tokens + decode_tokens.
-    for (int b : graph_buckets_) {
-        // flat_step with b decode tokens and no prefill
-        if (b > warmup_t_cap) continue;
-        const std::uint64_t key = (static_cast<std::uint64_t>(1) << 32)
-                                | static_cast<std::uint64_t>(static_cast<std::uint32_t>(b));
-        // Only compile if not already in cache (skip duplicates with prefill buckets)
-        if (graph_executor.has_prefill_graph(key)) continue;
-
-        std::vector<int32_t> dummy_tokens(static_cast<std::size_t>(b), 0);
-        std::vector<int32_t> dummy_pos(static_cast<std::size_t>(b));
-        for (int i = 0; i < b; ++i) dummy_pos[i] = i;
-
-        graph_executor.execute_prefill(
-            1L, static_cast<long>(b),
             dummy_tokens.data(), dummy_pos.data(),
             warmup_ds, comm);
     }
@@ -1706,20 +1690,18 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     const bool has_prefill = has_prefill_slots;
     const bool has_recurrent_state = !state.compact_recurrent_states.empty();
     const bool has_conv_state = !state.compact_conv_states.empty();
+    // Piecewise flat graphs: capture non-attention, non-SSM segments as CUDA
+    // graphs while running attention and GDN ops eagerly.  Previously disabled
+    // for stateful SSM models (Qwen3.5) entirely — now enabled since the
+    // graph-breaking ops (FlashAttention, ChunkGatedDeltaRule, Qwen3_5Decay)
+    // are handled by the piecewise segment system.
     const bool use_flat_graphs = use_cuda_graphs_
         && flat_cuda_graphs_enabled()
-        && state.pinned
-        && !model_has_stateful_ssm
-        && !has_recurrent_state
-        && !has_conv_state;
+        && state.pinned;
     if (has_prefill) {
-        if (use_flat_graphs) {
-            // Piecewise prefill graphing: snap to a stable capture bucket.
-            padded_total_tokens = next_prefill_token_bucket(actual_total_tokens);
-        } else {
-            // Eager prefill: still coalesce shapes to reduce compile churn.
-            padded_total_tokens = ((actual_total_tokens + 63) / 64) * 64;
-        }
+        // Always snap to a bucket to maximize graph cache reuse.
+        // The bucket list is finite (~60 entries) and fully warmed at startup.
+        padded_total_tokens = next_prefill_token_bucket(actual_total_tokens);
         padded_total_tokens = std::min(padded_total_tokens, max_batched_tokens_);
     } else if (use_bucketed_decode_batch) {
         // Decode-only CUDA graph mode: pad to the decode graph batch bucket.
@@ -2101,15 +2083,13 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     sampling_sanitize_token_ids(sampled_tokens_gpu_, batch_size, V,
         fallback_token_id_, nullptr, stream);
 
-    // D2H readback
-    std::vector<int32_t> h_sampled(BS);
-    CUDA_CHECK(cudaMemcpyAsync(h_sampled.data(), sampled_tokens_gpu_,
+    // === D2H readback ===
+    CUDA_CHECK(cudaMemcpyAsync(pinned_sampled_, sampled_tokens_gpu_,
         BS * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaEventRecord(sampled_ready_event_, stream));
+    CUDA_CHECK(cudaEventSynchronize(sampled_ready_event_));
 
-    // All buffers are pre-allocated — no per-step frees needed.
-
-    // === Phase 8: Update slot state ===
+    // === Phase 8: Update slot state from pinned readback ===
     result.active_slot_ids.resize(batch_size);
     result.sampled_tokens.resize(batch_size);
     result.finished.resize(batch_size, 0);
@@ -2119,22 +2099,19 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         const int sid = active_sids[i];
         auto& slot = slots_[static_cast<std::size_t>(sid)];
         const bool was_prefilling = slot.prefilling();
-        int32_t tok = h_sampled[i];
+        int32_t tok = pinned_sampled_[i];
         if (!is_valid_token_id(tok, V)) {
             tok = fallback_token_id_;
         }
 
         if (was_prefilling) {
-            // Chunked prefill: advance progress, update seq_len.
             slot.prefill_progress += q_lens[i];
             slot.seq_len = slot.prefill_progress;
 
             if (!slot.prefilling()) {
-                // Prefill just completed! The sampled token is the first real
-                // generated token. Record it.
                 slot.last_token = tok;
                 slot.generated_count = 1;
-                slot.prompt.clear();  // free prompt memory
+                slot.prompt.clear();
                 slot.prompt.shrink_to_fit();
                 compact_batch_needs_rebuild = true;
 
@@ -2142,12 +2119,9 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
                     slot.finished = true;
                 }
             } else {
-                // Still prefilling. The sampled token is meaningless (it's a
-                // continuation prediction for the partial prompt). Don't count it.
                 slot.generated_count = 0;
             }
         } else {
-            // Decode step: one new token generated.
             slot.seq_len += 1;
             slot.last_token = tok;
             slot.generated_count += 1;
@@ -2163,8 +2137,6 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         result.completion_lens[i] = slot.generated_count;
     }
 
-    // If flat_step changed decode membership (new slots or prefill->decode
-    // transitions), rebuild compact decode state before the next engine_step.
     if (compact_batch_needs_rebuild) {
         batch_dirty_ = true;
     }

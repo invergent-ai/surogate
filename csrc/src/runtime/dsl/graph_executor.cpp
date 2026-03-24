@@ -1863,7 +1863,7 @@ void GraphExecutor::execute_prefill(long B, long T,
 
         auto compiled = std::make_unique<CompiledGraph>(
             mCompiler->compile(*mForward, B, T, GraphCompileMode::InferencePrefill));
-        compiled->compute_layer_segments();
+        compiled->compute_layer_segments(static_cast<std::uint8_t>(GraphCompileMode::InferencePrefill));
 
         opts.DocMasking = saved_doc_masking;
         opts.Recompute = saved_recompute;
@@ -1990,7 +1990,7 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
 
         auto compiled = std::make_unique<CompiledGraph>(
             mCompiler->compile(*mForward, B, T, GraphCompileMode::InferenceFlatTokens));
-        compiled->compute_layer_segments();
+        compiled->compute_layer_segments(static_cast<std::uint8_t>(GraphCompileMode::InferenceFlatTokens));
 
         opts.DocMasking = saved_doc_masking;
         opts.Recompute = saved_recompute;
@@ -2179,7 +2179,7 @@ void GraphExecutor::execute_decode_step(long B,
 
         mDecodeCompiledForward = std::make_unique<CompiledGraph>(
             mCompiler->compile(*mForward, B, T, GraphCompileMode::InferenceDecode));
-        mDecodeCompiledForward->compute_layer_segments();
+        mDecodeCompiledForward->compute_layer_segments(static_cast<std::uint8_t>(GraphCompileMode::InferenceDecode));
         mDecodeCompiledB = B;
         mDecodeCompiledT = T;
 

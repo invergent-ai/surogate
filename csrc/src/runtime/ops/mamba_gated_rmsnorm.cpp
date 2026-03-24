@@ -97,7 +97,8 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
     // Save rstd and gated for backward.
     // Must persist via cudaMalloc because temp_alloc'd stack memory is freed at
     // layer boundaries (Stack.restore), leaving dangling pointers in mSaved.
-    if (mSaved) {
+    // Skip during inference (empty save list) — no backward pass needed.
+    if (mSaved && mSaveList && !mSaveList->empty()) {
         cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
         const bool capturing =
             (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&

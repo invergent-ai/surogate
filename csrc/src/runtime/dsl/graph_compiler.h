@@ -367,7 +367,9 @@ struct CompiledGraph {
 
     /// Populate layer_segments by scanning each layer for FlashAttention ops.
     /// Call after annotate_layer_boundaries().
-    void compute_layer_segments();
+    /// Populate layer_segments by scanning each layer for graph-breaking ops.
+    /// @param mode  The compile mode — InferenceDecode allows GDN ops in graphs.
+    void compute_layer_segments(std::uint8_t mode = 0);
 
     // Statistics
     std::size_t total_ops = 0;
