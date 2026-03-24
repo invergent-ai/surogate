@@ -91,13 +91,36 @@ class NativeGRPOTrainer:
         options.doc_masking = getattr(rc, "doc_masking", True)
         options.recompute = "true"
 
+        # Optional explicit stack-floor override for native GRPO.
+        override_min_stack = os.getenv("SUROGATE_GRPO_MIN_STACK_MB", "").strip()
+        if override_min_stack:
+            try:
+                options.min_stack_mb = max(64, int(override_min_stack))
+                logger.info(
+                    "Using RuntimeOptions.min_stack_mb=%d from SUROGATE_GRPO_MIN_STACK_MB.",
+                    int(options.min_stack_mb),
+                )
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid SUROGATE_GRPO_MIN_STACK_MB=%r.",
+                    override_min_stack,
+                )
+
         # Ensure the DeviceMemoryStack is large enough for paged decode and
         # backward graph temps. Use RuntimeOptions (not process env vars).
         if int(getattr(options, "min_stack_mb", 0)) <= 0:
             gen = config.generation
             page_block_size = 256
-            total_seqs = config.problems_per_step * gen.num_completions
-            # Estimate KV cache bytes (conservative: full max_total_len per seq)
+            prompt_batch = max(1, int(config.problems_per_step))
+            cfg_prompt_batch_cap = int(getattr(gen, "max_prompts_per_batch", 0) or 0)
+            if cfg_prompt_batch_cap > 0:
+                prompt_batch = max(1, min(prompt_batch, cfg_prompt_batch_cap))
+            # generate() shards prompts across local ranks; size by per-rank load.
+            prompt_batch_per_rank = (prompt_batch + max(1, total_gpus) - 1) // max(1, total_gpus)
+            total_seqs = max(1, prompt_batch_per_rank * int(gen.num_completions))
+            # Estimate generation decode footprint for stack floor sizing.
+            max_prompt = max(256, int(config.sequence_len))
+            kv_mode = "bf16"
             try:
                 from surogate.core.model.hf_config import HfConfigFactory
 
@@ -111,37 +134,84 @@ class NativeGRPOTrainer:
                 head_dim = HfConfigFactory.get_config_attr(
                     hf_cfg, "hidden_size"
                 ) // HfConfigFactory.get_config_attr(hf_cfg, "num_attention_heads")
-                max_prompt = 100
-                max_total = max_prompt + gen.max_gen_len  # prompt + gen
-                # Contiguous upper-bound estimate (kept as fallback)
-                kv_bytes_contig = (
-                    2 * n_kv_heads * head_dim * n_layers * 2 * total_seqs * max_total
-                )
+                vocab_size = HfConfigFactory.get_config_attr(hf_cfg, "vocab_size")
+                infos = _surogate.SystemInfo.get_gpu_info() or []
+                selected = infos[: max(1, total_gpus)] if infos else []
+                sms = [
+                    int(info.compute_capability_major) * 10
+                    + int(info.compute_capability_minor)
+                    for info in selected
+                ]
+                enable_env = os.getenv("SUROGATE_ENABLE_FP8_KV_CACHE", "").strip()
+                fp8_requested = (not enable_env) or (enable_env.lower() not in {"0", "false"})
+                fp8_supported_all = bool(sms) and all(sm >= 89 for sm in sms)
+                fp8_kv_assumed = fp8_requested and fp8_supported_all
+                kv_elem_bytes = 1 if fp8_kv_assumed else 2
+
+                # Use a conservative prompt estimate to avoid undersizing the stack
+                # for long-context GRPO prompts.
+                prompt_cap = 1024 if kv_elem_bytes == 1 else 2048
+                max_prompt = min(prompt_cap, max(256, int(config.sequence_len)))
                 # Paged GRPO estimate (matches GenerationEngine::generate_grpo budgeting).
-                M = config.problems_per_step
-                N = gen.num_completions
+                M = prompt_batch_per_rank
+                N = int(gen.num_completions)
                 shared_prefix_pages = (max_prompt + page_block_size - 1) // page_block_size
                 private_partial_extra = (N - 1) if (max_prompt > 0 and N > 1) else 0
                 prefix_pages_per_prompt = shared_prefix_pages + private_partial_extra
                 suffix_pages_per_seq = (gen.max_gen_len + page_block_size - 1) // page_block_size
                 total_pages = M * prefix_pages_per_prompt + M * N * suffix_pages_per_seq
                 page_elems = page_block_size * n_kv_heads * head_dim
-                k_pool_bytes = n_layers * total_pages * page_elems * 2  # bf16
+                k_pool_bytes = n_layers * total_pages * page_elems * kv_elem_bytes
                 kv_bytes_paged = 2 * k_pool_bytes  # K + V
-                kv_bytes = max(kv_bytes_contig, kv_bytes_paged)
-                # Training activations: ~hidden_size * seq_len * 4 bytes per
-                # intermediate tensor, with ~4 such tensors per layer
-                hidden_size = HfConfigFactory.get_config_attr(hf_cfg, "hidden_size")
-                train_bytes = hidden_size * config.sequence_len * 4 * 4 * n_layers
-                total_bytes = kv_bytes * 3.2 + train_bytes * 2.0
-                options.min_stack_mb = max(4096, int(total_bytes / (1024 * 1024)))
+                if kv_elem_bytes == 1:
+                    # FP8 path stores per-token K/V scales as FP32.
+                    scale_pool_bytes = (
+                        n_layers
+                        * total_pages
+                        * page_block_size
+                        * n_kv_heads
+                        * 4
+                    )
+                    kv_bytes_paged += 2 * scale_pool_bytes
+                logits_bytes = total_seqs * int(vocab_size) * 4
+                decode_track_bytes = total_seqs * int(gen.max_gen_len) * (4 + 4)
+                # decode metadata buffers and allocator fragmentation slack
+                decode_misc_bytes = total_seqs * 256 * 16
+                stack_slack_bytes = (1024 if kv_elem_bytes == 2 else 512) * 1024 * 1024
+                kv_safety_multiplier = 1.35 if kv_elem_bytes == 2 else 1.20
+                total_bytes = (
+                    kv_bytes_paged * kv_safety_multiplier
+                    + logits_bytes
+                    + decode_track_bytes
+                    + decode_misc_bytes
+                    + stack_slack_bytes
+                )
+                min_floor_mb = 3072 if kv_elem_bytes == 2 else 1536
+                suggested_mb = max(min_floor_mb, int(total_bytes / (1024 * 1024)))
+                # Avoid floor sizes that are likely to overrun VRAM while still
+                # leaving enough room for BF16 KV-cache on larger GPUs.
+                total_mem_mb = [
+                    int(info.total_memory) // (1024 * 1024)
+                    for info in selected
+                    if int(getattr(info, "total_memory", 0)) > 0
+                ]
+                if total_mem_mb:
+                    cap_mb = max(min_floor_mb, int(min(total_mem_mb) * 0.80))
+                    suggested_mb = min(suggested_mb, cap_mb)
+                options.min_stack_mb = suggested_mb
+                kv_mode = "fp8" if kv_elem_bytes == 1 else "bf16"
             except Exception:
-                options.min_stack_mb = 8192
+                options.min_stack_mb = 3072
+                kv_mode = "bf16"
             logger.info(
-                "Set RuntimeOptions.min_stack_mb=%d for %d sequences, seq_len=%d",
+                "Set RuntimeOptions.min_stack_mb=%d for per-rank generation "
+                "(prompts=%d, sequences=%d, seq_len=%d, prompt_est=%d, kv=%s)",
                 int(options.min_stack_mb),
+                int(prompt_batch_per_rank),
                 int(total_seqs),
                 int(config.sequence_len),
+                int(max_prompt),
+                kv_mode,
             )
         # --- Build LoRA config ---
         # Use a clean LoRA config with just rank/alpha from the YAML.
@@ -311,9 +381,16 @@ class NativeGRPOTrainer:
     @staticmethod
     def _log_fp8_kv_cache_default(label: str, ngpu: int) -> None:
         try:
+            # Native GRPO defaults to FP8 KV-cache, but explicit env override
+            # must be respected (e.g. SUROGATE_ENABLE_FP8_KV_CACHE=0).
             enable_env = os.getenv("SUROGATE_ENABLE_FP8_KV_CACHE", "").strip()
-            if (not enable_env) or enable_env.lower() in {"0", "false"}:
-                return
+            if not enable_env:
+                os.environ["SUROGATE_ENABLE_FP8_KV_CACHE"] = "1"
+                enable_requested = True
+                auto_enabled = True
+            else:
+                enable_requested = enable_env.lower() not in {"0", "false"}
+                auto_enabled = False
             infos = _surogate.SystemInfo.get_gpu_info()
             if not infos:
                 return
@@ -326,9 +403,28 @@ class NativeGRPOTrainer:
                 + int(info.compute_capability_minor)
                 for info in selected
             ]
-            if all(sm >= 89 for sm in sms):
-                sm_list = ", ".join(f"SM{sm}" for sm in sms)
-                logger.info("FP8 KV-cache enabled (%s, %s).", label, sm_list)
+            sm_list = ", ".join(f"SM{sm}" for sm in sms)
+            if enable_requested and all(sm >= 89 for sm in sms):
+                if auto_enabled:
+                    logger.info(
+                        "FP8 KV-cache auto-enabled (%s, %s).",
+                        label,
+                        sm_list,
+                    )
+                else:
+                    logger.info("FP8 KV-cache enabled (%s, %s).", label, sm_list)
+            elif not enable_requested:
+                logger.info(
+                    "FP8 KV-cache disabled by env (%s, %s).",
+                    label,
+                    sm_list,
+                )
+            else:
+                logger.info(
+                    "FP8 KV-cache requested (%s, %s). Unsupported GPUs will use BF16 KV-cache.",
+                    label,
+                    sm_list,
+                )
         except Exception:
             # Best-effort log only.
             pass
@@ -345,6 +441,159 @@ class NativeGRPOTrainer:
 
             return compute_temperature(step, config.sampling, config.max_steps)
         return 1.0
+
+    @staticmethod
+    def _is_cuda_oom_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "out of memory" in msg
+            or "cudaerror_memoryallocation" in msg
+            or "cuda error: 2" in msg
+            or "cublas_status_alloc_failed" in msg
+            or "std::bad_alloc" in msg
+            or "bad_alloc" in msg
+            or "[stack oom]" in msg
+            or "failed to allocate" in msg
+        )
+
+    def _generate_rollout_batch(
+        self,
+        prompts: list[list[int]],
+        num_completions: int,
+        max_gen_len: int,
+        temperature: float,
+        eos_token_id: int,
+        use_lora: bool,
+        use_cuda_graphs: bool,
+        top_k: int,
+        top_p: float,
+        prefill_chunk_size: int,
+    ) -> tuple[list, list, list, list]:
+        with self._trainer_call_lock:
+            return self.trainer.generate(
+                prompts=prompts,
+                num_completions=num_completions,
+                max_gen_len=max_gen_len,
+                temperature=temperature,
+                eos_token_id=eos_token_id,
+                use_lora=use_lora,
+                use_cuda_graphs=use_cuda_graphs,
+                top_k=top_k,
+                top_p=top_p,
+                prefill_chunk_size=prefill_chunk_size,
+            )
+
+    def _generate_rollout_tokens(
+        self,
+        prompt_token_ids: list[list[int]],
+        temperature: float,
+    ) -> tuple[list, list, list, list]:
+        config = self.config
+        gen = config.generation
+        total_prompts = len(prompt_token_ids)
+        if total_prompts == 0:
+            return [], [], [], []
+
+        cfg_batch_cap = int(getattr(gen, "max_prompts_per_batch", 0) or 0)
+        prompt_batch_cap = (
+            total_prompts
+            if cfg_batch_cap <= 0
+            else max(1, min(total_prompts, cfg_batch_cap))
+        )
+        adaptive_on_oom = bool(getattr(gen, "adaptive_batch_on_oom", True))
+        prefill_chunk_size = int(gen.prefill_chunk_size)
+        use_cuda_graphs = True
+
+        while True:
+            try:
+                all_tokens = []
+                all_logprobs = []
+                all_prompt_lens = []
+                all_completion_lens = []
+
+                for start in range(0, total_prompts, prompt_batch_cap):
+                    end = min(total_prompts, start + prompt_batch_cap)
+                    chunk_prompt_ids = prompt_token_ids[start:end]
+                    tokens, logprobs, prompt_lens, completion_lens = (
+                        self._generate_rollout_batch(
+                            prompts=chunk_prompt_ids,
+                            num_completions=gen.num_completions,
+                            max_gen_len=gen.max_gen_len,
+                            temperature=temperature,
+                            eos_token_id=self.eos_id,
+                            use_lora=config.lora,
+                            use_cuda_graphs=use_cuda_graphs,
+                            top_k=gen.top_k,
+                            top_p=gen.top_p,
+                            prefill_chunk_size=prefill_chunk_size,
+                        )
+                    )
+                    all_tokens.extend(tokens)
+                    all_logprobs.extend(logprobs)
+                    all_prompt_lens.extend(prompt_lens)
+                    all_completion_lens.extend(completion_lens)
+
+                return all_tokens, all_logprobs, all_prompt_lens, all_completion_lens
+            except Exception as exc:
+                msg = str(exc).lower()
+                # Exceptions that typically terminate a worker thread in the C++
+                # trainer. Retrying on the same trainer instance can deadlock.
+                fatal_worker_error = (
+                    "std::bad_alloc" in msg
+                    or "bad_alloc" in msg
+                    or "[stack oom]" in msg
+                    or "another worker has crashed" in msg
+                )
+                if fatal_worker_error:
+                    raise RuntimeError(
+                        "Native GRPO generation hit a fatal stack OOM and the "
+                        "trainer worker thread exited, so adaptive in-process "
+                        "retry cannot continue safely. Restart with lower "
+                        "generation memory settings (e.g. "
+                        "generation.max_prompts_per_batch=1, "
+                        "generation.num_completions, generation.max_gen_len), "
+                        "or enable FP8 KV-cache via "
+                        "SUROGATE_ENABLE_FP8_KV_CACHE=1 on SM89+ GPUs."
+                    ) from exc
+
+                if not (adaptive_on_oom and self._is_cuda_oom_error(exc)):
+                    raise
+
+                if prompt_batch_cap > 1:
+                    old_cap = prompt_batch_cap
+                    prompt_batch_cap = max(1, prompt_batch_cap // 2)
+                    logger.warning(
+                        "Generation OOM, retrying with max_prompts_per_batch=%d "
+                        "(was %d).",
+                        int(prompt_batch_cap),
+                        int(old_cap),
+                    )
+                    continue
+
+                if prefill_chunk_size > 16:
+                    old_prefill = prefill_chunk_size
+                    prefill_chunk_size = max(16, prefill_chunk_size // 2)
+                    logger.warning(
+                        "Generation OOM, retrying with prefill_chunk_size=%d "
+                        "(was %d).",
+                        int(prefill_chunk_size),
+                        int(old_prefill),
+                    )
+                    continue
+
+                if use_cuda_graphs:
+                    use_cuda_graphs = False
+                    logger.warning(
+                        "Generation OOM, retrying with use_cuda_graphs=False "
+                        "for native generate()."
+                    )
+                    continue
+
+                raise RuntimeError(
+                    "Native GRPO generation OOM even after adaptive fallback. "
+                    "Try lowering generation.num_completions, "
+                    "generation.max_gen_len, problems_per_step, or sequence_len."
+                ) from exc
 
     def _encode_prompt(self, prompt: str) -> list[int]:
         """Encode a prompt into safe in-vocab token ids."""
@@ -391,19 +640,10 @@ class NativeGRPOTrainer:
 
         # Generate completions with paged GRPO decode.
         gen_start = time.time()
-        with self._trainer_call_lock:
-            tokens, logprobs, prompt_lens, completion_lens = self.trainer.generate(
-                prompts=prompt_token_ids,
-                num_completions=num_completions,
-                max_gen_len=gen.max_gen_len,
-                temperature=temperature,
-                eos_token_id=self.eos_id,
-                use_lora=config.lora,
-                use_cuda_graphs=True,
-                top_k=gen.top_k,
-                top_p=gen.top_p,
-                prefill_chunk_size=gen.prefill_chunk_size,
-            )
+        tokens, logprobs, prompt_lens, completion_lens = self._generate_rollout_tokens(
+            prompt_token_ids=prompt_token_ids,
+            temperature=temperature,
+        )
         gen_time = time.time() - gen_start
 
         # Decode completions
@@ -1404,6 +1644,14 @@ class NativeGRPOTrainer:
         )
         logger.info(f"  Max gen length: {config.generation.max_gen_len}")
         logger.info(f"  Prefill chunk size: {config.generation.prefill_chunk_size}")
+        logger.info(
+            f"  Max prompts per generate call: "
+            f"{config.generation.max_prompts_per_batch or 'all'}"
+        )
+        logger.info(
+            f"  Adaptive generation OOM fallback: "
+            f"{bool(config.generation.adaptive_batch_on_oom)}"
+        )
         logger.info(f"  Learning rate: {config.learning_rate}")
         logger.info(
             f"  LoRA: enabled={config.lora}, "

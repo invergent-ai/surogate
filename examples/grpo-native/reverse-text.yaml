@@ -13,7 +13,7 @@ output_dir: ./output-grpo-native-reverse-text
 gpus: 1
 per_device_train_batch_size: 1
 sequence_len: 2048
-max_steps: 100
+max_steps: 20
 learning_rate: 1e-4
 lr_scheduler_type: constant
 warmup_steps: 0
@@ -26,6 +26,7 @@ recipe: bf16
 lora: true
 lora_rank: 16
 lora_alpha: 32
+# qlora_fp8: true
 
 # Generation (match production: rollouts_per_example=16, max_tokens=128)
 generation:
@@ -33,6 +34,10 @@ generation:
   max_gen_len: 128
   top_p: 1.0
   top_k: 0
+  # Memory control: lower this value to reduce peak KV-cache/logits memory.
+  # 0 means "all prompts in one generate() call" (fastest, highest VRAM).
+  max_prompts_per_batch: 2
+  adaptive_batch_on_oom: true
 
 # Sampling
 sampling:
@@ -60,3 +65,4 @@ problems_per_step: 8
 
 # Checkpointing
 save_steps: 100
+

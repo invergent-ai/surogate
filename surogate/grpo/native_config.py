@@ -38,6 +38,10 @@ class NativeGRPOGenerationConfig:
         top_k: Top-k sampling. 0 means disabled.
         min_p: Minimum probability threshold for sampling.
         prefill_chunk_size: Chunk size for prompt prefill. 0 disables chunking.
+        max_prompts_per_batch: Maximum prompts per generate() call.
+            0 means use all prompts in one call (fastest, highest peak VRAM).
+        adaptive_batch_on_oom: Automatically reduce prompt batch size when
+            generation OOMs.
     """
 
     num_completions: int = 4
@@ -46,6 +50,8 @@ class NativeGRPOGenerationConfig:
     top_k: int = 0
     min_p: float = 0.0
     prefill_chunk_size: int = 256
+    max_prompts_per_batch: int = 0
+    adaptive_batch_on_oom: bool = True
 
     def __init__(self, cfg: DictDefault):
         self.num_completions = cfg.get("num_completions", self.num_completions)
@@ -56,8 +62,16 @@ class NativeGRPOGenerationConfig:
         self.prefill_chunk_size = int(
             cfg.get("prefill_chunk_size", self.prefill_chunk_size)
         )
+        self.max_prompts_per_batch = int(
+            cfg.get("max_prompts_per_batch", self.max_prompts_per_batch)
+        )
+        self.adaptive_batch_on_oom = bool(
+            cfg.get("adaptive_batch_on_oom", self.adaptive_batch_on_oom)
+        )
         if self.prefill_chunk_size < 0:
             self.prefill_chunk_size = 0
+        if self.max_prompts_per_batch < 0:
+            self.max_prompts_per_batch = 0
 
 
 @dataclass

@@ -32,6 +32,10 @@ generation:
   max_gen_len: 64
   top_p: 0.9
   top_k: 0
+  # Memory control: lower this value to reduce peak KV-cache/logits memory.
+  # 0 means "all prompts in one generate() call" (fastest, highest VRAM).
+  max_prompts_per_batch: 2
+  adaptive_batch_on_oom: true
 
 # Sampling (temperature scheduling)
 sampling:
