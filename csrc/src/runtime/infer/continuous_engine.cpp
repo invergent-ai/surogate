@@ -46,8 +46,8 @@ inline bool flat_cuda_graphs_enabled() {
     if (cached >= 0) return cached != 0;
     const char* env = std::getenv("SUROGATE_SERVE_FLAT_CUDA_GRAPHS");
     if (!env || env[0] == '\0') {
-        cached = 0;  // default off for stability
-        return false;
+        cached = 1;  // default on; can be disabled with SUROGATE_SERVE_FLAT_CUDA_GRAPHS=0
+        return true;
     }
     cached = (env[0] != '0') ? 1 : 0;
     return cached != 0;
@@ -70,6 +70,29 @@ std::vector<int> build_graph_buckets(int max_slots) {
     }
     if (buckets.empty() || buckets.back() < max_slots) {
         buckets.push_back(max_slots);
+    }
+    return buckets;
+}
+
+std::vector<int> build_prefill_token_buckets(int max_tokens) {
+    // Match sglang-style piecewise capture buckets to maximize graph reuse:
+    // small tokens use fine granularity, larger tokens use coarser steps.
+    std::vector<int> buckets;
+    buckets.reserve(128);
+    auto append_range = [&](int start, int end, int step) {
+        for (int t = start; t <= end && t <= max_tokens; t += step) {
+            buckets.push_back(t);
+        }
+    };
+    append_range(4, 32, 4);
+    append_range(48, 256, 16);
+    append_range(288, 512, 32);
+    append_range(576, 1024, 64);
+    append_range(1280, 4096, 256);
+    append_range(4608, max_tokens, 512);
+
+    if (buckets.empty() || buckets.back() < max_tokens) {
+        buckets.push_back(max_tokens);
     }
     return buckets;
 }
@@ -643,6 +666,7 @@ void ContinuousGenerationEngine::init(
     max_batched_tokens_ = static_cast<int>(
         run_state.Inputs.Sizes[0] * (run_state.Inputs.Rank >= 2 ? run_state.Inputs.Sizes[1] : 1));
     if (max_batched_tokens_ <= 0) max_batched_tokens_ = 2048;
+    prefill_token_buckets_ = build_prefill_token_buckets(max_batched_tokens_);
     const auto MBT = static_cast<std::size_t>(max_batched_tokens_);
 
     flat_token_to_req_gpu_ = reinterpret_cast<int32_t*>(
@@ -675,6 +699,13 @@ int ContinuousGenerationEngine::next_bucket(int B) const {
         if (b >= B) return b;
     }
     return B;
+}
+
+int ContinuousGenerationEngine::next_prefill_token_bucket(int total_tokens) const {
+    for (int t : prefill_token_buckets_) {
+        if (t >= total_tokens) return t;
+    }
+    return total_tokens;
 }
 
 // ---------------------------------------------------------------------------
@@ -1562,11 +1593,23 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
 
     const int batch_size = static_cast<int>(active_sids.size());
     if (batch_size == 0) return result;
+    const bool selected_pure_decode = prefill_q_lens.empty();
+    const bool use_bucketed_decode_batch = selected_pure_decode && use_cuda_graphs_;
+    const int decode_exec_batch = use_bucketed_decode_batch ? next_bucket(batch_size) : batch_size;
+    const bool model_has_stateful_ssm =
+        config_ && (config_->MambaNumHeads > 0
+                 || config_->MambaSsmStateSize > 0
+                 || config_->MambaChunkSize > 0);
 
     // Build compact recurrent/conv state rows in the same active-slot order as this flat batch.
-    // Qwen3.5 decode correctness depends on these persistent per-layer states.
+    // For pure-decode CUDA-graph mode, pad state rows to the decode graph bucket.
     build_compact_states_from_slots_impl(
-        state, run_state_, batch_size, batch_size, active_sids, max_slots_);
+        state,
+        run_state_,
+        batch_size,
+        use_bucketed_decode_batch ? decode_exec_batch : batch_size,
+        active_sids,
+        max_slots_);
 
     // === Phase 3: Build flat token arrays ===
     // Each decode slot contributes 1 token.
@@ -1612,12 +1655,28 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     const int actual_total_tokens = total_tokens;
     int padded_total_tokens = actual_total_tokens;
     const bool has_prefill = has_prefill_slots;
+    const bool has_recurrent_state = !state.compact_recurrent_states.empty();
+    const bool has_conv_state = !state.compact_conv_states.empty();
+    const bool use_flat_graphs = use_cuda_graphs_
+        && flat_cuda_graphs_enabled()
+        && !model_has_stateful_ssm
+        && !has_recurrent_state
+        && !has_conv_state;
     if (has_prefill) {
-        // Round up to next multiple of 64 to reduce unique graph shapes.
-        padded_total_tokens = ((actual_total_tokens + 63) / 64) * 64;
+        if (use_flat_graphs) {
+            // Piecewise prefill graphing: snap to a stable capture bucket.
+            padded_total_tokens = next_prefill_token_bucket(actual_total_tokens);
+        } else {
+            // Eager prefill: still coalesce shapes to reduce compile churn.
+            padded_total_tokens = ((actual_total_tokens + 63) / 64) * 64;
+        }
         padded_total_tokens = std::min(padded_total_tokens, max_batched_tokens_);
+    } else if (use_bucketed_decode_batch) {
+        // Decode-only CUDA graph mode: pad to the decode graph batch bucket.
+        padded_total_tokens = decode_exec_batch;
     }
     const bool pure_decode = !has_prefill && (actual_total_tokens == batch_size);
+    const int exec_batch_size = pure_decode ? padded_total_tokens : batch_size;
 
     // Build host arrays (padded to padded_total_tokens, padding gets token_id=0, pos=0).
     std::vector<int32_t> h_token_ids(padded_total_tokens, 0);
@@ -1627,7 +1686,12 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // if any path accidentally touches padded lanes.
     std::vector<int32_t> h_kv_write_pos(padded_total_tokens, 0);
     std::vector<int32_t> h_q_indptr(batch_size + 1, 0);
-    std::vector<int32_t> h_seq_lens_k(batch_size, 0);
+    // Current seq lens (before KV append) for decode rope writes.
+    std::vector<int> h_seq_lens_current(exec_batch_size, 0);
+    // KV sequence lens after this forward pass (for decode/prefill attention metadata).
+    std::vector<int32_t> h_seq_lens_k(exec_batch_size, 0);
+    // Decode padding mask (padded lanes are marked finished=1 to skip KV writes).
+    std::vector<int> h_finished_flags(exec_batch_size, 0);
 
     int tok_offset = 0;
     for (int i = 0; i < batch_size; ++i) {
@@ -1649,6 +1713,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
                 h_kv_write_pos[tok_offset + t] = start + t;
             }
             // seq_lens_k = tokens already in KV + tokens we're adding now
+            h_seq_lens_current[i] = slot.seq_len;
             h_seq_lens_k[i] = static_cast<int32_t>(slot.seq_len + q_len);
             tok_offset += q_len;
         } else {
@@ -1662,6 +1727,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
             h_position_ids[tok_offset] = static_cast<int32_t>(slot.seq_len);
             h_token_to_req[tok_offset] = static_cast<int32_t>(i);
             h_kv_write_pos[tok_offset] = static_cast<int32_t>(slot.seq_len);
+            h_seq_lens_current[i] = slot.seq_len;
             h_seq_lens_k[i] = static_cast<int32_t>(slot.seq_len + 1);
             tok_offset += 1;
         }
@@ -1671,10 +1737,18 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         throw std::runtime_error(
             "ContinuousGenerationEngine::flat_step: token packing mismatch in flat batch");
     }
+    if (pure_decode && exec_batch_size > batch_size) {
+        // Padded decode rows: keep seq_lens at 0, but set seqused_k to 1 and
+        // mark finished so decode rope skips appending any KV for padded rows.
+        for (int i = batch_size; i < exec_batch_size; ++i) {
+            h_seq_lens_k[static_cast<std::size_t>(i)] = 1;
+            h_finished_flags[static_cast<std::size_t>(i)] = 1;
+        }
+    }
 
     // Build block table (compact, batch_size rows)
     const auto MPS = static_cast<std::size_t>(max_pages_per_seq_);
-    std::vector<int> h_block_table(static_cast<std::size_t>(batch_size) * MPS, 0);
+    std::vector<int> h_block_table(static_cast<std::size_t>(exec_batch_size) * MPS, 0);
     for (int i = 0; i < batch_size; ++i) {
         const auto& pages = slots_[static_cast<std::size_t>(active_sids[i])].page_ids;
         const auto row = static_cast<std::size_t>(i) * MPS;
@@ -1687,6 +1761,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // Allocate GPU buffers from arena (or reuse pre-allocated ones)
     const auto TT = static_cast<std::size_t>(padded_total_tokens);
     const auto BS = static_cast<std::size_t>(batch_size);
+    const auto BS_exec = static_cast<std::size_t>(exec_batch_size);
     const std::size_t token_bytes = TT * sizeof(int32_t);
 
     // Upload flat token/position IDs directly into run-state inputs consumed by
@@ -1742,10 +1817,16 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_q_indptr, h_q_indptr.data(),
         (BS + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu_, h_seq_lens_current.data(),
+        BS_exec * sizeof(int), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_seq_lens_k, h_seq_lens_k.data(),
-        BS * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        BS_exec * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    if (pure_decode) {
+        CUDA_CHECK(cudaMemcpyAsync(finished_gpu_, h_finished_flags.data(),
+            BS_exec * sizeof(int), cudaMemcpyHostToDevice, stream));
+    }
     CUDA_CHECK(cudaMemcpyAsync(block_table_gpu_, h_block_table.data(),
-        BS * MPS * sizeof(int), cudaMemcpyHostToDevice, stream));
+        BS_exec * MPS * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // === Phase 5: Build DecodeState for flat-token mode ===
     const bool fp8_kv = (page_pool_.dtype() == KVDType::FP8_E4M3);
@@ -1793,7 +1874,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.token_to_req_gpu = d_token_to_req;
     ds.kv_write_pos_gpu = d_kv_write_pos;
     ds.q_indptr_gpu = d_q_indptr;
-    ds.seq_lens_gpu = reinterpret_cast<int*>(d_seq_lens_k);
+    ds.seq_lens_gpu = seq_lens_gpu_;
     ds.cu_seqlens_q_gpu = d_q_indptr;
     ds.cu_seqlens_k_gpu = d_seq_lens_k;
     ds.seq_lens_k_gpu = d_seq_lens_k;
@@ -1847,26 +1928,36 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // For mixed steps with prefill tokens, use flat-token eager execution.
     const bool use_decode_path = pure_decode && use_cuda_graphs_;
     if (use_decode_path) {
-        // Pure decode: use execute_decode_step with exact batch size.
-        // The decode graph cache keys by B, so each unique batch size gets its
-        // own captured graph; padding to larger buckets wastes compute.
+        // Pure decode: use execute_decode_step with bucketed B to maximize
+        // graph-cache reuse (mini-sglang style).
         ds.flat_token_mode = false;
         ds.prefill_mode = false;
         ds.logits_out_gpu = logits_gpu_;
+        ds.finished_gpu = finished_gpu_;
+        // Keep decode graph signature stable across token steps.
+        ds.max_seqlen_k = max_seq_len_;
+        fill_decode_cu_seqlens(
+            cu_seqlens_q_gpu_,
+            seqused_k_gpu_,
+            seq_lens_gpu_,
+            exec_batch_size,
+            stream);
+        ds.cu_seqlens_q_gpu = cu_seqlens_q_gpu_;
+        ds.cu_seqlens_k_gpu = seqused_k_gpu_;
+        ds.seq_lens_k_gpu = seqused_k_gpu_;
         // With pinned buffers, the recurrent/conv state addresses are stable —
         // safe for CUDA graph capture. Set strict_state_buffers so ops don't
         // try to allocate (they must use the pre-allocated buffers).
         ds.flat_batch_size = batch_size;
         ds.strict_state_buffers = state.pinned;
         graph_executor.execute_decode_step(
-            static_cast<long>(batch_size),
+            static_cast<long>(exec_batch_size),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
             reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
             ds, comm, hook, state.pinned ? use_cuda_graphs_ : false);
     } else {
         // Mixed prefill+decode: flat-token execution with piecewise CUDA graphs.
         // Non-attention segments are captured/replayed; attention runs eagerly.
-        const bool use_flat_graphs = use_cuda_graphs_ && flat_cuda_graphs_enabled();
         graph_executor.execute_flat_tokens(
             static_cast<long>(padded_total_tokens),
             reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),

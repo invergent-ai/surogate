@@ -163,6 +163,7 @@ public:
 
 private:
     int next_bucket(int B) const;
+    int next_prefill_token_bucket(int total_tokens) const;
 
     /// Rebuild compact batch arrays from active slots.
     /// Only called when batch_dirty_ is true.
@@ -220,6 +221,7 @@ private:
 
     // CUDA graph bucket sizes
     std::vector<int> graph_buckets_;
+    std::vector<int> prefill_token_buckets_;
 
     // Persistent DecodeState (rebuilt only when batch changes)
     DecodeState decode_state_{};

@@ -33,32 +33,6 @@ def seed_everything(seed: Optional[int] = None, full_determinism: bool = False) 
     return seed
 
 
-def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
-    """Compute cu_seqlens from packed position_ids.
-
-    A new sequence starts whenever position_ids are not strictly consecutive
-    (i.e., diff != 1). This mirrors HF packed-sequence detection.
-    """
-    position_ids = position_ids[0]
-    if position_ids.numel() == 0:
-        return torch.tensor([0], device=position_ids.device, dtype=torch.int32)
-
-    diffs = position_ids[1:] - position_ids[:-1]
-    boundaries = torch.where(diffs != 1)[0] + 1  # indices where a new seq starts
-    starts = torch.cat(
-        [torch.tensor([0], device=position_ids.device, dtype=boundaries.dtype), boundaries]
-    )
-    ends = torch.cat(
-        [boundaries, torch.tensor([len(position_ids)], device=position_ids.device, dtype=boundaries.dtype)]
-    )
-    seq_lengths = ends - starts
-    cu_seqlens = torch.cumsum(
-        torch.cat([torch.tensor([0], device=position_ids.device, dtype=seq_lengths.dtype), seq_lengths]),
-        dim=0,
-    )
-    return cu_seqlens
-
-
 def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bool = False) -> Any:
     """Move inputs to a device"""
     if isinstance(data, Mapping):
