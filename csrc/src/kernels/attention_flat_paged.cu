@@ -312,9 +312,11 @@ void flat_attention_plan(
             "flat_attention_plan: q_indptr total does not match total_q_tokens");
     }
     auto& plan_info = *reinterpret_cast<flashinfer::PrefillPlanInfo*>(plan_info_opaque);
-    // Build page metadata on CPU.
-    std::vector<int32_t> h_page_indptr(batch_size + 1, 0);
-    std::vector<int32_t> h_last_page_len(batch_size);
+    // Build page metadata on CPU — reuse static buffers to avoid per-step heap allocation.
+    static thread_local std::vector<int32_t> h_page_indptr;
+    static thread_local std::vector<int32_t> h_last_page_len;
+    h_page_indptr.assign(batch_size + 1, 0);
+    h_last_page_len.resize(batch_size);
     int total_pages = 0;
     for (int i = 0; i < batch_size; ++i) {
         int k_len = std::max(1, static_cast<int>(h_seq_lens_k[i]));
@@ -325,7 +327,8 @@ void flat_attention_plan(
         h_last_page_len[i] = (rem == 0) ? page_block_size : rem;
     }
 
-    std::vector<int32_t> h_page_indices(total_pages);
+    static thread_local std::vector<int32_t> h_page_indices;
+    h_page_indices.resize(total_pages);
     for (int i = 0; i < batch_size; ++i) {
         int start = h_page_indptr[i];
         int count = h_page_indptr[i + 1] - start;
@@ -344,13 +347,18 @@ void flat_attention_plan(
         batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
     // Build KV indptr (cumulative KV lengths).
-    std::vector<int32_t> h_kv_indptr(batch_size + 1, 0);
+    static thread_local std::vector<int32_t> h_kv_indptr;
+    h_kv_indptr.assign(batch_size + 1, 0);
     for (int i = 0; i < batch_size; ++i) {
         h_kv_indptr[i + 1] = h_kv_indptr[i] + h_seq_lens_k[i];
     }
 
-    // Page-locked host buffer for PrefillPlan (reuse stack allocation).
-    std::vector<char> page_locked_buf(int_ws_size, 0);
+    // Page-locked host buffer for PrefillPlan — reuse across calls to avoid
+    // allocating+zeroing 16MB of heap memory every step (~8ms overhead).
+    static thread_local std::vector<char> page_locked_buf;
+    if (page_locked_buf.size() < int_ws_size) {
+        page_locked_buf.resize(int_ws_size, 0);
+    }
 
     auto plan_err = flashinfer::PrefillPlan<int32_t>(
         d_float_ws, float_ws_size,

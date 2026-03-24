@@ -1245,18 +1245,42 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
                   << free_mem / (1024*1024) << " MiB" << std::endl;
     }
 
-    // Default position IDs: [0..T-1] for each sequence in the batch.
+    // Default position IDs: [0..seq-1] for each row/plane in the position tensor.
+    // Use the buffer's realized shape rather than (B, T), because serving mode can
+    // allocate flat token-capacity buffers (e.g. [1, max_tokens] or [3, 1, max_tokens]).
     // This keeps Python-side training/tests deterministic even when callers do not provide
     // explicit position ids (unlike the C++ training binary which can load them from .bin files).
     {
-        auto* pos = ctx.Model->get_position_ids_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pos = pos_buf.get<std::int32_t>();
         if (!pos) {
             throw std::runtime_error("PositionIDs buffer is not INT32 (unexpected)");
         }
-        for (int b = 0; b < B; ++b) {
-            for (int t = 0; t < T; ++t) {
-                pos[b * T + t] = t;
+
+        if (pos_buf.Rank == 3 && pos_buf.Sizes[0] == 3) {
+            const long planes = pos_buf.Sizes[0];
+            const long rows = pos_buf.Sizes[1];
+            const long cols = pos_buf.Sizes[2];
+            for (long p = 0; p < planes; ++p) {
+                const long plane_offset = p * rows * cols;
+                for (long r = 0; r < rows; ++r) {
+                    const long row_offset = plane_offset + r * cols;
+                    for (long c = 0; c < cols; ++c) {
+                        pos[row_offset + c] = static_cast<std::int32_t>(c);
+                    }
+                }
             }
+        } else if (pos_buf.Rank >= 2) {
+            const long rows = pos_buf.Sizes[0];
+            const long cols = pos_buf.Sizes[1];
+            for (long r = 0; r < rows; ++r) {
+                const long row_offset = r * cols;
+                for (long c = 0; c < cols; ++c) {
+                    pos[row_offset + c] = static_cast<std::int32_t>(c);
+                }
+            }
+        } else {
+            throw std::runtime_error("PositionIDs buffer rank is < 2 (unexpected)");
         }
     }
 

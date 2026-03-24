@@ -817,19 +817,27 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
     // Without this, every new padded T value triggers ~72 segment CUDA graph
     // captures during inference (~1000 cudaGraphInstantiate + ~4000 cudaMalloc).
     // ========================================================================
-    // Flat-token segment graph warmup disabled: each captured CUDA graph
-    // consumes ~0.5-1MB GPU memory. Pre-warming 60 buckets × 72 segments
-    // ≈ 3GB, which starves KV cache and reduces concurrency.
-    // Segment graphs are captured lazily on first use instead.
-    if (false && use_cuda_graphs_ && !prefill_token_buckets_.empty()) {
+    // Pre-warm flat-token piecewise graphs for common prefill bucket sizes.
+    // Each bucket captures ~72 segment graphs (~0.5-1MB each). Limit to
+    // a subset of buckets to control memory usage (~500MB for 10 buckets).
+    if (use_cuda_graphs_ && !prefill_token_buckets_.empty()) {
         auto& state = ensure_engine_state_storage(this, max_slots_);
         const int Hq_model = config_->NumQueryHeads;
         const int Hkv_model = config_->NumKeyValHeads;
         const int group_size = (Hkv_model > 0) ? (Hq_model / Hkv_model) : 1;
         constexpr int kCtaTileQ = 16;
 
-        for (int bucket_t : prefill_token_buckets_) {
+        // Warm a subset of buckets to balance memory vs coverage.
+        // Skip small buckets (decode-only sizes) and sample every Nth for large ones.
+        int warmed_count = 0;
+        constexpr int kMaxWarmBuckets = 15;
+        const int skip = std::max(1, static_cast<int>(prefill_token_buckets_.size()) / kMaxWarmBuckets);
+        for (int bi = 0; bi < static_cast<int>(prefill_token_buckets_.size()); bi += skip) {
+            int bucket_t = prefill_token_buckets_[bi];
             if (bucket_t <= 0 || bucket_t > max_batched_tokens_) continue;
+            if (bucket_t < 64) continue;  // skip tiny buckets (decode-size)
+            if (warmed_count >= kMaxWarmBuckets) break;
+            ++warmed_count;
 
             // Build minimal flat-token DecodeState: 1 request with q_len=bucket_t.
             const int batch_size = 1;
@@ -1871,14 +1879,12 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // for stateful SSM models (Qwen3.5) entirely — now enabled since the
     // graph-breaking ops (FlashAttention, ChunkGatedDeltaRule, Qwen3_5Decay)
     // are handled by the piecewise segment system.
-    // Disable piecewise CUDA graphs for steps with prefill. Prefill is
-    // compute-bound (large matmuls, long attention) so kernel launch overhead
-    // is negligible, but graph compilation for each unique padded T costs
-    // 90-267ms. vLLM similarly uses graphs only for decode, not prefill.
+    // Piecewise CUDA graphs for prefill: capture non-attention segments,
+    // run attention eagerly. Requires pre-warming bucket sizes at startup
+    // to avoid 90-267ms graph compilation during serving.
     const bool use_flat_graphs = use_cuda_graphs_
         && flat_cuda_graphs_enabled()
-        && state.pinned
-        && !has_prefill;
+        && state.pinned;
     if (has_prefill) {
         // Always snap to a bucket to maximize graph cache reuse.
         // The bucket list is finite (~60 entries) and fully warmed at startup.
