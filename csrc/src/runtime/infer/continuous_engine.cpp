@@ -1693,6 +1693,59 @@ ContinuousStepResult ContinuousGenerationEngine::step(
 // ---------------------------------------------------------------------------
 // flat_step — prefill + decode in ONE forward pass via flat-token execution
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// run_sampling_dispatch — sample from logits_gpu_ → sampled_tokens_gpu_
+// ---------------------------------------------------------------------------
+void ContinuousGenerationEngine::run_sampling_dispatch(
+        int batch_size, int V, float temperature,
+        int top_k, float top_p, float min_p,
+        cudaStream_t stream) {
+    float* logits = logits_gpu_;
+    if (sanitize_logits_enabled()) {
+        sampling_sanitize_logits(logits, batch_size, V, stream);
+    }
+    if (temperature <= 0.0f) {
+        sampling_argmax(logits, sampled_tokens_gpu_, batch_size, V, stream);
+    } else {
+        const bool unconstrained = (top_k <= 0) && (top_p >= 1.0f) && (min_p <= 0.0f);
+        if (unconstrained && temperature == 1.0f) {
+            sampling_from_logits(logits, sampled_tokens_gpu_, batch_size, V,
+                false, 42, 0, stream);
+        } else {
+            float* temp_arr = nullptr;
+            if (temperature != 1.0f) {
+                temp_arr = temperature_gpu_;
+                for (int i = 0; i < std::min(batch_size, max_slots_); ++i) {
+                    pinned_.compact_temp[i] = temperature;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(temp_arr, pinned_.compact_temp,
+                    static_cast<std::size_t>(batch_size) * sizeof(float),
+                    cudaMemcpyHostToDevice, stream));
+            }
+            sampling_softmax(logits, logits, temp_arr,
+                             batch_size, V, softmax_ws_, softmax_ws_bytes_, stream);
+            if (top_k > 0 && top_p < 1.0f) {
+                sampling_top_k_top_p(logits, sampled_tokens_gpu_,
+                    top_k, top_p, batch_size, V, false, 42, 0, stream);
+            } else if (top_k > 0) {
+                sampling_top_k(logits, sampled_tokens_gpu_, top_k,
+                    batch_size, V, false, 42, 0, stream);
+            } else if (top_p < 1.0f) {
+                sampling_top_p(logits, sampled_tokens_gpu_, top_p,
+                    batch_size, V, false, 42, 0, stream);
+            } else if (min_p > 0.0f) {
+                sampling_min_p(logits, sampled_tokens_gpu_, min_p,
+                    batch_size, V, false, 42, 0, stream);
+            } else {
+                sampling_from_probs(logits, sampled_tokens_gpu_, batch_size, V,
+                    false, 42, 0, stream);
+            }
+        }
+    }
+    sampling_sanitize_token_ids(sampled_tokens_gpu_, batch_size, V,
+        fallback_token_id_, nullptr, stream);
+}
+
 ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step(
         const std::vector<std::vector<int32_t>>& new_prompts,
         const FlatStepConfig& config,
@@ -2163,31 +2216,79 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // supports CUDA graph capture for much faster repeated execution.
     // For mixed steps with prefill tokens, use flat-token eager execution.
     const bool use_decode_path = pure_decode && use_cuda_graphs_;
+    // When full_step captures forward+sampling+feedback in one graph, skip Phase 7.
+    bool full_step_handled_sampling = false;
+
     if (use_decode_path) {
-        // Pure decode: use execute_decode_step with bucketed B to maximize
-        // graph-cache reuse (mini-sglang style).
+        // Pure decode: capture the ENTIRE step (forward + sampling + token
+        // feedback) as one CUDA graph via full_step_graph_exec_. On replay,
+        // zero individual kernel launches — the GPU runs everything back-to-back.
         ds.flat_token_mode = false;
         ds.prefill_mode = false;
         ds.logits_out_gpu = logits_gpu_;
         ds.finished_gpu = finished_gpu_;
-        // Keep decode graph signature stable across token steps.
         ds.max_seqlen_k = max_seq_len_;
         fill_decode_cu_seqlens(
-            cu_seqlens_q_gpu_,
-            seqused_k_gpu_,
-            seq_lens_gpu_,
-            exec_batch_size,
-            stream);
+            cu_seqlens_q_gpu_, seqused_k_gpu_, seq_lens_gpu_,
+            exec_batch_size, stream);
         ds.cu_seqlens_q_gpu = cu_seqlens_q_gpu_;
         ds.cu_seqlens_k_gpu = seqused_k_gpu_;
         ds.seq_lens_k_gpu = seqused_k_gpu_;
         ds.flat_batch_size = batch_size;
         ds.strict_state_buffers = state.pinned;
-        graph_executor.execute_decode_step(
-            static_cast<long>(exec_batch_size),
-            reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
-            reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
-            ds, comm, hook, state.pinned ? use_cuda_graphs_ : false);
+
+        // Lambda: forward + sampling + token feedback — all using flat_step's
+        // local variables (exec_batch_size, ds), not compact_* members.
+        auto full_decode_step = [&]() {
+            // Forward pass
+            graph_executor.execute_decode_step(
+                static_cast<long>(exec_batch_size),
+                reinterpret_cast<const int32_t*>(run_state_->Inputs.Data),
+                reinterpret_cast<const int32_t*>(run_state_->PositionIDs.Data),
+                ds, comm, hook, /*use_cuda_graph=*/false);  // inner graph disabled when outer captures
+
+            // Sampling
+            run_sampling_dispatch(batch_size, V, config.temperature,
+                config.top_k, config.top_p, config.min_p, stream);
+
+            // Token feedback: sampled → next input (D2D)
+            CUDA_CHECK(cudaMemcpyAsync(run_state_->Inputs.Data, sampled_tokens_gpu_,
+                static_cast<std::size_t>(exec_batch_size) * sizeof(int32_t),
+                cudaMemcpyDeviceToDevice, stream));
+
+            // Update generation state on GPU (seq_lens++, EOS check)
+            update_generation_state(sampled_tokens_gpu_, finished_gpu_,
+                seq_lens_gpu_, completion_lens_gpu_, config.eos_token_id,
+                exec_batch_size, stream);
+
+            // Recompute cu_seqlens and position IDs for next step
+            fill_decode_cu_seqlens(cu_seqlens_q_gpu_, seqused_k_gpu_,
+                seq_lens_gpu_, exec_batch_size, stream);
+            CUDA_CHECK(cudaMemcpyAsync(run_state_->PositionIDs.Data, seq_lens_gpu_,
+                static_cast<std::size_t>(exec_batch_size) * sizeof(int32_t),
+                cudaMemcpyDeviceToDevice, stream));
+
+            // Mask finished tokens in input for next step
+            mask_finished_tokens(
+                reinterpret_cast<int32_t*>(run_state_->Inputs.Data),
+                finished_gpu_, exec_batch_size, stream);
+        };
+
+        const bool try_full_step = state.pinned;
+        if (try_full_step && full_step_primed_) {
+            // Replay the full-step graph
+            dsl::trace_or_execute_cuda_graph_with_stack(
+                full_decode_step, stream, full_step_graph_exec_,
+                /*enabled=*/true, run_state_->Stack,
+                full_step_graph_checkpoint_, "full_step_flat");
+        } else {
+            // First call: run eagerly to prime, next call will capture
+            full_decode_step();
+            if (try_full_step && !full_step_primed_) {
+                full_step_primed_ = true;
+            }
+        }
+        full_step_handled_sampling = true;
     } else {
         // Mixed prefill+decode: flat-token execution with piecewise CUDA graphs.
         // Non-attention segments are captured/replayed; attention runs eagerly.
@@ -2237,6 +2338,13 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
 
     if (flat_step_profile) { p6_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 7: Sample from logits ===
+    // Skip if run_one_decode_step already handled sampling (full_step_graph path).
+    if (full_step_handled_sampling) {
+        // Sampling + token feedback already done inside the full-step graph.
+        // Just D2H the sampled tokens from sampled_tokens_gpu_.
+        goto phase7_readback;
+    }
+    {
     // With the LM head gather optimization, logits_gpu_ already contains
     // [batch_size, V] logits (gathered from last-token hidden states).
     float* compact_logits = logits_gpu_;
@@ -2284,7 +2392,9 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     }
     sampling_sanitize_token_ids(sampled_tokens_gpu_, batch_size, V,
         fallback_token_id_, nullptr, stream);
+    } // end Phase 7 sampling block
 
+    phase7_readback:
     // === D2H readback ===
     long p7_launch_us = 0;
     if (flat_step_profile) { p7_launch_us = us_since(t_phase); }

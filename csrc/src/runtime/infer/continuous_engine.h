@@ -180,6 +180,9 @@ public:
     bool initialized() const { return initialized_; }
 
 private:
+    void run_sampling_dispatch(int batch_size, int V, float temperature,
+                               int top_k, float top_p, float min_p,
+                               cudaStream_t stream);
     int next_bucket(int B) const;
     int next_prefill_token_bucket(int total_tokens) const;
 
