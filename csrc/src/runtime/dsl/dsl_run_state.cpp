@@ -296,6 +296,9 @@ DslRunState::DslRunState(const PretrainedConfig& config,
       mRecomputeLevel(options.Recompute),
       mLoraOnlyMode(lora_only_mode),
       mPrequantized(prequantized),
+      mDynamicTokenBuffers(options.DynamicTokenBuffers),
+      mInferenceOnlyBuffers(options.DynamicTokenBuffers),
+      mMaxTokens(0),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
     if (!mAllocator) {
@@ -327,6 +330,19 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     mLMHeadChunks = options.LMHeadChunks;
     mAttnBwdChunks = options.AttBwdChunks;
     mStackSimulate = !allocate_stack;
+    const long default_tokens = std::max<long>(1, this->B * this->T);
+    if (mDynamicTokenBuffers) {
+        const long requested_tokens =
+            (options.MaxTokenCapacity > 0)
+                ? static_cast<long>(options.MaxTokenCapacity)
+                : default_tokens;
+        // Ensure decode can process max_num_seqs single-token requests.
+        mMaxTokens = std::max<long>(std::max<long>(1, this->B), requested_tokens);
+    } else {
+        mMaxTokens = default_tokens;
+    }
+
+    configure_token_buffers(config);
 
     const std::size_t stack_capacity = (stack_bytes > 0) ? stack_bytes : kDefaultStackBytes;
     if (allocate_stack) {
@@ -343,8 +359,10 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     create_cuda_resources();
     allocate_non_block_state(config);
     allocate_simplified_activations(config);
-    allocate_simplified_gradients(config);
-    build_activation_grad_zero_segments();
+    if (!mInferenceOnlyBuffers) {
+        allocate_simplified_gradients(config);
+        build_activation_grad_zero_segments();
+    }
     allocate_simplified_quant_buffers(config, options);
     allocate_residual_buffers(config, options.OffloadResidual);
     allocate_scratch_buffers(config);
@@ -390,6 +408,80 @@ Tensor& DslRunState::get_final_residual() {
         throw std::runtime_error("DslRunState: residual manager not initialized");
     }
     return mResidualManager->get_final_residual();
+}
+
+void DslRunState::configure_token_buffers(const PretrainedConfig& cfg) {
+    if (!mDynamicTokenBuffers) {
+        return;
+    }
+
+    const long token_batch = 1;
+    const long token_capacity = std::max<long>(1, mMaxTokens);
+
+    // In serving, model execution uses flat token views [1, max_tokens] for both prefill
+    // and decode paths, so token buffers must be sized by capacity, not static [B, T].
+    Inputs = mAllocator->allocate(ETensorDType::INT32, "inputs", {token_batch, token_capacity});
+
+    const bool multimodal_rope = cfg.Rope.is_multimodal();
+    const long pos_planes = multimodal_rope ? 3 : 1;
+    if (pos_planes > 1) {
+        PositionIDs = mAllocator->allocate(ETensorDType::INT32, "pos_ids", {pos_planes, token_batch, token_capacity});
+    } else {
+        PositionIDs = mAllocator->allocate(ETensorDType::INT32, "pos_ids", {token_batch, token_capacity});
+    }
+    Targets = mAllocator->allocate(ETensorDType::INT32, "targets", {token_batch, token_capacity});
+
+    Inputs_CPU = mAllocator->allocate(ETensorDType::INT32, "inputs_cpu", EAllocationType::PINNED, {token_batch, token_capacity});
+    if (pos_planes > 1) {
+        PositionIDs_CPU = mAllocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {pos_planes, token_batch, token_capacity});
+    } else {
+        PositionIDs_CPU = mAllocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {token_batch, token_capacity});
+    }
+    Targets_CPU = mAllocator->allocate(ETensorDType::INT32, "targets_cpu", EAllocationType::PINNED, {token_batch, token_capacity});
+    Losses = mAllocator->allocate(ETensorDType::FP32, "losses", {token_batch, token_capacity});
+
+    if (cfg.UseVisualInputs) {
+        const long C = cfg.HiddenSize;
+        const long max_visual = token_batch * token_capacity;
+        VisualPosMasks = mAllocator->allocate(ETensorDType::INT32, "visual_pos_masks", {token_batch, token_capacity});
+        VisualPosMasks_CPU = mAllocator->allocate(ETensorDType::INT32, "visual_pos_masks_cpu", EAllocationType::PINNED, {token_batch, token_capacity});
+        VisualEmbeds = mAllocator->allocate(cfg.DType, "visual_embeds", {max_visual, C});
+        VisualEmbeds_CPU = mAllocator->allocate(cfg.DType, "visual_embeds_cpu", EAllocationType::PINNED, {max_visual, C});
+        std::memset(VisualPosMasks_CPU.Data, 0, static_cast<std::size_t>(VisualPosMasks_CPU.bytes()));
+        std::memset(VisualEmbeds_CPU.Data, 0, static_cast<std::size_t>(VisualEmbeds_CPU.bytes()));
+
+        int deepstack_layers = cfg.DeepstackVisualLayers;
+        if (deepstack_layers < 0) {
+            deepstack_layers = 0;
+        }
+        if (deepstack_layers > 0) {
+            DeepstackVisualEmbeds.resize(static_cast<std::size_t>(deepstack_layers));
+            DeepstackVisualEmbeds_CPU.resize(static_cast<std::size_t>(deepstack_layers));
+            for (int i = 0; i < deepstack_layers; ++i) {
+                const std::string suffix = std::to_string(i);
+                const std::string name = "deepstack_visual_embeds_" + suffix;
+                const std::string cpu_name = "deepstack_visual_embeds_cpu_" + suffix;
+                DeepstackVisualEmbeds[static_cast<std::size_t>(i)] =
+                    mAllocator->allocate(cfg.DType, name.c_str(), {max_visual, C});
+                DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)] =
+                    mAllocator->allocate(cfg.DType, cpu_name.c_str(), EAllocationType::PINNED, {max_visual, C});
+                std::memset(
+                    DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)].Data,
+                    0,
+                    static_cast<std::size_t>(DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)].bytes()));
+            }
+        } else {
+            DeepstackVisualEmbeds.clear();
+            DeepstackVisualEmbeds_CPU.clear();
+        }
+    } else {
+        VisualPosMasks = {};
+        VisualPosMasks_CPU = {};
+        VisualEmbeds = {};
+        VisualEmbeds_CPU = {};
+        DeepstackVisualEmbeds.clear();
+        DeepstackVisualEmbeds_CPU.clear();
+    }
 }
 
 void DslRunState::ensure_rope_freq_capacity(const PretrainedConfig& cfg, int required_seq_len) {
@@ -438,8 +530,8 @@ void DslRunState::ensure_rope_freq_capacity(const PretrainedConfig& cfg, int req
 }
 
 void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
-    const long B = this->B;
-    const long T = this->T;
+    const long B = activation_batch_size();
+    const long T = activation_seq_len();
     const long C = cfg.HiddenSize;
     const long V = cfg.VocabSize;
     const auto dtype = mActivationDtype;
@@ -494,19 +586,24 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
         }
     }
 
-    mNonBlockGradients.d_ln_final = mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
-    // Always allocate d_embeddings even in LoRA-only mode. While embedding backward
-    // is skipped in LoRA mode, the autodiff graph still produces d_embed_1 as an
-    // intermediate. Without a persistent buffer, ensure_output_tensor allocates it on
-    // the stack where it blocks can_restore_stack for the entire backward pass (its
-    // last_use is the final embedding_backward op), preventing per-layer stack restores
-    // and causing stack OOM on MoE models with many layers.
-    mNonBlockGradients.d_embeddings = mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+    if (!mInferenceOnlyBuffers) {
+        mNonBlockGradients.d_ln_final = mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
+        // Always allocate d_embeddings even in LoRA-only mode. While embedding backward
+        // is skipped in LoRA mode, the autodiff graph still produces d_embed_1 as an
+        // intermediate. Without a persistent buffer, ensure_output_tensor allocates it on
+        // the stack where it blocks can_restore_stack for the entire backward pass (its
+        // last_use is the final embedding_backward op), preventing per-layer stack restores
+        // and causing stack OOM on MoE models with many layers.
+        mNonBlockGradients.d_embeddings = mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+    } else {
+        mNonBlockGradients.d_ln_final = {};
+        mNonBlockGradients.d_embeddings = {};
+    }
 }
 
 void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
-    const long B = this->B;
-    const long T = this->T;
+    const long B = activation_batch_size();
+    const long T = activation_seq_len();
     const long C = cfg.HiddenSize;
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
@@ -720,8 +817,14 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
 }
 
 void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
-    const long B = this->B;
-    const long T = this->T;
+    if (mInferenceOnlyBuffers) {
+        mSimplifiedGradients.clear();
+        mSimplifiedGradientsBase.clear();
+        return;
+    }
+
+    const long B = activation_batch_size();
+    const long T = activation_seq_len();
     const long C = cfg.HiddenSize;
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
@@ -941,8 +1044,8 @@ void DslRunState::build_activation_grad_zero_segments() {
 }
 
 void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options) {
-    const long B = this->B;
-    const long T = this->T;
+    const long B = activation_batch_size();
+    const long T = activation_seq_len();
     const long C = cfg.HiddenSize;
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
@@ -964,6 +1067,11 @@ void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg,
         fp8_cfg.margin = static_cast<float>(options.RecipeOptions.fp8_margin);
         mFP8ScalingState = std::make_unique<modules::FP8ScalingState>(
             fp8_cfg, mAllocator, DeviceId, cfg.NumLayers);
+    }
+
+    if (mInferenceOnlyBuffers) {
+        mSimplifiedQuantGrads = {};
+        return;
     }
 
     if (mGradQuantDtype == mGradDtype) {
@@ -996,8 +1104,8 @@ void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg,
 }
 
 void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
-    const long B = this->B;
-    const long T = this->T;
+    const long B = activation_batch_size();
+    const long T = activation_seq_len();
     const long C = cfg.HiddenSize;
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
@@ -1038,8 +1146,8 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
             {BT, n_chunks});
     }
 
-    // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
-    if (!mLoraOnlyMode) {
+    // Encoder backward scratch buffers - skip in LoRA-only mode and inference-only mode.
+    if (!mLoraOnlyMode && !mInferenceOnlyBuffers) {
         const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);
         const long num_c_groups = (C + group_width - 1) / group_width;
         mScratch.encoder_bwd_scratch = mAllocator->allocate(
@@ -1048,6 +1156,10 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
             ETensorDType::INT32, "encoder_bwd_indices", EAllocationType::PINNED, {B, T, num_c_groups});
         mScratch.encoder_bwd_info = mAllocator->allocate(
             ETensorDType::INT32, "encoder_bwd_info", EAllocationType::PINNED, {B, T, 4 * num_c_groups});
+    } else {
+        mScratch.encoder_bwd_scratch = {};
+        mScratch.encoder_bwd_indices = {};
+        mScratch.encoder_bwd_info = {};
     }
 
     const int attn_chunks = mAttnBwdChunks;
@@ -1118,12 +1230,14 @@ Tensor* DslRunState::get_gradient_quant_buffer(int op) {
 }
 
 void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg, bool offload_residuals) {
+    const int residual_B = static_cast<int>(activation_batch_size());
+    const int residual_T = static_cast<int>(activation_seq_len());
     mOffloadResiduals = offload_residuals;
     mResidualManager = std::make_unique<modules::ResidualManager>(
         mAllocator,
         cfg.NumLayers,
-        static_cast<int>(B),
-        static_cast<int>(T),
+        residual_B,
+        residual_T,
         cfg.HiddenSize,
         cfg.DType,
         offload_residuals,

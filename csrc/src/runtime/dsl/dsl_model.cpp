@@ -1099,12 +1099,14 @@ DslModel::DslModel(const PretrainedConfig& config,
                                               external_params.empty() ? nullptr : &external_params,
                                               use_weight_manager);
     std::optional<ETensorDType> grad_dtype_override = options.GradientType;
+    const bool allocate_param_grads = !options.DynamicTokenBuffers;
     mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator,
                                             options.OffloadGrads,
                                             options.offload_alloc(),
                                             mNumShards,
                                             mConfig->TiedWordEmbeddings,
-                                            grad_dtype_override);
+                                            grad_dtype_override,
+                                            allocate_param_grads);
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {

@@ -1233,7 +1233,8 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
                   << total_mem / (1024*1024) << " MiB" << std::endl;
     }
 
-    ctx.Model->allocate_run_state(mOptions, comm, B, T, /*allocate_optimizer=*/true);
+    const bool allocate_optimizer_state = !mOptions.DynamicTokenBuffers;
+    ctx.Model->allocate_run_state(mOptions, comm, B, T, allocate_optimizer_state);
 
     // DEBUG: GPU memory after run state allocation
     if (mOptions.DebugMemoryBreakdown && comm.rank() == 0) {

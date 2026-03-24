@@ -1697,6 +1697,13 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // CPU-side phase timing
     static const bool flat_step_profile = std::getenv("SUROGATE_FLAT_STEP_PROFILE") != nullptr;
     static int flat_step_profile_count = 0;
+    // Track inter-step gap (time between end of previous flat_step and start of this one)
+    static auto last_flat_step_end = std::chrono::high_resolution_clock::now();
+    long inter_step_gap_us = 0;
+    if (flat_step_profile) {
+        inter_step_gap_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - last_flat_step_end).count();
+    }
     using hrc = std::chrono::high_resolution_clock;
     auto t_start = hrc::now();
     auto t_phase = t_start;
@@ -2336,13 +2343,14 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         const long total_us = us_since(t_start);
         if (flat_step_profile_count < 50) {
             std::fprintf(stderr,
-                "[FLAT_STEP] #%d total=%ldus "
+                "[FLAT_STEP] #%d total=%ldus gap=%ldus "
                 "P1_alloc=%ld P2_select=%ld P3_build=%ld P4_upload=%ld "
                 "P5_state=%ld P5b_plan=%ld P6_forward=%ld P7_launch=%ld P7_sync=%ld P8_update=%ld\n",
-                flat_step_profile_count, total_us,
+                flat_step_profile_count, total_us, inter_step_gap_us,
                 p1_us, p2_us, p3_us, p4_us, p5_us, p5b_us, p6_us, p7_launch_us, p7_us, p8_us);
         }
         flat_step_profile_count++;
+        last_flat_step_end = std::chrono::high_resolution_clock::now();
     }
 
     return result;

@@ -46,7 +46,8 @@ public:
                  EAllocationType offload_alloc = EAllocationType::PINNED,
                  int num_shards = 1,
                  bool tied_embeddings = false,
-                 std::optional<ETensorDType> grad_dtype_override = std::nullopt);
+                 std::optional<ETensorDType> grad_dtype_override = std::nullopt,
+                 bool allocate_grad_tensors = true);
 
     /// Configure multi-GPU gradient reduction
     void configure(const DslGradStoreConfig& config);

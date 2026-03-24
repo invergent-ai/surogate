@@ -56,6 +56,14 @@ struct RuntimeOptions {
     bool OffloadQuants = false;
     bool OffloadOptimizer = false;
     bool OffloadGrads  = false;
+
+    // Serving optimization: allocate token/activation buffers by flat token capacity
+    // instead of static [B, T] runtime shapes.
+    bool DynamicTokenBuffers = false;
+    // Flat token capacity used when DynamicTokenBuffers=true.
+    // 0 means fallback to B*T.
+    int MaxTokenCapacity = 0;
+
     bool UseZeroCopy   = false;
     bool UseWriteCombined = false;
     bool ShardWeights = false;

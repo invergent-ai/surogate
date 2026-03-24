@@ -307,7 +307,8 @@ NB_MODULE(_surogate, m) {
         "Backwards-compatibility: `LLamaOptions` is an alias of this class.")
         .def("__init__", [](RuntimeOptions *t, const std::string& recompute, bool offload_residual,
             bool use_cuda_graphs, bool trigger_timing_events,
-            bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
+            bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads,
+            bool dynamic_token_buffers, int max_token_capacity, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
             bool init_projections_to_zero, bool debug_memory_breakdown, int lmhead_chunks, int attn_bwd_chunks, bool long_context,
             int min_stack_mb, int stack_slack_mb,
@@ -347,6 +348,8 @@ NB_MODULE(_surogate, m) {
                 .OffloadQuants = offload_quants,
                 .OffloadOptimizer = offload_optimizer,
                 .OffloadGrads = offload_grads,
+                .DynamicTokenBuffers = dynamic_token_buffers,
+                .MaxTokenCapacity = max_token_capacity,
                 .UseZeroCopy = use_zero_copy,
                 .UseWriteCombined = use_write_combined,
                 .ShardWeights = shard_weights,
@@ -376,6 +379,8 @@ NB_MODULE(_surogate, m) {
              nb::arg("offload_quants") = false,
              nb::arg("offload_optimizer") = false,
              nb::arg("offload_grads") = false,
+             nb::arg("dynamic_token_buffers") = false,
+             nb::arg("max_token_capacity") = 0,
              nb::arg("use_zero_copy") = false,
              nb::arg("use_write_combined") = false,
              nb::arg("shard_weights") = false,
@@ -441,6 +446,10 @@ NB_MODULE(_surogate, m) {
         .def_rw("offload_quants", &RuntimeOptions::OffloadQuants, "Offload quantized weights (if applicable).")
         .def_rw("offload_optimizer", &RuntimeOptions::OffloadOptimizer, "Offload optimizer state (momentum and variance buffers).")
         .def_rw("offload_grads", &RuntimeOptions::OffloadGrads, "Offload gradients.")
+        .def_rw("dynamic_token_buffers", &RuntimeOptions::DynamicTokenBuffers,
+                "Allocate serving token/activation buffers by flat token capacity instead of static [B, T].")
+        .def_rw("max_token_capacity", &RuntimeOptions::MaxTokenCapacity,
+                "Flat token capacity used when dynamic_token_buffers is enabled (0 = fallback to B*T).")
         .def_rw("offload_experts", &RuntimeOptions::OffloadExperts, "Offload MoE expert NF4 weights to CPU, stream on-demand.")
         .def_rw("selective_expert_dequant", &RuntimeOptions::SelectiveExpertDequant, "Only dequantize router-selected experts (reduces memory).")
         .def_rw("use_zero_copy", &RuntimeOptions::UseZeroCopy, "Use zero-copy buffers where supported.")

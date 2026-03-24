@@ -78,6 +78,8 @@ public:
     bool large_bwd_temps_on_stack() const { return mRecomputeLevel >= RecomputeLevel::Enabled; }
     bool is_lora_only_mode() const { return mLoraOnlyMode; }
     bool is_prequantized() const { return mPrequantized; }
+    bool dynamic_token_buffers() const { return mDynamicTokenBuffers; }
+    long max_token_capacity() const { return mMaxTokens; }
 
     /// @brief Get the recompute level
     RecomputeLevel recompute_level() const { return mRecomputeLevel; }
@@ -170,6 +172,10 @@ public:
     [[nodiscard]] float moe_aux_loss_coef() const { return mMoEAuxLossCoef; }
 
 private:
+    [[nodiscard]] long activation_batch_size() const { return mDynamicTokenBuffers ? 1L : B; }
+    [[nodiscard]] long activation_seq_len() const { return mDynamicTokenBuffers ? mMaxTokens : T; }
+    void configure_token_buffers(const PretrainedConfig& cfg);
+
     void allocate_non_block_state(const PretrainedConfig& cfg);
     void allocate_simplified_activations(const PretrainedConfig& cfg);
     void allocate_simplified_gradients(const PretrainedConfig& cfg);
@@ -187,6 +193,9 @@ private:
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
     bool mPrequantized = false;
+    bool mDynamicTokenBuffers = false;
+    bool mInferenceOnlyBuffers = false;
+    long mMaxTokens = 0;
     bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
     ETensorDType mGradDtype = ETensorDType::BF16;

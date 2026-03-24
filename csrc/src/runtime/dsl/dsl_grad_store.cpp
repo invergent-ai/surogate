@@ -35,7 +35,8 @@ DslGradStore::DslGradStore(const DslParamStore& params,
                            EAllocationType offload_alloc,
                            int num_shards,
                            bool tied_embeddings,
-                           std::optional<ETensorDType> grad_dtype_override)
+                           std::optional<ETensorDType> grad_dtype_override,
+                           bool allocate_grad_tensors)
     : mAllocator(allocator),
       mOffloadGrads(offload_grads),
       mOffloadAlloc(offload_alloc),
@@ -44,7 +45,15 @@ DslGradStore::DslGradStore(const DslParamStore& params,
         throw std::runtime_error("DslGradStore: allocator is null");
     }
 
-    // Full gradients are always allocated on device for NCCL compatibility.
+    // Serving-only init can skip parameter gradient tensor allocation entirely.
+    // The object still exists so forward-only executors can keep their interfaces.
+    if (!allocate_grad_tensors) {
+        mBlockStates[0] = {-1, false, nullptr};
+        mBlockStates[1] = {-1, false, nullptr};
+        return;
+    }
+
+    // Training mode: full gradients are allocated on device for NCCL compatibility.
     // Sharded gradients (for ZeRO-2) are allocated later in configure() and can be offloaded.
     const EAllocationType grad_alloc = EAllocationType::ON_DEVICE;
 
