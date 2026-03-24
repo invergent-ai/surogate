@@ -604,7 +604,8 @@ void ContinuousGenerationEngine::init(
         dsl::DslParamStore& weights,
         const modules::ModelConfig& config,
         const RuntimeOptions& options,
-        DeviceMemoryStack& arena) {
+        DeviceMemoryStack& arena,
+        int max_num_batched_tokens) {
     if (initialized_) {
         throw std::runtime_error("ContinuousGenerationEngine: already initialized");
     }
@@ -615,7 +616,6 @@ void ContinuousGenerationEngine::init(
     vocab_size_ = config.VocabSize;
     fallback_token_id_ = 0;
     use_cuda_graphs_ = use_cuda_graphs;
-    cuda_graph_primed_ = false;
     run_state_ = &run_state;
     weights_ = &weights;
     config_ = &config;
@@ -710,9 +710,17 @@ void ContinuousGenerationEngine::init(
     // Pre-allocate flat-step buffers (avoid per-step cudaMallocAsync).
     // max_batched_tokens is the token budget per flat_step.
     // Use the runtime's B*T capacity as the budget.
-    max_batched_tokens_ = static_cast<int>(
+    // Token budget per flat_step: limits how many tokens are processed per step.
+    // A smaller budget (e.g., 2048 like vLLM) creates many fast steps with
+    // fine-grained prefill/decode interleaving. A larger budget creates fewer,
+    // slower steps. The runtime capacity is the upper bound.
+    const int runtime_capacity = static_cast<int>(
         run_state.Inputs.Sizes[0] * (run_state.Inputs.Rank >= 2 ? run_state.Inputs.Sizes[1] : 1));
-    if (max_batched_tokens_ <= 0) max_batched_tokens_ = 2048;
+    if (max_num_batched_tokens > 0 && max_num_batched_tokens < runtime_capacity) {
+        max_batched_tokens_ = max_num_batched_tokens;
+    } else {
+        max_batched_tokens_ = (runtime_capacity > 0) ? runtime_capacity : 2048;
+    }
     prefill_token_buckets_ = build_prefill_token_buckets(max_batched_tokens_);
     const auto MBT = static_cast<std::size_t>(max_batched_tokens_);
 
@@ -1328,8 +1336,6 @@ int ContinuousGenerationEngine::add_sequence(
     slot.finished = false;
 
     batch_dirty_ = true;  // compact batch must be rebuilt
-    // Also invalidate CUDA graph since B may change.
-    cuda_graph_primed_ = false;
 
     return slot_id;
 }
@@ -1551,7 +1557,6 @@ std::vector<int> ContinuousGenerationEngine::add_sequences_batch(
     }
 
     batch_dirty_ = true;
-    cuda_graph_primed_ = false;
     return slot_ids;
 }
 
@@ -2176,9 +2181,6 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         ds.cu_seqlens_q_gpu = cu_seqlens_q_gpu_;
         ds.cu_seqlens_k_gpu = seqused_k_gpu_;
         ds.seq_lens_k_gpu = seqused_k_gpu_;
-        // With pinned buffers, the recurrent/conv state addresses are stable —
-        // safe for CUDA graph capture. Set strict_state_buffers so ops don't
-        // try to allocate (they must use the pre-allocated buffers).
         ds.flat_batch_size = batch_size;
         ds.strict_state_buffers = state.pinned;
         graph_executor.execute_decode_step(
@@ -2289,6 +2291,35 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     CUDA_CHECK(cudaMemcpyAsync(pinned_sampled_, sampled_tokens_gpu_,
         BS * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaEventRecord(sampled_ready_event_, stream));
+
+    // === Deferred sync mode: save state and return without blocking ===
+    if (deferred_sync_) {
+        // Save state needed by flat_step_collect to run Phase 8
+        pending_batch_size_ = batch_size;
+        pending_active_sids_.assign(active_sids.begin(), active_sids.end());
+        pending_q_lens_.assign(q_lens.begin(), q_lens.end());
+        pending_new_slot_ids_ = std::move(result.new_slot_ids);
+        pending_compact_batch_needs_rebuild_ = compact_batch_needs_rebuild;
+        has_pending_sampled_ = true;
+
+        if (flat_step_profile) {
+            p7_us = us_since(t_phase);
+            const long total_us = us_since(t_start);
+            if (flat_step_profile_count < 50) {
+                std::fprintf(stderr,
+                    "[FLAT_STEP_LAUNCH] #%d total=%ldus gap=%ldus "
+                    "P1_alloc=%ld P2_select=%ld P3_build=%ld P4_upload=%ld "
+                    "P5_state=%ld P5b_plan=%ld P6_forward=%ld P7_launch=%ld\n",
+                    flat_step_profile_count, total_us, inter_step_gap_us,
+                    p1_us, p2_us, p3_us, p4_us, p5_us, p5b_us, p6_us, p7_launch_us);
+            }
+            flat_step_profile_count++;
+            last_flat_step_end = std::chrono::high_resolution_clock::now();
+        }
+        return result;  // result has new_slot_ids but no sampled_tokens yet
+    }
+
+    // === Synchronous path: sync + Phase 8 inline ===
     CUDA_CHECK(cudaEventSynchronize(sampled_ready_event_));
 
     if (flat_step_profile) { p7_us = us_since(t_phase); t_phase = hrc::now(); }
@@ -2362,6 +2393,105 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// flat_step_launch — truly non-blocking: launches GPU work without sync
+// ---------------------------------------------------------------------------
+std::vector<int> ContinuousGenerationEngine::flat_step_launch(
+        const std::vector<std::vector<int32_t>>& new_prompts,
+        const FlatStepConfig& config,
+        dsl::GraphExecutor& graph_executor,
+        NCCLCommunicator& comm,
+        const modules::ForwardHook* hook) {
+    // If a previous launch is still pending, collect it first (blocking).
+    if (has_pending_sampled_) {
+        flat_step_collect();
+    }
+
+    // Enable deferred sync: flat_step will skip cudaEventSynchronize + Phase 8,
+    // saving state for flat_step_collect. The GPU work (forward + sampling + D2H)
+    // runs asynchronously while the CPU returns to the Python scheduling loop.
+    deferred_sync_ = true;
+    auto partial = flat_step(new_prompts, config, graph_executor, comm, hook);
+    deferred_sync_ = false;
+    // has_pending_sampled_ was set inside flat_step's deferred path
+    // new_slot_ids were saved to pending_new_slot_ids_ — return a copy
+    return pending_new_slot_ids_;
+}
+
+// ---------------------------------------------------------------------------
+// flat_step_collect — sync + Phase 8 for a previous flat_step_launch
+// ---------------------------------------------------------------------------
+ContinuousGenerationEngine::FlatStepResult
+ContinuousGenerationEngine::flat_step_collect() {
+    if (!has_pending_sampled_) {
+        return FlatStepResult{};
+    }
+    has_pending_sampled_ = false;
+
+    // Block until GPU finishes sampling + D2H readback
+    CUDA_CHECK(cudaEventSynchronize(sampled_ready_event_));
+
+    // Phase 8: Update slot state from pinned readback
+    const int batch_size = pending_batch_size_;
+    const int V = vocab_size_;
+    bool compact_batch_needs_rebuild = pending_compact_batch_needs_rebuild_;
+
+    FlatStepResult result;
+    result.new_slot_ids = std::move(pending_new_slot_ids_);
+    result.active_slot_ids.resize(batch_size);
+    result.sampled_tokens.resize(batch_size);
+    result.finished.resize(batch_size, 0);
+    result.completion_lens.resize(batch_size, 0);
+
+    for (int i = 0; i < batch_size; ++i) {
+        const int sid = pending_active_sids_[i];
+        auto& slot = slots_[static_cast<std::size_t>(sid)];
+        const bool was_prefilling = slot.prefilling();
+        int32_t tok = pinned_sampled_[i];
+        if (!is_valid_token_id(tok, V)) {
+            tok = fallback_token_id_;
+        }
+
+        if (was_prefilling) {
+            slot.prefill_progress += pending_q_lens_[i];
+            slot.seq_len = slot.prefill_progress;
+
+            if (!slot.prefilling()) {
+                slot.last_token = tok;
+                slot.generated_count = 1;
+                slot.prompt.clear();
+                slot.prompt.shrink_to_fit();
+                compact_batch_needs_rebuild = true;
+
+                if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
+                    slot.finished = true;
+                }
+            } else {
+                slot.generated_count = 0;
+            }
+        } else {
+            slot.seq_len += 1;
+            slot.last_token = tok;
+            slot.generated_count += 1;
+
+            if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
+                slot.finished = true;
+            }
+        }
+
+        result.active_slot_ids[i] = sid;
+        result.sampled_tokens[i] = tok;
+        result.finished[i] = slot.finished ? 1 : 0;
+        result.completion_lens[i] = slot.generated_count;
+    }
+
+    if (compact_batch_needs_rebuild) {
+        batch_dirty_ = true;
+    }
+
+    return result;
+}
+
 void ContinuousGenerationEngine::release_slot(int slot_id) {
     if (slot_id < 0 || slot_id >= max_slots_) return;
     auto& s = slots_[static_cast<std::size_t>(slot_id)];
@@ -2374,7 +2504,6 @@ void ContinuousGenerationEngine::release_slot(int slot_id) {
     s = SequenceSlot{};
     free_slot_stack_.push_back(slot_id);
     batch_dirty_ = true;
-    cuda_graph_primed_ = false;  // B may change
 }
 
 int ContinuousGenerationEngine::num_active() const {

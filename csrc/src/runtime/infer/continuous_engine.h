@@ -82,7 +82,8 @@ public:
               dsl::DslParamStore& weights,
               const modules::ModelConfig& config,
               const RuntimeOptions& options,
-              DeviceMemoryStack& arena);
+              DeviceMemoryStack& arena,
+              int max_num_batched_tokens = 0);
 
     /// Pre-warm prefill graph cache for common prompt lengths.
     /// Eliminates compilation latency on the first real request.
@@ -154,6 +155,23 @@ public:
         NCCLCommunicator& comm,
         const modules::ForwardHook* hook = nullptr);
 
+    /// Non-blocking flat_step: launches GPU work and returns immediately.
+    /// Returns new_slot_ids for the new prompts (available immediately).
+    /// Call flat_step_collect() to sync and get sampled tokens + slot updates.
+    std::vector<int> flat_step_launch(
+        const std::vector<std::vector<int32_t>>& new_prompts,
+        const FlatStepConfig& config,
+        dsl::GraphExecutor& graph_executor,
+        NCCLCommunicator& comm,
+        const modules::ForwardHook* hook = nullptr);
+
+    /// Collect results from a previous flat_step_launch.
+    /// Blocks on cudaEventSynchronize and updates slot state.
+    FlatStepResult flat_step_collect();
+
+    /// True if a flat_step_launch is pending collection.
+    bool has_pending_step() const { return has_pending_sampled_; }
+
     void release_slot(int slot_id);
     int num_active() const;
     int num_free_slots() const;
@@ -180,7 +198,6 @@ private:
     int vocab_size_ = 0;
     int32_t fallback_token_id_ = 0;
     bool use_cuda_graphs_ = false;
-    bool cuda_graph_primed_ = false;
 
     // Slot pool
     std::vector<SequenceSlot> slots_;
@@ -276,6 +293,10 @@ private:
     int pending_batch_size_ = 0;
     std::vector<int> pending_active_sids_;
     std::vector<int> pending_q_lens_;         // per-slot q_lens from previous step
+    std::vector<int> pending_new_slot_ids_;   // new_slot_ids for deferred flat_step_collect
+    bool pending_compact_batch_needs_rebuild_ = false;
+    FlatStepResult pending_result_;           // saved result from flat_step_launch
+    bool deferred_sync_ = false;              // when true, flat_step skips sync + Phase 8
 
     // CUDA graph bucket sizes
     std::vector<int> graph_buckets_;

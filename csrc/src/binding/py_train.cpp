@@ -2391,7 +2391,7 @@ void MultiGPUPyTrainer::close_generation_session(std::uint64_t session_id) {
 std::uint64_t MultiGPUPyTrainer::create_continuous_engine(
         int max_num_seqs, int max_seq_len,
         float gpu_memory_utilization, bool use_cuda_graphs,
-        int min_activation_mb) {
+        int min_activation_mb, int max_num_batched_tokens) {
     if (max_num_seqs <= 0) {
         throw std::invalid_argument("create_continuous_engine: max_num_seqs must be > 0");
     }
@@ -2447,7 +2447,8 @@ std::uint64_t MultiGPUPyTrainer::create_continuous_engine(
         engine->init(
             max_num_seqs, max_seq_len, total_pages,
             use_cuda_graphs,
-            run_state, params, model_config, mOptions, run_state.Stack);
+            run_state, params, model_config, mOptions, run_state.Stack,
+            max_num_batched_tokens);
 
         // Pre-warm prefill graphs for common prompt lengths to eliminate
         // compilation latency on the first real request.
@@ -2604,6 +2605,67 @@ MultiGPUPyTrainer::FlatStepResult MultiGPUPyTrainer::engine_flat_step(
         cfg.prefill_chunk_size = prefill_chunk_size;
 
         auto r = eng->flat_step(new_prompts, cfg, *ge, *ctx.Communicator);
+        result.new_slot_ids = std::move(r.new_slot_ids);
+        result.active_slot_ids = std::move(r.active_slot_ids);
+        result.sampled_tokens = std::move(r.sampled_tokens);
+        result.finished = std::move(r.finished);
+        result.completion_lens = std::move(r.completion_lens);
+    }, 0);
+
+    return result;
+}
+
+std::vector<int> MultiGPUPyTrainer::engine_flat_step_launch(
+        std::uint64_t engine_id,
+        const std::vector<std::vector<int32_t>>& new_prompts,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p, int prefill_chunk_size) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("engine_flat_step_launch: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    std::vector<int> new_slot_ids;
+    run_work([&](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) throw std::runtime_error("engine_flat_step_launch: not a DslModel");
+        auto* ge = dsl_model->graph_executor();
+        if (!ge) throw std::runtime_error("engine_flat_step_launch: no GraphExecutor");
+
+        infer::ContinuousGenerationEngine::FlatStepConfig cfg;
+        cfg.max_gen_len = max_gen_len;
+        cfg.temperature = temperature;
+        cfg.eos_token_id = eos_token_id;
+        cfg.top_k = top_k;
+        cfg.top_p = top_p;
+        cfg.min_p = min_p;
+        cfg.prefill_chunk_size = prefill_chunk_size;
+
+        new_slot_ids = eng->flat_step_launch(new_prompts, cfg, *ge, *ctx.Communicator);
+    }, 0);
+    return new_slot_ids;
+}
+
+MultiGPUPyTrainer::FlatStepResult MultiGPUPyTrainer::engine_flat_step_collect(
+        std::uint64_t engine_id) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("engine_flat_step_collect: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    FlatStepResult result;
+    run_work([&](sThreadContext& ctx) {
+        auto r = eng->flat_step_collect();
         result.new_slot_ids = std::move(r.new_slot_ids);
         result.active_slot_ids = std::move(r.active_slot_ids);
         result.sampled_tokens = std::move(r.sampled_tokens);

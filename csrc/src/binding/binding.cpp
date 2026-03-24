@@ -1549,7 +1549,9 @@ NB_MODULE(_surogate, m) {
         nb::arg("gpu_memory_utilization") = 0.9f,
         nb::arg("use_cuda_graphs") = true,
         nb::arg("min_activation_mb") = 512,
+        nb::arg("max_num_batched_tokens") = 0,
         "Create a continuous generation engine for iteration-level batching.\n"
+        "max_num_batched_tokens limits the token budget per step (0 = use runtime capacity).\n"
         "Returns engine_id.")
         .def("engine_add_sequences_batch", &MultiGPUPyTrainer::engine_add_sequences_batch,
         nb::arg("engine_id"), nb::arg("prompts"),
@@ -1608,6 +1610,34 @@ NB_MODULE(_surogate, m) {
         nb::arg("prefill_chunk_size") = 256,
         "Flat-token step: prefill new prompts + decode active sequences in one forward pass.\n"
         "Returns (new_slot_ids, active_slot_ids, sampled_tokens, finished, completion_lens).")
+        .def("engine_flat_step_launch", [](MultiGPUPyTrainer* trainer,
+                std::uint64_t engine_id,
+                const std::vector<std::vector<int32_t>>& new_prompts,
+                int max_gen_len, float temperature, int32_t eos_token_id,
+                int top_k, float top_p, float min_p, int prefill_chunk_size) {
+            return trainer->engine_flat_step_launch(
+                engine_id, new_prompts, max_gen_len, temperature, eos_token_id,
+                top_k, top_p, min_p, prefill_chunk_size);
+        },
+        nb::arg("engine_id"),
+        nb::arg("new_prompts"),
+        nb::arg("max_gen_len") = 512,
+        nb::arg("temperature") = 1.0f,
+        nb::arg("eos_token_id") = 2,
+        nb::arg("top_k") = 0,
+        nb::arg("top_p") = 1.0f,
+        nb::arg("min_p") = 0.0f,
+        nb::arg("prefill_chunk_size") = 256,
+        "Non-blocking flat_step: launches GPU work and returns immediately.")
+        .def("engine_flat_step_collect", [](MultiGPUPyTrainer* trainer,
+                std::uint64_t engine_id) {
+            auto r = trainer->engine_flat_step_collect(engine_id);
+            return nb::make_tuple(
+                r.new_slot_ids, r.active_slot_ids, r.sampled_tokens,
+                r.finished, r.completion_lens);
+        },
+        nb::arg("engine_id"),
+        "Collect results from a previous engine_flat_step_launch.")
         .def("engine_get_stats", [](MultiGPUPyTrainer* trainer,
                 std::uint64_t engine_id) {
             auto stats = trainer->engine_get_stats(engine_id);

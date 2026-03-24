@@ -235,7 +235,8 @@ public:
         int max_num_seqs, int max_seq_len,
         float gpu_memory_utilization,
         bool use_cuda_graphs,
-        int min_activation_mb = 512);
+        int min_activation_mb = 512,
+        int max_num_batched_tokens = 0);
 
     /// Add a sequence to the engine (prefill + assign slot).  Returns slot_id.
     int engine_add_sequence(
@@ -276,6 +277,14 @@ public:
         const std::vector<std::vector<int32_t>>& new_prompts,
         int max_gen_len, float temperature, int32_t eos_token_id,
         int top_k, float top_p, float min_p, int prefill_chunk_size = 256);
+
+    std::vector<int> engine_flat_step_launch(
+        std::uint64_t engine_id,
+        const std::vector<std::vector<int32_t>>& new_prompts,
+        int max_gen_len, float temperature, int32_t eos_token_id,
+        int top_k, float top_p, float min_p, int prefill_chunk_size = 256);
+
+    FlatStepResult engine_flat_step_collect(std::uint64_t engine_id);
 
     /// Lightweight runtime stats for a continuous engine.
     struct ContinuousEngineStats {
