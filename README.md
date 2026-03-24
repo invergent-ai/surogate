@@ -61,6 +61,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
 ### ✨ Highlights
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
+- **🚀 Native OpenAI-compatible serving**: run local inference with `surogate serve`
 - [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning**](https://docs.surogate.ai/guides/rl-training): advanced GRPO training and evaluation with custom, deterministic environments
 - [**🔧 RL Environments***](https://docs.surogate.ai/guides/rl-environments): predictable environments for RL training
 - [**🖥️...🖥️ Native multi-GPU**](https://docs.surogate.ai/guides/multi-gpu) training with multi-threaded backend
@@ -152,6 +153,48 @@ surogate sft config.yaml
 
 3) Outputs:
 - checkpoints, logs and artifacts are written under `output_dir`
+
+---
+
+## Quickstart (Native Serving)
+
+1) Create a serving config:
+
+```yaml
+model: Qwen/Qwen3-0.6B
+host: 0.0.0.0
+port: 8000
+api_key: my-secret-key
+
+gpus: 1
+dtype: bf16
+max_num_seqs: 64
+max_num_batched_tokens: 4096
+max_gen_len: 512
+temperature: 0.7
+top_p: 0.95
+```
+
+2) Start the server:
+
+```bash
+surogate serve serve.yaml
+```
+
+3) Call the OpenAI-compatible endpoint:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [{"role":"user","content":"Write a one-line haiku about GPUs."}],
+    "max_tokens": 64
+  }'
+```
+
+Available endpoints: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`.
 
 ---
 

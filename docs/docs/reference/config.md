@@ -16,6 +16,68 @@ This section provides a comprehensive reference for all configuration options av
 | `save_total_limit`         | int    | `5`            | Limit the total amount of checkpoints. Deletes older checkpoints in `output_dir`.      |
 | `from_scratch`             | bool   | `false`        | Train from scratch (random initialization) instead of fine-tuning a pre-trained model. |
 
+## Native Serving (`surogate serve`)
+
+These options apply to the native OpenAI-compatible serving engine.
+
+### Server and Runtime Settings
+
+| Option                   | Type   | Default   | Description                                                                                              |
+| ------------------------ | ------ | --------- | -------------------------------------------------------------------------------------------------------- |
+| `model`                  | string | required  | Hugging Face model ID or local model path to serve.                                                     |
+| `model_id`               | string | `null`    | Public model ID reported by API responses. Defaults to `model` when unset.                              |
+| `host`                   | string | `0.0.0.0` | Bind host for the HTTP server.                                                                           |
+| `port`                   | int    | `8000`    | Bind port for the HTTP server.                                                                           |
+| `log_level`              | string | `"info"`  | Uvicorn logging level (`"debug"`, `"info"`, `"warning"`, etc.).                                         |
+| `api_key`                | string | `null`    | Optional bearer token required by the API when set.                                                      |
+| `dtype`                  | string | `"bf16"`  | Runtime compute dtype. Options: `"bf16"`, `"fp32"`.                                                      |
+| `gpus`                   | int    | `1`       | Number of GPUs to initialize for serving runtime.                                                        |
+| `max_num_seqs`           | int    | `64`      | Maximum active sequences (continuous batching capacity).                                                 |
+| `max_num_batched_tokens` | int    | `2048`    | Scheduler/runtime token budget used for runtime buffer sizing.                                           |
+| `max_model_len`          | int    | `null`    | Maximum context length exposed by the server. If `null`, inferred from model/tokenizer.                 |
+| `trust_remote_code`      | bool   | `true`    | Whether to trust remote code when loading tokenizer/model metadata from Hugging Face.                    |
+| `min_stack_mb`           | int    | `null`    | Optional explicit minimum runtime stack arena size (MiB).                                                |
+| `gpu_memory_utilization` | float  | `0.9`     | Fraction of GPU memory budgeted for serving allocations. Must be in `(0, 1]`.                           |
+| `offload_experts`        | bool   | `false`   | Enable MoE expert offloading when supported by the runtime binding/model path.                           |
+| `use_cuda_graphs`        | bool   | `true`    | Enable CUDA graphs in the inference runtime.                                                             |
+| `prefill_chunk_size`     | int    | `2048`    | Prefill chunk size for long-prompt chunked prefill. Set `0` to disable chunking.                        |
+
+### Default Generation Settings
+
+| Option               | Type  | Default | Description                                                              |
+| -------------------- | ----- | ------- | ------------------------------------------------------------------------ |
+| `max_gen_len`        | int   | `512`   | Default max generated tokens per request (unless request overrides it).  |
+| `temperature`        | float | `1.0`   | Default sampling temperature.                                            |
+| `top_k`              | int   | `0`     | Default top-k cutoff (`0` disables top-k filtering).                     |
+| `top_p`              | float | `1.0`   | Default nucleus sampling probability (top-p).                            |
+| `min_p`              | float | `0.0`   | Default minimum-probability floor.                                       |
+| `repetition_penalty` | float | `1.0`   | Default repetition penalty (`> 0`).                                      |
+
+**Example serving config:**
+
+```yaml
+model: Qwen/Qwen3-0.6B
+model_id: qwen3-0.6b-local
+host: 0.0.0.0
+port: 8000
+api_key: ${SUROGATE_API_KEY}
+
+# runtime
+gpus: 1
+dtype: bf16
+max_num_seqs: 64
+max_num_batched_tokens: 8192
+gpu_memory_utilization: 0.9
+
+# generation defaults
+max_gen_len: 512
+temperature: 0.7
+top_p: 0.95
+top_k: 0
+min_p: 0.0
+repetition_penalty: 1.0
+```
+
 ## Model Settings
 
 | Option          | Type   | Default     | Description                                                                                                                                                                                                                                                                               |
