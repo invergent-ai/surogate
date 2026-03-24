@@ -249,6 +249,10 @@ class Qwen3_5CausalModel(_Qwen3_5DenseBase):
 
     _hf_block_mappings_ = _build_qwen3_5_block_mappings("model.layers.{layer}")
 
+    _inference_opts_ = {
+        "decode": ["gdn_qkvzba_fuse"],
+    }
+
 
 @model
 @hf_config(
@@ -282,6 +286,10 @@ class Qwen3_5ConditionalModel(_Qwen3_5DenseBase):
     lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
 
     _hf_block_mappings_ = _build_qwen3_5_block_mappings("model.language_model.layers.{layer}")
+
+    _inference_opts_ = {
+        "decode": [],
+    }
 
     # Multimodal external inputs (for vision-enabled Qwen3.5 conditional models).
     visual_pos_masks = Activation(

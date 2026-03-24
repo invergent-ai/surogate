@@ -114,6 +114,8 @@ class LlamaModel:
     # Block mappings composed from module-level defaults (GQAAttention, SwiGLUMLP, RMSNorm).
     _hf_block_mappings_ = build_dense_block_mappings()
 
+    _inference_opts_ = {}
+
     @forward
     def forward(
         self,

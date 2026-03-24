@@ -138,6 +138,7 @@ class ModuleIR:
     hf_config: Dict[str, Any] = field(default_factory=dict)
     hf_weight_mapping: Dict[str, Any] = field(default_factory=dict)
     hf_export_mapping: Dict[str, Any] = field(default_factory=dict)
+    inference_opts: Dict[str, List[str]] = field(default_factory=dict)
     params: Dict[str, TensorRef] = field(default_factory=dict)
     forward_graph: Optional[GraphIR] = None
     backward_graph: Optional[GraphIR] = None
@@ -1399,6 +1400,10 @@ def compile_model_spec(
         for name, mapping in spec.hf_export.mappings.items():
             ir.hf_export_mapping[name] = _serialize_hf_spec(mapping)
 
+    # Inference optimization passes
+    if spec.python_class and hasattr(spec.python_class, "_inference_opts_"):
+        ir.inference_opts = spec.python_class._inference_opts_
+
     # Create instance first so we can build dim_map for param resolution
     instance = None
     dim_map: Dict[str, str] = {}
@@ -1822,6 +1827,9 @@ def _module_ir_to_dict(ir: ModuleIR) -> Dict[str, Any]:
 
     if ir.activation_layout:
         result["activation_layout"] = _activation_layout_ir_to_dict(ir.activation_layout)
+
+    if ir.inference_opts:
+        result["inference_opts"] = ir.inference_opts
 
     return result
 

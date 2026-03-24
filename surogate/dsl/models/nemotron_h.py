@@ -349,6 +349,8 @@ class NemotronHModel:
         "shared_expert_down": "backbone.layers.{layer}.mixer.shared_experts.down_proj.weight",
     }
 
+    _inference_opts_ = {}
+
     @forward
     def forward(
         self,

@@ -260,11 +260,11 @@ class Qwen3Block:
 
             # MLP (SwiGLU)
             ln2_flat = g.view(ln2_out, shape=[B * T, self.C], out_name="ln2_flat")
-            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", out_name="mlp_up_flat")
+            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", role="mlp_up_proj", out_name="mlp_up_flat")
             mlp_up = g.view(mlp_up_flat, shape=[B, T, self.MUp], out_name="mlp_up")
-            mlp_act = g.swiglu(mlp_up, out_name="swiglu")
+            mlp_act = g.swiglu(mlp_up, role="mlp_activation", out_name="swiglu")
             mlp_act_flat = g.view(mlp_act, shape=[B * T, self.M], out_name="swiglu_flat")
-            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", out_name="mlp_down_flat")
+            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", role="mlp_down_proj", out_name="mlp_down_flat")
             out = g.view(out_flat, shape=[B, T, self.C], out_name="mlp_down")
 
             return out, res_att

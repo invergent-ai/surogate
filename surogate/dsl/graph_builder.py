@@ -150,20 +150,24 @@ class GraphBuilder:
         accumulate: bool = False,
         alpha: float = 1.0,
         beta: float = 0.0,
+        role: str | None = None,
         out_name: str | None = None,
     ) -> GraphRef:
         """Matrix multiplication: C = alpha * op(A) @ op(B) + beta * C"""
         out = out_name if out_name else self._fresh_name("mm")
+        attrs = {
+            "transpose": str(transpose),
+            "accumulate": accumulate,
+            "alpha": alpha,
+            "beta": beta,
+        }
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="matmul",
             inputs=[self._resolve_input(a), self._resolve_input(b)],
             outputs=[out],
-            attrs={
-                "transpose": str(transpose),
-                "accumulate": accumulate,
-                "alpha": alpha,
-                "beta": beta,
-            },
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -177,20 +181,24 @@ class GraphBuilder:
         accumulate: bool = False,
         alpha: float = 1.0,
         beta: float = 0.0,
+        role: str | None = None,
         out_name: str | None = None,
     ) -> GraphRef:
         """Matrix multiplication with fused bias: C = alpha * op(A) @ op(B) + bias (+ beta * C)."""
         out = out_name if out_name else self._fresh_name("mm")
+        attrs = {
+            "transpose": str(transpose),
+            "accumulate": accumulate,
+            "alpha": alpha,
+            "beta": beta,
+        }
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="matmul_bias",
             inputs=[self._resolve_input(a), self._resolve_input(b), self._resolve_input(bias)],
             outputs=[out],
-            attrs={
-                "transpose": str(transpose),
-                "accumulate": accumulate,
-                "alpha": alpha,
-                "beta": beta,
-            },
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -287,23 +295,31 @@ class GraphBuilder:
     # Activations
     # =========================================================================
 
-    def swiglu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+    def swiglu(self, x: str | GraphRef, *, role: str | None = None, out_name: str | None = None) -> GraphRef:
         """SwiGLU activation: silu(gate) * up"""
         out = out_name if out_name else self._fresh_name("swiglu")
+        attrs = {}
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="swiglu",
             inputs=[self._resolve_input(x)],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 
-    def silu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+    def silu(self, x: str | GraphRef, *, role: str | None = None, out_name: str | None = None) -> GraphRef:
         """SiLU (Swish) activation."""
         out = out_name if out_name else self._fresh_name("silu")
+        attrs = {}
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="silu",
             inputs=[self._resolve_input(x)],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -327,23 +343,31 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def relu2(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+    def relu2(self, x: str | GraphRef, *, role: str | None = None, out_name: str | None = None) -> GraphRef:
         """ReLU squared activation."""
         out = out_name if out_name else self._fresh_name("relu2")
+        attrs = {}
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="relu2",
             inputs=[self._resolve_input(x)],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 
-    def gelu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+    def gelu(self, x: str | GraphRef, *, role: str | None = None, out_name: str | None = None) -> GraphRef:
         """GELU activation."""
         out = out_name if out_name else self._fresh_name("gelu")
+        attrs = {}
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="gelu",
             inputs=[self._resolve_input(x)],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -735,13 +759,17 @@ class GraphBuilder:
         ))
         return self._make_output(out)
 
-    def mul(self, a: str | GraphRef, b: str | GraphRef) -> GraphRef:
+    def mul(self, a: str | GraphRef, b: str | GraphRef, *, role: str | None = None) -> GraphRef:
         """Element-wise multiplication."""
         out = self._fresh_name("mul")
+        attrs = {}
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="mul",
             inputs=[self._resolve_input(a), self._resolve_input(b)],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -986,9 +1014,13 @@ class GraphBuilder:
         x: str | GraphRef,
         weights: str | GraphRef,
         offsets: str | GraphRef,
+        role: str | None = None,
     ) -> GraphRef:
         """MoE grouped GEMM."""
         out = self._fresh_name("moe_gemm")
+        attrs = {}
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="moe_grouped_gemm",
             inputs=[
@@ -997,6 +1029,7 @@ class GraphBuilder:
                 self._resolve_input(offsets),
             ],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -1006,6 +1039,7 @@ class GraphBuilder:
         weights: str,
         scatter_indices: str | GraphRef,
         gate_up_interleaved: bool | None = None,
+        role: str | None = None,
         out_name: str | None = None,
     ) -> GraphRef:
         """MoE grouped GEMM for gate+up projection.
@@ -1022,6 +1056,8 @@ class GraphBuilder:
         attrs = {}
         if gate_up_interleaved is not None:
             attrs["gate_up_interleaved"] = gate_up_interleaved
+        if role is not None:
+            attrs["role"] = role
 
         self._add_node(GraphNode(
             op="moe_grouped_gemm_gate_up",
@@ -1040,6 +1076,7 @@ class GraphBuilder:
         x: str | GraphRef,
         weights: str,
         scatter_indices: str | GraphRef,
+        role: str | None = None,
         out_name: str | None = None,
     ) -> GraphRef:
         """MoE grouped GEMM for down projection.
@@ -1053,6 +1090,9 @@ class GraphBuilder:
             Output tensor (total_tokens, hidden_size)
         """
         out = out_name or self._fresh_name("moe_down")
+        attrs = {}
+        if role is not None:
+            attrs["role"] = role
         self._add_node(GraphNode(
             op="moe_grouped_gemm_down",
             inputs=[
@@ -1061,6 +1101,7 @@ class GraphBuilder:
                 self._resolve_input(scatter_indices),
             ],
             outputs=[out],
+            attrs=attrs,
         ))
         return self._make_output(out)
 

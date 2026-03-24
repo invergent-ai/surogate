@@ -2412,6 +2412,40 @@ void register_builtin_shape_signatures() {
     }
 
     // ------------------------------------------------------------------------
+    // Qwen3.5 GDN fused projection (inference decode)
+    // gdn_fused_proj
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "gdn_fused_proj";
+        sig.min_inputs = 5;
+        sig.max_inputs = 5;
+        sig.min_outputs = 4;
+        sig.max_outputs = 4;
+
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&)
+            -> std::optional<ShapeValidationError> {
+            if (inputs.size() < 5 || outputs.size() < 4) {
+                return ShapeValidationError{
+                    "gdn_fused_proj: requires 5 inputs and 4 outputs"};
+            }
+            // ln1_flat [BT, C], qkv_w [ConvDim, C], z_w [HvVd, C], b_w [Hv, C], a_w [Hv, C]
+            const auto& ln1 = inputs[0];
+            const auto& qkv_w = inputs[1];
+            if (auto err = validators::check_rank(ln1, 2, "ln1_flat", "gdn_fused_proj")) return err;
+            if (auto err = validators::check_rank(qkv_w, 2, "qkv_weight", "gdn_fused_proj")) return err;
+            // Validate that all weights share the same C dimension
+            if (!inputs[1].empty() && !inputs[2].empty() && inputs[1][1] != inputs[2][1]) {
+                return ShapeValidationError{
+                    "gdn_fused_proj: qkv_weight and z_weight must have same C dimension"};
+            }
+            return std::nullopt;
+        };
+
+        reg.register_signature(sig);
+    }
+
     // Qwen3.5 gated delta rule forward ops
     // chunk_gated_delta_rule
     // ------------------------------------------------------------------------

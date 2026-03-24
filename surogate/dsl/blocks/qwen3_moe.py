@@ -470,15 +470,15 @@ class Qwen3MoEBlock:
 
             # Grouped GEMM for gate+up projection
             expert_gate_up = g.moe_grouped_gemm_gate_up(
-                gemm_input, "experts_gate_up", gemm_scatter, out_name="expert_gate_up",
+                gemm_input, "experts_gate_up", gemm_scatter, role="moe_gate_up", out_name="expert_gate_up",
             )
 
             # SwiGLU activation
-            expert_act = g.swiglu(expert_gate_up, out_name="expert_act")
+            expert_act = g.swiglu(expert_gate_up, role="mlp_activation", out_name="expert_act")
 
             # Grouped GEMM for down projection
             expert_down = g.moe_grouped_gemm_down(
-                expert_act, "experts_down", gemm_scatter, out_name="expert_down",
+                expert_act, "experts_down", gemm_scatter, role="moe_down", out_name="expert_down",
             )
 
             # EP combine: route expert outputs back (no-op when ep_size=1)

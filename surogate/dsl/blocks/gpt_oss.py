@@ -404,6 +404,7 @@ class GptOssBlock:
                 "experts_gate_up",
                 gemm_scatter,
                 gate_up_interleaved=True,
+                role="moe_gate_up",
                 out_name="expert_gate_up",
             )
             expert_gate_up_bias = g.moe_expert_bias_add(
@@ -418,7 +419,7 @@ class GptOssBlock:
 
             # Grouped GEMM for down projection
             expert_down = g.moe_grouped_gemm_down(
-                expert_act, "experts_down", gemm_scatter, out_name="expert_down",
+                expert_act, "experts_down", gemm_scatter, role="moe_down", out_name="expert_down",
             )
             expert_down_bias = g.moe_expert_bias_add(
                 expert_down, "experts_down_bias", out_name="expert_down_bias",

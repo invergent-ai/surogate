@@ -121,6 +121,8 @@ class Qwen3Model:
     # Block mappings composed from module-level defaults (Qwen3Attention + QK-norm, SwiGLUMLP, RMSNorm).
     _hf_block_mappings_ = build_dense_block_mappings(attn_module=Qwen3Attention)
 
+    _inference_opts_ = {}
+
     @forward
     def forward(
         self,

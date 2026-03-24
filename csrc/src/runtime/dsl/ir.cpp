@@ -476,6 +476,17 @@ IRFile load_ir_from_json(const nlohmann::json& root) {
             if (mod_json.contains("activation_layout") && !mod_json["activation_layout"].is_null()) {
                 mod.activation_layout = parse_activation_layout(mod_json["activation_layout"]);
             }
+            if (mod_json.contains("inference_opts") && mod_json["inference_opts"].is_object()) {
+                for (auto& [key, val] : mod_json["inference_opts"].items()) {
+                    if (val.is_array()) {
+                        std::vector<std::string> passes;
+                        for (const auto& p : val) {
+                            if (p.is_string()) passes.push_back(p.get<std::string>());
+                        }
+                        mod.inference_opts[key] = std::move(passes);
+                    }
+                }
+            }
             ir.modules.push_back(std::move(mod));
         }
     }

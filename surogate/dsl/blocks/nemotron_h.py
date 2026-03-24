@@ -590,27 +590,27 @@ class NemotronHMLPBlock:
             # MLP
             ln_flat = g.view(ln, shape=[B * T, self.C])
             if self.mlp_bias:
-                up_flat = g.matmul_bias(ln_flat, "up_weight", "up_bias", transpose="NT")
+                up_flat = g.matmul_bias(ln_flat, "up_weight", "up_bias", transpose="NT", role="mlp_up_proj")
             else:
-                up_flat = g.matmul(ln_flat, "up_weight", transpose="NT")
+                up_flat = g.matmul(ln_flat, "up_weight", transpose="NT", role="mlp_up_proj")
             mlp_up = g.view(up_flat, shape=[B, T, self.M], out_name="mlp_up")
 
             # Activation (relu2 for Nemotron, configurable)
             if self.activation == "relu2":
-                swiglu = g.relu2(mlp_up, out_name="swiglu")
+                swiglu = g.relu2(mlp_up, role="mlp_activation", out_name="swiglu")
             elif self.activation == "silu":
-                swiglu = g.silu(mlp_up, out_name="swiglu")
+                swiglu = g.silu(mlp_up, role="mlp_activation", out_name="swiglu")
             elif self.activation == "gelu":
-                swiglu = g.gelu(mlp_up, out_name="swiglu")
+                swiglu = g.gelu(mlp_up, role="mlp_activation", out_name="swiglu")
             else:
-                swiglu = g.relu2(mlp_up, out_name="swiglu")  # Default
+                swiglu = g.relu2(mlp_up, role="mlp_activation", out_name="swiglu")  # Default
 
             # Down projection
             swiglu_flat = g.view(swiglu, shape=[B * T, self.M])
             if self.mlp_bias:
-                out_flat = g.matmul_bias(swiglu_flat, "down_weight", "down_bias", transpose="NT")
+                out_flat = g.matmul_bias(swiglu_flat, "down_weight", "down_bias", transpose="NT", role="mlp_down_proj")
             else:
-                out_flat = g.matmul(swiglu_flat, "down_weight", transpose="NT")
+                out_flat = g.matmul(swiglu_flat, "down_weight", transpose="NT", role="mlp_down_proj")
             out = g.view(out_flat, shape=[B, T, self.C], out_name="out")
 
             return out, res_in
@@ -797,17 +797,17 @@ class NemotronHMoEBlock:
 
             # Expert computation (simple up + activation + down)
             expert_up = g.moe_grouped_gemm(
-                gemm_input, "experts_up", gemm_scatter,
+                gemm_input, "experts_up", gemm_scatter, role="moe_gate_up",
             )
 
             # Activation
             if self.activation == "relu2":
-                expert_act = g.relu2(expert_up)
+                expert_act = g.relu2(expert_up, role="mlp_activation")
             else:
-                expert_act = g.silu(expert_up)
+                expert_act = g.silu(expert_up, role="mlp_activation")
 
             expert_down = g.moe_grouped_gemm_down(
-                expert_act, "experts_down", gemm_scatter,
+                expert_act, "experts_down", gemm_scatter, role="moe_down",
             )
 
             # EP combine: route expert outputs back (no-op when ep_size=1)

@@ -33,6 +33,7 @@
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/jit/gated_delta_rule_kernels.h"
+#include "runtime/jit/gdn_fused_proj_kernel.h"
 #include "runtime/infer/decode_state.h"
 
 namespace modules {
@@ -310,6 +311,8 @@ private:
     void dispatch_mamba_ssm_scan(const CompiledOp& op);
     void dispatch_mamba_gated_rmsnorm(const CompiledOp& op);
     void dispatch_mamba_out_proj(const CompiledOp& op, const modules::ForwardHook* hook);
+    // Qwen3.5 GDN fused projection (inference decode)
+    void dispatch_gdn_fused_proj(const CompiledOp& op);
     // Qwen3.5 gated delta rule forward dispatch
     void dispatch_gated_delta_rule_common(const CompiledOp& op, const char* op_name);
     void dispatch_chunk_gated_delta_rule(const CompiledOp& op);
@@ -351,6 +354,15 @@ private:
 
     // JIT-compiled Triton kernels for gated delta rule (loaded once from manifests)
     GatedDeltaRuleKernels mGdrKernels;
+
+    // JIT-compiled GDN fused projection kernel (inference decode)
+    GdnFusedProjKernel mGdnFusedProjKernel;
+
+    // Cached merged weights for GdnFusedProj (lazily allocated, persistent)
+    void* mGdnQkvzWeightData = nullptr;
+    void* mGdnBaWeightData = nullptr;
+    long mGdnQkvzWeightSize = 0;
+    long mGdnBaWeightSize = 0;
 
     // Log-prob extraction context (null in training mode)
     float*   mLogprobsGpu          = nullptr;

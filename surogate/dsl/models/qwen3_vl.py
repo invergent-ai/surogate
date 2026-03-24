@@ -139,6 +139,10 @@ class Qwen3VLModel:
     _hf_block_mappings_ = build_dense_block_mappings(attn_module=Qwen3Attention,
                                                      layer_prefix="model.language_model.layers.{layer}")
 
+    _inference_opts_ = {
+        "decode": [],
+    }
+
     @forward
     def forward(
         self,

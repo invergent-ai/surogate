@@ -136,6 +136,8 @@ class GptOssModel:
         **build_moe_mappings(moe_module=GptOssMoE),
     }
 
+    _inference_opts_ = {}
+
     @forward
     def forward(
         self,

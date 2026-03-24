@@ -42,6 +42,19 @@ def compile_jit_kernels(ir_json: str) -> dict[str, str]:
         gdr_manifests = _compile_gated_delta_rule(H, K, V)
         manifests.update(gdr_manifests)
 
+    # Check if the model declares gdn_qkvzba_fuse inference optimization
+    if _ir_requests_fusion(ir, "gdn_qkvzba_fuse"):
+        num_heads_qk, num_heads_v, head_qk, head_v = _extract_gdn_proj_dims(ir)
+        logger.info(
+            "Model requests GDN fused projection (Hqk=%d, Hv=%d, Kd=%d, Vd=%d) "
+            "— compiling Triton kernel...",
+            num_heads_qk, num_heads_v, head_qk, head_v,
+        )
+        gdn_manifests = _compile_gdn_fused_proj(
+            num_heads_qk, num_heads_v, head_qk, head_v,
+        )
+        manifests.update(gdn_manifests)
+
     if manifests:
         logger.info("Compiled %d JIT kernels total.", len(manifests))
 
@@ -111,6 +124,98 @@ def _compile_gated_delta_rule(H: int, K: int, V: int) -> dict[str, str]:
         sm=_detect_sm(),
         compile_fn=lambda output_dir: compile_gated_delta_rule(
             H=H, K=K, V=V, output_dir=output_dir,
+        ),
+    )
+
+
+def _ir_requests_fusion(ir: dict, fusion_id: str) -> bool:
+    """Check if any model in the IR declares a specific inference fusion pass."""
+    for module in ir.get("modules", []):
+        if not isinstance(module, dict):
+            continue
+        opts = module.get("inference_opts", {})
+        for _mode, passes in opts.items():
+            if isinstance(passes, list) and fusion_id in passes:
+                return True
+    return False
+
+
+def _extract_gdn_proj_dims(ir: dict) -> tuple[int, int, int, int]:
+    """Extract GDN projection dimensions from the IR.
+
+    Returns (num_heads_qk, num_heads_v, head_qk, head_v) for the
+    linear-attention blocks in Qwen3.5-style models.
+    """
+    config = {}
+    for module in ir.get("modules", []):
+        if isinstance(module, dict) and "config" in module:
+            config = module["config"]
+            break
+    if not config:
+        config = ir.get("config", {})
+
+    # Qwen3.5 linear-attention dimensions
+    # These come from the HF config fields mapped through @hf_config:
+    #   linear_num_key_heads  -> NUM_HEADS_QK (QK head groups)
+    #   linear_num_value_heads -> NUM_HEADS_V (V heads, must be >= NUM_HEADS_QK)
+    #   linear_key_head_dim   -> HEAD_QK (per-head QK dimension)
+    #   linear_value_head_dim -> HEAD_V (per-head V dimension)
+    num_heads_qk = config.get("linear_num_key_heads", 0)
+    num_heads_v = config.get("linear_num_value_heads", 0)
+    head_qk = config.get("linear_key_head_dim", 0)
+    head_v = config.get("linear_value_head_dim", 0)
+
+    # Fallback for non-Qwen3.5 models
+    if num_heads_qk == 0:
+        num_heads_qk = config.get("num_query_heads", 0)
+    if num_heads_v == 0:
+        num_heads_v = num_heads_qk  # Default: V heads = QK heads
+    if head_qk == 0:
+        head_qk = config.get("head_size", config.get("head_dim", 0))
+    if head_v == 0:
+        head_v = head_qk
+
+    if num_heads_qk == 0 or num_heads_v == 0 or head_qk == 0:
+        raise ValueError(
+            "Cannot determine GDN projection dims from IR. "
+            f"Config keys: {list(config.keys())}"
+        )
+
+    return num_heads_qk, num_heads_v, head_qk, head_v
+
+
+def _compile_gdn_fused_proj(
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_qk: int,
+    head_v: int,
+) -> dict[str, str]:
+    """Compile GDN fused projection kernels with caching."""
+    from surogate.kernels.cache import KernelCache
+    from surogate.kernels.triton.gdn_fused_proj import compile_gdn_fused_proj
+
+    cache = KernelCache()
+    src_files = [
+        Path(__file__).parent / "triton" / "gdn_fused_proj.py",
+        Path(__file__).parent / "compiler.py",
+    ]
+
+    return cache.get_or_compile(
+        name="gdn_fused_proj",
+        src_files=src_files,
+        dims={
+            "num_heads_qk": num_heads_qk,
+            "num_heads_v": num_heads_v,
+            "head_qk": head_qk,
+            "head_v": head_v,
+        },
+        sm=_detect_sm(),
+        compile_fn=lambda output_dir: compile_gdn_fused_proj(
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_qk=head_qk,
+            head_v=head_v,
+            output_dir=output_dir,
         ),
     )
 

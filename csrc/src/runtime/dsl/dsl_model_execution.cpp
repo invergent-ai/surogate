@@ -815,7 +815,10 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     const bool is_qwen3_hybrid_lora =
         lora_stack_tight &&
         (mModelConfig.architecture == modules::ArchitectureType::Hybrid) &&
-        (mModelConfig.Architecture == PretrainedConfig::QWEN3);
+        (mModelConfig.Architecture == PretrainedConfig::QWEN3 ||
+         mModelConfig.Architecture == PretrainedConfig::QWEN3_VL ||
+         mModelConfig.Architecture == PretrainedConfig::QWEN3_5 ||
+         mModelConfig.Architecture == PretrainedConfig::QWEN3_5_MOE);
     if (is_qwen3_hybrid_lora) {
         // Qwen3.5 hybrid blocks can hit an additional transient peak around SwiGLU
         // backward + LoRA hook temps that is not fully captured by the sizing simulation.

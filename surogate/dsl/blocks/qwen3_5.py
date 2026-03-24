@@ -235,11 +235,11 @@ class Qwen3_5AttentionBlock:
             )
 
             ln2_flat = g.view(ln2_out, shape=[B * T, self.C], out_name="ln2_flat")
-            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", out_name="mlp_up_flat")
+            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", role="mlp_up_proj", out_name="mlp_up_flat")
             mlp_up = g.view(mlp_up_flat, shape=[B, T, self.MUp], out_name="mlp_up")
-            mlp_act = g.swiglu(mlp_up, out_name="swiglu")
+            mlp_act = g.swiglu(mlp_up, role="mlp_activation", out_name="swiglu")
             mlp_act_flat = g.view(mlp_act, shape=[B * T, self.M], out_name="swiglu_flat")
-            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", out_name="mlp_down_flat")
+            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", role="mlp_down_proj", out_name="mlp_down_flat")
             out = g.view(out_flat, shape=[B, T, self.C], out_name="mlp_down")
 
             return out, res_att
@@ -367,6 +367,7 @@ class Qwen3_5LinearBlock:
                 ln1_flat,
                 "lin_in_proj_qkv_weight",
                 transpose="NT",
+                role="gdn_in_proj_qkv",
                 out_name="lin_mixed_qkv_flat",
             )
             mixed_qkv = g.view(mixed_qkv_flat, shape=[B, T, self.ConvDim], out_name="lin_mixed_qkv")
@@ -391,14 +392,14 @@ class Qwen3_5LinearBlock:
             key = g.view(k_flat, shape=[B, T, self.Hk, self.Kd], out_name="lin_key")
             value = g.view(v_flat, shape=[B, T, self.Hv, self.Vd], out_name="lin_value")
 
-            z_flat = g.matmul(ln1_flat, "lin_in_proj_z_weight", transpose="NT", out_name="lin_z_flat")
+            z_flat = g.matmul(ln1_flat, "lin_in_proj_z_weight", transpose="NT", role="gdn_in_proj_z", out_name="lin_z_flat")
             z = g.view(z_flat, shape=[B, T, self.Hv, self.Vd], out_name="lin_z")
 
-            b_flat = g.matmul(ln1_flat, "lin_in_proj_b_weight", transpose="NT", out_name="lin_b_flat")
+            b_flat = g.matmul(ln1_flat, "lin_in_proj_b_weight", transpose="NT", role="gdn_in_proj_b", out_name="lin_b_flat")
             b = g.view(b_flat, shape=[B, T, self.Hv], out_name="lin_b")
             beta = g.sigmoid(b)
 
-            a_flat = g.matmul(ln1_flat, "lin_in_proj_a_weight", transpose="NT", out_name="lin_a_flat")
+            a_flat = g.matmul(ln1_flat, "lin_in_proj_a_weight", transpose="NT", role="gdn_in_proj_a", out_name="lin_a_flat")
             a = g.view(a_flat, shape=[B, T, self.Hv], out_name="lin_a")
             g_decay = g.qwen3_5_decay(a, "lin_A_log", "lin_dt_bias", out_name="lin_decay")
 
@@ -449,11 +450,11 @@ class Qwen3_5LinearBlock:
             )
 
             ln2_flat = g.view(ln2_out, shape=[B * T, self.C], out_name="ln2_flat")
-            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", out_name="mlp_up_flat")
+            mlp_up_flat = g.matmul(ln2_flat, "mlp_up_weight", transpose="NT", role="mlp_up_proj", out_name="mlp_up_flat")
             mlp_up = g.view(mlp_up_flat, shape=[B, T, self.MUp], out_name="mlp_up")
-            mlp_act = g.swiglu(mlp_up, out_name="swiglu")
+            mlp_act = g.swiglu(mlp_up, role="mlp_activation", out_name="swiglu")
             mlp_act_flat = g.view(mlp_act, shape=[B * T, self.M], out_name="swiglu_flat")
-            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", out_name="mlp_down_flat")
+            out_flat = g.matmul(mlp_act_flat, "mlp_down_weight", transpose="NT", role="mlp_down_proj", out_name="mlp_down_flat")
             out = g.view(out_flat, shape=[B, T, self.C], out_name="mlp_down")
 
             return out, res_att

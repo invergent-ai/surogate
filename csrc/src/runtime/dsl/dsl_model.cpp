@@ -337,46 +337,37 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     return runtime;
 }
 
-std::optional<PretrainedConfig::ArchitectureId> arch_from_string(std::string_view name) {
-    std::string lower = internal::to_lower(std::string(name));
-    if (lower.find("qwen3moe") != std::string::npos || lower.find("qwen3_moe") != std::string::npos) {
-        return PretrainedConfig::QWEN3_MOE;
-    }
-    if (lower.find("qwen3") != std::string::npos) {
-        return PretrainedConfig::QWEN3;
-    }
-    if (lower.find("qwen2") != std::string::npos || lower.find("qwen25") != std::string::npos ||
-        lower.find("qwen2.5") != std::string::npos) {
-        return PretrainedConfig::QWEN2;
-    }
-    if (lower.find("nemotron") != std::string::npos) {
-        return PretrainedConfig::NEMOTRON_H;
-    }
-    if (lower.find("gpt_oss") != std::string::npos || lower.find("gpt-oss") != std::string::npos) {
-        return PretrainedConfig::GPT_OSS;
-    }
-    if (lower.find("llama") != std::string::npos) {
-        return PretrainedConfig::LLAMA;
-    }
-    return std::nullopt;
-}
-
 void apply_arch_from_hf_config(PretrainedConfig& cfg, const Module& module) {
-    if (const auto* value = internal::find_key(&module.hf_config, "architecture")) {
+    const auto try_set_architecture = [&](const AttrValue* value) -> bool {
+        if (!value) {
+            return false;
+        }
         if (auto arch = internal::as_string(*value)) {
-            if (auto mapped = arch_from_string(*arch)) {
+            if (auto mapped = map_architecture_id_from_hf_name(*arch)) {
                 cfg.Architecture = *mapped;
-                return;
+                return true;
             }
         }
-    }
-    if (const auto* value = internal::find_key(&module.hf_config, "model_type")) {
-        if (auto arch = internal::as_string(*value)) {
-            if (auto mapped = arch_from_string(*arch)) {
-                cfg.Architecture = *mapped;
+        if (const auto* list = internal::as_list(*value)) {
+            for (const auto& entry : *list) {
+                if (auto arch = internal::as_string(entry)) {
+                    if (auto mapped = map_architecture_id_from_hf_name(*arch)) {
+                        cfg.Architecture = *mapped;
+                        return true;
+                    }
+                }
             }
         }
+        return false;
+    };
+
+    if (try_set_architecture(internal::find_key(&module.hf_config, "architectures"))) {
+        return;
     }
+    if (try_set_architecture(internal::find_key(&module.hf_config, "architecture"))) {
+        return;
+    }
+    (void)try_set_architecture(internal::find_key(&module.hf_config, "model_type"));
 }
 
 /// Parse a standardised hybrid pattern string into per-layer overrides.

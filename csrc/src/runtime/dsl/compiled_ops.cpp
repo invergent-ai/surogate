@@ -321,6 +321,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MambaSsmScan: return "mamba_ssm_scan";
         case CompiledOpType::MambaGatedRMSNorm: return "mamba_gated_rmsnorm";
         case CompiledOpType::MambaOutProj: return "mamba_out_proj";
+        case CompiledOpType::GdnFusedProj: return "gdn_fused_proj";
         case CompiledOpType::ChunkGatedDeltaRule: return "chunk_gated_delta_rule";
         case CompiledOpType::Qwen3_5Decay: return "qwen3_5_decay";
         case CompiledOpType::RepeatInterleaveHeads: return "repeat_interleave_heads";
@@ -354,13 +355,18 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
     , mConfig(config)
     , mOptions(options)
 {
-    // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
+    // Load JIT-compiled Triton kernels (if manifests available)
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);
+        mGdnFusedProjKernel.load(options.JitKernelManifests);
     }
 }
 
 CompiledExecutor::~CompiledExecutor() {
+    // Free GDN fused proj cached weights
+    if (mGdnQkvzWeightData) cudaFree(mGdnQkvzWeightData);
+    if (mGdnBaWeightData) cudaFree(mGdnBaWeightData);
+
     // Free persistent GPU buffers
     if (mMoEExpertOffsetsGPU) {
         cudaFree(mMoEExpertOffsetsGPU);
@@ -2249,6 +2255,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 case CompiledOpType::MambaSsmScan:        dispatch_mamba_ssm_scan(op); break;
                 case CompiledOpType::MambaGatedRMSNorm:   dispatch_mamba_gated_rmsnorm(op); break;
                 case CompiledOpType::MambaOutProj:        dispatch_mamba_out_proj(op, hook); break;
+                // Qwen3.5 GDN fused projection (inference decode)
+                case CompiledOpType::GdnFusedProj: dispatch_gdn_fused_proj(op); break;
                 // Qwen3.5 gated delta rule
                 case CompiledOpType::ChunkGatedDeltaRule: dispatch_chunk_gated_delta_rule(op); break;
                 case CompiledOpType::Qwen3_5Decay:        dispatch_qwen3_5_decay(op); break;
@@ -3652,6 +3660,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::MambaOutProj:
                     dispatch_mamba_out_proj(op, hook);
                     break;
+                // Qwen3.5 GDN fused projection (inference decode)
+                case CompiledOpType::GdnFusedProj:
+                    dispatch_gdn_fused_proj(op);
+                    break;
                 // Qwen3.5 gated delta rule forward operations
                 case CompiledOpType::ChunkGatedDeltaRule:
                     dispatch_chunk_gated_delta_rule(op);
@@ -4636,6 +4648,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::MambaSsmScan:
                 case CompiledOpType::MambaGatedRMSNorm:
                 case CompiledOpType::MambaOutProj:
+                case CompiledOpType::GdnFusedProj:
                 case CompiledOpType::ChunkGatedDeltaRule:
                 case CompiledOpType::Qwen3_5Decay:
                 case CompiledOpType::RepeatInterleaveHeads:
@@ -4887,6 +4900,7 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op,
         case CompiledOpType::MambaSsmScan:       dispatch_mamba_ssm_scan(op); break;
         case CompiledOpType::MambaGatedRMSNorm:  dispatch_mamba_gated_rmsnorm(op); break;
         case CompiledOpType::MambaOutProj:       dispatch_mamba_out_proj(op, hook); break;
+        case CompiledOpType::GdnFusedProj:       dispatch_gdn_fused_proj(op); break;
         case CompiledOpType::ChunkGatedDeltaRule: dispatch_chunk_gated_delta_rule(op); break;
         case CompiledOpType::Qwen3_5Decay:       dispatch_qwen3_5_decay(op); break;
         case CompiledOpType::RepeatInterleaveHeads: dispatch_repeat_interleave_heads(op); break;

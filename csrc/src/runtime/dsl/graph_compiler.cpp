@@ -4,6 +4,7 @@
 // Compiled operation dispatch for DSL Graph executor.
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -15,12 +16,16 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/graph_executor_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "runtime/dsl/op_shape_signatures.h"
+#include "config/pretrained_config.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"
+#include "runtime/training/runtime_options.h"
 
 namespace dsl {
 
@@ -274,6 +279,8 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"mamba_ssm_scan", CompiledOpType::MambaSsmScan},
         {"mamba_gated_rmsnorm", CompiledOpType::MambaGatedRMSNorm},
         {"mamba_out_proj", CompiledOpType::MambaOutProj},
+        // Qwen3.5 GDN fused projection (inference decode)
+        {"gdn_fused_proj", CompiledOpType::GdnFusedProj},
         // Qwen3.5 gated delta rule forward operations
         {"chunk_gated_delta_rule", CompiledOpType::ChunkGatedDeltaRule},
         {"qwen3_5_decay", CompiledOpType::Qwen3_5Decay},
@@ -365,6 +372,57 @@ void GraphCompiler::update_dimensions(long B, long T) {
         mShapeEnv.values["SharedM"] = mConfig.IntermediateSize;
         mShapeEnv.values["SharedMUp"] = up_factor * mConfig.IntermediateSize;
     }
+}
+
+Graph GraphCompiler::apply_inference_fusion_passes(const Graph& graph,
+                                                   const FusionContext& ctx) const {
+    if (ctx.mode == GraphCompileMode::Default || !ctx.is_forward_graph) {
+        return graph;
+    }
+
+    // Map mode enum to manifest key
+    const char* mode_key = nullptr;
+    switch (ctx.mode) {
+        case GraphCompileMode::InferenceDecode:     mode_key = "decode"; break;
+        case GraphCompileMode::InferencePrefill:    mode_key = "prefill"; break;
+        case GraphCompileMode::InferenceFlatTokens: mode_key = "flat_tokens"; break;
+        default: return graph;
+    }
+
+    // Look up passes declared by this model for this mode
+    auto it = ctx.module->inference_opts.find(mode_key);
+    if (it == ctx.module->inference_opts.end() || it->second.empty()) {
+        return graph;
+    }
+
+    const bool debug = (std::getenv("SUROGATE_FUSION_DEBUG") != nullptr);
+    Graph rewritten = graph;
+    auto& registry = FusionPassRegistry::instance();
+
+    for (const auto& pass_id : it->second) {
+        const FusionPassInfo* pass = registry.find(pass_id);
+        if (!pass) {
+            if (debug) fprintf(stderr, "[fusion] unknown pass: %s\n", pass_id.c_str());
+            continue;
+        }
+
+        // Kernel capability gate
+        bool kernels_ok = true;
+        std::string missing;
+        for (const auto& req : pass->required_kernels) {
+            if (!ctx.has_kernel(req)) { kernels_ok = false; missing = req; break; }
+        }
+        if (!kernels_ok) {
+            if (debug) fprintf(stderr, "[fusion] %s skipped: missing kernel %s\n",
+                               pass_id.c_str(), missing.c_str());
+            continue;
+        }
+
+        bool changed = pass->run(rewritten, ctx);
+        if (debug) fprintf(stderr, "[fusion] %s: %s\n",
+                           pass_id.c_str(), changed ? "applied" : "no-op");
+    }
+    return rewritten;
 }
 
 CompiledOpType GraphCompiler::classify_op(const std::string& op_type) const {
@@ -1782,6 +1840,34 @@ void GraphCompiler::infer_output_shapes(
             break;
         }
 
+        case CompiledOpType::GdnFusedProj: {
+            // Inputs:
+            //   0: ln1_flat [BT, C]
+            //   1: qkv_weight [ConvDim, C]
+            //   2: z_weight [Hv*Vd, C]
+            //   3: b_weight [Hv, C]
+            //   4: a_weight [Hv, C]
+            // Outputs:
+            //   0: mixed_qkv [BT, ConvDim]  (qkv portion for conv1d)
+            //   1: z [BT, Hv*Vd]
+            //   2: b [BT, Hv]
+            //   3: a [BT, Hv]
+            if (input_shapes.size() >= 5 &&
+                !input_shapes[0].empty() && input_shapes[0].size() == 2 &&
+                !input_shapes[1].empty() && input_shapes[1].size() == 2) {
+                long BT = input_shapes[0][0];
+                long ConvDim = input_shapes[1][0];  // qkv_weight rows
+                long HvVd = input_shapes[2].empty() ? 0 : input_shapes[2][0];
+                long Hv_b = input_shapes[3].empty() ? 0 : input_shapes[3][0];
+                long Hv_a = input_shapes[4].empty() ? 0 : input_shapes[4][0];
+                output_shapes.push_back({BT, ConvDim});   // mixed_qkv
+                output_shapes.push_back({BT, HvVd});       // z
+                output_shapes.push_back({BT, Hv_b});       // b
+                output_shapes.push_back({BT, Hv_a});       // a
+            }
+            break;
+        }
+
         case CompiledOpType::ChunkGatedDeltaRule: {
             // Inputs:
             //   q [B, T, H, K], k [B, T, H, K], v [B, T, H, V], g [B, T, H], beta [B, T, H]
@@ -2193,8 +2279,46 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
     }
 }
 
-CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
+CompiledGraph GraphCompiler::compile(const Graph& graph,
+                                     long B,
+                                     long T,
+                                     GraphCompileMode mode) {
     update_dimensions(B, T);
+
+    const bool compiling_module_forward =
+        mModule.forward.has_value() && (&graph == &(*mModule.forward));
+
+    // Build fusion context with kernel capabilities
+    FusionContext fusion_ctx;
+    fusion_ctx.mode = mode;
+    fusion_ctx.is_forward_graph = compiling_module_forward;
+    fusion_ctx.module = &mModule;
+
+    // SM version from CUDA runtime
+    {
+        int device = 0;
+        cudaGetDevice(&device);
+        cudaDeviceProp props;
+        cudaGetDeviceProperties(&props, device);
+        fusion_ctx.sm_version = props.major * 10 + props.minor;
+    }
+
+    // Compiled-in ops (none currently — all active fusions use JIT kernels)
+
+    // Architecture gates
+    if (fusion_ctx.sm_version >= 89)  fusion_ctx.available_kernels.insert("arch:sm89+");
+    if (fusion_ctx.sm_version >= 90)  fusion_ctx.available_kernels.insert("arch:sm90+");
+    if (fusion_ctx.sm_version >= 100) fusion_ctx.available_kernels.insert("arch:sm100+");
+    if (fusion_ctx.sm_version >= 120) fusion_ctx.available_kernels.insert("arch:sm120+");
+
+    // JIT kernels: register each loaded kernel as a capability
+    for (const auto& [name, _path] : mOptions.JitKernelManifests) {
+        fusion_ctx.available_kernels.insert("jit:" + name);
+    }
+
+    Graph rewritten_graph = apply_inference_fusion_passes(graph, fusion_ctx);
+    const bool graph_rewritten = (rewritten_graph.operations.size() != graph.operations.size());
+    const Graph& active_graph = graph_rewritten ? rewritten_graph : graph;
 
     mExtraShapes.clear();
     mTensorShapes.clear();
@@ -2203,7 +2327,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
     mNextTensorId = 0;
 
     // Initialize shape database from graph inputs and params
-    for (const auto& [name, info] : graph.inputs) {
+    for (const auto& [name, info] : active_graph.inputs) {
         if (!info.shape.empty()) {
             TensorShape ts;
             ts.dims = resolve_shape(info.shape, mShapeEnv);
@@ -2214,7 +2338,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             mTensorDtypes[name] = *info.dtype;
         }
     }
-    for (const auto& [name, info] : graph.params) {
+    for (const auto& [name, info] : active_graph.params) {
         if (!info.shape.empty()) {
             TensorShape ts;
             ts.dims = resolve_shape(info.shape, mShapeEnv);
@@ -2225,7 +2349,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             mTensorDtypes[name] = *info.dtype;
         }
     }
-    for (const auto& [name, info] : graph.outputs) {
+    for (const auto& [name, info] : active_graph.outputs) {
         if (!info.shape.empty()) {
             TensorShape ts;
             ts.dims = resolve_shape(info.shape, mShapeEnv);
@@ -2276,8 +2400,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
     // graphs where view_backward ops use shape_like referencing forward tensors).
     // The forward pre-scan above already populated mExtraShapes with forward tensor
     // shapes, so shape_like references can resolve here.
-    if (!mModule.forward.has_value() || &graph != &(*mModule.forward)) {
-        for (const auto& op : graph.operations) {
+    // If inference rewrites changed the forward graph, pre-scan the rewritten graph too.
+    if (!compiling_module_forward || graph_rewritten) {
+        for (const auto& op : active_graph.operations) {
             const std::string& op_type =
                 (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
             if (op_type != "view" && op_type != "reshape") {
@@ -2311,12 +2436,12 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
     }
 
     CompiledGraph result;
-    result.name = graph.name;
-    result.ops.reserve(graph.operations.size());
-    result.total_ops = graph.operations.size();
+    result.name = active_graph.name;
+    result.ops.reserve(active_graph.operations.size());
+    result.total_ops = active_graph.operations.size();
 
-    for (std::size_t idx = 0; idx < graph.operations.size(); ++idx) {
-        const auto& op = graph.operations[idx];
+    for (std::size_t idx = 0; idx < active_graph.operations.size(); ++idx) {
+        const auto& op = active_graph.operations[idx];
         const std::string& op_type =
             (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
 

@@ -311,6 +311,10 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/graph_executor_helpers.cpp
     src/runtime/dsl/compiled_ops.cpp
     src/runtime/dsl/graph_compiler.cpp
+    src/runtime/dsl/fusions/fusion_pass.cpp
+    src/runtime/dsl/fusions/gdn_qkvzba_fuse.cpp
+    src/runtime/jit/gdn_fused_proj_kernel.cpp
+    src/runtime/ops/gdn_fused_proj.cpp
     src/runtime/dsl/weight_mapping.cpp
     src/runtime/dsl/dsl_weight_loader.cpp
     src/runtime/dsl/autodiff.cpp

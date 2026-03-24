@@ -10,6 +10,7 @@
 #define SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -28,8 +29,12 @@ struct PretrainedConfig {
         QWEN2,
         QWEN3,
         QWEN3_MOE,
+        QWEN3_VL,
         NEMOTRON_H,
         GPT_OSS,
+        QWEN3_5,
+        QWEN3_5_MOE,
+        QWEN35_5_MOE = QWEN3_5_MOE
     };
 
     // Architecture identifier
@@ -127,5 +132,6 @@ struct PretrainedConfig {
 std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, ETensorDType dtype);
 void save_pretrained_config(const PretrainedConfig& config, const char* file_name);
 std::unique_ptr<PretrainedConfig> create_pretrained_config_from_name(std::string_view name, ETensorDType dtype);
+std::optional<PretrainedConfig::ArchitectureId> map_architecture_id_from_hf_name(std::string_view name);
 
 #endif // SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H

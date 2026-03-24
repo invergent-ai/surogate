@@ -93,6 +93,36 @@ std::optional<T> get_opt(const nlohmann::json& obj, const char* key) {
 
 }  // namespace
 
+std::optional<PretrainedConfig::ArchitectureId> map_architecture_id_from_hf_name(std::string_view name) {
+    if (name.empty()) {
+        return std::nullopt;
+    }
+    const auto eq = [name](std::string_view expected) { return iequals(name, expected); };
+
+    // Exact HuggingFace "architectures" class names.
+    if (eq("LlamaForCausalLM")) return PretrainedConfig::LLAMA;
+    if (eq("Qwen3ForCausalLM")) return PretrainedConfig::QWEN3;
+    if (eq("Qwen3MoeForCausalLM")) return PretrainedConfig::QWEN3_MOE;
+    if (eq("Qwen3VLForConditionalGeneration")) return PretrainedConfig::QWEN3_VL;
+    if (eq("GptOssForCausalLM")) return PretrainedConfig::GPT_OSS;
+    if (eq("Qwen3_5ForConditionalGeneration")) return PretrainedConfig::QWEN3_5;
+    if (eq("Qwen3_5MoeForConditionalGeneration")) return PretrainedConfig::QWEN3_5_MOE;
+    if (eq("NemotronHForCausalLM")) return PretrainedConfig::NEMOTRON_H;
+
+    // Exact HuggingFace "model_type" identifiers.
+    if (eq("llama")) return PretrainedConfig::LLAMA;
+    if (eq("qwen2")) return PretrainedConfig::QWEN2;
+    if (eq("qwen3")) return PretrainedConfig::QWEN3;
+    if (eq("qwen3_moe")) return PretrainedConfig::QWEN3_MOE;
+    if (eq("qwen3_vl")) return PretrainedConfig::QWEN3_VL;
+    if (eq("gpt_oss")) return PretrainedConfig::GPT_OSS;
+    if (eq("qwen3_5")) return PretrainedConfig::QWEN3_5;
+    if (eq("qwen3_5_moe")) return PretrainedConfig::QWEN3_5_MOE;
+    if (eq("nemotron_h")) return PretrainedConfig::NEMOTRON_H;
+
+    return std::nullopt;
+}
+
 std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, ETensorDType dtype) {
     std::ifstream file(file_name);
     if (!file.is_open()) {
@@ -104,7 +134,7 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
     auto cfg = std::make_unique<PretrainedConfig>();
     cfg->DType = dtype;
 
-    // Architecture/model type (best-effort, stored as raw strings)
+    // Architecture/model_type from config.json (exact, no substring heuristics).
     if (config_json.contains("architectures") && config_json["architectures"].is_array() &&
         !config_json["architectures"].empty()) {
         if (auto arch = config_json["architectures"].front().get<std::string>(); !arch.empty()) {
@@ -113,6 +143,18 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
     }
     if (auto model_type = get_opt<std::string>(config_json, "model_type")) {
         cfg->ModelTypeName = *model_type;
+    }
+    bool architecture_set = false;
+    if (!cfg->ArchitectureName.empty()) {
+        if (auto mapped = map_architecture_id_from_hf_name(cfg->ArchitectureName)) {
+            cfg->Architecture = *mapped;
+            architecture_set = true;
+        }
+    }
+    if (!architecture_set && !cfg->ModelTypeName.empty()) {
+        if (auto mapped = map_architecture_id_from_hf_name(cfg->ModelTypeName)) {
+            cfg->Architecture = *mapped;
+        }
     }
 
     // Token IDs

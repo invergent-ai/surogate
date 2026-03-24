@@ -200,6 +200,11 @@ struct Module {
     std::optional<Graph> forward;
     std::optional<Graph> backward;
     std::optional<ActivationLayoutIR> activation_layout;  ///< Activation slots (from DSL)
+
+    /// Per-mode inference optimization passes (from Python DSL _inference_opts_).
+    /// Key: mode string ("decode", "prefill", "flat_tokens")
+    /// Value: ordered list of fusion pass IDs to apply.
+    std::unordered_map<std::string, std::vector<std::string>> inference_opts;
 };
 
 struct IRFile {

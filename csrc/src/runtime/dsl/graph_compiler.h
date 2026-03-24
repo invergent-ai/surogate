@@ -18,6 +18,7 @@
 
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
+#include "runtime/dsl/fusions/fusion_pass.h"
 #include "kernels/kernels.h"
 
 namespace modules {
@@ -131,6 +132,8 @@ enum class CompiledOpType : std::uint8_t {
     MambaSsmScan,
     MambaGatedRMSNorm,
     MambaOutProj,
+    // Qwen3.5 GDN fused projection (inference-only, decode)
+    GdnFusedProj,
     // Qwen3.5 gated delta rule forward operations
     ChunkGatedDeltaRule,
     Qwen3_5Decay,
@@ -372,7 +375,12 @@ struct CompiledGraph {
     std::size_t view_ops = 0;
 };
 
-
+enum class GraphCompileMode : std::uint8_t {
+    Default = 0,
+    InferencePrefill,
+    InferenceDecode,
+    InferenceFlatTokens,
+};
 
 // ============================================================================
 // Graph Compiler
@@ -387,7 +395,10 @@ public:
                   DslGradStore& grads);
 
     // Compile a forward or backward graph
-    CompiledGraph compile(const Graph& graph, long B, long T);
+    CompiledGraph compile(const Graph& graph,
+                          long B,
+                          long T,
+                          GraphCompileMode mode = GraphCompileMode::Default);
 
     // Update batch/sequence dimensions for shape resolution
     void update_dimensions(long B, long T);
@@ -418,6 +429,7 @@ private:
                             const std::vector<std::vector<long>>& input_shapes,
                             std::vector<std::vector<long>>& output_shapes);
     void validate_operation_shapes(const Operation& op, CompiledOpType type, size_t op_index);
+    Graph apply_inference_fusion_passes(const Graph& graph, const struct FusionContext& ctx) const;
 
     const Module& mModule;
     const modules::ModelConfig& mConfig;

@@ -150,6 +150,10 @@ class Qwen3MoEModel:
         **build_moe_mappings(include_shared=True),
     }
 
+    _inference_opts_ = {
+        "decode": [],
+    }
+
     @forward
     def forward(
         self,
