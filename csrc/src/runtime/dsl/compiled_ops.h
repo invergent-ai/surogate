@@ -636,6 +636,12 @@ private:
         std::vector<std::pair<int, Tensor>> tensor_snapshot;       // by tensor_id
         std::vector<std::pair<std::string, Tensor>> named_snapshot; // by name
         std::vector<std::pair<std::string, Tensor>> saved_snapshot; // mSaved entries written by dispatch
+        // Minimal replay set: only tensor IDs consumed by the next eager segment.
+        // On replay, only these entries are restored instead of the full snapshot.
+        // Empty = restore full snapshot (capture path or not yet computed).
+        std::vector<std::pair<int, Tensor>> replay_snapshot;
+        std::vector<std::pair<std::string, Tensor>> replay_named_snapshot;
+        bool replay_set_computed = false;
     };
 
     // Forward segment graphs: [layer_idx][segment_idx]

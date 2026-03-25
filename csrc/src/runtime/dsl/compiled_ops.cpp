@@ -17,6 +17,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/core.h>
@@ -3468,6 +3469,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             "global_segment");
                         if (is_capture) {
                             sg.post_checkpoint = mRunState.Stack.checkpoint();
+                            // Full snapshot for correctness during first capture.
                             sg.tensor_snapshot.clear();
                             sg.named_snapshot.clear();
                             sg.saved_snapshot.clear();
@@ -3486,15 +3488,57 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                     sg.saved_snapshot.emplace_back(name, t);
                                 }
                             }
-                        } else {
-                            mRunState.Stack.restore(sg.post_checkpoint);
-                            for (const auto& [tid, t] : sg.tensor_snapshot) {
-                                if (static_cast<std::size_t>(tid) < mTensors.size()) {
-                                    mTensors[tid] = t;
+                            // Compute minimal replay set: only tensor IDs consumed
+                            // by the next eager segment (typically FlashAttention).
+                            if (!sg.replay_set_computed) {
+                                sg.replay_set_computed = true;
+                                std::unordered_set<int> needed_tids;
+                                std::unordered_set<std::string> needed_names;
+                                if (gs + 1 < graph.global_segments.size() &&
+                                    graph.global_segments[gs + 1].eager) {
+                                    const auto& next_seg = graph.global_segments[gs + 1];
+                                    for (std::size_t oi = next_seg.start_op; oi < next_seg.end_op; ++oi) {
+                                        const auto& next_op = graph.ops[oi];
+                                        for (const auto& inp : next_op.inputs) {
+                                            if (inp.tensor_id >= 0) needed_tids.insert(inp.tensor_id);
+                                            if (!inp.name.empty()) needed_names.insert(inp.name);
+                                        }
+                                    }
+                                }
+                                for (const auto& [tid, t] : sg.tensor_snapshot) {
+                                    if (needed_tids.count(tid)) {
+                                        sg.replay_snapshot.emplace_back(tid, t);
+                                    }
+                                }
+                                for (const auto& [name, t] : sg.named_snapshot) {
+                                    if (needed_names.count(name)) {
+                                        sg.replay_named_snapshot.emplace_back(name, t);
+                                    }
                                 }
                             }
-                            for (const auto& [name, t] : sg.named_snapshot) {
-                                mNamedTensors[name] = t;
+                        } else {
+                            // Replay: restore only the minimal set needed by the
+                            // next eager segment (~2 entries vs ~873 full snapshot).
+                            mRunState.Stack.restore(sg.post_checkpoint);
+                            if (sg.replay_set_computed && !sg.replay_snapshot.empty()) {
+                                for (const auto& [tid, t] : sg.replay_snapshot) {
+                                    if (static_cast<std::size_t>(tid) < mTensors.size()) {
+                                        mTensors[tid] = t;
+                                    }
+                                }
+                                for (const auto& [name, t] : sg.replay_named_snapshot) {
+                                    mNamedTensors[name] = t;
+                                }
+                            } else if (!sg.replay_set_computed) {
+                                // Fallback: full restore.
+                                for (const auto& [tid, t] : sg.tensor_snapshot) {
+                                    if (static_cast<std::size_t>(tid) < mTensors.size()) {
+                                        mTensors[tid] = t;
+                                    }
+                                }
+                                for (const auto& [name, t] : sg.named_snapshot) {
+                                    mNamedTensors[name] = t;
+                                }
                             }
                             if (mSaved) {
                                 for (const auto& [name, t] : sg.saved_snapshot) {
@@ -3519,9 +3563,15 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                         max_snap = std::max(max_snap, sg.tensor_snapshot.size());
                         max_named = std::max(max_named, sg.named_snapshot.size());
                     }
+                    std::size_t max_replay = 0, max_replay_named = 0;
+                    for (const auto& sg : mFwdGlobalSegGraphs) {
+                        max_replay = std::max(max_replay, sg.replay_snapshot.size());
+                        max_replay_named = std::max(max_replay_named, sg.replay_named_snapshot.size());
+                    }
                     std::fprintf(stderr,
-                        "[global-seg] total=%zu eager=%d graph=%d max_tensor_snap=%zu max_named_snap=%zu\n",
-                        graph.global_segments.size(), n_eager, n_graph, max_snap, max_named);
+                        "[global-seg] total=%zu eager=%d graph=%d full_snap=%zu/%zu replay_snap=%zu/%zu\n",
+                        graph.global_segments.size(), n_eager, n_graph,
+                        max_snap, max_named, max_replay, max_replay_named);
                 }
                 // All model ops dispatched via global segments.
                 mSegmentDispatchedUntil = graph.ops.size();
