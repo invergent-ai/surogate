@@ -30,6 +30,7 @@
 #include "recipes/recipe_factory.h"
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
+#include "serve/native_http_server.h"
 #include "utilities/dtype.h"
 #include "tokenizer/tokenizer.h"
 
@@ -495,6 +496,46 @@ NB_MODULE(_surogate, m) {
         }, nb::arg("recipe_name"),
            "Set training recipe by name (bf16, fp8-hybrid, nvfp4).")
         ;
+
+    nb::class_<serve::NativeHttpServerConfig>(m, "NativeHttpServerConfig",
+        "Configuration for native C++ OpenAI-compatible HTTP server.")
+        .def(nb::init<>())
+        .def_rw("host", &serve::NativeHttpServerConfig::host)
+        .def_rw("port", &serve::NativeHttpServerConfig::port)
+        .def_rw("model_id", &serve::NativeHttpServerConfig::model_id)
+        .def_rw("api_key", &serve::NativeHttpServerConfig::api_key)
+        .def_rw("model_dir", &serve::NativeHttpServerConfig::model_dir)
+        .def_rw("eos_token_id", &serve::NativeHttpServerConfig::eos_token_id)
+        .def_rw("max_context_len", &serve::NativeHttpServerConfig::max_context_len)
+        .def_rw("runtime_seq_len", &serve::NativeHttpServerConfig::runtime_seq_len)
+        .def_rw("max_batch_sequences", &serve::NativeHttpServerConfig::max_batch_sequences)
+        .def_rw("prefill_budget_tokens", &serve::NativeHttpServerConfig::prefill_budget_tokens)
+        .def_rw("prefill_max_new_sequences", &serve::NativeHttpServerConfig::prefill_max_new_sequences)
+        .def_rw("prefill_chunk_size", &serve::NativeHttpServerConfig::prefill_chunk_size)
+        .def_rw("decode_pending_step_tokens", &serve::NativeHttpServerConfig::decode_pending_step_tokens)
+        .def_rw("decode_busy_step_tokens", &serve::NativeHttpServerConfig::decode_busy_step_tokens)
+        .def_rw("stream_batch_tokens", &serve::NativeHttpServerConfig::stream_batch_tokens)
+        .def_rw("gpu_memory_utilization", &serve::NativeHttpServerConfig::gpu_memory_utilization)
+        .def_rw("use_cuda_graphs", &serve::NativeHttpServerConfig::use_cuda_graphs)
+        .def_rw("max_num_batched_tokens", &serve::NativeHttpServerConfig::max_num_batched_tokens)
+        .def_rw("continuous_min_activation_mb", &serve::NativeHttpServerConfig::continuous_min_activation_mb)
+        .def_rw("continuous_engine_max_seq_len", &serve::NativeHttpServerConfig::continuous_engine_max_seq_len)
+        .def_rw("max_gen_len", &serve::NativeHttpServerConfig::max_gen_len)
+        .def_rw("temperature", &serve::NativeHttpServerConfig::temperature)
+        .def_rw("top_k", &serve::NativeHttpServerConfig::top_k)
+        .def_rw("top_p", &serve::NativeHttpServerConfig::top_p)
+        .def_rw("min_p", &serve::NativeHttpServerConfig::min_p)
+        .def_rw("repetition_penalty", &serve::NativeHttpServerConfig::repetition_penalty)
+        .def_rw("max_http_threads", &serve::NativeHttpServerConfig::max_http_threads)
+        .def_rw("enable_loop_trace", &serve::NativeHttpServerConfig::enable_loop_trace);
+
+    nb::class_<serve::NativeHttpServer>(m, "NativeHttpServer",
+        "Native C++ HTTP server for OpenAI-compatible serving.")
+        .def(nb::init<MultiGPUPyTrainer*, serve::NativeHttpServerConfig>(),
+             nb::arg("trainer"), nb::arg("config"),
+             nb::keep_alive<1, 2>())
+        .def("serve", &serve::NativeHttpServer::serve)
+        .def("stop", &serve::NativeHttpServer::stop);
 
     nb::class_<LoRAAdapterConfig>(m, "LoRAAdapterConfig",
         "LoRA (Low-Rank Adaptation) adapter configuration.\n\n"

@@ -446,6 +446,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe_cudnn.cpp
     src/kernels/block_quant.cu
     src/kernels/mxfp4_dequant.cu
+    src/kernels/turboquant.cu
     src/kernels/bnb_quant.cu
     src/kernels/global_norm.cu
     src/kernels/bias.cu
@@ -586,8 +587,19 @@ endif ()
 if (PYTHON_BINDING)
     find_package(Python COMPONENTS Interpreter Development.Module OPTIONAL_COMPONENTS Development.SABIModule)
     FetchContent_MakeAvailable(nanobind)
-    nanobind_add_module(_surogate STABLE_ABI NOSTRIP src/binding/binding.cpp src/binding/py_train.cpp)
+    nanobind_add_module(_surogate STABLE_ABI NOSTRIP
+        src/binding/binding.cpp
+        src/binding/py_train.cpp
+        src/serve/native_http_server.cpp
+        src/third_party/cpp-httplib/httplib.cpp
+    )
     target_link_libraries(_surogate PUBLIC surogate-common Python::Module fmt::fmt-header-only)
+    target_compile_definitions(_surogate PRIVATE
+        CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=1048576
+        CPPHTTPLIB_LISTEN_BACKLOG=512
+        CPPHTTPLIB_REQUEST_URI_MAX_LENGTH=32768
+        CPPHTTPLIB_TCP_NODELAY=1
+    )
 
     # pick up cuda libraries from within the current python env, if available
     set(RPATH_LIST
@@ -635,6 +647,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/kernels/test-attention-decode.cu
             src/testing/kernels/test-sampling.cu
             src/testing/kernels/test-attention-decode-fp8.cu
+            src/testing/kernels/test-turboquant.cu
 
 
             # Quantization

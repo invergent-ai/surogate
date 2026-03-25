@@ -86,21 +86,21 @@ std::vector<int> build_graph_buckets(int max_slots) {
 }
 
 std::vector<int> build_prefill_token_buckets(int max_tokens) {
-    // Match sglang-style piecewise capture buckets to maximize graph reuse:
-    // small tokens use fine granularity, larger tokens use coarser steps.
+    // Coarse bucket set: every bucket is pre-warmed at startup to eliminate
+    // cudaGraphInstantiate + cuStreamSynchronize during serving.
+    // ~20 buckets covers 1–2048 with ≤25% padding overhead.
     std::vector<int> buckets;
-    buckets.reserve(128);
+    buckets.reserve(32);
     auto append_range = [&](int start, int end, int step) {
         for (int t = start; t <= end && t <= max_tokens; t += step) {
             buckets.push_back(t);
         }
     };
-    append_range(4, 32, 4);
-    append_range(48, 256, 16);
-    append_range(288, 512, 32);
-    append_range(576, 1024, 64);
-    append_range(1280, 4096, 256);
-    append_range(4608, max_tokens, 512);
+    append_range(1, 1, 1);          // [1] — single-token (decode fallback)
+    append_range(32, 128, 32);      // [32, 64, 96, 128]
+    append_range(192, 512, 64);     // [192, 256, 320, 384, 448, 512]
+    append_range(640, 1024, 128);   // [640, 768, 896, 1024]
+    append_range(1280, max_tokens, 256); // [1280, 1536, 1792, 2048, ...]
 
     if (buckets.empty() || buckets.back() < max_tokens) {
         buckets.push_back(max_tokens);
@@ -835,16 +835,14 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
         const int group_size = (Hkv_model > 0) ? (Hq_model / Hkv_model) : 1;
         constexpr int kCtaTileQ = 16;
 
-        // Warm a subset of buckets to balance memory vs coverage.
-        // Skip small buckets (decode-only sizes) and sample every Nth for large ones.
+        // Warm ALL prefill buckets. The bucket list is coarse (~20 entries)
+        // so total graph memory is manageable (~1GB for 20 buckets × 108 segments).
+        // This eliminates cudaGraphInstantiate + cuStreamSynchronize during serving.
         int warmed_count = 0;
-        constexpr int kMaxWarmBuckets = 15;
-        const int skip = std::max(1, static_cast<int>(prefill_token_buckets_.size()) / kMaxWarmBuckets);
-        for (int bi = 0; bi < static_cast<int>(prefill_token_buckets_.size()); bi += skip) {
+        for (int bi = 0; bi < static_cast<int>(prefill_token_buckets_.size()); ++bi) {
             int bucket_t = prefill_token_buckets_[bi];
             if (bucket_t <= 0 || bucket_t > max_batched_tokens_) continue;
-            if (bucket_t < 64) continue;  // skip tiny buckets (decode-size)
-            if (warmed_count >= kMaxWarmBuckets) break;
+            if (bucket_t < 32) continue;  // skip tiny buckets
             ++warmed_count;
 
             // Build minimal flat-token DecodeState: 1 request with q_len=bucket_t.
@@ -2523,9 +2521,16 @@ std::vector<int> ContinuousGenerationEngine::flat_step_launch(
     deferred_sync_ = true;
     auto partial = flat_step(new_prompts, config, graph_executor, comm, hook);
     deferred_sync_ = false;
-    // has_pending_sampled_ was set inside flat_step's deferred path
-    // new_slot_ids were saved to pending_new_slot_ids_ — return a copy
-    return pending_new_slot_ids_;
+    // Normal async path: has_pending_sampled_ was set inside flat_step's deferred
+    // branch and new_slot_ids were stashed in pending_new_slot_ids_.
+    if (has_pending_sampled_) {
+        return pending_new_slot_ids_;
+    }
+
+    // No deferred collection is pending (e.g. batch_size==0 early return). In
+    // this case, return the immediate result instead of stale pending ids.
+    pending_new_slot_ids_.clear();
+    return partial.new_slot_ids;
 }
 
 // ---------------------------------------------------------------------------

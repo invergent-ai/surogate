@@ -165,21 +165,13 @@ def _openai_context_length_error(message: str, param: str) -> JSONResponse:
     )
 
 
-def _token_text_chunks(tokenizer: Any, token_ids: Sequence[int]) -> list[str]:
-    chunks: list[str] = []
-    for tok in token_ids:
-        piece = tokenizer.decode([int(tok)], skip_special_tokens=True)
-        if piece:
-            chunks.append(piece)
-    return chunks
-
-
 class NativeServingRuntime:
     def __init__(self, config: ServeConfig):
         self.config = config
         self.model_id = config.model_id or config.model or "native"
 
         model_dir = self._resolve_model_dir(config.model or "")
+        self._model_dir = model_dir
         self._apply_model_generation_config_defaults(model_dir, config)
         qlora_config, prequant_method, is_moe_model, model_max_len = (
             self._resolve_prequant_qlora_config(model_dir)
@@ -465,6 +457,22 @@ class NativeServingRuntime:
                 "Serve runtime running with max_num_seqs=1; concurrent requests will be serialized. "
                 "Set --max_num_seqs>1 to improve throughput."
             )
+
+        self._cpp_http_server = None
+        if self._cpp_http_handoff_enabled():
+            try:
+                self._init_cpp_http_server()
+                logger.info(
+                    "Native C++ HTTP handoff enabled (host=%s port=%d).",
+                    self.config.host,
+                    int(self.config.port),
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "Failed to initialize native C++ HTTP handoff; falling back to Python FastAPI server."
+                )
+
         self._batch_worker = threading.Thread(
             target=self._continuous_engine_loop,
             name="surogate-continuous-engine",
@@ -513,6 +521,68 @@ class NativeServingRuntime:
         except Exception:
             # Best-effort log only.
             pass
+
+    @staticmethod
+    def _cpp_http_handoff_enabled() -> bool:
+        raw = os.getenv("SUROGATE_SERVE_CPP_HTTP", "1").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _init_cpp_http_server(self) -> None:
+        if not hasattr(_surogate, "NativeHttpServer"):
+            raise RuntimeError("NativeHttpServer binding is not available in _surogate.")
+
+        cfg = _surogate.NativeHttpServerConfig()
+        cfg.host = self.config.host
+        cfg.port = int(self.config.port)
+        cfg.model_id = self.model_id
+        cfg.api_key = self.config.api_key or ""
+        cfg.model_dir = str(self._model_dir)
+        cfg.eos_token_id = int(self.eos_id)
+        cfg.max_context_len = int(self._max_context_len)
+        cfg.runtime_seq_len = int(self._runtime_seq_len)
+        cfg.max_batch_sequences = int(self._max_batch_sequences)
+        cfg.prefill_budget_tokens = int(self._prefill_budget_tokens)
+        cfg.prefill_max_new_sequences = int(self._prefill_max_new_sequences)
+        cfg.prefill_chunk_size = max(0, int(self.config.prefill_chunk_size))
+        cfg.decode_pending_step_tokens = int(self._decode_pending_step_tokens)
+        cfg.decode_busy_step_tokens = int(self._decode_busy_step_tokens)
+        cfg.stream_batch_tokens = max(
+            1, int(os.getenv("SUROGATE_SERVE_STREAM_BATCH_TOKENS", "16"))
+        )
+        cfg.gpu_memory_utilization = float(self.config.gpu_memory_utilization)
+        cfg.use_cuda_graphs = bool(self.config.use_cuda_graphs)
+        cfg.max_num_batched_tokens = int(self.config.max_num_batched_tokens)
+        cfg.continuous_min_activation_mb = int(self._continuous_min_activation_mb)
+        cfg.continuous_engine_max_seq_len = int(
+            min(
+                self._runtime_seq_len,
+                self.config.max_model_len
+                if self.config.max_model_len is not None
+                else 8192,
+            )
+        )
+        cfg.max_gen_len = int(self.config.max_gen_len)
+        cfg.temperature = float(self.config.temperature)
+        cfg.top_k = int(self.config.top_k)
+        cfg.top_p = float(self.config.top_p)
+        cfg.min_p = float(self.config.min_p)
+        cfg.repetition_penalty = float(self.config.repetition_penalty)
+        cfg.max_http_threads = max(
+            0, int(os.getenv("SUROGATE_SERVE_HTTP_THREADS", "0"))
+        )
+        cfg.enable_loop_trace = os.getenv("SUROGATE_SERVE_LOOP_TRACE", "").strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self._cpp_http_server = _surogate.NativeHttpServer(self.trainer, cfg)
+
+    def serve_cpp(self) -> None:
+        if getattr(self, "_cpp_http_server", None) is None:
+            raise RuntimeError("Native C++ HTTP server is not initialized.")
+        self._cpp_http_server.serve()
 
     def _build_trainer(
         self,
@@ -1975,6 +2045,15 @@ def create_app(runtime: NativeServingRuntime) -> FastAPI:
 
 def serve(config: ServeConfig):
     runtime = NativeServingRuntime(config)
+    if getattr(runtime, "_cpp_http_server", None) is not None:
+        logger.info(
+            "Starting native C++ HTTP server on %s:%s",
+            config.host,
+            config.port,
+        )
+        runtime.serve_cpp()
+        return
+
     app = create_app(runtime)
     logger.info(f"Starting native inference server on {config.host}:{config.port}")
     uvicorn.run(
