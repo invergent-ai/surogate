@@ -2721,6 +2721,34 @@ void MultiGPUPyTrainer::engine_destroy(std::uint64_t engine_id) {
     }
 }
 
+MultiGPUPyTrainer::InferenceContext MultiGPUPyTrainer::extract_inference_context(
+        std::uint64_t engine_id) {
+    infer::ContinuousGenerationEngine* eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mContinuousEnginesMutex);
+        auto it = mContinuousEngines.find(engine_id);
+        if (it == mContinuousEngines.end()) {
+            throw std::runtime_error("extract_inference_context: invalid engine_id");
+        }
+        eng = it->second.get();
+    }
+
+    InferenceContext ctx{};
+    ctx.engine = eng;
+    // Extract GraphExecutor and NCCLCommunicator from rank-0 context via run_work (one-time).
+    run_work([&](sThreadContext& tctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(tctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("extract_inference_context: model is not a DslModel");
+        }
+        ctx.graph_executor = dsl_model->graph_executor();
+        ctx.communicator = tctx.Communicator;
+        ctx.device_id = dsl_model->dsl_run_state().DeviceId;
+    }, /*idx=*/0);
+
+    return ctx;
+}
+
 int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {
     int result = 0;
     run_work([&result](sThreadContext& ctx) {

@@ -33,6 +33,9 @@ struct GPUUtilInfo;
 struct sSegmentMemory;
 class CommunicatorThreadsPack;
 class NCCLCommunicator;
+namespace dsl {
+class GraphExecutor;
+}
 namespace infer {
 class GenerationSession;
 class ContinuousGenerationEngine;
@@ -299,6 +302,17 @@ public:
 
     /// Destroy the engine.
     void engine_destroy(std::uint64_t engine_id);
+
+    /// Extract raw pointers for direct engine access (bypassing run_work).
+    /// Used by NativeHttpServer to call the engine from its own threads.
+    /// Only valid while the engine and trainer are alive.
+    struct InferenceContext {
+        infer::ContinuousGenerationEngine* engine = nullptr;
+        dsl::GraphExecutor* graph_executor = nullptr;
+        NCCLCommunicator* communicator = nullptr;
+        int device_id = 0;
+    };
+    InferenceContext extract_inference_context(std::uint64_t engine_id);
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism

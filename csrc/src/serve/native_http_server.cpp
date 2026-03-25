@@ -23,6 +23,8 @@
 #include <nlohmann/json.hpp>
 
 #include "third_party/cpp-httplib/httplib.h"
+#include "runtime/infer/continuous_engine.h"
+#include "utilities/utils.h"  // CUDA_CHECK
 
 namespace serve {
 
@@ -37,7 +39,8 @@ void signal_handler(int sig) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "\n[surogate][cpp-http] received %s, stopping...\n", name);
     if (len > 0) {
-        (void)write(STDERR_FILENO, buf, static_cast<size_t>(len));
+        auto ignored = write(STDERR_FILENO, buf, static_cast<size_t>(len));
+        (void)ignored;
     }
     auto* srv = g_active_server.load(std::memory_order_relaxed);
     if (srv) {
@@ -715,8 +718,18 @@ void NativeHttpServer::scheduler_loop() {
             cfg_.max_num_batched_tokens);
         engine_id_.store(engine_id, std::memory_order_relaxed);
 
-        // Collector thread keeps cudaEventSynchronize (inside collect) off the
-        // launch/scheduling path, matching vLLM-style async scheduling.
+        // Extract raw pointers for direct engine access (bypasses run_work).
+        infer_ctx_ = trainer_->extract_inference_context(engine_id);
+        CUDA_CHECK(cudaSetDevice(infer_ctx_.device_id));
+
+        auto* engine = infer_ctx_.engine;
+        auto* graph_exec = infer_ctx_.graph_executor;
+        auto* nccl_comm = infer_ctx_.communicator;
+
+        // Collector thread calls cudaEventSynchronize + Phase 8 directly on its
+        // own thread — no run_work serialization. This is the key difference from
+        // the old design: the scheduler can launch the next step while the
+        // collector is still blocking on the previous step's GPU completion.
         std::mutex collect_mu;
         std::condition_variable_any collect_cv;
         bool collect_requested = false;
@@ -724,9 +737,10 @@ void NativeHttpServer::scheduler_loop() {
         bool collect_ready = false;
         bool collect_stop = false;
         std::exception_ptr collect_error;
-        std::optional<MultiGPUPyTrainer::FlatStepResult> collected_step;
+        std::optional<infer::ContinuousGenerationEngine::FlatStepResult> collected_step;
 
         std::jthread collect_thread([&](std::stop_token st) {
+            CUDA_CHECK(cudaSetDevice(infer_ctx_.device_id));
             while (true) {
                 std::unique_lock<std::mutex> lock(collect_mu);
                 const bool ready = collect_cv.wait(lock, st, [&]() { return collect_stop || collect_requested; });
@@ -738,7 +752,9 @@ void NativeHttpServer::scheduler_loop() {
                 lock.unlock();
 
                 try {
-                    auto step = trainer_->engine_flat_step_collect(engine_id);
+                    // Direct call — cudaEventSynchronize happens on THIS thread,
+                    // not the GPU worker thread. No run_work round-trip.
+                    auto step = engine->flat_step_collect();
                     lock.lock();
                     collected_step = std::move(step);
                     collect_error = nullptr;
@@ -763,7 +779,7 @@ void NativeHttpServer::scheduler_loop() {
             const auto t_loop_start = std::chrono::high_resolution_clock::now();
 
             // Pull collected step from collector thread (if ready).
-            std::optional<MultiGPUPyTrainer::FlatStepResult> collected;
+            std::optional<infer::ContinuousGenerationEngine::FlatStepResult> collected;
             {
                 std::lock_guard<std::mutex> lock(collect_mu);
                 if (collect_ready) {
@@ -883,7 +899,7 @@ void NativeHttpServer::scheduler_loop() {
                         step_count, release_slots.size(), slot_map.size());
                 }
                 for (int sid : release_slots) {
-                    trainer_->engine_release_slot(engine_id, sid);
+                    engine->release_slot(sid);
                     slot_map.erase(sid);
                 }
                 if (sched_debug) {
@@ -986,16 +1002,17 @@ void NativeHttpServer::scheduler_loop() {
                     "[sched-dbg] step={} LAUNCH: new_prompts={} slot_map={} max_gen={} eos={}\n",
                     step_count, new_prompts.size(), slot_map.size(), max_gen, eos_for_step);
             }
-            auto new_slot_ids = trainer_->engine_flat_step_launch(
-                engine_id,
-                new_prompts,
-                max_gen,
-                first_params.temperature,
-                eos_for_step,
-                first_params.top_k,
-                first_params.top_p,
-                first_params.min_p,
-                cfg_.prefill_chunk_size);
+            // Direct engine call — no run_work serialization.
+            infer::ContinuousGenerationEngine::FlatStepConfig step_cfg;
+            step_cfg.max_gen_len = max_gen;
+            step_cfg.temperature = first_params.temperature;
+            step_cfg.eos_token_id = eos_for_step;
+            step_cfg.top_k = first_params.top_k;
+            step_cfg.top_p = first_params.top_p;
+            step_cfg.min_p = first_params.min_p;
+            step_cfg.prefill_chunk_size = cfg_.prefill_chunk_size;
+            auto new_slot_ids = engine->flat_step_launch(
+                new_prompts, step_cfg, *graph_exec, *nccl_comm);
 
             std::vector<ActiveGeneration> failed_prefills;
             for (size_t i = 0; i < prefill_items.size(); ++i) {
@@ -1088,10 +1105,14 @@ void NativeHttpServer::scheduler_loop() {
     }
 
     if (engine_id != 0) {
-        for (const auto& kv : slot_map) {
-            trainer_->engine_release_slot(engine_id, kv.first);
+        if (infer_ctx_.engine) {
+            for (const auto& kv : slot_map) {
+                infer_ctx_.engine->release_slot(kv.first);
+            }
         }
+        // Destroy goes through trainer (one-time cleanup).
         trainer_->engine_destroy(engine_id);
+        infer_ctx_ = {};
     }
     scheduler_exited_.store(true, std::memory_order_relaxed);
     pending_cv_.notify_all();

@@ -194,6 +194,10 @@ private:
     std::thread scheduler_thread_;
     std::atomic<std::uint64_t> engine_id_{0};
 
+    // Direct inference context — bypasses MultiGPUPyTrainer::run_work for the hot path.
+    // Extracted once after engine creation, used by scheduler + collect threads.
+    MultiGPUPyTrainer::InferenceContext infer_ctx_{};
+
     std::unique_ptr<httplib::Server> server_;
 };
 
