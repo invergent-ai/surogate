@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "binding/py_train.h"
+#include "serve/scheduler.h"
 #include "tokenizer/tokenizer.h"
 #include "third_party/cpp-httplib/httplib.h"
 
@@ -34,21 +35,21 @@ struct NativeHttpServerConfig {
     int max_context_len = 4096;
     int runtime_seq_len = 4096;
 
+    // Scheduler (vLLM v1 style)
     int max_batch_sequences = 64;
-    int prefill_budget_tokens = 2048;
-    int prefill_max_new_sequences = 64;
-    int prefill_chunk_size = 2048;
+    int max_num_batched_tokens = 2048;         // unified token budget per step
+    int long_prefill_token_threshold = 0;      // 0 = auto (4% of max_seq_len)
+    int max_num_partial_prefills = 1;          // max new requests per step
 
-    int decode_pending_step_tokens = 1;
-    int decode_busy_step_tokens = 1;
     int stream_batch_tokens = 16;
 
+    // Engine
     float gpu_memory_utilization = 0.9f;
     bool use_cuda_graphs = true;
-    int max_num_batched_tokens = 2048;
     int continuous_min_activation_mb = 256;
     int continuous_engine_max_seq_len = 4096;
 
+    // Generation defaults
     int max_gen_len = 512;
     float temperature = 1.0f;
     int top_k = 0;
@@ -56,6 +57,7 @@ struct NativeHttpServerConfig {
     float min_p = 0.0f;
     float repetition_penalty = 1.0f;
 
+    int multi_decode_steps = 1;
     int max_http_threads = 0;
     bool enable_loop_trace = false;
 };
@@ -118,6 +120,10 @@ private:
         std::vector<int32_t> generated_ids;
         bool finished = false;
         std::string finish_reason = "stop";
+        // Unified token tracking (mirrors vLLM's Request).
+        int num_prompt_tokens = 0;     // total prompt length
+        int num_computed_tokens = 0;   // advanced immediately after scheduling
+        bool is_prefill_chunk = true;  // true while num_computed_tokens < num_prompt_tokens
     };
 
     struct ContextLengthError : public std::runtime_error {
@@ -149,7 +155,6 @@ private:
 
     // Scheduler
     void scheduler_loop();
-    std::vector<ActiveGeneration> drain_pending_for_prefill(int max_new, int max_prompt_tokens);
     void finalize_request(ActiveGeneration& item);
     void fail_pending(const std::shared_ptr<PendingGeneration>& pending, const std::exception_ptr& eptr) const;
 
@@ -158,6 +163,7 @@ private:
     std::vector<int32_t> sanitize_token_ids(const std::vector<int32_t>& ids, bool& changed) const;
     int32_t sanitize_token(int32_t tok, bool& replaced) const;
     std::string safe_decode(const std::vector<int32_t>& ids) const;
+    std::string strip_thinking_preamble(const std::string& text) const;
     std::pair<std::string, bool> apply_stop(const std::string& text, const std::vector<std::string>& stop_strings) const;
     std::pair<std::vector<int32_t>, int> fit_prompt_and_max_tokens(
         const std::vector<int32_t>& prompt_ids,
@@ -197,6 +203,9 @@ private:
     // Direct inference context — bypasses MultiGPUPyTrainer::run_work for the hot path.
     // Extracted once after engine creation, used by scheduler + collect threads.
     MultiGPUPyTrainer::InferenceContext infer_ctx_{};
+
+    // Unified scheduler (vLLM v1 style).
+    std::unique_ptr<Scheduler> scheduler_;
 
     std::unique_ptr<httplib::Server> server_;
 };

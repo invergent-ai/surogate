@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace tokenizer {
@@ -78,9 +79,11 @@ public:
     // Returns the formatted string ready for encode().
     // If add_generation_prompt is true, appends the assistant header so the
     // model can continue generating.
+    // extra_flags are passed as template context variables (e.g. enable_thinking).
     std::string apply_chat_template(
         const std::vector<ChatMessage>& messages,
-        bool add_generation_prompt = false) const;
+        bool add_generation_prompt = false,
+        const std::unordered_map<std::string, bool>& extra_flags = {}) const;
 
     // Convenience: apply_chat_template + encode_with_special_tokens in one call.
     std::vector<int32_t> apply_chat_template_and_encode(

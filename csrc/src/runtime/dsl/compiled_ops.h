@@ -646,7 +646,8 @@ private:
 
     // Per-T segment graph cache for flat-token piecewise mode.
     // Each unique padded T gets its own set of segment graphs so they persist
-    // across steps with different T values.
+    // across steps with different T values. Keyed by T only because FlashAttention
+    // runs eagerly (not inside the graph) so the grid doesn't depend on batch_size.
     std::unordered_map<long, std::vector<std::vector<SegmentGraphExec>>> mFwdSegGraphsByT;
 
     /// Dispatch a single forward op (extracted from the switch in execute_forward).

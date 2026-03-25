@@ -1,0 +1,141 @@
+ Time (%)  Total Time (ns)  Instances     Avg (ns)         Med (ns)        Min (ns)       Max (ns)     StdDev (ns)   Style               Range            
+ --------  ---------------  ---------  ---------------  ---------------  -------------  -------------  -----------  -------  -----------------------------
+     48.3    3,246,162,700          1  3,246,162,700.0  3,246,162,700.0  3,246,162,700  3,246,162,700          0.0  PushPop  cuFile:CUFileInit            
+     31.2    2,094,636,112      1,161      1,804,165.5      1,227,118.0          8,580     46,798,927  3,590,645.2  PushPop  cuFile:cufile_posix_read     
+      9.1      613,928,630        399      1,538,668.2        529,846.0         20,599     46,973,663  3,382,492.2  PushPop  cuFile:cuFileRead            
+      5.8      391,282,696          1    391,282,696.0    391,282,696.0    391,282,696    391,282,696          0.0  PushPop  NCCL:ncclCommDestroy         
+      5.4      359,617,250          1    359,617,250.0    359,617,250.0    359,617,250    359,617,250          0.0  PushPop  NCCL:ncclCommInitRank        
+      0.1        9,446,417          3      3,148,805.7         53,449.0         35,169      9,357,799  5,377,153.7  PushPop  cuFile:cuFileHandleRegister  
+      0.0          485,457          1        485,457.0        485,457.0        485,457        485,457          0.0  PushPop  NCCL:ncclCommFinalize        
+      0.0           14,600          3          4,866.7          3,090.0          3,000          8,510      3,155.5  PushPop  cuFile:cuFileHandleDeregister
+
+[4/7] Executing 'cuda_api_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls    Avg (ns)       Med (ns)      Min (ns)     Max (ns)    StdDev (ns)                      Name                   
+ --------  ---------------  ---------  -------------  -------------  -----------  -----------  ------------  ------------------------------------------
+     75.2    5,908,467,477        404   14,624,919.5    8,951,935.0      555,485   61,220,407  15,661,496.0  cudaEventSynchronize                      
+      5.6      440,801,213      8,833       49,903.9       42,419.0          920      153,926      18,152.3  cuStreamSynchronize                       
+      4.9      381,340,400      1,297      294,017.3       51,589.0       29,359   39,875,166   2,287,440.1  cudaGraphInstantiate_v12000               
+      1.9      152,198,496      5,816       26,168.9       11,560.0        5,490      334,162      43,677.1  cudaGraphLaunch_v10000                    
+      1.9      151,568,177         30    5,052,272.6      126,637.0       58,539   38,038,833   9,221,999.4  cuLibraryLoadData                         
+      1.5      121,605,286          1  121,605,286.0  121,605,286.0  121,605,286  121,605,286           0.0  cuCtxCreate_v2                            
+      1.4      111,762,978          1  111,762,978.0  111,762,978.0  111,762,978  111,762,978           0.0  cudaMemGetInfo                            
+      1.2       92,770,864         72    1,288,484.2        2,950.0        1,170   79,998,604   9,509,123.0  cudaStreamSynchronize                     
+      1.1       89,726,799      8,833       10,158.1        8,130.0        2,520    1,753,045      31,540.8  cuMemcpyHtoDAsync_v2                      
+      0.9       72,044,778          1   72,044,778.0   72,044,778.0   72,044,778   72,044,778           0.0  cuCtxDestroy_v2                           
+      0.9       68,259,184      8,754        7,797.5        2,920.0          640   13,670,429     182,967.7  cudaLaunchKernel                          
+      0.7       55,731,996      4,628       12,042.4        7,580.0          750    8,729,936     128,631.8  cudaMemcpyAsync                           
+      0.7       51,542,306        489      105,403.5       44,058.0          560    7,110,367     372,529.7  cudaFree                                  
+      0.3       22,447,555        488       45,999.1       66,958.0        1,440      705,132      55,285.6  cudaMalloc                                
+      0.2       13,031,984        792       16,454.5          110.0           69    1,455,083     138,565.7  cuKernelSetAttribute                      
+      0.2       12,228,130        389       31,434.8       26,360.0           80    5,833,720     295,545.1  cuMemRelease                              
+      0.1       11,727,271         12      977,272.6      766,360.5       40,179    1,873,652     512,624.9  cuLibraryUnload                           
+      0.1       10,233,312        194       52,749.0       51,889.0       48,629      117,867       6,253.7  cuMemSetAccess                            
+      0.1       10,126,419          5    2,025,283.8    2,128,656.0      565,295    4,631,091   1,646,633.9  cuMemHostRegister_v2                      
+      0.1        9,428,437        914       10,315.6        3,160.0          800    5,836,000     193,097.1  cudaLaunchKernelExC_v11060                
+      0.1        8,672,838      4,610        1,881.3        1,060.0          410       61,469       2,093.4  cuLaunchKernel                            
+      0.1        8,342,159      4,610        1,809.6          290.0          230    3,477,660      59,003.0  cuKernelGetFunction                       
+      0.1        7,557,756          5    1,511,551.2      423,769.0       13,950    4,860,325   2,069,474.9  cuStreamCreateWithPriority                
+      0.1        7,085,196        194       36,521.6       29,954.0       28,219      230,124      18,075.0  cuMemUnmap                                
+      0.1        6,123,704      4,374        1,400.0          160.0           99      177,765       6,202.5  cudaMemsetAsync                           
+      0.1        4,661,330         30      155,377.7       27,244.0        9,950    1,852,872     419,539.3  cudaFreeHost                              
+      0.1        4,142,728      1,297        3,194.1        1,970.0        1,170    1,177,959      32,665.5  cudaGraphDestroy_v10000                   
+      0.0        3,252,797         10      325,279.7       40,803.5       12,010    1,470,662     522,576.7  cudaDeviceSynchronize                     
+      0.0        3,053,475        195       15,658.8       13,870.0       13,330      211,215      14,859.4  cuMemCreate                               
+      0.0        2,956,674         70       42,238.2          310.0           80    1,295,497     204,904.1  cudaGetDeviceProperties_v12000            
+      0.0        2,565,013      1,297        1,977.7        1,730.0        1,330       36,999       1,704.1  cudaStreamBeginCapture_v10000             
+      0.0        2,085,796        410        5,087.3        4,029.5          440       60,229       6,130.5  cudaEventRecord                           
+      0.0        1,848,572         29       63,743.9        8,599.0        1,720    1,484,351     273,658.9  cudaHostAlloc                             
+      0.0        1,643,981        396        4,151.5        3,019.5        2,650       54,129       5,204.0  cuLaunchKernelEx                          
+      0.0        1,603,929          1    1,603,929.0    1,603,929.0    1,603,929    1,603,929           0.0  cudaGraphExecDestroy_v10000               
+      0.0        1,093,992      6,497          168.4          100.0           70        7,490         281.0  cuKernelGetName                           
+      0.0          965,726      1,297          744.6          670.0          450       19,969         697.5  cudaStreamEndCapture_v10000               
+      0.0          609,661      2,527          241.3          170.0           80       12,239         354.7  cuGetProcAddress_v2                       
+      0.0          571,126         19       30,059.3        2,720.0        2,110      151,706      45,531.8  cudaStreamCreateWithFlags                 
+      0.0          378,830          1      378,830.0      378,830.0      378,830      378,830           0.0  cuMemAlloc_v2                             
+      0.0          306,124        194        1,578.0        1,490.0          600        4,660         566.9  cuMemAddressReserve                       
+      0.0          305,220        194        1,573.3        1,120.0          690       17,980       1,717.1  cuMemAddressFree                          
+      0.0          297,552         89        3,343.3        2,000.0        1,210      112,617      11,736.3  cudaDeviceGetDefaultMemPool_v11020        
+      0.0          287,371         89        3,228.9        2,580.0        1,260       47,589       4,975.8  cudaMemPoolTrimTo_v11020                  
+      0.0          283,373          2      141,686.5      141,686.5       65,509      217,864     107,731.3  cudaMemcpy                                
+      0.0          250,795         22       11,399.8        7,325.0        4,200       55,379      11,293.0  cudaStreamDestroy                         
+      0.0          249,053          1      249,053.0      249,053.0      249,053      249,053           0.0  cudaMemPoolDestroy_v11020                 
+      0.0          244,414      1,046          233.7          190.0          150        5,860         315.6  cudaThreadExchangeStreamCaptureMode_v10010
+      0.0          202,393        194        1,043.3          520.0          280       12,949       1,511.3  cuMemRetainAllocationHandle               
+      0.0          190,626          2       95,313.0       95,313.0       39,819      150,807      78,480.4  cuModuleLoadData                          
+      0.0          187,798        180        1,043.3          695.0          220        7,100         907.8  cudaStreamIsCapturing_v10000              
+      0.0          175,244        194          903.3          830.0          570        9,070         624.4  cuMemMap                                  
+      0.0          124,473         47        2,648.4        1,200.0          270       15,069       3,557.9  cuLibraryGetKernel                        
+      0.0          119,526          3       39,842.0       14,959.0        5,870       98,697      51,172.1  cudaStreamCreate                          
+      0.0           73,438          1       73,438.0       73,438.0       73,438       73,438           0.0  cudaMemPoolCreate_v11020                  
+      0.0           69,638         33        2,110.2          590.0          240       14,590       3,782.4  cudaEventDestroy                          
+      0.0           56,079         67          837.0          630.0          480        5,730         794.8  cudaStreamWaitEvent                       
+      0.0           39,539          1       39,539.0       39,539.0       39,539       39,539           0.0  cudaMallocHost                            
+      0.0           28,209         49          575.7          260.0          200        4,160         822.4  cudaEventCreateWithFlags                  
+      0.0           27,379         37          740.0          570.0          280        4,350         754.8  cudaGetDriverEntryPoint_v11030            
+      0.0           25,700          9        2,855.6        2,190.0          860        6,660       2,269.2  cuInit                                    
+      0.0           24,418        195          125.2           90.0           70        4,749         336.3  cuMemGetAllocationGranularity             
+      0.0           10,109         27          374.4          300.0          210        2,430         415.8  cuOccupancyMaxActiveClusters              
+      0.0            8,370          7        1,195.7          280.0           90        6,990       2,557.0  cuModuleGetLoadingMode                    
+      0.0            5,840          1        5,840.0        5,840.0        5,840        5,840           0.0  cuMemFree_v2                              
+      0.0            2,450          2        1,225.0        1,225.0          320        2,130       1,279.9  cudaEventCreate                           
+      0.0            2,380          1        2,380.0        2,380.0        2,380        2,380           0.0  cudaMemPoolSetAttribute_v11020            
+      0.0            1,500          2          750.0          750.0          310        1,190         622.3  cuOccupancyAvailableDynamicSMemPerBlock   
+      0.0            1,270          3          423.3          440.0          290          540         125.8  cudaGetDriverEntryPointByVersion_v12050   
+
+[5/7] Executing 'cuda_gpu_kern_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)   Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  ---------  ---------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     41.9      279,095,740      2,016  138,440.3  143,472.0    21,856   162,305     25,278.4  void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::KernelTraits<(flashinfer::MaskMode)…
+     22.4      149,635,510        576  259,783.9  230,977.0    61,312   528,065    160,034.9  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_tn_align8>(T1::Para…
+     13.1       87,008,359        972   89,514.8   67,520.0    15,968   245,696     63,591.7  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_tn_align8>(T1::Para…
+     10.7       71,455,362         72  992,435.6  993,234.5   983,202   997,186      3,253.4  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Par…
+      2.5       16,473,479         72  228,798.3  228,832.0   227,905   231,297        606.4  cudnn_generated_fort_native_sdpa_sm120_flash_fprop_f16_knob_3_64x64x128_4x1x1_cga1x1x1_kernel0_0    
+      1.9       12,725,603         60  212,093.4  202,832.5   100,576   856,962     97,792.2  void flashinfer::sampling::TopKTopPSamplingFromProbKernel<(unsigned int)1024, (cub::CUB_300102_SM_1…
+      1.6       10,702,101        949   11,277.2   10,048.0     5,696    22,241      4,996.3  void rmsnorm_forward_unified_kernel<__nv_bfloat16>(T1 *, T1 *, float *, const T1 *, const T1 *, con…
+      1.5        9,828,013        324   30,333.4   15,392.0     5,056    83,456     29,138.0  cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_3_64x64x128_4x1x1_cga1x1x1_kernel0_0
+      0.9        6,086,923        108   56,360.4   58,880.0    49,344    60,864      4,281.2  void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::KernelTraits<(flashinfer::MaskMode)…
+      0.9        5,764,020        324   17,790.2    9,072.0     4,224    48,384     15,702.9  void swiglu_forward_persistent_kernel<(bool)0, __nv_bfloat16>(T2 *, const T2 *, float *, int, int)  
+      0.6        3,804,365        468    8,129.0    5,120.0     1,888    23,456      6,884.2  void <unnamed>::qkv_qk_norm_rope_forward_kernel<__nv_bfloat16>(T1 *, float *, float *, const T1 *, …
+      0.3        2,179,524         73   29,856.5   23,488.0    22,784   483,041     53,780.1  void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8>(T1::Par…
+      0.3        2,085,349         36   57,926.4   57,728.0    57,056    64,224      1,203.5  void flashinfer::BatchDecodeWithPagedKVCacheKernel<(flashinfer::PosEncodingMode)0, (unsigned int)2,…
+      0.3        2,029,926         72   28,193.4   28,160.0    27,649    28,736        233.7  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_64x6_tn_align8>(T1::Param…
+      0.2        1,532,900        396    3,871.0    3,008.0     1,216     9,216      2,783.7  <unnamed>::kv_cache_store_paged_bf16_kernel(__nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *…
+      0.2        1,161,123         72   16,126.7   16,080.0    15,712    17,120        234.0  void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_bf16_64x64_64x6_tn_align8>(T1::Params)         
+      0.2        1,152,962         60   19,216.0   19,584.0    11,360    19,905      1,183.7  void flashinfer::sampling::OnlineSoftmaxReduceKernel<(unsigned int)1024, (unsigned int)4, float>(T3…
+      0.1          853,411         36   23,705.9   23,616.0    22,944    24,576        445.5  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x10_tn_align8>(T1::Para…
+      0.1          589,921        288    2,048.3    1,856.0     1,280     3,424        805.2  void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, __nv_bfloat16, __nv_bfloat16, float, __nv…
+      0.1          573,760         60    9,562.7   10,768.0     3,072    11,776      2,342.6  void flashinfer::sampling::OnlineSoftmaxMapKernel<(unsigned int)1024, (unsigned int)4, float>(T3 *,…
+      0.1          500,385          1  500,385.0  500,385.0   500,385   500,385          0.0  std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __n…
+      0.1          372,257        144    2,585.1    2,320.0     1,664     3,904        657.1  void swiglu_forward_kernel<__nv_bfloat16>(T1 *, const T1 *, float *, int, int)                      
+      0.1          349,408         89    3,925.9    4,512.0     1,344     6,048      1,518.2  void encoder_forward_kernel3_nowpe<__nv_bfloat16>(T1 *, const int *, const T1 *, int, int, int, int)
+      0.0          287,649        346      831.4      832.0       768       864         20.3  <unnamed>::fill_decode_cu_seqlens_kernel(int *, int *, const int *, int)                            
+      0.0          103,200         72    1,433.3    1,424.0     1,248     1,600        141.2  void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat1…
+      0.0           95,488         36    2,652.4    2,656.0     2,048     2,816        115.7  <unnamed>::build_flashinfer_decode_metadata_kernel(const int *, int, int, int *, int *, int *, int …
+      0.0           95,328         36    2,648.0    2,656.0     2,208     2,752         83.9  kv_cache_store_flat_paged_bf16_kernel(__nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *, cons…
+      0.0           58,432         60      973.9      960.0       800     1,120         53.8  <unnamed>::sanitize_token_ids_kernel(int *, int, int, int, int *)                                   
+      0.0           48,512         36    1,347.6    1,344.0     1,248     1,632         64.4  <unnamed>::kv_cache_append_paged_bf16_kernel(__nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 …
+      0.0           33,856         36      940.4      928.0       928       960         15.8  <unnamed>::gather_flashinfer_page_indices_kernel(const int *, int, const int *, const int *, int *,…
+      0.0           16,064          2    8,032.0    8,032.0     1,248    14,816      9,594.0  void convert_dtype_kernel<__nv_bfloat16, float>(T2 *, const T1 *, unsigned long)                    
+      0.0            1,632          1    1,632.0    1,632.0     1,632     1,632          0.0  <unnamed>::update_generation_state_kernel(const int *, int *, int *, int *, int, int)               
+      0.0            1,568          1    1,568.0    1,568.0     1,568     1,568          0.0  gather_rows_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const int *, int)                        
+      0.0              832          1      832.0      832.0       832       832          0.0  <unnamed>::mask_finished_tokens_kernel(int *, const int *, int)                                     
+
+[6/7] Executing 'cuda_gpu_mem_time_sum' stats report
+
+ Time (%)  Total Time (ns)  Count   Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)            Operation           
+ --------  ---------------  ------  --------  --------  --------  --------  -----------  ------------------------------
+     99.3      320,310,863  11,898  26,921.4  37,440.0       224   142,912     16,752.6  [CUDA memcpy Host-to-Device]  
+      0.5        1,676,388     472   3,551.7   2,560.0       768     9,760      2,923.3  [CUDA memcpy Device-to-Device]
+      0.1          387,520     555     698.2     416.0       256     3,872        697.9  [CUDA memset]                 
+      0.0          142,048     404     351.6     352.0       320       352          3.5  [CUDA memcpy Device-to-Host]  
+
+[7/7] Executing 'cuda_gpu_mem_size_sum' stats report
+
+ Total (MB)  Count   Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)            Operation           
+ ----------  ------  --------  --------  --------  --------  -----------  ------------------------------
+  8,837.368  11,898     0.743     1.049     0.000     4.194        0.467  [CUDA memcpy Host-to-Device]  
+  3,675.194     472     7.786     4.719     0.000    25.166        8.348  [CUDA memcpy Device-to-Device]
+    425.448     555     0.767     0.000     0.000    10.486        2.042  [CUDA memset]                 
+      0.026     404     0.000     0.000     0.000     0.000        0.000  [CUDA memcpy Device-to-Host]

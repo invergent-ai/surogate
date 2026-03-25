@@ -312,11 +312,54 @@ void flat_attention_plan(
             "flat_attention_plan: q_indptr total does not match total_q_tokens");
     }
     auto& plan_info = *reinterpret_cast<flashinfer::PrefillPlanInfo*>(plan_info_opaque);
-    // Build page metadata on CPU — reuse static buffers to avoid per-step heap allocation.
-    static thread_local std::vector<int32_t> h_page_indptr;
-    static thread_local std::vector<int32_t> h_last_page_len;
-    h_page_indptr.assign(batch_size + 1, 0);
-    h_last_page_len.resize(batch_size);
+
+    // -----------------------------------------------------------------------
+    // Pinned host arena for PrefillPlan metadata.
+    // ALL host→device copies must use pinned memory to avoid implicit
+    // cuStreamSynchronize (pageable memcpy forces driver-level sync).
+    // -----------------------------------------------------------------------
+    // Global pinned arena shared across threads (flat_attention_plan is only
+    // called from one thread at a time — the scheduler thread during serving,
+    // the main thread during warmup).
+    struct PinnedArena {
+        char* base = nullptr;
+        std::size_t capacity = 0;
+        std::size_t used = 0;
+
+        ~PinnedArena() { if (base) cudaFreeHost(base); }
+
+        void ensure(std::size_t bytes) {
+            if (bytes <= capacity) { used = 0; return; }
+            if (base) cudaFreeHost(base);
+            capacity = (bytes > (std::size_t(4) << 20)) ? bytes : (std::size_t(4) << 20);
+            CUDA_CHECK(cudaMallocHost(&base, capacity));
+            used = 0;
+        }
+
+        void* alloc_bytes(std::size_t bytes, std::size_t align) {
+            used = (used + align - 1) & ~(align - 1);
+            void* ptr = base + used;
+            used += bytes;
+            return ptr;
+        }
+    };
+    static PinnedArena arena;
+
+    // Compute sizes for all pinned allocations.
+    // page_indptr: batch_size+1, last_page_len: batch_size, kv_indptr: batch_size+1
+    // page_indices: up to batch_size * max_pages_per_seq (computed below)
+    // plan_workspace: int_ws_size bytes
+    const std::size_t metadata_bytes =
+        (batch_size + 1) * sizeof(int32_t) * 2 +  // page_indptr + kv_indptr
+        batch_size * sizeof(int32_t) +              // last_page_len
+        batch_size * block_table_stride * sizeof(int32_t) +  // page_indices (upper bound)
+        int_ws_size + 64;                           // plan workspace + alignment slack
+    arena.ensure(metadata_bytes);
+
+    int32_t* h_page_indptr   = static_cast<int32_t*>(arena.alloc_bytes((batch_size + 1) * sizeof(int32_t), alignof(int32_t)));
+    int32_t* h_last_page_len = static_cast<int32_t*>(arena.alloc_bytes(batch_size * sizeof(int32_t), alignof(int32_t)));
+
+    h_page_indptr[0] = 0;
     int total_pages = 0;
     for (int i = 0; i < batch_size; ++i) {
         int k_len = std::max(1, static_cast<int>(h_seq_lens_k[i]));
@@ -327,8 +370,7 @@ void flat_attention_plan(
         h_last_page_len[i] = (rem == 0) ? page_block_size : rem;
     }
 
-    static thread_local std::vector<int32_t> h_page_indices;
-    h_page_indices.resize(total_pages);
+    int32_t* h_page_indices = static_cast<int32_t*>(arena.alloc_bytes(total_pages * sizeof(int32_t), alignof(int32_t)));
     for (int i = 0; i < batch_size; ++i) {
         int start = h_page_indptr[i];
         int count = h_page_indptr[i + 1] - start;
@@ -338,34 +380,31 @@ void flat_attention_plan(
         }
     }
 
-    // Upload page metadata.
-    CUDA_CHECK(cudaMemcpyAsync(d_page_indptr, h_page_indptr.data(),
+    // Upload page metadata (pinned → truly async, no implicit sync).
+    CUDA_CHECK(cudaMemcpyAsync(d_page_indptr, h_page_indptr,
         (batch_size + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_page_indices, h_page_indices.data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_page_indices, h_page_indices,
         total_pages * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_last_page_len, h_last_page_len.data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_last_page_len, h_last_page_len,
         batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    // Build KV indptr (cumulative KV lengths).
-    static thread_local std::vector<int32_t> h_kv_indptr;
-    h_kv_indptr.assign(batch_size + 1, 0);
+    // Build KV indptr (cumulative KV lengths) — pinned.
+    int32_t* h_kv_indptr = static_cast<int32_t*>(arena.alloc_bytes((batch_size + 1) * sizeof(int32_t), alignof(int32_t)));
+    h_kv_indptr[0] = 0;
     for (int i = 0; i < batch_size; ++i) {
         h_kv_indptr[i + 1] = h_kv_indptr[i] + h_seq_lens_k[i];
     }
 
-    // Page-locked host buffer for PrefillPlan — reuse across calls to avoid
-    // allocating+zeroing 16MB of heap memory every step (~8ms overhead).
-    static thread_local std::vector<char> page_locked_buf;
-    if (page_locked_buf.size() < int_ws_size) {
-        page_locked_buf.resize(int_ws_size, 0);
-    }
+    // Pinned workspace for PrefillPlan (truly page-locked this time).
+    char* plan_ws = static_cast<char*>(arena.alloc_bytes(int_ws_size, 16));
+    std::memset(plan_ws, 0, int_ws_size);
 
     auto plan_err = flashinfer::PrefillPlan<int32_t>(
         d_float_ws, float_ws_size,
-        d_int_ws, page_locked_buf.data(), int_ws_size,
+        d_int_ws, plan_ws, int_ws_size,
         plan_info,
         const_cast<int32_t*>(h_q_indptr),
-        h_kv_indptr.data(),
+        h_kv_indptr,
         static_cast<uint32_t>(total_q_tokens),
         static_cast<uint32_t>(batch_size),
         static_cast<uint32_t>(Hq),
@@ -377,8 +416,6 @@ void flat_attention_plan(
         /*sizeof_dtype_o=*/sizeof(nv_bfloat16),
         /*window_left=*/-1,
         /*fixed_split_size=*/0,
-        // Keep flat-token path on the non-split prefill kernel for correctness.
-        // This avoids merge-workspace layout mismatches across FlashInfer versions.
         /*disable_split_kv=*/true,
         /*num_colocated_ctas=*/0,
         stream);

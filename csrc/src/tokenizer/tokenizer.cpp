@@ -147,7 +147,8 @@ struct Tokenizer::Impl {
     // Render the chat template with the given messages and options.
     std::string render_chat_template(
             const nlohmann::ordered_json& messages,
-            bool add_generation_prompt) const {
+            bool add_generation_prompt,
+            const std::unordered_map<std::string, bool>& extra_flags = {}) const {
         if (!chat_tmpl_root) {
             throw std::runtime_error("No chat template loaded.");
         }
@@ -157,6 +158,9 @@ struct Tokenizer::Impl {
         }));
         context->set("bos_token", bos_token_str);
         context->set("eos_token", eos_token_str);
+        for (const auto& [key, val] : extra_flags) {
+            context->set(key, val);
+        }
 
         auto now = std::chrono::system_clock::now();
         context->set("strftime_now", minja::Value::callable(
@@ -675,14 +679,15 @@ std::string Tokenizer::special_token(const std::string& name) const {
 
 std::string Tokenizer::apply_chat_template(
         const std::vector<ChatMessage>& messages,
-        bool add_generation_prompt) const {
+        bool add_generation_prompt,
+        const std::unordered_map<std::string, bool>& extra_flags) const {
     // Convert ChatMessage to nlohmann::ordered_json array
     nlohmann::ordered_json json_messages = nlohmann::ordered_json::array();
     for (const auto& msg : messages) {
         json_messages.push_back({{"role", msg.role}, {"content", msg.content}});
     }
 
-    return impl_->render_chat_template(json_messages, add_generation_prompt);
+    return impl_->render_chat_template(json_messages, add_generation_prompt, extra_flags);
 }
 
 std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(

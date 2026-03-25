@@ -140,13 +140,15 @@ public:
         float top_p = 1.0f;
         float min_p = 0.0f;
         int prefill_chunk_size = 256;  // max prefill tokens per request per step
+        int multi_decode_steps = 1;    // N graph replays per pure-decode step (1 = single-step)
     };
     struct FlatStepResult {
         std::vector<int> new_slot_ids;           // slot IDs for new prompts (-1 if failed)
         std::vector<int> active_slot_ids;        // all active slots (including new)
-        std::vector<int32_t> sampled_tokens;     // one per active slot
-        std::vector<int> finished;               // 1 if finished
-        std::vector<int> completion_lens;        // total generated per slot
+        std::vector<int32_t> sampled_tokens;     // [decode_steps * batch_size] flat, step-major
+        std::vector<int> finished;               // 1 if finished (after all steps)
+        std::vector<int> completion_lens;        // total generated per slot (after all steps)
+        int decode_steps = 1;                    // number of tokens per slot in sampled_tokens
     };
     FlatStepResult flat_step(
         const std::vector<std::vector<int32_t>>& new_prompts,
@@ -242,9 +244,12 @@ private:
     // Async D2H readback for flat_step (eliminates cudaStreamSynchronize).
     // Pinned host buffer + event allow the CPU to prepare the next batch
     // while the GPU finishes sampling + D2H copy.
-    int32_t* pinned_sampled_ = nullptr;      // cudaMallocHost'd pinned buffer
+    int32_t* pinned_sampled_ = nullptr;      // cudaMallocHost'd pinned buffer [max_slots_]
+    int32_t* pinned_multi_sampled_ = nullptr; // [kMaxMultiSteps * max_slots_]
+    static constexpr int kMaxMultiSteps = 16;
     cudaEvent_t sampled_ready_event_ = nullptr;  // recorded after D2H copy
     bool has_pending_sampled_ = false;        // true if event needs sync
+    int pending_decode_steps_ = 1;            // multi-step count for pending collect
 
     // ========================================================================
     // Pinned host staging buffers for H2D copies in flat_step().
@@ -318,11 +323,25 @@ private:
     // Pre-allocated flat-step GPU buffers (avoid per-step cudaMallocAsync)
     int max_batched_tokens_ = 0;           // token budget for flat_step
     int prefill_rr_cursor_ = 0;            // fairness cursor for budgeted prefill admission
-    int32_t* flat_token_to_req_gpu_ = nullptr;  // [max_batched_tokens_]
-    int32_t* flat_kv_write_pos_gpu_ = nullptr;  // [max_batched_tokens_]
-    int32_t* flat_q_indptr_gpu_ = nullptr;      // [max_slots_ + 1]
-    int32_t* flat_last_token_indices_gpu_ = nullptr; // [max_slots_]
-    int32_t* flat_seq_lens_k_gpu_ = nullptr;    // [max_slots_]
+
+    // Packed flat-step metadata: 5 arrays in one contiguous GPU + pinned buffer.
+    // ONE H2D copy per step replaces 5 separate cudaMemcpyAsync calls.
+    // Layout: [token_to_req:MBT] [kv_write_pos:MBT] [q_indptr:S+1] [seq_lens_k:S] [last_tok_idx:S]
+    void* flat_packed_gpu_ = nullptr;          // contiguous GPU buffer
+    void* flat_packed_pinned_ = nullptr;       // contiguous pinned host buffer
+    std::size_t flat_packed_bytes_ = 0;        // total size of packed buffer
+    // Offsets into packed buffer (in bytes)
+    std::size_t flat_off_token_to_req_ = 0;
+    std::size_t flat_off_kv_write_pos_ = 0;
+    std::size_t flat_off_q_indptr_ = 0;
+    std::size_t flat_off_seq_lens_k_ = 0;
+    std::size_t flat_off_last_token_idx_ = 0;
+    // Typed pointers into GPU packed buffer (set once at init)
+    int32_t* flat_token_to_req_gpu_ = nullptr;
+    int32_t* flat_kv_write_pos_gpu_ = nullptr;
+    int32_t* flat_q_indptr_gpu_ = nullptr;
+    int32_t* flat_last_token_indices_gpu_ = nullptr;
+    int32_t* flat_seq_lens_k_gpu_ = nullptr;
     int32_t* flat_page_indptr_gpu_ = nullptr;   // [max_slots_ + 1]
     int32_t* flat_page_indices_gpu_ = nullptr;  // [max_slots_ * max_pages_per_seq_]
     int32_t* flat_last_page_len_gpu_ = nullptr; // [max_slots_]

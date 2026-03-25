@@ -589,6 +589,14 @@ ContinuousGenerationEngine::~ContinuousGenerationEngine() {
         cudaFreeHost(pinned_sampled_);
         pinned_sampled_ = nullptr;
     }
+    if (pinned_multi_sampled_) {
+        cudaFreeHost(pinned_multi_sampled_);
+        pinned_multi_sampled_ = nullptr;
+    }
+    if (flat_packed_pinned_) {
+        cudaFreeHost(flat_packed_pinned_);
+        flat_packed_pinned_ = nullptr;
+    }
     pinned_.free_all();
     if (sampled_ready_event_) {
         cudaEventDestroy(sampled_ready_event_);
@@ -680,6 +688,8 @@ void ContinuousGenerationEngine::init(
 
     // Pinned host buffer for async D2H readback (eliminates cudaStreamSynchronize)
     CUDA_CHECK(cudaMallocHost(&pinned_sampled_, S * sizeof(int32_t)));
+    CUDA_CHECK(cudaMallocHost(&pinned_multi_sampled_,
+        static_cast<std::size_t>(kMaxMultiSteps) * S * sizeof(int32_t)));
     CUDA_CHECK(cudaEventCreateWithFlags(&sampled_ready_event_, cudaEventDisableTiming));
 
     // Pinned staging buffers for H2D copies in flat_step / rebuild_compact_batch.
@@ -724,16 +734,28 @@ void ContinuousGenerationEngine::init(
     prefill_token_buckets_ = build_prefill_token_buckets(max_batched_tokens_);
     const auto MBT = static_cast<std::size_t>(max_batched_tokens_);
 
-    flat_token_to_req_gpu_ = reinterpret_cast<int32_t*>(
-        alloc(MBT * sizeof(int32_t), "ce_flat_token_to_req"));
-    flat_kv_write_pos_gpu_ = reinterpret_cast<int32_t*>(
-        alloc(MBT * sizeof(int32_t), "ce_flat_kv_write_pos"));
-    flat_q_indptr_gpu_ = reinterpret_cast<int32_t*>(
-        alloc((S + 1) * sizeof(int32_t), "ce_flat_q_indptr"));
-    flat_last_token_indices_gpu_ = reinterpret_cast<int32_t*>(
-        alloc(S * sizeof(int32_t), "ce_flat_last_token_indices"));
-    flat_seq_lens_k_gpu_ = reinterpret_cast<int32_t*>(
-        alloc(S * sizeof(int32_t), "ce_flat_seq_lens_k"));
+    // Allocate ONE contiguous GPU + pinned buffer for flat-step metadata.
+    // Replaces 5 separate cudaMemcpyAsync calls with ONE bulk H2D transfer per step.
+    {
+        const std::size_t sz4 = sizeof(int32_t);
+        flat_off_token_to_req_ = 0;
+        flat_off_kv_write_pos_ = flat_off_token_to_req_ + MBT * sz4;
+        flat_off_q_indptr_     = flat_off_kv_write_pos_ + MBT * sz4;
+        flat_off_seq_lens_k_   = flat_off_q_indptr_     + (S + 1) * sz4;
+        flat_off_last_token_idx_ = flat_off_seq_lens_k_ + S * sz4;
+        flat_packed_bytes_     = flat_off_last_token_idx_ + S * sz4;
+
+        flat_packed_gpu_ = alloc(flat_packed_bytes_, "ce_flat_packed");
+        CUDA_CHECK(cudaMallocHost(&flat_packed_pinned_, flat_packed_bytes_));
+        std::memset(flat_packed_pinned_, 0, flat_packed_bytes_);
+
+        auto* gpu_base = reinterpret_cast<char*>(flat_packed_gpu_);
+        flat_token_to_req_gpu_      = reinterpret_cast<int32_t*>(gpu_base + flat_off_token_to_req_);
+        flat_kv_write_pos_gpu_      = reinterpret_cast<int32_t*>(gpu_base + flat_off_kv_write_pos_);
+        flat_q_indptr_gpu_          = reinterpret_cast<int32_t*>(gpu_base + flat_off_q_indptr_);
+        flat_seq_lens_k_gpu_        = reinterpret_cast<int32_t*>(gpu_base + flat_off_seq_lens_k_);
+        flat_last_token_indices_gpu_ = reinterpret_cast<int32_t*>(gpu_base + flat_off_last_token_idx_);
+    }
     flat_page_indptr_gpu_ = reinterpret_cast<int32_t*>(
         alloc((S + 1) * sizeof(int32_t), "ce_flat_page_indptr"));
     flat_page_indices_gpu_ = reinterpret_cast<int32_t*>(
@@ -1953,26 +1975,27 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     const bool pure_decode = !has_prefill && (actual_total_tokens == batch_size);
     const int exec_batch_size = pure_decode ? padded_total_tokens : batch_size;
 
-    // Build host arrays using pinned staging buffers (zero-copy cudaMemcpyAsync).
-    // Pageable std::vector memory forces cudaMemcpyAsync to synchronize (~631μs/call).
-    // Pinned memory makes it truly async (~5μs/call).
+    // Build host arrays. The 5 flat-step arrays (token_to_req, kv_write_pos,
+    // q_indptr, seq_lens_k, last_token_indices) are packed into one contiguous
+    // pinned buffer for a SINGLE bulk H2D copy in Phase 4.
+    // The remaining arrays (token_ids, position_ids, seq_lens_current, finished)
+    // use separate pinned staging buffers (they go to fixed GPU addresses).
     int32_t* h_token_ids = pinned_.token_ids;
     int32_t* h_position_ids = pinned_.position_ids;
-    int32_t* h_token_to_req = pinned_.token_to_req;
-    int32_t* h_kv_write_pos = pinned_.kv_write_pos;
-    int32_t* h_q_indptr = pinned_.q_indptr;
+    auto* packed_base = reinterpret_cast<char*>(flat_packed_pinned_);
+    int32_t* h_token_to_req = reinterpret_cast<int32_t*>(packed_base + flat_off_token_to_req_);
+    int32_t* h_kv_write_pos = reinterpret_cast<int32_t*>(packed_base + flat_off_kv_write_pos_);
+    int32_t* h_q_indptr     = reinterpret_cast<int32_t*>(packed_base + flat_off_q_indptr_);
+    int32_t* h_seq_lens_k   = reinterpret_cast<int32_t*>(packed_base + flat_off_seq_lens_k_);
     int*     h_seq_lens_current = pinned_.seq_lens_current;
-    int32_t* h_seq_lens_k = pinned_.seq_lens_k;
     int*     h_finished_flags = pinned_.finished_flags;
 
     // Zero-initialize (pinned memory persists across calls)
     std::memset(h_token_ids, 0, padded_total_tokens * sizeof(int32_t));
     std::memset(h_position_ids, 0, padded_total_tokens * sizeof(int32_t));
-    std::memset(h_token_to_req, 0, padded_total_tokens * sizeof(int32_t));
-    std::memset(h_kv_write_pos, 0, padded_total_tokens * sizeof(int32_t));
-    std::memset(h_q_indptr, 0, (batch_size + 1) * sizeof(int32_t));
+    // Zero the entire packed buffer once (covers token_to_req, kv_write_pos, q_indptr, seq_lens_k, last_token_idx)
+    std::memset(packed_base, 0, flat_packed_bytes_);
     std::memset(h_seq_lens_current, 0, exec_batch_size * sizeof(int));
-    std::memset(h_seq_lens_k, 0, exec_batch_size * sizeof(int32_t));
     std::memset(h_finished_flags, 0, exec_batch_size * sizeof(int));
 
     int tok_offset = 0;
@@ -2089,22 +2112,22 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
             stream));
     }
 
-    // Use pre-allocated flat-step buffers (no per-step cudaMallocAsync).
+    // Flat-step metadata pointers (into contiguous GPU packed buffer).
     int32_t* d_token_to_req = flat_token_to_req_gpu_;
     int32_t* d_kv_write_pos = flat_kv_write_pos_gpu_;
     int32_t* d_q_indptr = flat_q_indptr_gpu_;
     int32_t* d_seq_lens_k = flat_seq_lens_k_gpu_;
 
-    CUDA_CHECK(cudaMemcpyAsync(d_token_to_req, h_token_to_req,
-        TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_kv_write_pos, h_kv_write_pos,
-        TT * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_q_indptr, h_q_indptr,
-        (BS + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // ONE bulk H2D copy for the 5 packed flat-step arrays (token_to_req,
+    // kv_write_pos, q_indptr, seq_lens_k, last_token_indices).
+    // Replaces 5 separate cudaMemcpyAsync calls.
+    CUDA_CHECK(cudaMemcpyAsync(flat_packed_gpu_, flat_packed_pinned_,
+        flat_packed_bytes_, cudaMemcpyHostToDevice, stream));
+
+    // Remaining individual H2D copies for permanent GPU buffers
+    // (used by decode CUDA graph at fixed addresses).
     CUDA_CHECK(cudaMemcpyAsync(seq_lens_gpu_, h_seq_lens_current,
         BS_exec * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_seq_lens_k, h_seq_lens_k,
-        BS_exec * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     if (pure_decode) {
         CUDA_CHECK(cudaMemcpyAsync(finished_gpu_, h_finished_flags,
             BS_exec * sizeof(int), cudaMemcpyHostToDevice, stream));
@@ -2148,12 +2171,11 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     ds.flat_padded_batch_size = total_tiles;
 
     // Compute last-token indices for LM head gather optimization.
-    int32_t* h_last_token_indices = pinned_.last_token_indices;
+    int32_t* h_last_token_indices = reinterpret_cast<int32_t*>(packed_base + flat_off_last_token_idx_);
     for (int i = 0; i < batch_size; ++i) {
         h_last_token_indices[i] = h_q_indptr[i + 1] - 1;
     }
-    CUDA_CHECK(cudaMemcpyAsync(flat_last_token_indices_gpu_, h_last_token_indices,
-        BS * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // last_token_indices already in packed buffer (uploaded above).
     ds.flat_last_token_indices_gpu = flat_last_token_indices_gpu_;
 
     ds.token_to_req_gpu = d_token_to_req;
@@ -2216,6 +2238,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     const bool use_decode_path = pure_decode && use_cuda_graphs_;
     // When full_step captures forward+sampling+feedback in one graph, skip Phase 7.
     bool full_step_handled_sampling = false;
+    int num_decode_steps = 1;
 
     if (use_decode_path) {
         // Pure decode: capture the ENTIRE step (forward + sampling + token
@@ -2273,8 +2296,55 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         };
 
         const bool try_full_step = state.pinned;
-        if (try_full_step && full_step_primed_) {
-            // Replay the full-step graph
+        const int requested_multi = std::max(1, std::min(config.multi_decode_steps, kMaxMultiSteps));
+
+        // Clamp multi-step to the minimum remaining generation budget across
+        // all active decode slots. This prevents writing KV cache past
+        // allocated pages and generating beyond max_gen_len.
+        // Only enable multi-step when every slot has at least N steps of
+        // headroom in both generation budget AND page capacity.
+        int max_safe_steps = requested_multi;
+        if (requested_multi > 1) {
+            bool any_prefilling = false;
+            for (int i = 0; i < batch_size; ++i) {
+                const auto& slot = slots_[static_cast<std::size_t>(active_sids[i])];
+                if (slot.prefilling()) { any_prefilling = true; break; }
+                const int remaining = slot.max_gen_len - slot.generated_count;
+                const int page_capacity = static_cast<int>(slot.page_ids.size()) * kPageBlockSize;
+                const int page_headroom = page_capacity - slot.seq_len;
+                const int safe = std::min(remaining, page_headroom);
+                max_safe_steps = std::min(max_safe_steps, safe);
+            }
+            // Disable multi-step if any slot is prefilling or headroom is too tight.
+            if (any_prefilling || max_safe_steps < 2) {
+                max_safe_steps = 1;
+            }
+        }
+
+        // Multi-step only when the full-step graph is captured and ready.
+        num_decode_steps = (try_full_step && full_step_primed_ && max_safe_steps > 1)
+            ? max_safe_steps : 1;
+
+        if (try_full_step && full_step_primed_ && num_decode_steps > 1) {
+            // Multi-step decode: launch the full-step graph N times back-to-back.
+            // Each replay produces one token per slot. D2H copies between replays
+            // capture intermediate tokens. GPU runs all N steps with zero inter-step gap.
+            const auto slot_bytes = static_cast<std::size_t>(batch_size) * sizeof(int32_t);
+            for (int step = 0; step < num_decode_steps; ++step) {
+                dsl::trace_or_execute_cuda_graph_with_stack(
+                    full_decode_step, stream, full_step_graph_exec_,
+                    /*enabled=*/true, run_state_->Stack,
+                    full_step_graph_checkpoint_, "full_step_flat");
+                // D2H copy of this step's sampled tokens (async, ~1μs to queue).
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pinned_multi_sampled_ + step * max_slots_,
+                    sampled_tokens_gpu_,
+                    slot_bytes,
+                    cudaMemcpyDeviceToHost,
+                    stream));
+            }
+        } else if (try_full_step && full_step_primed_) {
+            // Single-step graph replay
             dsl::trace_or_execute_cuda_graph_with_stack(
                 full_decode_step, stream, full_step_graph_exec_,
                 /*enabled=*/true, run_state_->Stack,
@@ -2396,8 +2466,12 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // === D2H readback ===
     long p7_launch_us = 0;
     if (flat_step_profile) { p7_launch_us = us_since(t_phase); }
-    CUDA_CHECK(cudaMemcpyAsync(pinned_sampled_, sampled_tokens_gpu_,
-        BS * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    // For multi-step decode, D2H copies were already queued per-step above.
+    // For single-step (or non-graph path), do the standard D2H here.
+    if (num_decode_steps <= 1 || !full_step_handled_sampling) {
+        CUDA_CHECK(cudaMemcpyAsync(pinned_sampled_, sampled_tokens_gpu_,
+            BS * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    }
     CUDA_CHECK(cudaEventRecord(sampled_ready_event_, stream));
 
     // === Deferred sync mode: save state and return without blocking ===
@@ -2408,6 +2482,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         pending_q_lens_.assign(q_lens.begin(), q_lens.end());
         pending_new_slot_ids_ = std::move(result.new_slot_ids);
         pending_compact_batch_needs_rebuild_ = compact_batch_needs_rebuild;
+        pending_decode_steps_ = num_decode_steps;
         has_pending_sampled_ = true;
 
         if (flat_step_profile) {
@@ -2543,18 +2618,19 @@ ContinuousGenerationEngine::flat_step_collect() {
     }
     has_pending_sampled_ = false;
 
-    // Block until GPU finishes sampling + D2H readback
+    // Block until GPU finishes all decode steps + D2H readback
     CUDA_CHECK(cudaEventSynchronize(sampled_ready_event_));
 
-    // Phase 8: Update slot state from pinned readback
     const int batch_size = pending_batch_size_;
     const int V = vocab_size_;
+    const int N = pending_decode_steps_;
     bool compact_batch_needs_rebuild = pending_compact_batch_needs_rebuild_;
 
     FlatStepResult result;
     result.new_slot_ids = std::move(pending_new_slot_ids_);
     result.active_slot_ids.resize(batch_size);
-    result.sampled_tokens.resize(batch_size);
+    result.decode_steps = N;
+    result.sampled_tokens.resize(static_cast<std::size_t>(N) * batch_size);
     result.finished.resize(batch_size, 0);
     result.completion_lens.resize(batch_size, 0);
 
@@ -2562,40 +2638,63 @@ ContinuousGenerationEngine::flat_step_collect() {
         const int sid = pending_active_sids_[i];
         auto& slot = slots_[static_cast<std::size_t>(sid)];
         const bool was_prefilling = slot.prefilling();
-        int32_t tok = pinned_sampled_[i];
-        if (!is_valid_token_id(tok, V)) {
-            tok = fallback_token_id_;
-        }
 
         if (was_prefilling) {
+            // Prefill slots: only 1 token (multi-step is decode-only).
+            int32_t tok = (N > 1) ? pinned_multi_sampled_[i] : pinned_sampled_[i];
+            if (!is_valid_token_id(tok, V)) tok = fallback_token_id_;
+
             slot.prefill_progress += pending_q_lens_[i];
             slot.seq_len = slot.prefill_progress;
-
             if (!slot.prefilling()) {
                 slot.last_token = tok;
                 slot.generated_count = 1;
                 slot.prompt.clear();
                 slot.prompt.shrink_to_fit();
                 compact_batch_needs_rebuild = true;
-
                 if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
                     slot.finished = true;
                 }
             } else {
                 slot.generated_count = 0;
             }
+            result.sampled_tokens[0 * batch_size + i] = tok;
+            for (int s = 1; s < N; ++s) {
+                result.sampled_tokens[s * batch_size + i] = 0;
+            }
+        } else if (N > 1) {
+            // Decode slot with multi-step: process N tokens.
+            for (int s = 0; s < N; ++s) {
+                if (slot.finished) {
+                    result.sampled_tokens[s * batch_size + i] = 0;
+                    continue;
+                }
+                int32_t tok = pinned_multi_sampled_[s * max_slots_ + i];
+                if (!is_valid_token_id(tok, V)) tok = fallback_token_id_;
+
+                slot.seq_len += 1;
+                slot.last_token = tok;
+                slot.generated_count += 1;
+                if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
+                    slot.finished = true;
+                }
+                result.sampled_tokens[s * batch_size + i] = tok;
+            }
         } else {
+            // Single-step decode
+            int32_t tok = pinned_sampled_[i];
+            if (!is_valid_token_id(tok, V)) tok = fallback_token_id_;
+
             slot.seq_len += 1;
             slot.last_token = tok;
             slot.generated_count += 1;
-
             if (tok == slot.eos_token_id || slot.generated_count >= slot.max_gen_len) {
                 slot.finished = true;
             }
+            result.sampled_tokens[i] = tok;
         }
 
         result.active_slot_ids[i] = sid;
-        result.sampled_tokens[i] = tok;
         result.finished[i] = slot.finished ? 1 : 0;
         result.completion_lens[i] = slot.generated_count;
     }

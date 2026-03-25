@@ -447,6 +447,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/block_quant.cu
     src/kernels/mxfp4_dequant.cu
     src/kernels/turboquant.cu
+    src/kernels/attention_decode_tq.cu
     src/kernels/bnb_quant.cu
     src/kernels/global_norm.cu
     src/kernels/bias.cu
@@ -591,6 +592,7 @@ if (PYTHON_BINDING)
         src/binding/binding.cpp
         src/binding/py_train.cpp
         src/serve/native_http_server.cpp
+        src/serve/scheduler.cpp
         src/third_party/cpp-httplib/httplib.cpp
     )
     target_link_libraries(_surogate PUBLIC surogate-common Python::Module fmt::fmt-header-only)
@@ -648,6 +650,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/kernels/test-sampling.cu
             src/testing/kernels/test-attention-decode-fp8.cu
             src/testing/kernels/test-turboquant.cu
+            src/testing/kernels/test-attention-decode-tq.cu
 
 
             # Quantization

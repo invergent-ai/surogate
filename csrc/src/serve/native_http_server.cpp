@@ -110,6 +110,17 @@ inline std::string header_value_ci(const std::unordered_multimap<std::string, st
     return "";
 }
 
+inline std::string ltrim_ascii_whitespace(std::string text) {
+    size_t pos = 0;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+        ++pos;
+    }
+    if (pos == 0) {
+        return text;
+    }
+    return text.substr(pos);
+}
+
 }  // namespace
 
 void NativeHttpServer::TokenQueue::push(int32_t tok) {
@@ -352,7 +363,10 @@ std::string NativeHttpServer::messages_to_prompt_text(const json& messages) cons
     }
 
     try {
-        return tokenizer_.apply_chat_template(normalized, true);
+        return tokenizer_.apply_chat_template(
+            normalized,
+            true,
+            {{"enable_thinking", false}});
     } catch (...) {
         std::ostringstream oss;
         for (const auto& m : normalized) {
@@ -526,6 +540,9 @@ std::shared_ptr<NativeHttpServer::PendingGeneration> NativeHttpServer::enqueue_g
                 msg = fmt::format("native scheduler is not running: {}", scheduler_error_msg_);
             }
         }
+        std::cerr << fmt::format(
+            "[sched-reject] Rejecting request: shutdown={} failed={} exited={} msg={}\n",
+            shutdown_.load(), scheduler_failed_.load(), scheduler_exited_.load(), msg);
         fail_pending(pending, std::make_exception_ptr(std::runtime_error(msg)));
         return pending;
     }
@@ -562,32 +579,6 @@ void NativeHttpServer::fail_pending(
     }
 }
 
-std::vector<NativeHttpServer::ActiveGeneration> NativeHttpServer::drain_pending_for_prefill(
-    int max_new,
-    int max_prompt_tokens) {
-    std::vector<ActiveGeneration> out;
-    out.reserve(static_cast<size_t>(std::max(0, max_new)));
-
-    int used_prompt_tokens = 0;
-    const int token_budget = std::max(1, max_prompt_tokens);
-
-    std::lock_guard<std::mutex> lock(pending_mu_);
-    while (!pending_.empty() && static_cast<int>(out.size()) < max_new) {
-        auto pending = pending_.front();
-        const int prefill_tokens = std::max(1, static_cast<int>(pending->prompt_ids.size()) - 1);
-        if (!out.empty() && (used_prompt_tokens + prefill_tokens > token_budget)) {
-            break;
-        }
-        pending_.pop_front();
-        out.push_back(ActiveGeneration{pending});
-        used_prompt_tokens += prefill_tokens;
-        if (used_prompt_tokens >= token_budget) {
-            break;
-        }
-    }
-
-    return out;
-}
 
 int32_t NativeHttpServer::sanitize_token(int32_t tok, bool& replaced) const {
     if (tok >= 0 && tok < token_id_limit_) {
@@ -634,6 +625,38 @@ std::string NativeHttpServer::safe_decode(const std::vector<int32_t>& ids) const
     }
 }
 
+std::string NativeHttpServer::strip_thinking_preamble(const std::string& text) const {
+    constexpr const char* kThinkOpen = "<think>";
+    constexpr const char* kThinkClose = "</think>";
+    constexpr size_t kThinkCloseLen = 8;
+
+    const auto close_pos = text.find(kThinkClose);
+    if (close_pos == std::string::npos) {
+        return text;
+    }
+
+    bool should_strip = false;
+    const auto open_pos = text.find(kThinkOpen);
+    if (open_pos != std::string::npos && open_pos < close_pos) {
+        should_strip = true;
+    } else {
+        // Some tokenizers emit the closing tag text but hide the opening tag as
+        // a special token; treat an early `</think>` as a hidden-reasoning preamble.
+        constexpr size_t kMaxReasoningPrefixChars = 16384;
+        if (close_pos <= kMaxReasoningPrefixChars
+            && (close_pos == 0
+                || std::isspace(static_cast<unsigned char>(text[close_pos - 1])) != 0)) {
+            should_strip = true;
+        }
+    }
+    if (!should_strip) {
+        return text;
+    }
+
+    const size_t answer_start = close_pos + kThinkCloseLen;
+    return ltrim_ascii_whitespace(text.substr(answer_start));
+}
+
 std::pair<std::string, bool> NativeHttpServer::apply_stop(
     const std::string& text,
     const std::vector<std::string>& stop_strings) const {
@@ -663,10 +686,11 @@ void NativeHttpServer::finalize_request(ActiveGeneration& item) {
     bool had_invalid = false;
     auto clean_ids = sanitize_token_ids(item.generated_ids, had_invalid);
     const std::string raw_text = safe_decode(clean_ids);
-    auto [trimmed_text, stop_hit] = apply_stop(raw_text, item.pending->stop_strings);
+    const std::string visible_text = strip_thinking_preamble(raw_text);
+    auto [trimmed_text, stop_hit] = apply_stop(visible_text, item.pending->stop_strings);
 
     std::vector<int32_t> out_ids;
-    if (stop_hit) {
+    if (stop_hit || trimmed_text != raw_text) {
         out_ids = tokenizer_.encode(trimmed_text, false);
     } else {
         out_ids = std::move(clean_ids);
@@ -726,6 +750,15 @@ void NativeHttpServer::scheduler_loop() {
         auto* graph_exec = infer_ctx_.graph_executor;
         auto* nccl_comm = infer_ctx_.communicator;
 
+        // Create unified scheduler (vLLM v1 style).
+        SchedulerConfig sched_cfg;
+        sched_cfg.max_num_batched_tokens = cfg_.max_num_batched_tokens;
+        sched_cfg.max_num_seqs = cfg_.max_batch_sequences;
+        sched_cfg.long_prefill_token_threshold = cfg_.long_prefill_token_threshold;
+        sched_cfg.max_num_partial_prefills = cfg_.max_num_partial_prefills;
+        sched_cfg.max_seq_len = cfg_.continuous_engine_max_seq_len;
+        scheduler_ = std::make_unique<Scheduler>(sched_cfg);
+
         // Collector thread calls cudaEventSynchronize + Phase 8 directly on its
         // own thread — no run_work serialization. This is the key difference from
         // the old design: the scheduler can launch the next step while the
@@ -774,9 +807,27 @@ void NativeHttpServer::scheduler_loop() {
 
         int step_count = 0;
         const bool sched_debug = env_flag_enabled("SUROGATE_SERVE_SCHED_DEBUG", false);
+        auto last_progress = std::chrono::steady_clock::now();
 
         while (!shutdown_.load(std::memory_order_relaxed)) {
             const auto t_loop_start = std::chrono::high_resolution_clock::now();
+
+            // Watchdog: print if no progress for 5 seconds.
+            {
+                auto now = std::chrono::steady_clock::now();
+                const double sec = std::chrono::duration<double>(now - last_progress).count();
+                if (sec > 5.0) {
+                    std::size_t psize = 0;
+                    { std::lock_guard<std::mutex> lk(pending_mu_); psize = pending_.size(); }
+                    bool inflight = false;
+                    { std::lock_guard<std::mutex> lk(collect_mu); inflight = collect_inflight || collect_requested || collect_ready; }
+                    std::cerr << fmt::format(
+                        "[sched-watchdog] STALL step={} slot_map={} pending={} inflight={} has_pending={} failed={} exited={} shutdown={}\n",
+                        step_count, slot_map.size(), psize, inflight, engine->has_pending_step(),
+                        scheduler_failed_.load(), scheduler_exited_.load(), shutdown_.load());
+                    last_progress = now;
+                }
+            }
 
             // Pull collected step from collector thread (if ready).
             std::optional<infer::ContinuousGenerationEngine::FlatStepResult> collected;
@@ -815,76 +866,66 @@ void NativeHttpServer::scheduler_loop() {
 
                 std::vector<int> release_slots;
                 release_slots.reserve(collected->active_slot_ids.size());
-                for (size_t i = 0; i < collected->active_slot_ids.size(); ++i) {
+                const int Nsteps = std::max(1, collected->decode_steps);
+                const int Bactive = static_cast<int>(collected->active_slot_ids.size());
+                for (int i = 0; i < Bactive; ++i) {
                     const int sid = collected->active_slot_ids[i];
                     auto it = slot_map.find(sid);
-                    if (it == slot_map.end()) {
-                        if (sched_debug) {
-                            std::cerr << fmt::format("[sched-dbg]   sid={} NOT in slot_map, skipping\n", sid);
-                        }
-                        continue;
-                    }
+                    if (it == slot_map.end()) continue;
                     auto& item = it->second;
-                    if (item.finished) {
-                        if (sched_debug) {
-                            std::cerr << fmt::format("[sched-dbg]   sid={} already finished, skipping\n", sid);
-                        }
-                        continue;
-                    }
+                    if (item.finished) continue;
 
-                    const int32_t raw_tok = collected->sampled_tokens.size() > i ? collected->sampled_tokens[i] : fallback_token_id_;
-                    const int fin = collected->finished.size() > i ? collected->finished[i] : 0;
-                    const int clen = collected->completion_lens.size() > i ? collected->completion_lens[i] : 0;
+                    const int fin = (i < static_cast<int>(collected->finished.size())) ? collected->finished[i] : 0;
+                    const int clen = (i < static_cast<int>(collected->completion_lens.size())) ? collected->completion_lens[i] : 0;
+                    if (clen == 0 && !fin) continue;  // still prefilling
 
-                    if (clen == 0 && !fin) {
-                        if (sched_debug) {
-                            std::cerr << fmt::format("[sched-dbg]   sid={} clen=0 fin=0 (prefilling), skipping\n", sid);
-                        }
-                        continue;
-                    }
-
-                    bool tok_replaced = false;
-                    const int32_t emitted = sanitize_token(raw_tok, tok_replaced);
-                    item.generated_ids.push_back(emitted);
-                    if (item.pending->stream_queue) {
-                        item.pending->stream_queue->push(emitted);
-                    }
+                    // Process all N tokens for this slot (N=1 for prefill/single-step).
+                    // Use completion_lens to determine how many tokens the engine actually
+                    // generated — this is authoritative vs trying to detect padding values.
+                    const int prev_gen = static_cast<int>(item.generated_ids.size());
+                    const int engine_total_gen = clen;  // engine's total generated_count after all steps
+                    const int tokens_this_step = std::max(0, engine_total_gen - prev_gen);
+                    const int tokens_to_process = std::min(tokens_this_step, Nsteps);
 
                     bool should_finish = false;
-                    if (!item.pending->params.ignore_eos && emitted == eos_id_) {
-                        should_finish = true;
-                    }
-                    if (tok_replaced) {
-                        should_finish = true;
-                    }
-                    if (!should_finish && !item.pending->stop_strings.empty()) {
-                        auto partial = safe_decode(item.generated_ids);
-                        auto stop_res = apply_stop(partial, item.pending->stop_strings);
-                        if (stop_res.second) {
+                    for (int s = 0; s < tokens_to_process && !should_finish; ++s) {
+                        const size_t tok_idx = static_cast<size_t>(s) * Bactive + i;
+                        if (tok_idx >= collected->sampled_tokens.size()) break;
+                        const int32_t raw_tok = collected->sampled_tokens[tok_idx];
+
+                        bool tok_replaced = false;
+                        const int32_t emitted = sanitize_token(raw_tok, tok_replaced);
+                        item.generated_ids.push_back(emitted);
+                        if (item.pending->stream_queue) {
+                            item.pending->stream_queue->push(emitted);
+                        }
+
+                        if (!item.pending->params.ignore_eos && emitted == eos_id_) should_finish = true;
+                        if (tok_replaced) should_finish = true;
+                        if (!should_finish && static_cast<int>(item.generated_ids.size()) >= item.pending->params.max_tokens) {
                             should_finish = true;
                         }
                     }
-                    if (!should_finish && static_cast<int>(item.generated_ids.size()) >= item.pending->params.max_tokens) {
-                        should_finish = true;
-                    }
+
+                    // Check engine-reported finish flag
                     if (!should_finish && fin && !item.pending->params.ignore_eos) {
                         should_finish = true;
                     }
+                    // Check stop strings once (after all tokens emitted)
+                    if (!should_finish && !item.pending->stop_strings.empty()) {
+                        auto partial = safe_decode(item.generated_ids);
+                        if (apply_stop(partial, item.pending->stop_strings).second) {
+                            should_finish = true;
+                        }
+                    }
 
                     if (should_finish) {
-                        if (sched_debug) {
-                            std::cerr << fmt::format(
-                                "[sched-dbg]   sid={} FINISH tok={} gen_count={} has_stream={}\n",
-                                sid, emitted, item.generated_ids.size(),
-                                item.pending->stream_queue != nullptr);
-                        }
                         item.finished = true;
                         if (!item.generated_ids.empty() && item.generated_ids.back() == eos_id_) {
                             item.finish_reason = "stop";
                         } else if (!item.pending->stop_strings.empty()) {
                             auto partial = safe_decode(item.generated_ids);
-                            auto stop_res = apply_stop(partial, item.pending->stop_strings);
-                            item.finish_reason = stop_res.second ? "stop" : "length";
+                            item.finish_reason = apply_stop(partial, item.pending->stop_strings).second ? "stop" : "length";
                         } else {
                             item.finish_reason = "length";
                         }
@@ -927,43 +968,40 @@ void NativeHttpServer::scheduler_loop() {
                 continue;  // loop back to process collected results at the top
             }
 
-            // Drain new requests only when we are ready to launch immediately.
-            const int free_slots = std::max(0, cfg_.max_batch_sequences - static_cast<int>(slot_map.size()));
-            std::size_t pending_size = 0;
+            // === UNIFIED SCHEDULING (vLLM v1 style) ===
+            // Build slot views for the scheduler.
+            std::vector<SlotView> slot_views;
+            slot_views.reserve(slot_map.size());
+            for (const auto& [sid, item] : slot_map) {
+                SlotView sv;
+                sv.finished = item.finished;
+                sv.is_prefill_chunk = item.is_prefill_chunk;
+                sv.num_prompt_tokens = item.num_prompt_tokens;
+                sv.num_computed_tokens = item.num_computed_tokens;
+                slot_views.push_back(sv);
+            }
+
+            // Peek at pending prompt lengths (without popping).
+            std::vector<int> pending_lens;
             {
                 std::lock_guard<std::mutex> lock(pending_mu_);
-                pending_size = pending_.size();
-            }
-            auto prefill_items = drain_pending_for_prefill(
-                std::max(0, std::min(free_slots, cfg_.prefill_max_new_sequences)),
-                cfg_.prefill_budget_tokens);
-
-            if (sched_debug && (!prefill_items.empty() || step_count % 100 == 0)) {
-                std::cerr << fmt::format(
-                    "[sched-dbg] step={} drain: free_slots={} pending_before={} drained={} slot_map={}\n",
-                    step_count, free_slots, pending_size, prefill_items.size(), slot_map.size());
-            }
-
-            std::vector<std::vector<int32_t>> new_prompts;
-            std::vector<int> new_max_tokens;
-            new_prompts.reserve(prefill_items.size());
-            new_max_tokens.reserve(prefill_items.size());
-            for (auto& item : prefill_items) {
-                int max_tokens = item.pending->params.max_tokens;
-                const int prompt_len = static_cast<int>(item.pending->prompt_ids.size());
-                if (prompt_len + max_tokens > cfg_.runtime_seq_len) {
-                    max_tokens = std::max(1, cfg_.runtime_seq_len - prompt_len);
+                pending_lens.reserve(pending_.size());
+                for (const auto& p : pending_) {
+                    pending_lens.push_back(static_cast<int>(p->prompt_ids.size()));
                 }
-                new_prompts.push_back(item.pending->prompt_ids);
-                new_max_tokens.push_back(max_tokens);
             }
 
-            if (slot_map.empty() && new_prompts.empty()) {
-                if (sched_debug && pending_size > 0) {
-                    std::cerr << fmt::format(
-                        "[sched-dbg] step={} IDLE but pending_size={} free_slots={} — requests may be stuck!\n",
-                        step_count, pending_size, free_slots);
-                }
+            const int free_slots = std::max(0,
+                cfg_.max_batch_sequences - static_cast<int>(slot_map.size()));
+            auto sched_output = scheduler_->schedule(
+                slot_views.data(),
+                static_cast<int>(slot_views.size()),
+                static_cast<int>(pending_lens.size()),
+                free_slots,
+                pending_lens.data(),
+                static_cast<int>(pending_lens.size()));
+
+            if (!sched_output.has_work) {
                 std::unique_lock<std::mutex> lock(pending_mu_);
                 pending_cv_.wait_for(lock, std::chrono::milliseconds(1), [&]() {
                     return shutdown_.load(std::memory_order_relaxed) || !pending_.empty();
@@ -971,38 +1009,48 @@ void NativeHttpServer::scheduler_loop() {
                 continue;
             }
 
+            // Pop newly admitted requests from pending_.
+            std::vector<std::shared_ptr<PendingGeneration>> new_items;
+            std::vector<std::vector<int32_t>> new_prompts;
+            if (sched_output.num_new_admitted > 0) {
+                std::lock_guard<std::mutex> lock(pending_mu_);
+                for (int i = 0; i < sched_output.num_new_admitted && !pending_.empty(); ++i) {
+                    new_items.push_back(pending_.front());
+                    new_prompts.push_back(pending_.front()->prompt_ids);
+                    pending_.pop_front();
+                }
+            }
+
+            // Build generation params from the first available request.
             GenerationParams first_params;
-            if (!prefill_items.empty()) {
-                first_params = prefill_items.front().pending->params;
+            if (!new_items.empty()) {
+                first_params = new_items.front()->params;
             } else if (!slot_map.empty()) {
                 first_params = slot_map.begin()->second.pending->params;
             }
 
             const bool any_ignore_eos = [&]() {
                 for (const auto& kv : slot_map) {
-                    if (kv.second.pending->params.ignore_eos) {
-                        return true;
-                    }
+                    if (kv.second.pending->params.ignore_eos) return true;
                 }
-                for (const auto& item : prefill_items) {
-                    if (item.pending->params.ignore_eos) {
-                        return true;
-                    }
+                for (const auto& item : new_items) {
+                    if (item->params.ignore_eos) return true;
                 }
                 return false;
             }();
             const int32_t eos_for_step = any_ignore_eos ? -1 : eos_id_;
-            const int max_gen = !new_max_tokens.empty()
-                ? *std::max_element(new_max_tokens.begin(), new_max_tokens.end())
-                : std::min(cfg_.max_gen_len, 128);
 
-            // Launch flat_step — we are guaranteed !step_inflight here.
-            if (sched_debug) {
-                std::cerr << fmt::format(
-                    "[sched-dbg] step={} LAUNCH: new_prompts={} slot_map={} max_gen={} eos={}\n",
-                    step_count, new_prompts.size(), slot_map.size(), max_gen, eos_for_step);
+            int max_gen = std::min(cfg_.max_gen_len, 128);
+            for (const auto& item : new_items) {
+                int mt = item->params.max_tokens;
+                const int pl = static_cast<int>(item->prompt_ids.size());
+                if (pl + mt > cfg_.runtime_seq_len) {
+                    mt = std::max(1, cfg_.runtime_seq_len - pl);
+                }
+                max_gen = std::max(max_gen, mt);
             }
-            // Direct engine call — no run_work serialization.
+
+            // Launch flat_step — direct engine call.
             infer::ContinuousGenerationEngine::FlatStepConfig step_cfg;
             step_cfg.max_gen_len = max_gen;
             step_cfg.temperature = first_params.temperature;
@@ -1010,33 +1058,38 @@ void NativeHttpServer::scheduler_loop() {
             step_cfg.top_k = first_params.top_k;
             step_cfg.top_p = first_params.top_p;
             step_cfg.min_p = first_params.min_p;
-            step_cfg.prefill_chunk_size = cfg_.prefill_chunk_size;
+            step_cfg.prefill_chunk_size = sched_output.prefill_chunk_size;
+            step_cfg.multi_decode_steps = cfg_.multi_decode_steps;
             auto new_slot_ids = engine->flat_step_launch(
                 new_prompts, step_cfg, *graph_exec, *nccl_comm);
 
-            std::vector<ActiveGeneration> failed_prefills;
-            for (size_t i = 0; i < prefill_items.size(); ++i) {
+            // Register new slots in slot_map.
+            for (size_t i = 0; i < new_items.size(); ++i) {
                 const int sid = (i < new_slot_ids.size()) ? new_slot_ids[i] : -1;
-                if (sched_debug) {
-                    std::cerr << fmt::format(
-                        "[sched-dbg]   prefill[{}] sid={} prompt_len={}\n",
-                        i, sid, prefill_items[i].pending->prompt_ids.size());
-                }
                 if (sid < 0) {
-                    failed_prefills.push_back(std::move(prefill_items[i]));
+                    std::lock_guard<std::mutex> lock(pending_mu_);
+                    pending_.push_front(new_items[i]);
                 } else {
-                    slot_map[sid] = std::move(prefill_items[i]);
+                    ActiveGeneration ag;
+                    ag.pending = new_items[i];
+                    ag.num_prompt_tokens = static_cast<int>(ag.pending->prompt_ids.size());
+                    ag.num_computed_tokens = 0;
+                    ag.is_prefill_chunk = true;
+                    slot_map[sid] = std::move(ag);
                 }
             }
-            if (!failed_prefills.empty()) {
-                if (sched_debug) {
-                    std::cerr << fmt::format(
-                        "[sched-dbg] step={} re-queuing {} failed prefills\n",
-                        step_count, failed_prefills.size());
-                }
-                std::lock_guard<std::mutex> lock(pending_mu_);
-                for (auto it = failed_prefills.rbegin(); it != failed_prefills.rend(); ++it) {
-                    pending_.push_front(it->pending);
+
+            // Advance num_computed_tokens IMMEDIATELY (before GPU starts).
+            // Mirrors vLLM's _update_after_schedule() (scheduler.py line 964).
+            for (auto& [sid, item] : slot_map) {
+                if (item.finished) continue;
+                if (!item.is_prefill_chunk) {
+                    item.num_computed_tokens += 1;
+                } else {
+                    const int remaining = item.num_prompt_tokens - item.num_computed_tokens;
+                    const int chunk = std::min(remaining, sched_output.prefill_chunk_size);
+                    item.num_computed_tokens += std::max(1, chunk);
+                    item.is_prefill_chunk = (item.num_computed_tokens < item.num_prompt_tokens);
                 }
             }
 
@@ -1045,6 +1098,7 @@ void NativeHttpServer::scheduler_loop() {
                 collect_requested = true;
             }
             collect_cv.notify_one();
+            last_progress = std::chrono::steady_clock::now();
 
             ++step_count;
             if (cfg_.enable_loop_trace && (step_count <= 30 || step_count % 50 == 0)) {
@@ -1345,6 +1399,8 @@ void NativeHttpServer::setup_routes() {
             std::vector<GeneratedChoice> choices;
             bool has_choices = false;
             bool had_error = false;
+            std::vector<int32_t> emitted_ids;
+            size_t emitted_chars = 0;
         };
 
         auto state = std::make_shared<ChatStreamState>();
@@ -1392,10 +1448,17 @@ void NativeHttpServer::setup_routes() {
                             batch.push_back(next_tok);
                         }
 
-                        const std::string piece = safe_decode(batch);
-                        if (piece.empty()) {
+                        state->emitted_ids.insert(
+                            state->emitted_ids.end(),
+                            batch.begin(),
+                            batch.end());
+                        const std::string visible =
+                            strip_thinking_preamble(safe_decode(state->emitted_ids));
+                        if (visible.size() <= state->emitted_chars) {
                             continue;
                         }
+                        const std::string piece = visible.substr(state->emitted_chars);
+                        state->emitted_chars = visible.size();
 
                         chunk = sse_data(
                             json{
@@ -1579,6 +1642,8 @@ void NativeHttpServer::setup_routes() {
             std::vector<GeneratedChoice> choices;
             bool has_choices = false;
             bool had_error = false;
+            std::vector<int32_t> emitted_ids;
+            size_t emitted_chars = 0;
         };
 
         auto state = std::make_shared<CompletionStreamState>();
@@ -1609,10 +1674,17 @@ void NativeHttpServer::setup_routes() {
                             batch.push_back(next_tok);
                         }
 
-                        const std::string piece = safe_decode(batch);
-                        if (piece.empty()) {
+                        state->emitted_ids.insert(
+                            state->emitted_ids.end(),
+                            batch.begin(),
+                            batch.end());
+                        const std::string visible =
+                            strip_thinking_preamble(safe_decode(state->emitted_ids));
+                        if (visible.size() <= state->emitted_chars) {
                             continue;
                         }
+                        const std::string piece = visible.substr(state->emitted_chars);
+                        state->emitted_chars = visible.size();
 
                         chunk = sse_data(
                             json{

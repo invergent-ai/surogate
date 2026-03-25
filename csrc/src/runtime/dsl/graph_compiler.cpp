@@ -1268,7 +1268,9 @@ void CompiledGraph::compute_layer_segments(std::uint8_t mode_raw) {
             const bool is_inference_decode = (mode == GraphCompileMode::InferenceDecode);
             const bool graph_breaking =
                 // FlashAttention: graph-safe in decode (pre-allocated scratch),
-                // graph-breaking in prefill/training (dynamic cu_seqlens).
+                // graph-breaking in prefill (FlashInfer grid depends on batch_size — would need
+                // one graph per (T, batch_size) combination, ~800 unique sets — impractical).
+                // Graph-breaking in training (dynamic cu_seqlens).
                 (!is_inference_decode && ty == CompiledOpType::FlashAttention) ||
                 // Backward ops: always graph-breaking (training only).
                 ty == CompiledOpType::FlashAttentionBackward ||
