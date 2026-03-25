@@ -1991,6 +1991,7 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
         auto compiled = std::make_unique<CompiledGraph>(
             mCompiler->compile(*mForward, B, T, GraphCompileMode::InferenceFlatTokens));
         compiled->compute_layer_segments(static_cast<std::uint8_t>(GraphCompileMode::InferenceFlatTokens));
+        compiled->compute_global_segments();
 
         opts.DocMasking = saved_doc_masking;
         opts.Recompute = saved_recompute;
@@ -1998,6 +1999,12 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
         prefill_it = mPrefillCompiledForwardCache.emplace(prefill_key, std::move(compiled)).first;
     }
     CompiledGraph* flat_graph = prefill_it->second.get();
+
+    // Lazily compute global segments if the cached entry was created by
+    // execute_prefill (warmup) which doesn't populate them.
+    if (flat_graph->global_segments.empty() && !flat_graph->layer_segments.empty()) {
+        flat_graph->compute_global_segments();
+    }
 
     DslRunState& rs = mRunState;
     const std::size_t token_bytes = static_cast<std::size_t>(total_tokens) * sizeof(std::int32_t);
@@ -2104,11 +2111,33 @@ void GraphExecutor::execute_flat_tokens(long total_tokens,
         // Switch to the segment graph set for this padded T value.
         // Each unique T gets its own set of per-layer segment graphs,
         // so graphs captured at T=2048 aren't destroyed when T=1088.
-        mCompiledExecutor->switch_segment_graphs_for_shape(B, T, *flat_graph);
+        // Use cross-layer merged global segments when available (fewer graph launches).
+        static bool logged_path = false;
+        if (!flat_graph->global_segments.empty()) {
+            if (!logged_path) {
+                std::fprintf(stderr, "[exec-flat] Using GLOBAL segments: %zu global, %zu per-layer, B=%ld T=%ld\n",
+                    flat_graph->global_segments.size(), flat_graph->layer_segments.size(), B, T);
+                logged_path = true;
+            }
+            mCompiledExecutor->switch_global_segment_graphs_for_shape(B, T, *flat_graph);
+        } else {
+            if (!logged_path) {
+                std::fprintf(stderr, "[exec-flat] Using PER-LAYER segments: %zu layers, global empty, B=%ld T=%ld\n",
+                    flat_graph->layer_segments.size(), B, T);
+                logged_path = true;
+            }
+            mCompiledExecutor->switch_segment_graphs_for_shape(B, T, *flat_graph);
+        }
         mCompiledExecutor->set_split_attention_graphs(true);
         mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
         mCompiledExecutor->set_split_attention_graphs(false);
     } else {
+        static bool logged_no_piecewise = false;
+        if (!logged_no_piecewise) {
+            std::fprintf(stderr, "[exec-flat] Piecewise DISABLED (allow_piecewise=%d), B=%ld T=%ld\n",
+                allow_piecewise_graph, B, T);
+            logged_no_piecewise = true;
+        }
         mCompiledExecutor->set_split_attention_graphs(false);
         mCompiledExecutor->execute_forward(*flat_graph, comm, /*full=*/false, hook);
     }

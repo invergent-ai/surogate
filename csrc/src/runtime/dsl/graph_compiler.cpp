@@ -1309,6 +1309,35 @@ void CompiledGraph::compute_layer_segments(std::uint8_t mode_raw) {
     }
 }
 
+void CompiledGraph::compute_global_segments() {
+    global_segments.clear();
+    if (layer_segments.empty()) return;
+
+    // Flatten per-layer segments into a single ordered list.
+    std::vector<GraphSegment> flat;
+    for (const auto& layer_segs : layer_segments) {
+        for (const auto& seg : layer_segs) {
+            flat.push_back(seg);
+        }
+    }
+    if (flat.empty()) return;
+
+    // Merge adjacent non-eager segments.
+    // layer[L].post_attn (non-eager) + layer[L+1].pre_attn (non-eager)
+    // become a single CUDA graph when their op ranges are contiguous.
+    GraphSegment current = flat[0];
+    for (std::size_t i = 1; i < flat.size(); ++i) {
+        const auto& next = flat[i];
+        if (!current.eager && !next.eager && current.end_op == next.start_op) {
+            current.end_op = next.end_op;
+        } else {
+            global_segments.push_back(current);
+            current = next;
+        }
+    }
+    global_segments.push_back(current);
+}
+
 
 // ============================================================================
 // Shape Validation Methods

@@ -3431,17 +3431,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             // graph-breaking ops run eagerly. The normal loop still iterates
             // through these ops for layer_end handling, tensor persistence, and
             // pruning — but skips the per-op dispatch (already done here).
-            if (mSplitAttentionGraphs &&
-                !graph.layer_segments.empty() &&
-                static_cast<std::size_t>(op.layer_start) < graph.layer_segments.size() &&
-                !graph.layer_segments[static_cast<std::size_t>(op.layer_start)].empty()) {
-                const int L = op.layer_start;
-                const auto& segs = graph.layer_segments[static_cast<std::size_t>(L)];
-                for (std::size_t s = 0; s < segs.size(); ++s) {
-                    const auto& seg = segs[s];
+            if (mSplitAttentionGraphs && mUseGlobalSegments &&
+                !graph.global_segments.empty() && op.layer_start == 0) {
+                // Global segment dispatch: merged cross-layer segments.
+                // Dispatch ALL segments for the entire model at layer 0 start,
+                // then let the outer loop handle layer boundaries.
+                for (std::size_t gs = 0; gs < graph.global_segments.size(); ++gs) {
+                    const auto& seg = graph.global_segments[gs];
                     if (seg.eager) {
-                        // Check if this eager segment matches an MLP tile group.
-                        // compute_layer_segments emits these as single eager segments.
                         const MlpTileGroup* tile_group = nullptr;
                         for (const auto& tg : graph.mlp_tile_groups) {
                             if (tg.start_op_idx == seg.start_op) {
@@ -3457,9 +3454,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             }
                         }
                     } else {
-                        auto& sg = mFwdSegGraphs[static_cast<std::size_t>(L)][s];
+                        auto& sg = mFwdGlobalSegGraphs[gs];
                         const bool is_capture = (sg.exec == nullptr);
-                        // Track mSaved entries before segment to detect new ones
                         std::size_t saved_before = mSaved ? mSaved->size() : 0;
                         auto run = [&]() {
                             for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
@@ -3469,18 +3465,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                         trace_or_execute_cuda_graph_with_stack(
                             run, mRunState.MainStream, sg.exec, true,
                             mRunState.Stack, sg.checkpoint,
-                            "segment");
+                            "global_segment");
                         if (is_capture) {
-                            // Save post-dispatch stack state. On replay,
-                            // trace_or_execute restores to sg.checkpoint (pre-alloc)
-                            // before launching the graph. We must then advance
-                            // past the graph's stack allocations so the next
-                            // segment doesn't overlap.
                             sg.post_checkpoint = mRunState.Stack.checkpoint();
-
-                            // Snapshot all tensor entries after capture. On replay
-                            // dispatch doesn't run so mTensors/mNamedTensors/mSaved
-                            // wouldn't be populated.
                             sg.tensor_snapshot.clear();
                             sg.named_snapshot.clear();
                             sg.saved_snapshot.clear();
@@ -3494,19 +3481,13 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                     sg.named_snapshot.emplace_back(name, t);
                                 }
                             }
-                            // Snapshot mSaved entries added by dispatch (e.g.
-                            // MambaGatedRMSNorm writes rstd directly to mSaved)
                             if (mSaved && mSaved->size() > saved_before) {
                                 for (const auto& [name, t] : *mSaved) {
                                     sg.saved_snapshot.emplace_back(name, t);
                                 }
                             }
                         } else {
-                            // Advance stack past graph's allocations so the next
-                            // segment (eager attention) doesn't overlap.
                             mRunState.Stack.restore(sg.post_checkpoint);
-
-                            // Restore tensor/saved entries from capture snapshot
                             for (const auto& [tid, t] : sg.tensor_snapshot) {
                                 if (static_cast<std::size_t>(tid) < mTensors.size()) {
                                     mTensors[tid] = t;
@@ -3525,8 +3506,102 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                         }
                     }
                 }
-                // Mark: layer ops already dispatched. The normal loop will still
-                // iterate through them for layer_end handling but skip dispatch.
+                // Log global segment stats once.
+                static bool logged_global_seg_stats = false;
+                if (!logged_global_seg_stats) {
+                    logged_global_seg_stats = true;
+                    int n_eager = 0, n_graph = 0;
+                    for (const auto& seg : graph.global_segments) {
+                        if (seg.eager) ++n_eager; else ++n_graph;
+                    }
+                    std::size_t max_snap = 0, max_named = 0;
+                    for (const auto& sg : mFwdGlobalSegGraphs) {
+                        max_snap = std::max(max_snap, sg.tensor_snapshot.size());
+                        max_named = std::max(max_named, sg.named_snapshot.size());
+                    }
+                    std::fprintf(stderr,
+                        "[global-seg] total=%zu eager=%d graph=%d max_tensor_snap=%zu max_named_snap=%zu\n",
+                        graph.global_segments.size(), n_eager, n_graph, max_snap, max_named);
+                }
+                // All model ops dispatched via global segments.
+                mSegmentDispatchedUntil = graph.ops.size();
+            } else if (mSplitAttentionGraphs && !mUseGlobalSegments &&
+                !graph.layer_segments.empty() &&
+                static_cast<std::size_t>(op.layer_start) < graph.layer_segments.size() &&
+                !graph.layer_segments[static_cast<std::size_t>(op.layer_start)].empty()) {
+                // Per-layer segment dispatch (training / backward / fallback).
+                const int L = op.layer_start;
+                const auto& segs = graph.layer_segments[static_cast<std::size_t>(L)];
+                for (std::size_t s = 0; s < segs.size(); ++s) {
+                    const auto& seg = segs[s];
+                    if (seg.eager) {
+                        const MlpTileGroup* tile_group = nullptr;
+                        for (const auto& tg : graph.mlp_tile_groups) {
+                            if (tg.start_op_idx == seg.start_op) {
+                                tile_group = &tg;
+                                break;
+                            }
+                        }
+                        if (tile_group) {
+                            execute_tiled_mlp(graph, *tile_group, mB, mT, hook);
+                        } else {
+                            for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                dispatch_forward_op(graph.ops[i], hook);
+                            }
+                        }
+                    } else {
+                        auto& sg = mFwdSegGraphs[static_cast<std::size_t>(L)][s];
+                        const bool is_capture = (sg.exec == nullptr);
+                        std::size_t saved_before = mSaved ? mSaved->size() : 0;
+                        auto run = [&]() {
+                            for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                dispatch_forward_op(graph.ops[i], hook);
+                            }
+                        };
+                        trace_or_execute_cuda_graph_with_stack(
+                            run, mRunState.MainStream, sg.exec, true,
+                            mRunState.Stack, sg.checkpoint,
+                            "segment");
+                        if (is_capture) {
+                            sg.post_checkpoint = mRunState.Stack.checkpoint();
+                            sg.tensor_snapshot.clear();
+                            sg.named_snapshot.clear();
+                            sg.saved_snapshot.clear();
+                            for (int tid = 0; tid < static_cast<int>(mTensors.size()); ++tid) {
+                                if (mTensors[tid].Data) {
+                                    sg.tensor_snapshot.emplace_back(tid, mTensors[tid]);
+                                }
+                            }
+                            for (const auto& [name, t] : mNamedTensors) {
+                                if (t.Data) {
+                                    sg.named_snapshot.emplace_back(name, t);
+                                }
+                            }
+                            if (mSaved && mSaved->size() > saved_before) {
+                                for (const auto& [name, t] : *mSaved) {
+                                    sg.saved_snapshot.emplace_back(name, t);
+                                }
+                            }
+                        } else {
+                            mRunState.Stack.restore(sg.post_checkpoint);
+                            for (const auto& [tid, t] : sg.tensor_snapshot) {
+                                if (static_cast<std::size_t>(tid) < mTensors.size()) {
+                                    mTensors[tid] = t;
+                                }
+                            }
+                            for (const auto& [name, t] : sg.named_snapshot) {
+                                mNamedTensors[name] = t;
+                            }
+                            if (mSaved) {
+                                for (const auto& [name, t] : sg.saved_snapshot) {
+                                    if (mSaved->find(name) == mSaved->end()) {
+                                        (*mSaved)[name] = t;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 mSegmentDispatchedUntil = graph.layer_end_indices[static_cast<std::size_t>(L)];
             }
         }
@@ -5051,6 +5126,18 @@ void CompiledExecutor::reset_segment_graphs() {
     destroy(mFwdSegGraphs);
     destroy(mBwdSegGraphs[0]);
     destroy(mBwdSegGraphs[1]);
+    // Clear global segment graphs.
+    for (auto& sg : mFwdGlobalSegGraphs) {
+        if (sg.exec) { cudaGraphExecDestroy(sg.exec); sg.exec = nullptr; }
+    }
+    mFwdGlobalSegGraphs.clear();
+    for (auto& [t, v] : mFwdGlobalSegGraphsByT) {
+        for (auto& sg : v) {
+            if (sg.exec) { cudaGraphExecDestroy(sg.exec); sg.exec = nullptr; }
+        }
+    }
+    mFwdGlobalSegGraphsByT.clear();
+    mUseGlobalSegments = false;
     mSegGraphB = 0;
     mSegGraphT = 0;
 }
@@ -5081,6 +5168,29 @@ void CompiledExecutor::switch_segment_graphs_for_shape(long B, long T,
     }
     mSegGraphB = B;
     mSegGraphT = T;
+}
+
+void CompiledExecutor::switch_global_segment_graphs_for_shape(long B, long T,
+                                                               const CompiledGraph& graph) {
+    if (B == mSegGraphB && T == mSegGraphT && mUseGlobalSegments) return;
+
+    // Save current global graphs back to per-T cache.
+    if (mSegGraphT != 0 && !mFwdGlobalSegGraphs.empty()) {
+        mFwdGlobalSegGraphsByT[mSegGraphT] = std::move(mFwdGlobalSegGraphs);
+    }
+
+    // Load or create for new T.
+    auto it = mFwdGlobalSegGraphsByT.find(T);
+    if (it != mFwdGlobalSegGraphsByT.end()) {
+        mFwdGlobalSegGraphs = std::move(it->second);
+        mFwdGlobalSegGraphsByT.erase(it);
+    } else {
+        mFwdGlobalSegGraphs.clear();
+        mFwdGlobalSegGraphs.resize(graph.global_segments.size());
+    }
+    mSegGraphB = B;
+    mSegGraphT = T;
+    mUseGlobalSegments = true;
 }
 
 void CompiledExecutor::resize_fwd_segment_graphs(const CompiledGraph& fwd_graph) {

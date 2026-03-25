@@ -86,11 +86,10 @@ std::vector<int> build_graph_buckets(int max_slots) {
 }
 
 std::vector<int> build_prefill_token_buckets(int max_tokens) {
-    // Coarse bucket set: every bucket is pre-warmed at startup to eliminate
-    // cudaGraphInstantiate + cuStreamSynchronize during serving.
-    // ~20 buckets covers 1–2048 with ≤25% padding overhead.
+    // Moderate bucket set: pre-warmed at startup to reduce runtime graph captures.
+    // ~30 buckets balances coverage against warmup GPU memory cost.
     std::vector<int> buckets;
-    buckets.reserve(32);
+    buckets.reserve(40);
     auto append_range = [&](int start, int end, int step) {
         for (int t = start; t <= end && t <= max_tokens; t += step) {
             buckets.push_back(t);

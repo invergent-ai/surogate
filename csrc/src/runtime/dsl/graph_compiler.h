@@ -365,11 +365,19 @@ struct CompiledGraph {
     // layer_segments[L] = ordered segments for layer L.
     std::vector<std::vector<GraphSegment>> layer_segments;
 
-    /// Populate layer_segments by scanning each layer for FlashAttention ops.
-    /// Call after annotate_layer_boundaries().
     /// Populate layer_segments by scanning each layer for graph-breaking ops.
+    /// Call after annotate_layer_boundaries().
     /// @param mode  The compile mode — InferenceDecode allows GDN ops in graphs.
     void compute_layer_segments(std::uint8_t mode = 0);
+
+    // Global segments spanning the entire model (forward inference only).
+    // Adjacent non-eager segments across layer boundaries are merged,
+    // reducing graph launches from ~72 to ~37 for a 36-layer model.
+    std::vector<GraphSegment> global_segments;
+
+    /// Populate global_segments by merging adjacent graphable segments
+    /// from layer_segments. Call after compute_layer_segments().
+    void compute_global_segments();
 
     // Statistics
     std::size_t total_ops = 0;

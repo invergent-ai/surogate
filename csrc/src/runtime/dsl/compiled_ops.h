@@ -650,6 +650,13 @@ private:
     // runs eagerly (not inside the graph) so the grid doesn't depend on batch_size.
     std::unordered_map<long, std::vector<std::vector<SegmentGraphExec>>> mFwdSegGraphsByT;
 
+    // Global segment graphs: cross-layer merged segments (forward inference only).
+    // Reduces graph launches from ~72 to ~37 for a 36-layer model by merging
+    // layer[L].post_attn + layer[L+1].pre_attn into single CUDA graphs.
+    std::vector<SegmentGraphExec> mFwdGlobalSegGraphs;
+    std::unordered_map<long, std::vector<SegmentGraphExec>> mFwdGlobalSegGraphsByT;
+    bool mUseGlobalSegments = false;
+
     /// Dispatch a single forward op (extracted from the switch in execute_forward).
     void dispatch_forward_op(const CompiledOp& op, const modules::ForwardHook* hook);
     /// Dispatch a single backward op (extracted from the switch in execute_backward).
@@ -666,6 +673,8 @@ public:
     /// Switch mFwdSegGraphs to the cached set for the given (B, T).
     /// Creates and initializes a new set if one doesn't exist for this T.
     void switch_segment_graphs_for_shape(long B, long T, const CompiledGraph& graph);
+    /// Switch global segment graphs for the given T. Uses cross-layer merged segments.
+    void switch_global_segment_graphs_for_shape(long B, long T, const CompiledGraph& graph);
     /// Total bytes of persistent saved buffers (untracked by TensorAllocator).
     size_t saved_buffers_total_bytes() const {
         size_t total = 0;
