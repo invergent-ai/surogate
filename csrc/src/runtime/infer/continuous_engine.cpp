@@ -53,6 +53,20 @@ inline bool flat_cuda_graphs_enabled() {
     return cached != 0;
 }
 
+inline bool is_stateful_hybrid_arch(const modules::ModelConfig* config) {
+    if (!config) {
+        return false;
+    }
+    switch (config->Architecture) {
+        case PretrainedConfig::QWEN3_5:
+        case PretrainedConfig::QWEN3_5_MOE:
+        case PretrainedConfig::NEMOTRON_H:
+            return true;
+        default:
+            return false;
+    }
+}
+
 inline bool supports_fp8_kv_cache(const cudaDeviceProp& prop) {
     const char* env = std::getenv("SUROGATE_ENABLE_FP8_KV_CACHE");
     if (!env || !*env || *env == '0') return false;
@@ -920,7 +934,7 @@ void ContinuousGenerationEngine::warm_prefill_graphs(
             ds.recurrent_state_bytes = &state.compact_recurrent_state_bytes;
             ds.conv_states = &state.compact_conv_states;
             ds.conv_state_bytes = &state.compact_conv_state_bytes;
-            ds.strict_state_buffers = true;  // enable piecewise graph capture
+            ds.strict_state_buffers = false;  // warmup should not require strict state stitching
             const int packed_len = bucket_t * group_size;
             ds.flat_padded_batch_size = (packed_len + kCtaTileQ - 1) / kCtaTileQ;
             ds.flat_last_token_indices_gpu = flat_last_token_indices_gpu_;
@@ -1949,22 +1963,22 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     const int actual_total_tokens = total_tokens;
     int padded_total_tokens = actual_total_tokens;
     const bool has_prefill = has_prefill_slots;
-    const bool has_recurrent_state = !state.compact_recurrent_states.empty();
-    const bool has_conv_state = !state.compact_conv_states.empty();
-    // Piecewise flat graphs: capture non-attention, non-SSM segments as CUDA
-    // graphs while running attention and GDN ops eagerly.  Previously disabled
-    // for stateful SSM models (Qwen3.5) entirely — now enabled since the
-    // graph-breaking ops (FlashAttention, ChunkGatedDeltaRule, Qwen3_5Decay)
-    // are handled by the piecewise segment system.
+    const bool stateful_hybrid_arch = is_stateful_hybrid_arch(config_);
+    // Piecewise flat graphs: capture non-attention segments as CUDA graphs,
+    // run attention and graph-breaking ops eagerly.
+    // For stateful hybrid architectures (Qwen3.5/Nemotron-H), keep this path
+    // disabled by default because recurrent-state map turnover across requests
+    // can invalidate captured segment snapshots.
     // Piecewise CUDA graphs for prefill: capture non-attention segments,
     // run attention eagerly. Requires pre-warming bucket sizes at startup
     // to avoid 90-267ms graph compilation during serving.
+    const bool allow_hybrid_flat_graphs = env_flag_enabled("SUROGATE_SERVE_HYBRID_FLAT_CUDA_GRAPHS");
     const bool use_flat_graphs = use_cuda_graphs_
         && flat_cuda_graphs_enabled()
-        && state.pinned;
+        && state.pinned
+        && (!stateful_hybrid_arch || allow_hybrid_flat_graphs);
     if (has_prefill) {
-        // Always snap to a bucket to maximize graph cache reuse.
-        // The bucket list is finite (~60 entries) and fully warmed at startup.
+        // Snap to a bucket to maximize graph cache reuse.
         padded_total_tokens = next_prefill_token_bucket(actual_total_tokens);
         padded_total_tokens = std::min(padded_total_tokens, max_batched_tokens_);
     } else if (use_bucketed_decode_batch) {
@@ -2047,6 +2061,32 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         packed_base + flat_off_last_token_idx_);
     for (int i = 0; i < batch_size; ++i) {
         h_last_token_indices[i] = h_q_indptr[i + 1] - 1;
+    }
+
+    // Prevent padding tokens from corrupting the KV cache.
+    // The KV store kernel skips tokens with kv_write_pos < 0.
+    // Without this, padding tokens (zeroed by memset) write to request 0's
+    // KV position 0, overwriting real data with garbage from token 0.
+    for (int t = actual_total_tokens; t < padded_total_tokens; ++t) {
+        h_kv_write_pos[t] = -1;
+    }
+
+    // Debug: log flat batch metadata for first few steps.
+    static int meta_log_count = 0;
+    if (meta_log_count < 8) {
+        ++meta_log_count;
+        std::fprintf(stderr, "[flat-meta] step=%d B=%d total_tok=%d padded=%d pure_decode=%d q_indptr=[",
+            meta_log_count, batch_size, actual_total_tokens, padded_total_tokens, (int)pure_decode);
+        for (int i = 0; i <= batch_size && i <= 6; ++i)
+            std::fprintf(stderr, "%d ", h_q_indptr[i]);
+        std::fprintf(stderr, "] last_tok_idx=[");
+        for (int i = 0; i < batch_size && i < 6; ++i)
+            std::fprintf(stderr, "%d ", h_last_token_indices[i]);
+        std::fprintf(stderr, "] sids=[");
+        for (int i = 0; i < batch_size && i < 6; ++i)
+            std::fprintf(stderr, "%d(prefill=%d) ", active_sids[i],
+                (int)slots_[active_sids[i]].prefilling());
+        std::fprintf(stderr, "]\n");
     }
     if (pure_decode && exec_batch_size > batch_size) {
         // Padded decode rows: keep seq_lens at 0, but set seqused_k to 1 and
@@ -2296,7 +2336,14 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
                 finished_gpu_, exec_batch_size, stream);
         };
 
-        const bool try_full_step = state.pinned;
+        const bool allow_hybrid_full_step = env_flag_enabled("SUROGATE_SERVE_HYBRID_FULL_STEP_GRAPH");
+        const bool try_full_step = state.pinned
+            && (!stateful_hybrid_arch || allow_hybrid_full_step);
+        if (!try_full_step && full_step_graph_exec_) {
+            CUDA_CHECK(cudaGraphExecDestroy(full_step_graph_exec_));
+            full_step_graph_exec_ = nullptr;
+            full_step_primed_ = false;
+        }
         const int requested_multi = std::max(1, std::min(config.multi_decode_steps, kMaxMultiSteps));
 
         // Clamp multi-step to the minimum remaining generation budget across
@@ -2404,6 +2451,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     // Persist decode-updated recurrent/conv compact state back into slot-local storage.
     flush_compact_states_to_slots_impl(
         state, run_state_, batch_size, active_sids, max_slots_, slots_);
+
 
     if (flat_step_profile) { p6_us = us_since(t_phase); t_phase = hrc::now(); }
     // === Phase 7: Sample from logits ===

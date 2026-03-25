@@ -162,57 +162,120 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         if (flat_mode) {
             const int B_real = mDecodeState->flat_batch_size;
             const int T_total = T;
-            const int T_padded = std::max(1, mDecodeState->flat_max_q_len);
             const int32_t* indptr = mDecodeState->q_indptr_host;
             const std::size_t elem_bytes = get_dtype_size(x.DType);
-            const std::size_t src_pitch = static_cast<std::size_t>(T_total) * elem_bytes;
-            const std::size_t dst_pitch = static_cast<std::size_t>(T_padded) * elem_bytes;
+            const std::size_t flat_pitch = static_cast<std::size_t>(T_total) * elem_bytes;
+            cudaStream_t stream = mRunState.MainStream;
 
-            Tensor x_padded = mRunState.temp_alloc(x.DType, {B_real, conv_dim, T_padded}, "mamba_conv1d_flat_x");
-            mTemps.push_back(x_padded);
-            Tensor out_padded = mRunState.temp_alloc(x.DType, {B_real, conv_dim, T_padded}, "mamba_conv1d_flat_out");
-            mTemps.push_back(out_padded);
-
-            CUDA_CHECK(cudaMemsetAsync(x_padded.Data, 0, x_padded.bytes(), mRunState.MainStream));
-            CUDA_CHECK(cudaMemsetAsync(out_padded.Data, 0, out_padded.bytes(), mRunState.MainStream));
-
-            // Scatter flat [1, conv_dim, total_tokens] into padded [B_real, conv_dim, T_padded].
+            // Split decode (q_len<=1) and prefill (q_len>1) into separate
+            // kernel calls to prevent zero-padding from corrupting conv state.
+            std::vector<int> dec_idx, pre_idx;
+            int max_pre_q = 0;
             for (int i = 0; i < B_real; ++i) {
-                const int q_start = indptr[i];
-                const int q_len = indptr[i + 1] - indptr[i];
-                if (q_len <= 0) continue;
-                auto* dst_base = reinterpret_cast<char*>(x_padded.Data)
-                               + static_cast<std::size_t>(i) * static_cast<std::size_t>(conv_dim) * dst_pitch;
-                const auto* src_base = reinterpret_cast<const char*>(x.Data)
-                                     + static_cast<std::size_t>(q_start) * elem_bytes;
+                const int ql = indptr[i+1] - indptr[i];
+                if (ql <= 1) dec_idx.push_back(i);
+                else { pre_idx.push_back(i); max_pre_q = std::max(max_pre_q, ql); }
+            }
+            const std::size_t state_row = static_cast<std::size_t>(conv_dim) * state_len * elem_bytes;
+
+            // ---- PREFILL: process each slot individually with exact q_len ----
+            // No padding → no conv state corruption from zero-padded positions.
+            // Cost: one kernel call per prefill slot per layer. Acceptable for
+            // correctness (typically 1-5 prefill slots per step).
+            for (int p = 0; p < static_cast<int>(pre_idx.size()); ++p) {
+                const int i = pre_idx[p];
+                const int qs = indptr[i];
+                const int ql = indptr[i+1] - indptr[i];
+                if (ql <= 0) continue;
+                const std::size_t ql_pitch = static_cast<std::size_t>(ql) * elem_bytes;
+
+                Tensor sx = mRunState.temp_alloc(x.DType, {1, conv_dim, ql}, "conv1d_pre_sx");
+                mTemps.push_back(sx);
+                Tensor so = mRunState.temp_alloc(x.DType, {1, conv_dim, ql}, "conv1d_pre_so");
+                mTemps.push_back(so);
+
+                // Extract this slot's conv state.
+                Tensor ss = mRunState.temp_alloc(conv_state.DType,
+                    {1, conv_dim, state_len}, "conv1d_pre_ss");
+                mTemps.push_back(ss);
+                CUDA_CHECK(cudaMemcpyAsync(ss.Data,
+                    (const char*)conv_state.Data + i * state_row,
+                    state_row, cudaMemcpyDeviceToDevice, stream));
+
+                // Scatter this slot's tokens: flat [1, conv_dim, T_total] → [1, conv_dim, ql]
                 CUDA_CHECK(cudaMemcpy2DAsync(
-                    dst_base, dst_pitch,
-                    src_base, src_pitch,
-                    static_cast<std::size_t>(q_len) * elem_bytes,
-                    static_cast<std::size_t>(conv_dim),
-                    cudaMemcpyDeviceToDevice,
-                    mRunState.MainStream));
+                    sx.Data, ql_pitch,
+                    (const char*)x.Data + std::size_t(qs) * elem_bytes, flat_pitch,
+                    ql_pitch, conv_dim,
+                    cudaMemcpyDeviceToDevice, stream));
+
+                mamba_causal_conv1d_update(so, ss, sx, weight, bias,
+                                           1, ql, conv_dim, kernel, silu, stream);
+
+                // Gather output back to flat.
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    (char*)out_ptr->Data + std::size_t(qs) * elem_bytes, flat_pitch,
+                    so.Data, ql_pitch,
+                    ql_pitch, conv_dim,
+                    cudaMemcpyDeviceToDevice, stream));
+
+                // Write conv state back.
+                CUDA_CHECK(cudaMemcpyAsync(
+                    (char*)conv_state.Data + i * state_row,
+                    ss.Data, state_row, cudaMemcpyDeviceToDevice, stream));
             }
 
-            mamba_causal_conv1d_update(out_padded, conv_state, x_padded, weight, bias,
-                                       B_real, T_padded, conv_dim, kernel, silu, mRunState.MainStream);
+            // ---- DECODE sub-batch (T=1, exact) ----
+            if (!dec_idx.empty()) {
+                const int Bd = static_cast<int>(dec_idx.size());
 
-            // Gather padded output back to flat [1, conv_dim, total_tokens].
-            for (int i = 0; i < B_real; ++i) {
-                const int q_start = indptr[i];
-                const int q_len = indptr[i + 1] - indptr[i];
-                if (q_len <= 0) continue;
-                auto* dst_base = reinterpret_cast<char*>(out_ptr->Data)
-                               + static_cast<std::size_t>(q_start) * elem_bytes;
-                const auto* src_base = reinterpret_cast<const char*>(out_padded.Data)
-                                     + static_cast<std::size_t>(i) * static_cast<std::size_t>(conv_dim) * dst_pitch;
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    dst_base, src_pitch,
-                    src_base, dst_pitch,
-                    static_cast<std::size_t>(q_len) * elem_bytes,
-                    static_cast<std::size_t>(conv_dim),
-                    cudaMemcpyDeviceToDevice,
-                    mRunState.MainStream));
+                Tensor dx = mRunState.temp_alloc(x.DType, {Bd, conv_dim, 1}, "conv1d_dec_x");
+                mTemps.push_back(dx);
+                Tensor dout_t = mRunState.temp_alloc(x.DType, {Bd, conv_dim, 1}, "conv1d_dec_out");
+                mTemps.push_back(dout_t);
+
+                Tensor dstate = mRunState.temp_alloc(conv_state.DType,
+                    {Bd, conv_dim, state_len}, "conv1d_dec_state");
+                mTemps.push_back(dstate);
+                for (int d = 0; d < Bd; ++d) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        (char*)dstate.Data + d * state_row,
+                        (const char*)conv_state.Data + dec_idx[d] * state_row,
+                        state_row, cudaMemcpyDeviceToDevice, stream));
+                }
+
+                for (int d = 0; d < Bd; ++d) {
+                    const int qs = indptr[dec_idx[d]];
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        (char*)dx.Data + std::size_t(d) * conv_dim * elem_bytes,
+                        elem_bytes,
+                        (const char*)x.Data + std::size_t(qs) * elem_bytes,
+                        flat_pitch,
+                        elem_bytes,
+                        conv_dim,
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+
+                mamba_causal_conv1d_update(dout_t, dstate, dx, weight, bias,
+                                           Bd, 1, conv_dim, kernel, silu, stream);
+
+                for (int d = 0; d < Bd; ++d) {
+                    const int qs = indptr[dec_idx[d]];
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        (char*)out_ptr->Data + std::size_t(qs) * elem_bytes,
+                        flat_pitch,
+                        (const char*)dout_t.Data + std::size_t(d) * conv_dim * elem_bytes,
+                        elem_bytes,
+                        elem_bytes,
+                        conv_dim,
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+                for (int d = 0; d < Bd; ++d) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        (char*)conv_state.Data + dec_idx[d] * state_row,
+                        (const char*)dstate.Data + d * state_row,
+                        state_row, cudaMemcpyDeviceToDevice, stream));
+                }
             }
         } else {
             mamba_causal_conv1d_update(*out_ptr, conv_state, x, weight, bias,

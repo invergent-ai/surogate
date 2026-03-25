@@ -441,8 +441,8 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
             if (impl.encoder.find(bytes) == impl.encoder.end()) {
                 impl.encoder[bytes] = id;
                 impl.decoder[id] = bytes;
-                impl.vocab_size_ = std::max(impl.vocab_size_, static_cast<int32_t>(id + 1));
             }
+            impl.vocab_size_ = std::max(impl.vocab_size_, static_cast<int32_t>(id + 1));
         }
     }
 

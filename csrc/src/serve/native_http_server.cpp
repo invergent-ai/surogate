@@ -14,6 +14,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 #include <csignal>
@@ -24,6 +25,7 @@
 
 #include "third_party/cpp-httplib/httplib.h"
 #include "runtime/infer/continuous_engine.h"
+#include "utilities/crash_handler.h"
 #include "utilities/utils.h"  // CUDA_CHECK
 
 namespace serve {
@@ -121,6 +123,54 @@ inline std::string ltrim_ascii_whitespace(std::string text) {
     return text.substr(pos);
 }
 
+inline bool contains_ci(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    auto it = std::search(
+        haystack.begin(),
+        haystack.end(),
+        needle.begin(),
+        needle.end(),
+        [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+        });
+    return it != haystack.end();
+}
+
+inline bool is_stateful_chunking_model(const NativeHttpServerConfig& cfg, const PretrainedConfig& model_cfg) {
+    switch (model_cfg.Architecture) {
+        case PretrainedConfig::QWEN3_5:
+        case PretrainedConfig::QWEN3_5_MOE:
+        case PretrainedConfig::NEMOTRON_H:
+            return true;
+        default:
+            break;
+    }
+
+    if (contains_ci(cfg.model_id, "qwen3.5") || contains_ci(cfg.model_id, "qwen3_5") ||
+        contains_ci(cfg.model_id, "qwen3-5") || contains_ci(cfg.model_id, "nemotron-h") ||
+        contains_ci(cfg.model_id, "nemotron_h")) {
+        return true;
+    }
+
+    if (contains_ci(cfg.model_dir, "qwen3.5") || contains_ci(cfg.model_dir, "qwen3_5") ||
+        contains_ci(cfg.model_dir, "qwen3-5") || contains_ci(cfg.model_dir, "nemotron-h") ||
+        contains_ci(cfg.model_dir, "nemotron_h")) {
+        return true;
+    }
+
+    if (contains_ci(model_cfg.ModelTypeName, "qwen3_5") || contains_ci(model_cfg.ModelTypeName, "qwen3.5") ||
+        contains_ci(model_cfg.ArchitectureName, "qwen3_5") ||
+        contains_ci(model_cfg.ArchitectureName, "qwen3.5") ||
+        contains_ci(model_cfg.ModelTypeName, "nemotron_h") ||
+        contains_ci(model_cfg.ArchitectureName, "nemotron_h")) {
+        return true;
+    }
+
+    return false;
+}
+
 }  // namespace
 
 void NativeHttpServer::TokenQueue::push(int32_t tok) {
@@ -172,9 +222,25 @@ NativeHttpServer::NativeHttpServer(MultiGPUPyTrainer* trainer, NativeHttpServerC
     if (eos_id_ < 0) {
         eos_id_ = 2;
     }
-    token_id_limit_ = std::max(1, tokenizer_.vocab_size());
+    const int tokenizer_vocab = tokenizer_.vocab_size();
+    const int model_vocab = trainer_->config().VocabSize;
+    token_id_limit_ = std::max({1, tokenizer_vocab, model_vocab});
 
-    int32_t fallback = tokenizer_.encode_single_token("<unk>");
+    int32_t fallback = -1;
+    try {
+        const std::string unk = tokenizer_.special_token("unk_token");
+        if (!unk.empty()) {
+            fallback = tokenizer_.encode_single_token(unk);
+        }
+    } catch (...) {
+    }
+    if (fallback < 0 || fallback >= token_id_limit_) {
+        try {
+            fallback = tokenizer_.encode_single_token("<unk>");
+        } catch (...) {
+            fallback = -1;
+        }
+    }
     if (fallback < 0 || fallback >= token_id_limit_) {
         fallback = eos_id_;
     }
@@ -754,6 +820,19 @@ void NativeHttpServer::scheduler_loop() {
         sched_cfg.long_prefill_token_threshold = cfg_.long_prefill_token_threshold;
         sched_cfg.max_num_partial_prefills = cfg_.max_num_partial_prefills;
         sched_cfg.max_seq_len = cfg_.continuous_engine_max_seq_len;
+        const bool disable_stateful_chunking =
+            env_flag_enabled("SUROGATE_SERVE_DISABLE_CHUNKED_PREFILL_FOR_STATEFUL", true) &&
+            is_stateful_chunking_model(cfg_, trainer_->config());
+        if (disable_stateful_chunking) {
+            sched_cfg.enable_chunked_prefill = false;
+            sched_cfg.long_prefill_token_threshold = std::max(
+                sched_cfg.long_prefill_token_threshold,
+                std::max(sched_cfg.max_seq_len, cfg_.runtime_seq_len));
+            std::cerr << fmt::format(
+                "[surogate][cpp-http] stateful model detected (arch={}): disabling chunked prefill, threshold={}\n",
+                trainer_->config().model_name(),
+                sched_cfg.long_prefill_token_threshold);
+        }
         scheduler_ = std::make_unique<Scheduler>(sched_cfg);
 
         // Collector thread calls cudaEventSynchronize + Phase 8 directly on its
@@ -804,27 +883,9 @@ void NativeHttpServer::scheduler_loop() {
 
         int step_count = 0;
         const bool sched_debug = env_flag_enabled("SUROGATE_SERVE_SCHED_DEBUG", false);
-        auto last_progress = std::chrono::steady_clock::now();
 
         while (!shutdown_.load(std::memory_order_relaxed)) {
             const auto t_loop_start = std::chrono::high_resolution_clock::now();
-
-            // Watchdog: print if no progress for 5 seconds.
-            {
-                auto now = std::chrono::steady_clock::now();
-                const double sec = std::chrono::duration<double>(now - last_progress).count();
-                if (sec > 5.0) {
-                    std::size_t psize = 0;
-                    { std::lock_guard<std::mutex> lk(pending_mu_); psize = pending_.size(); }
-                    bool inflight = false;
-                    { std::lock_guard<std::mutex> lk(collect_mu); inflight = collect_inflight || collect_requested || collect_ready; }
-                    std::cerr << fmt::format(
-                        "[sched-watchdog] STALL step={} slot_map={} pending={} inflight={} has_pending={} failed={} exited={} shutdown={}\n",
-                        step_count, slot_map.size(), psize, inflight, engine->has_pending_step(),
-                        scheduler_failed_.load(), scheduler_exited_.load(), shutdown_.load());
-                    last_progress = now;
-                }
-            }
 
             // Pull collected step from collector thread (if ready).
             std::optional<infer::ContinuousGenerationEngine::FlatStepResult> collected;
@@ -1095,7 +1156,6 @@ void NativeHttpServer::scheduler_loop() {
                 collect_requested = true;
             }
             collect_cv.notify_one();
-            last_progress = std::chrono::steady_clock::now();
 
             ++step_count;
             if (cfg_.enable_loop_trace && (step_count <= 30 || step_count % 50 == 0)) {
@@ -1134,6 +1194,13 @@ void NativeHttpServer::scheduler_loop() {
         } catch (const std::exception& e) {
             err = e.what();
         } catch (...) {
+        }
+        if (err.find("Stack trace:") == std::string::npos) {
+            try {
+                err += "\n\nStack trace:\n";
+                err += surogate::capture_stacktrace(1, 64);
+            } catch (...) {
+            }
         }
         {
             std::lock_guard<std::mutex> lock(scheduler_error_mu_);

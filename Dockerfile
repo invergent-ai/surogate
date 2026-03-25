@@ -26,7 +26,7 @@ ARG VLLM_TORCH_BACKEND=cu130
 ARG WHEEL_URL=https://github.com/invergent-ai/surogate/releases/download/v${PACKAGE_VERSION}/surogate-${PACKAGE_VERSION}+${WHEEL_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV CUDA_LIB_ROOT="/home/surogate/.venv/lib/python3.12/site-packages/nvidia"
+ENV CUDA_LIB_ROOT="/root/.venv/lib/python3.12/site-packages/nvidia"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl libdw-dev python3-dev build-essential \
@@ -45,16 +45,13 @@ RUN echo "${CUDA_LIB_ROOT}/cu13/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && mv ~/.local/bin/uv* /usr/local/bin
 
-# Create non-root user
-RUN useradd -m -s /bin/bash surogate
-USER surogate
-WORKDIR /home/surogate
+WORKDIR /root
 
 # Create virtual environment
-RUN uv venv /home/surogate/.venv --python=3.12
+RUN uv venv /root/.venv --python=3.12
 
-ENV PATH="/home/surogate/.venv/bin:$PATH" \
-    VIRTUAL_ENV="/home/surogate/.venv"
+ENV PATH="/root/.venv/bin:$PATH" \
+    VIRTUAL_ENV="/root/.venv"
 
 # Install wheel from URL
 RUN uv pip install ${WHEEL_URL}
@@ -62,5 +59,4 @@ RUN uv pip install -U vllm --pre --extra-index-url https://wheels.vllm.ai/nightl
 RUN uv pip install "transformers==5.3.0"
 
 # Default entrypoint
-ENTRYPOINT [".venv/bin/surogate"]
-CMD ["--help"]
+ENTRYPOINT ["/bin/bash"]
