@@ -363,10 +363,7 @@ std::string NativeHttpServer::messages_to_prompt_text(const json& messages) cons
     }
 
     try {
-        return tokenizer_.apply_chat_template(
-            normalized,
-            true,
-            {{"enable_thinking", false}});
+        return tokenizer_.apply_chat_template(normalized, true);
     } catch (...) {
         std::ostringstream oss;
         for (const auto& m : normalized) {

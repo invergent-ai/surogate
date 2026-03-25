@@ -70,15 +70,6 @@ bool env_flag_enabled(const char* name) {
            value != "FALSE";
 }
 
-bool full_step_cuda_graph_mode_requested() {
-    const char* mode = std::getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE");
-    if (mode && *mode) {
-        return env_flag_enabled("SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE");
-    }
-    const char* buckets = std::getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_BUCKETS");
-    return buckets && *buckets;
-}
-
 bool graph_has_kernel(const Module& module, std::string_view kernel) {
     if (!module.forward.has_value()) {
         return false;
@@ -952,9 +943,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
                     static_cast<double>(budget) / (1024.0 * 1024.0),
                     dequant_cache_size == 0 ? "unlimited" : "pooled");
 
-            if (options.UseCudaGraphs &&
-                full_step_cuda_graph_mode_requested() &&
-                dequant_cache_size != 0) {
+            if (options.UseCudaGraphs && dequant_cache_size != 0) {
                 // Pooled dequant buffers can trigger lazy device allocations while
                 // a decode graph is being captured/replayed. Force resident mode
                 // so all dequant buffers are allocated eagerly outside capture.

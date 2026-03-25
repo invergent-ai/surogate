@@ -37,7 +37,6 @@ namespace dsl {
 class GraphExecutor;
 }
 namespace infer {
-class GenerationSession;
 class ContinuousGenerationEngine;
 }
 
@@ -200,35 +199,6 @@ public:
         int prefill_chunk_size = 256,
         float repetition_penalty = 1.0f);
 
-    struct GenerationSessionStepResult {
-        std::vector<std::vector<int32_t>> tokens;  // [num_prompts] new tokens per prompt for this chunk
-        std::vector<int> completion_lens;          // [num_prompts] total generated length so far
-        std::vector<int> finished;                 // [num_prompts] 1 if finished
-        bool all_finished = false;
-    };
-
-    // Persistent generation session (N=1) for continuous serving.
-    // open -> repeated step -> close.
-    std::uint64_t open_generation_session(
-        const std::vector<std::vector<int32_t>>& prompts,
-        int max_gen_len,
-        float temperature,
-        int eos_token_id,
-        bool use_lora,
-        bool use_cuda_graphs = false,
-        int top_k = 0,
-        float top_p = 1.0f,
-        float min_p = 0.0f,
-        int prefill_chunk_size = 256,
-        float repetition_penalty = 1.0f);
-
-    GenerationSessionStepResult step_generation_session(
-        std::uint64_t session_id,
-        int step_tokens,
-        const std::vector<int>& force_finished_rows = {});
-
-    void close_generation_session(std::uint64_t session_id);
-
     // -----------------------------------------------------------------------
     // Continuous generation engine (iteration-level continuous batching).
     // -----------------------------------------------------------------------
@@ -355,11 +325,6 @@ private:
     std::atomic<bool> mHasCrashed = false;
     std::atomic<int> mIsReady = 0;
     std::atomic<int> mWorkDone = 0;
-
-    struct GenerationSessionBundle;
-    std::mutex mGenerationSessionsMutex;
-    std::uint64_t mNextGenerationSessionId = 1;
-    std::unordered_map<std::uint64_t, std::unique_ptr<GenerationSessionBundle>> mGenerationSessions;
 
     std::mutex mContinuousEnginesMutex;
     std::uint64_t mNextContinuousEngineId = 1;

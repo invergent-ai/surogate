@@ -313,52 +313,36 @@ void flat_attention_plan(
     }
     auto& plan_info = *reinterpret_cast<flashinfer::PrefillPlanInfo*>(plan_info_opaque);
 
-    // -----------------------------------------------------------------------
-    // Pinned host arena for PrefillPlan metadata.
-    // ALL host→device copies must use pinned memory to avoid implicit
-    // cuStreamSynchronize (pageable memcpy forces driver-level sync).
-    // -----------------------------------------------------------------------
-    // Global pinned arena shared across threads (flat_attention_plan is only
-    // called from one thread at a time — the scheduler thread during serving,
-    // the main thread during warmup).
-    struct PinnedArena {
-        char* base = nullptr;
-        std::size_t capacity = 0;
-        std::size_t used = 0;
+    // Pinned host buffers — eliminates implicit cuStreamSynchronize from
+    // pageable cudaMemcpyAsync. All CPU writes complete before any H2D copy.
+    static char* pinned_buf = nullptr;
+    static std::size_t pinned_cap = 0;
+    const std::size_t needed =
+        (batch_size + 1) * sizeof(int32_t) * 2 +
+        batch_size * sizeof(int32_t) +
+        batch_size * block_table_stride * sizeof(int32_t) +
+        int_ws_size + 256;
+    if (needed > pinned_cap) {
+        if (pinned_buf) cudaFreeHost(pinned_buf);
+        // Allocate 2x needed to avoid repeated resizing as batch_size grows.
+        pinned_cap = std::max(needed * 2, std::size_t(32) << 20);  // min 32 MB
+        CUDA_CHECK(cudaMallocHost(&pinned_buf, pinned_cap));
+    }
 
-        ~PinnedArena() { if (base) cudaFreeHost(base); }
+    // Layout all buffers (non-overlapping, all CPU writes before any DMA).
+    std::size_t off = 0;
+    int32_t* h_page_indptr   = reinterpret_cast<int32_t*>(pinned_buf + off);
+    off += (batch_size + 1) * sizeof(int32_t);
+    int32_t* h_last_page_len = reinterpret_cast<int32_t*>(pinned_buf + off);
+    off += batch_size * sizeof(int32_t);
+    int32_t* h_page_indices  = reinterpret_cast<int32_t*>(pinned_buf + off);
+    off += batch_size * block_table_stride * sizeof(int32_t);
+    int32_t* h_kv_indptr     = reinterpret_cast<int32_t*>(pinned_buf + off);
+    off += (batch_size + 1) * sizeof(int32_t);
+    off = (off + 15) & ~std::size_t(15);
+    char* plan_ws            = pinned_buf + off;
 
-        void ensure(std::size_t bytes) {
-            if (bytes <= capacity) { used = 0; return; }
-            if (base) cudaFreeHost(base);
-            capacity = (bytes > (std::size_t(4) << 20)) ? bytes : (std::size_t(4) << 20);
-            CUDA_CHECK(cudaMallocHost(&base, capacity));
-            used = 0;
-        }
-
-        void* alloc_bytes(std::size_t bytes, std::size_t align) {
-            used = (used + align - 1) & ~(align - 1);
-            void* ptr = base + used;
-            used += bytes;
-            return ptr;
-        }
-    };
-    static PinnedArena arena;
-
-    // Compute sizes for all pinned allocations.
-    // page_indptr: batch_size+1, last_page_len: batch_size, kv_indptr: batch_size+1
-    // page_indices: up to batch_size * max_pages_per_seq (computed below)
-    // plan_workspace: int_ws_size bytes
-    const std::size_t metadata_bytes =
-        (batch_size + 1) * sizeof(int32_t) * 2 +  // page_indptr + kv_indptr
-        batch_size * sizeof(int32_t) +              // last_page_len
-        batch_size * block_table_stride * sizeof(int32_t) +  // page_indices (upper bound)
-        int_ws_size + 64;                           // plan workspace + alignment slack
-    arena.ensure(metadata_bytes);
-
-    int32_t* h_page_indptr   = static_cast<int32_t*>(arena.alloc_bytes((batch_size + 1) * sizeof(int32_t), alignof(int32_t)));
-    int32_t* h_last_page_len = static_cast<int32_t*>(arena.alloc_bytes(batch_size * sizeof(int32_t), alignof(int32_t)));
-
+    // Fill all metadata (CPU-only, no DMA yet).
     h_page_indptr[0] = 0;
     int total_pages = 0;
     for (int i = 0; i < batch_size; ++i) {
@@ -369,8 +353,6 @@ void flat_attention_plan(
         int rem = k_len % page_block_size;
         h_last_page_len[i] = (rem == 0) ? page_block_size : rem;
     }
-
-    int32_t* h_page_indices = static_cast<int32_t*>(arena.alloc_bytes(total_pages * sizeof(int32_t), alignof(int32_t)));
     for (int i = 0; i < batch_size; ++i) {
         int start = h_page_indptr[i];
         int count = h_page_indptr[i + 1] - start;
@@ -379,25 +361,19 @@ void flat_attention_plan(
                 h_block_table[i * block_table_stride + p]);
         }
     }
+    h_kv_indptr[0] = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        h_kv_indptr[i + 1] = h_kv_indptr[i] + h_seq_lens_k[i];
+    }
+    std::memset(plan_ws, 0, int_ws_size);
 
-    // Upload page metadata (pinned → truly async, no implicit sync).
+    // Now issue all DMA + PrefillPlan (all source data is stable).
     CUDA_CHECK(cudaMemcpyAsync(d_page_indptr, h_page_indptr,
         (batch_size + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_page_indices, h_page_indices,
         total_pages * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_last_page_len, h_last_page_len,
         batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-
-    // Build KV indptr (cumulative KV lengths) — pinned.
-    int32_t* h_kv_indptr = static_cast<int32_t*>(arena.alloc_bytes((batch_size + 1) * sizeof(int32_t), alignof(int32_t)));
-    h_kv_indptr[0] = 0;
-    for (int i = 0; i < batch_size; ++i) {
-        h_kv_indptr[i + 1] = h_kv_indptr[i] + h_seq_lens_k[i];
-    }
-
-    // Pinned workspace for PrefillPlan (truly page-locked this time).
-    char* plan_ws = static_cast<char*>(arena.alloc_bytes(int_ws_size, 16));
-    std::memset(plan_ws, 0, int_ws_size);
 
     auto plan_err = flashinfer::PrefillPlan<int32_t>(
         d_float_ws, float_ws_size,

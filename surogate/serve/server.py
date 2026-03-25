@@ -131,17 +131,6 @@ class NativeServingRuntime:
             )
 
         options.use_cuda_graphs = bool(config.use_cuda_graphs)
-        if (
-            options.use_cuda_graphs
-            and prequant_method in {"prequant_nvfp4", "prequant_fp8", "prequant_mxfp4"}
-            and os.getenv("SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE") is None
-        ):
-            os.environ["SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE"] = "0"
-            logger.info(
-                "Defaulting SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE=0 for prequant serving "
-                "with CUDA graphs (decode graphs stay enabled). Set "
-                "SUROGATE_SERVE_FULL_CUDA_GRAPH_MODE=1 to force full-step capture."
-            )
         options.doc_masking = True
         options.recompute = "true"
         if hasattr(options, "selective_expert_dequant"):

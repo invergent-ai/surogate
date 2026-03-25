@@ -11,8 +11,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -115,114 +113,6 @@ private:
     dsl::DslParamStore& mWeights;
     const modules::ModelConfig& mConfig;
     const RuntimeOptions& mOptions;
-};
-
-/// Incremental generation output for one decode chunk.
-struct GenerationSessionStepResult {
-    std::vector<std::vector<int32_t>> tokens;  // [batch_size] newly generated IDs for this step chunk
-    std::vector<int32_t> completion_lens;      // [batch_size] total generated tokens so far
-    std::vector<int32_t> finished;             // [batch_size] 1 if finished, else 0
-    bool all_finished = false;
-};
-
-/// Persistent decode session for serving continuous scheduling (N=1 completions).
-///
-/// Lifecycle:
-///   init(prompts, cfg, ...)
-///   step(k) repeatedly
-///   close()
-class GenerationSession {
-public:
-    GenerationSession(dsl::DslRunState& run_state,
-                      dsl::DslParamStore& weights,
-                      const modules::ModelConfig& config,
-                      const RuntimeOptions& options);
-    ~GenerationSession();
-
-    void init(const std::vector<std::vector<int32_t>>& prompts,
-              const GenerationEngineConfig& gen_config,
-              DeviceMemoryStack& arena,
-              dsl::GraphExecutor& graph_executor,
-              NCCLCommunicator& comm,
-              const modules::ForwardHook* hook = nullptr);
-
-    GenerationSessionStepResult step(
-        int max_steps,
-        dsl::GraphExecutor& graph_executor,
-        NCCLCommunicator& comm,
-        const modules::ForwardHook* hook = nullptr);
-
-    /// Force-finish specific sequence rows (e.g., stop-string hit on host).
-    void mark_finished(const std::vector<int>& rows);
-
-    void close(dsl::GraphExecutor& graph_executor);
-
-    bool initialized() const { return mInitialized; }
-    bool all_finished() const { return mAllFinished; }
-    int batch_size() const { return mBatchSize; }
-    int generated_steps() const { return mGeneratedSteps; }
-    int max_gen_len() const { return mGenConfig.max_gen_len; }
-
-private:
-    dsl::DslRunState& mRunState;
-    dsl::DslParamStore& mWeights;
-    const modules::ModelConfig& mConfig;
-    const RuntimeOptions& mOptions;
-
-    bool mInitialized = false;
-    bool mAllFinished = false;
-    DeviceMemoryStack* mArena = nullptr;
-    dsl::GraphExecutor* mGraphExecutor = nullptr;
-    DeviceMemoryStack::Checkpoint mArenaCheckpoint{};
-    GenerationEngineConfig mGenConfig{};
-    uint64_t mRngOffset = 0;
-    int mGeneratedSteps = 0;
-    bool mFullStepCudaGraphEnabled = false;
-    bool mFullStepCudaGraphPrimed = false;
-    bool mDecodeCudaGraphPrimed = false;
-    cudaGraphExec_t mFullStepCudaGraphExec = nullptr;
-    DeviceMemoryStack::Checkpoint mFullStepCudaGraphCheckpoint{};
-
-    int mBatchSize = 0;
-    int mMaxTotalLen = 0;
-    int mVocabSize = 0;
-    int32_t mFallbackTokenId = 0;
-
-    PagedKVCache mPagedKV;
-
-    int* mSeqLensGpu = nullptr;
-    int32_t* mCuSeqlensQGpu = nullptr;
-    int32_t* mSeqlensKGpu = nullptr;
-    int32_t* mPositionIdsGpu = nullptr;
-    int32_t* mLastTokensGpu = nullptr;
-    float* mLogitsGpu = nullptr;
-    float* mProbsGpu = nullptr;
-    void* mSoftmaxWs = nullptr;
-    std::size_t mSoftmaxWsBytes = 0;
-    int32_t* mSampledTokensGpu = nullptr;
-    float* mLogprobsGpu = nullptr;
-    int32_t* mCompletionLensGpu = nullptr;
-    int* mActiveCountGpu = nullptr;
-    int* mFinishedGpu = nullptr;
-    uint64_t* mSamplingOffsetsGpu = nullptr;
-    float* mTemperatureGpu = nullptr;
-    int* mPrefillBlockTableGpu = nullptr;
-
-    std::vector<int32_t> mPromptLensHost;
-    std::vector<int> mSeqLensHost;
-    std::vector<int> mFinishedHost;
-    std::vector<int32_t> mCompletionLensHost;
-    std::vector<int32_t> mSampledTokensHost;
-    std::vector<int32_t> mStepSampledTokensHost;
-    std::vector<int> mStepFinishedBeforeHost;
-    std::vector<uint64_t> mSamplingOffsetsHost;
-
-    infer::DecodeState mDecodeState{};
-
-    std::unordered_map<int, void*> mRecurrentStates;
-    std::unordered_map<int, std::size_t> mRecurrentStateBytes;
-    std::unordered_map<int, void*> mConvStates;
-    std::unordered_map<int, std::size_t> mConvStateBytes;
 };
 
 }  // namespace infer

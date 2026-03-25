@@ -2042,6 +2042,13 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
         throw std::runtime_error(
             "ContinuousGenerationEngine::flat_step: token packing mismatch in flat batch");
     }
+    // Last-token gather indices must be valid before the packed metadata H2D
+    // upload; otherwise logits are gathered from stale positions.
+    int32_t* h_last_token_indices = reinterpret_cast<int32_t*>(
+        packed_base + flat_off_last_token_idx_);
+    for (int i = 0; i < batch_size; ++i) {
+        h_last_token_indices[i] = h_q_indptr[i + 1] - 1;
+    }
     if (pure_decode && exec_batch_size > batch_size) {
         // Padded decode rows: keep seq_lens at 0, but set seqused_k to 1 and
         // mark finished so decode rope skips appending any KV for padded rows.
@@ -2170,12 +2177,7 @@ ContinuousGenerationEngine::FlatStepResult ContinuousGenerationEngine::flat_step
     }
     ds.flat_padded_batch_size = total_tiles;
 
-    // Compute last-token indices for LM head gather optimization.
-    int32_t* h_last_token_indices = reinterpret_cast<int32_t*>(packed_base + flat_off_last_token_idx_);
-    for (int i = 0; i < batch_size; ++i) {
-        h_last_token_indices[i] = h_q_indptr[i + 1] - 1;
-    }
-    // last_token_indices already in packed buffer (uploaded above).
+    // last_token_indices were populated before the packed H2D upload.
     ds.flat_last_token_indices_gpu = flat_last_token_indices_gpu_;
 
     ds.token_to_req_gpu = d_token_to_req;

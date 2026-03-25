@@ -3,9 +3,9 @@
 //
 // ContinuousGenerationEngine: iteration-level continuous batching for serving.
 //
-// Unlike GenerationSession (fixed batch, run-to-completion), this engine
-// maintains a pool of sequence slots.  New sequences can join at any decode
-// step and finished sequences release their KV-cache pages immediately.
+// This engine maintains a pool of sequence slots.  New sequences can join at
+// any decode step and finished sequences release their KV-cache pages
+// immediately.
 //
 // Decode state (seq_lens, last_tokens, finished, block_table) lives
 // persistently on the GPU.  The compact batch is only rebuilt when the
