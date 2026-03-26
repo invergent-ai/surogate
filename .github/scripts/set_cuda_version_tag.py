@@ -10,25 +10,16 @@ import tomlkit
 
 CUDA_DEPS = {
     'cu128': [
-        "nvidia-cuda-runtime-cu12==12.8.90",
-        "nvidia-cudnn-cu12==9.19.0.56",
-        "nvidia-nccl-cu12==2.29.3",
-        "nvidia-cufile-cu12==1.14.1.1",
-        "nvidia-cuda-nvrtc-cu12==12.8.93"
+        "torch==2.10.0+cu128",
+        "torchvision==0.25.0+cu128",
     ],
     'cu129': [
-        "nvidia-cuda-runtime-cu12==12.9.79",
-        "nvidia-cudnn-cu12==9.19.0.56",
-        "nvidia-nccl-cu12==2.29.3",
-        "nvidia-cufile-cu12==1.14.1.1",
-        "nvidia-cuda-nvrtc-cu12==12.9.86"
+        "torch==2.10.0+cu129",
+        "torchvision==0.25.0+cu129",
     ],
     'cu130': [
-        "nvidia-cuda-runtime==13.1.80",
-        "nvidia-cudnn-cu13==9.19.0.56",
-        "nvidia-nccl-cu13==2.29.3",
-        "nvidia-cufile==1.16.1.26",
-        "nvidia-cuda-nvrtc==13.1.115"
+        "torch==2.10.0+cu130",
+        "torchvision==0.25.0+cu130",
     ],
 }
 

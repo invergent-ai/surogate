@@ -30,8 +30,11 @@ jobs:
       matrix:
         include:
           - wheel_tag: "cu128"
+            dockerfile: "Dockerfile.cu128"
           - wheel_tag: "cu129"
+            dockerfile: "Dockerfile.cu129"
           - wheel_tag: "cu130"
+            dockerfile: "Dockerfile.cu130"
 
     steps:
       - name: Check if this CUDA version should be built
@@ -99,10 +102,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: true
           build-args: |
             PACKAGE_VERSION=${{ steps.version.outputs.version }}
-            CUDA_TAG=${{ matrix.wheel_tag }}
           tags: |
             ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}
             ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}

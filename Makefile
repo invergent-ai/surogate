@@ -5,14 +5,21 @@ BUILD_DIR ?= csrc/build
 BUILD_TYPE ?= Release
 PARALLEL_JOBS ?= $(shell nproc)
 
-.PHONY: all build export-checkpoint wheel configure clean clean-all build-tests test test-unit test-integration test-all help
+CCACHE := $(shell which ccache 2>/dev/null)
+ifdef CCACHE
+CCACHE_FLAGS := -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+CUDA_HOME ?= $(or $(CUDA_PATH),$(shell dirname $$(dirname $$(which nvcc 2>/dev/null)) 2>/dev/null),/usr/local/cuda)
+export CCACHE_CUDA_PATHS := $(CUDA_HOME)
+endif
+
+.PHONY: all build export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all help info
 
 # Default target
 all: build
 
 # Configure the build
 configure:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CCACHE_FLAGS)
 
 # Build all targets
 build: configure
@@ -22,9 +29,40 @@ build: configure
 	cp -f $(BUILD_DIR)/libsurogate-common.so surogate/
 	cp -f $(BUILD_DIR)/libsurogate-common.so .venv/lib/python3.12/site-packages/surogate/
 
-# Build Python wheel
-wheel:
-	uv build --wheel
+# Internal helper: build + repair wheel for a given CUDA tag
+# Usage: $(call build_wheel,cu128)
+define build_wheel
+	cp pyproject.toml pyproject.toml.bak && \
+	trap 'mv -f pyproject.toml.bak pyproject.toml' EXIT INT TERM; \
+	uv run --no-project --with tomlkit python3 .github/scripts/set_cuda_version_tag.py $(1) && \
+	CMAKE_ARGS="$(CCACHE_FLAGS)" uv build --wheel --out-dir dist && \
+	uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl \
+		-w dist/repaired/ \
+		--exclude libcuda.so.1 \
+		--exclude libcudart.so.12 \
+		--exclude libcudart.so.13 \
+		--exclude libcudnn.so.9 \
+		--exclude libcufile.so.0 \
+		--exclude libnccl.so.2 \
+		--exclude libcublas.so.12 \
+		--exclude libcublas.so.13 \
+		--exclude libcublasLt.so.12 \
+		--exclude libcublasLt.so.13 \
+		--exclude libnvidia-ml.so.1 && \
+	mv dist/repaired/*.whl dist/ && \
+	rm -rf dist/repaired/ dist/*linux_x86_64*.whl
+	@echo "Wheel ready in dist/:"
+	@ls -lh dist/*.whl
+endef
+
+wheel-cu128:
+	$(call build_wheel,cu128)
+
+wheel-cu129:
+	$(call build_wheel,cu129)
+
+wheel-cu130:
+	$(call build_wheel,cu130)
 
 wheel-dev: configure
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target _surogate
@@ -39,7 +77,7 @@ wheel-dev: configure
 
 # Build test executables without running them
 build-tests:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTS=ON
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTS=ON $(CCACHE_FLAGS)
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target unit-tests integration-tests
 
 # Build and run unit tests (kernels, modules, components)
@@ -66,7 +104,7 @@ clean:
 		cmake --build $(BUILD_DIR) --target clean 2>/dev/null || true; \
 	fi
 	rm -rf $(BUILD_DIR)/CMakeCache.txt $(BUILD_DIR)/CMakeFiles
-	rm -rf dist *.egg-info surogate/*.so
+	rm -rf dist wheelhouse *.egg-info surogate/*.so
 
 # Full clean - remove build directory entirely
 clean-all:
@@ -75,6 +113,20 @@ clean-all:
 
 # Rebuild from scratch
 rebuild: clean-all build
+
+# Show build configuration
+info:
+	@echo "Build configuration:"
+	@echo "  BUILD_DIR:     $(BUILD_DIR)"
+	@echo "  BUILD_TYPE:    $(BUILD_TYPE)"
+	@echo "  PARALLEL_JOBS: $(PARALLEL_JOBS)"
+ifdef CCACHE
+	@echo "  ccache:        enabled ($(CCACHE))"
+	@echo "  ccache CUDA:   $(if $(shell ccache --version | grep -q '^ccache version [4-9]' && echo yes),enabled (CCACHE_CUDA_PATHS=$(CCACHE_CUDA_PATHS)),disabled (requires ccache >= 4.0))"
+	@ccache --show-stats 2>/dev/null || true
+else
+	@echo "  ccache:        disabled (not found in PATH)"
+endif
 
 # Help target
 help:

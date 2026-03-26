@@ -11,6 +11,7 @@ jobs:
     runs-on: self-hosted
     container:
       image: ${{ matrix.cuda_build_image }}
+      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache
 
     strategy:
       matrix:
@@ -37,6 +38,9 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 8
       CUDAARCHS: ${{ matrix.archs }}
       UV_NO_SYNC: 1
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      CCACHE_CUDA_PATHS: /usr/local/cuda
 
     defaults:
       run:
@@ -60,11 +64,10 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: ${{ runner.os }}-cuda${{ matrix.cuda_version }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-cuda${{ matrix.cuda_version }}-
+        run: |
+          mkdir -p /ccache
+          ccache --max-size=10G
+          ccache --zero-stats
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -74,6 +77,9 @@ jobs:
 
       - name: Build wheel
         run: uv build --wheel --out-dir wheelhouse
+
+      - name: Show ccache stats
+        run: ccache --show-stats
 
       - name: Repair wheel
         run: |
