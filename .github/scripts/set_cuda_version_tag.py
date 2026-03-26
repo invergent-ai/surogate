@@ -23,7 +23,7 @@ CUDA_DEPS = {
         "nvidia-cufile-cu12==1.14.1.1",
         "nvidia-cuda-nvrtc-cu12==12.9.86"
     ],
-    'cu13': [
+    'cu130': [
         "nvidia-cuda-runtime==13.1.80",
         "nvidia-cudnn-cu13==9.19.0.56",
         "nvidia-nccl-cu13==2.29.3",

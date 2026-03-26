@@ -25,7 +25,7 @@ jobs:
             archs: "80;86;89;90;100a;103a;120a"
           - cuda_version: "13.1"
             cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
-            wheel_tag: "cu13"
+            wheel_tag: "cu130"
             archs: "80;86;89;90;100a;103a;120a"
     env:
       CMAKE_GENERATOR: Ninja
