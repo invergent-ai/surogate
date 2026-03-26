@@ -11,5 +11,8 @@
         "limits": "cpp"
     },
     "makefile.configureOnOpen": false,
-    "C_Cpp.default.compilerPath": "/usr/bin/g++-13"
+    "C_Cpp.default.compilerPath": "/usr/bin/g++-13",
+    "cmake.configureOnOpen": false,
+    "cmake.automaticReconfigure": false,
+    "cmake.buildBeforeRun": false
 }
