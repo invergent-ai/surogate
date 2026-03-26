@@ -73,25 +73,28 @@ fi
 # Uses CPU torch wheels to avoid pulling in nvidia-* pip packages;
 # CUDA kernels in surogate link against the system CUDA toolkit.
 
-install_cu128() {
+install_cu128_deps() {
     local version="$1"
     echo "Installing packages for CUDA 12.8..."
-    uv pip install "nvidia-cudnn-cu12==9.19.0.56"
+    uv pip install "nvidia-cudnn-cu12==9.19.0.56" "vllm==0.18.0" --torch-backend=cu128
     install_surogate_wheel "$version" "cu128"
 }
 
-install_cu129() {
+install_cu129_deps() {
     local version="$1"
     echo "Installing packages for CUDA 12.9..."
-    uv pip install "nvidia-cudnn-cu12==9.19.0.56"
+    uv pip install "nvidia-cudnn-cu12==9.19.0.56" "vllm==0.18.0" --torch-backend=cu129
     install_surogate_wheel "$version" "cu129"
 }
 
-install_cu13() {
+install_cu130_deps() {
     local version="$1"
     echo "Installing packages for CUDA 13+..."
     uv pip install "nvidia-cudnn-cu13==9.19.0.56"
-    install_surogate_wheel "$version" "cu129"
+    install_surogate_wheel "$version" "cu130"
+
+    echo "!!! vLLM does not yet have official CUDA 13 support, RL training will not work. !!!"
+    echo "You can still use Surogate for pretraining and fine-tuning."
 }
 
 # --- Helper: download and install the surogate wheel ---
@@ -177,11 +180,11 @@ echo "Latest version: $VERSION"
 # --- Dispatch to the right install function ---
 
 if [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    install_cu13 "$VERSION"
+    install_cu130_deps "$VERSION"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 9 ]]; then
-    install_cu129 "$VERSION"
+    install_cu129_deps "$VERSION"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 8 ]]; then
-    install_cu128 "$VERSION"
+    install_cu128_deps "$VERSION"
 else
     echo "Error: CUDA $CUDA_VERSION is not compatible with Surogate. Aborting."
     exit 1
