@@ -936,6 +936,14 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         // cudaMalloc (which is forbidden during capture).
         mCompiledExecutor->set_dimensions(B, T);
         mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
+
+        // Prime FP4 weight caches on first call. This covers split-attention mode
+        // (sample_packing + CUDA graphs) where use_graphs is false but we still need
+        // cached weights to avoid re-quantizing on every matmul.
+        if (!mWeightCachesPrimed) {
+            prime_fp4_weight_cache({});
+            mWeightCachesPrimed = true;
+        }
     } else if (!mWeightCachesPrimed) {
         // Prime FP4 weight caches on first eager execution (e.g., QLoRA where CUDA
         // graphs are disabled). FP4 on-the-fly quantization (two-level block scaling,

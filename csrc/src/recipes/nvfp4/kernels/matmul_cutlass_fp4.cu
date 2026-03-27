@@ -33,19 +33,26 @@
 #include "kernels/kernels.h"
 
 // ============================================================================
-// Public API Implementation
+// Cached SM version — avoids calling cudaGetDeviceProperties on every matmul
 // ============================================================================
 
-bool cutlass_supports_fp4() {
+static int get_sm_version() {
+    static int cached = -1;
+    if (cached >= 0) return cached;
     int device;
     cudaGetDevice(&device);
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, device);
-    int sm_version = props.major * 10 + props.minor;
+    cached = props.major * 10 + props.minor;
+    return cached;
+}
 
-    // FP4 requires Blackwell (SM100+)
-    // SM90 (Hopper) does NOT have FP4 tensor core support
-    return sm_version >= 100;
+// ============================================================================
+// Public API Implementation
+// ============================================================================
+
+bool cutlass_supports_fp4() {
+    return get_sm_version() >= 100;
 }
 
 std::size_t cutlass_fp4_workspace_size(int M, int N, int K) {
@@ -62,11 +69,7 @@ void matmul_cutlass_fp4(
     int M, int N, int K,
     cudaStream_t stream)
 {
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp props;
-    cudaGetDeviceProperties(&props, device);
-    int sm_version = props.major * 10 + props.minor;
+    const int sm_version = get_sm_version();
 
     if (sm_version < 100) {
         throw std::runtime_error("CUTLASS FP4 GEMM requires Blackwell (SM100+). "
@@ -112,11 +115,7 @@ void matmul_cutlass_fp4_f32(
     int M, int N, int K,
     cudaStream_t stream)
 {
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp props;
-    cudaGetDeviceProperties(&props, device);
-    int sm_version = props.major * 10 + props.minor;
+    const int sm_version = get_sm_version();
 
     if (sm_version < 100) {
         throw std::runtime_error("CUTLASS FP4 GEMM (FP32 out) requires Blackwell (SM100+). "
@@ -159,11 +158,7 @@ void matmul_cutlass_fp4_alpha(
     int M, int N, int K,
     cudaStream_t stream)
 {
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp props;
-    cudaGetDeviceProperties(&props, device);
-    int sm_version = props.major * 10 + props.minor;
+    const int sm_version = get_sm_version();
 
     if (sm_version < 100) {
         throw std::runtime_error("CUTLASS FP4 GEMM (alpha-ptr) requires Blackwell (SM100+). "
