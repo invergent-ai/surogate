@@ -869,6 +869,130 @@ void elementwise_mul(float* out, const float* a, const float* b, long total, cud
     elementwise_mul_kernel<<<div_up(total, threads), threads, 0, stream>>>(out, a, b, total);
 }
 
+// -----------------------------------------------------------------------------
+// Broadcast row-scale: out[i,j] = data[i,j] * scale[i]
+// shape: (N, M) * (N, 1) -> (N, M)
+//
+// Grid: (ceil(M/4/blockDim.x), N)  — one row per blockIdx.y, vectorized 8-byte loads.
+// Each thread processes 4 elements (128-bit load/store for bf16/fp16, or 4 floats).
+// The per-row scale is loaded once into shared memory (broadcast across all threads in row).
+// -----------------------------------------------------------------------------
+
+template<typename T, int VEC>
+__global__ void scale_rows_kernel(T* __restrict__ out,
+                                  const T* __restrict__ data,
+                                  const T* __restrict__ scale,
+                                  long M) {
+    const long row = blockIdx.y;
+    const float s = to_float(scale[row]);
+    const long base = row * M;
+    // Each thread handles VEC consecutive elements
+    long col = (static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x) * VEC;
+    if (col + VEC <= M) {
+        // Vectorized path: load VEC elements at once
+        using Vec = typename std::conditional<sizeof(T) == 2,
+            typename std::conditional<VEC == 8, uint4, uint2>::type,
+            float4>::type;
+        Vec v = *reinterpret_cast<const Vec*>(&data[base + col]);
+        T* elems = reinterpret_cast<T*>(&v);
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            elems[i] = from_float<T>(to_float(elems[i]) * s);
+        }
+        *reinterpret_cast<Vec*>(&out[base + col]) = v;
+    } else {
+        // Tail elements
+        for (long i = col; i < M; ++i) {
+            out[base + i] = from_float<T>(to_float(data[base + i]) * s);
+        }
+    }
+}
+
+// FP32 specialization (no to_float/from_float overhead)
+template<>
+__global__ void scale_rows_kernel<float, 4>(float* __restrict__ out,
+                                            const float* __restrict__ data,
+                                            const float* __restrict__ scale,
+                                            long M) {
+    const long row = blockIdx.y;
+    const float s = scale[row];
+    const long base = row * M;
+    long col = (static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (col + 4 <= M) {
+        float4 v = *reinterpret_cast<const float4*>(&data[base + col]);
+        v.x *= s; v.y *= s; v.z *= s; v.w *= s;
+        *reinterpret_cast<float4*>(&out[base + col]) = v;
+    } else {
+        for (long i = col; i < M; ++i) {
+            out[base + i] = data[base + i] * s;
+        }
+    }
+}
+
+void scale_rows(nv_bfloat16* out, const nv_bfloat16* data, const nv_bfloat16* scale, long N, long M, cudaStream_t stream) {
+    constexpr int VEC = 8;  // 8 x bf16 = 128 bits
+    const int threads = 256;
+    dim3 grid(div_up(M, threads * VEC), static_cast<unsigned>(N));
+    scale_rows_kernel<nv_bfloat16, VEC><<<grid, threads, 0, stream>>>(out, data, scale, M);
+}
+
+void scale_rows(half* out, const half* data, const half* scale, long N, long M, cudaStream_t stream) {
+    constexpr int VEC = 8;
+    const int threads = 256;
+    dim3 grid(div_up(M, threads * VEC), static_cast<unsigned>(N));
+    scale_rows_kernel<half, VEC><<<grid, threads, 0, stream>>>(out, data, scale, M);
+}
+
+void scale_rows(float* out, const float* data, const float* scale, long N, long M, cudaStream_t stream) {
+    constexpr int VEC = 4;  // 4 x fp32 = 128 bits
+    const int threads = 256;
+    dim3 grid(div_up(M, threads * VEC), static_cast<unsigned>(N));
+    scale_rows_kernel<float, VEC><<<grid, threads, 0, stream>>>(out, data, scale, M);
+}
+
+// -----------------------------------------------------------------------------
+// Row-reduce multiply: out[i] = sum_j(a[i,j] * b[i,j])
+// shape: (N, M) -> (N, 1)
+// One block per row, block-level reduction via shared memory.
+// -----------------------------------------------------------------------------
+
+template<typename T>
+__global__ void reduce_row_mul_kernel(T* __restrict__ out,
+                                      const T* __restrict__ a,
+                                      const T* __restrict__ b,
+                                      long M) {
+    extern __shared__ float smem[];
+    const long row = blockIdx.x;
+    const long base = row * M;
+    float sum = 0.0f;
+    for (long j = threadIdx.x; j < M; j += blockDim.x) {
+        sum += to_float(a[base + j]) * to_float(b[base + j]);
+    }
+    smem[threadIdx.x] = sum;
+    __syncthreads();
+    // Block reduce
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[row] = from_float<T>(smem[0]);
+}
+
+void reduce_row_mul(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* b, long N, long M, cudaStream_t stream) {
+    const int threads = 256;
+    reduce_row_mul_kernel<<<static_cast<unsigned>(N), threads, threads * sizeof(float), stream>>>(out, a, b, M);
+}
+
+void reduce_row_mul(half* out, const half* a, const half* b, long N, long M, cudaStream_t stream) {
+    const int threads = 256;
+    reduce_row_mul_kernel<<<static_cast<unsigned>(N), threads, threads * sizeof(float), stream>>>(out, a, b, M);
+}
+
+void reduce_row_mul(float* out, const float* a, const float* b, long N, long M, cudaStream_t stream) {
+    const int threads = 256;
+    reduce_row_mul_kernel<<<static_cast<unsigned>(N), threads, threads * sizeof(float), stream>>>(out, a, b, M);
+}
+
 namespace {
 
 __device__ __forceinline__ float softplus_stable(float x) {

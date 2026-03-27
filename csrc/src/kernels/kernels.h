@@ -2287,6 +2287,17 @@ void elementwise_mul(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* 
 void elementwise_mul(half* out, const half* a, const half* b, long total, cudaStream_t stream);
 void elementwise_mul(float* out, const float* a, const float* b, long total, cudaStream_t stream);
 
+// Broadcast row-scale: out[i,j] = data[i,j] * scale[i] for shape (N,M) * (N,1)
+void scale_rows(nv_bfloat16* out, const nv_bfloat16* data, const nv_bfloat16* scale, long N, long M, cudaStream_t stream);
+void scale_rows(half* out, const half* data, const half* scale, long N, long M, cudaStream_t stream);
+void scale_rows(float* out, const float* data, const float* scale, long N, long M, cudaStream_t stream);
+
+// Row-reduce multiply: out[i] = sum_j(a[i,j] * b[i,j]) for shape (N,M) -> (N,1)
+// Used for broadcast mul backward: d_scale = sum(d_out * data, dim=-1)
+void reduce_row_mul(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* b, long N, long M, cudaStream_t stream);
+void reduce_row_mul(half* out, const half* a, const half* b, long N, long M, cudaStream_t stream);
+void reduce_row_mul(float* out, const float* a, const float* b, long N, long M, cudaStream_t stream);
+
 // Qwen3.5 decay primitive:
 // g = -exp(A_log) * softplus(a + dt_bias)
 void qwen3_5_decay_forward(Tensor& out,

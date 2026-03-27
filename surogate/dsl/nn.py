@@ -323,6 +323,40 @@ class Module:
         return Proxy(out_name, ref)
 
     @staticmethod
+    def _mul(a: Proxy, b: Proxy, *, name: str | None = None) -> Proxy:
+        """Element-wise multiply."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("mul")
+        ref = g.mul(a.ref, b.ref)
+        return Proxy(out_name, ref)
+
+    @staticmethod
+    def _sigmoid(x: Proxy, *, name: str | None = None) -> Proxy:
+        """Sigmoid activation."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("sigmoid")
+        ref = g.sigmoid(x.ref, out_name=out_name)
+        return Proxy(out_name, ref)
+
+    @staticmethod
+    def _matmul(x: Proxy, weight_name: str, *, transpose: str = "NT",
+                name: str | None = None) -> Proxy:
+        """Matmul with a named weight parameter."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("matmul")
+        ref = g.matmul(x.ref, weight_name, transpose=transpose, out_name=out_name)
+        return Proxy(out_name, ref)
+
+    @staticmethod
+    def _register_param(name: str, shape: tuple, **kwargs) -> str:
+        """Register a weight parameter from within forward()."""
+        tracer = _current_tracer.get()
+        return tracer.register_param(name, shape, **kwargs)
+
+    @staticmethod
     def _zeros(shape: list, *, dtype: str = "bf16", name: str | None = None) -> Proxy:
         """Create a zero-filled tensor."""
         tracer = _current_tracer.get()
@@ -1950,11 +1984,11 @@ class MoESharedExpert(Module):
         tracer.register_param("down", ("C", "SharedM"))
 
         tracer.register_activation(
-            "gate", ("B * T", "SharedM"), share_policy="fft_share",
+            "gate_out", ("B * T", "SharedM"), share_policy="fft_share",
             when="use_shared_expert",
         )
         tracer.register_activation(
-            "up", ("B * T", "SharedM"), share_policy="fft_share",
+            "up_out", ("B * T", "SharedM"), share_policy="fft_share",
             when="use_shared_expert",
         )
         tracer.register_activation(
@@ -1972,11 +2006,11 @@ class MoESharedExpert(Module):
 
         shared_gate = g.matmul(
             x.ref, tracer.prefixed("gate"), transpose="NT",
-            out_name=tracer.prefixed("gate"),
+            out_name=tracer.prefixed("gate_out"),
         )
         shared_up = g.matmul(
             x.ref, tracer.prefixed("up"), transpose="NT",
-            out_name=tracer.prefixed("up"),
+            out_name=tracer.prefixed("up_out"),
         )
         shared_gate_act = g.silu(shared_gate, out_name=tracer.prefixed("gate_act"))
         shared_hidden = g.mul(shared_gate_act, shared_up)
@@ -3486,6 +3520,59 @@ QWEN3_5_VL_MODEL_NAME_REMAP: dict[str, str] = {
     "lm_head_weight": "lm_head",
     "lm_head_loss": "loss",
     "lm_head_x_flat": "xF_flat",
+}
+
+
+# Qwen3.5 MoE attention block: Qwen3_5Attention + MoE (replaces SwiGLUMLP)
+QWEN3_5_MOE_ATTN_BLOCK_REMAP: dict[str, str] = {
+    # Inherit norm + attention mappings from Qwen3.5 attention block
+    **{k: v for k, v in QWEN3_5_ATTN_BLOCK_REMAP.items()
+       if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
+    # --- moe (MoEExpertsGated) -> strip moe_ prefix ---
+    "moe_router_weight": "router_weight",
+    "moe_experts_gate_up": "experts_gate_up",
+    "moe_experts_down": "experts_down",
+    "moe_experts_up": "experts_up",
+    "moe_router_logits": "router_logits",
+    "moe_router_probs": "router_probs",
+    "moe_routing_weights": "routing_weights",
+    "moe_routing_indices": "routing_indices",
+    "moe_permuted_input": "permuted_input",
+    "moe_scatter_indices": "scatter_indices",
+    "moe_ep_recv_input": "ep_recv_input",
+    "moe_ep_recv_scatter": "ep_recv_scatter",
+    "moe_expert_gate_up": "expert_gate_up",
+    "moe_expert_act": "expert_act",
+    "moe_expert_down": "expert_down",
+    "moe_ep_combined": "ep_combined",
+    # shared_expert: prefixed names are already canonical
+    # shared_expert_gate_proj: the sigmoid gate param
+}
+
+# Qwen3.5 MoE linear block: GatedDeltaNet + MoE (replaces SwiGLUMLP)
+QWEN3_5_MOE_LINEAR_BLOCK_REMAP: dict[str, str] = {
+    # Inherit norm + linear attention mappings from Qwen3.5 linear block
+    **{k: v for k, v in QWEN3_5_LINEAR_BLOCK_REMAP.items()
+       if k.startswith(("attn_norm_", "mixer_", "mlp_norm_"))},
+    # --- moe (MoEExpertsGated) -> strip moe_ prefix ---
+    "moe_router_weight": "router_weight",
+    "moe_experts_gate_up": "experts_gate_up",
+    "moe_experts_down": "experts_down",
+    "moe_experts_up": "experts_up",
+    "moe_router_logits": "router_logits",
+    "moe_router_probs": "router_probs",
+    "moe_routing_weights": "routing_weights",
+    "moe_routing_indices": "routing_indices",
+    "moe_permuted_input": "permuted_input",
+    "moe_scatter_indices": "scatter_indices",
+    "moe_ep_recv_input": "ep_recv_input",
+    "moe_ep_recv_scatter": "ep_recv_scatter",
+    "moe_expert_gate_up": "expert_gate_up",
+    "moe_expert_act": "expert_act",
+    "moe_expert_down": "expert_down",
+    "moe_ep_combined": "ep_combined",
+    # shared_expert: prefixed names are already canonical
+    # shared_expert_gate_proj: the sigmoid gate param
 }
 
 

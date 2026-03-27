@@ -75,33 +75,40 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         initial_state = &resolve_tensor(op.inputs[5]);
     }
 
-    // Allocate outputs
-    Tensor* out_ptr = nullptr;
+    // Allocate outputs.
+    // IMPORTANT: Do NOT store pointers into mTemps — subsequent push_back() calls
+    // can reallocate the vector, invalidating any prior pointers. Instead, allocate
+    // all temp tensors first, then take stable pointers after all push_backs.
+    Tensor out_val;
+    bool out_is_ref = false;
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
         if (out_ref.DType == v.DType && tensor_shape_matches(out_ref, B, T, H, V)) {
-            out_ptr = &out_ref;
+            out_val = out_ref;
+            out_is_ref = true;
         }
     }
-    if (!out_ptr) {
-        Tensor out_t = mRunState.temp_alloc(v.DType, {B, T, H, V}, "gated_delta_rule_output");
-        mTemps.push_back(out_t);
-        out_ptr = &mTemps.back();
+    if (!out_is_ref) {
+        out_val = mRunState.temp_alloc(v.DType, {B, T, H, V}, "gated_delta_rule_output");
+        mTemps.push_back(out_val);
     }
 
-    Tensor* final_state_ptr = nullptr;
+    Tensor state_val;
+    bool state_is_ref = false;
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         Tensor& state_ref = ensure_output_tensor(op.outputs[1]);
         if (state_ref.DType == ETensorDType::FP32 &&
             tensor_shape_matches(state_ref, B, H, K, V)) {
-            final_state_ptr = &state_ref;
+            state_val = state_ref;
+            state_is_ref = true;
         }
     }
-    if (!final_state_ptr) {
-        Tensor state_t = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_final_state");
-        mTemps.push_back(state_t);
-        final_state_ptr = &mTemps.back();
+    if (!state_is_ref) {
+        state_val = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_final_state");
+        mTemps.push_back(state_val);
     }
+    Tensor* out_ptr = &out_val;
+    Tensor* final_state_ptr = &state_val;
 
     float scale = op.attrs.delta_rule_scale;
     if (!(scale > 0.0f)) {

@@ -442,6 +442,13 @@ void swiglu_forward_impl(floatX* out, const floatX* inp, float* abs_max_ptr, int
         throw std::runtime_error("swiglu_forward: input too large");
     }
 
+    // Zero-element case: MoE+EP can produce 0 routed tokens for some experts.
+    if (B * T * C == 0) {
+        if (abs_max_ptr)
+            CUDA_CHECK(cudaMemsetAsync(abs_max_ptr, 0, sizeof(float), stream));
+        return;
+    }
+
     using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
     if (abs_max_ptr)
         CUDA_CHECK(cudaMemsetAsync(abs_max_ptr, 0, sizeof(float), stream));
@@ -540,6 +547,13 @@ template<typename floatX>
 void swiglu_backward_impl(floatX* dinp, const floatX* dout, const floatX* inp, float* abs_max, int B, int T, int C, cudaStream_t stream) {
     if (2ll*B*T*C >= std::numeric_limits<int>::max()) {
         throw std::runtime_error("swiglu_backward: output too large");
+    }
+
+    // Zero-element case: MoE+EP can produce 0 routed tokens for some experts.
+    if (B * T * C == 0) {
+        if (abs_max)
+            CUDA_CHECK(cudaMemsetAsync(abs_max, 0, sizeof(float), stream));
+        return;
     }
 
     using x128 = GenericVector<floatX, 16/sizeof(floatX)>;

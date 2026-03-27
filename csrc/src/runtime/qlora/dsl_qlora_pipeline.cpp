@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// DslQLoRAPipeline: Unified weight loading + quantization pipeline.
+// DslQLoRAPipeline: Unified weight loading + quantization pipeline. 
 
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 
@@ -39,8 +39,14 @@ size_t spec_num_elements(const WeightLoadSpec& spec) {
 }
 
 /// Check if a weight spec represents a 3D (expert-batched) weight.
+/// Must also match known expert weight name patterns to avoid false positives
+/// on other 3D weights (e.g., conv1d weights in hybrid linear-attention layers).
 bool is_expert_weight(const WeightLoadSpec& spec) {
-    return spec.shape.size() >= 3;
+    if (spec.shape.size() < 3) return false;
+    const auto& n = spec.name;
+    return n.find("experts") != std::string::npos ||
+           n.find("expert_gate_up") != std::string::npos ||
+           n.find("expert_down") != std::string::npos;
 }
 
 const SafeTensorEntry* try_find_entry(const SafeTensorsReader& reader, std::string_view name) {

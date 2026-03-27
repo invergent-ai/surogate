@@ -784,10 +784,17 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     config.ep_rank = (options.EPSize > 1) ? (shard_idx % options.EPSize) : 0;
     config.ep_size = options.EPSize;
 
-    // Adjust expert weight specs to local dimensions when EP is active
+    // Adjust expert weight specs to local dimensions when EP is active.
+    // Only slice actual expert weights (name contains "experts"), not other 3D
+    // weights like conv1d in linear attention layers.
+    auto is_expert_name = [](const std::string& n) {
+        return n.find("experts") != std::string::npos ||
+               n.find("expert_gate_up") != std::string::npos ||
+               n.find("expert_down") != std::string::npos;
+    };
     if (config.ep_size > 1) {
         for (auto& spec : config.weight_specs) {
-            if (spec.shape.size() < 3) continue;  // Not an expert weight
+            if (spec.shape.size() < 3 || !is_expert_name(spec.name)) continue;
             const int E = static_cast<int>(spec.shape[0]);
             const int local_E = E / config.ep_size;
             spec.shape[0] = local_E;

@@ -365,12 +365,12 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     }
 
     if (architecture == "qwen2" || architecture == "qwen3" ||
-        architecture == "qwen3_moe" || architecture == "qwen3_vl") {
+        architecture == "qwen3_moe" || architecture == "qwen3_vl" || architecture == "qwen3_vl_moe") {
         // Qwen2/3 family: single-digit number matching
         impl.pre_tokenizer_regex = {
             "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         };
-    } else if (architecture == "qwen3_5") {
+    } else if (architecture == "qwen3_5" || architecture == "qwen3_5_moe") {
         // Qwen3.5: includes \p{M} (accent marks) in letter matching
         impl.pre_tokenizer_regex = {
             "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",

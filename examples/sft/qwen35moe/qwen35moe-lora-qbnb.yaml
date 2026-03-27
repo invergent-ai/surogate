@@ -1,11 +1,11 @@
-model: nvidia/Qwen3-30B-A3B-NVFP4
-output_dir: ./output_moe
+model: Qwen/Qwen3.5-35B-A3B
+output_dir: ./output_35_moe
 
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 
-gpus: 4
-ep_size: 4
+gpus: 1
+ep_size: 1
 ep_load_balance_threshold: 1.0
 
 sample_packing: true
@@ -24,6 +24,7 @@ lora_rank: 16
 lora_alpha: 32
 lora_dtype: bf16
 
+qlora_bnb: true
 qlora_offload_experts: true
 
 lora_target_modules:
