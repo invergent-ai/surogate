@@ -29,7 +29,10 @@
         "useKeyWithClickEvents": "off",
         "noLabelWithoutControl": "off"
       },
-      "complexity": { "all": true },
+      "complexity": { 
+        "all": true,
+        "useLiteralKeys": "off"
+      },
       "correctness": { 
         "all": true, 
         "useImportExtensions": "off",
@@ -41,7 +44,11 @@
         "all": true,
         "useNamingConvention": { "options": { "strictCase": false } }
       },
-      "suspicious": { "all": true, "noReactSpecificProps": "off" }
+      "suspicious": { 
+        "all": true, 
+        "noReactSpecificProps": "off",
+        "noExplicitAny": "off"
+       }
     }
   },
   "overrides": [

@@ -12,6 +12,8 @@ import type { RepoType } from "./hub-data";
 import { CreateRepoDialog } from "./create-repo-dialog";
 import { ImportDialog } from "./import-dialog";
 import { Database, GitBranch, Clock, Download, LayoutGrid, Loader2, Plus } from "lucide-react";
+import { useAppStore } from "@/stores/app-store";
+import { spawnTask } from "@/api/tasks";
 
 export function HubPage() {
   const navigate = useNavigate();
@@ -21,6 +23,8 @@ export function HubPage() {
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  const addTask = useAppStore((s) => s.addTask);
 
   useEffect(() => {
     void fetchRepositories();
@@ -165,9 +169,27 @@ export function HubPage() {
       <ImportDialog
         open={showImport}
         onClose={() => setShowImport(false)}
-        onImport={(params) => {
-          console.log("Import:", params);
+        onImport={async (params) => {
           setShowImport(false);
+          const taskType = params.type === "model" ? "import_model" : "import_dataset";
+          const repoId = params.repoId.replace("/", "-");
+          try {
+            const task = await spawnTask({
+              task_type: taskType,
+              name: `Import ${params.repoId}`,
+              project_id: activeProjectId ?? "",
+              params: {
+                hf_repo_id: params.repoId,
+                lakefs_repo_id: repoId,
+                lakefs_branch: "main",
+                ...(params.token ? { hf_token: params.token } : {}),
+                ...(params.subset ? { hf_dataset_subset: params.subset } : {}),
+              },
+            });
+            addTask(task);
+          } catch (e) {
+            console.error("Failed to start import task:", e);
+          }
         }}
       />
 

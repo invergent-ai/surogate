@@ -1,6 +1,7 @@
 """
 Main FastAPI application for Surogate
 """
+import asyncio
 import os
 import sys
 from pathlib import Path as _Path
@@ -25,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from pathlib import Path
 
-from routes import auth_router, project_router, hub_router
+from routes import auth_router, project_router, hub_router, compute_router, tasks_router
 
 logger = get_logger()
 
@@ -45,6 +46,16 @@ async def lifespan(app: FastAPI):
         await seed_lakefs_user("surogate", session, config)
         
     logger.info(f"Database ready: {config.database_url}")
+
+    from surogate.core.compute import init_skypilot
+    await asyncio.to_thread(init_skypilot)
+
+    from surogate.core.compute.local_tasks import LocalTaskManager
+    task_manager = LocalTaskManager(config)
+    async with factory() as session:
+        await task_manager.reap(session)
+    app.state.task_manager = task_manager
+
     yield
     await engine.dispose()
 
@@ -71,6 +82,8 @@ app.add_middleware(
 app.include_router(auth_router, prefix = "/api/auth", tags = ["auth"])
 app.include_router(project_router, prefix = "/api/projects", tags = ["projects"])
 app.include_router(hub_router, prefix = "/api/hub", tags = ["hub"])
+app.include_router(compute_router, prefix = "/api/compute", tags = ["compute"])
+app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 
 
 # ============ Health and System Endpoints ============

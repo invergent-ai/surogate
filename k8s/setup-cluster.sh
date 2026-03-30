@@ -150,12 +150,12 @@ EOF
 
 install_lakefs() {
     "$KUBECTL" create namespace lakefs
-    "$KUBECTL" apply -f ./lakefs/volume.yml
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/lakefs/volume.yml"
 
     local rendered_values
-    rendered_values=$(envsubst < ./lakefs/values.yml)
+    rendered_values=$(envsubst < "${SCRIPT_DIR}/lakefs/values.yml")
     "$HELM" install lakefs lakefs/lakefs -n lakefs -f - <<< "$rendered_values"
-    "$KUBECTL" apply -f ./lakefs/s3-service.yml
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/lakefs/s3-service.yml"
 }
 
 create_server_config() {
