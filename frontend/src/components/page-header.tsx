@@ -3,9 +3,11 @@
 //
 import type { ReactNode } from "react";
 import { Settings, Sun, Moon, LogOut } from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
 import { useTheme } from "@/hooks/use-theme";
 import { logout } from "@/api/auth";
 import { ProjectSelector } from "@/components/project-selector";
+import { useAppStore } from "@/stores/app-store";
 
 interface PageHeaderProps {
   title: string;
@@ -14,6 +16,10 @@ interface PageHeaderProps {
 
 export function PageHeader({ title, subtitle }: PageHeaderProps) {
   const { isDark, toggle } = useTheme();
+  const navigate = useNavigate();
+  const hasActiveTasks = useAppStore((s) =>
+    s.tasks.some((t) => t.status === "pending" || t.status === "running"),
+  );
 
   return (
     <header className="px-7 py-3 border-b border-line flex items-center justify-between bg-card sticky top-0 z-5">
@@ -26,6 +32,16 @@ export function PageHeader({ title, subtitle }: PageHeaderProps) {
         )}
       </div>
       <div className="flex items-center gap-3">
+        {hasActiveTasks && (
+          <button
+            type="button"
+            onClick={() => navigate({ to: "/studio/compute/workload-queue" })}
+            className="relative flex size-2.5 cursor-pointer bg-transparent border-none p-0"
+          >
+            <span className="absolute inline-flex size-full animate-ping rounded-full bg-green-500 opacity-75" />
+            <span className="relative inline-flex size-2.5 rounded-full bg-green-500" />
+          </button>
+        )}
         <ProjectSelector />
         <div className="w-px h-5 bg-line" />
         <button

@@ -1,23 +1,35 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { PageHeader } from "@/components/page-header";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Cloud, Plus } from "lucide-react";
-import { OverviewTab } from "./overview-tab";
-import { ClusterNodesTab } from "./cluster-nodes-tab";
-import { CloudTab } from "./cloud-tab";
-import { WorkloadQueueTab } from "./workload-queue-tab";
-import { CostsTab } from "./costs-tab";
-import { PoliciesTab } from "./policies-tab";
 import { LOCAL_NODES, CLOUD_INSTANCES } from "./compute-data";
 
+const TAB_ROUTES: Record<string, string> = {
+  overview: "/studio/compute",
+  nodes: "/studio/compute/cluster-nodes",
+  cloud: "/studio/compute/cloud",
+  queue: "/studio/compute/workload-queue",
+  costs: "/studio/compute/costs",
+  policies: "/studio/compute/policies",
+};
+
+const ROUTE_TO_TAB = Object.fromEntries(
+  Object.entries(TAB_ROUTES).map(([k, v]) => [v, k]),
+);
+
 export function ComputePage() {
+  const { pathname } = useLocation();
+  const navigate = useNavigate();
+  const activeTab = ROUTE_TO_TAB[pathname.replace(/\/$/, "")] ?? "overview";
+
   const usedGpu = LOCAL_NODES.reduce((s, n) => s + (n.gpu?.used || 0), 0);
   const totalGpu = LOCAL_NODES.reduce((s, n) => s + (n.gpu?.count || 0), 0);
-  const runningCloud = CLOUD_INSTANCES.filter(c => c.status === "running").length;
-  const cloudCost = CLOUD_INSTANCES.filter(c => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
+  const runningCloud = CLOUD_INSTANCES.filter((c) => c.status === "running").length;
+  const cloudCost = CLOUD_INSTANCES.filter((c) => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-background">
@@ -26,7 +38,7 @@ export function ComputePage() {
         subtitle={`${usedGpu}/${totalGpu} local GPUs · ${runningCloud} cloud instances · $${cloudCost.toFixed(0)}/hr cloud`}
       />
 
-      <Tabs defaultValue="overview" className="flex-1 flex flex-col overflow-hidden">
+      <Tabs value={activeTab} onValueChange={(v) => navigate({ to: TAB_ROUTES[v] })} className="flex-1 flex flex-col overflow-hidden">
         <div className="px-7 border-b border-line bg-card shrink-0 flex items-center justify-between">
           <TabsList variant="line">
             <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -49,12 +61,7 @@ export function ComputePage() {
         </div>
 
         <div className="flex-1 overflow-y-auto px-7 py-5 pb-10">
-          <TabsContent value="overview"><OverviewTab /></TabsContent>
-          <TabsContent value="nodes"><ClusterNodesTab /></TabsContent>
-          <TabsContent value="cloud"><CloudTab /></TabsContent>
-          <TabsContent value="queue"><WorkloadQueueTab /></TabsContent>
-          <TabsContent value="costs"><CostsTab /></TabsContent>
-          <TabsContent value="policies"><PoliciesTab /></TabsContent>
+          <Outlet />
         </div>
       </Tabs>
     </div>

@@ -37,6 +37,42 @@ const ComputePage = lazy(() =>
   })),
 );
 
+const OverviewTab = lazy(() =>
+  import("@/features/compute/overview-tab").then((m) => ({
+    default: m.OverviewTab,
+  })),
+);
+
+const ClusterNodesTab = lazy(() =>
+  import("@/features/compute/cluster-nodes-tab").then((m) => ({
+    default: m.ClusterNodesTab,
+  })),
+);
+
+const CloudTab = lazy(() =>
+  import("@/features/compute/cloud-tab").then((m) => ({
+    default: m.CloudTab,
+  })),
+);
+
+const WorkloadQueueTab = lazy(() =>
+  import("@/features/compute/workload-queue-tab").then((m) => ({
+    default: m.WorkloadQueueTab,
+  })),
+);
+
+const CostsTab = lazy(() =>
+  import("@/features/compute/costs-tab").then((m) => ({
+    default: m.CostsTab,
+  })),
+);
+
+const PoliciesTab = lazy(() =>
+  import("@/features/compute/policies-tab").then((m) => ({
+    default: m.PoliciesTab,
+  })),
+);
+
 const MonitoringPage = lazy(() =>
   import("@/features/monitoring/monitoring-page").then((m) => ({
     default: m.MonitoringPage,
@@ -125,6 +161,42 @@ export const computeRoute = createRoute({
   getParentRoute: () => Route,
   path: "/compute",
   component: ComputePage,
+});
+
+export const computeIndexRoute = createRoute({
+  getParentRoute: () => computeRoute,
+  path: "/",
+  component: OverviewTab,
+});
+
+export const computeClusterNodesRoute = createRoute({
+  getParentRoute: () => computeRoute,
+  path: "/cluster-nodes",
+  component: ClusterNodesTab,
+});
+
+export const computeCloudRoute = createRoute({
+  getParentRoute: () => computeRoute,
+  path: "/cloud",
+  component: CloudTab,
+});
+
+export const computeWorkloadQueueRoute = createRoute({
+  getParentRoute: () => computeRoute,
+  path: "/workload-queue",
+  component: WorkloadQueueTab,
+});
+
+export const computeCostsRoute = createRoute({
+  getParentRoute: () => computeRoute,
+  path: "/costs",
+  component: CostsTab,
+});
+
+export const computePoliciesRoute = createRoute({
+  getParentRoute: () => computeRoute,
+  path: "/policies",
+  component: PoliciesTab,
 });
 
 export const monitoringRoute = createRoute({

@@ -56,7 +56,16 @@ export function WorkloadQueueTab() {
 
   const allItems = useMemo<ExtendedWorkload[]>(() => {
     const localTaskItems = tasks.map(taskToWorkloadItem);
-    return [...WORKLOAD_QUEUE, ...localTaskItems];
+    const items = [...WORKLOAD_QUEUE, ...localTaskItems];
+    items.sort((a, b) => {
+      const aActive = a.status === "running" || a.status === "pending" ? 1 : 0;
+      const bActive = b.status === "running" || b.status === "pending" ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      const aTime = a.startedAt ? new Date(a.startedAt).getTime() : 0;
+      const bTime = b.startedAt ? new Date(b.startedAt).getTime() : 0;
+      return bTime - aTime;
+    });
+    return items;
   }, [tasks]);
 
   const filtered = useMemo(
