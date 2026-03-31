@@ -14,7 +14,7 @@ def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
     """HF mappings for Qwen3.5 MoE experts (pre-stacked 3D format).
 
     Qwen3.5 MoE stores expert weights as stacked 3D tensors:
-      - experts.gate_up_proj: [E, 2*M, C]
+      - experts.gate_up_proj: [E, 2*M, C] (HF order is [gate | up])
       - experts.down_proj:    [E, C, M]
     Unlike Qwen3 MoE which stores per-expert separate weights.
     """

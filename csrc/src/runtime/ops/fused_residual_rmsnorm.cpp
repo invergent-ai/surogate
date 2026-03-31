@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,10 +20,47 @@
 #include "runtime/dsl/graph_executor_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
 namespace dsl {
+
+namespace {
+bool contains_ci(std::string_view haystack, std::string_view needle) {
+    std::string h(haystack);
+    std::string n(needle);
+    std::transform(h.begin(), h.end(), h.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(n.begin(), n.end(), n.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return h.find(n) != std::string::npos;
+}
+
+bool is_nemotron_model(const modules::ModelConfig& cfg) {
+    return contains_ci(cfg.ModelTypeName, "nemotron") ||
+           contains_ci(cfg.ArchitectureName, "nemotron");
+}
+
+bool is_qwen3_5_model(const modules::ModelConfig& cfg) {
+    return contains_ci(cfg.ModelTypeName, "qwen3_5") ||
+           contains_ci(cfg.ModelTypeName, "qwen3.5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3_5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3.5");
+}
+
+bool tensors_overlap(const Tensor& a, const Tensor& b) {
+    if (!a.Data || !b.Data || a.Device != b.Device) {
+        return false;
+    }
+    const auto a_start = reinterpret_cast<std::uintptr_t>(a.Data);
+    const auto a_end = a_start + a.bytes();
+    const auto b_start = reinterpret_cast<std::uintptr_t>(b.Data);
+    const auto b_end = b_start + b.bytes();
+    return (a_start < b_end) && (b_start < a_end);
+}
+
+}  // namespace
 
 void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     Tensor& residual_in = resolve_tensor(op.inputs[0]);
@@ -92,30 +130,93 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
         throw std::runtime_error(oss.str());
     }
 
-    // During replay, the LN1/hybrid fused_residual_rmsnorm cannot correctly reconstruct
-    // the residual from its components (res_att[K-1] + mlp_down[K-1]) because those live
-    // in shared buffers that contain the last layer's values. Instead, use the correct
-    // per-layer residual from ResidualManager as the residual input, with a zero "input"
-    // so the kernel computes: residual_out = stored_res + 0 = stored_res, y = rmsnorm(stored_res).
-    // This applies to both standard LN1 (dense models) and hybrid norm (Nemotron-H).
-    if (mInReplay && !is_ln2_fwd && fwd_layer_idx >= 0) {
+    auto find_saved_tensor = [&](const std::string& name) -> const Tensor* {
+        if (!mSaved || name.empty()) {
+            return nullptr;
+        }
+        auto it = mSaved->find(name);
+        if (it != mSaved->end() && it->second.Data) {
+            return &it->second;
+        }
+        auto try_alt = [&](std::string alt_name) -> const Tensor* {
+            auto alt_it = mSaved->find(alt_name);
+            if (alt_it != mSaved->end() && alt_it->second.Data) {
+                return &alt_it->second;
+            }
+            return nullptr;
+        };
+        if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".ln1") == 0) {
+            if (const Tensor* alt = try_alt(name.substr(0, name.size() - 4) + ".ln1_flat")) {
+                return alt;
+            }
+        }
+        if (name.size() >= 3 && name.compare(name.size() - 3, 3, ".ln") == 0) {
+            if (const Tensor* alt = try_alt(name.substr(0, name.size() - 3) + ".ln_flat")) {
+                return alt;
+            }
+        }
+        return nullptr;
+    };
+
+    bool handled_replay_exact = false;
+    const bool qwen_ln1_like =
+        is_qwen3_5_model(mConfig) &&
+        (fwd_field == "ln1_weight" || fwd_field == "norm_weight");
+    if (mInReplay && fwd_layer_idx >= 0 && qwen_ln1_like) {
         Tensor& stored_res_ffn = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
-        if (stored_res_ffn.Data) {
-            // Use stored residual as residual_in, zero out input
-            Tensor zero_input = mRunState.temp_alloc(input.DType,
-                std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank), "fused_residual_rmsnorm_zero_input");
-            mTemps.push_back(zero_input);
-            fill_zero(zero_input, mRunState.MainStream);
-            fused_residual_rmsnorm_forward(residual_out, y, rstd, stored_res_ffn, zero_input, weight, nullptr,
-                                           op.attrs.eps, static_cast<int>(mB * mT),
-                                           mConfig.HiddenSize, mRunState.MainStream);
-            return;
+        const Tensor* saved_residual =
+            op.outputs.size() > 0 ? find_saved_tensor(op.outputs[0].name) : nullptr;
+        const Tensor* saved_ln1 =
+            op.outputs.size() > 1 ? find_saved_tensor(op.outputs[1].name) : nullptr;
+        const Tensor* saved_ln1_rstd =
+            op.outputs.size() > 2 ? find_saved_tensor(op.outputs[2].name) : nullptr;
+        const Tensor* exact_residual =
+            (saved_residual && saved_residual->Data) ? saved_residual : &stored_res_ffn;
+        if (exact_residual->Data && saved_ln1 && saved_ln1_rstd) {
+            auto copy_saved = [&](Tensor& dst, const Tensor& src, const char* what) {
+                if (!dst.Data || !src.Data || tensors_overlap(dst, src)) {
+                    return;
+                }
+                if (dst.bytes() != src.bytes() || dst.DType != src.DType) {
+                    throw std::runtime_error(
+                        std::string("fused_residual_rmsnorm replay exact-copy mismatch for ") + what);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(dst.Data, src.Data, dst.bytes(),
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            };
+            copy_saved(residual_out, *exact_residual, "residual_out");
+            copy_saved(y, *saved_ln1, "ln1");
+            copy_saved(rstd, *saved_ln1_rstd, "ln1_rstd");
+            handled_replay_exact = true;
         }
     }
 
-    fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
-                                   op.attrs.eps, static_cast<int>(mB * mT),
-                                   mConfig.HiddenSize, mRunState.MainStream);
+    if (!handled_replay_exact) {
+        // During replay, the LN1/hybrid fused_residual_rmsnorm cannot correctly reconstruct
+        // the residual from its components (res_att[K-1] + mlp_down[K-1]) because those live
+        // in shared buffers that contain the last layer's values. Instead, use the correct
+        // per-layer residual from ResidualManager as the residual input, with a zero "input"
+        // so the kernel computes: residual_out = stored_res + 0 = stored_res, y = rmsnorm(stored_res).
+        // This applies to both standard LN1 (dense models) and hybrid norm (Nemotron-H).
+        if (mInReplay && !is_ln2_fwd && fwd_layer_idx >= 0) {
+            Tensor& stored_res_ffn = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
+            if (stored_res_ffn.Data) {
+                // Use stored residual as residual_in, zero out input
+                Tensor zero_input = mRunState.temp_alloc(input.DType,
+                    std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank), "fused_residual_rmsnorm_zero_input");
+                mTemps.push_back(zero_input);
+                fill_zero(zero_input, mRunState.MainStream);
+                fused_residual_rmsnorm_forward(residual_out, y, rstd, stored_res_ffn, zero_input, weight, nullptr,
+                                               op.attrs.eps, static_cast<int>(mB * mT),
+                                               mConfig.HiddenSize, mRunState.MainStream);
+                return;
+            }
+        }
+
+        fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
+                                       op.attrs.eps, static_cast<int>(mB * mT),
+                                       mConfig.HiddenSize, mRunState.MainStream);
+    }
 
     // Pre-quantize normalized output into FP8 buffer for the downstream matmul.
     // LN1 output → QKV matmul input (fp8_quants.ln1)
@@ -273,6 +374,44 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         d_input_ptr = &ensure_output_tensor(op.outputs[1]);
     }
     Tensor& d_input = *d_input_ptr;
+
+    // If d_residual and d_input alias, rmsnorm_backward() skips its internal
+    // dresidual->dinp copy (it checks pointer equality). In EP runs, these
+    // canonical buffers can be reused across micro-batches, so aliasing here
+    // can accidentally carry stale activation gradients forward. Materialize
+    // a temporary copy to force a fresh overwrite path inside rmsnorm_backward.
+    Tensor d_residual_alias_copy{};
+    if (d_residual_input && d_residual_input->Data != d_input.Data &&
+        tensors_overlap(*d_residual_input, d_input)) {
+        // The same logical gradient can arrive as different contiguous views
+        // (e.g. [B,T,C] vs [BT,C]). The kernel performs a raw D2D copy whenever
+        // source/destination pointers differ, so distinct overlapping buffers must
+        // either be staged through a temp or rejected as invalid.
+        const bool full_span_match =
+            (d_residual_input->bytes() == d_input.bytes()) &&
+            (d_residual_input->DType == d_input.DType);
+        if (!full_span_match) {
+            std::ostringstream oss;
+            oss << "fused_residual_rmsnorm_backward: overlapping d_residual/d_input with "
+                << "mismatched spans or dtypes is unsafe (d_residual bytes="
+                << d_residual_input->bytes() << ", d_input bytes=" << d_input.bytes()
+                << ", d_residual dtype=" << dtype_to_str(d_residual_input->DType)
+                << ", d_input dtype=" << dtype_to_str(d_input.DType) << ")";
+            throw std::runtime_error(oss.str());
+        }
+        d_residual_alias_copy = mRunState.temp_alloc(
+            d_input.DType,
+            std::vector<long>(d_input.Sizes.begin(), d_input.Sizes.begin() + d_input.Rank),
+            "fused_residual_rmsnorm_d_residual_alias_copy");
+        mTemps.push_back(d_residual_alias_copy);
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_residual_alias_copy.Data,
+            d_residual_input->Data,
+            d_input.bytes(),
+            cudaMemcpyDeviceToDevice,
+            mRunState.MainStream));
+        d_residual_input = &d_residual_alias_copy;
+    }
 
     // d_weight may be nullptr if weight is frozen
     Tensor dummy_weight{};

@@ -327,6 +327,13 @@ void GenericQLoRAProvider::build_layer_offload_map() {
         return;
     }
 
+    // Offload groups can be present in weight metadata even when runtime
+    // offloading is disabled. Only report "has_offloading" when an actual
+    // offload manager is active; EP logic relies on this signal.
+    if (!mWeightMgr->offload_manager()) {
+        return;
+    }
+
     for (const auto& name : mWeightMgr->weight_names()) {
         int offload_group = mWeightMgr->get_offload_group(name);
         if (offload_group < 0) {

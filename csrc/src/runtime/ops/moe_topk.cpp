@@ -1,14 +1,10 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include <vector>
-#include <cstdlib>
-#include <cmath>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
-#include "utilities/dtype.h"
 
 namespace dsl {
 
@@ -40,7 +36,6 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     const float scaling_factor = op.attrs.scaling_factor;
     const float rounding_scale = op.attrs.topk_rounding_scale;
     const bool sort_by_index = op.attrs.topk_sort_by_index;
-
     // MoE topk outputs have dynamic shapes depending on num_tokens and top_k.
     // The compiled graph may have empty shapes for these intermediates, so we
     // allocate directly with the correct dimensions.
@@ -107,7 +102,6 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
     const bool normalize = op.attrs.normalize_weights;
     const bool softmax = op.attrs.topk_softmax;
     const float scaling_factor = op.attrs.scaling_factor;
-
     // If scaling_factor != 1.0, scale d_routing_weights by the factor before backward.
     // Forward was: output = topk(probs) * sf, so d_topk = d_output * sf
     Tensor* d_weights_ptr = &d_routing_weights;

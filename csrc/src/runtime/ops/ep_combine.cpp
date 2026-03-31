@@ -10,10 +10,12 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include <algorithm>
-#include <chrono>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
+
+#include <cuda_bf16.h>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
@@ -22,21 +24,7 @@
 
 namespace dsl {
 
-// Defined in ep_dispatch.cpp
-struct EpTimers {
-    double a2a_exchange_ms, a2a_hidden_ms, repermute_ms, offsets_sync_ms, weight_xfer_ms;
-    double total_dispatch_ms, total_combine_ms, total_dispatch_bwd_ms, total_combine_bwd_ms;
-    int call_count;
-    void print_and_reset();
-};
-extern thread_local EpTimers g_ep_timers;
-static inline double combine_ms_since(std::chrono::steady_clock::time_point start) {
-    return std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start).count();
-}
-
 void CompiledExecutor::dispatch_ep_combine(const CompiledOp& op) {
-    auto _t0_combine = std::chrono::steady_clock::now();
     Tensor& expert_output = resolve_tensor(op.inputs[0]);  // [total_recv, C] sorted by local expert
 
     const int ep_size = op.attrs.ep_size;
@@ -56,8 +44,9 @@ void CompiledExecutor::dispatch_ep_combine(const CompiledOp& op) {
         std::string field;
         parse_block_param(name, layer_idx, field);
     }
+    const int ep_key = ep_state_key(layer_idx);
 
-    auto it = mEpStates.find(layer_idx);
+    auto it = mEpStates.find(ep_key);
     if (it == mEpStates.end()) {
         throw std::runtime_error(
             "ep_combine: no EP state found for layer " + std::to_string(layer_idx));
@@ -89,15 +78,15 @@ void CompiledExecutor::dispatch_ep_combine(const CompiledOp& op) {
     }
 
     // ---- 2. Reverse A2A: send results back to originating GPUs ----
-    // Use shared persistent buffer (off-stack, shared across layers — only one layer at a time)
+    // Use per-layer persistent buffer: this activation is needed by backward.
     const size_t combined_need = static_cast<size_t>(ep_state.total_send) * hidden_size * elem_sz;
-    if (mSharedEpCombinedBytes < combined_need) {
-        // Release old buffer to pool (not cudaFree) — stored tensors may still reference it
-        if (mSharedEpCombinedGpu) mEpRetiredBufs.push_back({mSharedEpCombinedGpu, mSharedEpCombinedBytes});
-        CUDA_CHECK(cudaMalloc(&mSharedEpCombinedGpu, combined_need));
-        mSharedEpCombinedBytes = combined_need;
+    auto& ep_state_mut = mEpStates[ep_key];
+    if (ep_state_mut.combined_bytes < combined_need) {
+        if (ep_state_mut.combined_gpu) CUDA_CHECK(cudaFree(ep_state_mut.combined_gpu));
+        CUDA_CHECK(cudaMalloc(&ep_state_mut.combined_gpu, combined_need));
+        ep_state_mut.combined_bytes = combined_need;
     }
-    Tensor combined = make_raw_tensor(mSharedEpCombinedGpu, expert_output.DType,
+    Tensor combined = make_raw_tensor(ep_state_mut.combined_gpu, expert_output.DType,
         {static_cast<long>(ep_state.total_send), static_cast<long>(hidden_size)},
         expert_output.Device);
 
@@ -120,6 +109,10 @@ void CompiledExecutor::dispatch_ep_combine(const CompiledOp& op) {
     // Forward ep_dispatch reordered the send buffer: send_buf[i] = permuted_input[send_order[i]]
     // After reverse A2A, combined[i] = result for send_buf[i] = result for permuted_input[send_order[i]]
     // We need output[j] = result for permuted_input[j], so: output[j] = combined[inverse_order[j]]
+    const bool sync_combine_fwd_out =
+        (std::getenv("SUROGATE_EP_SYNC_COMBINE_FWD_OUT") != nullptr) &&
+        mComm && (mComm->dp_size() == 1);
+
     if (ep_state.llep_send_reorder_gpu) {
         const int N = ep_state.total_send;
         std::vector<int> send_order_host(N);
@@ -137,14 +130,13 @@ void CompiledExecutor::dispatch_ep_combine(const CompiledOp& op) {
         CUDA_CHECK(cudaMemcpyAsync(inv_gpu_ptr, inverse_order.data(),
                                     N * sizeof(int), cudaMemcpyHostToDevice, mRunState.MainStream));
 
-        // Allocate output in separate shared persistent buffer (NOT sorted_recv,
-        // which is used by ep_dispatch and may still be referenced by gradient checkpointing)
-        if (mSharedEpLlepCombineBytes < combined_need) {
-            if (mSharedEpLlepCombineGpu) mEpRetiredBufs.push_back({mSharedEpLlepCombineGpu, mSharedEpLlepCombineBytes});
-            CUDA_CHECK(cudaMalloc(&mSharedEpLlepCombineGpu, combined_need));
-            mSharedEpLlepCombineBytes = combined_need;
+        // Allocate per-layer persistent output for LLEP reorder.
+        if (ep_state_mut.llep_combined_bytes < combined_need) {
+            if (ep_state_mut.llep_combined_gpu) CUDA_CHECK(cudaFree(ep_state_mut.llep_combined_gpu));
+            CUDA_CHECK(cudaMalloc(&ep_state_mut.llep_combined_gpu, combined_need));
+            ep_state_mut.llep_combined_bytes = combined_need;
         }
-        Tensor reordered = make_raw_tensor(mSharedEpLlepCombineGpu, expert_output.DType,
+        Tensor reordered = make_raw_tensor(ep_state_mut.llep_combined_gpu, expert_output.DType,
             {static_cast<long>(N), static_cast<long>(hidden_size)}, expert_output.Device);
 
         if (expert_output.DType == ETensorDType::BF16) {
@@ -158,16 +150,26 @@ void CompiledExecutor::dispatch_ep_combine(const CompiledOp& op) {
         }
 
         ep_buf_release(inv_gpu_ptr, inv_gpu_bytes);
+        if (sync_combine_fwd_out) {
+            // In EP-only setups (dp_size=1), all EP ranks should reconstruct
+            // the same combined activation. This optional sync can suppress
+            // cross-rank drift in sensitive recurrent stacks.
+            mComm->all_reduce_avg(reordered, mRunState.MainStream);
+        }
         store_tensor(op.outputs[0], reordered);
     } else {
         // ---- 3. Store output ----
+        if (sync_combine_fwd_out) {
+            // In EP-only setups (dp_size=1), all EP ranks should reconstruct
+            // the same combined activation. This optional sync can suppress
+            // cross-rank drift in sensitive recurrent stacks.
+            mComm->all_reduce_avg(combined, mRunState.MainStream);
+        }
         store_tensor(op.outputs[0], combined);
     }
-    g_ep_timers.total_combine_ms += combine_ms_since(_t0_combine);
 }
 
 void CompiledExecutor::dispatch_ep_combine_backward(const CompiledOp& op) {
-    auto _t0_combine_bwd = std::chrono::steady_clock::now();
     // Backward of ep_combine: A2A + re-sort (same as ep_dispatch forward direction)
     // Input: d_combined [total_send, C]
     // Output: d_expert_output [total_recv, C] in local expert order
@@ -191,13 +193,62 @@ void CompiledExecutor::dispatch_ep_combine_backward(const CompiledOp& op) {
         std::string field;
         parse_block_param(name, layer_idx, field);
     }
-
-    auto it = mEpStates.find(layer_idx);
+    const int input_total_send = static_cast<int>(d_combined.Sizes[0]);
+    const int ep_key_default = ep_state_key(layer_idx);
+    int ep_key_selected = ep_key_default;
+    auto it = mEpStates.find(ep_key_default);
+    if (mOptions.EPSize > 1 && layer_idx >= 0) {
+        const int ep_key_r0 = (layer_idx << 1);
+        const int ep_key_r1 = ep_key_r0 | 1;
+        auto it_r0 = mEpStates.find(ep_key_r0);
+        auto it_r1 = mEpStates.find(ep_key_r1);
+        // Backward usually consumes replay activations when recompute is enabled.
+        // Prefer replay EP state when present, but keep shape sanity checks.
+        if (it_r1 != mEpStates.end() && it_r1->second.total_send == input_total_send) {
+            it = it_r1;
+            ep_key_selected = ep_key_r1;
+        } else if (it_r0 != mEpStates.end() && it_r0->second.total_send == input_total_send) {
+            it = it_r0;
+            ep_key_selected = ep_key_r0;
+        } else if (it_r1 != mEpStates.end()) {
+            it = it_r1;
+            ep_key_selected = ep_key_r1;
+        } else if (it_r0 != mEpStates.end()) {
+            it = it_r0;
+            ep_key_selected = ep_key_r0;
+        }
+    }
     if (it == mEpStates.end()) {
         throw std::runtime_error(
             "ep_combine_backward: no EP state for layer " + std::to_string(layer_idx));
     }
     const auto& ep_state = it->second;
+    auto& ep_state_mut = mEpStates[ep_key_selected];
+    if (ep_state.total_send != input_total_send) {
+        std::ostringstream oss;
+        oss << "ep_combine_backward: EP state/input mismatch at layer " << layer_idx
+            << " (selected_key=" << ep_key_selected
+            << ", state.total_send=" << ep_state.total_send
+            << ", input.rows=" << input_total_send << ")";
+        throw std::runtime_error(oss.str());
+    }
+    if (mComm && (mComm->dp_size() == 1) && (ep_size > 1)) {
+        // In replicated-input EP mode (dp_size=1), each EP rank contributes the same
+        // token gradients. Scale once here to keep expert-path gradient magnitude
+        // comparable to EP=1.
+        const float inv_ep = 1.0f / static_cast<float>(ep_size);
+        if (d_combined.DType == ETensorDType::BF16) {
+            moe_scale_forward(d_combined.get<nv_bfloat16>(),
+                              d_combined.get<nv_bfloat16>(),
+                              inv_ep, static_cast<int>(d_combined.nelem()),
+                              mRunState.MainStream);
+        } else {
+            moe_scale_forward(d_combined.get<float>(),
+                              d_combined.get<float>(),
+                              inv_ep, static_cast<int>(d_combined.nelem()),
+                              mRunState.MainStream);
+        }
+    }
 
     // ---- 0. If LLEP was active, redo the send reorder on gradients ----
     // Forward: output[j] = combined[inverse_order[j]]
@@ -256,14 +307,15 @@ void CompiledExecutor::dispatch_ep_combine_backward(const CompiledOp& op) {
     }
 
     // ---- 2. Re-sort by local expert (same permutation as dispatch forward) ----
-    // Use shared persistent buffer (off-stack, shared across layers — only one layer at a time)
+    // Use per-layer persistent output: shared cross-layer buffers can be overwritten
+    // before this tensor is consumed by downstream backward ops.
     const size_t sorted_need = static_cast<size_t>(ep_state.total_recv) * hidden_size * elem_sz;
-    if (mSharedEpSortedRecvBytes < sorted_need) {
-        if (mSharedEpSortedRecvGpu) mEpRetiredBufs.push_back({mSharedEpSortedRecvGpu, mSharedEpSortedRecvBytes});
-        CUDA_CHECK(cudaMalloc(&mSharedEpSortedRecvGpu, sorted_need));
-        mSharedEpSortedRecvBytes = sorted_need;
+    if (ep_state_mut.combine_bwd_sorted_bytes < sorted_need) {
+        if (ep_state_mut.combine_bwd_sorted_gpu) CUDA_CHECK(cudaFree(ep_state_mut.combine_bwd_sorted_gpu));
+        CUDA_CHECK(cudaMalloc(&ep_state_mut.combine_bwd_sorted_gpu, sorted_need));
+        ep_state_mut.combine_bwd_sorted_bytes = sorted_need;
     }
-    Tensor d_expert_sorted = make_raw_tensor(mSharedEpSortedRecvGpu, d_combined.DType,
+    Tensor d_expert_sorted = make_raw_tensor(ep_state_mut.combine_bwd_sorted_gpu, d_combined.DType,
         {static_cast<long>(ep_state.total_recv), static_cast<long>(hidden_size)},
         d_combined.Device);
 
@@ -285,7 +337,6 @@ void CompiledExecutor::dispatch_ep_combine_backward(const CompiledOp& op) {
     ep_buf_release(d_recv_unsorted_ptr, bwd_unsorted_bytes);
 
     store_tensor(op.outputs[0], d_expert_sorted);
-    g_ep_timers.total_combine_bwd_ms += combine_ms_since(_t0_combine_bwd);
 }
 
 }  // namespace dsl

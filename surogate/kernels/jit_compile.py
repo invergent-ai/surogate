@@ -58,8 +58,14 @@ def _ir_uses_op(ir: dict, op_name: str) -> bool:
 def _extract_gdr_dims(ir: dict) -> tuple[int, int, int]:
     """Extract H, K, V dimensions from the IR for gated delta rule.
 
-    The IR has modules[0].config with linear_num_key_heads, linear_key_head_dim,
-    linear_value_head_dim for Qwen3.5-style models.
+    The IR has modules[0].config with linear_num_key_heads, linear_num_value_heads,
+    linear_key_head_dim, and linear_value_head_dim for Qwen3.5-style models.
+
+    For Qwen3.5/GatedDeltaNet, ``chunk_gated_delta_rule`` runs after ``query`` and
+    ``key`` have been repeated from ``linear_num_key_heads`` to
+    ``linear_num_value_heads``. The Triton kernels therefore need to be compiled
+    for the runtime head count seen by the custom op, which is
+    ``linear_num_value_heads`` when present.
     """
     # The DSL IR stores model config in modules[0].config
     config = {}
@@ -72,8 +78,12 @@ def _extract_gdr_dims(ir: dict) -> tuple[int, int, int]:
     if not config:
         config = ir.get("config", {})
 
-    # Qwen3.5 linear attention dims
-    H = config.get("linear_num_key_heads", 0)
+    # Qwen3.5 linear attention dims. The GDR op consumes repeated q/k heads,
+    # so compile for the runtime head count seen by the op, not the pre-repeat
+    # key-head count.
+    H = config.get("linear_num_value_heads", 0)
+    if H == 0:
+        H = config.get("linear_num_key_heads", 0)
     K = config.get("linear_key_head_dim", 0)
     V = config.get("linear_value_head_dim", 0)
 

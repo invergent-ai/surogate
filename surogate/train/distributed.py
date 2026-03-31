@@ -635,10 +635,6 @@ class NodeTrainer:
         out_tokens = np.empty((total_rows, T), dtype=np.int32)
         pos_ids = np.empty((total_rows, T), dtype=np.int32)
 
-        # MRoPE models (e.g. Qwen3-VL) need multi-plane position IDs.
-        # The DataLoader only produces 1-plane IDs, so let C++ fill them.
-        uses_mrope = self._uses_mrope
-
         if use_full_step_graphs:
             chunk = local_gpus * B
             for micro_step in range(config.gradient_accumulation_steps):
@@ -646,22 +642,15 @@ class NodeTrainer:
                     self._train_loader.advance_epoch()
                 start = micro_step * chunk
                 end = start + chunk
-                if uses_mrope:
-                    self._train_loader.load_batch(in_tokens[start:end], out_tokens[start:end])
-                else:
-                    self._train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+                self._train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
         else:
             # Run gradient accumulation steps
             for micro_step in range(config.gradient_accumulation_steps):
                 if not self._train_loader.has_next():
                     self._train_loader.advance_epoch()
 
-                if uses_mrope:
-                    self._train_loader.load_batch(in_tokens, out_tokens)
-                    self._trainer.step(in_tokens, out_tokens)
-                else:
-                    self._train_loader.load_batch(in_tokens, out_tokens, pos_ids)
-                    self._trainer.step(in_tokens, out_tokens, pos_ids)
+                self._train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                self._trainer.step(in_tokens, out_tokens, pos_ids)
 
         # Optimizer update
         opt_config = _surogate.OptimizerConfig(
@@ -678,10 +667,7 @@ class NodeTrainer:
             normuon_cautious_wd=config.normuon_cautious_wd
         )
         if use_full_step_graphs:
-            if uses_mrope:
-                result = self._trainer.train_step_graphed(in_tokens, out_tokens, opt_config, step + 1)
-            else:
-                result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
+            result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
         else:
             result = self._trainer.update_with_config(opt_config, step + 1)
 
@@ -767,12 +753,8 @@ class NodeTrainer:
         batches = 0
 
         while self._eval_loader.has_next() and (max_steps < 0 or batches < max_steps):
-            if self._uses_mrope:
-                self._eval_loader.load_batch(in_tokens, out_tokens)
-                loss = self._trainer.validate(in_tokens, out_tokens)
-            else:
-                self._eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
-                loss = self._trainer.validate(in_tokens, out_tokens, pos_ids)
+            self._eval_loader.load_batch(in_tokens, out_tokens, pos_ids)
+            loss = self._trainer.validate(in_tokens, out_tokens, pos_ids)
             total_loss += loss
             batches += 1
 

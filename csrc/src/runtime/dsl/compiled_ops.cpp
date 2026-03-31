@@ -9,11 +9,13 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -41,6 +43,10 @@
 #include "utilities/dtype.h"
 
 namespace dsl {
+
+namespace {
+
+}  // namespace
 
 // MoE compact weight information (moved out of anonymous namespace for split files)
 MoeCompactInfo build_moe_compact_info(const int* expert_offsets_dev,
@@ -182,10 +188,6 @@ const int* CompiledExecutor::get_or_sync_moe_host_offsets(int layer_idx,
     CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
     return cached.data();
 }
-
-// Global state for QKV gradient tracking (shared across split op files)
-std::vector<std::byte*> g_qkv_dA_ptr_by_layer;
-std::vector<int> g_qkv_dA_micro_by_layer;
 
 float env_float(const char* name, float fallback) {
     if (!name || !*name) {
@@ -374,6 +376,12 @@ CompiledExecutor::~CompiledExecutor() {
         if (state.recv_reorder_gpu) cudaFree(state.recv_reorder_gpu);
         if (state.llep_send_reorder_gpu) cudaFree(state.llep_send_reorder_gpu);
         if (state.local_scatter_gpu) cudaFree(state.local_scatter_gpu);
+        if (state.sorted_recv_gpu) cudaFree(state.sorted_recv_gpu);
+        if (state.combined_gpu) cudaFree(state.combined_gpu);
+        if (state.llep_combined_gpu) cudaFree(state.llep_combined_gpu);
+        if (state.dispatch_bwd_send_gpu) cudaFree(state.dispatch_bwd_send_gpu);
+        if (state.dispatch_bwd_out_gpu) cudaFree(state.dispatch_bwd_out_gpu);
+        if (state.combine_bwd_sorted_gpu) cudaFree(state.combine_bwd_sorted_gpu);
     }
     mEpStates.clear();
 
@@ -425,6 +433,46 @@ void* CompiledExecutor::ep_buf_acquire(size_t need) {
 void CompiledExecutor::ep_buf_release(void* ptr, size_t bytes) {
     if (ptr && bytes > 0) {
         mEpBufPool.push_back({ptr, bytes});
+    }
+}
+
+void CompiledExecutor::clear_replay_copied_refs() {
+    if (mReplayCopiedBuffers.empty()) {
+        return;
+    }
+
+    auto points_to_replay_copy = [&](const std::byte* data) -> bool {
+        if (!data) {
+            return false;
+        }
+        for (void* ptr : mReplayCopiedBuffers) {
+            if (data == static_cast<const std::byte*>(ptr)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (auto& tensor : mTensors) {
+        if (points_to_replay_copy(tensor.Data)) {
+            tensor = Tensor{};
+        }
+    }
+
+    for (auto it = mNamedTensors.begin(); it != mNamedTensors.end();) {
+        if (points_to_replay_copy(it->second.Data)) {
+            it = mNamedTensors.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (mSaved) {
+        for (auto& [name, tensor] : *mSaved) {
+            if (points_to_replay_copy(tensor.Data)) {
+                tensor.Data = nullptr;
+            }
+        }
     }
 }
 
@@ -636,8 +684,19 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, tensor.Data, bytes,
                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
-        // Update tensor to point to persistent buffer (so backward finds it)
-        tensor.Data = static_cast<std::byte*>(dst_buffer);
+        // Update all authoritative tables to point at the persistent buffer.
+        // If we only patch mTensors, resolve_tensor() can still pick a stale
+        // stack-backed alias from mNamedTensors first.
+        Tensor saved_tensor = tensor;
+        saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
+        tensor = saved_tensor;
+        mNamedTensors[name] = saved_tensor;
+        if (mSaved) {
+            auto saved_it = mSaved->find(name);
+            if (saved_it != mSaved->end() || mSaveSet.find(name) != mSaveSet.end()) {
+                (*mSaved)[name] = saved_tensor;
+            }
+        }
     }
 }
 
@@ -1070,6 +1129,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(
 
             const std::size_t normed_bytes =
                 x_elems * static_cast<std::size_t>(get_dtype_size(x_ref.dtype));
+            ensure_buffer(op.op_id + ".out_fallback", normed_bytes);
             ensure_buffer(op.op_id + ".normed", normed_bytes);
 
             const int groups = op.attrs.n_groups > 0 ? op.attrs.n_groups : 1;
@@ -1102,6 +1162,20 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     // This gate is set by GraphExecutor after validating runtime options + plan.
     const bool recompute_enabled = mRecomputeEnabled;
     const bool forward_replay_active = recompute_enabled && static_cast<bool>(mRecomputeFn);
+    auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+        std::string h(haystack);
+        std::string n(needle);
+        std::transform(h.begin(), h.end(), h.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(n.begin(), n.end(), n.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return h.find(n) != std::string::npos;
+    };
+    const bool is_qwen3_5_model =
+        contains_ci(mConfig.ModelTypeName, "qwen3_5") ||
+        contains_ci(mConfig.ModelTypeName, "qwen3.5") ||
+        contains_ci(mConfig.ArchitectureName, "qwen3_5") ||
+        contains_ci(mConfig.ArchitectureName, "qwen3.5");
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
         if (force_persist) {
@@ -1114,11 +1188,21 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         int layer_idx = -1;
         std::string field;
         if (parse_block_param(tensor_name, layer_idx, field)) {
+            const std::string base_field = strip_ssa_suffix(field);
             // When forward replay is active, ALL block tensors will be regenerated
             if (forward_replay_active) {
+                // Qwen3.5 replay drifts at LN1 if we drop the exact original normalized
+                // activation into metadata-only mode. Keep these tensors persistent so
+                // replay can consume the saved forward values instead of recomputing them.
+                if (is_qwen3_5_model &&
+                    (base_field == "ln1" || base_field == "ln1_flat" ||
+                     base_field == "ln" || base_field == "ln_flat" ||
+                     base_field == "ln1_rstd" || base_field == "ln_rstd")) {
+                    return false;
+                }
                 return true;
             }
-            return mSlotRegistry->will_recompute(strip_ssa_suffix(field), lora_only_mode);
+            return mSlotRegistry->will_recompute(base_field, lora_only_mode);
         }
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
@@ -1260,14 +1344,18 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             (name == "xF_flat" || name == "xF" || name == "ln_final" ||
              name == "ln_final_rstd" || name == "residual_final" || name == "final_residual" ||
              force_lora_hook);
+        const bool prefer_live = prefer_live_tensor(name);
         // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed),
         // unless we are forcing a persistent copy to replace metadata-only entries.
         auto saved_it = mSaved->find(name);
         if (saved_it != mSaved->end()) {
-            if (!force_persist || saved_it->second.Data != nullptr) {
+            // Layer-end replay bookkeeping pre-seeds metadata-only entries for block tensors.
+            // If this tensor should not remain metadata-only, refresh it now with live data.
+            const bool needs_refresh = (saved_it->second.Data == nullptr) &&
+                                       (force_persist || force_persist_name || !prefer_live);
+            if (!needs_refresh) {
                 continue;
             }
-            // Allow refresh when force_persist=true and existing entry is metadata-only.
             mSaved->erase(saved_it);
         }
 
@@ -1289,7 +1377,6 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                                         name.find("router_logits") != std::string::npos ||
                                         name.find("permuted_input") != std::string::npos ||
                                         name.find("expert_") != std::string::npos);
-            const bool prefer_live = prefer_live_tensor(name);
             const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
             save_tensor_with_policy(name, *found_tensor, prefer_live, force_persist || force_persist_name);
             continue;
@@ -1964,6 +2051,20 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                                             const CompiledGraph& fwd_graph,
                                             const modules::ForwardHook* hook) {
     static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
+    auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+        std::string h(haystack);
+        std::string n(needle);
+        std::transform(h.begin(), h.end(), h.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(n.begin(), n.end(), n.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return h.find(n) != std::string::npos;
+    };
+    const bool is_qwen3_5_model =
+        contains_ci(mConfig.ModelTypeName, "qwen3_5") ||
+        contains_ci(mConfig.ModelTypeName, "qwen3.5") ||
+        contains_ci(mConfig.ArchitectureName, "qwen3_5") ||
+        contains_ci(mConfig.ArchitectureName, "qwen3.5");
     if (debug_replay) {
         fprintf(stderr, "[REPLAY] replay_layer_forward layer=%d B=%ld T=%ld\n", layer_idx, B, T);
     }
@@ -1975,6 +2076,10 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
         mHasDeferredReplayCheckpoint = false;
     }
+    // Previous replay copies are no longer needed once we start recomputing the
+    // next lower layer, but any tables still pointing at them must be scrubbed
+    // before freeing or they become dangling saved tensors.
+    clear_replay_copied_refs();
     // Free persistent copies from previous replay (backward has consumed them)
     for (void* ptr : mReplayCopiedBuffers) {
         cudaFreeAsync(ptr, mRunState.MainStream);
@@ -2254,14 +2359,35 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
     }
 
-    // Persist replayed tensors into mSaved — save stack pointers directly (no D2D copy).
-    // The stack will stay live until backward consumes the data.
+    // Persist replayed tensors into mSaved — save live pointers first, then
+    // selectively copy any entries whose backing storage is not stable enough
+    // to survive the replay checkpoint restore / subsequent layer execution.
     if (mSaved && mSaveList) {
+        auto replay_preserve_existing_saved = [&](const std::string& tensor_name) -> bool {
+            if (!is_qwen3_5_model) {
+                return false;
+            }
+            int saved_layer = -1;
+            std::string saved_field;
+            if (!parse_block_param(tensor_name, saved_layer, saved_field) || saved_layer != layer_idx) {
+                return false;
+            }
+            const std::string base = strip_ssa_suffix(saved_field);
+            return base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat" ||
+                   base == "ln1_rstd" || base == "ln_rstd";
+        };
         for (const auto& name : *mSaveList) {
             {
                 int lyr_check = -1;
                 std::string fld_check;
                 if (!parse_block_param(name, lyr_check, fld_check) || lyr_check != layer_idx) continue;
+            }
+
+            if (replay_preserve_existing_saved(name)) {
+                auto existing_it = mSaved->find(name);
+                if (existing_it != mSaved->end() && existing_it->second.Data) {
+                    continue;
+                }
             }
 
             // Try to find the tensor from the replayed forward graph
@@ -2323,10 +2449,61 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     // allocation before backward ops start allocating their temps, preventing
     // stack OOM on memory-hungry backward ops (e.g., gated delta rule).
     if (mSaved) {
+        auto replay_saved_slot_requires_persist = [&](const std::string& tensor_name) -> bool {
+            if (!mSlotRegistry || tensor_name.empty()) {
+                return false;
+            }
+
+            auto requires_persist = [&](const std::string& lookup_name) -> bool {
+                if (auto entry = mSlotRegistry->lookup(lookup_name)) {
+                    return entry->slot == TensorSlot::Mapped ||
+                           entry->memory_hint == ActivationMemoryHint::Shared;
+                }
+                return false;
+            };
+
+            int saved_layer_idx = -1;
+            std::string saved_field;
+            if (parse_block_param(tensor_name, saved_layer_idx, saved_field)) {
+                return requires_persist(strip_ssa_suffix(saved_field));
+            }
+            return requires_persist(strip_ssa_suffix(tensor_name));
+        };
+
+        auto replay_temp_backed = [&](const Tensor& tensor) -> bool {
+            if (!tensor.Data || tensor.bytes() == 0) {
+                return false;
+            }
+            const std::byte* ptr = tensor.Data;
+            for (std::size_t i = replay_temp_mark; i < mTemps.size(); ++i) {
+                const Tensor& tmp = mTemps[i];
+                if (!tmp.Data) {
+                    continue;
+                }
+                const std::size_t tmp_bytes = tmp.bytes();
+                if (tmp_bytes == 0) {
+                    continue;
+                }
+                const std::byte* begin = tmp.Data;
+                const std::byte* end = begin + tmp_bytes;
+                if (ptr >= begin && ptr < end) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         for (auto& [name, tensor] : *mSaved) {
             if (!tensor.Data) continue;
-            if (!mRunState.Stack.owns(tensor.Data)) continue;
-            // This tensor lives on the stack — copy to persistent memory
+            const bool stack_backed = mRunState.Stack.owns(tensor.Data);
+            const bool temp_backed = replay_temp_backed(tensor);
+            const bool slot_requires_persist = replay_saved_slot_requires_persist(name);
+            if (!stack_backed && !temp_backed && !slot_requires_persist) {
+                continue;
+            }
+            // Tensor would be invalidated by replay checkpoint restore / temp rollback,
+            // or it lives in a shared/mapped activation slot that replay can overwrite
+            // before backward consumes the saved value.
             const std::size_t bytes = tensor.bytes();
             if (bytes == 0) continue;
             void* persistent = nullptr;
@@ -2913,6 +3090,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 t = Tensor{};
             }
         }
+        for (auto it = mNamedTensors.begin(); it != mNamedTensors.end();) {
+            const Tensor& t = it->second;
+            if (t.Data && mRunState.Stack.owns(t.Data) && !mRunState.Stack.is_live(t.Data)) {
+                it = mNamedTensors.erase(it);
+            } else {
+                ++it;
+            }
+        }
     };
     // Detect if the stream is being captured (either by internal graphs via mCapturing,
     // or by an outer full-step graph from train_step_graphed in py_train.cpp).
@@ -2947,23 +3132,71 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         return parse_block_param(name, lyr, fld) && lyr == target_layer;
     };
 
+    auto contains_ci_local = [](std::string_view haystack, std::string_view needle) {
+        std::string h(haystack);
+        std::string n(needle);
+        std::transform(h.begin(), h.end(), h.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(n.begin(), n.end(), n.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return h.find(n) != std::string::npos;
+    };
+    const bool is_qwen3_5_forward_replay_model =
+        contains_ci_local(mConfig.ModelTypeName, "qwen3_5") ||
+        contains_ci_local(mConfig.ModelTypeName, "qwen3.5") ||
+        contains_ci_local(mConfig.ArchitectureName, "qwen3_5") ||
+        contains_ci_local(mConfig.ArchitectureName, "qwen3.5");
+
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
             return;
         }
 
-        // When forward replay is active, save metadata only for ALL block tensors.
-        // Replay will regenerate them during backward.
-        if (forward_replay_active) {
-            for (const auto& name : *mSaveList) {
-                if (!name_belongs_to_layer(name, layer_idx)) continue;
-                if (mSaved->find(name) != mSaved->end()) continue;
-                // Save an empty metadata entry — replay_layer_forward will fill in real data
-                Tensor meta{};
-                (*mSaved)[name] = meta;
+        auto q35_forward_replay_needs_persist = [&](const std::string& name) -> bool {
+            if (!forward_replay_active || !is_qwen3_5_forward_replay_model) {
+                return false;
             }
-            return;
-        }
+            int resolved_layer = -1;
+            std::string field;
+            if (!parse_block_param(name, resolved_layer, field) || resolved_layer != layer_idx) {
+                return false;
+            }
+            const std::string base_field = strip_ssa_suffix(field);
+            return base_field == "ln1" || base_field == "ln1_flat" ||
+                   base_field == "ln" || base_field == "ln_flat" ||
+                   base_field == "ln1_rstd" || base_field == "ln_rstd";
+        };
+
+        auto persist_saved_source_now = [&](const std::string& name, const Tensor& src) -> bool {
+            if (!src.Data) {
+                return false;
+            }
+            const size_t bytes = src.bytes();
+            if (bytes == 0) {
+                return false;
+            }
+            auto buf_it = mMoeSavedBuffers.find(name);
+            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+                if (fwd_stream_capturing) {
+                    return false;
+                }
+                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
+                    CUDA_CHECK(cudaFree(buf_it->second));
+                }
+                void* new_buffer = nullptr;
+                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+                mMoeSavedBuffers[name] = new_buffer;
+                mMoeSavedSizes[name] = bytes;
+            }
+            void* dst_buffer = mMoeSavedBuffers[name];
+            CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
+                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            Tensor saved_tensor = src;
+            saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
+            (*mSaved)[name] = saved_tensor;
+            bind_tensor(name, saved_tensor);
+            return true;
+        };
 
         auto resolve_saved_source = [&](const std::string& name) -> std::optional<Tensor> {
             // Prefer exact match from the flat tensor vector (O(1) lookup).
@@ -3022,6 +3255,26 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             return std::nullopt;
         };
+
+        // When forward replay is active, save metadata only for most block tensors.
+        // Qwen3.5 LN1 replay is the exception: ln1/ln1_rstd sit in shared activation
+        // space, so their exact forward values must be copied at layer end before
+        // later ops overwrite the slot.
+        if (forward_replay_active) {
+            for (const auto& name : *mSaveList) {
+                if (!name_belongs_to_layer(name, layer_idx)) continue;
+                if (mSaved->find(name) != mSaved->end()) continue;
+                if (q35_forward_replay_needs_persist(name)) {
+                    auto src_opt = resolve_saved_source(name);
+                    if (src_opt.has_value() && persist_saved_source_now(name, *src_opt)) {
+                        continue;
+                    }
+                }
+                Tensor meta{};
+                (*mSaved)[name] = meta;
+            }
+            return;
+        }
         
         int saved_count = 0;
         int recompute_count = 0;
@@ -3911,6 +4164,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 t = Tensor{};
             }
         }
+        for (auto it = mNamedTensors.begin(); it != mNamedTensors.end();) {
+            const Tensor& t = it->second;
+            if (t.Data && mRunState.Stack.owns(t.Data) && !mRunState.Stack.is_live(t.Data)) {
+                it = mNamedTensors.erase(it);
+            } else {
+                ++it;
+            }
+        }
     };
 
     // Bind initial gradient tensors (from loss computation)
@@ -4795,6 +5056,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mHasDeferredReplayCheckpoint = false;
     }
 
+    clear_replay_copied_refs();
     // Free persistent copies from last replay
     for (void* ptr : mReplayCopiedBuffers) {
         cudaFreeAsync(ptr, mRunState.MainStream);

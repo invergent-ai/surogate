@@ -3,11 +3,9 @@
 
 #include "runtime/dsl/compiled_ops.h"
 
-#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
@@ -46,12 +44,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         std::string field;
         parse_block_param(name, layer_idx_any, field);
     }
+    const int ep_key_any = ep_state_key(layer_idx_any);
 
     // For EP, derive num_experts from the forward-cached offsets.
     // LLEP may change num_merged per layer.
     int num_experts_for_offsets = static_cast<int>(mConfig.NumLocalExperts);
     if (mOptions.EPSize > 1 && layer_idx_any >= 0) {
-        auto ci = mMoEHostOffsetsCache.find(layer_idx_any);
+        auto ci = mMoEHostOffsetsCache.find(ep_key_any);
+        if (ci == mMoEHostOffsetsCache.end()) {
+            ci = mMoEHostOffsetsCache.find(layer_idx_any);
+        }
         if (ci != mMoEHostOffsetsCache.end() && ci->second.size() > 1) {
             num_experts_for_offsets = static_cast<int>(ci->second.size()) - 1;
         }
@@ -62,13 +64,28 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     Tensor expert_offsets_view;
     Tensor* expert_offsets_ptr = nullptr;
     if (layer_idx_any >= 0) {
-        const std::string key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-        auto it_saved = mMoeSavedBuffers.find(key);
-        if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+        const std::string base_key =
+            "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+        std::vector<std::string> candidate_keys;
+        if (mOptions.EPSize > 1) {
+            candidate_keys.push_back(base_key + (mInReplay ? "#r1" : "#r0"));
+            candidate_keys.push_back(base_key + (mInReplay ? "#r0" : "#r1"));
+        }
+        candidate_keys.push_back(base_key);
+
+        void* saved_ptr = nullptr;
+        for (const auto& key : candidate_keys) {
+            auto it_saved = mMoeSavedBuffers.find(key);
+            if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+                saved_ptr = it_saved->second;
+                break;
+            }
+        }
+        if (saved_ptr != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts_for_offsets + 1);
-            expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
+            expert_offsets_view.Data = static_cast<std::byte*>(saved_ptr);
             expert_offsets_ptr = &expert_offsets_view;
         }
     }
@@ -90,23 +107,74 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     // pointers instead of contiguous weight tensors.
     bool is_llep_active = false;
     const void* const* llep_weight_ptrs = nullptr;
+    std::vector<const void*> refreshed_native_weight_ptrs;
     {
-        auto llep_it = mLLEPStates.find(layer_idx_any);
+        auto llep_it = mLLEPStates.find(ep_key_any);
         if (llep_it != mLLEPStates.end() && llep_it->second.active) {
             auto& llep = llep_it->second;
             is_llep_active = true;
             std::string_view wname = op.inputs[1].name;
-            if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            const auto meta_it = mEPLayerMeta.find(ep_key_any);
+            const bool refresh_native_only_ptrs =
+                llep.owned_foreign_ptrs.empty() &&
+                meta_it != mEPLayerMeta.end() &&
+                meta_it->second.num_merged == meta_it->second.num_local &&
+                llep.num_merged_experts == meta_it->second.num_local &&
+                weights.Rank >= 3;
+            if (refresh_native_only_ptrs) {
+                const auto& meta = meta_it->second;
+                const std::size_t elem_sz = get_dtype_size(weights.DType);
+                const std::size_t expert_elems =
+                    static_cast<std::size_t>(weights.Sizes[1]) *
+                    static_cast<std::size_t>(weights.Sizes[2]);
+                const std::size_t expert_bytes = expert_elems * elem_sz;
+                refreshed_native_weight_ptrs.resize(llep.num_merged_experts);
+                for (int m = 0; m < llep.num_merged_experts; ++m) {
+                    const int global_e = llep.merged_to_global[m];
+                    const int local_idx = global_e - meta.native_start;
+                    if (local_idx < 0 || local_idx >= meta.num_local) {
+                        throw std::runtime_error(
+                            "moe_grouped_gemm: invalid native expert refresh mapping at layer "
+                            + std::to_string(layer_idx_any) + " global_e=" + std::to_string(global_e)
+                            + " local_idx=" + std::to_string(local_idx));
+                    }
+                    refreshed_native_weight_ptrs[m] =
+                        static_cast<const std::byte*>(weights.Data)
+                        + static_cast<std::size_t>(local_idx) * expert_bytes;
+                }
+                llep_weight_ptrs = refreshed_native_weight_ptrs.data();
+            } else if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
             } else if (wname.find("_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
-                // Separate up projection (Nemotron-H "experts_up") — reuses gate_up_weight_ptrs
-                // since ep_dispatch populates it from whichever up-projection weight exists.
+                // Separate up projection (Nemotron-H / Nemotron Nano "experts_up") — reuses
+                // gate_up_weight_ptrs since ep_dispatch populates it from whichever up-projection
+                // weight exists.
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             }
             num_experts = llep.num_merged_experts;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
+        }
+    }
+    if (!llep_weight_ptrs && mOptions.EPSize > 1 && layer_idx_any >= 0 && weights.Rank >= 3) {
+        const int weight_rows = static_cast<int>(weights.Sizes[0]);
+        if (weight_rows > num_experts) {
+            auto meta_it = mEPLayerMeta.find(ep_key_any);
+            if (meta_it != mEPLayerMeta.end()) {
+                const auto& meta = meta_it->second;
+                if (meta.num_local == num_experts &&
+                    meta.native_start >= 0 &&
+                    (meta.native_start + num_experts) <= weight_rows) {
+                    const std::size_t elem_sz = get_dtype_size(weights.DType);
+                    const std::size_t expert_elems =
+                        static_cast<std::size_t>(weights.Sizes[1]) *
+                        static_cast<std::size_t>(weights.Sizes[2]);
+                    weights.Data = static_cast<std::byte*>(weights.Data)
+                        + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                    weights.Sizes[0] = num_experts;
+                }
+            }
         }
     }
 
@@ -121,7 +189,18 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     if (num_experts > 0 && expert_offsets.Data) {
         // Use cached host offsets (populated by dispatch_moe_permute or ep_dispatch for this layer).
         host_offsets_ptr = get_or_sync_moe_host_offsets(
-            layer_idx_any, expert_offsets.get<int>(), num_experts);
+            ep_key_any, expert_offsets.get<int>(), num_experts);
+    }
+
+    // Refresh MoE expert weights for this layer using the current routing offsets.
+    auto* qlora_provider = mWeights.qlora_provider();
+    if (host_offsets_ptr && layer_idx_any >= 0 &&
+        qlora_provider && qlora_provider->supports_selective_moe()) {
+        (void)refresh_moe_experts_if_needed(layer_idx_any,
+                                            host_offsets_ptr,
+                                            num_experts,
+                                            mWeights,
+                                            mRunState.MainStream);
     }
 
     MoeCompactInfo compact = host_offsets_ptr
@@ -216,7 +295,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
             const auto* up_ptr = lora_block.moe.grouped.up.has_value()
                 ? &(*lora_block.moe.grouped.up) : nullptr;
             {
-                auto llep_lora_it = mLLEPStates.find(layer_idx_any);
+                auto llep_lora_it = mLLEPStates.find(ep_key_any);
                 if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
                     && llep_lora_it->second.has_merged_lora
                     && llep_lora_it->second.merged_lora.up.has_value()) {
@@ -265,7 +344,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                 Tensor weight_view = weight_t;
                 int weight_rows = (weight_view.Rank > 0) ? static_cast<int>(weight_view.Sizes[0]) : num_experts;
                 if (mOptions.EPSize > 1 && layer_idx_any >= 0 && weight_view.Rank >= 3 && weight_rows > num_experts) {
-                    auto meta_it = mEPLayerMeta.find(layer_idx_any);
+                    auto meta_it = mEPLayerMeta.find(ep_key_any);
                     if (meta_it != mEPLayerMeta.end()) {
                         const auto& meta = meta_it->second;
                         if (meta.num_local == num_experts &&
@@ -356,12 +435,32 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         std::string field;
         parse_block_param(name, layer_idx_any, field);
     }
+    const int input_total_recv = static_cast<int>(inp.Sizes[0]);
+    int ep_key_any = ep_state_key(layer_idx_any);
+    if (mOptions.EPSize > 1 && layer_idx_any >= 0) {
+        const int ep_key_r0 = (layer_idx_any << 1);
+        const int ep_key_r1 = ep_key_r0 | 1;
+        auto it_r0 = mEpStates.find(ep_key_r0);
+        auto it_r1 = mEpStates.find(ep_key_r1);
+        if (it_r1 != mEpStates.end() && it_r1->second.total_recv == input_total_recv) {
+            ep_key_any = ep_key_r1;
+        } else if (it_r0 != mEpStates.end() && it_r0->second.total_recv == input_total_recv) {
+            ep_key_any = ep_key_r0;
+        } else if (it_r1 != mEpStates.end()) {
+            ep_key_any = ep_key_r1;
+        } else if (it_r0 != mEpStates.end()) {
+            ep_key_any = ep_key_r0;
+        }
+    }
 
     // For EP, derive num_experts from the forward-cached offsets.
     // LLEP may change num_merged per layer (transferring experts between GPUs),
     // so mConfig.NumLocalExperts may not match the actual merged expert count.
     if (mOptions.EPSize > 1 && layer_idx_any >= 0) {
-        auto ci = mMoEHostOffsetsCache.find(layer_idx_any);
+        auto ci = mMoEHostOffsetsCache.find(ep_key_any);
+        if (ci == mMoEHostOffsetsCache.end()) {
+            ci = mMoEHostOffsetsCache.find(layer_idx_any);
+        }
         if (ci != mMoEHostOffsetsCache.end() && ci->second.size() > 1) {
             num_experts = static_cast<int>(ci->second.size()) - 1;
         }
@@ -371,13 +470,30 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     Tensor expert_offsets_view;
     Tensor* expert_offsets_ptr = nullptr;
     if (layer_idx_any >= 0) {
-        const std::string key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-        auto it_saved = mMoeSavedBuffers.find(key);
-        if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+        const std::string base_key =
+            "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+        std::vector<std::string> candidate_keys;
+        if (mOptions.EPSize > 1) {
+            candidate_keys.push_back(base_key + "#r1");
+            candidate_keys.push_back(base_key + "#r0");
+        } else {
+            candidate_keys.push_back(moe_saved_key(layer_idx_any, "moe_expert_offsets"));
+        }
+        candidate_keys.push_back(base_key);
+
+        void* saved_ptr = nullptr;
+        for (const auto& key : candidate_keys) {
+            auto it_saved = mMoeSavedBuffers.find(key);
+            if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+                saved_ptr = it_saved->second;
+                break;
+            }
+        }
+        if (saved_ptr != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
-            expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
+            expert_offsets_view.Data = static_cast<std::byte*>(saved_ptr);
             expert_offsets_ptr = &expert_offsets_view;
         }
     }
@@ -402,14 +518,44 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     const void* const* llep_weight_ptrs = nullptr;
     bool is_llep_active = false;
     std::vector<const void*> reconstructed_weight_ptrs;  // local storage for case 2
+    std::vector<const void*> refreshed_native_weight_ptrs;
     {
-        auto llep_it = mLLEPStates.find(layer_idx_any);
+        auto llep_it = mLLEPStates.find(ep_key_any);
         if (llep_it != mLLEPStates.end() && llep_it->second.active) {
             // Case 1: full LLEP state with foreign weight pointers
             is_llep_active = true;
             auto& llep = llep_it->second;
             std::string_view wname = op.inputs[2].name;
-            if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            const auto meta_it = mEPLayerMeta.find(ep_key_any);
+            const bool refresh_native_only_ptrs =
+                llep.owned_foreign_ptrs.empty() &&
+                meta_it != mEPLayerMeta.end() &&
+                meta_it->second.num_merged == meta_it->second.num_local &&
+                llep.num_merged_experts == meta_it->second.num_local &&
+                weights.Rank >= 3;
+            if (refresh_native_only_ptrs) {
+                const auto& meta = meta_it->second;
+                const std::size_t elem_sz = get_dtype_size(weights.DType);
+                const std::size_t expert_elems =
+                    static_cast<std::size_t>(weights.Sizes[1]) *
+                    static_cast<std::size_t>(weights.Sizes[2]);
+                const std::size_t expert_bytes = expert_elems * elem_sz;
+                refreshed_native_weight_ptrs.resize(llep.num_merged_experts);
+                for (int m = 0; m < llep.num_merged_experts; ++m) {
+                    const int global_e = llep.merged_to_global[m];
+                    const int local_idx = global_e - meta.native_start;
+                    if (local_idx < 0 || local_idx >= meta.num_local) {
+                        throw std::runtime_error(
+                            "moe_grouped_gemm_backward: invalid native expert refresh mapping at layer "
+                            + std::to_string(layer_idx_any) + " global_e=" + std::to_string(global_e)
+                            + " local_idx=" + std::to_string(local_idx));
+                    }
+                    refreshed_native_weight_ptrs[m] =
+                        static_cast<const std::byte*>(weights.Data)
+                        + static_cast<std::size_t>(local_idx) * expert_bytes;
+                }
+                llep_weight_ptrs = refreshed_native_weight_ptrs.data();
+            } else if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
@@ -420,7 +566,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
         } else if (mOptions.EPSize > 1 && layer_idx_any >= 0) {
             // Case 2: LLEP state cleared but metadata survives
-            auto meta_it = mEPLayerMeta.find(layer_idx_any);
+            auto meta_it = mEPLayerMeta.find(ep_key_any);
             if (meta_it != mEPLayerMeta.end() && meta_it->second.num_merged != meta_it->second.num_local) {
                 // num_merged > num_local means foreign experts were present in forward.
                 // Reconstruct weight pointers: native experts use dequantized weights,
@@ -455,6 +601,26 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             }
         }
     }
+    if (!llep_weight_ptrs && mOptions.EPSize > 1 && layer_idx_any >= 0 && weights.Rank >= 3) {
+        const int weight_rows = static_cast<int>(weights.Sizes[0]);
+        if (weight_rows > num_experts) {
+            auto meta_it = mEPLayerMeta.find(ep_key_any);
+            if (meta_it != mEPLayerMeta.end()) {
+                const auto& meta = meta_it->second;
+                if (meta.num_local == num_experts &&
+                    meta.native_start >= 0 &&
+                    (meta.native_start + num_experts) <= weight_rows) {
+                    const std::size_t elem_sz = get_dtype_size(weights.DType);
+                    const std::size_t expert_elems =
+                        static_cast<std::size_t>(weights.Sizes[1]) *
+                        static_cast<std::size_t>(weights.Sizes[2]);
+                    weights.Data = static_cast<std::byte*>(weights.Data)
+                        + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                    weights.Sizes[0] = num_experts;
+                }
+            }
+        }
+    }
 
     const int out_features = (weights.Rank >= 2) ? static_cast<int>(weights.Sizes[1]) : 0;
     const int in_features = (weights.Rank >= 3) ? static_cast<int>(weights.Sizes[2]) : 0;
@@ -466,7 +632,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     if (num_experts > 0 && expert_offsets.Data) {
         // Use cached host offsets (populates on first backward access for this layer).
         host_offsets_ptr = get_or_sync_moe_host_offsets(
-            layer_idx_any, expert_offsets.get<int>(), num_experts);
+            ep_key_any, expert_offsets.get<int>(), num_experts);
     }
 
     MoeCompactInfo compact = host_offsets_ptr
@@ -480,6 +646,18 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     const int* active_ptr = compact.active_experts.empty() ? nullptr : compact.active_experts.data();
     const int num_active = compact.active_experts.empty() ? -1 : compact.num_active;
     const bool weight_is_compact = compact.weight_is_compact;
+
+    auto* qlora_provider = mWeights.qlora_provider();
+    if (qlora_provider && qlora_provider->supports_selective_moe()) {
+        const int* refresh_offsets = host_offsets_ptr;
+        if (refresh_offsets) {
+            (void)refresh_moe_experts_if_needed(layer_idx_any,
+                                                refresh_offsets,
+                                                num_experts,
+                                                mWeights,
+                                                mRunState.MainStream);
+        }
+    }
 
     // Input gradient shape: same as inp
     const long total_tokens = d_out.Sizes[0];
@@ -560,7 +738,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                 ? &(*lora_block.moe.grouped.up) : nullptr;
             bool llep_lora_active = false;
             {
-                auto llep_lora_it = mLLEPStates.find(layer_idx_any);
+                auto llep_lora_it = mLLEPStates.find(ep_key_any);
                 if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
                     && llep_lora_it->second.has_merged_lora
                     && llep_lora_it->second.merged_lora.up.has_value()) {
@@ -610,7 +788,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                 Tensor weight_view = weight_t;
                 int weight_rows = (weight_view.Rank > 0) ? static_cast<int>(weight_view.Sizes[0]) : num_experts;
                 if (mOptions.EPSize > 1 && layer_idx_any >= 0 && weight_view.Rank >= 3 && weight_rows > num_experts) {
-                    auto meta_it = mEPLayerMeta.find(layer_idx_any);
+                    auto meta_it = mEPLayerMeta.find(ep_key_any);
                     if (meta_it != mEPLayerMeta.end()) {
                         const auto& meta = meta_it->second;
                         if (meta.num_local == num_experts &&
@@ -665,7 +843,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                 Tensor d_weight_view = d_weight;
                 int weight_rows = (d_weight_view.Rank > 0) ? static_cast<int>(d_weight_view.Sizes[0]) : num_experts;
                 if (mOptions.EPSize > 1 && layer_idx_any >= 0 && d_weight_view.Rank >= 3 && weight_rows > num_experts) {
-                    auto meta_it = mEPLayerMeta.find(layer_idx_any);
+                    auto meta_it = mEPLayerMeta.find(ep_key_any);
                     if (meta_it != mEPLayerMeta.end()) {
                         const auto& meta = meta_it->second;
                         if (meta.num_local == num_experts &&

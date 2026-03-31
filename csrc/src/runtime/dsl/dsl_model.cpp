@@ -643,6 +643,12 @@ qlora::QuantizerConfig build_quantizer_config(
     } else if (qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantMXFP4) {
         qcfg.format = qlora::QuantFormat::HF_MXFP4;
         qcfg.block_size = 32;
+    } else if (qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantBnBNF4) {
+        qcfg.format = qlora::QuantFormat::BNB_NF4;
+        qcfg.block_size = 64;
+        // Runtime always uses non-double-quant dequant path (FP32 absmax).
+        // Double quant is handled at load time by recovering FP32 absmax.
+        qcfg.double_quant = false;
     } else {
         qcfg.format = qlora::QuantFormat::NONE;
     }
@@ -824,6 +830,11 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
                 config.data_suffix = "_blocks";
                 config.scale_suffix = "_scales";
                 break;
+            case modules::QLoRAQuantStrategy::PrequantBnBNF4:
+                // BnB NF4: data is hf_name directly, absmax is hf_name + ".absmax"
+                config.scale_suffix = ".absmax";
+                config.bnb_prequant_double_quant = qlora_cfg.bnb_double_quant;
+                break;
             default:
                 break;
         }
@@ -898,6 +909,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
         qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantFP8 ? "Prequant-FP8" :
         qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantNVFP4 ? "Prequant-NVFP4" :
         qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantMXFP4 ? "Prequant-MXFP4" :
+        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantBnBNF4 ? "Prequant-BnB-NF4" :
         "none";
 
     fprintf(stderr, "[QLoRA] Generic provider: %d weight specs (%d quantizable), "

@@ -158,6 +158,16 @@ struct DslQLoRAPipelineConfig {
     std::vector<std::string> modules_to_not_convert;
 
     // =========================================================================
+    // BitsAndBytes NF4 pre-quantized model configuration
+    // =========================================================================
+
+    /// Whether the HF source model uses BnB double quantization.
+    /// When true, the importer reads INT8-quantized absmax + nested_absmax +
+    /// nested_quant_map + nested_offset and recovers FP32 absmax on CPU.
+    /// When false, absmax is read directly as FP32 from safetensors.
+    bool bnb_prequant_double_quant = false;
+
+    // =========================================================================
     // Adapter merging (stacked LoRA)
     // =========================================================================
 

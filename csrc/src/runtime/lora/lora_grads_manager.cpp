@@ -31,6 +31,10 @@ void ModularLoRAGradsManager::allocate_gradients() {
     auto ctx = mAllocator->with_context("Modular_LoRA_Grads");
     mFullGrads.blocks.resize(mConfig.num_layers);
     mShardedGrads.blocks.resize(mConfig.num_layers);
+    // No runtime path currently consumes mShardedGrads. Keeping a second full device copy
+    // of all LoRA grad buffers materially increases VRAM pressure for EP+MoE models, so
+    // leave the sharded set as empty metadata until a caller actually needs it.
+    constexpr bool kAllocateLegacyShardedGradStorage = false;
 
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
@@ -69,6 +73,9 @@ void ModularLoRAGradsManager::allocate_gradients() {
     };
     auto alloc_shard = [&](int in_f, int out_f, const std::string& name) -> LoRALayerWeights<TensorShard> {
         LoRALayerWeights<TensorShard> w;
+        if constexpr (!kAllocateLegacyShardedGradStorage) {
+            return w;
+        }
         w.A = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {r, in_f}));
         w.B = mAllocator->allocate_shard(mConfig.grad_dtype, /*shard_idx=*/0, /*num_shards=*/1, (name + "_B").c_str(), {out_f, r});
         return w;
@@ -82,6 +89,9 @@ void ModularLoRAGradsManager::allocate_gradients() {
     };
     auto alloc_grouped_shard = [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<TensorShard> {
         LoRAGroupedLayerWeights<TensorShard> w;
+        if constexpr (!kAllocateLegacyShardedGradStorage) {
+            return w;
+        }
         w.A = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {E, r, in_f}));
         w.B = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r}));
         return w;
@@ -288,6 +298,7 @@ void ModularLoRAGradsManager::notify_block(int layer_idx, cudaStream_t stream, N
 
 void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm) {
     if (comm.world_size() == 1) return;
+    const bool ep_active = comm.ep_enabled();
 
     auto all_reduce_layer = [&](std::optional<LoRALayerWeights<Tensor>>& layer) {
         if (!layer.has_value()) return;
@@ -295,10 +306,22 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
         if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
     };
 
+    auto all_reduce_layer_dp = [&](std::optional<LoRALayerWeights<Tensor>>& layer) {
+        if (!layer.has_value()) return;
+        if (layer->A.Data) comm.all_reduce_avg_dp(layer->A, stream);
+        if (layer->B.Data) comm.all_reduce_avg_dp(layer->B, stream);
+    };
+
     auto all_reduce_grouped_layer = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& layer) {
         if (!layer.has_value()) return;
         if (layer->A.Data) comm.all_reduce_avg(layer->A, stream);
         if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
+    };
+
+    auto all_reduce_grouped_layer_dp = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& layer) {
+        if (!layer.has_value()) return;
+        if (layer->A.Data) comm.all_reduce_avg_dp(layer->A, stream);
+        if (layer->B.Data) comm.all_reduce_avg_dp(layer->B, stream);
     };
 
     for (auto& block : mFullGrads.blocks) {
@@ -312,17 +335,33 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
         all_reduce_layer(block.mlp.down);
 
         if (block.moe.use_grouped) {
-            all_reduce_grouped_layer(block.moe.grouped.gate);
-            all_reduce_grouped_layer(block.moe.grouped.gate_up);
-            all_reduce_grouped_layer(block.moe.grouped.up);
-            all_reduce_grouped_layer(block.moe.grouped.down);
+            // Expert LoRA tensors are sharded by EP rank. Reducing across the full world
+            // would mix different experts; reduce across DP group only when EP is active.
+            if (ep_active) {
+                all_reduce_grouped_layer_dp(block.moe.grouped.gate);
+                all_reduce_grouped_layer_dp(block.moe.grouped.gate_up);
+                all_reduce_grouped_layer_dp(block.moe.grouped.up);
+                all_reduce_grouped_layer_dp(block.moe.grouped.down);
+            } else {
+                all_reduce_grouped_layer(block.moe.grouped.gate);
+                all_reduce_grouped_layer(block.moe.grouped.gate_up);
+                all_reduce_grouped_layer(block.moe.grouped.up);
+                all_reduce_grouped_layer(block.moe.grouped.down);
+            }
         } else {
             // MoE expert LoRA gradients
             for (auto& expert : block.moe.experts) {
-                all_reduce_layer(expert.gate);
-                all_reduce_layer(expert.gate_up);
-                all_reduce_layer(expert.up);
-                all_reduce_layer(expert.down);
+                if (ep_active) {
+                    all_reduce_layer_dp(expert.gate);
+                    all_reduce_layer_dp(expert.gate_up);
+                    all_reduce_layer_dp(expert.up);
+                    all_reduce_layer_dp(expert.down);
+                } else {
+                    all_reduce_layer(expert.gate);
+                    all_reduce_layer(expert.gate_up);
+                    all_reduce_layer(expert.up);
+                    all_reduce_layer(expert.down);
+                }
             }
         }
 

@@ -1,6 +1,5 @@
 #include "runtime/dsl/compiled_ops.h"
 
-#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <vector>

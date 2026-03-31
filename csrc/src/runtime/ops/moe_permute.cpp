@@ -1,14 +1,14 @@
 #include "runtime/dsl/compiled_ops.h"
 
-#include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
-
 namespace dsl {
 
 void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
@@ -88,7 +88,8 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
 
         // Populate per-layer cache so downstream gate_up/down ops skip redundant D2H syncs.
         if (layer_idx_any >= 0) {
-            mMoEHostOffsetsCache[layer_idx_any] = mMoEExpertOffsetsData;
+            const int offsets_key = ep_state_key(layer_idx_any);
+            mMoEHostOffsetsCache[offsets_key] = mMoEExpertOffsetsData;
         }
     }
 
@@ -104,7 +105,6 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                            gather_indices.get<int>(),
                            total_tokens, num_tokens, hidden_size, top_k, mRunState.MainStream);
     }
-
     // Persist per-layer routing buffers for backward (expert_offsets + gather_indices).
     {
         int layer_idx = op.attrs.layer_idx;
@@ -121,7 +121,7 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                 if (!src.Data) {
                     return;
                 }
-                const std::string key = "blocks[" + std::to_string(layer_idx) + "]." + suffix;
+                const std::string key = moe_saved_key(layer_idx, suffix.c_str());
                 const size_t bytes = src.bytes();
                 if (bytes == 0) {
                     return;
@@ -165,10 +165,17 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
 
 void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
     Tensor& d_permuted = resolve_tensor(op.inputs[0]);
-    Tensor& gather_indices_saved = resolve_tensor(op.inputs[1]);  // Saved from forward
+    Tensor& scatter_indices_saved = resolve_tensor(op.inputs[1]);  // Saved from forward
     Tensor& d_input = ensure_output_tensor(op.outputs[0]);
 
-    // Prefer per-layer saved gather indices when available.
+    Tensor* scatter_indices = nullptr;
+    if (scatter_indices_saved.Data != nullptr &&
+        scatter_indices_saved.DType == ETensorDType::INT32) {
+        scatter_indices = &scatter_indices_saved;
+    }
+
+    // Fallback: reconstruct gather indices from the per-layer saved buffer when
+    // scatter indices are unavailable.
     Tensor* gather_indices = nullptr;
     Tensor gather_indices_view;
     int layer_idx = op.attrs.layer_idx;
@@ -184,8 +191,13 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
         parse_block_param(name, layer_idx, field);
     }
     if (layer_idx >= 0) {
-        const std::string key = "blocks[" + std::to_string(layer_idx) + "].moe_gather_indices";
+        const std::string key = moe_saved_key(layer_idx, "moe_gather_indices");
         auto it = mMoeSavedBuffers.find(key);
+        if (it == mMoeSavedBuffers.end()) {
+            // Backward-compatible fallback for unsuffixed key.
+            const std::string legacy_key = "blocks[" + std::to_string(layer_idx) + "].moe_gather_indices";
+            it = mMoeSavedBuffers.find(legacy_key);
+        }
         if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
             const int top_k = op.attrs.top_k > 0 ? op.attrs.top_k : 1;
             const int num_tokens = static_cast<int>(d_input.Sizes[0]);
@@ -197,38 +209,44 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
             gather_indices = &gather_indices_view;
         }
     }
-    if (!gather_indices) {
-        // Try flat vector via pre-resolved gather tensor ID
-        if (op.attrs.moe_gather_tensor_id >= 0 &&
-            static_cast<std::size_t>(op.attrs.moe_gather_tensor_id) < mTensors.size() &&
-            mTensors[op.attrs.moe_gather_tensor_id].Data) {
-            gather_indices = &mTensors[op.attrs.moe_gather_tensor_id];
-        }
-    }
-    if (!gather_indices) {
-        gather_indices = &gather_indices_saved;
-    }
-
     const int top_k = op.attrs.top_k;
     const int num_tokens = static_cast<int>(d_input.Sizes[0]);
     const int hidden_size = static_cast<int>(d_input.Sizes[1]);
     const int total_tokens = num_tokens * top_k;
-    if (d_permuted.DType == ETensorDType::BF16) {
-        fill_zero(d_input, mRunState.MainStream);
-        moe_permute_backward(d_input.get<nv_bfloat16>(),
-                             d_permuted.get<nv_bfloat16>(),
-                             gather_indices->get<int>(),
-                             total_tokens, num_tokens, hidden_size, top_k,
-                             mRunState.MainStream);
-    } else {
-        fill_zero(d_input, mRunState.MainStream);
-        moe_permute_backward(d_input.get<float>(),
-                             d_permuted.get<float>(),
-                             gather_indices->get<int>(),
-                             total_tokens, num_tokens, hidden_size, top_k,
-                             mRunState.MainStream);
+    if (!scatter_indices && !gather_indices) {
+        throw std::runtime_error("moe_permute_backward missing both scatter_indices and gather_indices");
     }
-
+    if (d_permuted.DType == ETensorDType::BF16) {
+        if (scatter_indices) {
+            moe_permute_backward_from_scatter(d_input.get<nv_bfloat16>(),
+                                              d_permuted.get<nv_bfloat16>(),
+                                              scatter_indices->get<int>(),
+                                              total_tokens, num_tokens, hidden_size, top_k,
+                                              mRunState.MainStream);
+        } else {
+            fill_zero(d_input, mRunState.MainStream);
+            moe_permute_backward(d_input.get<nv_bfloat16>(),
+                                 d_permuted.get<nv_bfloat16>(),
+                                 gather_indices->get<int>(),
+                                 total_tokens, num_tokens, hidden_size, top_k,
+                                 mRunState.MainStream);
+        }
+    } else {
+        if (scatter_indices) {
+            moe_permute_backward_from_scatter(d_input.get<float>(),
+                                              d_permuted.get<float>(),
+                                              scatter_indices->get<int>(),
+                                              total_tokens, num_tokens, hidden_size, top_k,
+                                              mRunState.MainStream);
+        } else {
+            fill_zero(d_input, mRunState.MainStream);
+            moe_permute_backward(d_input.get<float>(),
+                                 d_permuted.get<float>(),
+                                 gather_indices->get<int>(),
+                                 total_tokens, num_tokens, hidden_size, top_k,
+                                 mRunState.MainStream);
+        }
+    }
     store_tensor(op.outputs[0], d_input);
 }
 

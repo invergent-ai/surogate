@@ -24,7 +24,13 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
     Tensor& qkv = resolve_tensor(op.inputs[0]);
     Tensor& freqs = resolve_tensor(op.inputs[1]);
     Tensor& pos_ids = resolve_tensor(op.inputs[2]);
-    Tensor& out = ensure_output_tensor(op.outputs[0]);
+    const std::vector<long> out_shape(
+        qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
+    Tensor out = ensure_output_tensor_or_persistent(
+        ensure_output_tensor(op.outputs[0]),
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".out",
+        qkv.DType, out_shape, "rope");
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -48,6 +54,7 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
     rope_forward(out, qkv, freqs, reinterpret_cast<int*>(pos_ids.Data), nullptr,
                  static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs,
                  op.attrs.rotary_dim, mRunState.MainStream);
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
@@ -55,7 +62,13 @@ void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& freqs = resolve_tensor(op.inputs[1]);
     Tensor& pos_ids = resolve_tensor(op.inputs[2]);
-    Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
+    const std::vector<long> d_qkv_shape(
+        d_out.Sizes.begin(), d_out.Sizes.begin() + d_out.Rank);
+    Tensor d_qkv = ensure_output_tensor_or_persistent(
+        ensure_output_tensor(op.outputs[0]),
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".d_qkv",
+        d_out.DType, d_qkv_shape, "rope_backward");
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -69,6 +82,7 @@ void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
     rope_backward(d_qkv, d_out, freqs, reinterpret_cast<int*>(pos_ids.Data), abs_max_ptr,
                   static_cast<int>(mB), static_cast<int>(mT),
                   Hq, Hkv, Hs, op.attrs.rotary_dim, mRunState.MainStream);
+    store_tensor(op.outputs[0], d_qkv);
 }
 
 }  // namespace dsl

@@ -62,14 +62,33 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     Tensor& freqs = resolve_tensor(op.inputs[3]);
     Tensor& pos_ids = resolve_tensor(op.inputs[4]);
 
-    // Get output tensor from pre-allocated slot if available
-    Tensor& qkv_out = ensure_output_tensor(op.outputs[0]);
-    Tensor& q_rstd = ensure_output_tensor(op.outputs[1]);
-    Tensor& k_rstd = ensure_output_tensor(op.outputs[2]);
-
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
+    const Tensor& qkv_out_candidate = ensure_output_tensor(op.outputs[0]);
+    const Tensor& q_rstd_candidate = ensure_output_tensor(op.outputs[1]);
+    const Tensor& k_rstd_candidate = ensure_output_tensor(op.outputs[2]);
+    const std::vector<long> qkv_shape(
+        qkv_in.Sizes.begin(), qkv_in.Sizes.begin() + qkv_in.Rank);
+    const std::vector<long> q_rstd_shape =
+        !op.outputs[1].shape.empty() ? op.outputs[1].shape : std::vector<long>{mB, mT, Hq};
+    const std::vector<long> k_rstd_shape =
+        !op.outputs[2].shape.empty() ? op.outputs[2].shape : std::vector<long>{mB, mT, Hkv};
+    Tensor qkv_out = ensure_output_tensor_or_persistent(
+        qkv_out_candidate,
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".qkv_out",
+        qkv_in.DType, qkv_shape, "qkv_qk_norm_rope");
+    Tensor q_rstd = ensure_output_tensor_or_persistent(
+        q_rstd_candidate,
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[1].name + ".q_rstd",
+        ETensorDType::FP32, q_rstd_shape, "qkv_qk_norm_rope");
+    Tensor k_rstd = ensure_output_tensor_or_persistent(
+        k_rstd_candidate,
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[2].name + ".k_rstd",
+        ETensorDType::FP32, k_rstd_shape, "qkv_qk_norm_rope");
     const bool cudnn_gqa_ok = (Hq == Hkv);
     int qkv_channels = Hs * (Hq + 2 * Hkv);
     const int qkv_expected = qkv_channels;
@@ -186,6 +205,8 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     }
 
     store_tensor(op.outputs[0], qkv_out);
+    store_tensor(op.outputs[1], q_rstd);
+    store_tensor(op.outputs[2], k_rstd);
 }
 
 void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) {
@@ -198,15 +219,29 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     Tensor& k_rstd = resolve_tensor(op.inputs[5]);    // Saved RSTD (FP32)
     Tensor& freqs = resolve_tensor(op.inputs[6]);
     Tensor& pos_ids = resolve_tensor(op.inputs[7]);
-
-    Tensor* d_qkv_ptr = &ensure_output_tensor(op.outputs[0]);
-    if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != d_out.nelem()) {
-        std::vector<long> shape(d_out.Sizes.begin(), d_out.Sizes.begin() + d_out.Rank);
-        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape, "qkv_qk_norm_rope_backward_d_qkv");
-        mTemps.push_back(tmp);
-        d_qkv_ptr = &mTemps.back();
+    // Resolve optional dweight outputs first. ensure_output_tensor may allocate into mTemps,
+    // so we must not take references to mTemps-backed d_qkv before this point.
+    Tensor* d_q_norm = nullptr;
+    Tensor* d_k_norm = nullptr;
+    bool accum_q = false;
+    bool accum_k = false;
+    const bool skip_norm_dweight = mRunState.is_lora_only_mode();
+    if (!skip_norm_dweight && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+        d_q_norm = &ensure_output_tensor(op.outputs[1]);
+        accum_q = mAccumulateTensors.count(op.outputs[1].name) > 0;
     }
-    Tensor& d_qkv = *d_qkv_ptr;
+    if (!skip_norm_dweight && op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
+        d_k_norm = &ensure_output_tensor(op.outputs[2]);
+        accum_k = mAccumulateTensors.count(op.outputs[2].name) > 0;
+    }
+
+    const std::vector<long> d_qkv_shape(
+        qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
+    Tensor d_qkv = ensure_output_tensor_or_persistent(
+        ensure_output_tensor(op.outputs[0]),
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".d_qkv",
+        d_out.DType, d_qkv_shape, "qkv_qk_norm_rope_backward");
 
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -256,17 +291,6 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
         }
     }
     const int q_rows = Hq * Hs;
-    if (const char* dbg = std::getenv("SUROGATE_DEBUG_QWEN35_BWD");
-        dbg && std::string(dbg) == "1") {
-        fprintf(stderr, "[QWEN35_BWD][qkv_qk_norm_rope_backward] Hq=%d Hkv=%d Hs=%d qkv_channels=%d\n",
-                Hq, Hkv, Hs, qkv_channels);
-        log_tensor_shape("d_out", d_out);
-        log_tensor_shape("qkv", qkv);
-        log_tensor_shape("q_rstd", q_rstd);
-        log_tensor_shape("k_rstd", k_rstd);
-        log_tensor_shape("d_qkv", d_qkv);
-    }
-
     auto view_qkv = [&](Tensor& t) -> Tensor {
         const long needed = static_cast<long>(mB) * static_cast<long>(mT) * qkv_channels;
         if ((t.Rank == 4 || (t.Rank == 3 && t.Sizes[2] != qkv_channels)) &&
@@ -291,20 +315,10 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     Tensor d_qkv_view = view_qkv(d_qkv);
     Tensor q_rstd_view = view_rstd(q_rstd, Hq);
     Tensor k_rstd_view = view_rstd(k_rstd, Hkv);
-
-    // Optional weight gradients — skip in LoRA mode where QK norm weights are frozen.
-    Tensor* d_q_norm = nullptr;
-    Tensor* d_k_norm = nullptr;
-    bool accum_q = false;
-    bool accum_k = false;
-    const bool skip_norm_dweight = mRunState.is_lora_only_mode();
-    if (!skip_norm_dweight && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-        d_q_norm = &ensure_output_tensor(op.outputs[1]);
-        accum_q = mAccumulateTensors.count(op.outputs[1].name) > 0;
-    }
-    if (!skip_norm_dweight && op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
-        d_k_norm = &ensure_output_tensor(op.outputs[2]);
-        accum_k = mAccumulateTensors.count(op.outputs[2].name) > 0;
+    int layer_idx = -1;
+    std::string layer_field;
+    if (!parse_block_param(op.inputs[1].name, layer_idx, layer_field)) {
+        parse_block_param(op.outputs[0].name, layer_idx, layer_field);
     }
 
     // Compute d_weight before overwriting d_out_view.
@@ -341,20 +355,17 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
         const std::size_t bytes = static_cast<std::size_t>(d_out_view.nelem()) * get_dtype_size(d_out_view.DType);
         CUDA_CHECK(cudaMemcpyAsync(d_qkv_view.Data, d_out_view.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
-
     // Combined backward for Q and K norms with RoPE
     // Q norm backward (with RoPE): channel_offset=0
     qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, q_norm, q_rstd_view,
                                         freqs, reinterpret_cast<int*>(pos_ids.Data),
                                         static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
                                         Hq, Hs, 0, mRunState.MainStream, nullptr);
-
     // K norm backward (with RoPE): channel_offset=q_rows
     qkv_head_rmsnorm_rope_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd_view,
                                         freqs, reinterpret_cast<int*>(pos_ids.Data),
                                         static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
                                         Hkv, Hs, q_rows, mRunState.MainStream, nullptr);
-
     // V doesn't have normalization - its gradients pass through unchanged
     // The d_out already contains the V gradients at the correct offset
 

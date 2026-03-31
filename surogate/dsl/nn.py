@@ -450,6 +450,8 @@ class RMSNorm(Module):
         if len(args) == 2:
             # Fused residual + rmsnorm
             residual, x = args
+            full_y_name = tracer.prefixed("y")
+            save_y = full_y_name in {"ln1", "ln"} or full_y_name.endswith("attn_norm_y")
 
             res_slot = tracer.register_activation(
                 "res", ("B", "T", "C"),
@@ -457,6 +459,7 @@ class RMSNorm(Module):
             )
             y_slot = tracer.register_activation(
                 "y", ("B", "T", "C"),
+                save=save_y,
                 share_policy="when_recomputed",
             )
             rstd_slot = tracer.register_activation(
@@ -3049,7 +3052,10 @@ class Embedding(Module):
         g = tracer.graph
         (token_ids,) = args
 
-        w = tracer.register_param("weight", ("vocab_size", "d_model"))
+        # Keep token embeddings full-precision in QLoRA flows.
+        w = tracer.register_param(
+            "weight", ("vocab_size", "d_model"), quantizable=False,
+        )
 
         out_slot = tracer.register_activation(
             "out", ("B", "T", "d_model"),
@@ -3079,7 +3085,10 @@ class LMHead(Module):
         g = tracer.graph
         x, targets = args
 
-        w = tracer.register_param("weight", ("vocab_size", "d_model"))
+        # Keep LM head full-precision in QLoRA flows.
+        w = tracer.register_param(
+            "weight", ("vocab_size", "d_model"), quantizable=False,
+        )
 
         loss_slot = tracer.register_activation(
             "loss", ("B * T",),

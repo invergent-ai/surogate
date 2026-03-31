@@ -30,13 +30,12 @@ void CompiledExecutor::dispatch_repeat_interleave_heads(const CompiledOp& op) {
     const long H = x.Sizes[2];
     const long D = x.Sizes[3];
 
-    Tensor out = ensure_output_tensor(op.outputs[0]);
-    if (out.Rank != 4 || out.DType != x.DType ||
-        out.Sizes[0] != B || out.Sizes[1] != T ||
-        out.Sizes[2] != H * repeats || out.Sizes[3] != D) {
-        out = mRunState.temp_alloc(x.DType, {B, T, H * repeats, D}, "repeat_interleave_heads_out");
-        mTemps.push_back(out);
-    }
+    const std::vector<long> out_shape{B, T, H * repeats, D};
+    Tensor out = ensure_output_tensor_or_persistent(
+        ensure_output_tensor(op.outputs[0]),
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".out",
+        x.DType, out_shape, "repeat_interleave_heads");
     repeat_interleave_heads_forward(out, x, repeats, mRunState.MainStream);
     store_tensor(op.outputs[0], out);
 }
@@ -58,17 +57,15 @@ void CompiledExecutor::dispatch_repeat_interleave_heads_backward(const CompiledO
         throw std::runtime_error("repeat_interleave_heads_backward: d_out shape mismatch");
     }
 
-    Tensor d_x = ensure_output_tensor(op.outputs[0]);
-    if (d_x.Rank != 4 || d_x.DType != x.DType ||
-        d_x.Sizes[0] != x.Sizes[0] || d_x.Sizes[1] != x.Sizes[1] ||
-        d_x.Sizes[2] != x.Sizes[2] || d_x.Sizes[3] != x.Sizes[3]) {
-        d_x = mRunState.temp_alloc(x.DType, {x.Sizes[0], x.Sizes[1], x.Sizes[2], x.Sizes[3]}, "repeat_interleave_heads_backward_d_x");
-        mTemps.push_back(d_x);
-    }
+    const std::vector<long> d_x_shape{x.Sizes[0], x.Sizes[1], x.Sizes[2], x.Sizes[3]};
+    Tensor d_x = ensure_output_tensor_or_persistent(
+        ensure_output_tensor(op.outputs[0]),
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".d_x",
+        x.DType, d_x_shape, "repeat_interleave_heads_backward");
 
     repeat_interleave_heads_backward(d_x, d_out, repeats, mRunState.MainStream);
     store_tensor(op.outputs[0], d_x);
 }
 
 }  // namespace dsl
-

@@ -10,9 +10,11 @@
 #include "runtime/dsl/graph_executor_helpers.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 
 #include "kernels/kernels.h"
 #include "runtime/core/forward_hooks.h"
@@ -29,6 +31,27 @@
 #include <vector>
 
 namespace dsl {
+
+namespace {
+
+bool contains_ci(std::string_view haystack, std::string_view needle) {
+    std::string h(haystack);
+    std::string n(needle);
+    std::transform(h.begin(), h.end(), h.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(n.begin(), n.end(), n.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return h.find(n) != std::string::npos;
+}
+
+bool is_qwen3_5_model(const modules::ModelConfig& cfg) {
+    return contains_ci(cfg.ModelTypeName, "qwen3_5") ||
+           contains_ci(cfg.ModelTypeName, "qwen3.5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3_5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3.5");
+}
+
+} // namespace
 
 // ============================================================================
 // Document masking: detect document boundaries from position_ids resets
@@ -169,6 +192,7 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         const float dropout = mLoRAConfig->dropout;
         const bool is_training = mLoRARunState->is_training;
         const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+        const bool use_qwen35_attention_lora = is_qwen3_5_model(cfg);
 
         // Helper to compute unique dropout seed per layer and projection type
         auto get_dropout_seed = [&](int proj_type) -> unsigned int {
@@ -184,6 +208,7 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
 
         switch (point) {
             case modules::ForwardHookPoint::AfterQKVProjection: {
+                if (use_qwen35_attention_lora) break;
                 // Projection types: 0=Q, 1=K, 2=V, 3=O, 4=Up, 5=Gate, 6=Down
                 if (lora_block.attention.q.has_value()) {
                     modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
@@ -208,6 +233,7 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
                 }
             } break;
             case modules::ForwardHookPoint::AfterAttnOutProjection: {
+                if (use_qwen35_attention_lora) break;
                 if (lora_block.attention.o.has_value()) {
                     modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
@@ -317,12 +343,14 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
         const int rank = mLoRAConfig->rank;
         const float scaling = mLoRAConfig->scaling();
         const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+        const bool use_qwen35_attention_lora = is_qwen3_5_model(cfg);
 
         auto& acts = rs.simplified_acts(layer_idx);
         auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
 
         switch (point) {
             case modules::ForwardHookPoint::AfterQKVProjection: {
+                if (use_qwen35_attention_lora) break;
                 // Validation: no dropout (is_training=false)
                 if (lora_block.attention.q.has_value()) {
                     modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
@@ -347,6 +375,7 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
                 }
             } break;
             case modules::ForwardHookPoint::AfterAttnOutProjection: {
+                if (use_qwen35_attention_lora) break;
                 if (lora_block.attention.o.has_value()) {
                     modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
@@ -474,6 +503,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
         const bool is_training = mLoRARunState->is_training;
         const int micro_step = mLoRARunState->micro_step;
         const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+        const bool use_qwen35_attention_lora = is_qwen3_5_model(cfg);
 
         // Helper to compute unique dropout seed per layer and projection type
         auto get_dropout_seed = [&](int proj_type) -> unsigned int {
@@ -613,6 +643,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                 }
             } break;
             case modules::BackwardHookPoint::AfterAttnOutBackward: {
+                if (use_qwen35_attention_lora) break;
                 if (!lora_block.attention.o.has_value()) break;
 
                 bool lora_accum = false;
@@ -639,6 +670,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
             } break;
             case modules::BackwardHookPoint::AfterQKVBackward: {
+                if (use_qwen35_attention_lora) break;
                 bool lora_accum = false;
                 auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                 lora_accum = lora_accum || accumulate;
@@ -1009,12 +1041,14 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
             const int rank = mLoRAConfig->rank;
             const float scaling = mLoRAConfig->scaling();
             const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+            const bool use_qwen35_attention_lora = is_qwen3_5_model(cfg);
 
             auto& acts = rs.simplified_acts(layer_idx);
             auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
 
             switch (point) {
                 case modules::ForwardHookPoint::AfterQKVProjection: {
+                    if (use_qwen35_attention_lora) break;
                     if (lora_block.attention.q.has_value()) {
                         modules::detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
@@ -1038,6 +1072,7 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                     }
                 } break;
                 case modules::ForwardHookPoint::AfterAttnOutProjection: {
+                    if (use_qwen35_attention_lora) break;
                     if (lora_block.attention.o.has_value()) {
                         modules::detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
                                                         mLoRARunState->intermediate, mLoRARunState->slice,
@@ -1235,6 +1270,7 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
         const bool is_training = mLoRARunState->is_training;
         const int micro_step = mLoRARunState->micro_step;
         const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+        const bool use_qwen35_attention_lora = is_qwen3_5_model(cfg);
 
         auto get_dropout_seed = [&](int proj_type) -> unsigned int {
             return mLoRARunState->dropout_base_seed
@@ -1331,6 +1367,7 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
                 }
             } break;
             case modules::BackwardHookPoint::AfterAttnOutBackward: {
+                if (use_qwen35_attention_lora) break;
                 if (!lora_block.attention.o.has_value()) break;
                 bool lora_accum = false;
                 auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
@@ -1348,6 +1385,7 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
             } break;
             case modules::BackwardHookPoint::AfterQKVBackward: {
+                if (use_qwen35_attention_lora) break;
                 bool lora_accum = false;
                 auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                 lora_accum = lora_accum || accumulate;
@@ -1554,6 +1592,7 @@ void DslModel::backward_grpo(Tensor inputs, Tensor targets,
             const bool is_training = mLoRARunState->is_training;
             const int micro_step = mLoRARunState->micro_step;
             const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+            const bool use_qwen35_attention_lora = is_qwen3_5_model(cfg);
 
             auto get_dropout_seed = [&](int proj_type) -> unsigned int {
                 return mLoRARunState->dropout_base_seed
@@ -1650,6 +1689,7 @@ void DslModel::backward_grpo(Tensor inputs, Tensor targets,
                     }
                 } break;
                 case modules::BackwardHookPoint::AfterAttnOutBackward: {
+                    if (use_qwen35_attention_lora) break;
                     if (!lora_block.attention.o.has_value()) break;
                     bool lora_accum = false;
                     auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
@@ -1667,6 +1707,7 @@ void DslModel::backward_grpo(Tensor inputs, Tensor targets,
                         rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 } break;
                 case modules::BackwardHookPoint::AfterQKVBackward: {
+                    if (use_qwen35_attention_lora) break;
                     bool lora_accum = false;
                     auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                     lora_accum = lora_accum || accumulate;

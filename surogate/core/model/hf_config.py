@@ -111,14 +111,24 @@ class HfConfigFactory:
             if quant_bits is not None:
                 res['quant_bits'] = quant_bits
         elif quant_method == 'bitsandbytes':
-            res['quant_method'] = 'bnb'
-            load_in_4bit = quantization_config.get('_load_in_4bit')
-            load_in_8bit = quantization_config.get('_load_in_8bit')
+            load_in_4bit = quantization_config.get('_load_in_4bit') or quantization_config.get('load_in_4bit')
+            load_in_8bit = quantization_config.get('_load_in_8bit') or quantization_config.get('load_in_8bit')
             bnb_4bit_compute_dtype = quantization_config.get('bnb_4bit_compute_dtype')
             if load_in_4bit:
+                # BnB 4-bit NF4 pre-quantized: packed NF4 + per-block absmax in safetensors
+                res['quant_method'] = 'prequant_bnb_nf4'
                 res['quant_bits'] = 4
+                res['bnb_double_quant'] = quantization_config.get('bnb_4bit_use_double_quant', False)
+                res['bnb_quant_type'] = quantization_config.get('bnb_4bit_quant_type', 'nf4')
+                # BnB uses llm_int8_skip_modules for modules to keep in full precision
+                skip_modules = quantization_config.get('llm_int8_skip_modules', [])
+                if skip_modules:
+                    res['modules_to_not_convert'] = skip_modules
             elif load_in_8bit:
+                res['quant_method'] = 'bnb'
                 res['quant_bits'] = 8
+            else:
+                res['quant_method'] = 'bnb'
             res['torch_dtype'] = HfConfigFactory.to_torch_dtype(bnb_4bit_compute_dtype)
         elif quant_method == 'hqq':
             res['quant_method'] = quant_method

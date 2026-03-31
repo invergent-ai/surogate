@@ -7,14 +7,68 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
+#include <utility>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "utilities/comm.h"
 #include "utilities/dtype.h"
 
 namespace dsl {
+
+namespace {
+Tensor make_persistent_tensor(DslRunState& run_state,
+                              std::unordered_map<std::string, void*>& buffers,
+                              std::unordered_map<std::string, size_t>& sizes,
+                              const std::string& key,
+                              ETensorDType dtype,
+                              const std::vector<long>& shape) {
+    const size_t elem_sz = get_dtype_size(dtype);
+    size_t nelem = 1;
+    for (long d : shape) {
+        nelem *= static_cast<size_t>(d);
+    }
+    const size_t bytes = nelem * elem_sz;
+    if (bytes == 0) {
+        Tensor t;
+        t.DType = dtype;
+        t.Rank = static_cast<int>(shape.size());
+        for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[static_cast<size_t>(i)];
+        return t;
+    }
+
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool capturing =
+        (cudaStreamIsCapturing(run_state.MainStream, &capture_status) == cudaSuccess &&
+         capture_status != cudaStreamCaptureStatusNone);
+
+    auto it = buffers.find(key);
+    if (it == buffers.end() || sizes[key] < bytes) {
+        if (capturing) {
+            throw std::runtime_error(
+                "mamba_gated_rmsnorm: missing preallocated persistent buffer for '" + key +
+                "' during CUDA graph capture");
+        }
+        if (it != buffers.end() && it->second != nullptr) {
+            CUDA_CHECK(cudaFree(it->second));
+        }
+        void* buf = nullptr;
+        CUDA_CHECK(cudaMalloc(&buf, bytes));
+        buffers[key] = buf;
+        sizes[key] = bytes;
+    }
+
+    Tensor t;
+    t.DType = dtype;
+    t.Rank = static_cast<int>(shape.size());
+    for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[static_cast<size_t>(i)];
+    t.Data = static_cast<std::byte*>(buffers[key]);
+    return t;
+}
+}  // namespace
 
 void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
     // Inputs: x [..., D], gate [..., D], weight [D]
@@ -46,15 +100,33 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
     const float eps = op.attrs.eps;
     const int groups = op.attrs.n_groups > 0 ? op.attrs.n_groups : 1;
     const bool norm_before_gate = op.attrs.norm_before_gate;
+    if (groups <= 0 || (D % groups) != 0) {
+        throw std::runtime_error("mamba_gated_rmsnorm: invalid groups="
+                                 + std::to_string(groups) + " for D="
+                                 + std::to_string(D));
+    }
 
     // 1. silu_gate = silu(gate)
     Tensor silu_gate = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_silu_gate");
     mTemps.push_back(silu_gate);
     silu_forward(silu_gate, gate, n, mRunState.MainStream);
 
-    Tensor out_t = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_out_t");
+    Tensor out_t;
+    bool out_is_ref = false;
+    if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+        Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
+        if (out_ref.DType == x.DType && out_ref.nelem() == n) {
+            out_t = (out_ref.Rank == x.Rank) ? out_ref : view_tensor(out_ref, x_shape);
+            out_is_ref = true;
+        }
+    }
+    if (!out_is_ref) {
+        // Hybrid EP paths can trigger shape/layout fallback more often. Avoid stack-backed
+        // temporaries for graph outputs: they can be recycled before downstream consumers run.
+        out_t = make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+                                       op.op_id + ".out_fallback", x.DType, x_shape);
+    }
     Tensor rstd = mRunState.temp_alloc(ETensorDType::FP32, {B * T, groups}, "mamba_gated_rmsnorm_rstd");
-    mTemps.push_back(out_t);
     mTemps.push_back(rstd);
 
     Tensor normed_or_gated;
@@ -142,12 +214,14 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
     // Saved input[5] is:
     // - norm_before_gate=False: gated = x * silu(gate) (norm input)
     // - norm_before_gate=True : normed = RMSNorm(x) (pre-gate normalized output)
+    //
+    // For robustness, backward recomputes rstd/normed_or_gated from x/gate/weight instead of
+    // consuming saved buffers directly. This avoids dependence on persisted scratch state that
+    // can be corrupted under certain EP execution paths.
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& x = resolve_tensor(op.inputs[1]);
     Tensor& gate = resolve_tensor(op.inputs[2]);
     Tensor& weight = resolve_tensor(op.inputs[3]);
-    Tensor& rstd = resolve_tensor(op.inputs[4]);
-    Tensor& normed_or_gated = resolve_tensor(op.inputs[5]);
 
     if (x.Rank != gate.Rank || x.Rank != d_out.Rank) {
         throw std::runtime_error("mamba_gated_rmsnorm_backward: rank mismatch among x/gate/d_out");
@@ -161,13 +235,54 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
     const int D = static_cast<int>(x.Sizes[x.Rank - 1]);
     const long n = static_cast<long>(B) * T * D;
     const std::vector<long> x_shape(x.Sizes.begin(), x.Sizes.begin() + x.Rank);
+    const float eps = op.attrs.eps;
     const int groups = op.attrs.n_groups > 0 ? op.attrs.n_groups : 1;
     const bool norm_before_gate = op.attrs.norm_before_gate;
+    if (groups <= 0 || (D % groups) != 0) {
+        throw std::runtime_error("mamba_gated_rmsnorm_backward: invalid groups="
+                                 + std::to_string(groups) + " for D="
+                                 + std::to_string(D));
+    }
 
     // Common gate activation for both branches
     Tensor silu_gate = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_silu_gate");
     mTemps.push_back(silu_gate);
     silu_forward(silu_gate, gate, n, mRunState.MainStream);
+
+    // Recompute normalization intermediates (rstd + branch-specific tensor) to avoid
+    // relying on saved transient buffers.
+    Tensor recomputed_rstd =
+        mRunState.temp_alloc(ETensorDType::FP32, {B * T, groups}, "mamba_gated_rmsnorm_backward_rstd");
+    Tensor recomputed_normed_or_gated =
+        mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_backward_normed_or_gated");
+    mTemps.push_back(recomputed_rstd);
+    mTemps.push_back(recomputed_normed_or_gated);
+
+    if (norm_before_gate) {
+        // recomputed_normed_or_gated := RMSNorm(x)
+        mamba_group_rmsnorm_forward(
+            recomputed_normed_or_gated, recomputed_rstd, x, weight, eps, B, T, D, groups,
+            mRunState.MainStream);
+    } else {
+        // recomputed_normed_or_gated := gated = x * silu(gate)
+        if (x.DType == ETensorDType::BF16) {
+            elementwise_mul(recomputed_normed_or_gated.get<nv_bfloat16>(), x.get<nv_bfloat16>(),
+                            silu_gate.get<nv_bfloat16>(), n, mRunState.MainStream);
+        } else if (x.DType == ETensorDType::FP16) {
+            elementwise_mul(recomputed_normed_or_gated.get<half>(), x.get<half>(),
+                            silu_gate.get<half>(), n, mRunState.MainStream);
+        } else {
+            elementwise_mul(recomputed_normed_or_gated.get<float>(), x.get<float>(),
+                            silu_gate.get<float>(), n, mRunState.MainStream);
+        }
+        // recomputed_rstd must match RMSNorm(gated)
+        Tensor tmp_normed =
+            mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_backward_tmp_normed");
+        mTemps.push_back(tmp_normed);
+        mamba_group_rmsnorm_forward(
+            tmp_normed, recomputed_rstd, recomputed_normed_or_gated, weight, eps, B, T, D, groups,
+            mRunState.MainStream);
+    }
 
     Tensor d_x = mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_x");
     Tensor d_gate = mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_gate");
@@ -192,22 +307,23 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
                             n, mRunState.MainStream);
         }
         // d_x, d_weight via RMSNorm backward on x.
-        mamba_group_rmsnorm_backward_dx(d_x, d_normed, x, weight, rstd, B, T, D, groups, mRunState.MainStream);
+        mamba_group_rmsnorm_backward_dx(
+            d_x, d_normed, x, weight, recomputed_rstd, B, T, D, groups, mRunState.MainStream);
         mamba_group_rmsnorm_backward_dweight_fp32(
-            d_weight_fp32, d_normed, x, rstd, B, T, D, groups, mRunState.MainStream);
+            d_weight_fp32, d_normed, x, recomputed_rstd, B, T, D, groups, mRunState.MainStream);
 
         // d_gate = silu_backward(d_out * normed, gate)
         Tensor d_out_times_normed = mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_out_times_normed");
         mTemps.push_back(d_out_times_normed);
         if (d_out.DType == ETensorDType::BF16) {
             elementwise_mul(d_out_times_normed.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(),
-                            normed_or_gated.get<nv_bfloat16>(), n, mRunState.MainStream);
+                            recomputed_normed_or_gated.get<nv_bfloat16>(), n, mRunState.MainStream);
         } else if (d_out.DType == ETensorDType::FP16) {
             elementwise_mul(d_out_times_normed.get<half>(), d_out.get<half>(),
-                            normed_or_gated.get<half>(), n, mRunState.MainStream);
+                            recomputed_normed_or_gated.get<half>(), n, mRunState.MainStream);
         } else {
             elementwise_mul(d_out_times_normed.get<float>(), d_out.get<float>(),
-                            normed_or_gated.get<float>(), n, mRunState.MainStream);
+                            recomputed_normed_or_gated.get<float>(), n, mRunState.MainStream);
         }
         silu_backward(d_gate, gate, d_out_times_normed, n, mRunState.MainStream);
     } else {
@@ -215,9 +331,11 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
         Tensor d_gated = mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_gated");
         mTemps.push_back(d_gated);
         mamba_group_rmsnorm_backward_dx(
-            d_gated, d_out, normed_or_gated, weight, rstd, B, T, D, groups, mRunState.MainStream);
+            d_gated, d_out, recomputed_normed_or_gated, weight, recomputed_rstd,
+            B, T, D, groups, mRunState.MainStream);
         mamba_group_rmsnorm_backward_dweight_fp32(
-            d_weight_fp32, d_out, normed_or_gated, rstd, B, T, D, groups, mRunState.MainStream);
+            d_weight_fp32, d_out, recomputed_normed_or_gated, recomputed_rstd,
+            B, T, D, groups, mRunState.MainStream);
 
         // d_x = d_gated * silu(gate)
         if (d_out.DType == ETensorDType::BF16) {
@@ -256,10 +374,12 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
         Tensor dst = dst_ref;
         if (dst.Rank != src.Rank || dst.nelem() != src.nelem()) {
             // Reallocate when shape doesn't match (happens in hybrid models where
-            // different block types share tensor_ids but have different dimensions)
+            // different block types share tensor_ids but have different dimensions).
+            // Use persistent storage rather than temp_alloc to avoid dangling output pointers.
             std::vector<long> shape(src.Sizes.begin(), src.Sizes.begin() + src.Rank);
-            dst = mRunState.temp_alloc(src.DType, shape, "mamba_gated_rmsnorm_backward_realloc");
-            mTemps.push_back(dst);
+            dst = make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+                                         op.op_id + "." + out_ref.name + ".realloc",
+                                         src.DType, shape);
         }
 
         bool accumulate = false;

@@ -382,6 +382,13 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         impl.pre_tokenizer_regex = {
             "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         };
+    } else if (architecture == "gpt_oss" || architecture == "gpt-oss") {
+        // GPT-OSS family: case-aware OpenAI word splitting with 1-3 digit groups.
+        impl.pre_tokenizer_regex = {
+            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+            "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+        };
     } else if (architecture == "gpt2" || architecture == "gpt_bigcode") {
         // GPT-2 family
         impl.pre_tokenizer_regex = {

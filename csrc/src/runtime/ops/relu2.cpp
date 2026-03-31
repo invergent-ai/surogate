@@ -17,9 +17,19 @@ void CompiledExecutor::dispatch_relu2(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
 
     // Element-wise op: output shape matches input shape.
-    // Compiled shape may be empty for MoE intermediates, so allocate from input dims.
+    // EP-routed MoE intermediates can have dynamic row counts, so the compiled
+    // output buffer may be empty or simply the wrong shape for this rank.
     Tensor out;
-    if (op.outputs[0].shape.empty() && inp.Rank > 0) {
+    auto needs_dynamic = [&](const TensorRef& out_ref, const Tensor& in) -> bool {
+        if (out_ref.shape.empty()) return true;
+        if (in.Rank <= 0) return false;
+        if (static_cast<int>(out_ref.shape.size()) != in.Rank) return true;
+        for (int i = 0; i < in.Rank; ++i) {
+            if (out_ref.shape[i] != in.Sizes[i]) return true;
+        }
+        return false;
+    };
+    if (needs_dynamic(op.outputs[0], inp)) {
         std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
         out = mRunState.temp_alloc(inp.DType, shape, "relu2_out");
         mTemps.push_back(out);

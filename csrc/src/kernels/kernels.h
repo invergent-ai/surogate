@@ -1839,8 +1839,10 @@ void moe_combine_backward(nv_bfloat16* d_expert_out, float* d_routing_weights,
                           const int* scatter_indices, int num_tokens, int total_tokens,
                           int hidden_size, int top_k, cudaStream_t stream);
 
-/// @brief Backward pass for token permutation.
-/// Gathers gradients from permuted order back to token order.
+/// @brief Backward pass for token permutation using gather_indices.
+/// Scatters gradients from permuted order back to token order with atomicAdd.
+/// This is kept as a legacy fallback; prefer
+/// moe_permute_backward_from_scatter for deterministic accumulation.
 /// @param d_input Output gradient in token order (num_tokens, hidden_size).
 /// @param d_permuted Input gradient in permuted order (total_tokens, hidden_size).
 /// @param gather_indices Gather indices from forward pass.
@@ -1853,6 +1855,20 @@ void moe_permute_backward(float* d_input, const float* d_permuted, const int* ga
                           int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
 void moe_permute_backward(nv_bfloat16* d_input, const nv_bfloat16* d_permuted, const int* gather_indices,
                           int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+/// @brief Backward pass for token permutation using scatter_indices.
+/// Deterministically gathers each token's top-k expert contributions without atomics.
+/// @param d_input Output gradient in token order (num_tokens, hidden_size).
+/// @param d_permuted Input gradient in permuted order (total_tokens, hidden_size).
+/// @param scatter_indices Inverse mapping from token-assignment index to permuted position.
+/// @param total_tokens Total token-expert assignments.
+/// @param num_tokens Number of original tokens.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_permute_backward_from_scatter(float* d_input, const float* d_permuted, const int* scatter_indices,
+                                       int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+void moe_permute_backward_from_scatter(nv_bfloat16* d_input, const nv_bfloat16* d_permuted, const int* scatter_indices,
+                                       int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
 
 /// @brief Compute router z-loss for MoE training regularization.
 /// z_loss = coef * (1/num_tokens) * sum_t(logsumexp(logits_t))^2
@@ -1923,7 +1939,7 @@ void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bf
 /// @param input Input tensor (total_tokens, K) FP8 E4M3
 /// @param weights Expert weights (num_experts, M, K) FP8 E4M3
 /// @param scale_input Per-tensor scale for input (device pointer)
-/// @param scale_weights Per-tensor scale for weights (device pointer)
+/// @param scale_weights Per-expert weight scales in compact/global expert order (device pointer)
 /// @param expert_offsets Token offsets per expert (num_experts + 1)
 /// @param num_experts Number of experts
 /// @param M Output dimension per expert
@@ -2141,7 +2157,7 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_up,
 /// @param d_output Input gradient from downstream (total_tokens, M) FP8 E5M2
 /// @param weights Expert weights (num_experts, M, K) FP8 E4M3
 /// @param scale_dout Per-tensor scale for d_output (device pointer)
-/// @param scale_weights Per-tensor scale for weights (device pointer)
+/// @param scale_weights Per-expert weight scales in compact/global expert order (device pointer)
 /// @param expert_offsets Token offsets per expert (num_experts + 1)
 /// @param num_experts Number of experts
 /// @param K Input dimension (hidden_size)

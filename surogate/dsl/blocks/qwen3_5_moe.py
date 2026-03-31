@@ -74,7 +74,7 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
         self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
         self.moe = nn.MoEExpertsGated(
             d_model, d_ff, num_experts, num_experts_per_tok,
-            norm_topk_prob=True, ep_size=ep_size,
+            norm_topk_prob=False, ep_size=ep_size,
         )
         self.shared_expert = nn.MoESharedExpert(d_model, shared_expert_intermediate)
 
@@ -178,7 +178,7 @@ class Qwen3_5MoELinearBlock(nn.Block):
         self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
         self.moe = nn.MoEExpertsGated(
             d_model, d_ff, num_experts, num_experts_per_tok,
-            norm_topk_prob=True, ep_size=ep_size,
+            norm_topk_prob=False, ep_size=ep_size,
         )
         self.shared_expert = nn.MoESharedExpert(d_model, shared_expert_intermediate)
 

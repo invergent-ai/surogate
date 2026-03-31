@@ -48,7 +48,11 @@ bool env_enabled(const char* name) {
 }
 
 inline int host_batch_row_for_local_rank(int local_rank, int ep_size) {
-    (void)ep_size;
+    // Default EP behavior: ranks in the same EP group consume the same host row.
+    // This keeps non-expert forward/backward numerically aligned across EP ranks.
+    if (ep_size > 1) {
+        return local_rank / ep_size;
+    }
     return local_rank;
 }
 
@@ -443,7 +447,7 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
  * Buffer layout expectation:
  * - `inputs` contains `local_gpus * B * T` int32 tokens laid out contiguously.
  * - EP disabled: rank `i` reads row `i`.
- * - EP enabled: each rank still reads its own row (row = local_rank).
+ * - EP enabled: ranks in the same EP group read the same row (`row = local_rank / ep_size`).
  * Same rule applies to `targets`.
  *
  * @param inputs Pointer to host int32 token IDs for all ranks (see layout above).
@@ -667,7 +671,6 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         : ((mContexts.front().Model->get_position_ids_buffer().Rank == 3)
               ? static_cast<int>(mContexts.front().Model->get_position_ids_buffer().Sizes[0])
               : 1);
-    const std::size_t pos_stride = stride * static_cast<std::size_t>(pos_planes);
 
     run_work([&](sThreadContext& ctx) {
         auto& rs = ctx.Model->get_run_state();
@@ -745,13 +748,25 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             const std::size_t offset =
                 (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
                  static_cast<std::size_t>(src_row)) * stride;
-            const std::size_t pos_offset =
+            const std::size_t pos_row_offset =
                 (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
-                 static_cast<std::size_t>(src_row)) * pos_stride;
+                 static_cast<std::size_t>(src_row)) * stride;
             std::memcpy(gs.inputs[j].Data, inputs + offset, stride * sizeof(std::int32_t));
             std::memcpy(gs.targets[j].Data, targets + offset, stride * sizeof(std::int32_t));
             if (position_ids) {
-                std::memcpy(gs.position_ids[j].Data, position_ids + pos_offset, pos_stride * sizeof(std::int32_t));
+                auto* dst = reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data);
+                const auto* src = position_ids + static_cast<std::ptrdiff_t>(pos_row_offset);
+                if (pos_planes > 1) {
+                    // Python passes 2D [rows, T] position IDs.
+                    // Expand to [planes, B, T] by replicating the same packed IDs
+                    // across planes (required to preserve doc-boundary resets).
+                    for (int p = 0; p < pos_planes; ++p) {
+                        std::memcpy(dst + static_cast<std::size_t>(p) * stride, src,
+                                    stride * sizeof(std::int32_t));
+                    }
+                } else {
+                    std::memcpy(dst, src, stride * sizeof(std::int32_t));
+                }
             } else {
                 fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data), pos_planes, B, T);
             }

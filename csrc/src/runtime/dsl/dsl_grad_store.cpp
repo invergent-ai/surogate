@@ -299,6 +299,7 @@ void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
 
 void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream, cudaEvent_t done_event) {
     const bool ep_active = comm.ep_enabled();
+    const bool ep_only = ep_active && (comm.dp_size() == 1);
 
     // Helper: reduce a single gradient using the appropriate communicator
     auto reduce_one = [&](const std::string& name, Tensor& grad) {
@@ -311,7 +312,7 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
 
     // If overlapped reduction is enabled and we have layer gradients that were already reduced,
     // only reduce non-layer gradients (embeddings, lm_head, final_norm)
-    if (is_overlapped_enabled() && mHasLayerGrads) {
+    if (is_overlapped_enabled() && mHasLayerGrads && !ep_only) {
         // Collect non-layer gradient names (those not in any layer)
         std::unordered_set<std::string> layer_grads;
         for (const auto& layer_names : mLayerGradNames) {
@@ -347,6 +348,9 @@ void DslGradStore::notify_block(int layer_idx, cudaStream_t stream, NCCLCommunic
     // No layer gradient map: can't do per-layer reduction
     if (layer_idx < 0 || layer_idx >= static_cast<int>(mLayerGradNames.size())) return;
     if (mLayerGradNames[layer_idx].empty()) return;
+    // EP-only (dp_size=1): defer layer grad reduction to reduce_all_async().
+    // Layer-end overlap can race with late gradient writes in EP backward paths.
+    if (comm.ep_enabled() && comm.dp_size() == 1) return;
 
     if (!mConfig.shard_gradients) {
         // ZeRO-1: reduce-scatter once per optimizer step (on the last micro-step)

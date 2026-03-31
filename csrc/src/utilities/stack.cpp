@@ -217,7 +217,9 @@ bool DeviceMemoryStack::is_live(const std::byte* ptr) const {
         return false;
     }
     for (const auto& rec : mAlloc) {
-        if (rec.Pointer == ptr) {
+        const std::byte* begin = rec.Pointer;
+        const std::byte* end = begin + rec.Amount;
+        if (ptr >= begin && ptr < end) {
             return true;
         }
     }

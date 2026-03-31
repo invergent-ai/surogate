@@ -640,6 +640,239 @@ static std::vector<size_t> unicode_regex_split_custom_qwen(const std::string & t
     return bpe_offsets;
 }
 
+// GPT-OSS system regex:
+// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+// \p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+static std::vector<size_t> unicode_regex_split_custom_gpt_oss(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        static const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
+        auto _get_cpt = [&] (const size_t pos) -> uint32_t {
+            return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : OUT_OF_RANGE;
+        };
+
+        auto _get_flags = [&] (const size_t pos) -> unicode_cpt_flags {
+            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        };
+
+        auto _is_upperlike = [&] (const unicode_cpt_flags & flags) -> bool {
+            return flags.is_accent_mark || (flags.is_letter && !flags.is_lowercase);
+        };
+
+        auto _is_lowerlike = [&] (const unicode_cpt_flags & flags) -> bool {
+            return flags.is_accent_mark || (flags.is_letter && !flags.is_uppercase);
+        };
+
+        auto _match_apostrophe_suffix = [&] (size_t pos) -> size_t {
+            if (_get_cpt(pos) != '\'' || pos + 1 >= offset_end) {
+                return pos;
+            }
+
+            const uint32_t cpt_next = unicode_tolower(_get_cpt(pos + 1));
+            if (cpt_next == 's' || cpt_next == 't' || cpt_next == 'm' || cpt_next == 'd') {
+                return pos + 2;
+            }
+
+            if (pos + 2 < offset_end) {
+                const uint32_t cpt_next_next = unicode_tolower(_get_cpt(pos + 2));
+                if ((cpt_next == 'r' && cpt_next_next == 'e') ||
+                    (cpt_next == 'v' && cpt_next_next == 'e') ||
+                    (cpt_next == 'l' && cpt_next_next == 'l')) {
+                    return pos + 3;
+                }
+            }
+
+            return pos;
+        };
+
+        auto _match_word_core_a = [&] (const size_t core_pos) -> size_t {
+            bool state_upper = true;   // [upperlike]*
+            bool state_lower = false;  // then [lowerlike]+
+            size_t best_end = core_pos;
+
+            for (size_t pos = core_pos; pos < offset_end; ++pos) {
+                const auto flags = _get_flags(pos);
+                const bool upperlike = _is_upperlike(flags);
+                const bool lowerlike = _is_lowerlike(flags);
+
+                const bool next_upper = state_upper && upperlike;
+                const bool next_lower = (state_upper || state_lower) && lowerlike;
+                state_upper = next_upper;
+                state_lower = next_lower;
+
+                if (!state_upper && !state_lower) {
+                    break;
+                }
+                if (state_lower) {
+                    best_end = pos + 1;
+                }
+            }
+
+            return best_end;
+        };
+
+        auto _match_word_core_b = [&] (const size_t core_pos) -> size_t {
+            bool state_upper = false;  // [upperlike]+
+            bool state_lower = false;  // then [lowerlike]*
+            bool first = true;
+            size_t best_end = core_pos;
+
+            for (size_t pos = core_pos; pos < offset_end; ++pos) {
+                const auto flags = _get_flags(pos);
+                const bool upperlike = _is_upperlike(flags);
+                const bool lowerlike = _is_lowerlike(flags);
+
+                const bool next_upper = (first || state_upper) && upperlike;
+                const bool next_lower = (state_upper || state_lower) && lowerlike;
+                state_upper = next_upper;
+                state_lower = next_lower;
+                first = false;
+
+                if (!state_upper && !state_lower) {
+                    break;
+                }
+
+                // Pattern B is already valid after the first upperlike codepoint.
+                best_end = pos + 1;
+            }
+
+            return best_end;
+        };
+
+        auto _match_word = [&] (const size_t token_pos) -> size_t {
+            const auto token_flags = _get_flags(token_pos);
+            const bool prefix_eligible =
+                !(token_flags.is_letter || token_flags.is_number) &&
+                _get_cpt(token_pos) != '\r' && _get_cpt(token_pos) != '\n';
+            const bool core_eligible = _is_upperlike(token_flags) || _is_lowerlike(token_flags);
+
+            auto _match_pattern = [&] (const auto & core_matcher) -> size_t {
+                // The leading ? is greedy, so try consuming it first, then backtrack.
+                if (prefix_eligible && token_pos + 1 < offset_end) {
+                    const size_t core_end = core_matcher(token_pos + 1);
+                    if (core_end > token_pos + 1) {
+                        return _match_apostrophe_suffix(core_end);
+                    }
+                }
+
+                if (core_eligible) {
+                    const size_t core_end = core_matcher(token_pos);
+                    if (core_end > token_pos) {
+                        return _match_apostrophe_suffix(core_end);
+                    }
+                }
+
+                return token_pos;
+            };
+
+            size_t best_end = _match_pattern(_match_word_core_a);
+            if (best_end > token_pos) {
+                return best_end;
+            }
+
+            return _match_pattern(_match_word_core_b);
+        };
+
+        size_t _prev_end = offset_ini;
+        auto _add_token = [&] (const size_t end) -> size_t {
+            assert(_prev_end <= end && end <= offset_end);
+            size_t len = end - _prev_end;
+            if (len > 0) {
+                bpe_offsets.push_back(len);
+            }
+            _prev_end = end;
+            return len;
+        };
+
+        for (size_t pos = offset_ini; pos < offset_end; /*pos++*/ ) {
+            const uint32_t cpt = _get_cpt(pos);
+            const auto flags = _get_flags(pos);
+
+            const size_t word_end = _match_word(pos);
+            if (word_end > pos) {
+                pos = word_end;
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: \p{N}{1,3}
+            if (flags.is_number) {
+                size_t ini = pos;
+                while (_get_flags(pos).is_number) {
+                    if (++pos - ini >= 3) {
+                        _add_token(pos);
+                        ini = pos;
+                    }
+                }
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: <space>?[^\s\p{L}\p{N}]+[\r\n/]*
+            auto flags2 = (cpt == ' ' ? _get_flags(pos + 1) : flags);
+            if (!(flags2.is_whitespace || flags2.is_letter || flags2.is_number) && flags2.as_uint()) {
+                pos += (cpt == ' ');
+                while (!(flags2.is_whitespace || flags2.is_letter || flags2.is_number) && flags2.as_uint()) {
+                    flags2 = _get_flags(++pos);
+                }
+                uint32_t cpt2 = _get_cpt(pos);
+                while (cpt2 == '\r' || cpt2 == '\n' || cpt2 == '/') {
+                    cpt2 = _get_cpt(++pos);
+                }
+                _add_token(pos);
+                continue;
+            }
+
+            size_t num_whitespaces = 0;
+            size_t last_end_r_or_n = 0;
+            while (_get_flags(pos + num_whitespaces).is_whitespace) {
+                uint32_t cpt2 = _get_cpt(pos + num_whitespaces);
+                if (cpt2 == '\r' || cpt2 == '\n') {
+                    last_end_r_or_n = pos + num_whitespaces + 1;
+                }
+                num_whitespaces++;
+            }
+
+            // regex: \s*[\r\n]+
+            if (last_end_r_or_n > 0) {
+                pos = last_end_r_or_n;
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: \s+(?!\S)
+            if (num_whitespaces > 1 && _get_cpt(pos + num_whitespaces) != OUT_OF_RANGE) {
+                pos += num_whitespaces - 1;
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: \s+
+            if (num_whitespaces > 0) {
+                pos += num_whitespaces;
+                _add_token(pos);
+                continue;
+            }
+
+            // no matches
+            _add_token(++pos);
+        }
+    }
+
+    return bpe_offsets;
+}
+
 // K2 system regex patterns (from tokenization_kimi.py):
 // [\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 static std::vector<size_t> unicode_regex_split_custom_kimi_k2(const std::string & text, const std::vector<size_t> & offsets) {
@@ -901,6 +1134,16 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         // Qwen2/3 pattern (same as Llama3 but \p{N} instead of \p{N}{1,3})
         bpe_offsets = unicode_regex_split_custom_qwen(text, offsets);
+    } else if (
+            regex_expr ==
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
+            regex_expr ==
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|"
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|"
+                "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_gpt_oss(text, offsets);
     } else if (
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         // Qwen3.5 pattern (includes \p{M} accent marks in letter matching)

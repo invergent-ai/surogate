@@ -844,6 +844,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 self.qlora_config = _surogate.QLoRAConfig.prequant_nvfp4()
             elif prequant_method == 'prequant_mxfp4':
                 self.qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
+            elif prequant_method == 'prequant_bnb_nf4':
+                bnb_dq = self.model_info.quant_info.get('bnb_double_quant', False)
+                self.qlora_config = _surogate.QLoRAConfig.prequant_bnb(double_quant=bnb_dq)
             # Populate modules_to_not_convert from HF config
             ignore_list = self.model_info.quant_info.get('modules_to_not_convert', [])
             if ignore_list:

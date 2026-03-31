@@ -7,15 +7,70 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
+#include <unordered_map>
+#include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
+#include "runtime/dsl/graph_executor_utils.h"
+#include "utilities/comm.h"
 #include "utilities/utils.h"
 
 namespace dsl {
 namespace {
+
+Tensor make_persistent_tensor(DslRunState& run_state,
+                              std::unordered_map<std::string, void*>& buffers,
+                              std::unordered_map<std::string, size_t>& sizes,
+                              const std::string& key,
+                              ETensorDType dtype,
+                              const std::vector<long>& shape) {
+    const size_t elem_sz = get_dtype_size(dtype);
+    size_t nelem = 1;
+    for (long d : shape) {
+        nelem *= static_cast<size_t>(d);
+    }
+    const size_t bytes = nelem * elem_sz;
+    if (bytes == 0) {
+        Tensor t;
+        t.DType = dtype;
+        t.Rank = static_cast<int>(shape.size());
+        for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[static_cast<size_t>(i)];
+        return t;
+    }
+
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool capturing =
+        (cudaStreamIsCapturing(run_state.MainStream, &capture_status) == cudaSuccess &&
+         capture_status != cudaStreamCaptureStatusNone);
+
+    auto it = buffers.find(key);
+    if (it == buffers.end() || sizes[key] < bytes) {
+        if (capturing) {
+            throw std::runtime_error(
+                "gated_delta_rule: missing preallocated persistent buffer for '" + key +
+                "' during CUDA graph capture");
+        }
+        if (it != buffers.end() && it->second != nullptr) {
+            CUDA_CHECK(cudaFree(it->second));
+        }
+        void* buf = nullptr;
+        CUDA_CHECK(cudaMalloc(&buf, bytes));
+        buffers[key] = buf;
+        sizes[key] = bytes;
+    }
+
+    Tensor t;
+    t.DType = dtype;
+    t.Rank = static_cast<int>(shape.size());
+    for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[static_cast<size_t>(i)];
+    t.Data = static_cast<std::byte*>(buffers[key]);
+    return t;
+}
 
 
 bool tensor_shape_matches(const Tensor& t, long n0, long n1, long n2, long n3) {
@@ -89,8 +144,8 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         }
     }
     if (!out_is_ref) {
-        out_val = mRunState.temp_alloc(v.DType, {B, T, H, V}, "gated_delta_rule_output");
-        mTemps.push_back(out_val);
+        out_val = make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+                                         op.op_id + ".out_fallback", v.DType, {B, T, H, V});
     }
 
     Tensor state_val;
@@ -104,8 +159,9 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         }
     }
     if (!state_is_ref) {
-        state_val = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_final_state");
-        mTemps.push_back(state_val);
+        state_val = make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+                                           op.op_id + ".state_fallback", ETensorDType::FP32,
+                                           {B, H, K, V});
     }
     Tensor* out_ptr = &out_val;
     Tensor* final_state_ptr = &state_val;
@@ -347,9 +403,9 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
                 out_ref.Sizes[1] != shape[1] || out_ref.Sizes[2] != shape[2])) ok = false;
             if (ok) return out_ref;
         }
-        Tensor temp = mRunState.temp_alloc(dtype, shape);
-        mTemps.push_back(temp);
-        return temp;
+        return make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+                                      op.op_id + ".bwd_out" + std::to_string(out_idx) + ".fallback",
+                                      dtype, shape);
     };
 
     if (debug_replay) fprintf(stderr, "[GDR_BWD] allocating outputs B=%ld T=%ld H=%ld K=%ld V=%ld\n", B, T, H, K, V);
@@ -395,6 +451,8 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     void* dk_data = d_k->Data;
     Tensor q_norm_bwd, k_norm_bwd, q_rstd_bwd, k_rstd_bwd;
     Tensor dq_norm_buf, dk_norm_buf;
+    const Tensor* q_eff_tensor = &q;
+    const Tensor* k_eff_tensor = &k;
     if (use_l2norm) {
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: allocating temps...\n");
         q_norm_bwd = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_q_norm_bwd");
@@ -424,6 +482,8 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: done, allocating dq/dk norm buffers...\n");
         q_eff = q_norm_bwd.Data;
         k_eff = k_norm_bwd.Data;
+        q_eff_tensor = &q_norm_bwd;
+        k_eff_tensor = &k_norm_bwd;
         // Backward pipeline writes dq_norm/dk_norm to temp buffers
         try {
             if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: temp_alloc dq_norm q.DType=%d\n", static_cast<int>(q.DType));
@@ -568,6 +628,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
                                 static_cast<unsigned>(BH)},
                                args, 15, stream);
     }
+    const long dg_bth = B * T * H;
 
     // TODO: dg_nk reduction across NK dimension needs a small kernel or cumsum approach.
     // For now, the dg reduction is deferred to the cumsum_rev step below, which
@@ -578,11 +639,10 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     {
         // Simple approach: use first slice as accumulator, add remaining slices.
         // For NK=2 (typical), this is just one addition.
-        const long bth = B * T * H;
         float* dg_base = dg_nk.get<float>();
         float* dg_out_ptr = d_g->get<float>();
         // Copy first slice
-        CUDA_CHECK(cudaMemcpyAsync(dg_out_ptr, dg_base, bth * sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(dg_out_ptr, dg_base, dg_bth * sizeof(float),
                                     cudaMemcpyDeviceToDevice, stream));
         for (int nk = 1; nk < NK; ++nk) {
             // dg_out += dg_nk[nk]
@@ -591,8 +651,8 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             float alpha = 1.0f;
             cublasHandle_t handle = mRunState.cublas_handle();
             cublasSetStream(handle, stream);
-            cublasSaxpy(handle, static_cast<int>(bth), &alpha,
-                        dg_base + nk * bth, 1, dg_out_ptr, 1);
+            cublasSaxpy(handle, static_cast<int>(dg_bth), &alpha,
+                        dg_base + nk * dg_bth, 1, dg_out_ptr, 1);
         }
     }
 
@@ -653,6 +713,10 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             mGdrKernels.l2norm_bwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
                                      args, 5, stream);
         }
+    }
+
+    if (mComm && mComm->ep_enabled() && (mComm->dp_size() == 1)) {
+        mComm->all_reduce_avg(*d_g, stream);
     }
 
     CUDA_CHECK(cudaGetLastError());

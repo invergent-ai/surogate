@@ -881,13 +881,13 @@ def chunk_bwd_dqkwg_kernel(
         b_h = tl.load(p_h, boundary_check=(0, 1))
         b_dh_v = tl.load(p_dh, boundary_check=(0, 1))
         b_dg_last += tl.sum(b_h * b_dh_v)
-        b_ds += tl.dot(b_do, tl.trans(b_v))
-        b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
-        b_dk += tl.dot(b_v, b_dh_v.to(b_v.dtype))
+        b_ds += safe_dot(b_do, tl.trans(b_v))
+        b_dq += safe_dot(b_do, b_h.to(b_do.dtype))
+        b_dk += safe_dot(b_v, b_dh_v.to(b_v.dtype))
         # dw = -sum_v(dv @ h^T) per K-block
         p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_dv_v = tl.load(p_dv, boundary_check=(0, 1))
-        b_dw += tl.dot(b_dv_v.to(b_v.dtype), b_h.to(b_v.dtype))
+        b_dw += safe_dot(b_dv_v.to(b_v.dtype), b_h.to(b_v.dtype))
 
     p_dw = tl.make_block_ptr(dw, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     tl.store(p_dw, (-b_dw).to(p_dw.dtype.element_ty), boundary_check=(0, 1))
@@ -922,13 +922,13 @@ def chunk_bwd_dqkwg_kernel(
     b_dg_last += tl.sum(b_dk * b_k)
 
     b_ds = tl.where(m_A, b_ds * tl.exp(b_g[:, None] - b_g[None, :]), 0) * scale
-    b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
+    b_ds2 = b_ds * safe_dot(b_q, tl.trans(b_k))
     b_dg += tl.sum(b_ds2, axis=1)
     b_dg -= tl.sum(b_ds2, axis=0)
 
     b_ds = b_ds.to(b_k.dtype)
-    b_dq += tl.dot(b_ds, b_k)
-    b_dk += tl.dot(tl.trans(b_ds), b_q)
+    b_dq += safe_dot(b_ds, b_k)
+    b_dk += safe_dot(tl.trans(b_ds), b_q)
 
     p_dg = tl.make_block_ptr(dg, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_dg = tl.where(o_t < min(i_t * BT + BT, T) - 1, b_dg, b_dg + b_dg_last)

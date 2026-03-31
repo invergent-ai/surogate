@@ -31,6 +31,7 @@ enum class QLoRAQuantStrategy {
     PrequantFP8,    ///< HF fine-grained FP8: per-block (128x128) FP8 E4M3 + FP32 inverse scales
     PrequantNVFP4,  ///< HF NVFP4 (ModelOpt): packed FP4 + FP8 block scales + FP32 global scale
     PrequantMXFP4,  ///< HF MXFP4: packed FP4 + E8M0 shared exponents per 32-element block
+    PrequantBnBNF4, ///< HF BitsAndBytes NF4: packed NF4 + per-block absmax (± double quant)
 };
 
 /**
@@ -211,7 +212,8 @@ struct QLoRAConfig {
     [[nodiscard]] bool is_prequantized() const {
         return strategy == QLoRAQuantStrategy::PrequantFP8 ||
                strategy == QLoRAQuantStrategy::PrequantNVFP4 ||
-               strategy == QLoRAQuantStrategy::PrequantMXFP4;
+               strategy == QLoRAQuantStrategy::PrequantMXFP4 ||
+               strategy == QLoRAQuantStrategy::PrequantBnBNF4;
     }
 
     /**
@@ -325,6 +327,32 @@ struct QLoRAConfig {
     }
 
     /**
+     * @brief Create config for loading HF pre-quantized BitsAndBytes NF4 models
+     *
+     * For models saved with bitsandbytes 4-bit quantization (quant_method = "bitsandbytes",
+     * load_in_4bit = true). Weights are packed NF4 (2 values per byte) with per-block
+     * absmax scaling. Optionally includes double quantization (INT8-quantized absmax
+     * with nested per-group scales + offset).
+     *
+     * During loading, double-quantized absmax is recovered to FP32 on CPU,
+     * so the runtime always uses the simple FP32-absmax dequant path.
+     *
+     * @param source_double_quant Whether the HF source model uses double quantization.
+     *        When true, the loader reads nested_absmax + nested_quant_map + offset
+     *        to recover FP32 absmax. When false, absmax is read directly as FP32.
+     */
+    static QLoRAConfig prequant_bnb(bool source_double_quant = false) {
+        QLoRAConfig cfg;
+        cfg.enabled = true;
+        cfg.strategy = QLoRAQuantStrategy::PrequantBnBNF4;
+        cfg.scale_config.block_size = 64;  // BnB default block size
+        cfg.base_dtype = ETensorDType::BYTE;  // Packed NF4 stored as uint8
+        cfg.adapter_dtype = ETensorDType::BF16;
+        cfg.bnb_double_quant = source_double_quant;
+        return cfg;
+    }
+
+    /**
      * @brief Create disabled QLoRA configuration (regular LoRA)
      */
     static QLoRAConfig none() {
@@ -344,6 +372,7 @@ inline const char* to_string(QLoRAQuantStrategy strategy) {
         case QLoRAQuantStrategy::PrequantFP8: return "prequant_fp8";
         case QLoRAQuantStrategy::PrequantNVFP4: return "prequant_nvfp4";
         case QLoRAQuantStrategy::PrequantMXFP4: return "prequant_mxfp4";
+        case QLoRAQuantStrategy::PrequantBnBNF4: return "prequant_bnb_nf4";
         default: return "unknown";
     }
 }

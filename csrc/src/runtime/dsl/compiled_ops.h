@@ -332,6 +332,22 @@ private:
                                              const int* device_offsets,
                                              int num_experts);
 
+    // EP replay-aware cache key helpers.
+    // For EP, replay forward can run before backward and overwrite per-layer metadata.
+    // Keying EP metadata by (layer, replay_slot) prevents replay=1 clobbering replay=0.
+    [[nodiscard]] int ep_state_key(int layer_idx) const {
+        if (layer_idx < 0) return layer_idx;
+        if (mOptions.EPSize <= 1) return layer_idx;
+        return (layer_idx << 1) | (mInReplay ? 1 : 0);
+    }
+    [[nodiscard]] std::string moe_saved_key(int layer_idx, const char* suffix) const {
+        std::string key = "blocks[" + std::to_string(layer_idx) + "]." + suffix;
+        if (mOptions.EPSize > 1) {
+            key += (mInReplay ? "#r1" : "#r0");
+        }
+        return key;
+    }
+
     // Layer boundary handling
     void handle_layer_start(int layer_idx);
     void handle_layer_end(int layer_idx);
@@ -459,8 +475,9 @@ private:
     void* mMoEExpertOffsetsGPU = nullptr;  // Persistent GPU buffer (not stack-allocated)
     size_t mMoEExpertOffsetsGPUSize = 0;   // Size in bytes
 
-    // Per-layer host-side MoE expert offsets cache.
-    // Populated once per layer (forward: in dispatch_moe_permute; backward: on first access).
+    // Host-side MoE expert offsets cache.
+    // Key is layer_idx for non-EP, ep_state_key(layer_idx) for EP.
+    // Populated once per key (forward: in permute/ep_dispatch; backward: on first access).
     // Avoids redundant D2H synchronization in grouped GEMM ops within the same layer.
     std::unordered_map<int, std::vector<int>> mMoEHostOffsetsCache;
 
@@ -486,8 +503,24 @@ private:
         size_t llep_send_reorder_bytes = 0;
         void* local_scatter_gpu = nullptr; // local_scatter [total_recv] indices output
         size_t local_scatter_bytes = 0;
+        // Forward EP outputs must remain valid until backward of this layer.
+        // Shared cross-layer buffers can be overwritten by subsequent layers/recompute.
+        void* sorted_recv_gpu = nullptr;    // ep_dispatch output [total_recv, hidden]
+        size_t sorted_recv_bytes = 0;
+        void* combined_gpu = nullptr;       // ep_combine output [total_send, hidden]
+        size_t combined_bytes = 0;
+        void* llep_combined_gpu = nullptr;  // ep_combine LLEP reorder output [total_send, hidden]
+        size_t llep_combined_bytes = 0;
+        // Backward EP outputs must also remain valid until their consumer runs.
+        // Shared cross-layer buffers can be overwritten by later EP ops.
+        void* dispatch_bwd_send_gpu = nullptr;  // ep_dispatch_backward reverse A2A [total_send, hidden]
+        size_t dispatch_bwd_send_bytes = 0;
+        void* dispatch_bwd_out_gpu = nullptr;   // ep_dispatch_backward LLEP reorder output [total_send, hidden]
+        size_t dispatch_bwd_out_bytes = 0;
+        void* combine_bwd_sorted_gpu = nullptr; // ep_combine_backward output [total_recv, hidden]
+        size_t combine_bwd_sorted_bytes = 0;
     };
-    std::unordered_map<int, EpLayerState> mEpStates;  // keyed by layer_idx
+    std::unordered_map<int, EpLayerState> mEpStates;  // keyed by ep_state_key(layer_idx)
 
     // LLEP (Least-Loaded EP) per-layer state for dynamic load balancing.
     // When active, merged weight tensors contain native + foreign expert weights,
@@ -542,7 +575,7 @@ private:
             down_weight_ptrs.clear();
         }
     };
-    std::unordered_map<int, LLEPLayerState> mLLEPStates;  // keyed by layer_idx
+    std::unordered_map<int, LLEPLayerState> mLLEPStates;  // keyed by ep_state_key(layer_idx)
 
     // Lightweight per-layer EP metadata — survives LLEP state clearing.
     // Backward uses this to reconstruct native-only weight pointers when
@@ -553,7 +586,7 @@ private:
         int num_local = 0;                 // number of native experts
         std::vector<int> merged_to_global; // merged_idx → global expert ID
     };
-    std::unordered_map<int, EPLayerMeta> mEPLayerMeta;  // keyed by layer_idx
+    std::unordered_map<int, EPLayerMeta> mEPLayerMeta;  // keyed by ep_state_key(layer_idx)
 
     // Shared GPU buffers for EP combine / dispatch_backward output (off-stack).
     // Only one layer uses these at a time, so sharing saves ~1.2 GB vs per-layer.
@@ -584,6 +617,7 @@ private:
     // because the pool recycles buffers for temporary EP intermediates, which would overwrite
     // data still referenced by saved tensors. Freed at destructor time.
     std::vector<EpPoolEntry> mEpRetiredBufs;
+    void clear_replay_copied_refs();
 
     // Reusable per-forward layer tracking vectors (avoid heap allocation every forward call).
     std::vector<DeviceMemoryStack::Checkpoint> mLayerCheckpoints;

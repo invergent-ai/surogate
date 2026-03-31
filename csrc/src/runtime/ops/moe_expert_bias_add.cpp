@@ -27,7 +27,6 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
         std::string field;
         parse_block_param(name, layer_idx_any, field);
     }
-
     if (layer_idx_any >= 0) {
         // For the last MoE layer, prefer the global expert_offsets restored for backward.
         if (layer_idx_any == static_cast<int>(mConfig.NumLayers) - 1) {
@@ -48,8 +47,17 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
                 cudaGetLastError();
             }
         }
-        const std::string key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+        const std::string key = moe_saved_key(layer_idx_any, "moe_expert_offsets");
         auto it_saved = mMoeSavedBuffers.find(key);
+        std::string size_key = key;
+        if (it_saved == mMoeSavedBuffers.end()) {
+            const std::string legacy_key =
+                "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+            it_saved = mMoeSavedBuffers.find(legacy_key);
+            if (it_saved != mMoeSavedBuffers.end()) {
+                size_key = legacy_key;
+            }
+        }
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             cudaPointerAttributes attr{};
             cudaError_t err = cudaPointerGetAttributes(&attr, it_saved->second);
@@ -57,7 +65,7 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
             // Use actual stored size (may be num_merged+1 when LLEP is active, not num_local+1)
-            auto size_it = mMoeSavedSizes.find(key);
+            auto size_it = mMoeSavedSizes.find(size_key);
             if (size_it != mMoeSavedSizes.end()) {
                 expert_offsets_view.Sizes[0] = static_cast<long>(size_it->second / sizeof(int));
             } else {
@@ -117,12 +125,13 @@ void CompiledExecutor::dispatch_moe_expert_bias_add(const CompiledOp& op) {
         std::string field;
         parse_block_param(name, layer_idx, field);
     }
+    const int ep_key = ep_state_key(layer_idx);
 
     // Check if LLEP is active for this layer (merged experts != local experts)
     int num_experts = static_cast<int>(mConfig.NumLocalExperts);
     const LLEPLayerState* llep = nullptr;
     if (layer_idx >= 0) {
-        auto it = mLLEPStates.find(layer_idx);
+        auto it = mLLEPStates.find(ep_key);
         if (it != mLLEPStates.end() && it->second.active) {
             llep = &it->second;
             num_experts = llep->num_merged_experts;

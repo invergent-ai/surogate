@@ -1,14 +1,13 @@
 #include "runtime/dsl/compiled_ops.h"
 
-#include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -19,7 +18,6 @@
 #include "utilities/dtype.h"
 
 namespace dsl {
-
 void CompiledExecutor::dispatch_swiglu(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
 
@@ -71,6 +69,15 @@ void CompiledExecutor::dispatch_swiglu_backward(const CompiledOp& op) {
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& inp = resolve_tensor(op.inputs[1]);
     Tensor& d_inp = ensure_output_tensor(op.outputs[0]);
+    int layer_idx = op.attrs.layer_idx;
+    if (layer_idx < 0 && op.inputs.size() > 1) {
+        std::string_view name = op.inputs[1].name;
+        if (name.rfind("saved.", 0) == 0) {
+            name.remove_prefix(6);
+        }
+        std::string field;
+        parse_block_param(name, layer_idx, field);
+    }
 
     // For FP8 hybrid backward, record abs_max of d_mlp_up for subsequent quantization
     float* abs_max_ptr = mRunState.has_fp8_hybrid_backward()

@@ -6,6 +6,7 @@
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <iostream>
 #include <limits>
@@ -13,6 +14,7 @@
 
 #include <cuda_bf16.h>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
@@ -78,6 +80,127 @@ void read_raw_padded(const SafeTensorEntry& entry, Tensor& target,
     } else {
         entry.read_raw(target, 0, target_nelem, true);
     }
+}
+
+/// Recover FP32 per-block absmax from BnB double-quantized components.
+///
+/// BnB double quantization stores absmax as INT8 with a nested quantization
+/// layer. This function reads the auxiliary tensors from safetensors and
+/// reconstructs FP32 absmax values on CPU:
+///   recovered[i] = nested_quant_map[absmax_u8[i]] * nested_absmax[i/256] + offset
+///
+/// @param reader       SafeTensors reader.
+/// @param hf_name      HF weight name prefix (e.g., "model.layers.0.self_attn.q_proj.weight").
+/// @param output_gpu   Pre-allocated FP32 GPU buffer to write recovered absmax into.
+/// @param num_blocks   Number of quantization blocks (= ceil(num_elements / block_size)).
+/// @param stream       CUDA stream.
+/// @return true if recovery succeeded, false if required tensors are missing.
+bool recover_bnb_double_quant_absmax(
+    const SafeTensorsReader& reader,
+    const std::string& hf_name,
+    void* output_gpu,
+    long num_blocks,
+    cudaStream_t stream) {
+
+    constexpr int nested_block_size = 256;  // BnB default
+    const long num_groups = (num_blocks + nested_block_size - 1) / nested_block_size;
+
+    // 1. Read INT8 absmax (U8) → GPU temp → CPU
+    std::string absmax_hf = hf_name + ".absmax";
+    const auto* absmax_ep = try_find_entry(reader, absmax_hf);
+    if (!absmax_ep) return false;
+
+    void* absmax_gpu = nullptr;
+    CUDA_CHECK(cudaMalloc(&absmax_gpu, num_blocks));
+    Tensor absmax_tensor = Tensor::from_pointer(
+        static_cast<std::byte*>(absmax_gpu), 0,
+        ETensorDType::BYTE, std::vector<long>{num_blocks});
+    absmax_ep->read_raw(absmax_tensor, 0, num_blocks, true);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<uint8_t> absmax_u8(num_blocks);
+    CUDA_CHECK(cudaMemcpy(absmax_u8.data(), absmax_gpu,
+        num_blocks, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(absmax_gpu));
+
+    // 2. Read nested_absmax (per-group FP32) → GPU temp → CPU
+    std::string nested_hf = hf_name + ".nested_absmax";
+    const auto* nested_ep = try_find_entry(reader, nested_hf);
+    if (!nested_ep) return false;
+
+    void* nested_gpu = nullptr;
+    const size_t nested_bytes = num_groups * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&nested_gpu, nested_bytes));
+    Tensor nested_tensor = Tensor::from_pointer(
+        static_cast<std::byte*>(nested_gpu), 0,
+        ETensorDType::FP32, std::vector<long>{num_groups});
+    nested_ep->read_raw(nested_tensor, 0, num_groups, true);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<float> nested_absmax(num_groups);
+    CUDA_CHECK(cudaMemcpy(nested_absmax.data(), nested_gpu,
+        nested_bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(nested_gpu));
+
+    // 3. Read nested_quant_map (dynamic 8-bit codebook, 256 entries) → GPU temp → CPU
+    std::string qmap_hf = hf_name + ".nested_quant_map";
+    const auto* qmap_ep = try_find_entry(reader, qmap_hf);
+    if (!qmap_ep) return false;
+
+    void* qmap_gpu = nullptr;
+    CUDA_CHECK(cudaMalloc(&qmap_gpu, 256 * sizeof(float)));
+    Tensor qmap_tensor = Tensor::from_pointer(
+        static_cast<std::byte*>(qmap_gpu), 0,
+        ETensorDType::FP32, std::vector<long>{256L});
+    qmap_ep->read_raw(qmap_tensor, 0, 256, true);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<float> nested_quant_map(256);
+    CUDA_CHECK(cudaMemcpy(nested_quant_map.data(), qmap_gpu,
+        256 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(qmap_gpu));
+
+    // 4. Read nested_offset from quant_state JSON metadata blob
+    float nested_offset = 0.0f;
+    std::string qs_hf = hf_name + ".quant_state.bitsandbytes__nf4";
+    const auto* qs_ep = try_find_entry(reader, qs_hf);
+    if (qs_ep) {
+        long qs_nelem = 1;
+        for (auto d : qs_ep->shape()) qs_nelem *= d;
+        void* qs_gpu = nullptr;
+        CUDA_CHECK(cudaMalloc(&qs_gpu, qs_nelem));
+        Tensor qs_tensor = Tensor::from_pointer(
+            static_cast<std::byte*>(qs_gpu), 0,
+            ETensorDType::BYTE, std::vector<long>{qs_nelem});
+        qs_ep->read_raw(qs_tensor, 0, qs_nelem, false);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<uint8_t> qs_bytes(qs_nelem);
+        CUDA_CHECK(cudaMemcpy(qs_bytes.data(), qs_gpu,
+            qs_nelem, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(qs_gpu));
+        std::string qs_json(qs_bytes.begin(), qs_bytes.end());
+        try {
+            auto j = nlohmann::json::parse(qs_json);
+            nested_offset = j.value("nested_offset", 0.0f);
+        } catch (...) {
+            // Fall back to offset=0 if JSON parsing fails
+        }
+    }
+
+    // 5. Recover FP32 absmax on CPU:
+    //    recovered[i] = quant_map[absmax_u8[i]] * nested_absmax[i/256] + offset
+    std::vector<float> recovered(num_blocks);
+    for (long i = 0; i < num_blocks; ++i) {
+        const float dequant_val = nested_quant_map[absmax_u8[i]];
+        const float group_scale = nested_absmax[i / nested_block_size];
+        recovered[i] = dequant_val * group_scale + nested_offset;
+    }
+
+    // 6. Copy recovered FP32 absmax to GPU output buffer
+    CUDA_CHECK(cudaMemcpyAsync(
+        output_gpu, recovered.data(),
+        num_blocks * sizeof(float),
+        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    return true;
 }
 
 /// Temporary GPU allocation for loading pre-quantized expert weights
@@ -377,6 +500,37 @@ const dsl::MappingSpec* resolve_mapping_spec(
     }
 
     return nullptr;
+}
+
+std::string to_lower_ascii(std::string_view s) {
+    std::string out(s);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return out;
+}
+
+bool is_qwen3_5_moe_model(const PretrainedConfig& pt_config) {
+    const std::string arch = to_lower_ascii(pt_config.ArchitectureName);
+    const std::string model_type = to_lower_ascii(pt_config.ModelTypeName);
+    return arch.find("qwen3_5moe") != std::string::npos ||
+           model_type.find("qwen3_5_moe") != std::string::npos ||
+           model_type.find("qwen3_5moe") != std::string::npos;
+}
+
+bool should_swap_qwen3_5_moe_gate_up_halves(const dsl::MappingSpec& mspec,
+                                            const std::string& internal_name,
+                                            const PretrainedConfig& pt_config) {
+    if (mspec.kind != dsl::MappingSpec::Kind::Direct &&
+        mspec.kind != dsl::MappingSpec::Kind::Transform) {
+        return false;
+    }
+    if (!is_qwen3_5_moe_model(pt_config)) {
+        return false;
+    }
+
+    const std::string& source = mspec.source.empty() ? internal_name : mspec.source;
+    return source.find("experts.gate_up_proj") != std::string::npos;
 }
 
 /// Substitute {layer} and {expert} placeholders in HF name template.
@@ -795,6 +949,7 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
 
     // --- Pass 1: Non-expert weights (2D quantizable + full-precision) ---
 
+    bool logged_qwen35_gate_up_swap = false;
     for (int i = 0; i < total; ++i) {
         const auto& spec = config.weight_specs[i];
 
@@ -929,6 +1084,29 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
         const int K = static_cast<int>(spec.shape[2]);
         const size_t per_expert_bytes = static_cast<size_t>(per_M) * K * sizeof(nv_bfloat16);
 
+        int mapped_layer_idx = -1;
+        const auto* mspec = resolve_mapping_spec(config.mapping, spec.name, mapped_layer_idx);
+        (void)mapped_layer_idx;
+        if (!mspec) {
+            throw std::runtime_error(
+                "import_and_quantize_weights: no mapping for expert param '"
+                + spec.name + "'");
+        }
+
+        const bool swap_qwen35_gate_up_halves =
+            should_swap_qwen3_5_moe_gate_up_halves(*mspec, spec.name, pt_config);
+        if (swap_qwen35_gate_up_halves && (per_M % 2 != 0)) {
+            throw std::runtime_error(
+                "import_and_quantize_weights: expected even per-expert rows for "
+                "Qwen3.5 MoE experts.gate_up_proj: " + spec.name);
+        }
+        if (swap_qwen35_gate_up_halves && !logged_qwen35_gate_up_swap) {
+            fmt::print(stderr,
+                       "[QLoRA Import] Qwen3.5 MoE experts.gate_up_proj detected: "
+                       "reordering [gate|up] -> [up|gate] before quantization.\n");
+            logged_qwen35_gate_up_swap = true;
+        }
+
         // Allocate a small per-expert load buffer
         void* expert_buf_ptr = nullptr;
         CUDA_CHECK(cudaMalloc(&expert_buf_ptr, per_expert_bytes));
@@ -950,6 +1128,16 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
             // Merge adapter delta for this expert (stacked LoRA)
             if (adapter_merger) {
                 adapter_merger->apply_expert(spec.name, global_e, expert_buf, stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            if (swap_qwen35_gate_up_halves) {
+                swap_halves_bf16(
+                    expert_buf.get<nv_bfloat16>(),
+                    per_M,
+                    K,
+                    per_M / 2,
+                    stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
@@ -1315,28 +1503,54 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
                             comp_qt.data, 0, comp_qt.data.nelem(), true);
 
                         // Read per-block scales
-                        // Use the target scale dtype (e.g. FP32 for FP8, FP8_E4M3
-                        // for NVFP4) — HF files may store scales in a different
-                        // dtype (e.g. BF16) and read_raw handles conversion.
-                        std::string comp_scale_hf = comp_hf + config.scale_suffix;
-                        const auto& comp_scale_entry =
-                            reader.find_entry(comp_scale_hf);
-                        const auto target_scale_dtype = qt.scales.DType;
-                        size_t need_scale =
-                            static_cast<size_t>(entry_nelem(comp_scale_entry))
-                            * get_dtype_size(target_scale_dtype);
-                        if (need_scale > comp_scale_cap) {
-                            if (comp_scale_gpu) CUDA_CHECK(cudaFree(comp_scale_gpu));
-                            CUDA_CHECK(cudaMalloc(&comp_scale_gpu, need_scale));
-                            comp_scale_cap = need_scale;
+                        const long comp_nelem = static_cast<long>(comp_M) * spec.K;
+                        const long comp_num_blocks =
+                            (comp_nelem + comp_qt.block_size - 1) / comp_qt.block_size;
+
+                        if (config.quantizer_config.format == QuantFormat::BNB_NF4 &&
+                            config.bnb_prequant_double_quant) {
+                            // BnB double quant: recover FP32 absmax from nested quant state
+                            size_t need_scale = comp_num_blocks * sizeof(float);
+                            if (need_scale > comp_scale_cap) {
+                                if (comp_scale_gpu) CUDA_CHECK(cudaFree(comp_scale_gpu));
+                                CUDA_CHECK(cudaMalloc(&comp_scale_gpu, need_scale));
+                                comp_scale_cap = need_scale;
+                            }
+                            comp_qt.scales = Tensor::from_pointer(
+                                static_cast<std::byte*>(comp_scale_gpu), 0,
+                                ETensorDType::FP32,
+                                std::vector<long>{comp_num_blocks});
+                            bool ok = recover_bnb_double_quant_absmax(
+                                reader, comp_hf, comp_scale_gpu,
+                                comp_num_blocks, stream);
+                            if (!ok) {
+                                throw std::runtime_error(
+                                    "BnB double quant recovery failed for fuse component: "
+                                    + comp_hf);
+                            }
+                        } else {
+                            // Standard scale reading (FP32 absmax for BnB non-double-quant,
+                            // or FP8/FP32 for other formats).
+                            std::string comp_scale_hf = comp_hf + config.scale_suffix;
+                            const auto& comp_scale_entry =
+                                reader.find_entry(comp_scale_hf);
+                            const auto target_scale_dtype = qt.scales.DType;
+                            size_t need_scale =
+                                static_cast<size_t>(entry_nelem(comp_scale_entry))
+                                * get_dtype_size(target_scale_dtype);
+                            if (need_scale > comp_scale_cap) {
+                                if (comp_scale_gpu) CUDA_CHECK(cudaFree(comp_scale_gpu));
+                                CUDA_CHECK(cudaMalloc(&comp_scale_gpu, need_scale));
+                                comp_scale_cap = need_scale;
+                            }
+                            comp_qt.scales = Tensor::from_pointer(
+                                static_cast<std::byte*>(comp_scale_gpu), 0,
+                                target_scale_dtype,
+                                std::vector<long>(comp_scale_entry.shape().begin(),
+                                                  comp_scale_entry.shape().end()));
+                            comp_scale_entry.read_raw(
+                                comp_qt.scales, 0, comp_qt.scales.nelem(), true);
                         }
-                        comp_qt.scales = Tensor::from_pointer(
-                            static_cast<std::byte*>(comp_scale_gpu), 0,
-                            target_scale_dtype,
-                            std::vector<long>(comp_scale_entry.shape().begin(),
-                                              comp_scale_entry.shape().end()));
-                        comp_scale_entry.read_raw(
-                            comp_qt.scales, 0, comp_qt.scales.nelem(), true);
 
                         // Swizzle component scales (NVFP4: row-major → F8_128x4)
                         if (config.quantizer_config.format == QuantFormat::FP4_BLOCK_2D) {
@@ -1496,7 +1710,30 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
             // Read pre-quantized weight data directly from safetensors
             // For FP8/NVFP4: data_suffix is empty, reads from hf_name directly
             // For MXFP4: data_suffix="_blocks", reads from hf_name + "_blocks"
+            // For BnB NF4: data_suffix is empty, reads from hf_name directly
             read_raw_padded(data_entry, qt.data, stream);
+
+            // BnB NF4 pre-quantized with double quantization: the absmax in
+            // safetensors is INT8-quantized (U8). We need to recover FP32 absmax
+            // from: nested_quant_map[absmax_u8[i]] * nested_absmax[i/256] + offset.
+            // The recovery is done on CPU since the data is small.
+            if (config.quantizer_config.format == QuantFormat::BNB_NF4 &&
+                config.bnb_prequant_double_quant) {
+                const long num_elements = static_cast<long>(spec.M) * spec.K;
+                const long num_blocks = (num_elements + qt.block_size - 1) / qt.block_size;
+
+                bool ok = recover_bnb_double_quant_absmax(
+                    reader, hf_name, qt.scales.Data, num_blocks, stream);
+                if (!ok) {
+                    if (load_full_precision(spec, "missing BnB double quant data")) { loaded++; }
+                    continue;
+                }
+
+                weight_mgr->store_prequantized(
+                    spec.name, std::move(qt), spec.offload_group, spec.shape);
+                loaded++;
+                continue;
+            }
 
             // Read scale tensor
             std::string scale_hf = hf_name + config.scale_suffix;

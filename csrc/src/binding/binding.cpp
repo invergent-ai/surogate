@@ -548,6 +548,7 @@ NB_MODULE(_surogate, m) {
         .value("PREQUANT_FP8", modules::QLoRAQuantStrategy::PrequantFP8, "Pre-quantized HF FP8 (DeepSeek-V3/R1)")
         .value("PREQUANT_NVFP4", modules::QLoRAQuantStrategy::PrequantNVFP4, "Pre-quantized HF NVFP4 (ModelOpt)")
         .value("PREQUANT_MXFP4", modules::QLoRAQuantStrategy::PrequantMXFP4, "Pre-quantized HF MXFP4")
+        .value("PREQUANT_BNB_NF4", modules::QLoRAQuantStrategy::PrequantBnBNF4, "Pre-quantized HF BitsAndBytes NF4")
         ;
 
     nb::class_<modules::QLoRAConfig>(m, "QLoRAConfig",
@@ -570,8 +571,10 @@ NB_MODULE(_surogate, m) {
                 strat = modules::QLoRAQuantStrategy::PrequantNVFP4;
             } else if (strategy == "prequant_mxfp4") {
                 strat = modules::QLoRAQuantStrategy::PrequantMXFP4;
+            } else if (strategy == "prequant_bnb_nf4" || strategy == "prequant_bnb") {
+                strat = modules::QLoRAQuantStrategy::PrequantBnBNF4;
             } else if (!strategy.empty() && strategy != "none") {
-                throw std::runtime_error("Unknown QLoRA strategy: " + strategy + " (valid: none, fp8, nvfp4, bnb, prequant_fp8, prequant_nvfp4, prequant_mxfp4)");
+                throw std::runtime_error("Unknown QLoRA strategy: " + strategy + " (valid: none, fp8, nvfp4, bnb, prequant_fp8, prequant_nvfp4, prequant_mxfp4, prequant_bnb_nf4)");
             }
 
             new (t) modules::QLoRAConfig{
@@ -610,6 +613,8 @@ NB_MODULE(_surogate, m) {
                              cfg->strategy = modules::QLoRAQuantStrategy::PrequantNVFP4;
                          } else if (strat == "prequant_mxfp4") {
                              cfg->strategy = modules::QLoRAQuantStrategy::PrequantMXFP4;
+                         } else if (strat == "prequant_bnb_nf4" || strat == "prequant_bnb") {
+                             cfg->strategy = modules::QLoRAQuantStrategy::PrequantBnBNF4;
                          } else {
                              cfg->strategy = modules::QLoRAQuantStrategy::None;
                          }
@@ -686,6 +691,16 @@ NB_MODULE(_surogate, m) {
            "For loading HF models with microscaling FP4 quantization.\n"
            "Uses E8M0 shared exponents per 32-element block.\n\n"
            "Returns: QLoRAConfig for pre-quantized MXFP4 loading.")
+        .def_static("prequant_bnb", [](bool double_quant) {
+            return modules::QLoRAConfig::prequant_bnb(double_quant);
+        }, nb::arg("double_quant") = false,
+           "Create pre-quantized BitsAndBytes NF4 QLoRA configuration.\n\n"
+           "For loading HF models saved with bitsandbytes 4-bit quantization.\n"
+           "Packed NF4 data with per-block absmax scaling. Works on any CUDA GPU.\n\n"
+           "Parameters:\n"
+           "- double_quant: Whether the HF source uses double quantization (INT8 absmax).\n"
+           "  When true, the loader recovers FP32 absmax from nested quantization state.\n\n"
+           "Returns: QLoRAConfig for pre-quantized BnB NF4 loading.")
         .def_rw("bnb_double_quant", &modules::QLoRAConfig::bnb_double_quant,
                 "Enable double quantization for BnB (quantize absmax values to INT8).")
         .def_rw("bnb_double_quant_group_size", &modules::QLoRAConfig::bnb_double_quant_group_size,

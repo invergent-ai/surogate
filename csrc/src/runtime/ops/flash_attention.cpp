@@ -20,24 +20,40 @@
 #include "runtime/dsl/graph_executor_helpers.h"
 #include "runtime/dsl/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
 namespace dsl {
-
 void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     Tensor& qkv = resolve_tensor(op.inputs[0]);
     Tensor* sinks = nullptr;
     if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
         sinks = &resolve_tensor(op.inputs[1]);
     }
-    Tensor& out = ensure_output_tensor(op.outputs[0]);
-    Tensor& lse = ensure_output_tensor(op.outputs[1]);
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
     const int H  = Hq + 2 * Hkv;
+    const Tensor& out_candidate = ensure_output_tensor(op.outputs[0]);
+    const Tensor& lse_candidate = ensure_output_tensor(op.outputs[1]);
+    const std::vector<long> out_shape =
+        !op.outputs[0].shape.empty() ? op.outputs[0].shape : std::vector<long>{mB, mT, Hq, Hs};
+    const std::vector<long> lse_shape =
+        !op.outputs[1].shape.empty()
+            ? op.outputs[1].shape
+            : std::vector<long>(lse_candidate.Sizes.begin(), lse_candidate.Sizes.begin() + lse_candidate.Rank);
+    Tensor out = ensure_output_tensor_or_persistent(
+        out_candidate,
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".out",
+        qkv.DType, out_shape, "flash_attention");
+    Tensor lse = ensure_output_tensor_or_persistent(
+        lse_candidate,
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[1].name + ".lse",
+        ETensorDType::FP32, lse_shape, "flash_attention");
 
     int layer_idx = op.attrs.layer_idx;
     if (layer_idx < 0 && !op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
@@ -139,6 +155,9 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             throw std::logic_error("flash_attention: unsupported output dtype");
         }
     }
+
+    store_tensor(op.outputs[0], out);
+    store_tensor(op.outputs[1], lse);
 }
 
 void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
@@ -151,16 +170,14 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     if (op.inputs.size() > 4 && !op.inputs[4].name.empty()) {
         sinks = &resolve_tensor(op.inputs[4]);
     }
-    Tensor* d_qkv_ptr = &ensure_output_tensor(op.outputs[0]);
     const long qkv_nelem = static_cast<long>(qkv.nelem());
-    if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != qkv_nelem || d_qkv_ptr->DType != d_out.DType) {
-        std::vector<long> shape(qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
-        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape, "flash_attention_d_qkv");
-        mTemps.push_back(tmp);
-        d_qkv_ptr = &mTemps.back();
-    }
-    Tensor& d_qkv = *d_qkv_ptr;
-
+    const std::vector<long> d_qkv_shape(
+        qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
+    Tensor d_qkv = ensure_output_tensor_or_persistent(
+        ensure_output_tensor(op.outputs[0]),
+        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        op.op_id + "." + op.outputs[0].name + ".d_qkv",
+        d_out.DType, d_qkv_shape, "flash_attention_backward");
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = static_cast<int>(mConfig.head_size());
@@ -172,7 +189,6 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         std::string field;
         parse_block_param(op.inputs[3].name, layer_idx, field);
     }
-
     int window_size = op.attrs.window_size;
     if (window_size <= 0 && mConfig.use_sliding_window && mConfig.is_sliding_layer(layer_idx)) {
         window_size = mConfig.sliding_window_size;
@@ -190,6 +206,9 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     int max_doc_seqlen = mMaxDocSeqlen;
     int total_doc_tokens = mTotalDocTokens;
     Tensor generated_cu_seqlens;
+    Tensor dk_expanded, dv_expanded;
+    nv_bfloat16* dk_exp_ptr = nullptr;
+    nv_bfloat16* dv_exp_ptr = nullptr;
     if (use_varlen && cu_seqlens_ptr == nullptr) {
         num_docs = static_cast<int>(mB);
         max_doc_seqlen = static_cast<int>(mT);
@@ -207,22 +226,37 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             d_qkv.DType != ETensorDType::BF16) {
             throw std::logic_error("flash_attention_backward: varlen path currently requires BF16 tensors");
         }
+        const bool deterministic_bwd =
+            (std::getenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC") != nullptr);
         // Document-level masking: Flash Attention varlen backward
         const int Hs_rounded = Hs <= 128 ? ((Hs + 31) / 32) * 32 : ((Hs + 63) / 64) * 64;
         const long padded_total = static_cast<long>(total_doc_tokens) + 128L * static_cast<long>(num_docs);
-        const long dq_accum_elems = padded_total * static_cast<long>(Hq) * static_cast<long>(Hs_rounded);
+        const long dq_accum_stride = padded_total * static_cast<long>(Hq) * static_cast<long>(Hs_rounded);
+        const int split_den = std::max(1, num_docs * Hq);
+        const int dq_accum_splits =
+            deterministic_bwd
+                ? std::max(1, (mRunState.DeviceProp.multiProcessorCount + split_den - 1) / split_den)
+                : 1;
+        const long dq_accum_elems = dq_accum_stride * static_cast<long>(dq_accum_splits);
         const long dsoftmax_elems = static_cast<long>(Hq) * padded_total;
         Tensor dq_accum = mRunState.temp_alloc(ETensorDType::FP32, {dq_accum_elems}, "flash_attention_dq_accum");
         Tensor dsoftmax = mRunState.temp_alloc(ETensorDType::FP32, {dsoftmax_elems}, "flash_attention_dsoftmax");
         mTemps.push_back(dq_accum);
         mTemps.push_back(dsoftmax);
+        // Upstream FlashAttention zeroes softmax_d for varlen backward regardless of
+        // deterministic mode. The kernel treats it as an accumulation/work buffer.
+        fill_zero(dsoftmax, mRunState.MainStream);
+        if (deterministic_bwd) {
+            // FlashAttention deterministic backward uses one dQ accumulation buffer per split.
+            // The upstream API allocates nsplits * stride and zeros it before launch.
+            CUDA_CHECK(cudaMemsetAsync(
+                dq_accum.Data, 0, static_cast<size_t>(dq_accum_elems) * sizeof(float),
+                mRunState.MainStream));
+        }
 
         // GQA expanded dk/dv buffers: flash backward writes dK/dV with Hq head
         // indices, but interleaved buffer only has Hkv slots. Allocate separate
         // (total_q, Hq, HS) buffers when Hq != Hkv.
-        nv_bfloat16* dk_exp_ptr = nullptr;
-        nv_bfloat16* dv_exp_ptr = nullptr;
-        Tensor dk_expanded, dv_expanded;
         if (Hq != Hkv) {
             const long exp_elems = static_cast<long>(total_doc_tokens) * static_cast<long>(Hq) * static_cast<long>(Hs);
             dk_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems}, "flash_attention_dk_expanded");
@@ -231,6 +265,11 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             mTemps.push_back(dv_expanded);
             dk_exp_ptr = dk_expanded.get<nv_bfloat16>();
             dv_exp_ptr = dv_expanded.get<nv_bfloat16>();
+            // Flash varlen GQA backward may leave portions of the expanded KV grads untouched
+            // before the explicit Hq->Hkv reduce/scatter. Under EP, rank-local temp allocator
+            // history differs, so stale BF16 contents here become rank-specific K/V noise.
+            fill_zero(dk_expanded, mRunState.MainStream);
+            fill_zero(dv_expanded, mRunState.MainStream);
         }
 
         // Zero dqkv — convert_dQ writes all Q elements, but K/V sections need
@@ -243,7 +282,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             cu_seqlens_ptr, dq_accum.get<float>(), dsoftmax.get<float>(),
             dk_exp_ptr, dv_exp_ptr,
             num_docs, max_doc_seqlen, total_doc_tokens,
-            Hq, Hkv, Hs, /*deterministic=*/false, mRunState.MainStream);
+            Hq, Hkv, Hs, deterministic_bwd, mRunState.MainStream);
     } else if (window_size > 0) {
         if (out.DType == ETensorDType::FP32) {
             attention_backward_custom(d_qkv, lse, out, d_out, qkv,
@@ -313,13 +352,30 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         }
     }
 
+    const bool sync_flash_attn_bwd_out =
+        mComm && mComm->ep_enabled() && (mComm->dp_size() == 1) &&
+        use_varlen && (Hq != Hkv);
+    if (sync_flash_attn_bwd_out) {
+        // Under EP with dp_size=1, these attention activations are replicated across ranks.
+        // Flash-attention backward on the shared path must therefore produce identical dQKV.
+        // Varlen GQA backward currently emits rank-divergent K/V gradients even with identical
+        // inputs, so average the replicated gradient here to restore the intended shared value.
+        mComm->all_reduce_avg(d_qkv, mRunState.MainStream);
+    }
+
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         if (!sinks || !sinks->Data) {
             // Sinks parameter not available (e.g., offloaded in QLoRA mode or not a LoRA target).
             // Skip sinks gradient computation — it's unused when sinks isn't being trained.
             goto skip_sinks;
         }
-        Tensor& d_sinks_out = ensure_output_tensor(op.outputs[1]);
+        const std::vector<long> d_sinks_shape =
+            !op.outputs[1].shape.empty() ? op.outputs[1].shape : std::vector<long>{static_cast<long>(Hq)};
+        Tensor d_sinks_out = ensure_output_tensor_or_persistent(
+            ensure_output_tensor(op.outputs[1]),
+            mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+            op.op_id + "." + op.outputs[1].name + ".d_sinks",
+            op.outputs[1].dtype, d_sinks_shape, "flash_attention_backward");
 
         bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
         if (!accumulate && !op.outputs[1].name.empty()) {
@@ -388,6 +444,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         } else {
             throw std::logic_error("flash_attention_backward: unsupported d_sinks dtype");
         }
+        store_tensor(op.outputs[1], d_sinks_out);
     }
     skip_sinks:
 

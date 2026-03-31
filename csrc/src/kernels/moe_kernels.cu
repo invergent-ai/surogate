@@ -1006,6 +1006,35 @@ __global__ void moe_compute_gather_indices_kernel(
     scatter_indices[idx] = dest_idx; // Inverse mapping
 }
 
+// Deterministic gather/scatter index construction.
+// Assignments are processed in strictly increasing `idx` order, so each expert's
+// local ordering is stable and identical across replicas/devices.
+// This avoids EP rank divergence caused by nondeterministic atomic scheduling.
+__global__ void moe_compute_gather_indices_deterministic_kernel(
+    int* __restrict__ gather_indices,       // (total_tokens,) output
+    int* __restrict__ scatter_indices,      // (total_tokens,) output
+    const int* __restrict__ expert_indices, // (num_tokens, top_k)
+    const int* __restrict__ expert_offsets, // (num_experts + 1)
+    int* __restrict__ expert_positions,     // (num_experts,) running positions
+    int total_assignments,
+    int num_experts
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    for (int idx = 0; idx < total_assignments; ++idx) {
+        const int expert_id = expert_indices[idx];
+        if (expert_id < 0 || expert_id >= num_experts) {
+            continue;
+        }
+        const int slot = expert_positions[expert_id]++;
+        const int dest_idx = expert_offsets[expert_id] + slot;
+        gather_indices[dest_idx] = idx;
+        scatter_indices[idx] = dest_idx;
+    }
+}
+
 // Permute hidden states from token order to expert-grouped order
 template<typename T>
 __global__ void moe_permute_tokens_kernel(
@@ -1675,13 +1704,13 @@ void moe_build_indices(
     int total = num_tokens * top_k;
     if (total == 0) return;  // No tokens to index
 
-    int block_size = 256;
-    int grid_size = (total + block_size - 1) / block_size;
-
-    moe_compute_gather_indices_kernel<<<grid_size, block_size, 0, stream>>>(
+    // Use deterministic index construction so EP replicas observe identical
+    // per-expert token ordering across devices/ranks.
+    moe_compute_gather_indices_deterministic_kernel<<<1, 1, 0, stream>>>(
         gather_indices, scatter_indices, expert_indices, expert_offsets,
-        expert_positions, num_tokens, top_k, num_experts
+        expert_positions, total, num_experts
     );
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================
@@ -3751,6 +3780,63 @@ __global__ void moe_permute_backward_kernel_bf16(
     }
 }
 
+template<typename T, typename AccT>
+__global__ void moe_permute_backward_from_scatter_kernel(
+    T* __restrict__ d_input,                // (num_tokens, hidden_size)
+    const T* __restrict__ d_permuted,       // (total_tokens, hidden_size)
+    const int* __restrict__ scatter_indices,// (total_tokens,) assignment_idx -> permuted pos
+    int total_tokens,
+    int num_tokens,
+    int hidden_size,
+    int top_k
+) {
+    using x128 = GenericVector<T, 16 / sizeof(T)>;
+
+    int token_idx = blockIdx.x;
+    if (token_idx >= num_tokens) return;
+
+    T* d_in = d_input + token_idx * hidden_size;
+    const int assignment_base = token_idx * top_k;
+
+    int d = threadIdx.x * x128::size;
+    for (; d + x128::size <= hidden_size; d += blockDim.x * x128::size) {
+        AccT acc[x128::size];
+#pragma unroll
+        for (int i = 0; i < x128::size; ++i) {
+            acc[i] = AccT(0);
+        }
+        for (int k = 0; k < top_k; ++k) {
+            const int assignment_idx = assignment_base + k;
+            const int expert_pos = scatter_indices[assignment_idx];
+            if (expert_pos < 0 || expert_pos >= total_tokens) continue;
+            x128 val = x128::load(d_permuted + expert_pos * hidden_size + d);
+#pragma unroll
+            for (int i = 0; i < x128::size; ++i) {
+                acc[i] += static_cast<AccT>(val[i]);
+            }
+        }
+        x128 out;
+#pragma unroll
+        for (int i = 0; i < x128::size; ++i) {
+            out[i] = static_cast<T>(acc[i]);
+        }
+        out.store(d_in + d);
+    }
+
+    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x;
+         r < hidden_size;
+         r += blockDim.x) {
+        AccT acc = AccT(0);
+        for (int k = 0; k < top_k; ++k) {
+            const int assignment_idx = assignment_base + k;
+            const int expert_pos = scatter_indices[assignment_idx];
+            if (expert_pos < 0 || expert_pos >= total_tokens) continue;
+            acc += static_cast<AccT>(d_permuted[expert_pos * hidden_size + r]);
+        }
+        d_in[r] = static_cast<T>(acc);
+    }
+}
+
 // ============================================================================
 // Backward Host Wrapper Functions
 // ============================================================================
@@ -3887,6 +3973,40 @@ void moe_permute_backward(
     );
 }
 
+void moe_permute_backward_from_scatter(
+    nv_bfloat16* d_input,
+    const nv_bfloat16* d_permuted,
+    const int* scatter_indices,
+    int total_tokens,
+    int num_tokens,
+    int hidden_size,
+    int top_k,
+    cudaStream_t stream
+) {
+    const int block_size = 256;
+    const int grid_size = num_tokens;
+    moe_permute_backward_from_scatter_kernel<nv_bfloat16, float><<<grid_size, block_size, 0, stream>>>(
+        d_input, d_permuted, scatter_indices, total_tokens, num_tokens, hidden_size, top_k
+    );
+}
+
+void moe_permute_backward_from_scatter(
+    float* d_input,
+    const float* d_permuted,
+    const int* scatter_indices,
+    int total_tokens,
+    int num_tokens,
+    int hidden_size,
+    int top_k,
+    cudaStream_t stream
+) {
+    const int block_size = 256;
+    const int grid_size = num_tokens;
+    moe_permute_backward_from_scatter_kernel<float, float><<<grid_size, block_size, 0, stream>>>(
+        d_input, d_permuted, scatter_indices, total_tokens, num_tokens, hidden_size, top_k
+    );
+}
+
 // ============================================================================
 // FP8 MoE Grouped GEMM Implementations
 // ============================================================================
@@ -3933,6 +4053,7 @@ void moe_grouped_gemm(nv_bfloat16* output,
         const __nv_fp8_e4m3* input_slice = input + static_cast<long>(start) * K;
         const __nv_fp8_e4m3* weight_slice = weights + static_cast<long>(weight_idx) * M * K;
         nv_bfloat16* output_slice = output + static_cast<long>(start) * M;
+        const float* weight_scale_slice = scale_weights ? (scale_weights + weight_idx) : nullptr;
 
         // Dispatch FP8 matmul: output = input @ weight.T
         // input: (num_tokens, K) E4M3
@@ -3940,7 +4061,7 @@ void moe_grouped_gemm(nv_bfloat16* output,
         // output: (num_tokens, M) BF16
         matmul(output_slice, weight_slice, input_slice,
                static_cast<nv_bfloat16*>(nullptr),  // no bias
-               scale_weights, scale_input,
+               weight_scale_slice, scale_input,
                cublas_handle, nullptr, 0,  // no workspace needed
                M, num_tokens, K,
                mode,  // typically TN
@@ -3984,12 +4105,13 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input,
         const __nv_fp8_e5m2* dout_slice = d_output + static_cast<long>(start) * M;
         const __nv_fp8_e4m3* weight_slice = weights + static_cast<long>(weight_idx) * M * K;
         nv_bfloat16* dinp_slice = d_input + static_cast<long>(start) * K;
+        const float* weight_scale_slice = scale_weights ? (scale_weights + weight_idx) : nullptr;
 
         // dinp = W^T @ dout => (K, M) @ (num_tokens, M)^T = (K, num_tokens)^T = (num_tokens, K)
         // Using NN mode: dinp = weight @ dout where weight is (M, K) -> need (K, M)
         matmul(dinp_slice, weight_slice, dout_slice,
                static_cast<nv_bfloat16*>(nullptr),  // no bias
-               scale_weights, scale_dout,
+               weight_scale_slice, scale_dout,
                cublas_handle, nullptr, 0,
                K, num_tokens, M,
                EMMTranspose::NN,  // weight needs to be transposed

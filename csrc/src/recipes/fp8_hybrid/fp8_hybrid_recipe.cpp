@@ -423,14 +423,14 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
 
         // Step 2: Quantize expert weights to FP8 E4M3 (per-expert quantization)
         Tensor weights_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_fp8");
-        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2}, "weight_stats");
-        weights_fp8.Stats = weight_stats.get<float>();
+        Tensor weight_amax = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_amax");
+        Tensor weight_scales = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_scales");
 
         for (int e = 0; e < ctx.num_experts; ++e) {
             const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
             __nv_fp8_e4m3* weight_fp8_e = weights_fp8.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
-            float* abs_max_e = weight_stats.get<float>() + e * 2;
-            float* scale_e = abs_max_e + 1;
+            float* abs_max_e = weight_amax.get<float>() + e;
+            float* scale_e = weight_scales.get<float>() + e;
 
             abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
             quantize_with_abs_max(weight_fp8_e, scale_e, weight_e, abs_max_e,
@@ -443,7 +443,7 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
             inp_fp8.get<__nv_fp8_e4m3>(),
             weights_fp8.get<__nv_fp8_e4m3>(),
             inp_fp8.scale(),
-            weight_stats.get<float>() + 1,  // First scale
+            weight_scales.get<float>(),
             ctx.expert_offsets, ctx.num_experts,
             ctx.N, ctx.K,
             reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle), ctx.stream,
@@ -451,7 +451,8 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
             1.0f, 0.0f, EMMTranspose::TN,
             ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
 
-        rs.temp_free(weight_stats);
+        rs.temp_free(weight_scales);
+        rs.temp_free(weight_amax);
         rs.temp_free(weights_fp8);
         return;  // Success - FP8 path completed
     }
@@ -511,14 +512,14 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
 
         // Step 2: Quantize expert weights to E4M3
         Tensor weights_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_e4m3");
-        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2}, "weight_stats");
-        weights_e4m3.Stats = weight_stats.get<float>();
+        Tensor weight_amax = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_amax");
+        Tensor weight_scales = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_scales");
 
         for (int e = 0; e < ctx.num_experts; ++e) {
             const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
             __nv_fp8_e4m3* weight_fp8_e = weights_e4m3.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
-            float* abs_max_e = weight_stats.get<float>() + e * 2;
-            float* scale_e = abs_max_e + 1;
+            float* abs_max_e = weight_amax.get<float>() + e;
+            float* scale_e = weight_scales.get<float>() + e;
 
             abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
             quantize_with_abs_max(weight_fp8_e, scale_e, weight_e, abs_max_e,
@@ -531,14 +532,15 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
             dout_e5m2.get<__nv_fp8_e5m2>(),
             weights_e4m3.get<__nv_fp8_e4m3>(),
             dout_e5m2.scale(),
-            weight_stats.get<float>() + 1,  // First scale
+            weight_scales.get<float>(),
             ctx.expert_offsets, ctx.num_experts,
             ctx.K, ctx.N,
             reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle), ctx.stream,
             ctx.host_offsets,
             ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
 
-        rs.temp_free(weight_stats);
+        rs.temp_free(weight_scales);
+        rs.temp_free(weight_amax);
         rs.temp_free(weights_e4m3);
         return;  // Success - FP8 backward completed
     }
