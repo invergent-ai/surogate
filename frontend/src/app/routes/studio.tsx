@@ -31,6 +31,24 @@ const SkillsPage = lazy(() =>
   })),
 );
 
+const SkillsTab = lazy(() =>
+  import("@/features/skills/skills-tab").then((m) => ({
+    default: m.SkillsTab,
+  })),
+);
+
+const ToolsTab = lazy(() =>
+  import("@/features/skills/tools-tab").then((m) => ({
+    default: m.ToolsTab,
+  })),
+);
+
+const McpServersTab = lazy(() =>
+  import("@/features/skills/mcp-servers-tab").then((m) => ({
+    default: m.McpServersTab,
+  })),
+);
+
 const ComputePage = lazy(() =>
   import("@/features/compute/compute-page").then((m) => ({
     default: m.ComputePage,
@@ -121,6 +139,48 @@ const RepoDetailPage = lazy(() =>
   })),
 );
 
+const SettingsPage = lazy(() =>
+  import("@/features/settings/settings-page").then((m) => ({
+    default: m.SettingsPage,
+  })),
+);
+
+const ProfileTab = lazy(() =>
+  import("@/features/settings/profile-tab").then((m) => ({
+    default: m.ProfileTab,
+  })),
+);
+
+const SettingsProjectsTab = lazy(() =>
+  import("@/features/settings/projects-tab").then((m) => ({
+    default: m.ProjectsTab,
+  })),
+);
+
+const ApiKeysTab = lazy(() =>
+  import("@/features/settings/api-keys-tab").then((m) => ({
+    default: m.ApiKeysTab,
+  })),
+);
+
+const HubConfigTab = lazy(() =>
+  import("@/features/settings/hub-tab").then((m) => ({
+    default: m.HubTab,
+  })),
+);
+
+const SettingsIntegrationsTab = lazy(() =>
+  import("@/features/settings/integrations-tab").then((m) => ({
+    default: m.IntegrationsTab,
+  })),
+);
+
+const NotificationsTab = lazy(() =>
+  import("@/features/settings/notifications-tab").then((m) => ({
+    default: m.NotificationsTab,
+  })),
+);
+
 function StudioLayout() {
   useInitialData();
   return <Outlet />;
@@ -155,6 +215,24 @@ export const skillsRoute = createRoute({
   getParentRoute: () => Route,
   path: "/skills",
   component: SkillsPage,
+});
+
+export const skillsIndexRoute = createRoute({
+  getParentRoute: () => skillsRoute,
+  path: "/",
+  component: SkillsTab,
+});
+
+export const skillsToolsRoute = createRoute({
+  getParentRoute: () => skillsRoute,
+  path: "/tools",
+  component: ToolsTab,
+});
+
+export const skillsMcpRoute = createRoute({
+  getParentRoute: () => skillsRoute,
+  path: "/mcp",
+  component: McpServersTab,
 });
 
 export const computeRoute = createRoute({
@@ -256,4 +334,46 @@ export const repoDetailRoute = createRoute({
   getParentRoute: () => hubRoute,
   path: "$",
   component: RepoDetailWrapper,
+});
+
+export const settingsRoute = createRoute({
+  getParentRoute: () => Route,
+  path: "/settings",
+  component: SettingsPage,
+});
+
+export const settingsIndexRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: "/",
+  component: ProfileTab,
+});
+
+export const settingsProjectsRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: "/projects",
+  component: SettingsProjectsTab,
+});
+
+export const settingsApiKeysRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: "/api-keys",
+  component: ApiKeysTab,
+});
+
+export const settingsHubRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: "/hub",
+  component: HubConfigTab,
+});
+
+export const settingsIntegrationsRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: "/integrations",
+  component: SettingsIntegrationsTab,
+});
+
+export const settingsNotificationsRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: "/notifications",
+  component: NotificationsTab,
 });

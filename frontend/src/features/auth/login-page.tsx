@@ -179,7 +179,7 @@ export function LoginPage() {
             </div>
           </div>
 
-          <h2 className="font-display text-7xl font-extrabold text-foreground leading-[1.1] tracking-tight max-w-[600px]">
+          <h2 className="font-display text-7xl font-extrabold text-foreground leading-[1.1] tracking-tight max-w-[650px]">
             Build, train, and
             <br />
             deploy <span className="text-primary">AI agents</span>
@@ -187,9 +187,7 @@ export function LoginPage() {
             at enterprise scale.
           </h2>
           <p className="font-display text-2xl text-muted-foreground mt-6 max-w-[50rem] leading-relaxed">
-            The complete platform for authoring skills, fine-tuning LLMs,
-            orchestrating deployments, and monitoring production agents on
-            Kubernetes.
+            The authoring platform for enterprise production agents.
           </p>
         </div>
 
@@ -213,7 +211,7 @@ export function LoginPage() {
             ))}
           </div>
           <div className="font-display mt-6 text-sm text-faint">
-            v2.4.0 &middot; Kubernetes-native &middot; Enterprise SSO
+            <a className="underline" href="https://surogate.ai" target="_blank">surogate.ai</a> v2.4.0 &middot; Copyright © 2026 Invergent SA &middot; All rights reserved.
           </div>
         </div>
       </div>

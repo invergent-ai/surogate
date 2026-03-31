@@ -80,15 +80,14 @@ export function Navbar() {
       {/* project selector */}
       {!collapsed && (
         <div className="px-3 py-2.5">
-          <div className="bg-input border border-border rounded-md px-2.5 py-[7px] flex items-center gap-2 cursor-pointer">
+          <div className="bg-input border border-border rounded-md px-2.5 py-1 text-sm flex items-center gap-2 cursor-pointer">
             <div
               className="w-2 h-2 rounded-full shrink-0"
               style={{ background: project?.color }}
             />
-            <span className="text-subtle flex-1 truncate font-display">
+            <span className="text-subtle flex-1 truncate font-semibold">
               {project?.name}
             </span>
-            <span className="text-muted-foreground text-[9px]">▾</span>
           </div>
         </div>
       )}
@@ -177,7 +176,15 @@ export function Navbar() {
                 ⌘K
               </kbd>
             </button>
-            <div className="flex items-center gap-2 px-1 py-1.5 cursor-pointer">
+            <Link
+              to="/studio/settings"
+              className={cn(
+                "flex items-center gap-2 px-1 py-1.5 cursor-pointer no-underline rounded-md transition-colors",
+                pathname.startsWith("/studio/settings")
+                  ? "bg-line"
+                  : "hover:bg-input",
+              )}
+            >
               <div className="w-6 h-6 rounded-full bg-linear-to-br from-blue-500 to-violet-500 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
                 AK
               </div>
@@ -187,7 +194,7 @@ export function Navbar() {
                 </div>
                 <div className="text-[9px] text-faint">Skill Engineer</div>
               </div>
-            </div>
+            </Link>
           </>
         )}
         <button

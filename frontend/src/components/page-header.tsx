@@ -12,9 +12,10 @@ import { useAppStore } from "@/stores/app-store";
 interface PageHeaderProps {
   title: string;
   subtitle?: ReactNode;
+  action?: ReactNode;
 }
 
-export function PageHeader({ title, subtitle }: PageHeaderProps) {
+export function PageHeader({ title, subtitle, action }: PageHeaderProps) {
   const { isDark, toggle } = useTheme();
   const navigate = useNavigate();
   const hasActiveTasks = useAppStore((s) =>
@@ -42,6 +43,7 @@ export function PageHeader({ title, subtitle }: PageHeaderProps) {
             <span className="relative inline-flex size-2.5 rounded-full bg-green-500" />
           </button>
         )}
+        {action}
         <ProjectSelector />
         <div className="w-px h-5 bg-line" />
         <button

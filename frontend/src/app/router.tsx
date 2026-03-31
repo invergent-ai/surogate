@@ -12,6 +12,9 @@ import {
   agentsRoute,
   modelsRoute,
   skillsRoute,
+  skillsIndexRoute,
+  skillsToolsRoute,
+  skillsMcpRoute,
   computeRoute,
   computeIndexRoute,
   computeClusterNodesRoute,
@@ -28,6 +31,13 @@ import {
   hubRoute,
   hubIndexRoute,
   repoDetailRoute,
+  settingsRoute,
+  settingsIndexRoute,
+  settingsProjectsRoute,
+  settingsApiKeysRoute,
+  settingsHubRoute,
+  settingsIntegrationsRoute,
+  settingsNotificationsRoute,
 } from "./routes/studio";
 import { Route as indexRoute } from "./routes/index";
 
@@ -40,7 +50,11 @@ const routeTree = rootRoute.addChildren([
     studioIndexRoute,
     agentsRoute,
     modelsRoute,
-    skillsRoute,
+    skillsRoute.addChildren([
+      skillsIndexRoute,
+      skillsToolsRoute,
+      skillsMcpRoute,
+    ]),
     computeRoute.addChildren([
       computeIndexRoute,
       computeClusterNodesRoute,
@@ -56,6 +70,14 @@ const routeTree = rootRoute.addChildren([
     datasetsRoute,
     trainingRoute,
     hubRoute.addChildren([hubIndexRoute, repoDetailRoute]),
+    settingsRoute.addChildren([
+      settingsIndexRoute,
+      settingsProjectsRoute,
+      settingsApiKeysRoute,
+      settingsHubRoute,
+      settingsIntegrationsRoute,
+      settingsNotificationsRoute,
+    ]),
   ]),
 ]);
 
