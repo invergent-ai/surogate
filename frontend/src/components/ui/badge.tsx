@@ -14,7 +14,7 @@ export function Badge({ children, variant = "default", className }: BadgeProps) 
   return (
     <span
       className={cn(
-        "text-[9px] px-1.5 py-[1px] rounded font-display",
+        "text-sm px-1.5 py-[1px] rounded font-display",
         variant === "default" && "bg-accent text-muted-foreground",
         variant === "danger" && "bg-destructive/10 text-destructive",
         variant === "active" && "bg-primary/15 text-primary",

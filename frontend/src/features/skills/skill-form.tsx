@@ -6,17 +6,7 @@ import MDEditor from "@uiw/react-md-editor";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import type { Skill } from "@/types/skill";
-
-/** Backend SkillStatus enum values. */
-const SKILL_STATUSES = ["active", "error"] as const;
 
 interface SkillFormProps {
   /** When provided the form is in edit mode, otherwise create mode. */
@@ -30,8 +20,6 @@ export interface SkillFormData {
   displayName: string;
   description: string;
   content: string;
-  version: string;
-  status: string;
   tags: string[];
 }
 
@@ -42,8 +30,6 @@ export function SkillForm({ skill, onSave, onCancel }: SkillFormProps) {
   const [displayName, setDisplayName] = useState(skill?.displayName ?? "");
   const [description, setDescription] = useState(skill?.description ?? "");
   const [content, setContent] = useState(skill?.content ?? "");
-  const [version, setVersion] = useState(skill?.version ?? "1.0.0");
-  const [status, setStatus] = useState(skill?.status ?? "active");
   const [tagsRaw, setTagsRaw] = useState(skill?.tags.join(", ") ?? "");
   const [nameError, setNameError] = useState<string | null>(null);
 
@@ -70,8 +56,6 @@ export function SkillForm({ skill, onSave, onCancel }: SkillFormProps) {
       displayName: displayName.trim() || name.trim(),
       description: description.trim(),
       content,
-      version: version.trim() || "1.0.0",
-      status,
       tags,
     });
   };
@@ -132,34 +116,6 @@ export function SkillForm({ skill, onSave, onCancel }: SkillFormProps) {
           />
         </div>
 
-        {/* Version & Status row */}
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block mb-1 text-sm text-muted-foreground font-display">Version</label>
-            <Input
-              value={version}
-              onChange={(e) => setVersion(e.target.value)}
-              placeholder="1.0.0"
-              className="font-mono"
-            />
-          </div>
-          <div>
-            <label className="block mb-1 text-sm text-muted-foreground font-display">Status</label>
-            <Select value={status} onValueChange={setStatus}>
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {SKILL_STATUSES.map((s) => (
-                  <SelectItem key={s} value={s}>
-                    {s.charAt(0).toUpperCase() + s.slice(1)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-
         {/* Tags */}
         <div>
           <label className="block mb-1 text-sm text-muted-foreground font-display">Tags</label>
@@ -181,11 +137,10 @@ export function SkillForm({ skill, onSave, onCancel }: SkillFormProps) {
             height={320}
             preview="edit"
           />
-          <div className="text-muted-foreground text-xs mt-1">Markdown skill definition</div>
         </div>
 
         {/* Actions */}
-        <div className="flex justify-end gap-2 pt-2 pb-4">
+        <div className="flex gap-2 pt-2 pb-4">
           <Button variant="outline" type="button" onClick={onCancel}>
             Cancel
           </Button>

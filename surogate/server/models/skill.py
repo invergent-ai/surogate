@@ -13,10 +13,7 @@ class SkillCreateRequest(BaseModel):
     display_name: str
     description: str = ""
     content: str = ""
-    version: str = "1.0.0"
-    status: str = "active"
     tags: list[str] = []
-    hub_ref: Optional[str] = None
 
 
 class SkillUpdateRequest(BaseModel):
@@ -24,10 +21,7 @@ class SkillUpdateRequest(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     content: Optional[str] = None
-    version: Optional[str] = None
-    status: Optional[str] = None
     tags: Optional[list[str]] = None
-    hub_ref: Optional[str] = None
 
 
 # ── Skill Responses ──────────────────────────────────────────────────
@@ -42,6 +36,7 @@ class SkillResponse(BaseModel):
     version: str
     status: str
     author_id: str
+    author_username: str = ""
     tags: list[str] = []
     hub_ref: Optional[str] = None
     created_at: Optional[str] = None

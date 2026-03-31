@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { useEffect, useState } from "react";
-import { useNavigate } from "@tanstack/react-router";
 import { Loader2, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,6 +24,7 @@ import { SkillForm } from "./skill-form";
 import type { SkillFormData } from "./skill-form";
 import { useAppStore } from "@/stores/app-store";
 import { RepoExplorer } from "@/features/hub/repo-explorer";
+import { MarkdownPreview } from "@/components/markdown/markdown-preview";
 
 function SkillListItem({
   skill,
@@ -48,22 +48,16 @@ function SkillListItem({
       <div className="flex items-center justify-between mb-1">
         <div className="flex items-center gap-2">
           <span className="text-amber-500 text-sm">&#x1F4C4;</span>
-          <span className="text-xs font-semibold text-foreground font-display">
+          <span className="text-sm font-semibold text-foreground font-display">
             {skill.displayName}
           </span>
-          <Badge>v{skill.version}</Badge>
+          <Badge>{skill.version}</Badge>
         </div>
         <StatusDot status={toStatus(skill.status)} />
       </div>
-      <code className="text-[10px] text-muted-foreground/60 font-mono mb-0.5 block">
-        {skill.name}
-      </code>
-      <p className="text-[10px] text-muted-foreground leading-snug line-clamp-1 mb-1.5">
-        {skill.description}
-      </p>
-      <div className="flex items-center gap-2 text-[9px] text-muted-foreground/50">
-        <span>&#x2B21; {skill.agent}</span>
-        <span>&middot;</span>
+      <div className="flex items-center gap-2 text-xs text-muted-foreground/50">
+        { skill.agent && <span>&#x2B21; {skill.agent}</span> }
+        { skill.agent && <span>&middot;</span> }
         <span>{skill.author}</span>
         <span>&middot;</span>
         <span>{skill.updatedAt}</span>
@@ -73,7 +67,6 @@ function SkillListItem({
 }
 
 function SkillDetail({ skill, onClose, onEdit, onDelete, onPublish }: { skill: Skill; onClose: () => void; onEdit: () => void; onDelete: () => Promise<void>; onPublish: (tag: string) => Promise<boolean> }) {
-  const navigate = useNavigate();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showPublish, setShowPublish] = useState(false);
   const [publishTag, setPublishTag] = useState("");
@@ -106,31 +99,19 @@ function SkillDetail({ skill, onClose, onEdit, onDelete, onPublish }: { skill: S
                 <span className="text-base font-bold text-foreground font-display">
                   {skill.displayName}
                 </span>
-                <Badge>v{skill.version}</Badge>
+                <Badge>{skill.version}</Badge>
                 <StatusDot status={toStatus(skill.status)} />
               </div>
-              <code className="text-[10px] text-muted-foreground/60 font-mono block">
-                {skill.name}
-              </code>
-              <div className="text-[10px] text-muted-foreground mt-0.5">
-                Agent: <span className="text-foreground/70">{skill.agent}</span> &middot;{" "}
+              <div className="text-sm text-muted-foreground mt-0.5">
+                Agent: <span className="text-foreground/70">{skill.agent || 'none'}</span> &middot;{" "}
                 {skill.author} &middot; {skill.updatedAt}
               </div>
-              {skill.hubRef && (
-                <button
-                  type="button"
-                  onClick={() => navigate({ to: `/studio/hub/${skill.hubRef}` })}
-                  className="text-[10px] text-amber-500 hover:underline cursor-pointer mt-0.5 bg-transparent border-none p-0 font-mono"
-                >
-                  &#x2B21; {skill.hubRef}
-                </button>
-              )}
             </div>
           </div>
           <div className="flex gap-1.5">
-            <Button variant="outline" size="xs" onClick={onEdit}>Edit</Button>
-            <Button variant="outline" size="xs" onClick={() => { setPublishTag(""); setPublishError(null); setShowPublish(true); }}>Publish</Button>
-            <Button variant="outline" size="xs" onClick={() => setShowDeleteConfirm(true)}>
+            <Button variant="outline" onClick={onEdit}>Edit</Button>
+            <Button onClick={() => { setPublishTag(""); setPublishError(null); setShowPublish(true); }}>Publish</Button>
+            <Button variant="destructive" onClick={() => setShowDeleteConfirm(true)}>
               <Trash2 size={12} className="mr-1" />Delete
             </Button>
             <Button variant="ghost" size="icon-xs" onClick={onClose}>
@@ -154,9 +135,16 @@ function SkillDetail({ skill, onClose, onEdit, onDelete, onPublish }: { skill: S
           </TabsList>
         </div>
 
-        <TabsContent value="content" className="flex-1 overflow-y-auto p-6">
-          <pre className="bg-muted/40 border border-border rounded-lg p-5 text-xs text-foreground/80 leading-relaxed whitespace-pre-wrap font-mono">
-            {skill.content}
+        <TabsContent value="content" className="flex-1 overflow-y-auto">
+          <pre className="m-5 rounded-md border border-border/60 bg-muted/20 text-foreground/80 leading-relaxed whitespace-pre-wrap font-mono">
+            <p className="px-5 py-3 font-bold">DESCRIPTION</p>
+            <p className="px-5">{skill.description}</p>
+          </pre>
+          <pre className="px-5 text-foreground/80 leading-relaxed whitespace-pre-wrap font-mono">
+            <MarkdownPreview
+              markdown={skill.content}
+              className="!max-h-none !text-base !p-5 !leading-normal"
+            />
           </pre>
         </TabsContent>
 
@@ -287,8 +275,6 @@ export function SkillsTab() {
         display_name: data.displayName,
         description: data.description,
         content: data.content,
-        version: data.version,
-        status: data.status,
         tags: data.tags,
       });
       if (result) {
@@ -323,10 +309,10 @@ export function SkillsTab() {
       {/* List */}
       <div className="w-105 min-w-105 border-r border-border flex flex-col">
         <div className="px-4 py-3 border-b border-border flex justify-between items-center">
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-sm text-muted-foreground">
             {skills.length} agent skill files
           </span>
-          <Button size="xs" onClick={handleCreate}>+ New Skill</Button>
+          <Button onClick={handleCreate}>+ New Skill</Button>
         </div>
         <div className="flex-1 overflow-y-auto">
           {skills.map((s) => (

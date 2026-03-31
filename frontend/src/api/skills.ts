@@ -14,6 +14,7 @@ export interface SkillResponse {
   version: string;
   status: string;
   author_id: string;
+  author_username: string;
   tags: string[];
   hub_ref: string | null;
   created_at: string | null;
@@ -30,21 +31,14 @@ export interface SkillCreateRequest {
   display_name: string;
   description?: string;
   content?: string;
-  version?: string;
-  status?: string;
   tags?: string[];
-  hub_ref?: string | null;
 }
 
 export interface SkillUpdateRequest {
-  name?: string;
   display_name?: string;
   description?: string;
   content?: string;
-  version?: string;
-  status?: string;
   tags?: string[];
-  hub_ref?: string | null;
 }
 
 // ── API calls ──────────────────────────────────────────────────────

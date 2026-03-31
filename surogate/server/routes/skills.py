@@ -37,6 +37,7 @@ def _skill_to_response(skill) -> SkillResponse:
         version=skill.version,
         status=skill.status.value if hasattr(skill.status, "value") else skill.status,
         author_id=skill.author_id,
+        author_username=skill.author.username if skill.author else "",
         tags=skill.tags or [],
         hub_ref=skill.hub_ref,
         created_at=str(skill.created_at) if skill.created_at else None,

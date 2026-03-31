@@ -16,7 +16,7 @@ function toSkill(s: SkillResponse): Skill {
     content: s.content,
     version: s.version,
     status: s.status,
-    author: s.author_id,
+    author: s.author_username || s.author_id,
     updatedAt: s.updated_at ?? "",
     tags: s.tags,
     agent: "",

@@ -23,6 +23,7 @@ export default defineConfig([
       globals: globals.browser,
     },
     rules: {
+      "no-restricted-imports": "warn",
       "react-hooks/exhaustive-deps": "off",
       // Allow shadcn ui components to export variants
       "react-refresh/only-export-components": [
