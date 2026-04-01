@@ -5,7 +5,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path as _Path
-
+from sqlalchemy.ext.asyncio import AsyncSession
 from surogate.core.config.server_config import ServerConfig
 from surogate.core.db.engine import get_session_factory
 from surogate.core.hub.lakefs import seed_lakefs_user, init_lakefs
@@ -26,24 +26,32 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from pathlib import Path
 
-from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, metrics_router
+from surogate.core.db.repository import auth as auth_repository
+from surogate.core.compute.kubernetes import init_kubernetes
+
+from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router
 
 logger = get_logger()
+
+async def init_app(session: AsyncSession, config: ServerConfig):
+    await auth_repository.seed_admin_user(session)
+    await init_lakefs(config)
+    await seed_lakefs_user("surogate", session, config)
+    init_kubernetes()  
+    
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from surogate.core.db import init_engine, create_all_tables
-    from surogate.core.db.repository import auth as auth_repository
 
     config: ServerConfig = getattr(app.state, "config", None)
     engine = init_engine(config.database_url)
     await create_all_tables()
 
     factory = get_session_factory()
+    
     async with factory() as session:
-        await auth_repository.seed_admin_user(session)
-        await init_lakefs(config)
-        await seed_lakefs_user("surogate", session, config)
+        await init_app(session, config)
         
     logger.info(f"Database ready: {config.database_url}")
 
@@ -85,7 +93,6 @@ app.include_router(hub_router, prefix = "/api/hub", tags = ["hub"])
 app.include_router(compute_router, prefix = "/api/compute", tags = ["compute"])
 app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
-app.include_router(metrics_router, prefix = "/api/metrics", tags = ["metrics"])
 
 
 # ============ Health and System Endpoints ============

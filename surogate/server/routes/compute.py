@@ -1,18 +1,21 @@
 """Compute API routes — managed jobs, nodes, cloud, costs, policies."""
 
+from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from prometheus_api_client.prometheus_connect import PrometheusConnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from surogate.core.compute import _initialized as skypilot_initialized
 from surogate.core.compute import service as compute_service
 from surogate.core.db.engine import get_session
 from surogate.core.db.repository import compute as compute_repo
 from surogate.server.auth.authentication import get_current_subject
+import surogate.core.compute.kubernetes as k8s
 from surogate.server.models.compute import (
     CloudAccountResponse,
-    HealthResponse,
+    K8NodeResponse,
+    K8NodeMetricsResponse,
     JobLaunchRequest,
     JobListResponse,
     JobResponse,
@@ -25,19 +28,47 @@ from surogate.server.models.compute import (
 router = APIRouter()
 
 
-# ── Health ───────────────────────────────────────────────────────────
+# ── Kubernetes ───────────────────────────────────────────────────────────
+@router.get("/nodes", response_model=list[K8NodeResponse])
+async def get_local_node_metrics(
+    request: Request,
+):
+    prom = PrometheusConnect(url=request.app.state.config.prometheus_endpoint, disable_ssl=True)
+    responses: list[K8NodeResponse] = []
+    
+    for node in k8s.k8_nodes.node_info_dict.values():
+        node_available_mem = prom.custom_query(query=f"node_memory_MemAvailable_bytes{{node='{node.name}'}}")
+        node_total_mem = prom.custom_query(query=f"node_memory_MemTotal_bytes{{node='{node.name}'}}")
+        node_cpu_util = prom.custom_query(query=f'1 - avg by(node) (irate(node_cpu_seconds_total{{mode="idle", node="{node.name}"}}[1m]))')
 
-
-@router.get("/health", response_model=HealthResponse)
-async def get_health():
-    """Check whether SkyPilot has been initialized."""
-    version = None
-    try:
-        import sky
-        version = getattr(sky, "__version__", None)
-    except Exception:
-        pass
-    return HealthResponse(initialized=skypilot_initialized, version=version)
+        metrics = K8NodeMetricsResponse(node_name=node.name, timestamp=int(datetime.now().timestamp()))
+        if len(node_available_mem) > 0:
+            value = node_available_mem[0].get('value')
+            if value and len(value) > 1:
+                metrics.free_memory_bytes = int(value[1])
+        
+        if len(node_total_mem) > 0:
+            value = node_total_mem[0].get('value')
+            if value and len(value) > 1:
+                metrics.total_memory_bytes = int(value[1])
+            
+        if len(node_cpu_util) > 0:
+            value = node_cpu_util[0].get('value')
+            if value and len(value) > 1:
+                metrics.cpu_utilization_percent = float(value[1]) * 100
+                
+        responses.append(K8NodeResponse(
+            name=node.name, 
+            accelerator_type=node.accelerator_type,
+            total=node.total,
+            free=node.free,
+            cpu_count=node.cpu_count,
+            memory_gb=node.memory_gb,
+            is_ready=node.is_ready,
+            metrics=metrics
+        ))
+    
+    return responses
 
 
 # ── Overview ─────────────────────────────────────────────────────────

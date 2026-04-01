@@ -90,7 +90,7 @@ create_cluster() {
     done
     
     tmp_config=$(mktemp /tmp/k3d-config-XXXXXX.yaml)
-    envsubst < "${SCRIPT_DIR}/cluster.yaml" > "$tmp_config"
+    envsubst < "${SCRIPT_DIR}/cluster.yml" > "$tmp_config"
     "$K3D" cluster create --config "$tmp_config" --gpus all
     rm -f "$tmp_config"
 }

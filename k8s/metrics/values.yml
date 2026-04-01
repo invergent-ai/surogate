@@ -12,6 +12,14 @@ kubeScheduler:
 kubeProxy:
   enabled: false
 
+# Add 'node' label to node-exporter metrics using the k8s node name
+prometheus-node-exporter:
+  prometheus:
+    monitor:
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_endpoint_node_name]
+          targetLabel: node
+
 # Prometheus Configuration
 prometheus:
   prometheusSpec:

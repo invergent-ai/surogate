@@ -1,9 +1,10 @@
 """Pydantic models for compute API routes."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 from pydantic import BaseModel
+from sky.models import KubernetesNodeInfo
 
 
 # ── Requests ──────────────────────────────────────────────────────────
@@ -174,7 +175,26 @@ class OverviewResponse(BaseModel):
     queue_running: int
     queue_queued: int
 
-
-class HealthResponse(BaseModel):
-    initialized: bool
-    version: Optional[str] = None
+class K8NodeMetricsResponse(BaseModel):
+    timestamp: int
+    node_name: str
+    total_memory_bytes: Optional[int] = None
+    free_memory_bytes: Optional[int] = None
+    cpu_utilization_percent: Optional[float] = None
+    
+class K8NodeResponse(BaseModel):
+    name: str
+    accelerator_type: Optional[str]
+     # Resources available on the node. E.g., {'nvidia.com/gpu': '2'}
+    total: Dict[str, int]
+    free: Dict[str, int]
+    # CPU count (total CPUs available on the node)
+    cpu_count: Optional[float] = None
+    # Memory in GB (total memory available on the node)
+    memory_gb: Optional[float] = None
+    # Whether the node is ready (all conditions are satisfied)
+    is_ready: bool = True
+    
+    metrics: Optional[K8NodeMetricsResponse] = None
+    
+    

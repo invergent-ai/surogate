@@ -1,25 +1,38 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useMemo } from "react";
+import { useEffect } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { ProgressBar } from "@/components/ui/progress-bar";
 import { StatusDot } from "@/components/ui/status-dot";
+import { useAppStore } from "@/stores/app-store";
 import {
-  LOCAL_NODES, CLOUD_INSTANCES, CLOUD_ACCOUNTS, WORKLOAD_QUEUE,
-  WORKLOAD_COLORS, PROVIDER_COLORS,
+  CLOUD_INSTANCES, CLOUD_ACCOUNTS, WORKLOAD_QUEUE,
+  PROVIDER_COLORS,
 } from "./compute-data";
 
+function getGpuCount(resources?: Record<string, number>): number {
+  return resources?.["nvidia.com/gpu"] ?? 0;
+}
+
 export function OverviewTab() {
-  const totalLocalGpu = LOCAL_NODES.reduce((s, n) => s + (n.gpu?.count || 0), 0);
-  const usedLocalGpu = LOCAL_NODES.reduce((s, n) => s + (n.gpu?.used || 0), 0);
+  const k8sNodes = useAppStore((s) => s.k8sNodes);
+  const fetchK8Nodes = useAppStore((s) => s.fetchK8Nodes);
+
+  useEffect(() => {
+    fetchK8Nodes();
+  }, [fetchK8Nodes]);
+
+  const totalLocalGpu = k8sNodes.reduce((s, n) => s + getGpuCount(n.total), 0);
+  const usedLocalGpu = totalLocalGpu - k8sNodes.reduce((s, n) => s + getGpuCount(n.free), 0);
+  const readyNodes = k8sNodes.filter((n) => n.is_ready).length;
   const totalCloudGpu = CLOUD_INSTANCES.reduce((s, c) => s + parseInt(c.gpu), 0);
   const cloudHourlyCost = CLOUD_INSTANCES.filter(c => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
   const monthlySpend = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlySpend, 0);
   const monthlyBudget = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlyBudget, 0);
 
   const kpis = [
-    { label: "Local GPUs", value: `${usedLocalGpu}/${totalLocalGpu}`, sub: `${LOCAL_NODES.filter(n => n.status === "active").length} nodes` },
+    { label: "Local GPUs", value: `${usedLocalGpu}/${totalLocalGpu}`, sub: `${readyNodes} nodes` },
     { label: "Cloud GPUs", value: totalCloudGpu, sub: `${CLOUD_INSTANCES.filter(c => c.status === "running").length} instances` },
     { label: "Queue Depth", value: WORKLOAD_QUEUE.filter(w => w.status === "queued").length, sub: `${WORKLOAD_QUEUE.filter(w => w.status === "running").length} running` },
     { label: "Cloud $/hr", value: `$${cloudHourlyCost.toFixed(0)}`, sub: "active instances" },
@@ -49,10 +62,8 @@ export function OverviewTab() {
             <span className="text-sm font-semibold text-foreground font-display">Cluster Map</span>
             <div className="flex gap-2.5 text-[11px]">
               {[
-                { label: "Training", color: WORKLOAD_COLORS.training },
-                { label: "Serving", color: WORKLOAD_COLORS.serving },
-                { label: "Eval", color: WORKLOAD_COLORS.eval },
-                { label: "Idle", color: WORKLOAD_COLORS.idle },
+                { label: "Used", color: "var(--primary)" },
+                { label: "Free", color: "#1A1F2E" },
               ].map(l => (
                 <span key={l.label} className="flex items-center gap-1 text-faint">
                   <span className="w-2 h-2 rounded-sm" style={{ background: l.color }} />
@@ -62,37 +73,48 @@ export function OverviewTab() {
             </div>
           </div>
           <div className="p-4 grid grid-cols-4 gap-2">
-            {LOCAL_NODES.map(node => (
-              <Card
-                key={node.id}
-                size="sm"
-                className="p-2.5 cursor-pointer transition-all hover:border-border"
-                style={{ opacity: node.status === "cordoned" ? 0.5 : 1 }}
-              >
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-[11px] text-muted-foreground font-medium">{node.id}</span>
-                  <StatusDot status={node.status === "active" ? "running" : "error"} />
-                </div>
-                <div className="text-[10px] text-faint mb-1.5">
-                  {node.gpu ? `${node.gpu.count}\u00d7 ${node.gpu.type}` : "CPU only"}
-                </div>
-                {node.gpu && (
-                  <div className="grid gap-0.5 mb-1.5" style={{ gridTemplateColumns: `repeat(${node.gpu.count}, 1fr)` }}>
-                    {node.workloads
-                      .flatMap(w => Array.from({ length: w.gpu }, () => ({ color: WORKLOAD_COLORS[w.type] || WORKLOAD_COLORS.idle, label: w.name })))
-                      .concat(Array.from({ length: Math.max(0, node.gpu.count - node.gpu.used) }, () => ({ color: WORKLOAD_COLORS.idle, label: "idle" })))
-                      .slice(0, node.gpu.count)
-                      .map((s, i) => (
-                        <div key={i} className="h-4 rounded" style={{ background: s.color, border: `1px solid ${s.color === WORKLOAD_COLORS.idle ? "var(--border)" : s.color + "60"}` }} title={s.label} />
-                      ))}
+            {k8sNodes.map(node => {
+              const gpuTotal = getGpuCount(node.total);
+              const gpuFree = getGpuCount(node.free);
+              const gpuUsed = gpuTotal - gpuFree;
+              const cpuUtil = node.metrics?.cpu_utilization_percent ?? 0;
+              const memTotalGb = node.memory_gb ?? 0;
+              const memFreeGb = node.metrics?.free_memory_bytes
+                ? node.metrics.free_memory_bytes / (1024 ** 3)
+                : 0;
+              const memUsedGb = memTotalGb - memFreeGb;
+
+              return (
+                <Card
+                  key={node.name}
+                  size="sm"
+                  className="p-2.5 cursor-pointer transition-all hover:border-border"
+                  style={{ opacity: node.is_ready ? 1 : 0.5 }}
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[11px] text-muted-foreground font-medium">{node.name}</span>
+                    <StatusDot status={node.is_ready ? "running" : "error"} />
                   </div>
-                )}
-                <ProgressBar value={node.gpu?.utilization || node.cpu.utilization} color="var(--primary)" />
-                <div className="text-[10px] text-faint mt-1">
-                  GPU {node.gpu?.utilization || 0}% · CPU {node.cpu.utilization}% · {node.mem.used}/{node.mem.total}{node.mem.unit}
-                </div>
-              </Card>
-            ))}
+                  <div className="text-[10px] text-faint mb-1.5">
+                    {gpuTotal > 0 ? `${gpuTotal}\u00d7 ${node.accelerator_type ?? "GPU"}` : "CPU only"}
+                  </div>
+                  {gpuTotal > 0 && (
+                    <div className="grid gap-0.5 mb-1.5" style={{ gridTemplateColumns: `repeat(${gpuTotal}, 1fr)` }}>
+                      {Array.from({ length: gpuUsed }, (_, i) => (
+                        <div key={`u${i}`} className="h-4 rounded" style={{ background: "var(--primary)", border: "1px solid var(--primary)" }} title="used" />
+                      ))}
+                      {Array.from({ length: gpuFree }, (_, i) => (
+                        <div key={`f${i}`} className="h-4 rounded" style={{ background: "#1A1F2E", border: "1px solid var(--border)" }} title="free" />
+                      ))}
+                    </div>
+                  )}
+                  <ProgressBar value={cpuUtil} color="var(--primary)" />
+                  <div className="text-[10px] text-faint mt-1">
+                    {gpuTotal > 0 && `GPU ${gpuUsed}/${gpuTotal} · `}CPU {cpuUtil.toFixed(0)}% · {memUsedGb.toFixed(0)}/{memTotalGb.toFixed(0)}Gi
+                  </div>
+                </Card>
+              );
+            })}
           </div>
         </Card>
 
