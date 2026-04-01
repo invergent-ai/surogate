@@ -162,12 +162,17 @@ install_lakefs() {
     "$KUBECTL" apply -f "${SCRIPT_DIR}/lakefs/s3-service.yml"
 }
 
+install_gpu() {
+    "$KUBECTL" create namespace nvidia-gpu-operator
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/gpu/configmap.yml"
+    "$HELM" install nvidia-gpu-operator nvidia/gpu-operator --version=v26.3.0 --wait -n nvidia-gpu-operator -f "${SCRIPT_DIR}/gpu/values.yml"
+}
+
 install_metrics() {
-  "$KUBECTL" create namespace monitoring
-  "$HELM" install dcgm-exporter dcgm-exporter/dcgm-exporter -f "${SCRIPT_DIR}/metrics/dcgm.yml"
-  "$HELM" install kube-prometheus-stack prometheus-community/kube-prometheus-stack -f "${SCRIPT_DIR}/metrics/values.yml" -n monitoring
-  "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/ingress.yml"
-  "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/gpu_scraper.yml"
+    "$KUBECTL" create namespace monitoring
+    "$HELM" install kube-prometheus-stack prometheus-community/kube-prometheus-stack -f "${SCRIPT_DIR}/metrics/values.yml" -n monitoring
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/ingress.yml"
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/gpu_scraper.yml"
 }
 
 create_server_config() {
@@ -200,6 +205,7 @@ echo -e "${CYAN}  Run: export KUBECONFIG=$SUROGATE_DIR/kubeconfig${NC}"
 
 export KUBECONFIG="$SUROGATE_DIR/kubeconfig"
 
+install_gpu
 install_traefik
 install_lakefs
 install_metrics

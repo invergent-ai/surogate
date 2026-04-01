@@ -185,7 +185,7 @@ class K8NodeMetricsResponse(BaseModel):
 class K8NodeResponse(BaseModel):
     name: str
     accelerator_type: Optional[str]
-     # Resources available on the node. E.g., {'nvidia.com/gpu': '2'}
+     # Resources available on the node. E.g., {'accelerators_available': '2'}
     total: Dict[str, int]
     free: Dict[str, int]
     # CPU count (total CPUs available on the node)

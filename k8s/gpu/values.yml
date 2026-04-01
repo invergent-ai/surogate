@@ -1,0 +1,70 @@
+dcgmExporter:
+  enabled: true
+  env:
+    - name: DCGM_EXPORTER_INTERVAL
+      value: "5000"  # in milliseconds
+  serviceMonitor:
+    enabled: false
+  # Schedule the DCGM Exporter on worker nodes only
+  # If you want to run GPU workloads on control-plane nodes, remove this affinity configuration
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: DoesNotExist
+  config:
+    name: custom-dcgm-exporter-metrics
+    create: true
+    data: |-
+      # General
+      DCGM_FI_DEV_COUNT, counter, Number of GPUs in the system.
+      DCGM_FI_DEV_NAME, label, Name of the GPU.
+
+      # Memory
+      DCGM_FI_DEV_FB_TOTAL, counter, Total framebuffer memory (in Mb).
+      DCGM_FI_DEV_FB_FREE, counter, Free framebuffer memory (in Mb).
+      DCGM_FI_DEV_FB_USED, counter, Used framebuffer memory (in Mb).
+      DCGM_FI_DEV_FB_RESERVED, counter, Reserved framebuffer memory (in Mb).
+
+      # Temperature
+      DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (in C).
+      DCGM_FI_DEV_GPU_TEMP,    gauge, GPU temperature (in C).
+
+      # Power
+      DCGM_FI_DEV_POWER_USAGE,              gauge, Power draw (in W).
+      DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption since boot (in mJ).
+
+      # Utilization (the sample period varies depending on the product)
+      DCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (in %).
+      DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %).
+
+# use host nvidia driver
+driver:
+  enabled: false
+
+devicePlugin:
+  config:
+    name: time-slicing-config
+
+gdrcopy:
+  enabled: false
+
+toolkit:
+  enabled: false
+
+nfd:
+  enabled: true
+
+node-feature-discovery:
+  worker:
+    # Schedule the DCGM Exporter on worker nodes only
+    # If you want to run GPU workloads on control-plane nodes, remove this affinity configuration
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: DoesNotExist

@@ -12,5 +12,5 @@ docker build \
   --build-arg K3S_TAG=$K3S_TAG \
   --build-arg CUDA_TAG=$CUDA_TAG \
   -t $IMAGE .
-docker push $IMAGE
+# docker push $IMAGE
 echo "Done!"
