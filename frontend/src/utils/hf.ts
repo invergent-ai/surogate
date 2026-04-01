@@ -1,5 +1,9 @@
 type HFKind = 'models' | 'datasets';
 
+export interface HFSibling {
+  rfilename: string;
+}
+
 export interface HFItem {
   id: string;
   author?: string;
@@ -8,6 +12,7 @@ export interface HFItem {
   last_modified?: string;
   downloads?: number;
   name?: string;
+  siblings?: HFSibling[];
   [key: string]: unknown;
 }
 

@@ -7,13 +7,14 @@ import { createTasksSlice, type TasksSlice } from "./tasks-slice";
 import { createHubSlice, type HubSlice } from "./hub-slice";
 import { createSkillsSlice, type SkillsSlice } from "./skills-slice";
 import { createComputeSlice, type ComputeSlice } from "./compute-slice";
+import { createModelsSlice, type ModelsSlice } from "./models-slice";
 
 
-export type AppState = ProjectsSlice & TasksSlice & HubSlice & SkillsSlice & ComputeSlice & {
+export type AppState = ProjectsSlice & TasksSlice & HubSlice & SkillsSlice & ComputeSlice & ModelsSlice & {
   loading: boolean;
   error: string | null;
 };
- 
+
 export const useAppStore = create<AppState>((...a) => ({
   loading: false,
   error: null,
@@ -22,4 +23,5 @@ export const useAppStore = create<AppState>((...a) => ({
   ...createHubSlice(...a),
   ...createSkillsSlice(...a),
   ...createComputeSlice(...a),
+  ...createModelsSlice(...a),
 }));

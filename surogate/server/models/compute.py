@@ -1,10 +1,8 @@
 """Pydantic models for compute API routes."""
 
-from datetime import datetime
 from typing import Dict, Optional
 
 from pydantic import BaseModel
-from sky.models import KubernetesNodeInfo
 
 
 # ── Requests ──────────────────────────────────────────────────────────
@@ -18,6 +16,24 @@ class JobLaunchRequest(BaseModel):
     accelerators: Optional[str] = None
     cloud: Optional[str] = None
     use_spot: bool = False
+
+
+class ServingServiceLaunchRequest(BaseModel):
+    task_yaml: str
+    service_name: str
+    project_id: str
+    accelerators: Optional[str] = None
+    cloud: Optional[str] = None
+    use_spot: bool = False
+    min_replicas: int = 1
+    max_replicas: Optional[int] = None
+    readiness_path: Optional[str] = None
+    load_balancing_policy: Optional[str] = None
+
+
+class ServingServiceUpdateRequest(BaseModel):
+    task_yaml: str
+    mode: str = "rolling"  # rolling / blue_green
 
 
 class PolicyToggleRequest(BaseModel):
@@ -51,6 +67,44 @@ class JobResponse(BaseModel):
 
 class JobListResponse(BaseModel):
     jobs: list[JobResponse]
+    total: int
+    status_counts: dict[str, int]
+
+
+class ServingServiceReplicaResponse(BaseModel):
+    replica_id: int
+    name: Optional[str] = None
+    status: str
+    version: Optional[int] = None
+    launched_at: Optional[str] = None
+    endpoint: Optional[str] = None
+
+
+class ServingServiceResponse(BaseModel):
+    id: str
+    name: str
+    status: str
+    endpoint: Optional[str] = None
+    accelerators: Optional[str] = None
+    cloud: Optional[str] = None
+    region: Optional[str] = None
+    use_spot: bool = False
+    min_replicas: int = 1
+    max_replicas: Optional[int] = None
+    readiness_path: Optional[str] = None
+    load_balancing_policy: Optional[str] = None
+    update_mode: Optional[str] = None
+    replicas: list[ServingServiceReplicaResponse] = []
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    requested_by: Optional[str] = None
+    project: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class ServingServiceListResponse(BaseModel):
+    services: list[ServingServiceResponse]
     total: int
     status_counts: dict[str, int]
 

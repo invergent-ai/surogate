@@ -191,6 +191,7 @@ export function HubPage() {
                 lakefs_branch: "main",
                 ...(params.token ? { hf_token: params.token } : {}),
                 ...(params.subset ? { hf_dataset_subset: params.subset } : {}),
+                ...(params.ggufFile ? { gguf_file: params.ggufFile } : {}),
               },
             });
             addTask(task);

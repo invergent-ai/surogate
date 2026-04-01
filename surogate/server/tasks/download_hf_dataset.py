@@ -16,7 +16,6 @@ import os
 import shutil
 import sys
 import tempfile
-from multiprocessing import Process, Queue
 
 import lakefs_sdk
 import urllib3
@@ -78,29 +77,6 @@ def _lakefs_upload(path: str, content_path: str):
 
 # ── HuggingFace download ────────────────────────────────────────────
 
-def _do_download(repo_id, subset, queue):
-    try:
-        ds = load_dataset(repo_id, subset or None, token=hf_token or None, keep_in_memory=False)
-        try:
-            ds.cleanup_cache_files()
-        except Exception:
-            pass
-        queue.put("done")
-    except Exception as e:
-        queue.put(f"error: {e}")
-
-
-def _launch_download(repo_id, subset):
-    queue = Queue()
-    proc = Process(target=_do_download, args=(repo_id, subset, queue))
-    proc.start()
-    while proc.is_alive():
-        proc.join(timeout=0.2)
-    result = queue.get() if not queue.empty() else None
-    proc.join(timeout=1)
-    return result
-
-
 def _delete_cache(dataset_id):
     from huggingface_hub import scan_cache_dir
     from huggingface_hub.constants import HF_HOME
@@ -139,11 +115,14 @@ def _write_dataset_info(dataset):
 def download():
     global returncode, error_msg
     try:
-        result = _launch_download(hf_dataset_id, hf_dataset_subset)
-
-        if isinstance(result, str) and result.startswith("error:"):
-            returncode = 1
-            error_msg = result[len("error: "):]
+        ds = load_dataset(
+            hf_dataset_id, hf_dataset_subset or None,
+            token=hf_token or None, keep_in_memory=False,
+        )
+        try:
+            ds.cleanup_cache_files()
+        except Exception:
+            pass
     except GatedRepoError:
         returncode = 77
         error_msg = f"{hf_dataset_id} is a gated dataset. Accept the terms on its HuggingFace page first."

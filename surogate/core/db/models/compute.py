@@ -216,6 +216,132 @@ class LocalTask(UUIDMixin, Base):
     )
 
 
+class ServingService(UUIDMixin, Base):
+    """Platform metadata for a SkyPilot serving service.
+
+    SkyPilot Serve manages the controller, load balancer, and replicas.
+    This model stores Surogate-specific context: project ownership,
+    who launched it, original task YAML, and replica/autoscaling config.
+    """
+
+    __tablename__ = "serving_services"
+
+    name: Mapped[str] = mapped_column(sa.String(255), unique=True)
+    project_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("projects.id"), index=True
+    )
+    requested_by_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("users.id"), index=True
+    )
+    task_yaml: Mapped[str] = mapped_column(sa.Text)
+    status: Mapped[str] = mapped_column(sa.String(32), default="controller_init")
+    endpoint: Mapped[Optional[str]] = mapped_column(
+        sa.String(512), nullable=True
+    )
+    accelerators: Mapped[Optional[str]] = mapped_column(
+        sa.String(128), nullable=True
+    )
+    cloud: Mapped[Optional[str]] = mapped_column(
+        sa.String(64), nullable=True
+    )
+    region: Mapped[Optional[str]] = mapped_column(
+        sa.String(64), nullable=True
+    )
+    use_spot: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    min_replicas: Mapped[int] = mapped_column(sa.Integer, default=1)
+    max_replicas: Mapped[Optional[int]] = mapped_column(
+        sa.Integer, nullable=True
+    )
+    readiness_path: Mapped[Optional[str]] = mapped_column(
+        sa.String(255), nullable=True
+    )
+    load_balancing_policy: Mapped[Optional[str]] = mapped_column(
+        sa.String(64), nullable=True
+    )
+    update_mode: Mapped[Optional[str]] = mapped_column(
+        sa.String(32), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime, server_default=sa.func.now()
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime, nullable=True
+    )
+    terminated_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime, nullable=True
+    )
+
+
+class DeployedModelStatus(enum.Enum):
+    deploying = "deploying"
+    serving = "serving"
+    error = "error"
+    stopped = "stopped"
+
+
+class DeployedModel(UUIDMixin, Base):
+    """A model deployment linked to a ServingService.
+
+    Captures model-specific metadata (identity, config, generation defaults)
+    while the linked ServingService handles infrastructure (SkyPilot, replicas,
+    cloud placement).  Status is derived from the ServingService state.
+    """
+
+    __tablename__ = "deployed_models"
+
+    name: Mapped[str] = mapped_column(sa.String(255), unique=True)
+    display_name: Mapped[str] = mapped_column(sa.String(512))
+    base_model: Mapped[str] = mapped_column(sa.String(512))
+    family: Mapped[Optional[str]] = mapped_column(
+        sa.String(128), nullable=True
+    )
+    param_count: Mapped[Optional[str]] = mapped_column(
+        sa.String(32), nullable=True
+    )
+    model_type: Mapped[str] = mapped_column(
+        sa.String(64), default="Base"
+    )
+    quantization: Mapped[Optional[str]] = mapped_column(
+        sa.String(64), nullable=True
+    )
+    context_window: Mapped[Optional[int]] = mapped_column(
+        sa.Integer, nullable=True
+    )
+    engine: Mapped[Optional[str]] = mapped_column(
+        sa.String(128), nullable=True
+    )
+    image: Mapped[Optional[str]] = mapped_column(
+        sa.String(512), nullable=True
+    )
+    hub_ref: Mapped[Optional[str]] = mapped_column(
+        sa.String(512), nullable=True
+    )
+    namespace: Mapped[Optional[str]] = mapped_column(
+        sa.String(128), nullable=True
+    )
+    serving_config: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        sa.JSON, nullable=True
+    )
+    generation_defaults: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        sa.JSON, nullable=True
+    )
+    serving_service_id: Mapped[Optional[str]] = mapped_column(
+        sa.ForeignKey("serving_services.id"), nullable=True, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("projects.id"), index=True
+    )
+    deployed_by_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("users.id"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime, server_default=sa.func.now()
+    )
+    last_deployed_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime, nullable=True
+    )
+
+
 class ComputePolicy(UUIDMixin, Base):
     __tablename__ = "compute_policies"
 
@@ -244,5 +370,8 @@ __all__ = [
     "LocalTaskType",
     "LocalTaskStatus",
     "LocalTask",
+    "ServingService",
+    "DeployedModelStatus",
+    "DeployedModel",
     "ComputePolicy",
 ]

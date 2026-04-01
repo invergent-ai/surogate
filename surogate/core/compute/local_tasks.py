@@ -294,6 +294,8 @@ class LocalTaskManager:
                 env["HF_TOKEN"] = params["hf_token"]
             if params.get("hf_dataset_subset"):
                 env["HF_DATASET_SUBSET"] = params["hf_dataset_subset"]
+            if params.get("gguf_file"):
+                env["GGUF_FILE"] = params["gguf_file"]
 
         # Rclone config for the "lakefs" remote via env vars
         if cfg.lakefs_s3_endpoint and creds and all(creds):

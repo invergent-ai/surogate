@@ -13,13 +13,12 @@ import asyncio
 import json
 import os
 import sys
-from multiprocessing import Process, Queue
 
 import lakefs_sdk
 import urllib3
-from huggingface_hub import HfFileSystem, snapshot_download
+from huggingface_hub import HfFileSystem, hf_hub_download
 from huggingface_hub.errors import GatedRepoError
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 urllib3.disable_warnings()
 
@@ -32,11 +31,7 @@ lakefs_branch = os.environ.get("LAKEFS_BRANCH", "main")
 lakefs_key = os.environ.get("LAKECTL_CREDENTIALS_ACCESS_KEY_ID", "")
 lakefs_secret = os.environ.get("LAKECTL_CREDENTIALS_SECRET_ACCESS_KEY", "")
 lakefs_endpoint = os.environ.get("LAKECTL_SERVER_ENDPOINT_URL", "")
-
-ALLOW_PATTERNS = [
-    "*.json", "*.safetensors", "*.py", "tokenizer.model", "*.tiktoken",
-    "*.npz", "*.bin", "*.jinja", "*.yaml", "*.md",
-]
+gguf_file = os.environ.get("GGUF_FILE", "")
 
 # ── Globals ──────────────────────────────────────────────────────────
 
@@ -67,16 +62,6 @@ def _lakefs_commit(message: str):
         )
 
 
-def _lakefs_upload(path: str, content_path: str):
-    with _lakefs_client() as client:
-        api = lakefs_sdk.ObjectsApi(client)
-        api.upload_object(
-            repository=lakefs_repo_id,
-            branch=lakefs_branch,
-            path=path,
-            content=content_path,
-        )
-
 
 # ── HuggingFace download ────────────────────────────────────────────
 
@@ -91,25 +76,6 @@ def _get_snapshot_path(repo_id):
         return None
     commits = sorted(os.listdir(snapshots))
     return os.path.join(snapshots, commits[-1]) if commits else None
-
-
-def _do_download(repo_id, queue, allow_patterns):
-    try:
-        snapshot_download(repo_id, allow_patterns=allow_patterns, token=hf_token or None)
-        queue.put("done")
-    except Exception as e:
-        queue.put(f"error: {e}")
-
-
-def _launch_download(repo_id, allow_patterns):
-    queue = Queue()
-    proc = Process(target=_do_download, args=(repo_id, queue, allow_patterns))
-    proc.start()
-    while proc.is_alive():
-        proc.join(timeout=0.2)
-    result = queue.get() if not queue.empty() else None
-    proc.join(timeout=1)
-    return result
 
 
 def _check_gated(repo_id):
@@ -150,11 +116,11 @@ def download():
         return
 
     try:
-        result = _launch_download(hf_model_id, ALLOW_PATTERNS)
-
-        if isinstance(result, str) and result.startswith("error:"):
-            returncode = 1
-            error_msg = result[len("error: "):]
+        hf_hub_download(
+            repo_id=hf_model_id,
+            filename=gguf_file if gguf_file else None,
+            token=hf_token or None,
+        )
     except Exception as e:
         returncode = 1
         error_msg = f"{type(e).__name__}: {e}"
@@ -170,7 +136,15 @@ def _write_chat_template(repo_id, local_path):
     except Exception as e:
         print(f"Warning: Could not extract chat template: {e}")
 
-
+def _write_model_info(repo_id, local_path):
+    try:
+        config = AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
+        if config:
+            with open(os.path.join(local_path, "surogate_model_info.json"), "w") as f:
+                json.dump(config.to_dict(), f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not extract model info: {e}")
+    
 async def _upload_to_lakefs(local_path):
     from anyio import open_process
     from anyio.streams.text import TextReceiveStream
@@ -193,6 +167,7 @@ async def main():
 
     print(f"HF_MODEL_ID: {hf_model_id}")
     print(f"LAKEFS_REPO_ID: {lakefs_repo_id}/{lakefs_branch}")
+    print(f"GGUF_FILE: {gguf_file or '(none)'}")
 
     # 1. Download from HuggingFace
     download()
@@ -206,9 +181,12 @@ async def main():
         print("ERROR: Download succeeded but snapshot path not found")
         sys.exit(1)
 
-    # 2. Extract chat template
-    _write_chat_template(hf_model_id, local_path)
+    # 2. Extract chat template for non-GGUF models
+    if len(gguf_file) == 0:
+        _write_chat_template(hf_model_id, local_path)
 
+    _write_model_info(hf_model_id, local_path)
+    
     # 3. Upload to LakeFS via rclone
     rc = await _upload_to_lakefs(local_path)
     if rc != 0:

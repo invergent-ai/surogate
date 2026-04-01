@@ -1,23 +1,17 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { StatusDot } from "@/components/ui/status-dot";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog";
 import { cn } from "@/utils/cn";
-import { MODELS, TYPE_STYLES, toStatus } from "./models-data";
+import { TYPE_STYLES, toStatus } from "./models-data";
 import { ModelDetail, ModelEmptyState } from "./model-detail";
+import { useAppStore } from "@/stores/app-store";
 import type { Model } from "./models-data";
+import { ServeModelDialog } from "./serve-model-dialog";
 
 // ── Status filter buttons ──────────────────────────────────────
 
@@ -115,100 +109,33 @@ function ModelListItem({
   );
 }
 
-// ── Serve model modal ─────────────────────────────────────────
-
-const SERVE_SOURCES = [
-  { icon: "\u2295", label: "Local Hub", desc: "From your registry" },
-  { icon: "\uD83E\uDD17", label: "Hugging Face", desc: "From HF Hub" },
-  { icon: "\u29C9", label: "Custom Image", desc: "Container registry" },
-];
-
-const SERVE_FIELDS = [
-  { label: "Model", placeholder: "meta-llama/Llama-3.1-8B-Instruct" },
-  { label: "Namespace", placeholder: "prod-cx" },
-  { label: "GPU Type", placeholder: "A100 80GB" },
-  { label: "GPU Count", placeholder: "2" },
-  { label: "Quantization", placeholder: "awq" },
-  { label: "Engine", placeholder: "vLLM 0.6.4" },
-];
-
-function ServeModelDialog({
-  open,
-  onOpenChange,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Serve Model</DialogTitle>
-          <DialogDescription>
-            Deploy an LLM to your cluster for inference
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="text-[10px] text-muted-foreground/50 uppercase tracking-wide mb-2 font-display">
-          Source
-        </div>
-        <div className="grid grid-cols-3 gap-2 mb-5">
-          {SERVE_SOURCES.map((s, i) => (
-            <button
-              key={s.label}
-              className={cn(
-                "p-3 rounded-lg border text-center transition-colors cursor-pointer",
-                i === 0
-                  ? "border-blue-500/20 bg-muted/60"
-                  : "border-border bg-muted/40 hover:border-blue-500/20 hover:bg-muted/60",
-              )}
-            >
-              <div className="text-lg mb-1">{s.icon}</div>
-              <div className="text-[11px] font-semibold text-foreground font-display">
-                {s.label}
-              </div>
-              <div className="text-[9px] text-muted-foreground mt-0.5">
-                {s.desc}
-              </div>
-            </button>
-          ))}
-        </div>
-
-        <div className="grid grid-cols-2 gap-3">
-          {SERVE_FIELDS.map((f) => (
-            <div key={f.label}>
-              <div className="text-[9px] text-muted-foreground/50 mb-1 font-display uppercase tracking-wide">
-                {f.label}
-              </div>
-              <Input placeholder={f.placeholder} className="h-8 text-xs" />
-            </div>
-          ))}
-        </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button onClick={() => onOpenChange(false)}>Deploy</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-// ── Main page ──────────────────────────────────────────────────
-
 export function ModelsPage() {
-  const [selectedId, setSelectedId] = useState<string | null>("llama-3.1-8b-cx");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterSearch, setFilterSearch] = useState("");
   const [showServeModal, setShowServeModal] = useState(false);
 
-  const model = selectedId
-    ? MODELS.find((m) => m.id === selectedId) ?? null
+  const models = useAppStore((s) => s.models);
+  const selectedModel = useAppStore((s) => s.selectedModel);
+  const modelsStatusCounts = useAppStore((s) => s.modelsStatusCounts);
+  const fetchModel = useAppStore((s) => s.fetchModel);
+  const startModelsPolling = useAppStore((s) => s.startModelsPolling);
+
+  useEffect(() => {
+    const stopPolling = startModelsPolling();
+    return stopPolling;
+  }, [startModelsPolling]);
+
+  const handleSelect = (id: string) => {
+    setSelectedId(id);
+    fetchModel(id);
+  };
+
+  const model = selectedModel && selectedModel.id === selectedId
+    ? selectedModel
     : null;
 
-  const filtered = MODELS.filter((m) => {
+  const filtered = models.filter((m: Model) => {
     if (filterStatus !== "all" && m.status !== filterStatus) return false;
     if (
       filterSearch &&
@@ -220,17 +147,17 @@ export function ModelsPage() {
   });
 
   const statusCounts = {
-    all: MODELS.length,
-    serving: MODELS.filter((m) => m.status === "serving").length,
-    error: MODELS.filter((m) => m.status === "error").length,
-    stopped: MODELS.filter((m) => m.status === "stopped").length,
+    all: models.length,
+    serving: modelsStatusCounts["serving"] ?? 0,
+    error: modelsStatusCounts["error"] ?? 0,
+    stopped: modelsStatusCounts["stopped"] ?? 0,
   };
 
-  const totalGpus = MODELS.reduce(
-    (s, m) => s + (m.status === "serving" ? m.gpu.count : 0),
+  const totalGpus = models.reduce(
+    (s: number, m: Model) => s + (m.status === "serving" ? m.gpu.count : 0),
     0,
   );
-  const totalTps = MODELS.reduce((s, m) => s + m.tps, 0);
+  const totalTps = models.reduce((s: number, m: Model) => s + m.tps, 0);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-background">
@@ -244,8 +171,8 @@ export function ModelsPage() {
         }
         action={
           <div className="flex gap-2">
-            <Button size="sm" onClick={() => setShowServeModal(true)}>
-              &#x25C7; Serve Model
+            <Button onClick={() => setShowServeModal(true)}>
+              &#x25C7; Deploy Model
             </Button>
           </div>
         }
@@ -296,7 +223,7 @@ export function ModelsPage() {
                 key={m.id}
                 model={m}
                 selected={selectedId === m.id}
-                onSelect={() => setSelectedId(m.id)}
+                onSelect={() => handleSelect(m.id)}
               />
             ))}
             {filtered.length === 0 && (

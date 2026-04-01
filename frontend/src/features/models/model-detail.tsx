@@ -1,7 +1,9 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { cn } from "@/utils/cn";
@@ -11,9 +13,27 @@ import { PerformanceTab } from "./performance-tab";
 import { ConfigTab } from "./config-tab";
 import { FinetunesTab } from "./finetunes-tab";
 import { EventsTab } from "./events-tab";
+import { useAppStore } from "@/stores/app-store";
 import type { Model } from "./models-data";
 
 export function ModelDetail({ model }: { model: Model }) {
+  const stopModel = useAppStore((s) => s.stopModel);
+  const restartModel = useAppStore((s) => s.restartModel);
+  const deleteModel = useAppStore((s) => s.deleteModel);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+
+  const handleStop = () => {
+    if (confirm("Stop serving this model?")) {
+      stopModel(model.id);
+    }
+  };
+
+  const handleRestart = () => {
+    if (confirm("Restart this model?")) {
+      restartModel(model.id);
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Header */}
@@ -66,22 +86,42 @@ export function ModelDetail({ model }: { model: Model }) {
                 {model.description}
               </p>
               <div className="flex gap-3 mt-1.5 text-[10px] text-muted-foreground/40 flex-wrap">
-                <span>
-                  base:{" "}
-                  <span className="text-muted-foreground">{model.base}</span>
-                </span>
-                <span>
-                  params:{" "}
-                  <span className="text-muted-foreground">
-                    {model.paramCount}
+                {model.base && model.base !== "\u2014" && (
+                  <span>
+                    base:{" "}
+                    <span className="text-muted-foreground">{model.base}</span>
                   </span>
-                </span>
-                <span>
-                  ctx:{" "}
-                  <span className="text-muted-foreground">
-                    {model.contextWindow.toLocaleString()}
+                )}
+                {model.family && model.family !== "\u2014" && (
+                  <span>
+                    family:{" "}
+                    <span className="text-muted-foreground">{model.family}</span>
                   </span>
-                </span>
+                )}
+                {model.paramCount && model.paramCount !== "\u2014" && (
+                  <span>
+                    params:{" "}
+                    <span className="text-muted-foreground">
+                      {model.paramCount}
+                    </span>
+                  </span>
+                )}
+                {model.quantization && model.quantization !== "\u2014" && (
+                  <span>
+                    quant:{" "}
+                    <span className="text-muted-foreground">
+                      {model.quantization}
+                    </span>
+                  </span>
+                )}
+                {model.contextWindow > 0 && (
+                  <span>
+                    ctx:{" "}
+                    <span className="text-muted-foreground">
+                      {model.contextWindow.toLocaleString()}
+                    </span>
+                  </span>
+                )}
                 {model.engine !== "\u2014" && (
                   <span>
                     engine:{" "}
@@ -101,17 +141,17 @@ export function ModelDetail({ model }: { model: Model }) {
           </div>
           <div className="flex gap-1.5 shrink-0">
             {model.status === "serving" && (
-              <Button variant="outline" size="xs">
-                Scale
+              <Button variant="outline" size="xs" onClick={handleStop}>
+                Stop
               </Button>
             )}
-            {model.status === "stopped" && (
-              <Button variant="outline" size="xs">
+            {(model.status === "stopped" || model.status === "configured") && (
+              <Button variant="outline" size="xs" onClick={handleRestart}>
                 Deploy
               </Button>
             )}
             {model.status === "error" && (
-              <Button variant="destructive" size="xs">
+              <Button variant="destructive" size="xs" onClick={handleRestart}>
                 Restart
               </Button>
             )}
@@ -123,8 +163,8 @@ export function ModelDetail({ model }: { model: Model }) {
             <Button variant="outline" size="xs">
               Logs
             </Button>
-            <Button variant="ghost" size="icon-xs">
-              &#x22EF;
+            <Button variant="destructive" size="xs" onClick={() => setDeleteOpen(true)}>
+              Delete
             </Button>
           </div>
         </div>
@@ -139,7 +179,7 @@ export function ModelDetail({ model }: { model: Model }) {
           <TabsList variant="line">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="performance">Performance</TabsTrigger>
-            <TabsTrigger value="config">Serving Config</TabsTrigger>
+            <TabsTrigger value="config">Config</TabsTrigger>
             <TabsTrigger value="finetunes">Fine-tunes</TabsTrigger>
             <TabsTrigger value="events">Events</TabsTrigger>
           </TabsList>
@@ -163,6 +203,19 @@ export function ModelDetail({ model }: { model: Model }) {
           </TabsContent>
         </div>
       </Tabs>
+
+      <ConfirmDialog
+        open={deleteOpen}
+        title="Delete model"
+        description={<>This will permanently delete <strong>{model.displayName}</strong> and terminate any running service.</>}
+        confirmLabel="Delete"
+        variant="destructive"
+        onConfirm={async () => {
+          await deleteModel(model.id);
+          setDeleteOpen(false);
+        }}
+        onCancel={() => setDeleteOpen(false)}
+      />
     </div>
   );
 }

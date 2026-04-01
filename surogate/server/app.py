@@ -29,7 +29,7 @@ from pathlib import Path
 from surogate.core.db.repository import auth as auth_repository
 from surogate.core.compute.kubernetes import init_kubernetes
 
-from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router
+from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router
 
 logger = get_logger()
 
@@ -93,6 +93,7 @@ app.include_router(hub_router, prefix = "/api/hub", tags = ["hub"])
 app.include_router(compute_router, prefix = "/api/compute", tags = ["compute"])
 app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
+app.include_router(models_router, prefix = "/api/models", tags = ["models"])
 
 
 # ============ Health and System Endpoints ============

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from prometheus_api_client.prometheus_connect import PrometheusConnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from surogate.core.compute import service as compute_service
+from surogate.core.compute import sky as sky_service
 from surogate.core.db.engine import get_session
 from surogate.core.db.repository import compute as compute_repo
 from surogate.server.auth.authentication import get_current_subject
@@ -23,6 +23,11 @@ from surogate.server.models.compute import (
     OverviewResponse,
     PolicyResponse,
     PolicyToggleRequest,
+    ServingServiceLaunchRequest,
+    ServingServiceListResponse,
+    ServingServiceReplicaResponse,
+    ServingServiceResponse,
+    ServingServiceUpdateRequest,
 )
 
 router = APIRouter()
@@ -82,14 +87,14 @@ async def get_overview(
     """Aggregated dashboard KPIs for the Overview tab."""
     nodes = await compute_repo.list_nodes(session)
     accounts = await compute_repo.list_cloud_accounts(session)
-    jobs_data = await compute_service.list_jobs(session, limit=200)
+    jobs_data = await sky_service.list_jobs(session, limit=200)
 
     local_gpu_total = sum(n.gpu_total for n in nodes)
     local_gpu_used = sum(n.gpu_used for n in nodes)
 
     cloud_instances = []
     try:
-        cloud_instances = await compute_service.get_cluster_status()
+        cloud_instances = await sky_service.get_cluster_status()
     except Exception:
         pass
 
@@ -118,6 +123,199 @@ async def get_overview(
     )
 
 
+# ── Serving Services ────────────────────────────────────────────────
+
+
+@router.get("/services", response_model=ServingServiceListResponse)
+async def list_serving_services(
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+    project_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, le=200),
+):
+    """List serving services with optional filters."""
+    data = await sky_service.list_serving_services(
+        session,
+        project_id=project_id,
+        status_filter=status,
+        limit=limit,
+    )
+    services = [
+        ServingServiceResponse(
+            id=s.id,
+            name=s.name,
+            status=s.status,
+            endpoint=s.endpoint,
+            accelerators=s.accelerators,
+            cloud=s.cloud,
+            region=s.region,
+            use_spot=s.use_spot,
+            min_replicas=s.min_replicas,
+            max_replicas=s.max_replicas,
+            readiness_path=s.readiness_path,
+            load_balancing_policy=s.load_balancing_policy,
+            update_mode=s.update_mode,
+            created_at=s.created_at.isoformat() if s.created_at else None,
+            started_at=s.started_at.isoformat() if s.started_at else None,
+            requested_by=s.requested_by_id,
+            project=s.project_id,
+        )
+        for s in data["services"]
+    ]
+    return ServingServiceListResponse(
+        services=services,
+        total=data["total"],
+        status_counts=data["status_counts"],
+    )
+
+
+@router.post("/services", response_model=ServingServiceResponse)
+async def launch_serving_service(
+    req: ServingServiceLaunchRequest,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """Launch a new serving service."""
+    svc = await sky_service.launch_serving_service(
+        session,
+        task_yaml=req.task_yaml,
+        service_name=req.service_name,
+        project_id=req.project_id,
+        requested_by_id=current_subject,
+        accelerators=req.accelerators,
+        cloud=req.cloud,
+        use_spot=req.use_spot,
+        min_replicas=req.min_replicas,
+        max_replicas=req.max_replicas,
+        readiness_path=req.readiness_path,
+        load_balancing_policy=req.load_balancing_policy,
+    )
+    return ServingServiceResponse(
+        id=svc.id,
+        name=svc.name,
+        status=svc.status,
+        endpoint=svc.endpoint,
+        accelerators=svc.accelerators,
+        cloud=svc.cloud,
+        region=svc.region,
+        use_spot=svc.use_spot,
+        min_replicas=svc.min_replicas,
+        max_replicas=svc.max_replicas,
+        readiness_path=svc.readiness_path,
+        load_balancing_policy=svc.load_balancing_policy,
+    )
+
+
+@router.get("/services/{service_id}/status", response_model=ServingServiceResponse)
+async def get_serving_service_status(
+    service_id: str,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get detailed status for a serving service including replicas."""
+    svc = await compute_repo.get_serving_service(session, service_id)
+    if svc is None:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    sky_info = await sky_service.get_serving_service_status(svc.name)
+    replicas = []
+    if sky_info and "replica_info" in sky_info:
+        replicas = [
+            ServingServiceReplicaResponse(
+                replica_id=r["replica_id"],
+                name=r.get("name"),
+                status=str(r.get("status", "unknown")),
+                version=r.get("version"),
+                launched_at=str(r["launched_at"]) if r.get("launched_at") else None,
+                endpoint=r.get("endpoint"),
+            )
+            for r in sky_info["replica_info"]
+        ]
+
+    return ServingServiceResponse(
+        id=svc.id,
+        name=svc.name,
+        status=svc.status,
+        endpoint=svc.endpoint,
+        accelerators=svc.accelerators,
+        cloud=svc.cloud,
+        region=svc.region,
+        use_spot=svc.use_spot,
+        min_replicas=svc.min_replicas,
+        max_replicas=svc.max_replicas,
+        readiness_path=svc.readiness_path,
+        load_balancing_policy=svc.load_balancing_policy,
+        update_mode=svc.update_mode,
+        replicas=replicas,
+        created_at=svc.created_at.isoformat() if svc.created_at else None,
+        started_at=svc.started_at.isoformat() if svc.started_at else None,
+        requested_by=svc.requested_by_id,
+        project=svc.project_id,
+    )
+
+
+@router.put("/services/{service_id}", response_model=ServingServiceResponse)
+async def update_serving_service(
+    service_id: str,
+    req: ServingServiceUpdateRequest,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """Update a serving service with a new task configuration."""
+    try:
+        svc = await sky_service.update_serving_service(
+            session, service_id, task_yaml=req.task_yaml, mode=req.mode
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return ServingServiceResponse(
+        id=svc.id,
+        name=svc.name,
+        status=svc.status,
+        endpoint=svc.endpoint,
+        accelerators=svc.accelerators,
+        cloud=svc.cloud,
+        region=svc.region,
+        use_spot=svc.use_spot,
+        min_replicas=svc.min_replicas,
+        max_replicas=svc.max_replicas,
+        update_mode=req.mode,
+    )
+
+
+@router.delete("/services/{service_id}")
+async def terminate_serving_service(
+    service_id: str,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+    purge: bool = Query(False),
+):
+    """Tear down a serving service."""
+    try:
+        await sky_service.terminate_serving_service(session, service_id, purge=purge)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"status": "shutting_down"}
+
+
+@router.post("/services/{service_name}/replicas/{replica_id}/terminate")
+async def terminate_replica(
+    service_name: str,
+    replica_id: int,
+    current_subject: str = Depends(get_current_subject),
+    purge: bool = Query(False),
+):
+    """Terminate a specific replica of a serving service."""
+    try:
+        await sky_service.terminate_serving_service_replica(
+            service_name, replica_id, purge=purge
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"status": "terminated"}
+
+
 # ── Managed Jobs ─────────────────────────────────────────────────────
 
 
@@ -131,7 +329,7 @@ async def list_jobs(
     limit: int = Query(50, le=200),
 ):
     """List managed jobs with optional filters."""
-    data = await compute_service.list_jobs(
+    data = await sky_service.list_jobs(
         session,
         project_id=project_id,
         type_filter=type,
@@ -174,7 +372,7 @@ async def launch_job(
     session: AsyncSession = Depends(get_session),
 ):
     """Submit a new managed job."""
-    job = await compute_service.launch_job(
+    job = await sky_service.launch_job(
         session,
         task_yaml=req.task_yaml,
         name=req.name,
@@ -208,7 +406,7 @@ async def cancel_job(
 ):
     """Cancel a managed job."""
     try:
-        await compute_service.cancel_job(session, job_id)
+        await sky_service.cancel_job(session, job_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {"status": "cancelled"}
@@ -270,7 +468,7 @@ async def list_cloud_instances(
 ):
     """List active SkyPilot clusters / cloud instances."""
     try:
-        clusters = await compute_service.get_cluster_status()
+        clusters = await sky_service.get_cluster_status()
     except Exception:
         clusters = []
     return clusters
@@ -283,7 +481,7 @@ async def terminate_cloud_instance(
 ):
     """Tear down a SkyPilot cluster."""
     try:
-        await compute_service.terminate_cluster(cluster_name)
+        await sky_service.terminate_cluster(cluster_name)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"status": "terminated"}
@@ -299,7 +497,7 @@ async def get_costs(
 ):
     """Cost report from SkyPilot."""
     try:
-        report = await compute_service.get_cost_report(days=days)
+        report = await sky_service.get_cost_report(days=days)
     except Exception:
         report = []
     return report
