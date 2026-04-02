@@ -274,9 +274,9 @@ async def terminate_serving_service(session: AsyncSession, service_id: str, purg
     try:
         await asyncio.to_thread(serve_core.down, service_names=svc.name, purge=purge)
         status = "stopped"
-    except Exception:
+    except Exception as ex:
         logger.warning(
-            f"SkyPilot serve down failed for {svc.name}", exc_info=True
+            f"SkyPilot serve down failed for {svc.name}: {ex}", exc_info=True
         )
         status = "failed_cleanup"
 

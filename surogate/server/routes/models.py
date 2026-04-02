@@ -129,12 +129,15 @@ async def scale_model(
 @router.post("/{model_id}/start", response_model=DeployedModelResponse)
 async def start_model(
     model_id: str,
+    request: Request,
     current_subject: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
 ):
     """Start serving a stopped model via SkyPilot."""
     try:
-        resp = await models_service.start_model(session, model_id)
+        resp = await models_service.start_model(
+            session, model_id, server_config=request.app.state.config,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return resp
@@ -143,12 +146,15 @@ async def start_model(
 @router.post("/{model_id}/restart", response_model=DeployedModelResponse)
 async def restart_model(
     model_id: str,
+    request: Request,
     current_subject: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
 ):
     """Restart a deployed model."""
     try:
-        resp = await models_service.restart_model(session, model_id)
+        resp = await models_service.restart_model(
+            session, model_id, server_config=request.app.state.config,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return resp

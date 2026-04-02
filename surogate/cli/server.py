@@ -96,12 +96,11 @@ def _graceful_shutdown(server = None):
     handlers are unreliable after Ctrl+C.
     """
     logger.info("Graceful shutdown initiated — cleaning up subprocesses...")
-    
-    # 1. Shut down uvicorn server (releases the listening socket)
+
+    # 1. Shut down uvicorn server (releases the listening socket).
+    #    This triggers the lifespan teardown which calls cleanup_children().
     if server is not None:
         server.should_exit = True
-        
-    logger.info("All subprocesses cleaned up")
     
     
 if __name__ == '__main__':

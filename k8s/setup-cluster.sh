@@ -205,8 +205,8 @@ echo -e "${CYAN}  Run: export KUBECONFIG=$SUROGATE_DIR/kubeconfig${NC}"
 
 export KUBECONFIG="$SUROGATE_DIR/kubeconfig"
 
-install_gpu
 install_traefik
+install_gpu
 install_lakefs
 install_metrics
 create_server_config

@@ -369,16 +369,39 @@ async def scale_model(
     return build_model_response(m, svc)
 
 
+_MODEL_DIR = "/models"
+
+
 def _build_task_yaml(
     model: DeployedModel,
     svc: ServingService,
+    *,
+    lakefs_s3_endpoint: Optional[str] = None,
+    lakefs_access_key: Optional[str] = None,
+    lakefs_secret_key: Optional[str] = None,
 ) -> str:
     """Generate a SkyPilot serving task YAML for llama.cpp."""
 
-    # TODO: add --lora for serving a lora adapter, hf token and sampling params
-    run_cmd = "cd /app && ./llama-server --metrics --host 0.0.0.0 --port 8080"
-    run_cmd += f" -m {model.base_model}"
+    hub = _parse_hub_ref(model.hub_ref) if model.hub_ref else None
 
+    # ── Run command ─────────────────────────────────────────────────
+    if hub:
+        # Download model from LakeFS via rclone, then start server.
+        # Auto-detect: use the GGUF file if one exists, else directory.
+        run_cmd = (
+            f"rclone copy --no-check-certificate lakefs:{hub['repo']}/{hub['branch']}/ {_MODEL_DIR} && "
+            f"GGUF=$(find {_MODEL_DIR} -maxdepth 1 -name '*.gguf' | head -1) && "
+            f"MODEL_PATH=${{GGUF:-{_MODEL_DIR}}} && "
+            "cd /app && ./llama-server --metrics --host 0.0.0.0 --port 8080"
+            " -m $MODEL_PATH"
+        )
+    else:
+        run_cmd = (
+            "cd /app && ./llama-server --metrics --host 0.0.0.0 --port 8080"
+            f" -m {model.base_model}"
+        )
+
+    # TODO: add --lora for serving a lora adapter, hf token and sampling params
     if model.context_window and model.context_window > 0:
         run_cmd += f" -c {model.context_window}"
 
@@ -403,14 +426,38 @@ def _build_task_yaml(
         },
         "run": run_cmd,
     }
+
+    # Pass rclone config for LakeFS S3 gateway via env vars — same
+    # pattern as local_tasks.py uses for subprocess-based imports.
+    if hub and lakefs_s3_endpoint and lakefs_access_key and lakefs_secret_key:
+        task["envs"] = {
+            "RCLONE_CONFIG_LAKEFS_TYPE": "s3",
+            "RCLONE_CONFIG_LAKEFS_PROVIDER": "Other",
+            "RCLONE_CONFIG_LAKEFS_ENV_AUTH": "false",
+            "RCLONE_CONFIG_LAKEFS_NO_CHECK_BUCKET": "true",
+            "RCLONE_CONFIG_LAKEFS_ENDPOINT": lakefs_s3_endpoint,
+            "RCLONE_CONFIG_LAKEFS_ACCESS_KEY_ID": lakefs_access_key,
+            "RCLONE_CONFIG_LAKEFS_SECRET_ACCESS_KEY": lakefs_secret_key,
+        }
+
     if svc.load_balancing_policy:
         task["service"]["load_balancing_policy"] = svc.load_balancing_policy
 
     return yaml.dump(task, default_flow_style=False)
 
 
+def _parse_hub_ref(hub_ref: str) -> Optional[dict]:
+    """Parse ``repo@branch`` into ``{'repo': ..., 'branch': ...}``."""
+    parts = hub_ref.split("@", 1)
+    if len(parts) != 2:
+        return None
+    return {"repo": parts[0], "branch": parts[1]}
+
+
 async def start_model(
-    session: AsyncSession, model_id: str,
+    session: AsyncSession,
+    model_id: str,
+    server_config: Optional[ServerConfig] = None,
 ) -> Optional[DeployedModelResponse]:
     """Start serving a stopped model by generating a task YAML and launching via SkyPilot."""
     m = await repo.get_deployed_model(session, model_id)
@@ -424,6 +471,18 @@ async def start_model(
     if svc is None:
         raise ValueError(f"No serving service configured for model {model_id}")
 
+    # Fetch per-user LakeFS credentials for hub models
+    lakefs_kw: dict = {}
+    if m.hub_ref and server_config and server_config.lakefs_s3_endpoint:
+        import surogate.core.db.repository.user as user_repo
+        creds = await user_repo.get_lakefs_credentials(session, m.deployed_by_id)
+        if creds and all(creds):
+            lakefs_kw = {
+                "lakefs_s3_endpoint": server_config.lakefs_s3_endpoint,
+                "lakefs_access_key": creds[0],
+                "lakefs_secret_key": creds[1],
+            }
+
     # Terminate if still running
     if svc.status not in ("shutting_down", "failed", "failed_cleanup", "stopped"):
         try:
@@ -431,7 +490,7 @@ async def start_model(
         except Exception:
             logger.warning(f"Failed to terminate old service for model {model_id}", exc_info=True)
 
-    task_yaml = _build_task_yaml(m, svc)
+    task_yaml = _build_task_yaml(m, svc, **lakefs_kw)
 
     svc = await sky_service.launch_serving_service(session, svc, task_yaml)
 
@@ -456,7 +515,9 @@ async def stop_model(session: AsyncSession, model_id: str) -> None:
 
 
 async def restart_model(
-    session: AsyncSession, model_id: str
+    session: AsyncSession,
+    model_id: str,
+    server_config: Optional[ServerConfig] = None,
 ) -> Optional[DeployedModelResponse]:
     """Restart a model by stopping then starting it."""
     m = await repo.get_deployed_model(session, model_id)
@@ -469,7 +530,7 @@ async def restart_model(
         except ValueError:
             pass  # already stopped
 
-    return await start_model(session, model_id)
+    return await start_model(session, model_id, server_config=server_config)
 
 
 async def get_model_logs(
