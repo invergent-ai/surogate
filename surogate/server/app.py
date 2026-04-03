@@ -34,6 +34,7 @@ from surogate.core.db.repository import auth as auth_repository
 from surogate.core.compute import init_skypilot 
 
 from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router
+from routes.proxy import router as proxy_router, start_sync_loop, stop_sync_loop
 
 logger = get_logger()
 
@@ -73,8 +74,24 @@ async def lifespan(app: FastAPI):
     await monitor.start()
     app.state.serving_monitor = monitor
 
+    # Re-register any already-running serving services with the proxy
+    from routes.proxy import register_service
+    async with factory() as session:
+        from surogate.core.db.repository import compute as compute_repo
+        active_services = await compute_repo.list_active_serving_services(session)
+        for svc in active_services:
+            try:
+                from sky.serve import serve_state
+                port = serve_state.get_service_controller_port(svc.name)
+                register_service(svc.name, port)
+            except Exception:
+                logger.debug("Could not re-register proxy for %s", svc.name)
+
+    await start_sync_loop()
+
     yield
 
+    await stop_sync_loop()
     await monitor.stop()
     await engine.dispose()
 
@@ -105,6 +122,7 @@ app.include_router(compute_router, prefix = "/api/compute", tags = ["compute"])
 app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
+app.include_router(proxy_router, prefix = "/api/serve", tags = ["proxy"])
 
 
 # ============ WebSocket ============

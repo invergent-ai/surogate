@@ -152,9 +152,8 @@ class ServingMonitor:
             if new_status in ("failed", "failed_cleanup", "controller_failed"):
                 updates["terminated_at"] = now
 
-            ep = info.get("endpoint")
-            if ep and ep != svc.endpoint:
-                updates["endpoint"] = ep
+            # Endpoint is managed by our proxy (set at launch time).
+            # Don't overwrite with SkyPilot's stale localhost:<lb_port>.
 
             await repo.update_serving_service(session, svc.id, **updates)
             # Apply updates in-memory so the response builder sees fresh data

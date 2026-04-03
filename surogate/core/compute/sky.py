@@ -199,9 +199,15 @@ async def launch_serving_service(
         from surogate.core.compute.skypilot.patcher import _active_project_id
 
         _active_project_id.set(svc.project_id)
-        _, endpoint = await asyncio.to_thread(
+        await asyncio.to_thread(
             serve_core.up, task, service_name=svc.name
         )
+        # Register with our reverse proxy (replaces SkyPilot's LB process)
+        from sky.serve import serve_state
+        from surogate.server.routes.proxy import register_service
+        controller_port = serve_state.get_service_controller_port(svc.name)
+        register_service(svc.name, controller_port)
+        endpoint = f"/api/serve/{svc.name}"
     except Exception as exc:
         logger.warning(
             f"SkyPilot serve launch failed for {svc.name}: {exc}",
@@ -273,6 +279,9 @@ async def terminate_serving_service(session: AsyncSession, service_id: str, purg
     svc = await repo.get_serving_service(session, service_id)
     if svc is None:
         raise ValueError(f"Serving service {service_id} not found")
+
+    from surogate.server.routes.proxy import unregister_service
+    unregister_service(svc.name)
 
     try:
         await asyncio.to_thread(serve_core.down, service_names=svc.name, purge=purge)

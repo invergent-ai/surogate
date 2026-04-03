@@ -91,18 +91,37 @@ def set_image_pull_policy_if_not_present():
         
 
 def patch_serve_limits():
-    """Widen SkyPilot serve limits for consolidation mode.
+    """Widen SkyPilot serve limits and replace the per-service load balancer.
 
     By default SkyPilot only opens ports 30001-30020 (20 services) and
     caps the number of services based on available memory.  Since we run
     in consolidation mode the port range firewall rule is irrelevant and
     we manage our own resource budget, so we remove both limits.
+
+    We also replace the load-balancer subprocess with a no-op: instead of
+    spawning a separate uvicorn process per service, all proxying is
+    handled by the Surogate server's own proxy route
+    (``/api/models/serve/{service_name}/...``).  The SkyPilot controller
+    process still runs and manages replicas / autoscaling — we just talk
+    to it from our proxy sync loop.
     """
     from sky.serve import constants as serve_constants
+    from sky.serve import load_balancer
     from sky.utils import controller_utils
 
     serve_constants.LOAD_BALANCER_PORT_RANGE = '30001-31000'
     controller_utils.can_start_new_process = lambda pool: True
+
+    def _noop_load_balancer(*args, **kwargs):
+        """Replaces SkyPilot's per-service LB process.
+
+        The actual proxying is handled by the Surogate server.
+        Registration with our proxy happens in the monitor when
+        the controller port becomes known.
+        """
+        pass
+
+    load_balancer.run_load_balancer = _noop_load_balancer
 
 
 def set_consolidattion_mode():
