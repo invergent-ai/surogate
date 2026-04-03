@@ -172,6 +172,7 @@ async def custom_init_app_state(
     resolved_chat_template = load_chat_template(args.chat_template)
     
     chat_kwargs = dict(
+        openai_serving_render=state.openai_serving_render,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
@@ -185,7 +186,7 @@ async def custom_init_app_state(
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
     )
-    
+
     serving_chat = OpenAIServingChatWithTokens(
         engine_client,
         state.openai_serving_models,

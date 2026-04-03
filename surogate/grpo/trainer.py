@@ -154,7 +154,7 @@ class GRPOTrainer:
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
         """Copy tokenizer, vocab, and config files from source model to output directory."""
         tokenizer_files = [
-            "config.json",
+            "config.json", "preprocessor_config.json",
             "tokenizer.json", "tokenizer_config.json",
             "special_tokens_map.json", "vocab.json", "merges.txt",
             "added_tokens.json", "chat_template.jinja", "generation_config.json"

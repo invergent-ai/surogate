@@ -20,6 +20,7 @@ COMMAND_MAPPING: Dict[str, str] = {
     'vf-eval': 'surogate.cli.vf_eval',
     'tokenize': 'surogate.cli.tokenize_cmd',
     'server': 'surogate.cli.server',
+    'merge': 'surogate.cli.merge',
 }
 
 def _get_version() -> str:
@@ -80,6 +81,10 @@ def parse_args():
     # server command
     from surogate.cli.server import prepare_command_parser as serve_prepare_command_parser
     serve_prepare_command_parser(subparsers.add_parser('server', help="Start the Surogate HTTP server"))
+
+    # merge command
+    from surogate.cli.merge import prepare_command_parser as merge_prepare_command_parser
+    merge_prepare_command_parser(subparsers.add_parser('merge', help="Merge a LoRA checkpoint into the base model"))
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:
