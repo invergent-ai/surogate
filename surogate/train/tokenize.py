@@ -453,6 +453,7 @@ def _encode_and_prepare_native(
     all_masks = []
     doc_lengths = []
     n_skipped = 0
+    n_empty = 0
     n_total = len(dataset)
 
     def encode_batch(messages_batch):
@@ -480,6 +481,7 @@ def _encode_and_prepare_native(
                 continue
             ids = result['input_ids']
             if len(ids) == 0:
+                n_empty += 1
                 continue
             tokens = np.asarray(ids, dtype=np.int32)
             labels = np.asarray(result['labels'], dtype=np.int32)
@@ -513,8 +515,12 @@ def _encode_and_prepare_native(
                 collect_results(pending_future.result())
                 pbar.update(pending_count)
 
-    if n_skipped > 0:
-        logger.warning(f"Skipped {n_skipped} examples due to encoding errors")
+    n_dropped = n_skipped + n_empty
+    if n_dropped > 0:
+        logger.warning(
+            f"Dropped {n_dropped}/{n_total} records "
+            f"({n_skipped} encoding errors, {n_empty} empty results)"
+        )
 
     return all_tokens, all_masks, doc_lengths
 
@@ -670,6 +676,20 @@ class TokenizeDatasets(SurogateCommand):
 
             if n == 0:
                 continue
+
+            # Log document length statistics relative to seq_len
+            lengths = np.array(doc_lengths)
+            n_truncated = int(np.sum(lengths > seq_len))
+            if n_truncated > 0:
+                logger.warning(
+                    f"{split_name}: {n_truncated}/{n} documents ({n_truncated/n*100:.1f}%) "
+                    f"exceed sequence_len={seq_len} and will be truncated"
+                )
+            logger.info(
+                f"{split_name} doc lengths: "
+                f"min={int(lengths.min())}, max={int(lengths.max())}, "
+                f"mean={int(lengths.mean())}, median={int(np.median(lengths))}"
+            )
 
             out_dir = self.config.output_dir
             name_prefix = 'train' if split_name == 'train' else 'eval'
