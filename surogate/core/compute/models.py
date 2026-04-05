@@ -149,6 +149,19 @@ def build_model_response(
 # ── Service functions ────────────────────────────────────────────────
 
 
+async def _unique_service_name(session: AsyncSession, base: str) -> str:
+    """Return *base* if unused, otherwise append ``-2``, ``-3``, etc."""
+    existing = await repo.get_serving_service_by_name(session, base)
+    if existing is None:
+        return base
+    n = 2
+    while True:
+        candidate = f"{base}-{n}"
+        if await repo.get_serving_service_by_name(session, candidate) is None:
+            return candidate
+        n += 1
+
+
 async def create_model(
     session: AsyncSession,
     *,
@@ -205,21 +218,29 @@ async def create_model(
     if not generation_defaults and resolved.get("generation_defaults"):
         generation_defaults = resolved["generation_defaults"]
 
+    # Build service name: <project_namespace>-<model_slug>, deduplicated
+    import sqlalchemy as sa
+    from surogate.core.db.models.platform import Project
+    proj = (await session.execute(
+        sa.select(Project.namespace).where(Project.id == project_id)
+    )).scalar_one_or_none()
+    svc_base = f"{proj}-{name}" if proj else name
+    svc_name = await _unique_service_name(session, svc_base)
+
     # Create the ServingService first (defaults to k8s, stopped)
     svc = await repo.create_serving_service(
         session,
-        name=name,
+        name=svc_name,
         project_id=project_id,
         requested_by_id=requested_by_id,
         task_yaml="",
         infra="k8s",
-
         status="stopped",
     )
 
     model = await repo.create_deployed_model(
         session,
-        name=name,
+        name=svc_name,
         display_name=display_name,
         base_model=base_model,
         project_id=project_id,
@@ -414,6 +435,7 @@ def _build_task_yaml(
         "ports": 8080,
         "infra": svc.infra or "k8s",
         "use_spot": svc.use_spot or False,
+        "accelerators": "RTX4070-LAPTOP-GPU:1",
     }
     if svc.accelerators:
         resources["accelerators"] = svc.accelerators

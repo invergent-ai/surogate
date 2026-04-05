@@ -44,6 +44,11 @@ class ServingMonitor:
         await monitor.stop()    # cancels on shutdown
     """
 
+    # Number of consecutive ticks an active DB entity can be absent from
+    # SkyPilot's status output before we mark it as failed.  With a 5 s
+    # poll interval this gives ~30 s of grace for transient glitches.
+    _MISSING_THRESHOLD = 6
+
     def __init__(
         self,
         poll_interval: float = 5.0,
@@ -53,6 +58,9 @@ class ServingMonitor:
         self._task: Optional[asyncio.Task] = None
         self._callbacks: list[TransitionCallback] = []
         self._task_manager = task_manager
+        # Track consecutive "missing from SkyPilot" ticks per entity id
+        self._missing_services: dict[str, int] = {}
+        self._missing_jobs: dict[str, int] = {}
 
         # Wire ourselves as the watch-creator so every spawned local task
         # fires transition callbacks when it completes.
@@ -136,9 +144,25 @@ class ServingMonitor:
 
         for svc in db_services:
             if svc.name not in sky_statuses:
-                continue
+                # Track consecutive misses; mark failed after threshold
+                count = self._missing_services.get(svc.id, 0) + 1
+                self._missing_services[svc.id] = count
+                if count >= self._MISSING_THRESHOLD:
+                    logger.warning(
+                        "ServingService %s (%s) absent from SkyPilot for "
+                        "%d ticks – marking as failed",
+                        svc.name, svc.id, count,
+                    )
+                    self._missing_services.pop(svc.id, None)
+                    info = {"status": "failed"}
+                    # Fall through to the normal update path below
+                else:
+                    continue
+            else:
+                # Present in SkyPilot – reset miss counter
+                self._missing_services.pop(svc.id, None)
+                info = sky_statuses[svc.name]
 
-            info = sky_statuses[svc.name]
             new_status = info.get("status", "")
             if new_status == svc.status:
                 continue
@@ -180,10 +204,24 @@ class ServingMonitor:
         for job in db_jobs:
             if job.skypilot_job_id is None:
                 continue
-            if job.skypilot_job_id not in sky_statuses:
-                continue
 
-            new_status = _map_status(sky_statuses[job.skypilot_job_id])
+            if job.skypilot_job_id not in sky_statuses:
+                count = self._missing_jobs.get(job.id, 0) + 1
+                self._missing_jobs[job.id] = count
+                if count >= self._MISSING_THRESHOLD:
+                    logger.warning(
+                        "ManagedJob %s (%s) absent from SkyPilot for "
+                        "%d ticks – marking as failed",
+                        job.name, job.id, count,
+                    )
+                    self._missing_jobs.pop(job.id, None)
+                    new_status = "failed"
+                else:
+                    continue
+            else:
+                self._missing_jobs.pop(job.id, None)
+                new_status = _map_status(sky_statuses[job.skypilot_job_id])
+
             if new_status == job.status:
                 continue
 

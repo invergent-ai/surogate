@@ -70,8 +70,8 @@ async def seed_default_project(session: AsyncSession, username: str) -> None:
         return
 
     project = Project(
-        name="My First Project",
-        namespace="default",
+        name=f"{username}'s Project",
+        namespace=f"{username}-default",
         color="#F59E0B",
         status=ProjectStatus.active,
         created_by_id=user_row.id,

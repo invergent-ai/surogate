@@ -109,9 +109,16 @@ function dispatchModel(
     statusCounts[msg.new_status] = (statusCounts[msg.new_status] ?? 0) + 1;
   }
 
+  // Clear any pending action for this model since its status just changed
+  const pending = { ...state.modelPending };
+  if (updated.id in pending) {
+    delete pending[updated.id];
+  }
+
   useAppStore.setState({
     models,
     modelsStatusCounts: statusCounts,
+    modelPending: pending,
     // Keep selectedModel in sync
     selectedModel:
       state.selectedModel?.id === updated.id ? updated : state.selectedModel,

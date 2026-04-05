@@ -194,6 +194,7 @@ async def launch_serving_service(
     task = sky.Task.from_yaml_config(task_config)
 
     endpoint = None
+    controller_port = None
     status = "controller_init"
     try:
         from surogate.core.compute.skypilot.patcher import _active_project_id
@@ -220,6 +221,7 @@ async def launch_serving_service(
         task_yaml=task_yaml,
         status=status,
         endpoint=endpoint,
+        controller_port=controller_port,
     )
     return await repo.get_serving_service(session, svc.id)
 

@@ -114,10 +114,15 @@ export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
     set((s) => ({ modelPending: { ...s.modelPending, [modelId]: cur?.status ?? "" } }));
     try {
       const updated = await modelsApi.startModel(modelId);
-      set((s) => ({
-        selectedModel: s.selectedModel?.id === modelId ? updated : s.selectedModel,
-        models: s.models.map((m) => (m.id === modelId ? updated : m)),
-      }));
+      set((s) => {
+        const pending = { ...s.modelPending };
+        delete pending[modelId];
+        return {
+          selectedModel: s.selectedModel?.id === modelId ? updated : s.selectedModel,
+          models: s.models.map((m) => (m.id === modelId ? updated : m)),
+          modelPending: pending,
+        };
+      });
       return true;
     } catch (e) {
       set((s) => {
@@ -134,10 +139,15 @@ export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
     set((s) => ({ modelPending: { ...s.modelPending, [modelId]: cur?.status ?? "" } }));
     try {
       const updated = await modelsApi.restartModel(modelId);
-      set((s) => ({
-        selectedModel: s.selectedModel?.id === modelId ? updated : s.selectedModel,
-        models: s.models.map((m) => (m.id === modelId ? updated : m)),
-      }));
+      set((s) => {
+        const pending = { ...s.modelPending };
+        delete pending[modelId];
+        return {
+          selectedModel: s.selectedModel?.id === modelId ? updated : s.selectedModel,
+          models: s.models.map((m) => (m.id === modelId ? updated : m)),
+          modelPending: pending,
+        };
+      });
       return true;
     } catch (e) {
       set((s) => {

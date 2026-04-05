@@ -235,6 +235,9 @@ class ServingService(UUIDMixin, Base):
     )
     task_yaml: Mapped[str] = mapped_column(sa.Text)
     status: Mapped[str] = mapped_column(sa.String(32), default="controller_init")
+    controller_port: Mapped[Optional[int]] = mapped_column(
+        sa.Integer, nullable=True
+    )
     endpoint: Mapped[Optional[str]] = mapped_column(
         sa.String(512), nullable=True
     )

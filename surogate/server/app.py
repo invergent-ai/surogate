@@ -74,18 +74,33 @@ async def lifespan(app: FastAPI):
     await monitor.start()
     app.state.serving_monitor = monitor
 
-    # Re-register any already-running serving services with the proxy
+    # Re-register any already-running serving services with the proxy.
+    # Prefer the port stored in our DB (survives full restarts); fall back
+    # to SkyPilot's in-memory state for services launched before the column
+    # existed.
     from routes.proxy import register_service
     async with factory() as session:
         from surogate.core.db.repository import compute as compute_repo
         active_services = await compute_repo.list_active_serving_services(session)
         for svc in active_services:
-            try:
-                from sky.serve import serve_state
-                port = serve_state.get_service_controller_port(svc.name)
-                register_service(svc.name, port)
-            except Exception:
-                logger.debug("Could not re-register proxy for %s", svc.name)
+            port = svc.controller_port
+            if port is None:
+                try:
+                    from sky.serve import serve_state
+                    port = serve_state.get_service_controller_port(svc.name)
+                    # Back-fill the DB so future restarts don't need SkyPilot state
+                    await compute_repo.update_serving_service(
+                        session, svc.id, controller_port=port,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not recover controller port for %s from "
+                        "DB or SkyPilot – service will not be proxied until "
+                        "the monitor detects it or it is restarted",
+                        svc.name,
+                    )
+                    continue
+            register_service(svc.name, port)
 
     await start_sync_loop()
 

@@ -26,6 +26,7 @@ export function ServeModelDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const createModel = useAppStore((s) => s.createModel);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
   const [baseModelField, setBaseModelField] = useState("");
   const [saving, setSaving] = useState(false);
   const [sourceIdx, setSourceIdx] = useState(0);
@@ -48,7 +49,7 @@ export function ServeModelDialog({
       name: slug,
       display_name: displayName,
       base_model: baseModel,
-      project_id: "default",
+      project_id: activeProjectId ?? "",
       hub_ref: hubSelection ? `${hubSelection.repo}@${hubSelection.ref}` : undefined,
     });
     setSaving(false);
