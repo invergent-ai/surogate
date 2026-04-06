@@ -90,13 +90,13 @@ async def init_lakefs(config: ServerConfig):
 
 # ============ Repositories ============
 
-async def list_repositories(client: ApiClient, prefix: Optional[str] = None) -> List[RepositoryList]:
+async def list_repositories(client: ApiClient, prefix: Optional[str] = None) -> RepositoryList:
     try:
         repos_api = lakefs_sdk.RepositoriesApi(client)
         return repos_api.list_repositories(prefix=prefix)
     except ApiException as e:
         logger.error(f"Error listing LakeFS repositories: {e}")
-        return []
+        return RepositoryList(pagination=Pagination(has_more=False, next_offset="", results=0, max_per_page=0), results=[])
     
 async def create_repository(client: ApiClient, user: str, request: RepositoryCreation, config: ServerConfig) -> Optional[Repository]:
     try:
@@ -168,14 +168,20 @@ async def seed_lakefs_user(user: str, session: AsyncSession, config: ServerConfi
             return
         client = await get_lakefs_admin_client(config)
         auth_api = lakefs_sdk.AuthApi(client)
-        request = UserCreation(id=user)
-        auth_api.create_user(user_creation=request)
+        try:
+            auth_api.create_user(user_creation=UserCreation(id=user))
+        except ApiException as e:
+            if e.status != 409:
+                raise
         creds = auth_api.create_credentials(user_id=user)
-        auth_api.add_group_membership(USERS_GROUP, user)
+        try:
+            auth_api.add_group_membership(USERS_GROUP, user)
+        except ApiException as e:
+            if e.status != 409:
+                raise
         await set_lakefs_credentials(session, user, creds.access_key_id, creds.secret_access_key)
     except ApiException as e:
-        if e.status != 409:
-            logger.error(f"Error creating LakeFS user '{user}': {e}")
+        logger.error(f"Error seeding LakeFS user '{user}': {e}")
         return None
 
 async def get_repository(client: ApiClient, repository: str) -> Optional[Repository]:

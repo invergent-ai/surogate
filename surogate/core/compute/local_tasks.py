@@ -257,6 +257,14 @@ class LocalTaskManager:
             if task_type == LocalTaskType.import_model
             else REPO_TYPE_DATASET
         )
+        # LakeFS needs the username, not the UUID
+        import sqlalchemy as sa_
+        from surogate.core.db.models.platform import User as UserModel_
+        username_row = await session.execute(
+            sa_.select(UserModel_.username).where(UserModel_.id == user_id)
+        )
+        lakefs_username = username_row.scalar_one()
+
         client = await get_lakefs_client(user_id, session, self._config)
         req = RepositoryCreation(
             name=repo_id,
@@ -267,7 +275,7 @@ class LocalTaskManager:
                 "externalId": params.get("hf_repo_id", ""),
             },
         )
-        await create_repository(client, user_id, req, self._config)
+        await create_repository(client, lakefs_username, req, self._config)
 
     async def _build_env(
         self,
@@ -287,10 +295,11 @@ class LocalTaskManager:
 
         # Use per-user LakeFS credentials so the subprocess operates as that user
         creds = await user_repo.get_lakefs_credentials(session, user_id)
-        if creds and all(creds):
-            env["LAKECTL_CREDENTIALS_ACCESS_KEY_ID"] = creds[0]
-            env["LAKECTL_CREDENTIALS_SECRET_ACCESS_KEY"] = creds[1]
-
+        if not creds or not all(creds):
+            raise ValueError("User does not have LakeFS credentials. Create them first via the Hub.")
+        env["LAKECTL_CREDENTIALS_ACCESS_KEY_ID"] = creds[0]
+        env["LAKECTL_CREDENTIALS_SECRET_ACCESS_KEY"] = creds[1]
+        
         # Task-specific params → env vars
         if task_type in (LocalTaskType.import_model, LocalTaskType.import_dataset):
             env["HF_REPO_ID"] = params.get("hf_repo_id", "")

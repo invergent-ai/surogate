@@ -50,7 +50,9 @@ dependencies = [
     "densemax-lakefs-sdk @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_sdk-1.50.0-py3-none-any.whl",
     "ray>=2.5.0",
     "verifiers==0.1.11",
-    "wandb==0.25.1"
+    "wandb==0.25.1",
+    "sqlalchemy[asyncio]==2.0.0,<2.0.1",
+    "httpx>=0.27,<1.0"
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

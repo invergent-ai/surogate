@@ -51,9 +51,9 @@ export function ModelDetail({ model }: { model: Model }) {
             <div
               className="w-11 h-11 rounded-[10px] shrink-0 flex items-center justify-center text-xl border"
               style={{
-                backgroundColor: model.status === "ready" ? "#3B82F618" : undefined,
-                borderColor: model.status === "ready" ? "#3B82F630" : undefined,
-                color: model.status === "ready" ? "#3B82F6" : undefined,
+                backgroundColor: toStatus(model.status) === "serving" ? "#3B82F618" : undefined,
+                borderColor: toStatus(model.status) === "serving" ? "#3B82F630" : undefined,
+                color: toStatus(model.status) === "serving" ? "#3B82F6" : undefined,
               }}
             >
               &#x25C7;
@@ -81,7 +81,7 @@ export function ModelDetail({ model }: { model: Model }) {
                       "font-medium",
                       toStatus(model.status) === "error"
                         ? "text-destructive"
-                        : model.status === "ready"
+                        : toStatus(model.status) === "serving"
                           ? "text-green-500"
                           : "text-muted-foreground",
                     )}
@@ -169,7 +169,7 @@ export function ModelDetail({ model }: { model: Model }) {
                 {pending ? "Restarting\u2026" : "Restart"}
               </Button>
             )}
-            {model.status === "ready" && (
+            {toStatus(model.status) === "serving" && (
               <Button variant="outline" size="xs">
                 &#x25B7; Playground
               </Button>

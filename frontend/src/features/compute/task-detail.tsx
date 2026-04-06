@@ -79,7 +79,7 @@ export function TaskDetail({ item, onClose }: { item: ExtendedWorkload; onClose:
 
         <div className="flex">
           {/* Left: info */}
-          <div className="w-80 shrink-0 px-4 py-3 border-r border-line">
+          <div className="w-100 shrink-0 px-4 py-3 border-r border-line">
             <div className="grid grid-cols-2 gap-x-4 gap-y-2.5">
               <InfoRow icon={Folder} label="Project" value={item.project} />
               <InfoRow icon={User} label="Requested by" value={item.requestedBy} />

@@ -1,8 +1,9 @@
 """Pydantic models for project API routes."""
 
 from datetime import datetime
+from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 
 class CreateProjectRequest(BaseModel):
@@ -18,5 +19,11 @@ class ProjectResponse(BaseModel):
     status: str
     created_by_id: str
     created_at: datetime
+    dstack_project_name: Optional[str] = None
 
-    model_config = {"from_attributes": True}
+    @validator("status", pre=True)
+    def coerce_status(cls, v):
+        return v.value if hasattr(v, "value") else str(v)
+
+    class Config:
+        orm_mode = True

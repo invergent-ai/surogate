@@ -29,12 +29,12 @@ from pathlib import Path
 
 from surogate.core.db.repository import auth as auth_repository
 
-# the order of imports is important here. init_skypilot() must be called before any sky imports, 
+# the order of imports is important here. init_dstack() must be called before any dstack imports,
 # and it must be called in the main thread to properly set up context propagation for threads.
-from surogate.core.compute import init_skypilot 
+from surogate.core.compute import init_dstack, shutdown_dstack
+from surogate.core.compute.kubernetes import init_kubernetes
 
 from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router
-from routes.proxy import router as proxy_router, start_sync_loop, stop_sync_loop
 
 logger = get_logger()
 
@@ -43,8 +43,9 @@ async def init_app(session: AsyncSession, config: ServerConfig):
     await auth_repository.seed_admin_user(session)
     await init_lakefs(config)
     await seed_lakefs_user("surogate", session, config)
-    await asyncio.to_thread(init_skypilot)
-    
+    await init_dstack(database_url=config.dstack_database_url)
+    init_kubernetes()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -55,11 +56,9 @@ async def lifespan(app: FastAPI):
     await create_all_tables()
 
     factory = get_session_factory()
-    
+
     async with factory() as session:
         await init_app(session, config)
-        
-    logger.info(f"Database ready: {config.database_url}")
 
     from surogate.core.compute.local_tasks import LocalTaskManager
     task_manager = LocalTaskManager(config)
@@ -67,47 +66,17 @@ async def lifespan(app: FastAPI):
         await task_manager.reap(session)
     app.state.task_manager = task_manager
 
-    # Start background monitor for SkyPilot serving services, managed jobs & local tasks
+    # Start background monitor for dstack runs & local tasks
     from surogate.core.compute.monitor import ServingMonitor
     monitor = ServingMonitor(poll_interval=5.0, task_manager=task_manager)
     monitor.on_transition(notify_transition)
     await monitor.start()
     app.state.serving_monitor = monitor
 
-    # Re-register any already-running serving services with the proxy.
-    # Prefer the port stored in our DB (survives full restarts); fall back
-    # to SkyPilot's in-memory state for services launched before the column
-    # existed.
-    from routes.proxy import register_service
-    async with factory() as session:
-        from surogate.core.db.repository import compute as compute_repo
-        active_services = await compute_repo.list_active_serving_services(session)
-        for svc in active_services:
-            port = svc.controller_port
-            if port is None:
-                try:
-                    from sky.serve import serve_state
-                    port = serve_state.get_service_controller_port(svc.name)
-                    # Back-fill the DB so future restarts don't need SkyPilot state
-                    await compute_repo.update_serving_service(
-                        session, svc.id, controller_port=port,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Could not recover controller port for %s from "
-                        "DB or SkyPilot – service will not be proxied until "
-                        "the monitor detects it or it is restarted",
-                        svc.name,
-                    )
-                    continue
-            register_service(svc.name, port)
-
-    await start_sync_loop()
-
     yield
 
-    await stop_sync_loop()
     await monitor.stop()
+    await shutdown_dstack()
     await engine.dispose()
 
 
@@ -138,7 +107,12 @@ app.include_router(compute_router, prefix = "/api/nebius", tags = ["nebius"])
 app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
-app.include_router(proxy_router, prefix = "/api/serve", tags = ["proxy"])
+
+# Mount dstack's built-in service proxy — routes requests to K8s pods via SSH tunnels
+from dstack._internal.server.services.proxy.deps import ServerProxyDependencyInjector
+from dstack._internal.server.services.proxy.routers import service_proxy as dstack_service_proxy
+app.state.proxy_dependency_injector = ServerProxyDependencyInjector()
+app.include_router(dstack_service_proxy.router, prefix = "/proxy/services", tags = ["dstack-proxy"])
 
 
 # ============ WebSocket ============
@@ -177,23 +151,17 @@ async def shutdown_server(
     request: Request,
     current_subject: str = Depends(get_current_subject),
 ):
-    """Gracefully shut down the Surogate server.
-
-    Called by the frontend quit dialog so users can stop the server from the UI
-    without needing to use the CLI or kill the process manually.
-    """
+    """Gracefully shut down the Surogate server."""
     import asyncio
 
     async def _delayed_shutdown():
-        await asyncio.sleep(0.2)  # Let the HTTP response return first
+        await asyncio.sleep(0.2)
         trigger = getattr(request.app.state, "trigger_shutdown", None)
         if trigger is not None:
             trigger()
         else:
-            # Fallback when not launched via run_server() (e.g. direct uvicorn)
             import signal
             import os
-
             os.kill(os.getpid(), signal.SIGTERM)
 
     request.app.state._shutdown_task = asyncio.create_task(_delayed_shutdown())
@@ -204,14 +172,7 @@ async def shutdown_server(
 # ============ Serve Frontend ============
 
 def _strip_crossorigin(html_bytes: bytes) -> bytes:
-    """Remove ``crossorigin`` attributes from script/link tags.
-
-    Vite adds ``crossorigin`` by default which forces CORS mode on font
-    subresource loads.  When Studio is served over plain HTTP, Firefox
-    HTTPS-Only Mode does not exempt CORS font requests -- causing all
-    @font-face downloads to fail silently.  Stripping the attribute
-    makes them regular same-origin fetches that work on any protocol.
-    """
+    """Remove ``crossorigin`` attributes from script/link tags."""
     import re as _re
 
     html = html_bytes.decode("utf-8")
@@ -252,7 +213,6 @@ def setup_frontend(app: FastAPI, build_path: Path):
         if file_path.is_file():
             return FileResponse(file_path)
 
-        # Serve index.html as bytes — avoids Content-Length mismatch
         content = (build_path / "index.html").read_bytes()
         content = _strip_crossorigin(content)
         return Response(

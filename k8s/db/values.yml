@@ -1,0 +1,13 @@
+primary:
+  service:
+    type: NodePort
+    nodePorts:
+      postgresql: 32432
+  initdb:
+    scripts:
+      create-dstack.sql: |
+        CREATE USER dstack WITH PASSWORD 'dstack';
+        CREATE DATABASE dstack OWNER dstack;
+      create-surogate.sql: |
+        CREATE USER surogate WITH PASSWORD 'surogate';
+        CREATE DATABASE surogate OWNER surogate;

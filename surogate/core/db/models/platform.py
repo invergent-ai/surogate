@@ -87,6 +87,9 @@ class Project(UUIDMixin, TimestampMixin, Base):
         sa.Enum(ProjectStatus), default=ProjectStatus.active
     )
     created_by_id: Mapped[str] = mapped_column(sa.ForeignKey("users.id"))
+    dstack_project_name: Mapped[Optional[str]] = mapped_column(
+        sa.String(50), nullable=True, unique=True
+    )
 
     created_by: Mapped[User] = relationship(foreign_keys=[created_by_id])
     members: Mapped[list[ProjectMember]] = relationship(back_populates="project")

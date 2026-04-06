@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import sqlalchemy as sa
 from surogate.core.db.engine import get_session
 from surogate.core.db.models.compute import LocalTask, LocalTaskStatus, LocalTaskType
-from surogate.server.auth.authentication import get_current_subject
+from surogate.server.auth.authentication import get_current_subject, get_current_user_id
 from surogate.server.models.tasks import (
     LocalTaskResponse,
     TaskLogsResponse,
@@ -62,7 +62,7 @@ async def list_tasks(
 async def spawn_task(
     req: TaskSpawnRequest,
     request: Request,
-    current_subject: str = Depends(get_current_subject),
+    current_user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ):
     """Spawn a new local task as a subprocess."""
@@ -72,7 +72,7 @@ async def spawn_task(
         task_type=req.task_type,
         name=req.name,
         project_id=req.project_id,
-        user_id=current_subject,
+        user_id=current_user_id,
         params=req.params,
     )
     return _to_response(task)

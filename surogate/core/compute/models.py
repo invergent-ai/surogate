@@ -1,19 +1,17 @@
 """Service layer for deployed models.
 
 Bridges DeployedModel (model identity + config) with ServingService
-(infrastructure / SkyPilot).  Status is derived from the linked
+(infrastructure / dstack).  Status is derived from the linked
 ServingService state rather than stored on the model itself.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
-
-import yaml
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from surogate.core.compute import sky as sky_service
+from surogate.core.compute import dstack as dstack_service
 from surogate.core.config.server_config import ServerConfig
 from surogate.core.db.models.compute import DeployedModel, ServingService
 from surogate.core.db.repository import compute as repo
@@ -41,8 +39,9 @@ def _derive_status(svc: Optional[ServingService]) -> str:
 def _relative_time(dt: Optional[datetime]) -> str:
     if dt is None:
         return "\u2014"
-    now = datetime.now(timezone.utc)
-    naive = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    now = datetime.utcnow()
+    # Strip tzinfo if present so both sides are naive UTC
+    naive = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     delta = now - naive
     seconds = int(delta.total_seconds())
     if seconds < 60:
@@ -62,8 +61,8 @@ def _uptime(svc: Optional[ServingService]) -> str:
         return "\u2014"
     if svc.status not in ("ready",):
         return "\u2014"
-    now = datetime.now(timezone.utc)
-    started = svc.started_at.replace(tzinfo=timezone.utc) if svc.started_at.tzinfo is None else svc.started_at
+    now = datetime.utcnow()
+    started = svc.started_at.replace(tzinfo=None) if svc.started_at.tzinfo is not None else svc.started_at
     delta = now - started
     days = delta.days
     hours = delta.seconds // 3600
@@ -137,6 +136,7 @@ def build_model_response(
         endpoint=svc.endpoint or "\u2014" if svc else "\u2014",
         image=model.image or "\u2014",
         hub_ref=model.hub_ref or "",
+        use_spot=svc.use_spot if svc else False,
         connected_agents=[],
         serving_config=model.serving_config,
         generation_defaults=model.generation_defaults,
@@ -186,7 +186,7 @@ async def create_model(
     """Create a model record, resolving metadata from config files.
 
     This only creates the DB record — call start_model() to actually
-    launch the serving service via SkyPilot.
+    launch the serving service via dstack.
     """
 
     # Resolve model info from config.json / generation_config.json
@@ -386,7 +386,7 @@ async def scale_model(
     await repo.update_serving_service(
         session, m.serving_service_id, replicas=replicas,
     )
-    logger.info(f"Scaled model {model_id} to {replicas} replicas (SkyPilot scaling not yet wired)")
+    logger.info(f"Scaled model {model_id} to {replicas} replicas")
 
     svc = await repo.get_serving_service(session, m.serving_service_id)
     return build_model_response(m, svc)
@@ -395,7 +395,7 @@ async def scale_model(
 _MODEL_DIR = "/models"
 
 
-def _build_task_yaml(
+def _build_service_params(
     model: DeployedModel,
     svc: ServingService,
     *,
@@ -403,15 +403,13 @@ def _build_task_yaml(
     lakefs_k8s_s3_endpoint: Optional[str] = None,
     lakefs_access_key: Optional[str] = None,
     lakefs_secret_key: Optional[str] = None,
-) -> str:
-    """Generate a SkyPilot serving task YAML for llama.cpp."""
+) -> dict:
+    """Build parameters dict for dstack_service.launch_service()."""
 
     hub = _parse_hub_ref(model.hub_ref) if model.hub_ref else None
 
     # ── Run command ─────────────────────────────────────────────────
     if hub:
-        # Download model from LakeFS via rclone, then start server.
-        # Auto-detect: use the GGUF file if one exists, else directory.
         run_cmd = (
             "echo \"Downloading model from ${RCLONE_CONFIG_LAKEFS_ENDPOINT}...\" && "
             f"rclone copy --no-check-certificate lakefs:{hub['repo']}/{hub['branch']}/ {_MODEL_DIR} && "
@@ -426,52 +424,28 @@ def _build_task_yaml(
             f" -m {model.base_model}"
         )
 
-    # TODO: add --lora for serving a lora adapter, hf token and sampling params
     if model.context_window and model.context_window > 0:
         run_cmd += f" -c {model.context_window}"
 
-    resources: dict = {
-        "image_id": "docker:ghcr.io/invergent-ai/sky-llama-cpp:full-cuda12",
-        "ports": 8080,
-        # "infra": svc.infra or "k8s",
-        "infra": "nebius",
-        "use_spot": svc.use_spot or True,
-        # "accelerators": "RTX4070-LAPTOP-GPU:1",
-        "accelerators": "H100:1"
-    }
-    if svc.accelerators:
-        resources["accelerators"] = svc.accelerators
-
-    task: dict = {
-        "resources": resources,
-        "secrets": {
-            "HF_TOKEN": ""
-        },
-        "service": {
-            "readiness_probe": svc.readiness_path or "/health",
-            "replicas": svc.replicas,
-            "ports": 8080,
-        },
-        "run": run_cmd,
-    }
-
-    # Pass rclone config for LakeFS S3 gateway via env vars — same
-    # pattern as local_tasks.py uses for subprocess-based imports.
+    env: dict[str, str] = {}
     if hub and lakefs_access_key and lakefs_secret_key:
-        task["envs"] = {
+        env = {
             "RCLONE_CONFIG_LAKEFS_TYPE": "s3",
             "RCLONE_CONFIG_LAKEFS_PROVIDER": "Other",
             "RCLONE_CONFIG_LAKEFS_ENV_AUTH": "false",
             "RCLONE_CONFIG_LAKEFS_NO_CHECK_BUCKET": "true",
-            "RCLONE_CONFIG_LAKEFS_ENDPOINT": lakefs_k8s_s3_endpoint if svc.infra == "k8s" else lakefs_s3_endpoint,
+            "RCLONE_CONFIG_LAKEFS_ENDPOINT": lakefs_k8s_s3_endpoint if svc.infra == "k8s" else (lakefs_s3_endpoint or ""),
             "RCLONE_CONFIG_LAKEFS_ACCESS_KEY_ID": lakefs_access_key,
             "RCLONE_CONFIG_LAKEFS_SECRET_ACCESS_KEY": lakefs_secret_key,
         }
 
-    if svc.load_balancing_policy:
-        task["service"]["load_balancing_policy"] = svc.load_balancing_policy
-
-    return yaml.dump(task, default_flow_style=False)
+    return {
+        "image": "ghcr.io/invergent-ai/sky-llama-cpp:full-cuda12",
+        "commands": [run_cmd],
+        "port": 8080,
+        "env": env,
+        "readiness_probe": svc.readiness_path or "/health",
+    }
 
 
 def _parse_hub_ref(hub_ref: str) -> Optional[dict]:
@@ -487,9 +461,9 @@ async def start_model(
     model_id: str,
     server_config: Optional[ServerConfig] = None,
 ) -> Optional[DeployedModelResponse]:
-    """Start serving a stopped model by generating a task YAML and launching via SkyPilot."""
+    """Start serving a stopped model by launching a dstack service run."""
     m = await repo.get_deployed_model(session, model_id)
-    
+
     if m is None:
         raise ValueError(f"Model {model_id} not found")
 
@@ -514,19 +488,18 @@ async def start_model(
             }
 
     # Terminate if still running
-    if svc.status not in ("shutting_down", "failed", "failed_cleanup", "stopped"):
+    if svc.status not in ("failed", "stopped", "cancelled"):
         try:
-            await sky_service.terminate_serving_service(session, m.serving_service_id)
+            await dstack_service.terminate_service(session, m.serving_service_id)
         except Exception:
             logger.warning(f"Failed to terminate old service for model {model_id}", exc_info=True)
 
-    task_yaml = _build_task_yaml(m, svc, **lakefs_kw)
-    
-    svc = await sky_service.launch_serving_service(session, svc, task_yaml)
+    params = _build_service_params(m, svc, **lakefs_kw)
+    svc = await dstack_service.launch_service(session, svc, **params)
 
     await repo.update_deployed_model(
         session, model_id,
-        last_deployed_at=datetime.now(timezone.utc),
+        last_deployed_at=datetime.utcnow(),
     )
 
     m = await repo.get_deployed_model(session, model_id)
@@ -541,7 +514,7 @@ async def stop_model(session: AsyncSession, model_id: str) -> None:
     if not m.serving_service_id:
         raise ValueError("Model is not currently serving")
 
-    await sky_service.terminate_serving_service(session, m.serving_service_id)
+    await dstack_service.terminate_service(session, m.serving_service_id)
 
 
 async def restart_model(
@@ -567,8 +540,6 @@ async def get_model_logs(
     session: AsyncSession,
     model_id: str,
     *,
-    target: str = "controller",
-    replica_id: Optional[int] = None,
     tail: int = 200,
 ) -> dict:
     """Fetch logs for a deployed model's serving service."""
@@ -582,41 +553,39 @@ async def get_model_logs(
     if svc is None:
         raise ValueError("Serving service not found")
 
-    lines = await sky_service.tail_serving_logs(
-        svc.name, target=target, replica_id=replica_id, tail=tail,
+    if not svc.dstack_run_name or not svc.dstack_project_name:
+        return {"model_id": model_id, "lines": []}
+
+    lines = await dstack_service.get_run_logs(
+        svc.dstack_run_name, svc.dstack_project_name, tail=tail,
     )
-    return {"model_id": model_id, "target": target, "lines": lines}
+    return {"model_id": model_id, "lines": lines}
 
 
 async def delete_model(session: AsyncSession, model_id: str) -> None:
-    """Delete the model and its ServingService, tearing down SkyPilot in the background."""
+    """Delete the model and its ServingService, tearing down dstack in the background."""
     m = await repo.get_deployed_model(session, model_id)
     if m is None:
         raise ValueError(f"Model {model_id} not found")
 
     serving_service_id = m.serving_service_id
-    service_name: str | None = None
-    if serving_service_id:
-        svc = await repo.get_serving_service(session, serving_service_id)
-        if svc is not None:
-            service_name = svc.name
 
     # Delete DB records immediately so the UI can move on
     await repo.delete_deployed_model(session, model_id)
     if serving_service_id:
-        await repo.delete_serving_service(session, serving_service_id)
-
-    # Tear down the SkyPilot service in the background
-    if service_name:
-        asyncio.create_task(_teardown_sky_service(service_name))
+        # Terminate in background, then delete the surogate record
+        asyncio.create_task(_teardown_service(session, serving_service_id))
 
 
-async def _teardown_sky_service(service_name: str) -> None:
-    """Best-effort SkyPilot service teardown — runs as a background task."""
-    from sky.serve.server import core as serve_core
+async def _teardown_service(session: AsyncSession, service_id: str) -> None:
+    """Best-effort dstack service teardown — runs as a background task."""
+    from surogate.core.db.engine import get_session_factory
 
-    try:
-        await asyncio.to_thread(serve_core.down, service_names=service_name, purge=False)
-        logger.info("SkyPilot service '%s' torn down", service_name)
-    except Exception:
-        logger.warning("Failed to tear down SkyPilot service '%s'", service_name, exc_info=True)
+    factory = get_session_factory()
+    async with factory() as new_session:
+        try:
+            await dstack_service.terminate_service(new_session, service_id)
+            logger.info("dstack service %s torn down", service_id)
+        except Exception:
+            logger.warning("Failed to tear down dstack service %s", service_id, exc_info=True)
+        await repo.delete_serving_service(new_session, service_id)

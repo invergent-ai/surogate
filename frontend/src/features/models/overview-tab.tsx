@@ -146,7 +146,7 @@ export function OverviewTab({ model }: { model: Model }) {
             <div className="text-xs font-semibold text-foreground font-display mb-4">
               GPU Resources
             </div>
-            {model.status === "ready" ? (
+            {model.status === "running" ? (
               <div className="flex gap-8 items-start">
                 <div className="flex gap-5 items-center">
                   <GaugeRing

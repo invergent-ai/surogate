@@ -28,7 +28,8 @@ class LocalTaskResponse(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
 
 
 class TaskLogsResponse(BaseModel):

@@ -19,18 +19,17 @@ export type {
 
 // ── Status mapping ──────────────────────────────────────────────
 
-// Map raw SkyPilot serving status → StatusDot color only
+// Map dstack serving status → StatusDot color
 const DOT_MAP: Record<string, Status> = {
-  controller_init: "deploying",
-  replica_init: "deploying",
-  no_replica: "deploying",
-  ready: "serving",
-  controller_failed: "error",
+  queued: "deploying",
+  submitted: "deploying",
+  provisioning: "deploying",
+  running: "serving",
+  cancelling: "deploying",
+  cancelled: "stopped",
+  completed: "completed",
   failed: "error",
-  failed_cleanup: "error",
-  shutting_down: "deploying",
   stopped: "stopped",
-  configured: "stopped",
 };
 
 export function toStatus(raw: string): Status {

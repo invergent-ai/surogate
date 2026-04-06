@@ -95,34 +95,9 @@ def _graceful_shutdown(server = None):
     before the parent exits. This is critical on Windows where atexit
     handlers are unreliable after Ctrl+C.
     """
-    logger.info("Graceful shutdown initiated — cleaning up subprocesses...")
+    logger.info("Graceful shutdown initiated...")
 
-    # 1. Kill SkyPilot controller processes spawned in consolidation mode.
-    #    These are fully detached (nohup + new session) so they survive our exit
-    #    unless explicitly terminated.
-    try:
-        from sky.jobs import scheduler as sky_scheduler
-        from sky.jobs import utils as managed_job_utils
-        from sky.utils import subprocess_utils as sky_subprocess_utils
-
-        records = sky_scheduler.get_controller_process_records()
-        if records:
-            for record in records:
-                try:
-                    if managed_job_utils.controller_process_alive(record, quiet=True):
-                        logger.info(f"Killing SkyPilot controller process {record.pid}")
-                        sky_subprocess_utils.kill_children_processes(
-                            parent_pids=[record.pid], force=True)
-                except Exception:
-                    pass
-            try:
-                os.remove(os.path.expanduser(sky_scheduler.JOB_CONTROLLER_PID_PATH))
-            except FileNotFoundError:
-                pass
-    except Exception as e:
-        logger.warning(f"Failed to clean up SkyPilot controller processes: {e}")
-
-    # 2. Shut down uvicorn server (releases the listening socket).
+    # Shut down uvicorn server (releases the listening socket).
     #    This triggers the lifespan teardown which stops the monitor and
     #    disposes DB connections.
     if server is not None:

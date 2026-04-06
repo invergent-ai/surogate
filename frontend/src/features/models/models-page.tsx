@@ -47,9 +47,9 @@ function ModelListItem({
         <div
           className="w-8.5 h-8.5 rounded-lg shrink-0 flex items-center justify-center text-[15px] border"
           style={{
-            backgroundColor: model.status === "ready" ? "#3B82F612" : undefined,
-            borderColor: model.status === "ready" ? "#3B82F625" : undefined,
-            color: model.status === "ready" ? "#3B82F6" : undefined,
+            backgroundColor: toStatus(model.status) === "serving" ? "#3B82F612" : undefined,
+            borderColor: toStatus(model.status) === "serving" ? "#3B82F625" : undefined,
+            color: toStatus(model.status) === "serving" ? "#3B82F6" : undefined,
           }}
         >
           &#x25C7;
@@ -82,7 +82,7 @@ function ModelListItem({
                 className={cn(
                   toStatus(model.status) === "error"
                     ? "text-destructive"
-                    : model.status === "ready"
+                    : toStatus(model.status) === "serving"
                       ? "text-green-500"
                       : "text-muted-foreground",
                 )}
@@ -90,7 +90,7 @@ function ModelListItem({
                 {model.status}
               </span>
             </span>
-            {model.status === "ready" && (
+            {toStatus(model.status) === "serving" && (
               <>
                 <span className="text-muted-foreground/30">&middot;</span>
                 <span className="text-muted-foreground">
@@ -150,13 +150,13 @@ export function ModelsPage() {
 
   const statusCounts = {
     all: models.length,
-    serving: sum("ready"),
-    error: sum("controller_failed", "failed", "failed_cleanup"),
-    stopped: sum("stopped", "shutting_down", "configured"),
+    serving: sum("running"),
+    error: sum("failed"),
+    stopped: sum("stopped", "cancelled", "completed"),
   };
 
   const totalGpus = models.reduce(
-    (s: number, m: Model) => s + (m.status === "ready" ? m.gpu.count : 0),
+    (s: number, m: Model) => s + (toStatus(m.status) === "serving" ? m.gpu.count : 0),
     0,
   );
   const totalTps = models.reduce((s: number, m: Model) => s + m.tps, 0);

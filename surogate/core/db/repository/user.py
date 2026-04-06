@@ -12,13 +12,15 @@ async def get_user_by_username(session: AsyncSession, username: str) -> Optional
     )
     return result.scalar_one_or_none()
 
-async def get_lakefs_credentials(session: AsyncSession, username: str) -> Optional[tuple[str, str]]:
-    """Return LakeFS credentials (key, secret) for a user."""
+async def get_lakefs_credentials(session: AsyncSession, user_identifier: str) -> Optional[tuple[str, str]]:
+    """Return LakeFS credentials (key, secret) for a user.
+
+    *user_identifier* can be either a username or a user UUID.
+    """
+    # Try by username first (short strings), then by id (UUID format)
     result = await session.execute(
-        sa.select(
-            User.hub_key,
-            User.hub_secret,
-        ).where(User.username == username)
+        sa.select(User.hub_key, User.hub_secret)
+        .where(sa.or_(User.username == user_identifier, User.id == user_identifier))
     )
     return result.one_or_none()
 

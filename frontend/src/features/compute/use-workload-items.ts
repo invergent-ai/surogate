@@ -49,8 +49,8 @@ function modelToWorkloadItem(m: Model): ExtendedWorkload {
 }
 
 const ACTIVE_STATUSES = [
-  "running", "pending", "serving", "deploying",
-  "ready", "controller_init", "replica_init", "no_replica",
+  "running", "queued", "submitted", "provisioning", "cancelling",
+  "pending", "serving", "deploying",
 ];
 
 /**

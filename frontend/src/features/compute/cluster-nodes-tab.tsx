@@ -7,14 +7,6 @@ import { ProgressBar } from "@/components/ui/progress-bar";
 import { useAppStore } from "@/stores/app-store";
 import { STATUS_COLORS } from "./compute-data";
 
-function getGpuTotal(node: { total?: Record<string, number> }): number {
-  return node.total?.["accelerator_count"] ?? 0;
-}
-
-function getGpuFree(node: { free?: Record<string, number> }): number {
-  return node.free?.["accelerators_available"] ?? 0;
-}
-
 export function ClusterNodesTab() {
   const k8sNodes = useAppStore((s) => s.k8sNodes);
 
@@ -31,8 +23,8 @@ export function ClusterNodesTab() {
           </thead>
           <tbody>
             {k8sNodes.map(n => {
-              const gpuTotal = getGpuTotal(n);
-              const gpuFree = getGpuFree(n);
+              const gpuTotal = n.accelerator_count;
+              const gpuFree = n.accelerator_available;
               const gpuUsed = gpuTotal - gpuFree;
               const cpuUtil = n.metrics?.cpu_utilization_percent ?? 0;
               const memTotalGb = n.memory_gb ?? 0;

@@ -1,4 +1,4 @@
-"""Compute API routes — managed jobs, nodes, cloud, costs, policies."""
+"""Compute API routes — managed jobs, nodes, cloud, policies."""
 
 from datetime import datetime
 from typing import Optional
@@ -7,10 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from prometheus_api_client.prometheus_connect import PrometheusConnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from surogate.core.compute import sky as sky_service
+from surogate.core.compute import dstack as dstack_service
 from surogate.core.db.engine import get_session
 from surogate.core.db.repository import compute as compute_repo
-from surogate.server.auth.authentication import get_current_subject
+from surogate.server.auth.authentication import get_current_subject, get_current_user_id
 from surogate.server.models.compute import (
     CloudAccountResponse,
     K8NodeResponse,
@@ -32,12 +32,14 @@ router = APIRouter()
 async def get_local_node_metrics(
     request: Request,
 ):
-    # this import needs to be done inside the function to avoid importing sky before skypilot is initialized,
     import surogate.core.compute.kubernetes as k8s
+
+    if k8s.k8_nodes is None:
+        return []
 
     prom = PrometheusConnect(url=request.app.state.config.prometheus_endpoint, disable_ssl=True)
     responses: list[K8NodeResponse] = []
-    
+
     for node in k8s.k8_nodes.node_info_dict.values():
         node_available_mem = prom.custom_query(query=f"node_memory_MemAvailable_bytes{{node='{node.name}'}}")
         node_total_mem = prom.custom_query(query=f"node_memory_MemTotal_bytes{{node='{node.name}'}}")
@@ -48,28 +50,28 @@ async def get_local_node_metrics(
             value = node_available_mem[0].get('value')
             if value and len(value) > 1:
                 metrics.free_memory_bytes = int(value[1])
-        
+
         if len(node_total_mem) > 0:
             value = node_total_mem[0].get('value')
             if value and len(value) > 1:
                 metrics.total_memory_bytes = int(value[1])
-            
+
         if len(node_cpu_util) > 0:
             value = node_cpu_util[0].get('value')
             if value and len(value) > 1:
                 metrics.cpu_utilization_percent = float(value[1]) * 100
-                
+
         responses.append(K8NodeResponse(
-            name=node.name, 
+            name=node.name,
             accelerator_type=node.accelerator_type,
-            total=node.total,
-            free=node.free,
+            accelerator_count=node.accelerator_count,
+            accelerator_available=node.accelerator_available,
             cpu_count=node.cpu_count,
             memory_gb=node.memory_gb,
             is_ready=node.is_ready,
             metrics=metrics
         ))
-    
+
     return responses
 
 
@@ -84,22 +86,15 @@ async def get_overview(
     """Aggregated dashboard KPIs for the Overview tab."""
     nodes = await compute_repo.list_nodes(session)
     accounts = await compute_repo.list_cloud_accounts(session)
-    jobs_data = await sky_service.list_jobs(session, limit=200)
+    jobs_data = await dstack_service.list_tasks(session, limit=200)
 
     local_gpu_total = sum(n.gpu_total for n in nodes)
     local_gpu_used = sum(n.gpu_used for n in nodes)
 
-    cloud_instances = []
-    try:
-        cloud_instances = await sky_service.get_cluster_status()
-    except Exception:
-        pass
-
+    # Cloud instances from dstack
+    cloud_instances = await dstack_service.list_instances()
     cloud_gpu_total = 0
     cloud_hourly_cost = 0.0
-    for ci in cloud_instances:
-        gpu_count = getattr(ci, "gpu_count", 0) or 0
-        cloud_gpu_total += gpu_count
 
     monthly_spend = sum(a.monthly_spend for a in accounts)
     monthly_budget = sum(a.monthly_budget for a in accounts)
@@ -133,7 +128,7 @@ async def list_jobs(
     limit: int = Query(50, le=200),
 ):
     """List managed jobs with optional filters."""
-    data = await sky_service.list_jobs(
+    data = await dstack_service.list_tasks(
         session,
         project_id=project_id,
         type_filter=type,
@@ -158,7 +153,7 @@ async def list_jobs(
             cloud=j.cloud,
             region=j.region,
             use_spot=j.use_spot,
-            skypilot_job_id=j.skypilot_job_id,
+            dstack_run_name=j.dstack_run_name,
         )
         for j in data["jobs"]
     ]
@@ -172,19 +167,19 @@ async def list_jobs(
 @router.post("/jobs", response_model=JobResponse)
 async def launch_job(
     req: JobLaunchRequest,
-    current_subject: str = Depends(get_current_subject),
+    current_user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ):
     """Submit a new managed job."""
-    job = await sky_service.launch_job(
+    job = await dstack_service.submit_task(
         session,
-        task_yaml=req.task_yaml,
         name=req.name,
         project_id=req.project_id,
         workload_type=req.workload_type,
-        requested_by_id=current_subject,
+        requested_by_id=current_user_id,
+        image="python:3.11",  # TODO: make configurable via request
+        commands=[req.task_yaml],  # task_yaml used as the command for now
         accelerators=req.accelerators,
-        cloud=req.cloud,
         use_spot=req.use_spot,
     )
     return JobResponse(
@@ -198,7 +193,7 @@ async def launch_job(
         cloud=job.cloud,
         region=job.region,
         use_spot=job.use_spot,
-        skypilot_job_id=job.skypilot_job_id,
+        dstack_run_name=job.dstack_run_name,
     )
 
 
@@ -210,38 +205,40 @@ async def cancel_job(
 ):
     """Cancel a managed job."""
     try:
-        await sky_service.cancel_job(session, job_id)
+        await dstack_service.cancel_task(session, job_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {"status": "cancelled"}
 
 
-# ── Cluster Nodes ────────────────────────────────────────────────────
+# ── Instances ───────────────────────────────────────────────────────
 
 
-@router.get("/nodes", response_model=list[NodeResponse])
-async def list_nodes(
+@router.get("/cloud/instances")
+async def list_cloud_instances(
     current_subject: str = Depends(get_current_subject),
-    session: AsyncSession = Depends(get_session),
 ):
-    """List local cluster nodes."""
-    nodes = await compute_repo.list_nodes(session)
-    return [
-        NodeResponse(
-            id=n.id,
-            hostname=n.hostname,
-            pool=n.pool.value,
-            status=n.status.value,
-            gpu=None,
-            cpu={"cores": n.cpu_cores, "used": 0, "utilization": n.cpu_used_percent},
-            mem={"total": 0, "used": 0, "unit": "Gi"},
-            workloads=[],
-        )
-        for n in nodes
-    ]
+    """List active dstack instances."""
+    return await dstack_service.list_instances()
 
 
-# ── Cloud ────────────────────────────────────────────────────────────
+@router.post("/cloud/instances/{instance_id}/terminate")
+async def terminate_cloud_instance(
+    instance_id: str,
+    project_name: Optional[str] = Query(None),
+    current_subject: str = Depends(get_current_subject),
+):
+    """Terminate a dstack instance."""
+    if not project_name:
+        raise HTTPException(status_code=400, detail="project_name query param required")
+    try:
+        await dstack_service.terminate_instance(instance_id, project_name)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"status": "terminated"}
+
+
+# ── Cloud Accounts ──────────────────────────────────────────────────
 
 @router.get("/cloud/accounts", response_model=list[CloudAccountResponse])
 async def list_cloud_accounts(
@@ -263,47 +260,6 @@ async def list_cloud_accounts(
         )
         for a in accounts
     ]
-
-
-@router.get("/cloud/instances")
-async def list_cloud_instances(
-    current_subject: str = Depends(get_current_subject),
-):
-    """List active SkyPilot clusters / cloud instances."""
-    try:
-        clusters = await sky_service.get_cluster_status()
-    except Exception:
-        clusters = []
-    return clusters
-
-
-@router.post("/cloud/instances/{cluster_name}/terminate")
-async def terminate_cloud_instance(
-    cluster_name: str,
-    current_subject: str = Depends(get_current_subject),
-):
-    """Tear down a SkyPilot cluster."""
-    try:
-        await sky_service.terminate_cluster(cluster_name)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return {"status": "terminated"}
-
-
-# ── Costs ────────────────────────────────────────────────────────────
-
-
-@router.get("/costs")
-async def get_costs(
-    current_subject: str = Depends(get_current_subject),
-    days: int = Query(30, le=365),
-):
-    """Cost report from SkyPilot."""
-    try:
-        report = await sky_service.get_cost_report(days=days)
-    except Exception:
-        report = []
-    return report
 
 
 # ── Policies ─────────────────────────────────────────────────────────

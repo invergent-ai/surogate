@@ -9,9 +9,8 @@ export interface K8NodeMetrics {
 export interface K8Node {
     name: string;
     accelerator_type?: string;
-    total?: Record<string, number>;
-    free?: Record<string, number>;
-    ip_address?: string;
+    accelerator_count: number;
+    accelerator_available: number;
     cpu_count?: number;
     memory_gb?: number;
     is_ready: boolean;

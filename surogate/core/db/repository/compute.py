@@ -28,7 +28,8 @@ async def create_managed_job(
     workload_type: CloudWorkloadType,
     requested_by_id: str,
     task_yaml: str,
-    skypilot_job_id: Optional[int] = None,
+    dstack_run_name: Optional[str] = None,
+    dstack_project_name: Optional[str] = None,
     status: str = "pending",
     accelerators: Optional[str] = None,
     cloud: Optional[str] = None,
@@ -36,7 +37,8 @@ async def create_managed_job(
     use_spot: bool = False,
 ) -> ManagedJob:
     job = ManagedJob(
-        skypilot_job_id=skypilot_job_id,
+        dstack_run_name=dstack_run_name,
+        dstack_project_name=dstack_project_name,
         name=name,
         project_id=project_id,
         workload_type=workload_type,
@@ -62,11 +64,11 @@ async def get_managed_job(
     return result.scalar_one_or_none()
 
 
-async def get_managed_job_by_skypilot_id(
-    session: AsyncSession, sky_job_id: int
+async def get_managed_job_by_run_name(
+    session: AsyncSession, run_name: str
 ) -> Optional[ManagedJob]:
     result = await session.execute(
-        sa.select(ManagedJob).where(ManagedJob.skypilot_job_id == sky_job_id)
+        sa.select(ManagedJob).where(ManagedJob.dstack_run_name == run_name)
     )
     return result.scalar_one_or_none()
 

@@ -30,11 +30,6 @@ class ServingServiceLaunchRequest(BaseModel):
     load_balancing_policy: Optional[str] = None
 
 
-class ServingServiceUpdateRequest(BaseModel):
-    task_yaml: str
-    mode: str = "rolling"  # rolling / blue_green
-
-
 class PolicyToggleRequest(BaseModel):
     enabled: bool
 
@@ -59,24 +54,16 @@ class JobResponse(BaseModel):
     cloud: Optional[str] = None
     region: Optional[str] = None
     use_spot: bool = False
-    skypilot_job_id: Optional[int] = None
+    dstack_run_name: Optional[str] = None
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
 
 
 class JobListResponse(BaseModel):
     jobs: list[JobResponse]
     total: int
     status_counts: dict[str, int]
-
-
-class ServingServiceReplicaResponse(BaseModel):
-    replica_id: int
-    name: Optional[str] = None
-    status: str
-    version: Optional[int] = None
-    launched_at: Optional[str] = None
-    endpoint: Optional[str] = None
 
 
 class ServingServiceResponse(BaseModel):
@@ -89,15 +76,14 @@ class ServingServiceResponse(BaseModel):
     use_spot: bool = False
     num_replicas: int = 1
     readiness_path: Optional[str] = None
-    load_balancing_policy: Optional[str] = None
-    update_mode: Optional[str] = None
-    replicas: list[ServingServiceReplicaResponse] = []
+    dstack_run_name: Optional[str] = None
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     requested_by: Optional[str] = None
     project: Optional[str] = None
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
 
 
 class ServingServiceListResponse(BaseModel):
@@ -141,7 +127,9 @@ class NodeResponse(BaseModel):
     mem: MemInfo
     workloads: list[WorkloadSlot]
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
+        use_enum_values = True
 
 
 class CloudAccountResponse(BaseModel):
@@ -154,7 +142,9 @@ class CloudAccountResponse(BaseModel):
     monthly_budget: float = 0
     monthly_spend: float = 0
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
+        use_enum_values = True
 
 
 class CloudInstanceResponse(BaseModel):
@@ -172,7 +162,9 @@ class CloudInstanceResponse(BaseModel):
     spot_savings: Optional[str] = None
     auto_terminate: Optional[str] = None
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
+        use_enum_values = True
 
 
 class PolicyResponse(BaseModel):
@@ -185,7 +177,8 @@ class PolicyResponse(BaseModel):
     last_triggered: Optional[str] = None
     trigger_count: int = 0
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
 
 
 class CostByTypeItem(BaseModel):
@@ -236,9 +229,8 @@ class K8NodeMetricsResponse(BaseModel):
 class K8NodeResponse(BaseModel):
     name: str
     accelerator_type: Optional[str]
-     # Resources available on the node. E.g., {'accelerators_available': '2'}
-    total: Dict[str, int]
-    free: Dict[str, int]
+    accelerator_count: int = 0
+    accelerator_available: int = 0
     # CPU count (total CPUs available on the node)
     cpu_count: Optional[float] = None
     # Memory in GB (total memory available on the node)

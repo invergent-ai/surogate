@@ -11,7 +11,8 @@ class ServerConfig:
     port: int = 8888
     workers: int = 1
     log_level: str = 'info'
-    database_url: str = 'sqlite+aiosqlite:///surogate.db'
+    database_url: str = 'postgresql+asyncpg://surogate:surogate@127.0.0.1:5432/surogate'
+    dstack_database_url: str = 'postgresql+asyncpg://dstack:dstack@127.0.0.1:5432/dstack'
     lakefs_endpoint: Optional[str] = None
     lakefs_s3_endpoint: Optional[str] = None
     lakefs_k8s_s3_endpoint: Optional[str] = 'http://lakefs-s3.lakefs.svc'
@@ -26,6 +27,7 @@ class ServerConfig:
         self.workers = cfg.get('workers', self.workers)
         self.log_level = cfg.get('log_level', self.log_level)
         self.database_url = cfg.get('database_url', self.database_url)
+        self.dstack_database_url = cfg.get('dstack_database_url', self.dstack_database_url)
         self.lakefs_endpoint = cfg.get('lakefs_endpoint', self.lakefs_endpoint)
         self.lakefs_s3_endpoint = cfg.get('lakefs_s3_endpoint', self.lakefs_s3_endpoint)
         self.lakefs_access_key = cfg.get('lakefs_access_key', self.lakefs_access_key)

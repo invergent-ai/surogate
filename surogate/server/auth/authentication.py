@@ -33,6 +33,24 @@ async def get_current_subject(
     )
 
 
+async def get_current_user_id(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    session: AsyncSession = Depends(get_session),
+) -> str:
+    """Validate JWT and return the user's UUID (not username)."""
+    from surogate.core.db.models.platform import User
+    username = await _get_current_subject(
+        credentials, session, allow_password_change=False,
+    )
+    row = await session.execute(
+        sa.select(User.id).where(User.username == username)
+    )
+    user_id = row.scalar_one_or_none()
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return user_id
+
+
 def _decode_subject_without_verification(token: str) -> Optional[str]:
     try:
         payload = jwt.decode(

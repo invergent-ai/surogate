@@ -20,6 +20,10 @@ export default defineConfig({
         target: "http://127.0.0.1:8888",
         changeOrigin: true,
       },
+      "/proxy": {
+        target: "http://127.0.0.1:8888",
+        changeOrigin: true,
+      },
       "/ws": {
         target: "http://127.0.0.1:8888",
         changeOrigin: true,

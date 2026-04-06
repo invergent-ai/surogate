@@ -10,14 +10,6 @@ import { Cloud, Plus } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
 import { CLOUD_INSTANCES } from "./compute-data";
 
-function getGpuTotal(node: { total?: Record<string, number> }): number {
-  return node.total?.["accelerator_count"] ?? 0;
-}
-
-function getGpuFree(node: { free?: Record<string, number> }): number {
-  return node.free?.["accelerators_available"] ?? 0;
-}
-
 const TAB_ROUTES: Record<string, string> = {
   overview: "/studio/compute",
   nodes: "/studio/compute/cluster-nodes",
@@ -42,8 +34,8 @@ export function ComputePage() {
     void fetchK8Nodes();
   }, [fetchK8Nodes]);
 
-  const totalGpu = k8sNodes.reduce((s, n) => s + getGpuTotal(n), 0);
-  const usedGpu = totalGpu - k8sNodes.reduce((s, n) => s + getGpuFree(n), 0);
+  const totalGpu = k8sNodes.reduce((s, n) => s + n.accelerator_count, 0);
+  const usedGpu = totalGpu - k8sNodes.reduce((s, n) => s + n.accelerator_available, 0);
   const runningCloud = CLOUD_INSTANCES.filter((c) => c.status === "running").length;
   const cloudCost = CLOUD_INSTANCES.filter((c) => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
 

@@ -14,8 +14,8 @@ export function ClusterHealthCard() {
     void fetchK8Nodes();
   }, [fetchK8Nodes]);
 
-  const totalGpu = k8sNodes.reduce((s, n) => s + (n.total?.["accelerator_count"] ?? 0), 0);
-  const freeGpu = k8sNodes.reduce((s, n) => s + (n.free?.["accelerators_available"] ?? 0), 0);
+  const totalGpu = k8sNodes.reduce((s, n) => s + n.accelerator_count, 0);
+  const freeGpu = k8sNodes.reduce((s, n) => s + n.accelerator_available, 0);
   const usedGpu = totalGpu - freeGpu;
   const gpuUtil = totalGpu > 0 ? Math.round((usedGpu / totalGpu) * 100) : 0;
 
@@ -41,7 +41,7 @@ export function ClusterHealthCard() {
     { label: "Nodes Ready", value: `${readyNodes} / ${totalNodes}`, max: totalNodes || 1, current: readyNodes, color: "#22C55E" },
   ];
 
-  const gpuNodes = k8sNodes.filter((n) => (n.total?.["accelerator_count"] ?? 0) > 0).length;
+  const gpuNodes = k8sNodes.filter((n) => n.accelerator_count > 0).length;
   const totalCpuCores = k8sNodes.reduce((s, n) => s + (n.cpu_count ?? 0), 0);
 
   const stats = [

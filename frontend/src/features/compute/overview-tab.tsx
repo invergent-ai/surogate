@@ -12,20 +12,12 @@ import {
 import { useWorkloadItems } from "./use-workload-items";
 import { statusForDot } from "./detail-shared";
 
-function getGpuTotal(node: { total?: Record<string, number> }): number {
-  return node.total?.["accelerator_count"] ?? 0;
-}
-
-function getGpuFree(node: { free?: Record<string, number> }): number {
-  return node.free?.["accelerators_available"] ?? 0;
-}
-
 export function OverviewTab() {
   const k8sNodes = useAppStore((s) => s.k8sNodes);
   const workloads = useWorkloadItems();
 
-  const totalLocalGpu = k8sNodes.reduce((s, n) => s + getGpuTotal(n), 0);
-  const usedLocalGpu = totalLocalGpu - k8sNodes.reduce((s, n) => s + getGpuFree(n), 0);
+  const totalLocalGpu = k8sNodes.reduce((s, n) => s + n.accelerator_count, 0);
+  const usedLocalGpu = totalLocalGpu - k8sNodes.reduce((s, n) => s + n.accelerator_available, 0);
   const readyNodes = k8sNodes.filter((n) => n.is_ready).length;
   const totalCloudGpu = CLOUD_INSTANCES.reduce((s, c) => s + parseInt(c.gpu), 0);
   const cloudHourlyCost = CLOUD_INSTANCES.filter(c => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
@@ -78,8 +70,8 @@ export function OverviewTab() {
           </div>
           <div className="p-4 grid grid-cols-4 gap-2">
             {k8sNodes.map(node => {
-              const gpuTotal = getGpuTotal(node);
-              const gpuFree = getGpuFree(node);
+              const gpuTotal = node.accelerator_count;
+              const gpuFree = node.accelerator_available;
               const gpuUsed = gpuTotal - gpuFree;
               const cpuUtil = node.metrics?.cpu_utilization_percent ?? 0;
               const memTotalGb = node.memory_gb ?? 0;

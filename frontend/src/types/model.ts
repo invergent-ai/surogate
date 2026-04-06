@@ -108,6 +108,7 @@ export interface Model {
   endpoint: string;
   image: string;
   hubRef: string;
+  useSpot: boolean;
   connectedAgents: ModelConnectedAgent[];
   servingConfig: ModelServingConfig | null;
   generationDefaults: ModelGenerationDefaults | null;

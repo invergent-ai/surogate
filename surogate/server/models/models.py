@@ -129,6 +129,7 @@ class DeployedModelResponse(BaseModel):
     endpoint: str
     image: str
     hub_ref: str
+    use_spot: bool = False
     connected_agents: list[ConnectedAgentInfo] = []
     serving_config: Optional[dict] = None
     generation_defaults: Optional[dict] = None
@@ -136,7 +137,8 @@ class DeployedModelResponse(BaseModel):
     metrics_history: MetricsHistoryInfo = MetricsHistoryInfo()
     events: list[EventInfo] = []
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
 
 
 class DeployedModelListResponse(BaseModel):
@@ -147,5 +149,4 @@ class DeployedModelListResponse(BaseModel):
 
 class ModelLogsResponse(BaseModel):
     model_id: str
-    target: str
     lines: list[str]

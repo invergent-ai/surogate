@@ -1,140 +1,270 @@
-"""Compute module — SkyPilot initialization and monkeypatches.
+"""Compute module — dstack initialization and project bridge.
 
-SkyPilot is used as a direct library (bypassing its REST API server).
-We call the implementation layer: sky.execution, sky.core, sky.jobs.server.core.
+Bootstraps dstack as an embedded library: runs migrations, creates an
+admin user, starts the APScheduler background tasks that drive run
+state transitions (SUBMITTED → PROVISIONING → RUNNING → DONE/FAILED).
 
-Monkeypatches are applied before any sky imports to support
-platform-specific features.
+Environment variables are set **before** any dstack import so that
+dstack's module-level settings pick them up.
 """
 
+import asyncio
 import os
-import uuid
-
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional
+
+# ── Pre-import env configuration ────────────────────────────────────
+# These MUST be set before any dstack._internal import.
+# Store dstack data under ~/.surogate/dstack/ instead of ~/.dstack/server/
+_surogate_home = str(Path.home() / ".surogate" / "dstack")
+os.environ.setdefault("DSTACK_SERVER_DIR", _surogate_home)
+os.environ.setdefault("DSTACK_DO_NOT_UPDATE_DEFAULT_PROJECT", "1")
+os.environ.setdefault("DSTACK_SERVER_CONFIG_DISABLED", "1")
+# TODO: raise back to WARNING once dstack integration is stable
+os.environ.setdefault("DSTACK_SERVER_LOG_LEVEL", "DEBUG")
+# Prevent dstack's SSH client from offering agent keys — only use the project key file.
+# Without this, systems with many SSH keys in the agent exceed MaxAuthTries on the jump pod.
+os.environ.pop("SSH_AUTH_SOCK", None)
 
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
+# ── Patch dstack create_or_update_repo for asyncpg compat ───────────
+# dstack's create_repo uses begin_nested() + session.add() without flush.
+# With autoflush=False the INSERT only happens at savepoint commit, but
+# the IntegrityError from the commit isn't caught by the try/except.
+# We patch create_or_update_repo to check existence first, avoiding the
+# broken savepoint path entirely.
+def _patch_repos():
+    from dstack._internal.server.services import repos as _repos
+
+    _original = _repos.create_or_update_repo
+
+    async def _safe_create_or_update_repo(session, project, repo_id, repo_info):
+        # Check if repo already exists — if so, just update
+        existing = await _repos.get_repo_model(session, project, repo_id)
+        if existing is not None:
+            return await _repos.update_repo(session, project, repo_id, repo_info)
+        # Doesn't exist — try to create (first run in this project)
+        return await _original(session, project, repo_id, repo_info)
+
+    _repos.create_or_update_repo = _safe_create_or_update_repo
+
+_patch_repos()
+
+# ── Module state (set by init_dstack) ───────────────────────────────
+
 _initialized = False
+_admin = None              # dstack UserModel
+_scheduler = None          # APScheduler instance
+_pipeline_manager = None   # Pipeline task manager
 
-dummy_request_id = str(uuid.uuid4())  # Used in skylet for non-SkyPilot requests
 
-def init_skypilot():
-    """Initialize SkyPilot as a library.
+async def init_dstack(database_url: str | None = None) -> None:
+    """Bootstrap dstack as an embedded library.
 
-    1. Initialize global user state (SkyPilot's SQLite DB).
-    2. Reload SkyPilot config.
+    1. Run Alembic migrations for dstack's own DB
+    2. Create / retrieve the admin user
+    3. Create / retrieve the default project
+    4. Register the Kubernetes backend (from current kubeconfig)
+    5. Start APScheduler background tasks
     """
-    
-    global _initialized
+    global _initialized, _admin, _scheduler, _pipeline_manager
     if _initialized:
         return
 
-    os.environ.setdefault("ENV_VAR_IS_SKYPILOT_SERVER", "1")
-        
-    # ── Patch get_current_request_id to return a real UUID ──────
-    from sky.utils import common_utils
-    _original_get_request_id = common_utils.get_current_request_id
+    if database_url:
+        os.environ["DSTACK_DATABASE_URL"] = database_url
 
-    def _patched_get_current_request_id() -> str:
-        value = _original_get_request_id()
-        if value == "dummy-request-id":
-            return dummy_request_id
-        return value
+    from dstack._internal.server.db import Database, get_session_ctx, migrate, override_db
+    from dstack._internal.server import settings as dstack_settings
+    from dstack._internal.server.services.users import get_or_create_admin_user
+    from dstack._internal.server.services.projects import get_or_create_default_project
+    from dstack._internal.server.background.scheduled_tasks import start_scheduled_tasks
+    # Import triggers EncryptedString.set_encrypt_decrypt() at module level
+    import dstack._internal.server.services.encryption  # noqa: F401
 
-    common_utils.get_current_request_id = _patched_get_current_request_id
-    
-    # ── Patch skypilot to work with our projects ──────
-    import sky.check
-    import sky.skypilot_config as skypilot_config
-    import sky.data.storage as sky_storage
-    import sky.global_user_state as global_user_state
-    import surogate.core.compute.skypilot.patcher as patcher
-    
-    sky.check._get_workspace_allowed_clouds = patcher._surogate_get_workspace_allowed_clouds
-    skypilot_config.get_active_workspace = patcher._surogate_get_active_workspace
-    sky_storage.get_cached_enabled_storage_cloud_names_or_refresh = patcher._surogate_get_cached_enabled_storage_cloud_names_or_refresh
-    global_user_state.get_cached_enabled_clouds = patcher._surogate_get_cached_enabled_clouds
-    global_user_state.get_allowed_clouds = patcher._surogate_get_allowed_clouds
+    logger.info("Initializing dstack...")
 
-    # ── Remove artificial service limits ─────────────────────────
-    patch_serve_limits()
+    # dstack's run_sync() calls need a thread pool — match what dstack's
+    # own app.py does before any DB work.
+    loop = asyncio.get_running_loop()
+    if loop._default_executor is None:  # type: ignore[attr-defined]
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=128))
 
-    # ── SkyPilot state initialization ────────────────────────────
-    set_consolidattion_mode()
-    set_image_pull_policy_if_not_present()
-    
-    from sky import global_user_state
-    from sky import skypilot_config
+    # Resolve the actual DB URL — env var may have been set after settings.py loaded
+    db_url = database_url or os.environ.get("DSTACK_DATABASE_URL") or dstack_settings.DATABASE_URL
+    logger.info("dstack DB: %s", db_url.split("@")[-1] if "@" in db_url else db_url)
 
-    global_user_state.initialize_and_get_db()
-    skypilot_config.safe_reload_config()
+    # dstack creates its DB/engine at import time (before the event loop).
+    # Recreate it now with the correct URL and a fresh connection pool.
+    override_db(Database(url=db_url))
+
+    # 1. DB migrations
+    await migrate()
+    # Replace the DB after migration so background tasks get a clean pool.
+    override_db(Database(url=db_url))
+
+    # 2. Admin user + default project
+    async with get_session_ctx() as session:
+        admin, _created = await get_or_create_admin_user(session=session)
+        await get_or_create_default_project(session=session, user=admin)
+
+    _admin = admin
+
+    # 3. Background processing
+    _scheduler = start_scheduled_tasks()
+    logger.info("dstack APScheduler jobs: %s", [j.name for j in _scheduler.get_jobs()])
+
+    from dstack._internal.server.background.scheduled_tasks.probes import PROBES_SCHEDULER
+    PROBES_SCHEDULER.start()
+
+    from dstack._internal.settings import FeatureFlags
+    if FeatureFlags.PIPELINE_PROCESSING_ENABLED:
+        from dstack._internal.server.background.pipeline_tasks import start_pipeline_tasks
+        _pipeline_manager = start_pipeline_tasks()
+        logger.info("dstack pipeline tasks started")
 
     _initialized = True
-    logger.info("SkyPilot initialized (direct library mode)")
+    logger.info("dstack initialised — APScheduler running")
 
-    from surogate.core.compute.kubernetes import init_kubernetes
-    init_kubernetes()
-    
 
-def set_image_pull_policy_if_not_present():
-    # ── Patch kubernetes-ray template: Always → IfNotPresent ────
-    from pathlib import Path
-    import sky
-    _tpl = Path(sky.__file__).parent / 'templates' / 'kubernetes-ray.yml.j2'
-    _content = _tpl.read_text()
-    _patched = _content.replace('imagePullPolicy: Always', 'imagePullPolicy: IfNotPresent')
-    if _patched != _content:
-        _tpl.write_text(_patched)
-        logger.info("Patched kubernetes-ray.yml.j2: imagePullPolicy → IfNotPresent")
-        
+async def ensure_kubernetes_backend(project) -> None:
+    """Register the local K8s cluster as a dstack backend on the given project.
 
-def patch_serve_limits():
-    """Widen SkyPilot serve limits and replace the per-service load balancer.
-
-    By default SkyPilot only opens ports 30001-30020 (20 services) and
-    caps the number of services based on available memory.  Since we run
-    in consolidation mode the port range firewall rule is irrelevant and
-    we manage our own resource budget, so we remove both limits.
-
-    We also replace the load-balancer subprocess with a no-op: instead of
-    spawning a separate uvicorn process per service, all proxying is
-    handled by the Surogate server's own proxy route
-    (``/api/models/serve/{service_name}/...``).  The SkyPilot controller
-    process still runs and manages replicas / autoscaling — we just talk
-    to it from our proxy sync loop.
+    Reads ``~/.kube/config`` (or the in-cluster config) and creates a
+    ``kubernetes`` backend so dstack can schedule runs on the cluster.
+    Silently skips if the backend already exists or no kubeconfig is found.
     """
-    from sky.serve import constants as serve_constants
-    from sky.serve import load_balancer
-    from sky.utils import controller_utils
-
-    serve_constants.LOAD_BALANCER_PORT_RANGE = '30001-31000'
-    controller_utils.can_start_new_process = lambda pool: True
-
-    def _noop_load_balancer(*args, **kwargs):
-        """Replaces SkyPilot's per-service LB process.
-
-        The actual proxying is handled by the Surogate server.
-        Registration with our proxy happens in the monitor when
-        the controller port becomes known.
-        """
-        pass
-
-    load_balancer.run_load_balancer = _noop_load_balancer
-
-
-def set_consolidattion_mode():
-    # ── Ensure ~/.sky/config.yaml exists with consolidation_mode ──
+    import os
     from pathlib import Path
-    _sky_config = Path.home() / '.sky' / 'config.yaml'
-    if not _sky_config.exists():
-        _sky_config.parent.mkdir(parents=True, exist_ok=True)
-        _sky_config.write_text(
-            'jobs:\n'
-            '  controller:\n'
-            '    consolidation_mode: true\n'
-            'serve:\n'
-            '  controller:\n'
-            '    consolidation_mode: true\n'
+
+    from dstack._internal.core.errors import ResourceExistsError
+    from dstack._internal.server.db import get_session_ctx
+    from dstack._internal.server.services.backends import create_backend
+
+    # Read kubeconfig
+    kubeconfig_path = Path(os.environ.get("KUBECONFIG", "~/.kube/config")).expanduser()
+    if not kubeconfig_path.exists():
+        logger.info("No kubeconfig at %s — skipping K8s backend", kubeconfig_path)
+        return
+
+    kubeconfig_data = kubeconfig_path.read_text()
+
+    from dstack._internal.core.backends.kubernetes.models import (
+        KubernetesBackendConfigWithCreds,
+        KubernetesProxyJumpConfig,
+        KubeconfigConfig,
+    )
+
+    # Proxy jump lets dstack SSH into pods via an external node address.
+    # Set DSTACK_K8S_PROXY_HOST / DSTACK_K8S_PROXY_PORT to enable.
+    proxy_jump = None
+    proxy_host = os.environ.get("DSTACK_K8S_PROXY_HOST", "localhost")
+    if proxy_host:
+        proxy_jump = KubernetesProxyJumpConfig(
+            hostname=proxy_host,
+            port=int(os.environ.get("DSTACK_K8S_PROXY_PORT", "32000")),
         )
+
+    k8s_config = KubernetesBackendConfigWithCreds(
+        type="kubernetes",
+        kubeconfig=KubeconfigConfig(data=kubeconfig_data),
+        namespace=os.environ.get("DSTACK_K8S_NAMESPACE", "dstack"),
+        proxy_jump=proxy_jump,
+    )
+
+    async with get_session_ctx() as session:
+        try:
+            await create_backend(session=session, project=project, config=k8s_config)
+            logger.info("Registered Kubernetes backend for project '%s'", project.name)
+        except ResourceExistsError:
+            logger.debug("Kubernetes backend already exists for project '%s'", project.name)
+        except Exception as ex:
+            logger.warning("Failed to register Kubernetes backend: %s", ex, exc_info=True)
+
+async def shutdown_dstack() -> None:
+    """Gracefully stop dstack background processing and dispose its DB."""
+    global _initialized, _scheduler, _pipeline_manager
+
+    if _pipeline_manager is not None:
+        _pipeline_manager.shutdown()
+        await _pipeline_manager.drain()
+        _pipeline_manager = None
+
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
+        _scheduler = None
+
+    from dstack._internal.server.db import get_db
+    await get_db().engine.dispose()
+
+    _initialized = False
+    logger.info("dstack shut down")
+
+
+# ── Accessors ───────────────────────────────────────────────────────
+
+
+def get_dstack_admin():
+    """Return the dstack admin UserModel (set during init)."""
+    if _admin is None:
+        raise RuntimeError("dstack not initialised — call init_dstack() first")
+    return _admin
+
+
+async def get_dstack_project(project_name: str):
+    """Look up a dstack ProjectModel by name.  Returns None if not found."""
+    from dstack._internal.server.db import get_session_ctx
+    from dstack._internal.server.services.projects import get_project_model_by_name
+
+    async with get_session_ctx() as session:
+        return await get_project_model_by_name(session=session, project_name=project_name)
+
+
+async def ensure_dstack_project(surogate_project_namespace: str):
+    """Get or create a dstack project for a surogate project namespace.
+
+    dstack project names are limited to 50 chars and must match
+    ``[a-zA-Z0-9-_]``.  We sanitise the surogate namespace accordingly.
+
+    Returns the dstack ``ProjectModel``.
+    """
+    import re
+    from dstack._internal.server.db import get_session_ctx
+    from dstack._internal.server.services.projects import (
+        create_project,
+        get_project_model_by_name,
+        get_project_model_by_name_or_error,
+    )
+
+    # Sanitise: keep alphanum / dash / underscore, truncate to 50
+    sanitised = re.sub(r"[^a-zA-Z0-9_-]", "-", surogate_project_namespace)[:50]
+    if not sanitised:
+        sanitised = "default"
+
+    async with get_session_ctx() as session:
+        existing = await get_project_model_by_name(session=session, project_name=sanitised)
+        if existing is not None:
+            return existing
+
+        admin = get_dstack_admin()
+        try:
+            await create_project(
+                session=session,
+                user=admin,
+                project_name=sanitised,
+            )
+        except Exception as ex:
+            # Race condition or already exists — retrieve it
+            logger.warning("Failed to create dstack project: %s", ex, exc_info=True)
+
+        project_model = await get_project_model_by_name_or_error(
+            session=session, project_name=sanitised,
+        )
+
+    # Register K8s backend on the new project
+    await ensure_kubernetes_backend(project_model)
+    return project_model

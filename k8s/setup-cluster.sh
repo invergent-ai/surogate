@@ -81,6 +81,7 @@ setup_helm_repositories() {
     "$HELM" repo add prometheus-community https://prometheus-community.github.io/helm-charts
     "$HELM" repo add nvidia https://helm.ngc.nvidia.com/nvidia
     "$HELM" repo add dcgm-exporter https://nvidia.github.io/dcgm-exporter/helm-charts
+    "$HELM" repo add bitnami https://charts.bitnami.com/bitnami
     "$HELM" repo update
 }
 
@@ -98,7 +99,7 @@ create_cluster() {
 install_traefik() {
     "$MKCERT" -key-file "${SUROGATE_DIR}/ssl.key.pem" -cert-file "${SUROGATE_DIR}/ssl.cert.pem" "*.k8.localhost"
     "$KUBECTL" create secret generic traefik-tls-secret --from-file=tls.crt="${SUROGATE_DIR}/ssl.cert.pem" --from-file=tls.key="${SUROGATE_DIR}/ssl.key.pem" -n kube-system
-    "$HELM" install traefik traefik/traefik --version 35.4.0 -n kube-system -f "$SCRIPT_DIR/traefik/values.yml"
+    "$HELM" install traefik traefik/traefik --version 35.4.0 -n kube-system -f "$SCRIPT_DIR/traefik/values.yml" > /dev/null
     "$KUBECTL" apply -f "${SCRIPT_DIR}/traefik/middleware.yml"
 }
 
@@ -158,28 +159,39 @@ install_lakefs() {
 
     local rendered_values
     rendered_values=$(envsubst < "${SCRIPT_DIR}/lakefs/values.yml")
-    "$HELM" install lakefs lakefs/lakefs -n lakefs -f - <<< "$rendered_values"
+    "$HELM" install lakefs lakefs/lakefs -n lakefs -f - <<< "$rendered_values" > /dev/null
     "$KUBECTL" apply -f "${SCRIPT_DIR}/lakefs/s3-service.yml"
 }
 
 install_gpu() {
     "$KUBECTL" create namespace nvidia-gpu-operator
     "$KUBECTL" apply -f "${SCRIPT_DIR}/gpu/configmap.yml"
-    "$HELM" install nvidia-gpu-operator nvidia/gpu-operator --version=v26.3.0 --wait -n nvidia-gpu-operator -f "${SCRIPT_DIR}/gpu/values.yml"
+    "$HELM" install nvidia-gpu-operator nvidia/gpu-operator --version=v26.3.0 --wait -n nvidia-gpu-operator -f "${SCRIPT_DIR}/gpu/values.yml" > /dev/null
 }
 
 install_metrics() {
     "$KUBECTL" create namespace monitoring
-    "$HELM" install kube-prometheus-stack prometheus-community/kube-prometheus-stack -f "${SCRIPT_DIR}/metrics/values.yml" -n monitoring
+    "$HELM" install kube-prometheus-stack prometheus-community/kube-prometheus-stack -f "${SCRIPT_DIR}/metrics/values.yml" -n monitoring > /dev/null
     "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/ingress.yml"
     "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/gpu_scraper.yml"
+}
+
+install_role() {
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/role/cluster-role.yml"
+}
+
+install_db() {
+    "$HELM" install surogate-db bitnami/postgresql --wait -f "${SCRIPT_DIR}/db/values.yml" > /dev/null
+    # if needed, you can retrieve the generated password for the 'postgres' user with:
+    # export POSTGRES_PASSWORD=$("$KUBECTL" get secret --namespace surogate-db surogate-db-postgresql -o jsonpath="{.data.password}" | base64 -d)
 }
 
 create_server_config() {
     cat >"${SUROGATE_DIR}/config.yaml" <<EOF
 host: 127.0.0.1
 port: 8888
-database_url: sqlite+aiosqlite:///${SUROGATE_DIR}/surogate.db
+database_url: postgresql+asyncpg://surogate:surogate@127.0.0.1:32432/surogate
+dstack_database_url: postgresql+asyncpg://dstack:dstack@127.0.0.1:32432/dstack
 lakefs_endpoint: https://lakefs.k8s.localhost
 lakefs_s3_endpoint: https://lakefs-s3.k8s.localhost
 lakefs_access_key: $LAKEFS_ACCESS_KEY_ID
@@ -190,7 +202,7 @@ EOF
 # Check if any k3d clusters exist
 existing=$("$K3D" cluster list -o json | jq -r '.[].name')
 if [ -n "$existing" ]; then
-    echo -e "${RED}✖ ERROR: Existing k3d clusters found, please delete all clusters and try again.${NC}"
+    echo -e "${RED}✖ ERROR: Existing k3d cl6usters found, please delete all clusters and try again.${NC}"
     exit 1
 fi
 
@@ -206,9 +218,11 @@ echo -e "${CYAN}  Run: export KUBECONFIG=$SUROGATE_DIR/kubeconfig${NC}"
 export KUBECONFIG="$SUROGATE_DIR/kubeconfig"
 
 install_traefik
+install_db
 install_gpu
 install_lakefs
 install_metrics
+install_role
 create_server_config
 
 echo -e "${GREEN}✓ Cluster setup complete!${NC}"

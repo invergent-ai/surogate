@@ -136,7 +136,7 @@ export function PlaygroundPage() {
   }, [fetchModels]);
 
   const servingModels = useMemo(
-    () => allModels.filter((m) => m.status === "ready"),
+    () => allModels.filter((m) => m.status === "running"),
     [allModels],
   );
 

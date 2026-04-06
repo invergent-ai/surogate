@@ -10,6 +10,7 @@ import {
   SelectContent,
   SelectItem,
 } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
 import { useAppStore } from "@/stores/app-store";
 import { cn } from "@/utils/cn";
 import type { Model } from "./models-data";
@@ -89,6 +90,7 @@ export function ConfigTab({ model }: { model: Model }) {
   );
   const [gpuCount, setGpuCount] = useState(String(model.gpu.count || 1));
   const [engine, setEngine] = useState(model.engine !== "\u2014" ? model.engine : "");
+  const [useSpot, setUseSpot] = useState(model.useSpot ?? false);
   const [saving, setSaving] = useState(false);
 
   const handleSave = async () => {
@@ -103,6 +105,7 @@ export function ConfigTab({ model }: { model: Model }) {
       engine: engine || undefined,
       accelerators: acc || undefined,
       infra: computeIdx === 1 ? (cloud || undefined) : "k8s",
+      use_spot: useSpot,
     });
     setSaving(false);
   };
@@ -213,6 +216,20 @@ export function ConfigTab({ model }: { model: Model }) {
               </Select>
             </div>
           </div>
+
+          {/* Spot instances */}
+          <label className="flex items-center gap-2 cursor-pointer">
+            <Checkbox
+              checked={useSpot}
+              onCheckedChange={(v) => setUseSpot(v === true)}
+            />
+            <span className="text-[11px] text-foreground font-display">
+              Use spot instances
+            </span>
+            <span className="text-[9px] text-muted-foreground/50">
+              (cheaper but may be preempted)
+            </span>
+          </label>
         </div>
       </section>
 

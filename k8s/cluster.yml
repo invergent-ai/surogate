@@ -30,6 +30,12 @@ ports:
   - port: 0.0.0.0:${HTTPS_PORT}:443 # https port host:container
     nodeFilters:
       - loadbalancer
+  - port: 0.0.0.0:32000:32000 # dstack ssh jump pod
+    nodeFilters:
+      - agent:*
+  - port: 0.0.0.0:32432:32432 # postgresql
+    nodeFilters:
+      - agent:*
 
 hostAliases:
   - ip: 127.0.0.1

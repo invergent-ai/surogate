@@ -55,7 +55,8 @@ class SkillResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
 
 
 class SkillListResponse(BaseModel):

@@ -48,6 +48,18 @@ async def login(
     await project_repository.seed_default_project(session, payload.username)
     await seed_lakefs_user(payload.username, session, request.app.state.config)
 
+    # Ensure dstack projects + K8s backends exist for all user projects
+    from surogate.core.compute import ensure_dstack_project
+    projects = await project_repository.get_user_projects(session, payload.username)
+    for proj in projects:
+        if not proj.dstack_project_name:
+            try:
+                dstack_proj = await ensure_dstack_project(proj.namespace)
+                proj.dstack_project_name = dstack_proj.name
+                await session.commit()
+            except Exception:
+                pass
+
     access_token = await create_access_token(payload.username, session)
     refresh_token = await create_refresh_token(payload.username, session)
 

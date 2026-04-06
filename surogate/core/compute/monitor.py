@@ -1,20 +1,17 @@
-"""Background monitor for SkyPilot serving services and managed jobs.
+"""Background monitor for dstack runs and local tasks.
 
-Runs a single asyncio task that bulk-fetches status from SkyPilot every
-``poll_interval`` seconds, diffs against the DB, batch-updates changed rows,
-and fires registered callbacks on status transitions.
+Runs a single asyncio task that bulk-fetches run statuses from dstack
+every ``poll_interval`` seconds, diffs against the surogate DB,
+batch-updates changed rows, and fires registered callbacks on status
+transitions.
 """
 
 import asyncio
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
-from surogate.core.compute.sky import (
-    _get_managed_job_statuses,
-    _get_serve_statuses,
-    _map_status,
-)
+from surogate.core.compute.dstack import get_active_run_statuses, map_status
 from surogate.core.db.engine import get_session_factory
 from surogate.core.db.repository import compute as repo
 from surogate.utils.logger import get_logger
@@ -30,7 +27,7 @@ TransitionCallback = Callable[[str, str, str, str, str, dict[str, Any]], Awaitab
 
 
 class ServingMonitor:
-    """Periodically polls SkyPilot for status changes and updates the DB.
+    """Periodically polls dstack for status changes and updates the DB.
 
     Also wraps ``LocalTaskManager._watch`` so that local-task completions
     flow through the same transition callback system.
@@ -44,11 +41,6 @@ class ServingMonitor:
         await monitor.stop()    # cancels on shutdown
     """
 
-    # Number of consecutive ticks an active DB entity can be absent from
-    # SkyPilot's status output before we mark it as failed.  With a 5 s
-    # poll interval this gives ~30 s of grace for transient glitches.
-    _MISSING_THRESHOLD = 6
-
     def __init__(
         self,
         poll_interval: float = 5.0,
@@ -58,9 +50,6 @@ class ServingMonitor:
         self._task: Optional[asyncio.Task] = None
         self._callbacks: list[TransitionCallback] = []
         self._task_manager = task_manager
-        # Track consecutive "missing from SkyPilot" ticks per entity id
-        self._missing_services: dict[str, int] = {}
-        self._missing_jobs: dict[str, int] = {}
 
         # Wire ourselves as the watch-creator so every spawned local task
         # fires transition callbacks when it completes.
@@ -70,13 +59,7 @@ class ServingMonitor:
     # ── Public API ──────────────────────────────────────────────────
 
     def on_transition(self, cb: TransitionCallback) -> None:
-        """Register a callback invoked on every status transition.
-
-        The callback receives
-        ``(entity_type, entity_id, name, old_status, new_status, data)``.
-        ``entity_type`` is ``"model"``, ``"job"``, or ``"task"``.
-        ``data`` is the full entity dict (same shape as the REST response).
-        """
+        """Register a callback invoked on every status transition."""
         self._callbacks.append(cb)
 
     async def start(self) -> None:
@@ -111,76 +94,61 @@ class ServingMonitor:
     async def _tick(self) -> None:
         factory = get_session_factory()
 
-        # 1. Bulk-fetch from SkyPilot (2 calls total, regardless of count)
-        sky_serve, sky_jobs = await asyncio.gather(
-            _get_serve_statuses(),
-            _get_managed_job_statuses(),
-            return_exceptions=True,
-        )
-        if isinstance(sky_serve, Exception):
-            logger.debug("Could not fetch SkyPilot serve statuses: %s", sky_serve)
-            sky_serve = {}
-        if isinstance(sky_jobs, Exception):
-            logger.debug("Could not fetch SkyPilot job statuses: %s", sky_jobs)
-            sky_jobs = {}
-
-        # 2. Load only active (non-terminal) records from DB
         async with factory() as session:
             active_services = await repo.list_active_serving_services(session)
             active_jobs = await repo.list_active_managed_jobs(session)
 
-            # 3. Diff and update serving services
-            await self._sync_serving_services(session, active_services, sky_serve)
+            # Collect unique dstack project names
+            project_names: set[str] = set()
+            for svc in active_services:
+                if svc.dstack_project_name:
+                    project_names.add(svc.dstack_project_name)
+            for job in active_jobs:
+                if job.dstack_project_name:
+                    project_names.add(job.dstack_project_name)
 
-            # 4. Diff and update managed jobs
-            await self._sync_managed_jobs(session, active_jobs, sky_jobs)
+            # Bulk-fetch statuses from dstack (one query per project)
+            all_statuses: dict[str, str] = {}
+            for pname in project_names:
+                try:
+                    statuses = await get_active_run_statuses(pname)
+                    all_statuses.update(statuses)
+                except Exception:
+                    logger.debug("Could not fetch dstack statuses for %s", pname, exc_info=True)
+
+            await self._sync_serving_services(session, active_services, all_statuses)
+            await self._sync_managed_jobs(session, active_jobs, all_statuses)
 
     async def _sync_serving_services(
-        self, session, db_services, sky_statuses: dict,
+        self, session, db_services, dstack_statuses: dict[str, str],
     ) -> None:
         from surogate.core.compute.models import build_model_response
 
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
 
         for svc in db_services:
-            if svc.name not in sky_statuses:
-                # Track consecutive misses; mark failed after threshold
-                count = self._missing_services.get(svc.id, 0) + 1
-                self._missing_services[svc.id] = count
-                if count >= self._MISSING_THRESHOLD:
-                    logger.warning(
-                        "ServingService %s (%s) absent from SkyPilot for "
-                        "%d ticks – marking as failed",
-                        svc.name, svc.id, count,
-                    )
-                    self._missing_services.pop(svc.id, None)
-                    info = {"status": "failed"}
-                    # Fall through to the normal update path below
-                else:
-                    continue
-            else:
-                # Present in SkyPilot – reset miss counter
-                self._missing_services.pop(svc.id, None)
-                info = sky_statuses[svc.name]
+            if not svc.dstack_run_name:
+                continue
 
-            new_status = info.get("status", "")
+            if svc.dstack_run_name in dstack_statuses:
+                new_status = dstack_statuses[svc.dstack_run_name]
+            else:
+                # Not in active runs — it's terminal
+                new_status = "stopped"
+
             if new_status == svc.status:
                 continue
 
             old_status = svc.status
 
-            # Build update dict
             updates: dict = {"status": new_status}
-            if new_status == "ready" and svc.started_at is None:
+            if new_status == "running" and svc.started_at is None:
                 updates["started_at"] = now
-            if new_status in ("failed", "failed_cleanup", "controller_failed"):
+
+            if new_status in ("failed", "stopped", "cancelled", "completed"):
                 updates["terminated_at"] = now
 
-            # Endpoint is managed by our proxy (set at launch time).
-            # Don't overwrite with SkyPilot's stale localhost:<lb_port>.
-
             await repo.update_serving_service(session, svc.id, **updates)
-            # Apply updates in-memory so the response builder sees fresh data
             for k, v in updates.items():
                 setattr(svc, k, v)
 
@@ -189,38 +157,25 @@ class ServingMonitor:
                 svc.name, svc.id, old_status, new_status,
             )
 
-            # Build full DeployedModelResponse for the linked model
             model = await repo.get_deployed_model_by_service(session, svc.id)
             if model is not None:
                 resp = build_model_response(model, svc)
-                data = resp.model_dump(mode="json")
+                data = resp.dict()
                 await self._fire_callbacks("model", model.id, model.name, old_status, new_status, data)
 
     async def _sync_managed_jobs(
-        self, session, db_jobs, sky_statuses: dict[int, str],
+        self, session, db_jobs, dstack_statuses: dict[str, str],
     ) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
 
         for job in db_jobs:
-            if job.skypilot_job_id is None:
+            if not job.dstack_run_name:
                 continue
 
-            if job.skypilot_job_id not in sky_statuses:
-                count = self._missing_jobs.get(job.id, 0) + 1
-                self._missing_jobs[job.id] = count
-                if count >= self._MISSING_THRESHOLD:
-                    logger.warning(
-                        "ManagedJob %s (%s) absent from SkyPilot for "
-                        "%d ticks – marking as failed",
-                        job.name, job.id, count,
-                    )
-                    self._missing_jobs.pop(job.id, None)
-                    new_status = "failed"
-                else:
-                    continue
+            if job.dstack_run_name in dstack_statuses:
+                new_status = dstack_statuses[job.dstack_run_name]
             else:
-                self._missing_jobs.pop(job.id, None)
-                new_status = _map_status(sky_statuses[job.skypilot_job_id])
+                new_status = "failed"
 
             if new_status == job.status:
                 continue
@@ -261,7 +216,6 @@ class ServingMonitor:
 
         new_status = "completed" if proc.returncode == 0 else "failed"
 
-        # Load fresh record from DB so the response matches the REST shape
         factory = get_session_factory()
         async with factory() as session:
             data = await _load_task_dict(session, task_id)
@@ -306,7 +260,7 @@ def _job_to_dict(job, status: str, started_at=None) -> dict[str, Any]:
         "cloud": job.cloud,
         "region": job.region,
         "use_spot": job.use_spot,
-        "skypilot_job_id": job.skypilot_job_id,
+        "dstack_run_name": job.dstack_run_name,
     }
 
 

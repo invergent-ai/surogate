@@ -129,17 +129,20 @@ class CloudAccount(UUIDMixin, Base):
 
 
 class ManagedJob(UUIDMixin, Base):
-    """Platform metadata for a SkyPilot managed job.
+    """Platform metadata for a dstack task run.
 
-    SkyPilot's own SQLite DB tracks job/cluster state.  This model stores
+    dstack's own DB tracks run/job state.  This model stores
     Surogate-specific context: which project owns the job, who requested it,
-    what type of workload it is, and the original task YAML for audit/replay.
+    what type of workload it is, and a pointer to the dstack run.
     """
 
     __tablename__ = "managed_jobs"
 
-    skypilot_job_id: Mapped[Optional[int]] = mapped_column(
-        sa.Integer, index=True, nullable=True
+    dstack_run_name: Mapped[Optional[str]] = mapped_column(
+        sa.String(100), index=True, nullable=True
+    )
+    dstack_project_name: Mapped[Optional[str]] = mapped_column(
+        sa.String(50), nullable=True
     )
     name: Mapped[str] = mapped_column(sa.String(255))
     project_id: Mapped[str] = mapped_column(
@@ -217,11 +220,11 @@ class LocalTask(UUIDMixin, Base):
 
 
 class ServingService(UUIDMixin, Base):
-    """Platform metadata for a SkyPilot serving service.
+    """Platform metadata for a dstack service run.
 
-    SkyPilot Serve manages the controller, load balancer, and replicas.
-    This model stores Surogate-specific context: project ownership,
-    who launched it, original task YAML, and replica/autoscaling config.
+    dstack manages the service lifecycle.  This model stores
+    Surogate-specific context: project ownership, who launched it,
+    and a pointer to the dstack run.
     """
 
     __tablename__ = "serving_services"
@@ -233,11 +236,14 @@ class ServingService(UUIDMixin, Base):
     requested_by_id: Mapped[str] = mapped_column(
         sa.ForeignKey("users.id"), index=True
     )
-    task_yaml: Mapped[str] = mapped_column(sa.Text)
-    status: Mapped[str] = mapped_column(sa.String(32), default="controller_init")
-    controller_port: Mapped[Optional[int]] = mapped_column(
-        sa.Integer, nullable=True
+    dstack_run_name: Mapped[Optional[str]] = mapped_column(
+        sa.String(100), index=True, nullable=True
     )
+    dstack_project_name: Mapped[Optional[str]] = mapped_column(
+        sa.String(50), nullable=True
+    )
+    task_yaml: Mapped[str] = mapped_column(sa.Text)
+    status: Mapped[str] = mapped_column(sa.String(32), default="submitted")
     endpoint: Mapped[Optional[str]] = mapped_column(
         sa.String(512), nullable=True
     )
@@ -256,7 +262,7 @@ class ServingService(UUIDMixin, Base):
         sa.String(64), nullable=True
     )
     update_mode: Mapped[Optional[str]] = mapped_column(
-        sa.String(32), nullable=True
+        sa.String(64), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime, server_default=sa.func.now()
@@ -280,7 +286,7 @@ class DeployedModel(UUIDMixin, Base):
     """A model deployment linked to a ServingService.
 
     Captures model-specific metadata (identity, config, generation defaults)
-    while the linked ServingService handles infrastructure (SkyPilot, replicas,
+    while the linked ServingService handles infrastructure (dstack, replicas,
     cloud placement).  Status is derived from the ServingService state.
     """
 

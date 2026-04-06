@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from surogate.core.compute import models as models_service
 from surogate.core.db.engine import get_session
-from surogate.server.auth.authentication import get_current_subject
+from surogate.server.auth.authentication import get_current_subject, get_current_user_id
 from surogate.server.models.models import (
     DeployedModelCreateRequest,
     DeployedModelListResponse,
@@ -56,7 +56,7 @@ async def get_model(
 async def create_model(
     req: DeployedModelCreateRequest,
     request: Request,
-    current_subject: str = Depends(get_current_subject),
+    current_user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new model record, resolving metadata from config files."""
@@ -66,7 +66,7 @@ async def create_model(
         display_name=req.display_name,
         base_model=req.base_model,
         project_id=req.project_id,
-        requested_by_id=current_subject,
+        requested_by_id=current_user_id,
         family=req.family,
         param_count=req.param_count,
         model_type=req.model_type,
@@ -133,7 +133,7 @@ async def start_model(
     current_subject: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
 ):
-    """Start serving a stopped model via SkyPilot."""
+    """Start serving a stopped model via dstack."""
     try:
         resp = await models_service.start_model(
             session, model_id, server_config=request.app.state.config
@@ -179,15 +179,12 @@ async def get_model_logs(
     model_id: str,
     current_subject: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
-    target: str = Query("controller"),
-    replica_id: Optional[int] = Query(None),
     tail: int = Query(200, le=1000),
 ):
     """Get the last N lines of logs for a model's serving service."""
     try:
         return await models_service.get_model_logs(
-            session, model_id,
-            target=target, replica_id=replica_id, tail=tail,
+            session, model_id, tail=tail,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
