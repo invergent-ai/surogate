@@ -7,10 +7,12 @@ import { StatusDot } from "@/components/ui/status-dot";
 import { cn } from "@/utils/cn";
 import { useAppStore } from "@/stores/app-store";
 import { toStatus } from "@/features/models/models-data";
+import { useNavigate } from "@tanstack/react-router";
 
 export function ServingModelsCard() {
   const models = useAppStore((s) => s.models);
   const fetchModels = useAppStore((s) => s.fetchModels);
+  const navigate = useNavigate();
 
   useEffect(() => {
     void fetchModels();
@@ -29,7 +31,8 @@ export function ServingModelsCard() {
       {models.map((m) => (
         <div
           key={m.id}
-          className="px-4 py-2.5 border-b border-input flex items-center gap-2.5"
+          className="px-4 py-2.5 border-b border-input flex items-center gap-2.5 cursor-pointer hover:bg-muted/30 transition-colors"
+          onClick={() => navigate({ to: "/studio/models", search: { modelId: m.id } })}
         >
           <StatusDot status={toStatus(m.status)} />
           <div className="flex-1 min-w-0">

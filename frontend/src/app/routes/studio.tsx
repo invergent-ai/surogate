@@ -221,6 +221,9 @@ export const modelsRoute = createRoute({
   getParentRoute: () => Route,
   path: "/models",
   component: ModelsPage,
+  validateSearch: (search: Record<string, unknown>) => ({
+    modelId: (search.modelId as string) || "",
+  }),
 });
 
 export const skillsRoute = createRoute({

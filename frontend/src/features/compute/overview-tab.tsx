@@ -20,8 +20,9 @@ export function OverviewTab() {
   const totalLocalGpu = k8sNodes.reduce((s, n) => s + n.accelerator_count, 0);
   const usedLocalGpu = totalLocalGpu - k8sNodes.reduce((s, n) => s + n.accelerator_available, 0);
   const readyNodes = k8sNodes.filter((n) => n.is_ready).length;
-  const activeInstances = cloudInstances.filter(c => c.status === "idle" || c.status === "busy");
-  const cloudHourlyCost = cloudInstances.reduce((s, c) => s + c.cost_per_hour, 0);
+  const cloudOnly = cloudInstances.filter(c => c.provider !== "kubernetes");
+  const activeInstances = cloudOnly.filter(c => c.status === "idle" || c.status === "busy");
+  const cloudHourlyCost = cloudOnly.reduce((s, c) => s + c.cost_per_hour, 0);
   const monthlySpend = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlySpend, 0);
   const monthlyBudget = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlyBudget, 0);
 
@@ -30,7 +31,7 @@ export function OverviewTab() {
 
   const kpis = [
     { label: "Local GPUs", value: `${usedLocalGpu}/${totalLocalGpu}`, sub: `${readyNodes} nodes` },
-    { label: "Cloud Instances", value: activeInstances.length, sub: `${cloudInstances.length} total` },
+    { label: "Cloud Instances", value: activeInstances.length, sub: `${cloudOnly.length} total` },
     { label: "Queue Depth", value: queued, sub: `${running} running` },
     { label: "Cloud $/hr", value: `$${cloudHourlyCost.toFixed(0)}`, sub: "active instances" },
     { label: "Monthly Spend", value: `$${(monthlySpend / 1000).toFixed(1)}K`, sub: `of $${(monthlyBudget / 1000).toFixed(0)}K budget` },
@@ -121,12 +122,12 @@ export function OverviewTab() {
           <Card size="sm">
             <div className="flex items-center gap-2 px-4 py-2.5 border-b border-line">
               <span className="text-sm font-semibold text-foreground font-display">Cloud Instances</span>
-              <span className="text-[11px] px-1.5 py-px rounded bg-muted text-faint">{cloudInstances.length}</span>
+              <span className="text-[11px] px-1.5 py-px rounded bg-muted text-faint">{cloudOnly.length}</span>
             </div>
-            {cloudInstances.length === 0 && (
+            {cloudOnly.length === 0 && (
               <div className="px-4 py-4 text-center text-[11px] text-faint">No active cloud instances</div>
             )}
-            {cloudInstances.map(inst => {
+            {cloudOnly.map(inst => {
               const isRunning = inst.status === "idle" || inst.status === "busy";
               return (
                 <div key={inst.id} className="px-4 py-2.5 border-b border-line last:border-0">

@@ -25,7 +25,8 @@ export function CloudTab() {
 
   useEffect(() => { fetchBackends(); fetchCloudInstances(); }, [activeProjectId, fetchBackends, fetchCloudInstances]);
 
-  const cloudHourlyCost = cloudInstances.reduce((s, c) => s + c.cost_per_hour, 0);
+  const cloudOnly = cloudInstances.filter(i => i.provider !== "kubernetes");
+  const cloudHourlyCost = cloudOnly.reduce((s, c) => s + c.cost_per_hour, 0);
 
   // Exclude kubernetes — that's the local cluster, not a cloud backend
   const cloudBackends = backends.filter(b => b.type !== "kubernetes");
@@ -99,10 +100,10 @@ export function CloudTab() {
           <span className="text-sm font-semibold text-foreground font-display">Active Cloud Instances</span>
           <span className="text-sm" style={{ color: "#F59E0B" }}>Total: ${cloudHourlyCost.toFixed(2)}/hr</span>
         </div>
-        {cloudInstances.length === 0 && (
+        {cloudOnly.length === 0 && (
           <div className="px-4 py-6 text-center text-sm text-faint">No active cloud instances</div>
         )}
-        {cloudInstances.map(inst => {
+        {cloudOnly.map(inst => {
           const isRunning = inst.status === "idle" || inst.status === "busy";
           return (
             <div key={inst.id} className="px-4 py-3.5 border-b border-line last:border-0 flex items-start justify-between">

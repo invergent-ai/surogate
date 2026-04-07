@@ -13,6 +13,7 @@ import { useAppStore } from "@/stores/app-store";
 import type { Model } from "./models-data";
 import { ServeModelDialog } from "./serve-model-dialog";
 import { isProxyModel } from "@/utils/model";
+import { useSearch } from "@tanstack/react-router";
 
 // ── Status filter buttons ──────────────────────────────────────
 
@@ -116,6 +117,7 @@ function ModelListItem({
 }
 
 export function ModelsPage() {
+  const { modelId: urlModelId } = useSearch({ strict: false }) as { modelId?: string };
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterSearch, setFilterSearch] = useState("");
@@ -130,6 +132,16 @@ export function ModelsPage() {
   useEffect(() => {
     void fetchModels();
   }, [fetchModels]);
+
+  useEffect(() => {
+    if (urlModelId && models.length > 0 && !selectedId) {
+      const match = models.find(m => m.id === urlModelId);
+      if (match) {
+        setSelectedId(match.id);
+        fetchModel(match.id);
+      }
+    }
+  }, [urlModelId, models, selectedId, fetchModel]);
 
   const handleSelect = (id: string) => {
     setSelectedId(id);
