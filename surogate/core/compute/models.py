@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from surogate.core.compute import dstack as dstack_service
 from surogate.core.config.server_config import ServerConfig
-from surogate.core.db.models.compute import DeployedModel, ServingService
+from surogate.core.db.models.compute import DeployedModel, ModelSource, ServingService
 from surogate.core.db.repository import compute as repo
 from surogate.core.hub import lakefs
 from surogate.core.hub.model_info import resolve_from_huggingface, resolve_from_lakefs
@@ -136,6 +136,8 @@ def build_model_response(
         endpoint=svc.endpoint or "\u2014" if svc else "\u2014",
         image=model.image or "\u2014",
         hub_ref=model.hub_ref or "",
+        infra=svc.infra if svc else None,
+        source=model.source if isinstance(model.source, str) else (model.source.value if model.source else None),
         use_spot=svc.use_spot if svc else False,
         connected_agents=[],
         serving_config=model.serving_config,
@@ -179,6 +181,7 @@ async def create_model(
     image: Optional[str] = None,
     hub_ref: Optional[str] = None,
     namespace: Optional[str] = None,
+    source: Optional[str] = None,
     serving_config: Optional[dict] = None,
     generation_defaults: Optional[dict] = None,
     server_config: Optional[ServerConfig] = None,
@@ -218,23 +221,19 @@ async def create_model(
     if not generation_defaults and resolved.get("generation_defaults"):
         generation_defaults = resolved["generation_defaults"]
 
-    # Build service name: <project_namespace>-<model_slug>, deduplicated
-    import sqlalchemy as sa
-    from surogate.core.db.models.platform import Project
-    proj = (await session.execute(
-        sa.select(Project.namespace).where(Project.id == project_id)
-    )).scalar_one_or_none()
-    svc_base = f"{proj}-{name}" if proj else name
+    # Build service name: <model_slug>-<4-char random suffix>
+    import secrets
+    svc_base = f"{name}-{secrets.token_hex(2)}"
     svc_name = await _unique_service_name(session, svc_base)
 
-    # Create the ServingService first (defaults to k8s, stopped)
+    # Create the ServingService (unconfigured — user must set infra,
+    # accelerators, and engine via the Config tab before starting).
     svc = await repo.create_serving_service(
         session,
         name=svc_name,
         project_id=project_id,
         requested_by_id=requested_by_id,
         task_yaml="",
-        infra="k8s",
         status="stopped",
     )
 
@@ -254,6 +253,7 @@ async def create_model(
         image=image,
         hub_ref=hub_ref,
         namespace=namespace,
+        source=source,
         serving_config=serving_config,
         generation_defaults=generation_defaults,
         serving_service_id=svc.id,
@@ -405,30 +405,34 @@ def _build_service_params(
     lakefs_secret_key: Optional[str] = None,
 ) -> dict:
     """Build parameters dict for dstack_service.launch_service()."""
-
-    hub = _parse_hub_ref(model.hub_ref) if model.hub_ref else None
+    
+    if model.source not in [ModelSource.huggingface, ModelSource.local_hub]:
+        raise ValueError(f"Unsupported model source: {model.source}")
 
     # ── Run command ─────────────────────────────────────────────────
-    if hub:
+    if model.source == ModelSource.local_hub:
+        hub_parts = _parse_hub_ref(model.hub_ref)
         run_cmd = (
             "echo \"Downloading model from ${RCLONE_CONFIG_LAKEFS_ENDPOINT}...\" && "
-            f"rclone copy --no-check-certificate lakefs:{hub['repo']}/{hub['branch']}/ {_MODEL_DIR} && "
+            f"rclone copy --no-check-certificate lakefs:{hub_parts['repo']}/{hub_parts['branch']}/ {_MODEL_DIR} && "
             f"GGUF=$(find {_MODEL_DIR} -maxdepth 1 -name '*.gguf' | head -1) && "
             f"MODEL_PATH=${{GGUF:-{_MODEL_DIR}}} && "
             "cd /app && ./llama-server --metrics --host 0.0.0.0 --port 8080"
             " -m $MODEL_PATH"
         )
     else:
+        # the base model has the following format: user/repo:gguf_file
+        gguf_file = model.base_model.split(":")[-1]
+        repo = model.base_model.split(":")[0]
         run_cmd = (
-            "cd /app && ./llama-server --metrics --host 0.0.0.0 --port 8080"
-            f" -m {model.base_model}"
+            f"cd /app && ./llama-server --metrics --host 0.0.0.0 --port 8080 -hf {repo} -hff {gguf_file}"
         )
 
     if model.context_window and model.context_window > 0:
         run_cmd += f" -c {model.context_window}"
 
     env: dict[str, str] = {}
-    if hub and lakefs_access_key and lakefs_secret_key:
+    if model.source == ModelSource.local_hub and lakefs_access_key and lakefs_secret_key:
         env = {
             "RCLONE_CONFIG_LAKEFS_TYPE": "s3",
             "RCLONE_CONFIG_LAKEFS_PROVIDER": "Other",
@@ -447,14 +451,12 @@ def _build_service_params(
         "readiness_probe": svc.readiness_path or "/health",
     }
 
-
 def _parse_hub_ref(hub_ref: str) -> Optional[dict]:
     """Parse ``repo@branch`` into ``{'repo': ..., 'branch': ...}``."""
     parts = hub_ref.split("@", 1)
     if len(parts) != 2:
         return None
     return {"repo": parts[0], "branch": parts[1]}
-
 
 async def start_model(
     session: AsyncSession,
@@ -473,6 +475,20 @@ async def start_model(
     svc = await repo.get_serving_service(session, m.serving_service_id)
     if svc is None:
         raise ValueError(f"No serving service configured for model {model_id}")
+
+    # Validate deployment configuration is complete
+    missing: list[str] = []
+    if not m.engine:
+        missing.append("engine")
+    if not svc.accelerators:
+        missing.append("accelerators (GPU)")
+    if not svc.infra:
+        missing.append("infra (compute target)")
+    if missing:
+        raise ValueError(
+            f"Deployment configuration incomplete — set {', '.join(missing)} "
+            f"in the Config tab before starting"
+        )
 
     # Fetch per-user LakeFS credentials for hub models
     lakefs_kw: dict = {}

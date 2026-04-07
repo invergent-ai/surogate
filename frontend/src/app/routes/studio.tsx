@@ -97,6 +97,12 @@ const ConnectCloudPage = lazy(() =>
   })),
 );
 
+const BackendOffersPage = lazy(() =>
+  import("@/features/compute/backend-offers-page").then((m) => ({
+    default: m.BackendOffersPage,
+  })),
+);
+
 const MonitoringPage = lazy(() =>
   import("@/features/monitoring/monitoring-page").then((m) => ({
     default: m.MonitoringPage,
@@ -269,6 +275,10 @@ export const computeWorkloadQueueRoute = createRoute({
   getParentRoute: () => computeRoute,
   path: "/workload-queue",
   component: WorkloadQueueTab,
+  validateSearch: (search: Record<string, unknown>) => ({
+    filter: (search.filter as string) || "",
+    id: (search.id as string) || "",
+  }),
 });
 
 export const computeCostsRoute = createRoute({
@@ -289,6 +299,15 @@ export const connectCloudRoute = createRoute({
   component: ConnectCloudPage,
   validateSearch: (search: Record<string, unknown>) => ({
     provider: (search.provider as string) || "",
+  }),
+});
+
+export const backendOffersRoute = createRoute({
+  getParentRoute: () => Route,
+  path: "/backend-offers",
+  component: BackendOffersPage,
+  validateSearch: (search: Record<string, unknown>) => ({
+    backend: (search.backend as string) || "",
   }),
 });
 

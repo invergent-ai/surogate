@@ -12,6 +12,7 @@ import { ModelDetail, ModelEmptyState } from "./model-detail";
 import { useAppStore } from "@/stores/app-store";
 import type { Model } from "./models-data";
 import { ServeModelDialog } from "./serve-model-dialog";
+import { isProxyModel } from "@/utils/model";
 
 // ── Status filter buttons ──────────────────────────────────────
 
@@ -33,6 +34,8 @@ function ModelListItem({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const isProxy = isProxyModel(model);
+  
   return (
     <button
       onClick={onSelect}
@@ -45,7 +48,7 @@ function ModelListItem({
     >
       <div className="flex items-start gap-2.5">
         <div
-          className="w-8.5 h-8.5 rounded-lg shrink-0 flex items-center justify-center text-[15px] border"
+          className="w-8.5 h-8.5 rounded-lg shrink-0 flex items-center justify-center border"
           style={{
             backgroundColor: toStatus(model.status) === "serving" ? "#3B82F612" : undefined,
             borderColor: toStatus(model.status) === "serving" ? "#3B82F625" : undefined,
@@ -56,13 +59,13 @@ function ModelListItem({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 mb-0.5">
-            <span className="text-xs font-semibold text-foreground font-display truncate">
+            <span className="font-semibold text-foreground text-sm truncate">
               {model.name}
             </span>
-            {TYPE_STYLES[model.type] && (
+            {!isProxy && TYPE_STYLES[model.type] && (
               <span
                 className={cn(
-                  "text-[8px] px-1.5 py-px rounded font-medium uppercase tracking-wide shrink-0",
+                  "text-xs px-1.5 py-px rounded font-medium uppercase tracking-wide shrink-0",
                   TYPE_STYLES[model.type].bg,
                   TYPE_STYLES[model.type].fg,
                 )}
@@ -71,26 +74,29 @@ function ModelListItem({
               </span>
             )}
           </div>
-          <div className="text-[10px] text-muted-foreground mb-1 truncate">
+          { !isProxy && (<div className="text-xs text-muted-foreground mb-1 truncate">
             {model.family} &middot; {model.paramCount}
             {model.quantization !== "\u2014" ? ` \u00B7 ${model.quantization}` : ""}
           </div>
-          <div className="flex items-center gap-2.5 text-[10px]">
+          )}
+          <div className="flex items-center gap-2.5 text-xs">
             <span className="flex items-center gap-1">
-              <StatusDot status={toStatus(model.status)} />
+              <StatusDot status={isProxy ? "serving" : toStatus(model.status)} />
               <span
                 className={cn(
-                  toStatus(model.status) === "error"
-                    ? "text-destructive"
-                    : toStatus(model.status) === "serving"
-                      ? "text-green-500"
-                      : "text-muted-foreground",
+                  isProxy
+                    ? "text-green-500"
+                    : toStatus(model.status) === "error"
+                      ? "text-destructive"
+                      : toStatus(model.status) === "serving"
+                        ? "text-green-500"
+                        : "text-muted-foreground",
                 )}
               >
-                {model.status}
+                {isProxy ? "proxy" : model.status}
               </span>
             </span>
-            {toStatus(model.status) === "serving" && (
+            {toStatus(model.status) === "serving" && !isProxy && (
               <>
                 <span className="text-muted-foreground/30">&middot;</span>
                 <span className="text-muted-foreground">
@@ -189,7 +195,6 @@ export function ModelsPage() {
               value={filterSearch}
               onChange={(e) => setFilterSearch(e.target.value)}
               placeholder="Filter models..."
-              className="h-8 text-xs"
             />
             <div className="flex gap-1">
               {STATUS_FILTERS.map((f) => {
@@ -200,7 +205,7 @@ export function ModelsPage() {
                     key={f.id}
                     onClick={() => setFilterStatus(f.id)}
                     className={cn(
-                      "px-2 py-1 rounded text-[10px] font-medium font-display border transition-colors cursor-pointer",
+                      "px-2 py-1 rounded text-xs transition-colors cursor-pointer",
                       isActive
                         ? f.id === "error"
                           ? "border-red-500/20 bg-red-500/10 text-red-500"

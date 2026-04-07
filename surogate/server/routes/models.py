@@ -76,6 +76,7 @@ async def create_model(
         image=req.image,
         hub_ref=req.hub_ref,
         namespace=req.namespace,
+        source=req.source,
         serving_config=req.serving_config,
         generation_defaults=req.generation_defaults,
         server_config=request.app.state.config,

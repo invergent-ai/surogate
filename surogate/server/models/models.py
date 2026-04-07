@@ -22,6 +22,7 @@ class DeployedModelCreateRequest(BaseModel):
     image: Optional[str] = None
     hub_ref: Optional[str] = None
     namespace: Optional[str] = None
+    source: Optional[str] = None
     serving_config: Optional[dict] = None
     generation_defaults: Optional[dict] = None
 
@@ -129,6 +130,8 @@ class DeployedModelResponse(BaseModel):
     endpoint: str
     image: str
     hub_ref: str
+    infra: Optional[str] = None
+    source: Optional[str] = None
     use_spot: bool = False
     connected_agents: list[ConnectedAgentInfo] = []
     serving_config: Optional[dict] = None

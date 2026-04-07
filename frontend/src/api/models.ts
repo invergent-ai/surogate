@@ -20,6 +20,7 @@ export interface CreateModelRequest {
   image?: string;
   hub_ref?: string;
   namespace?: string;
+  source?: string;
   serving_config?: Record<string, unknown>;
   generation_defaults?: Record<string, unknown>;
 }
@@ -90,6 +91,8 @@ export interface RawModel {
   endpoint: string;
   image: string;
   hub_ref: string;
+  infra: string | null;
+  source: string | null;
   connected_agents: { name: string; status: string; rps: number }[];
   serving_config: Record<string, unknown> | null;
   generation_defaults: Record<string, unknown> | null;
@@ -152,21 +155,10 @@ export function transformModel(r: RawModel): Model {
     endpoint: r.endpoint,
     image: r.image,
     hubRef: r.hub_ref,
+    infra: r.infra,
+    source: r.source,
     connectedAgents: r.connected_agents,
-    servingConfig: r.serving_config
-      ? {
-          maxModelLen: (r.serving_config.max_model_len as number) ?? 0,
-          tensorParallelSize: (r.serving_config.tensor_parallel_size as number) ?? 1,
-          maxBatchSize: (r.serving_config.max_batch_size as number) ?? 0,
-          gpuMemoryUtilization: (r.serving_config.gpu_memory_utilization as number) ?? 0,
-          swapSpace: (r.serving_config.swap_space as string) ?? "0",
-          quantization: (r.serving_config.quantization as string) ?? "",
-          dtype: (r.serving_config.dtype as string) ?? "",
-          enforceEager: (r.serving_config.enforce_eager as boolean) ?? false,
-          enableChunkedPrefill: (r.serving_config.enable_chunked_prefill as boolean) ?? false,
-          maxNumSeqs: (r.serving_config.max_num_seqs as number) ?? 0,
-        }
-      : null,
+    servingConfig: r.serving_config ?? null,
     generationDefaults: r.generation_defaults
       ? {
           temperature: (r.generation_defaults.temperature as number) ?? 0,

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { useState } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { StatusDot } from "@/components/ui/status-dot";
@@ -12,11 +14,12 @@ import { OverviewTab } from "./overview-tab";
 import { PerformanceTab } from "./performance-tab";
 import { ConfigTab } from "./config-tab";
 import { FinetunesTab } from "./finetunes-tab";
-import { EventsTab } from "./events-tab";
 import { useAppStore } from "@/stores/app-store";
 import type { Model } from "./models-data";
+import { isProxyModel } from "@/utils/model";
 
 export function ModelDetail({ model }: { model: Model }) {
+  const navigate = useNavigate();
   const startModel = useAppStore((s) => s.startModel);
   const stopModel = useAppStore((s) => s.stopModel);
   const restartModel = useAppStore((s) => s.restartModel);
@@ -24,8 +27,14 @@ export function ModelDetail({ model }: { model: Model }) {
   const pending = useAppStore((s) => s.modelPending[model.id] ?? null);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  const isProxy = isProxyModel(model);
+
+  const configComplete = isProxy || (
+    model.engine !== "\u2014" &&
+    (model.engine === "llamacpp" || model.infra === "k8s" || (model.gpu.type !== "\u2014" && model.gpu.count > 0)));
+
   const handleStart = () => {
-    if (confirm(`Deploy ${model.displayName} via SkyPilot?`)) {
+    if (confirm(`Deploy ${model.displayName}?`)) {
       startModel(model.id);
     }
   };
@@ -63,10 +72,10 @@ export function ModelDetail({ model }: { model: Model }) {
                 <h2 className="text-base font-bold text-foreground font-display tracking-tight">
                   {model.displayName}
                 </h2>
-                {TYPE_STYLES[model.type] && (
+                {!isProxy && TYPE_STYLES[model.type] && (
                   <span
                     className={cn(
-                      "text-[8px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wide",
+                      "text-sm px-1.5 py-0.5 rounded font-semibold uppercase tracking-wide",
                       TYPE_STYLES[model.type].bg,
                       TYPE_STYLES[model.type].fg,
                     )}
@@ -74,39 +83,46 @@ export function ModelDetail({ model }: { model: Model }) {
                     {model.type}
                   </span>
                 )}
-                <span className="flex items-center gap-1 text-[10px]">
-                  <StatusDot status={toStatus(model.status)} />
-                  <span
-                    className={cn(
-                      "font-medium",
-                      toStatus(model.status) === "error"
-                        ? "text-destructive"
-                        : toStatus(model.status) === "serving"
-                          ? "text-green-500"
-                          : "text-muted-foreground",
-                    )}
-                  >
-                    {model.status}
+                {isProxy ? (
+                  <span className="flex items-center gap-1 text-sm">
+                    <StatusDot status="serving" />
+                    <span className="font-medium text-green-500">proxy</span>
                   </span>
-                </span>
+                ) : (
+                  <span className="flex items-center gap-1 text-sm">
+                    <StatusDot status={toStatus(model.status)} />
+                    <span
+                      className={cn(
+                        "font-medium",
+                        toStatus(model.status) === "error"
+                          ? "text-destructive"
+                          : toStatus(model.status) === "serving"
+                            ? "text-green-500"
+                            : "text-muted-foreground",
+                      )}
+                    >
+                      {model.status}
+                    </span>
+                  </span>
+                )}
               </div>
-              <p className="text-[11px] text-muted-foreground max-w-[560px] leading-snug">
+              <p className="text-sm text-muted-foreground max-w-[560px] leading-snug">
                 {model.description}
               </p>
-              <div className="flex gap-3 mt-1.5 text-[10px] text-muted-foreground/40 flex-wrap">
-                {model.base && model.base !== "\u2014" && (
+              <div className="flex gap-3 mt-1.5 text-xs text-muted-foreground/40 flex-wrap">
+                {!isProxy && model.base !== "\u2014" && (
                   <span>
                     base:{" "}
                     <span className="text-muted-foreground">{model.base}</span>
                   </span>
                 )}
-                {model.family && model.family !== "\u2014" && (
+                {!isProxy && model.family && model.family !== "\u2014" && (
                   <span>
                     family:{" "}
                     <span className="text-muted-foreground">{model.family}</span>
                   </span>
                 )}
-                {model.paramCount && model.paramCount !== "\u2014" && (
+                {!isProxy && model.paramCount && model.paramCount !== "\u2014" && (
                   <span>
                     params:{" "}
                     <span className="text-muted-foreground">
@@ -114,7 +130,7 @@ export function ModelDetail({ model }: { model: Model }) {
                     </span>
                   </span>
                 )}
-                {model.quantization && model.quantization !== "\u2014" && (
+                {!isProxy && model.quantization && model.quantization !== "\u2014" && (
                   <span>
                     quant:{" "}
                     <span className="text-muted-foreground">
@@ -133,7 +149,7 @@ export function ModelDetail({ model }: { model: Model }) {
                 {model.engine !== "\u2014" && (
                   <span>
                     engine:{" "}
-                    <span className="text-muted-foreground">
+                    <span className="text-muted">
                       {model.engine}
                     </span>
                   </span>
@@ -144,7 +160,7 @@ export function ModelDetail({ model }: { model: Model }) {
                     <span className="text-blue-500">{model.endpoint}</span>
                   </span>
                 )}
-                {model.hubRef && (
+                {!isProxy && model.hubRef && (
                   <span>
                     hub:{" "}
                     <span className="text-blue-500">{model.hubRef}</span>
@@ -154,34 +170,50 @@ export function ModelDetail({ model }: { model: Model }) {
             </div>
           </div>
           <div className="flex gap-1.5 shrink-0">
-            {toStatus(model.status) !== "stopped" && toStatus(model.status) !== "error" && (
-              <Button variant="outline" size="xs" onClick={handleStop} disabled={!!pending}>
+            {!isProxy && toStatus(model.status) !== "stopped" && toStatus(model.status) !== "error" && (
+              <Button variant="outline" size="sm" onClick={handleStop} disabled={!!pending}>
                 {pending ? "Stopping\u2026" : "Stop"}
               </Button>
             )}
-            {toStatus(model.status) === "stopped" && (
-              <Button variant="outline" size="xs" onClick={handleStart} disabled={!!pending}>
+            {!isProxy && toStatus(model.status) === "stopped" && (
+              <Button
+                size="sm"
+                onClick={handleStart}
+                disabled={!!pending || !configComplete}
+                title={!configComplete ? "Configure engine and GPU in the Config tab first" : undefined}
+              >
                 {pending ? "Starting\u2026" : "Start"}
               </Button>
             )}
-            {toStatus(model.status) === "error" && (
-              <Button variant="destructive" size="xs" onClick={handleRestart} disabled={!!pending}>
+            {!isProxy && toStatus(model.status) === "error" && (
+              <Button variant="destructive" size="sm" onClick={handleRestart} disabled={!!pending}>
                 {pending ? "Restarting\u2026" : "Restart"}
               </Button>
             )}
             {toStatus(model.status) === "serving" && (
-              <Button variant="outline" size="xs">
+              <Button variant="outline" size="sm">
                 &#x25B7; Playground
               </Button>
             )}
-            <Button variant="outline" size="xs">
-              Logs
-            </Button>
-            <Button variant="destructive" size="xs" onClick={() => setDeleteOpen(true)}>
+            <Button variant="destructive" size="sm" onClick={() => setDeleteOpen(true)}>
               Delete
             </Button>
+            {!isProxy && (
+              <Button variant="outline" size="sm" onClick={() => navigate({ to: "/studio/compute/workload-queue", search: { filter: "serving", id: model.id } })}>View job</Button>
+            )}
           </div>
         </div>
+      {/* Unconfigured alert */}
+        {!isProxy && !configComplete && toStatus(model.status) === "stopped" && (
+          <div className="px-6 py-3 shrink-0">
+            <Alert variant={'destructive'}>
+              <AlertDescription className="text-xs">
+                This model needs a compute target, GPU, and engine before it can be
+                started. Open the <strong>Config</strong> tab to set them up.
+              </AlertDescription>
+            </Alert>
+          </div>
+        )}
       </div>
 
       {/* Tabs */}
@@ -194,8 +226,7 @@ export function ModelDetail({ model }: { model: Model }) {
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="performance">Performance</TabsTrigger>
             <TabsTrigger value="config">Config</TabsTrigger>
-            <TabsTrigger value="finetunes">Fine-tunes</TabsTrigger>
-            <TabsTrigger value="events">Events</TabsTrigger>
+            {!isProxy && <TabsTrigger value="finetunes">Fine-tunes</TabsTrigger>}
           </TabsList>
         </div>
 
@@ -209,12 +240,11 @@ export function ModelDetail({ model }: { model: Model }) {
           <TabsContent value="config" className="mt-0">
             <ConfigTab model={model} />
           </TabsContent>
-          <TabsContent value="finetunes" className="mt-0">
-            <FinetunesTab model={model} />
-          </TabsContent>
-          <TabsContent value="events" className="mt-0">
-            <EventsTab model={model} />
-          </TabsContent>
+          {!isProxy && (
+            <TabsContent value="finetunes" className="mt-0">
+              <FinetunesTab model={model} />
+            </TabsContent>
+          )}
         </div>
       </Tabs>
 

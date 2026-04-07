@@ -30,6 +30,13 @@ class ServingServiceLaunchRequest(BaseModel):
     load_balancing_policy: Optional[str] = None
 
 
+class ConnectNebiusRequest(BaseModel):
+    project_id: str
+    service_account_id: str
+    public_key_id: str
+    private_key_content: str
+
+
 class PolicyToggleRequest(BaseModel):
     enabled: bool
 

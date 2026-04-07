@@ -25,18 +25,6 @@ export interface ModelConnectedAgent {
   rps: number;
 }
 
-export interface ModelServingConfig {
-  maxModelLen: number;
-  tensorParallelSize: number;
-  maxBatchSize: number;
-  gpuMemoryUtilization: number;
-  swapSpace: string;
-  quantization: string;
-  dtype: string;
-  enforceEager: boolean;
-  enableChunkedPrefill: boolean;
-  maxNumSeqs: number;
-}
 
 export interface ModelGenerationDefaults {
   temperature: number;
@@ -108,9 +96,11 @@ export interface Model {
   endpoint: string;
   image: string;
   hubRef: string;
+  infra: string | null;
+  source: string | null;
   useSpot: boolean;
   connectedAgents: ModelConnectedAgent[];
-  servingConfig: ModelServingConfig | null;
+  servingConfig: Record<string, unknown> | null;
   generationDefaults: ModelGenerationDefaults | null;
   fineTunes: ModelFineTune[];
   metricsHistory: ModelMetricsHistory;

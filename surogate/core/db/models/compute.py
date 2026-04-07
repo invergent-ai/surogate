@@ -275,6 +275,13 @@ class ServingService(UUIDMixin, Base):
     )
 
 
+class ModelSource(enum.Enum):
+    local_hub = "local_hub"
+    huggingface = "huggingface"
+    openrouter = "openrouter"
+    url = "url"
+
+
 class DeployedModelStatus(enum.Enum):
     deploying = "deploying"
     serving = "serving"
@@ -321,6 +328,9 @@ class DeployedModel(UUIDMixin, Base):
     )
     namespace: Mapped[Optional[str]] = mapped_column(
         sa.String(128), nullable=True
+    )
+    source: Mapped[Optional[ModelSource]] = mapped_column(
+        sa.Enum(ModelSource), nullable=True
     )
     serving_config: Mapped[Optional[dict[str, Any]]] = mapped_column(
         sa.JSON, nullable=True
@@ -374,6 +384,7 @@ __all__ = [
     "LocalTaskStatus",
     "LocalTask",
     "ServingService",
+    "ModelSource",
     "DeployedModelStatus",
     "DeployedModel",
     "ComputePolicy",

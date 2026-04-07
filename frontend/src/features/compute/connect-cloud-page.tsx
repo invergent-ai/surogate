@@ -50,7 +50,7 @@ export function ConnectCloudPage() {
           Back to Cloud
         </Button>
 
-        <Card size="sm" className="max-w-xl p-6">
+        <Card size="sm" className="p-6">
           {info && (
             <div className="flex items-center gap-3 border-b border-line">
               {logo

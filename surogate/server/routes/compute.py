@@ -13,12 +13,12 @@ from surogate.core.db.repository import compute as compute_repo
 from surogate.server.auth.authentication import get_current_subject, get_current_user_id
 from surogate.server.models.compute import (
     CloudAccountResponse,
+    ConnectNebiusRequest,
     K8NodeResponse,
     K8NodeMetricsResponse,
     JobLaunchRequest,
     JobListResponse,
     JobResponse,
-    NodeResponse,
     OverviewResponse,
     PolicyResponse,
     PolicyToggleRequest,
@@ -260,6 +260,82 @@ async def list_cloud_accounts(
         )
         for a in accounts
     ]
+
+
+# ── Cloud Backends ─────────────────────────────────────────────────────
+
+
+@router.get("/cloud/backends")
+async def list_cloud_backends(
+    project_id: str = Query(...),
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """List registered dstack backends for the given project."""
+    try:
+        return await dstack_service.list_backends(session, project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.get("/cloud/backends/offers")
+async def list_backend_offers(
+    project_id: str = Query(...),
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """List available instance offers from all cloud backends for the project."""
+    try:
+        return await dstack_service.list_backend_offers(session, project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch offers: {exc}")
+
+
+@router.delete("/cloud/backends/{backend_type}")
+async def delete_cloud_backend(
+    backend_type: str,
+    project_id: str = Query(...),
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """Remove a cloud backend from the project."""
+    try:
+        await dstack_service.delete_backend(session, project_id, backend_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "deleted", "backend_type": backend_type}
+
+
+@router.post("/cloud/backends/nebius")
+async def connect_nebius_backend(
+    req: ConnectNebiusRequest,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """Register a Nebius backend and verify by fetching offers."""
+    from surogate.core.compute import ensure_nebius_backend
+
+    dstack_project = await dstack_service._resolve_dstack_project(session, req.project_id)
+    await ensure_nebius_backend(
+        dstack_project,
+        service_account_id=req.service_account_id,
+        public_key_id=req.public_key_id,
+        private_key_content=req.private_key_content,
+    )
+
+    try:
+        offers = await dstack_service.verify_backend(session, req.project_id, "nebius")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Backend registered but verification failed: {exc}",
+        )
+
+    return {"status": "connected", "provider": "nebius", "offers": offers}
 
 
 # ── Policies ─────────────────────────────────────────────────────────

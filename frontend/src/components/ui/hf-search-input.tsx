@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { useState, useEffect, useRef } from "react";
-import { hfSearch, type HFItem } from "@/utils/hf";
+import { hfSearch, GGUF_PREFERRED_QUANTS, type HFItem } from "@/utils/hf";
 import { cn } from "@/utils/cn";
 import {
   Tooltip,
@@ -31,11 +31,20 @@ interface HfSearchInputProps {
   disabled?: boolean;
 }
 
+function quantRank(filename: string): number {
+  const upper = filename.toUpperCase();
+  for (let i = 0; i < GGUF_PREFERRED_QUANTS.length; i++) {
+    if (upper.includes(GGUF_PREFERRED_QUANTS[i])) return i;
+  }
+  return GGUF_PREFERRED_QUANTS.length;
+}
+
 function ggufFiles(item: HFItem): string[] {
   if (!item.siblings) return [];
   return item.siblings
     .map((s) => s.rfilename)
-    .filter((f) => f.endsWith(".gguf"));
+    .filter((f) => f.endsWith(".gguf") && !f.toLowerCase().includes("mmproj"))
+    .sort((a, b) => quantRank(a) - quantRank(b));
 }
 
 export function HfSearchInput({
@@ -43,7 +52,7 @@ export function HfSearchInput({
   onChange,
   kind,
   token,
-  placeholder = "qwen/Qwen3-4B",
+  placeholder = "Qwen/Qwen3-4B",
   className,
   disabled,
 }: HfSearchInputProps) {
@@ -110,8 +119,8 @@ export function HfSearchInput({
     }
   };
 
-  const handleGgufSelect = (repo: string, filename: string) => {
-    onChange(`${repo}/${filename}`);
+  const handleGGUFSelect = (repo: string, filename: string) => {
+    onChange(`${repo}:${filename}`);
     setOpen(false);
     setSelectedItem(null);
     setQuery("");
@@ -142,7 +151,7 @@ export function HfSearchInput({
               value ? "text-foreground font-mono" : "text-muted-foreground",
             )}
           >
-            <span className="flex-1 w-0 truncate text-left">{value || placeholder}</span>
+            <span className="flex-1 w-0 truncate text-left text-muted-foregound">{value || placeholder}</span>
             <ChevronsUpDown size={12} className="shrink-0 ml-2 text-muted-foreground/50" />
           </button>
         </TooltipTrigger>
@@ -173,8 +182,8 @@ export function HfSearchInput({
                 </span>
               </>
             ) : (
-              <span className="text-[10px] text-muted-foreground/60 uppercase tracking-wide font-display">
-                HuggingFace {kind === "models" ? "Models" : "Datasets"}
+              <span className="text-[10px] text-muted-foreground/60 tracking-wide font-display">
+                Search {kind === "models" ? "Models..." : "Datasets..."} 
               </span>
             )}
           </div>
@@ -220,7 +229,7 @@ export function HfSearchInput({
                   </div>
                 ) : (
                   results.map((item) => {
-                    const hasGgufs = ggufFiles(item).length > 0;
+                    const hasGGUFs = ggufFiles(item).length > 0;
                     return (
                       <Tooltip key={item.id}>
                         <TooltipTrigger asChild>
@@ -243,7 +252,7 @@ export function HfSearchInput({
                                 </span>
                               )}
                             </div>
-                            {hasGgufs && (
+                            {hasGGUFs && (
                               <ChevronRight
                                 size={12}
                                 className="text-muted-foreground/40 shrink-0"
@@ -268,15 +277,15 @@ export function HfSearchInput({
                   </div>
                 ) : (
                   <>
-                    <div className="px-3 py-1 text-[9px] uppercase tracking-wide text-muted-foreground/50 font-display sticky top-0 bg-popover z-10">
-                      GGUF Files
+                    <div className="px-3 py-1 text-xs tracking-wide text-muted-foreground/50 font-medium sticky top-0 bg-popover z-10">
+                      GGUF Files (ordered by quality - best first)
                     </div>
                     {filteredGgufs.map((filename) => (
                       <Tooltip key={filename}>
                         <TooltipTrigger asChild>
                           <button
                             type="button"
-                            onClick={() => handleGgufSelect(selectedItem!.id, filename)}
+                            onClick={() => handleGGUFSelect(selectedItem!.id, filename)}
                             className={cn(
                               "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors cursor-pointer border-none bg-transparent",
                               "hover:bg-accent/60",

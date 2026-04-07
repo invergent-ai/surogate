@@ -210,7 +210,15 @@ def _download_hf_json(
 def resolve_from_huggingface(
     repo_id: str, token: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Resolve model info from a Hugging Face repo."""
+    """Resolve model info from a Hugging Face repo.
+
+    Handles GGUF references like ``owner/repo:file.gguf`` by stripping the
+    filename and fetching config.json from the base ``owner/repo``.
+    """
+    # GGUF refs use colon separator: owner/repo:file.gguf
+    if ":" in repo_id and repo_id.split(":")[-1].endswith(".gguf"):
+        repo_id = repo_id.split(":")[0]
+
     config = _download_hf_json(repo_id, "config.json", token)
     if config is None:
         return {}

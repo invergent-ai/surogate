@@ -1,14 +1,18 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { PageHeader } from "@/components/page-header";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
-import { Cloud, Plus } from "lucide-react";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
+import { Plus } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
 import { CLOUD_INSTANCES } from "./compute-data";
+import { AddCloudCard } from "./add-cloud-card";
 
 const TAB_ROUTES: Record<string, string> = {
   overview: "/studio/compute",
@@ -27,6 +31,7 @@ export function ComputePage() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const activeTab = ROUTE_TO_TAB[pathname.replace(/\/$/, "")] ?? "overview";
+  const [connectOpen, setConnectOpen] = useState(false);
 
   const k8sNodes = useAppStore((s) => s.k8sNodes);
   const fetchK8Nodes = useAppStore((s) => s.fetchK8Nodes);
@@ -57,13 +62,9 @@ export function ComputePage() {
             <TabsTrigger value="policies">Policies</TabsTrigger>
           </TabsList>
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm">
+            <Button variant="outline" size="sm" onClick={() => setConnectOpen(true)}>
               <Plus size={14} />
               Connect Cloud
-            </Button>
-            <Button size="sm">
-              <Cloud size={14} />
-              Launch Instance
             </Button>
           </div>
         </div>
@@ -72,6 +73,17 @@ export function ComputePage() {
           <Outlet />
         </div>
       </Tabs>
+
+      <Dialog open={connectOpen} onOpenChange={setConnectOpen}>
+        <DialogContent className="sm:max-w-3xl p-0">
+          <DialogHeader className="px-6 pt-5 pb-0">
+            <DialogTitle>Connect Cloud Provider</DialogTitle>
+          </DialogHeader>
+          <div className="px-2 pb-4" onClick={() => setConnectOpen(false)}>
+            <AddCloudCard />
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

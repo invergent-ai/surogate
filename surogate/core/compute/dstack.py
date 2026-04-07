@@ -87,6 +87,153 @@ async def _resolve_dstack_project(session: AsyncSession, project_id: str):
     return project
 
 
+async def delete_backend(session: AsyncSession, project_id: str, backend_type: str) -> None:
+    """Terminate all instances on a backend, then remove it from the project."""
+    from dstack._internal.core.models.backends.base import BackendType
+    from dstack._internal.core.models.instances import InstanceStatus
+    from dstack._internal.server.db import get_session_ctx as dstack_session_ctx
+    from dstack._internal.server.models import InstanceModel
+    from dstack._internal.server.services.backends import delete_backends
+
+    dstack_project = await _resolve_dstack_project(session, project_id)
+    bt = BackendType(backend_type)
+
+    # Terminate all active instances on this backend
+    async with dstack_session_ctx() as dstack_session:
+        await dstack_session.execute(
+            sa.update(InstanceModel)
+            .where(
+                InstanceModel.project_id == dstack_project.id,
+                InstanceModel.backend == bt,
+                InstanceModel.deleted == False,
+                InstanceModel.status.notin_([
+                    InstanceStatus.TERMINATED,
+                    InstanceStatus.TERMINATING,
+                ]),
+            )
+            .values(status=InstanceStatus.TERMINATING)
+        )
+        await dstack_session.commit()
+
+    # Remove the backend and invalidate the cache
+    async with dstack_session_ctx() as dstack_session:
+        await delete_backends(dstack_session, dstack_project, [bt])
+
+    from surogate.core.compute import _invalidate_backends_cache
+    _invalidate_backends_cache(dstack_project)
+
+
+async def list_backends(session: AsyncSession, project_id: str) -> list[dict]:
+    """Return the registered dstack backends for a surogate project with instance stats."""
+    from dstack._internal.core.models.instances import InstanceStatus
+    from dstack._internal.server.db import get_session_ctx as dstack_session_ctx
+    from dstack._internal.server.models import InstanceModel
+
+    dstack_project = await _resolve_dstack_project(session, project_id)
+
+    # Query active instance counts and cost per backend type for this project
+    instance_stats: dict[str, dict] = {}
+    try:
+        async with dstack_session_ctx() as dstack_session:
+            stmt = (
+                sa.select(
+                    InstanceModel.backend,
+                    sa.func.count().label("count"),
+                    sa.func.coalesce(sa.func.sum(InstanceModel.price), 0.0).label("hourly_cost"),
+                )
+                .where(
+                    InstanceModel.project_id == dstack_project.id,
+                    InstanceModel.deleted == False,
+                    InstanceModel.status.notin_([
+                        InstanceStatus.TERMINATED,
+                        InstanceStatus.TERMINATING,
+                    ]),
+                )
+                .group_by(InstanceModel.backend)
+            )
+            for row in (await dstack_session.execute(stmt)).all():
+                backend_type = row.backend.value if hasattr(row.backend, "value") else str(row.backend)
+                instance_stats[backend_type] = {
+                    "active_instances": row.count,
+                    "hourly_cost": round(float(row.hourly_cost), 2),
+                }
+    except Exception:
+        logger.debug("Could not fetch backend instance stats", exc_info=True)
+
+    return [
+        {
+            "type": b.type.value,
+            "id": str(b.id),
+            **(instance_stats.get(b.type.value, {"active_instances": 0, "hourly_cost": 0.0})),
+        }
+        for b in dstack_project.backends
+    ]
+
+
+async def _fetch_offers(backends) -> list[dict]:
+    """Fetch offers from a list of dstack Backend objects and return serialised dicts."""
+    from dstack._internal.core.models.resources import ResourcesSpec
+    from dstack._internal.core.models.runs import Requirements
+    from dstack._internal.server.services.backends import get_backend_offers
+
+    requirements = Requirements(resources=ResourcesSpec())
+    offers_iter = await get_backend_offers(backends, requirements)
+
+    seen = set()
+    results = []
+    for backend, offer in offers_iter:
+        key = (backend.TYPE.value, offer.instance.name, offer.region)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        gpus = offer.instance.resources.gpus
+        results.append({
+            "backend": backend.TYPE.value,
+            "instance": offer.instance.name,
+            "region": offer.region,
+            "price": round(offer.price, 4),
+            "cpus": offer.instance.resources.cpus,
+            "memory_mib": offer.instance.resources.memory_mib,
+            "spot": offer.instance.resources.spot,
+            "gpu_count": len(gpus),
+            "gpu_name": gpus[0].name if gpus else None,
+            "gpu_memory_mib": gpus[0].memory_mib if gpus else None,
+            "availability": offer.availability.value,
+        })
+
+    return results
+
+
+async def list_backend_offers(session: AsyncSession, project_id: str) -> list[dict]:
+    """Return available instance offers across all cloud backends for a project."""
+    from dstack._internal.server.services.backends import get_project_backends
+
+    dstack_project = await _resolve_dstack_project(session, project_id)
+    backends = await get_project_backends(dstack_project)
+    cloud_backends = [b for b in backends if b.TYPE.value not in ("local", "kubernetes")]
+    if not cloud_backends:
+        return []
+
+    return await _fetch_offers(cloud_backends)
+
+
+async def verify_backend(session: AsyncSession, project_id: str, backend_type: str) -> list[dict]:
+    """Fetch offers for a single backend type on a project. Raises on failure."""
+    from dstack._internal.server.services.backends import (
+        get_project_backend_by_type_or_error,
+    )
+    from dstack._internal.core.models.backends.base import BackendType
+
+    dstack_project = await _resolve_dstack_project(session, project_id)
+    bt = BackendType(backend_type)
+    backend = await get_project_backend_by_type_or_error(dstack_project, bt)
+    offers = await _fetch_offers([backend])
+    if not offers:
+        raise RuntimeError(f"No offers returned from {backend_type} — credentials may be invalid")
+    return offers
+
+
 def _dstack_name(base: str, prefix: str = "") -> str:
     """Sanitize a name to match dstack's ``^[a-z][a-z0-9-]{1,40}$`` (max 41 chars)."""
     import hashlib

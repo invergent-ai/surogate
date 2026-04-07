@@ -50,7 +50,7 @@ export function Navbar() {
     <nav
       className={cn(
         "bg-card border-r border-line flex flex-col overflow-hidden z-10 transition-all duration-200",
-        collapsed ? "w-14 min-w-14" : "w-[232px] min-w-[232px]",
+        collapsed ? "w-14 min-w-14" : "w-65 min-w-65",
       )}
     >
       {/* logo */}
@@ -67,10 +67,10 @@ export function Navbar() {
         />
         {!collapsed && (
           <div>
-            <div className="font-display font-bold text-foreground tracking-tight">
+            <div className=" font-bold text-foreground tracking-tight">
               Studio
             </div>
-            <div className="text-[9px] text-muted-foreground tracking-[0.08em] uppercase">
+            <div className="text-muted-foreground tracking-[0.08em] uppercase">
               Agent Platform
             </div>
           </div>
@@ -102,7 +102,7 @@ export function Navbar() {
         {NAV_SECTIONS.map((section) => (
           <div key={section.label} className="mb-1">
             {!collapsed && (
-              <div className="px-4 pt-2.5 pb-1 text-[9px] font-semibold text-faint tracking-[0.12em] uppercase">
+              <div className="px-4 pt-2.5 pb-1 font-semibold text-faint tracking-[0.12em] uppercase">
                 {section.label}
               </div>
             )}
@@ -117,7 +117,7 @@ export function Navbar() {
                   key={item.path}
                   to={item.path}
                   className={cn(
-                    "flex items-center gap-2 w-full no-underline cursor-pointer font-display transition-all duration-150",
+                    "flex items-center gap-2 w-full no-underline cursor-pointer  transition-all duration-150",
                     collapsed
                       ? "justify-center py-2"
                       : "px-3 py-1.5 my-px",
@@ -139,7 +139,7 @@ export function Navbar() {
                       {item.badge && (
                         <span
                           className={cn(
-                            "text-[9px] px-[5px] py-px rounded",
+                            "px-[5px] py-px rounded",
                             isActive
                               ? "bg-primary/15 text-primary"
                               : "bg-accent text-muted-foreground",
@@ -168,13 +168,10 @@ export function Navbar() {
           <>
             <button
               type="button"
-              className="flex items-center gap-2 w-full border-none cursor-pointer px-2.5 py-[7px] bg-input rounded-md text-muted-foreground font-display mb-1.5"
+              className="flex items-center gap-2 w-full border-none cursor-pointer px-2.5 py-[7px] bg-input rounded-md text-muted-foreground  mb-1.5"
             >
               <span>⌕</span>
               <span className="flex-1 text-left">Search</span>
-              <kbd className="text-[9px] bg-accent px-1 py-px rounded">
-                ⌘K
-              </kbd>
             </button>
             <Link
               to="/studio/settings"
@@ -185,14 +182,14 @@ export function Navbar() {
                   : "hover:bg-input",
               )}
             >
-              <div className="w-6 h-6 rounded-full bg-linear-to-br from-blue-500 to-violet-500 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+              <div className="w-6 h-6 rounded-full bg-linear-to-br from-blue-500 to-violet-500 flex items-center justify-center font-bold text-white shrink-0">
                 AK
               </div>
               <div className="flex-1 min-w-0">
-                <div className="text-subtle font-medium font-display">
+                <div className="text-subtle font-medium ">
                   A. Kovács
                 </div>
-                <div className="text-[9px] text-faint">Skill Engineer</div>
+                <div className="text-xs text-faint">Skill Engineer</div>
               </div>
             </Link>
           </>

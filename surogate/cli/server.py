@@ -1,10 +1,8 @@
 import asyncio
-import os
 from pathlib import Path
 import sys
 import argparse
 import signal
-from threading import Thread
 import traceback
 import urllib3
 
@@ -49,6 +47,7 @@ def run_server(config: ServerConfig, frontend_path: Path = Path(__file__).resolv
     
     import uvicorn
     import time
+    import logging
     from surogate.server.app import app, setup_frontend
     from threading import Thread, Event
      
@@ -64,7 +63,8 @@ def run_server(config: ServerConfig, frontend_path: Path = Path(__file__).resolv
                 
     # Start the server in a separate thread so that we can listen for signals
     config = uvicorn.Config(
-        app, host=config.host, port=config.port, log_level="info", access_log = False, workers=config.workers
+        app, host=config.host, port=config.port, access_log = False, 
+        workers=config.workers, log_level=logging.ERROR
     )
     _server = uvicorn.Server(config)
     _shutdown_event = Event()

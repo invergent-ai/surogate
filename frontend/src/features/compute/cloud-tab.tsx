@@ -1,69 +1,93 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+import { useEffect, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
-import { ProgressBar } from "@/components/ui/progress-bar";
-import { CLOUD_ACCOUNTS, CLOUD_INSTANCES, PROVIDER_COLORS } from "./compute-data";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { CLOUD_INSTANCES, PROVIDER_COLORS, SUPPORTED_PROVIDERS } from "./compute-data";
 import { AddCloudCard } from "./add-cloud-card";
+import { useAppStore } from "@/stores/app-store";
+import { useNavigate } from "@tanstack/react-router";
+import { Trash2 } from "lucide-react";
 
 export function CloudTab() {
   const cloudHourlyCost = CLOUD_INSTANCES.filter(c => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
-  const connectedKeys = new Set(CLOUD_ACCOUNTS.map(a => a.provider));
+  const backends = useAppStore((s) => s.cloudBackends);
+  const fetchBackends = useAppStore((s) => s.fetchCloudBackends);
+  const deleteBackend = useAppStore((s) => s.deleteCloudBackend);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  const navigate = useNavigate();
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+
+  useEffect(() => { fetchBackends(); }, [activeProjectId, fetchBackends]);
+
+  // Exclude kubernetes — that's the local cluster, not a cloud backend
+  const cloudBackends = backends.filter(b => b.type !== "kubernetes");
 
   return (
     <div className="space-y-5 animate-in fade-in duration-200">
-      {/* Cloud accounts */}
-      <div className="grid grid-cols-3 gap-3">
-        {CLOUD_ACCOUNTS.map(a => (
-          <Card
-            key={a.provider}
-            size="sm"
-            className="p-4"
-            style={{
-              borderColor: a.status === "connected" ? (PROVIDER_COLORS[a.provider] ?? "#1E2330") + "30" : undefined,
-              opacity: a.status === "disconnected" ? 0.4 : 1,
-            }}
-          >
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-2">
-                <span className="text-lg" style={{ color: PROVIDER_COLORS[a.provider] }}>{"\u2601"}</span>
-                <div>
-                  <div className="text-sm font-bold text-foreground font-display">{a.name}</div>
-                  <div className="text-[11px] text-faint">{a.provider.toUpperCase()}</div>
+      {/* Registered backends */}
+      {cloudBackends.length > 0 && (
+        <div className="grid grid-cols-3 gap-3">
+          {cloudBackends.map(b => {
+            const info = SUPPORTED_PROVIDERS.find(p => p.key === b.type);
+            const color = PROVIDER_COLORS[b.type] ?? "#888";
+            return (
+              <Card key={b.id} size="sm" className="p-4" style={{ borderColor: color + "30" }}>
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <div>
+                      <div className="text-sm font-bold text-foreground font-display">
+                        {info?.name ?? b.type}
+                      </div>
+                      <div className="text-[11px] text-faint">{info?.description ?? "Cloud backend"}</div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <StatusDot status="running" />
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="text-faint hover:text-destructive"
+                      onClick={() => setDeleteTarget(b.type)}
+                    >
+                      <Trash2 size={12} />
+                    </Button>
+                  </div>
                 </div>
-              </div>
-              <StatusDot status={a.status === "connected" ? "running" : "stopped"} />
-            </div>
-            {a.status === "connected" && (
-              <>
-                <div className="grid grid-cols-2 gap-2 mb-2.5">
+                <div className="grid grid-cols-2 gap-2 mb-3">
                   <div>
-                    <div className="text-[10px] text-faint uppercase mb-0.5">GPU Quota</div>
-                    <div className="text-base font-bold text-foreground">{a.usedGpu}/{a.quotaGpu}</div>
+                    <div className="text-[10px] text-faint uppercase mb-0.5">Instances</div>
+                    <div className="text-base font-bold text-foreground">{b.active_instances}</div>
                   </div>
                   <div>
-                    <div className="text-[10px] text-faint uppercase mb-0.5">Spend</div>
-                    <div className="text-base font-bold text-foreground">${a.monthlySpend.toLocaleString()}</div>
+                    <div className="text-[10px] text-faint uppercase mb-0.5">Cost</div>
+                    <div className="text-base font-bold" style={{ color: b.hourly_cost > 0 ? "#F59E0B" : undefined }}>
+                      ${b.hourly_cost.toFixed(2)}/hr
+                    </div>
                   </div>
                 </div>
-                <div className="mb-1">
-                  <div className="flex justify-between text-[11px] text-faint mb-1">
-                    <span>Budget: ${a.monthlyBudget.toLocaleString()}</span>
-                    <span>{Math.round(a.monthlySpend / a.monthlyBudget * 100)}%</span>
-                  </div>
-                  <ProgressBar value={(a.monthlySpend / a.monthlyBudget) * 100} color={PROVIDER_COLORS[a.provider]} />
-                </div>
-                <div className="text-[11px] text-faint mt-2">Regions: {a.regions.join(", ")}</div>
-              </>
-            )}
-            {a.status === "disconnected" && (
-              <Button variant="outline" size="sm" className="w-full mt-2">Connect</Button>
-            )}
-          </Card>
-        ))}
-      </div>
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className="w-full"
+                  onClick={() => navigate({ to: "/studio/backend-offers", search: { backend: b.type } })}
+                >
+                  Available instances
+                </Button>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
+      {cloudBackends.length === 0 && (
+        <Card size="sm" className="p-6 text-center text-sm text-faint">
+          No cloud backends connected. Add one below to start launching cloud GPU instances.
+        </Card>
+      )}
 
       {/* Active Cloud instances */}
       <Card size="sm" className="overflow-hidden">
@@ -101,6 +125,19 @@ export function CloudTab() {
 
       {/* Supported cloud providers */}
       <AddCloudCard />
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="Remove cloud backend"
+        description={`This will disconnect the ${deleteTarget?.toUpperCase()} backend from this project and terminate all running instances on it.`}
+        confirmLabel="Remove"
+        variant="destructive"
+        onConfirm={async () => {
+          if (deleteTarget) await deleteBackend(deleteTarget);
+          setDeleteTarget(null);
+        }}
+        onCancel={() => setDeleteTarget(null)}
+      />
 
     </div>
   );

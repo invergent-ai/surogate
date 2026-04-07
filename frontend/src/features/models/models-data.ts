@@ -10,7 +10,6 @@ export type {
   ModelGpu,
   ModelVram,
   ModelConnectedAgent,
-  ModelServingConfig,
   ModelGenerationDefaults,
   ModelFineTune,
   ModelMetricsHistory,

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import React, { useState, useMemo } from "react";
+import { useSearch } from "@tanstack/react-router";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
@@ -18,8 +19,11 @@ import { useWorkloadItems } from "./use-workload-items";
 const FILTERS = ["all", "training", "serving", "eval", "task"] as const;
 
 export function WorkloadQueueTab() {
-  const [filter, setFilter] = useState("all");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const { filter: filterParam, id: idParam } = useSearch({ strict: false }) as { filter?: string; id?: string };
+  const [filter, setFilter] = useState(
+    filterParam && FILTERS.includes(filterParam as typeof FILTERS[number]) ? filterParam : "all",
+  );
+  const [selectedId, setSelectedId] = useState<string | null>(idParam || null);
   const [deleteTarget, setDeleteTarget] = useState<ExtendedWorkload | null>(null);
   const deleteTask = useAppStore((s) => s.deleteTask);
   const deleteModel = useAppStore((s) => s.deleteModel);

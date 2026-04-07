@@ -25,11 +25,11 @@ export function PageHeader({ title, subtitle, action }: PageHeaderProps) {
   return (
     <header className="px-7 py-3 border-b border-line flex items-center justify-between bg-card sticky top-0 z-5">
       <div>
-        <h1 className="font-display text-[17px] font-bold text-foreground tracking-tight">
+        <h1 className="font-bold text-foreground tracking-tight">
           {title}
         </h1>
         {subtitle && (
-          <p className="text-muted-foreground mt-px">{subtitle}</p>
+          <p className="text-muted-foreground mt-px text-sm">{subtitle}</p>
         )}
       </div>
       <div className="flex items-center gap-3">

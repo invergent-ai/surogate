@@ -185,6 +185,46 @@ async def ensure_kubernetes_backend(project) -> None:
         except Exception as ex:
             logger.warning("Failed to register Kubernetes backend: %s", ex, exc_info=True)
 
+def _invalidate_backends_cache(project) -> None:
+    """Evict a project from dstack's in-memory backends cache."""
+    from dstack._internal.server.services.backends import _BACKENDS_CACHE
+    _BACKENDS_CACHE.pop(project.id, None)
+
+
+async def ensure_nebius_backend(project, service_account_id: str, public_key_id: str, private_key_content: str) -> None:
+    """Register a Nebius backend on the given dstack project.
+
+    Credentials are passed in-memory — nothing is written to disk.
+    Silently skips if the backend already exists.
+    """
+    from dstack._internal.core.errors import ResourceExistsError
+    from dstack._internal.server.db import get_session_ctx
+    from dstack._internal.server.services.backends import create_backend
+    from dstack._internal.core.backends.nebius.models import (
+        NebiusBackendConfigWithCreds,
+        NebiusServiceAccountCreds,
+    )
+
+    creds = NebiusServiceAccountCreds(
+        service_account_id=service_account_id,
+        public_key_id=public_key_id,
+        private_key_content=private_key_content,
+    )
+    config = NebiusBackendConfigWithCreds(type="nebius", creds=creds)
+
+    _invalidate_backends_cache(project)
+
+    async with get_session_ctx() as session:
+        try:
+            await create_backend(session=session, project=project, config=config)
+            logger.info("Registered Nebius backend for project '%s'", project.name)
+        except ResourceExistsError:
+            logger.debug("Nebius backend already exists for project '%s'", project.name)
+        except Exception as ex:
+            logger.warning("Failed to register Nebius backend: %s", ex, exc_info=True)
+            raise
+
+
 async def shutdown_dstack() -> None:
     """Gracefully stop dstack background processing and dispose its DB."""
     global _initialized, _scheduler, _pipeline_manager
