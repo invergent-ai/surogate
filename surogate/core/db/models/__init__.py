@@ -7,3 +7,4 @@ from surogate.core.db.models.observe import *  # noqa: F401,F403
 from surogate.core.db.models.evaluate import *  # noqa: F401,F403
 from surogate.core.db.models.train import *  # noqa: F401,F403
 from surogate.core.db.models.settings import *  # noqa: F401,F403
+from surogate.core.db.models.trace import *  # noqa: F401,F403

@@ -34,7 +34,7 @@ from surogate.core.db.repository import auth as auth_repository
 from surogate.core.compute import init_dstack, shutdown_dstack
 from surogate.core.compute.kubernetes import init_kubernetes
 
-from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router
+from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router, proxy_router
 
 logger = get_logger()
 
@@ -108,11 +108,10 @@ app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
 
-# Mount dstack's built-in service proxy — routes requests to K8s pods via SSH tunnels
+# Mount service proxy with chat-completion observability
 from dstack._internal.server.services.proxy.deps import ServerProxyDependencyInjector
-from dstack._internal.server.services.proxy.routers import service_proxy as dstack_service_proxy
 app.state.proxy_dependency_injector = ServerProxyDependencyInjector()
-app.include_router(dstack_service_proxy.router, prefix = "/proxy/services", tags = ["dstack-proxy"])
+app.include_router(proxy_router, prefix = "/proxy/services", tags = ["proxy"])
 
 
 # ============ WebSocket ============
