@@ -14,6 +14,7 @@ import {
   LayoutListIcon,
   Trash2Icon,
 } from "lucide-react";
+import { useSearch } from "@tanstack/react-router";
 import {
   type ReactElement,
   memo,
@@ -67,18 +68,20 @@ const CompareContent = memo(function CompareContent({
   servingModels,
   selectedModelId,
   compareModelId,
+  onCompareModelChange,
 }: {
   pairId: string;
   servingModels: { id: string; displayName: string; projectColor: string }[];
   selectedModelId: string | null;
   compareModelId: string | null;
+  onCompareModelChange: (modelId: string) => void;
 }): ReactElement {
   const handlesRef = useRef<Record<string, CompareHandle>>({});
 
   const leftModel = servingModels.find((m) => m.id === selectedModelId);
-  const rightModel = servingModels.find((m) => m.id === compareModelId);
   const leftColor = leftModel?.projectColor || DEFAULT_COLOR;
-  const rightColor = rightModel?.projectColor || DEFAULT_COLOR;
+
+  const rightCandidates = servingModels.filter((m) => m.id !== selectedModelId);
 
   return (
     <CompareHandlesProvider handlesRef={handlesRef}>
@@ -94,23 +97,43 @@ const CompareContent = memo(function CompareContent({
               </span>
             </div>
             <div className="min-h-0 flex-1">
-              <PlaygroundRuntimeProvider pairId={pairId}>
+              <PlaygroundRuntimeProvider pairId={pairId} modelId={selectedModelId ?? undefined}>
                 <RegisterCompareHandle name="left" />
                 <Thread hideComposer hideWelcome />
               </PlaygroundRuntimeProvider>
             </div>
           </div>
           <div className="flex min-h-0 flex-col border-l border-border">
-            <div className="px-3 py-1.5 text-end">
-              <span
-                className="text-[10px] font-semibold uppercase tracking-wider"
-                style={{ color: rightColor }}
-              >
-                {rightModel?.displayName ?? "Model 2"}
-              </span>
+            <div className="flex items-center justify-end gap-1.5 px-3 py-1.5">
+              {rightCandidates.map((m) => {
+                const color = m.projectColor || DEFAULT_COLOR;
+                const isActive = m.id === compareModelId;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className={cn(
+                      "rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider transition-all",
+                      isActive
+                        ? "font-bold"
+                        : "border-transparent text-muted-foreground hover:text-foreground",
+                    )}
+                    style={
+                      isActive
+                        ? { borderColor: `${color}44`, backgroundColor: `${color}12`, color }
+                        : undefined
+                    }
+                    onClick={() => {
+                      if (!isActive) onCompareModelChange(m.id);
+                    }}
+                  >
+                    {m.displayName}
+                  </button>
+                );
+              })}
             </div>
             <div className="min-h-0 flex-1">
-              <PlaygroundRuntimeProvider pairId={pairId}>
+              <PlaygroundRuntimeProvider pairId={pairId} modelId={compareModelId ?? undefined}>
                 <RegisterCompareHandle name="right" />
                 <Thread hideComposer hideWelcome />
               </PlaygroundRuntimeProvider>
@@ -139,6 +162,14 @@ export function PlaygroundPage() {
     () => allModels.filter((m) => m.status === "running"),
     [allModels],
   );
+
+  // Apply model ID from URL search param (e.g. navigating from Models page)
+  const { modelId: urlModelId } = useSearch({ strict: false }) as { modelId?: string };
+  useEffect(() => {
+    if (urlModelId && servingModels.some((m) => m.id === urlModelId)) {
+      usePlaygroundStore.getState().setSelectedModelId(urlModelId);
+    }
+  }, [urlModelId, servingModels]);
 
   // Playground store
   const selectedModelId = usePlaygroundStore((s) => s.selectedModelId);
@@ -201,6 +232,11 @@ export function PlaygroundPage() {
       }
     }
   }, [compareModelId, servingModels, effectiveModelId, setCompareModelId]);
+
+  const handleCompareModelChange = useCallback((modelId: string) => {
+    setCompareModelId(modelId);
+    setView({ mode: "compare", pairId: crypto.randomUUID() });
+  }, [setCompareModelId]);
 
   const handleNewThread = useCallback(() => {
     usePlaygroundStore.getState().setActiveThreadId(null);
@@ -350,6 +386,7 @@ export function PlaygroundPage() {
         {showSessions && (
           <SessionsPanel
             view={view}
+            selectedModelId={effectiveModelId}
             onSelect={handleThreadSelect}
             onNewSession={handleNewThread}
             onNewCompare={handleNewCompare}
@@ -392,6 +429,7 @@ export function PlaygroundPage() {
               servingModels={servingModels}
               selectedModelId={effectiveModelId}
               compareModelId={compareModelId}
+              onCompareModelChange={handleCompareModelChange}
             />
           )}
         </div>

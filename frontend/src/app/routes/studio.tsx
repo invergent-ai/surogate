@@ -333,6 +333,9 @@ export const playgroundRoute = createRoute({
   getParentRoute: () => Route,
   path: "/playground",
   component: PlaygroundPage,
+  validateSearch: (search: Record<string, unknown>) => ({
+    modelId: (search.modelId as string) || "",
+  }),
 });
 
 export const datasetsRoute = createRoute({

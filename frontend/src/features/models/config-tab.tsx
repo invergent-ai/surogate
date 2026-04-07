@@ -231,8 +231,8 @@ export function ConfigTab({ model }: { model: Model }) {
                       <SelectValue placeholder="Number of GPUs" />
                     </SelectTrigger>
                     <SelectContent>
-                      {["1", "2", "4", "8"].map((n) => (
-                        <SelectItem key={n} value={n}>{n} GPU{n !== "1" ? "s" : ""}</SelectItem>
+                      {["0", "1", "2", "4", "8"].map((n) => (
+                        <SelectItem key={n} value={n}>{n === "0" ? "CPU only" : `${n} GPU${n !== "1" ? "s" : ""}`}</SelectItem>
                       ))}
                     </SelectContent>
                   </Select>

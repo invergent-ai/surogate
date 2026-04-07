@@ -378,6 +378,7 @@ function fallbackTitleFromUserText(userText: string): string {
 
 function createDexieAdapter(
   pairId?: string,
+  modelId?: string,
 ): unstable_RemoteThreadListAdapter {
   return {
     async fetch(remoteId: string) {
@@ -419,12 +420,12 @@ function createDexieAdapter(
     },
 
     async initialize(threadId: string) {
-      const currentModelId =
-        usePlaygroundStore.getState().selectedModelId ?? "";
+      const effectiveModelId =
+        modelId ?? usePlaygroundStore.getState().selectedModelId ?? "";
       await db.threads.add({
         id: threadId,
         title: "New Chat",
-        modelId: currentModelId,
+        modelId: effectiveModelId,
         pairId,
         archived: false,
         createdAt: Date.now(),
@@ -708,18 +709,20 @@ function ActiveThreadSync({
 export function PlaygroundRuntimeProvider({
   children,
   pairId,
+  modelId,
   initialThreadId,
   newThreadNonce,
 }: {
   children: ReactNode;
   pairId?: string;
+  modelId?: string;
   initialThreadId?: string;
   newThreadNonce?: string;
 }): ReactElement {
   const runtime = useRemoteThreadListRuntime({
     runtimeHook: useRuntimeHook,
     adapter: {
-      ...createDexieAdapter(pairId),
+      ...createDexieAdapter(pairId, modelId),
       unstable_Provider: ThreadHistoryProvider,
     },
   });

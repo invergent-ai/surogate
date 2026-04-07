@@ -52,6 +52,7 @@ function viewForItem(item: SidebarItem): PlaygroundView {
 
 interface SessionsPanelProps {
   view: PlaygroundView;
+  selectedModelId: string | null;
   onSelect: (view: PlaygroundView) => void;
   onNewSession: () => void;
   onNewCompare: () => void;
@@ -59,13 +60,40 @@ interface SessionsPanelProps {
 
 export function SessionsPanel({
   view,
+  selectedModelId,
   onSelect,
   onNewSession,
   onNewCompare,
 }: SessionsPanelProps) {
   const allThreads = useLiveQuery(
-    () => db.threads.orderBy("createdAt").reverse().toArray(),
-    [],
+    async () => {
+      if (!selectedModelId) {
+        return db.threads.orderBy("createdAt").reverse().toArray();
+      }
+      // Fetch threads belonging to this model
+      const modelThreads = await db.threads
+        .where("modelId")
+        .equals(selectedModelId)
+        .toArray();
+
+      // For compare pairs, also fetch the sibling threads so the pair is complete
+      const pairIds = new Set(
+        modelThreads.map((t) => t.pairId).filter(Boolean) as string[],
+      );
+      if (pairIds.size > 0) {
+        const siblings = await db.threads
+          .where("pairId")
+          .anyOf([...pairIds])
+          .toArray();
+        const idSet = new Set(modelThreads.map((t) => t.id));
+        for (const s of siblings) {
+          if (!idSet.has(s.id)) modelThreads.push(s);
+        }
+      }
+
+      return modelThreads;
+    },
+    [selectedModelId],
   );
   const items = groupThreads(allThreads ?? []);
   const activeId =

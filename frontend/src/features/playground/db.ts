@@ -16,6 +16,11 @@ db.version(1).stores({
   messages: "id, threadId, createdAt",
 });
 
+db.version(2).stores({
+  threads: "id, pairId, archived, createdAt, modelId",
+  messages: "id, threadId, createdAt",
+});
+
 export { db };
 
 /**

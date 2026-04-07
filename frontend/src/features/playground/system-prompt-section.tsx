@@ -27,7 +27,7 @@ export function SystemPromptSection({
     return (
       <button
         type="button"
-        className="flex w-full shrink-0 items-center gap-1.5 border-b border-border bg-card/50 px-5 py-1.5 text-left text-[9px] text-muted-foreground transition-colors hover:text-foreground"
+        className="flex w-full shrink-0 items-center gap-1.5 border-b border-border bg-card/50 px-5 py-1.5 text-left text-muted-foreground transition-colors hover:text-foreground"
         onClick={() => setIsOpen(true)}
       >
         <ChevronDownIcon className="size-3" />
@@ -40,7 +40,7 @@ export function SystemPromptSection({
     <div className="shrink-0 border-b border-border bg-card/50 px-5 py-2.5">
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="font-display text-[9px] font-semibold uppercase tracking-widest text-primary">
+          <span className="font-display text-sm font-semibold uppercase tracking-widest text-primary">
             System Prompt
           </span>
           <div className="flex gap-0.5">
@@ -48,9 +48,8 @@ export function SystemPromptSection({
               <Button
                 key={p.id}
                 variant="ghost"
-                size="xs"
+                size="sm"
                 className={cn(
-                  "h-[18px] rounded px-1.5 text-[8px]",
                   activePreset === p.id
                     ? "border border-primary/30 bg-primary/10 text-primary"
                     : "border border-transparent text-muted-foreground",

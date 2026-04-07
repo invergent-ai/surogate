@@ -191,7 +191,9 @@ export function ModelDetail({ model }: { model: Model }) {
               </Button>
             )}
             {toStatus(model.status) === "serving" && (
-              <Button variant="outline" size="sm">
+              <Button variant="outline" size="sm" onClick={() => {
+                navigate({ to: "/studio/playground", search: { modelId: model.id } });
+              }}>
                 &#x25B7; Playground
               </Button>
             )}
