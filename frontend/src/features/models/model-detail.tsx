@@ -31,7 +31,7 @@ export function ModelDetail({ model }: { model: Model }) {
 
   const configComplete = isProxy || (
     model.engine !== "\u2014" &&
-    (model.engine === "llamacpp" || model.infra === "k8s" || (model.gpu.type !== "\u2014" && model.gpu.count > 0)));
+    (model.engine === "llamacpp" || model.infra === "kubernetes" || (model.gpu.type !== "\u2014" && model.gpu.count > 0)));
 
   const handleStart = () => {
     if (confirm(`Deploy ${model.displayName}?`)) {

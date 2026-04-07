@@ -444,7 +444,7 @@ def _build_service_params(
             "RCLONE_CONFIG_LAKEFS_PROVIDER": "Other",
             "RCLONE_CONFIG_LAKEFS_ENV_AUTH": "false",
             "RCLONE_CONFIG_LAKEFS_NO_CHECK_BUCKET": "true",
-            "RCLONE_CONFIG_LAKEFS_ENDPOINT": lakefs_k8s_s3_endpoint if svc.infra == "k8s" else (lakefs_s3_endpoint or ""),
+            "RCLONE_CONFIG_LAKEFS_ENDPOINT": lakefs_k8s_s3_endpoint if svc.infra == "kubernetes" else (lakefs_s3_endpoint or ""),
             "RCLONE_CONFIG_LAKEFS_ACCESS_KEY_ID": lakefs_access_key,
             "RCLONE_CONFIG_LAKEFS_SECRET_ACCESS_KEY": lakefs_secret_key,
         }

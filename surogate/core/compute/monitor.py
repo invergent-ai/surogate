@@ -11,7 +11,7 @@ import subprocess
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
-from surogate.core.compute.dstack import get_active_run_statuses, map_status
+from surogate.core.compute.dstack import get_active_run_statuses, get_run_metrics, map_status
 from surogate.core.db.engine import get_session_factory
 from surogate.core.db.repository import compute as repo
 from surogate.utils.logger import get_logger
@@ -119,6 +119,16 @@ class ServingMonitor:
             await self._sync_serving_services(session, active_services, all_statuses)
             await self._sync_managed_jobs(session, active_jobs, all_statuses)
 
+            # Build service_id → model_id map so metrics are keyed by model ID
+            svc_to_model: dict[str, str] = {}
+            for svc in active_services:
+                model = await repo.get_deployed_model_by_service(session, svc.id)
+                if model is not None:
+                    svc_to_model[svc.id] = model.id
+
+        # Broadcast metrics for running dstack workloads
+        await self._broadcast_metrics(active_services, active_jobs, svc_to_model)
+
     async def _sync_serving_services(
         self, session, db_services, dstack_statuses: dict[str, str],
     ) -> None:
@@ -197,6 +207,40 @@ class ServingMonitor:
 
             data = _job_to_dict(job, new_status, started)
             await self._fire_callbacks("job", job.id, job.name, old_status, new_status, data)
+
+    # ── Metrics broadcast ────────────────────────────────────────────
+
+    async def _broadcast_metrics(self, services, jobs, svc_to_model: dict[str, str]) -> None:
+        """Fetch latest dstack metrics for running workloads and broadcast them."""
+        from surogate.server.notifier import manager as ws_manager
+
+        running = []
+        for svc in services:
+            if svc.status == "running" and svc.dstack_run_name and svc.dstack_project_name:
+                entity_id = svc_to_model.get(svc.id, svc.id)
+                running.append(("model", entity_id, svc.dstack_project_name, svc.dstack_run_name))
+        for job in jobs:
+            if job.status == "running" and job.dstack_run_name and job.dstack_project_name:
+                running.append(("job", job.id, job.dstack_project_name, job.dstack_run_name))
+
+        if not running:
+            return
+
+        tasks = [
+            get_run_metrics(proj, run)
+            for _, _, proj, run in running
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for (entity_type, entity_id, _, _), result in zip(running, results):
+            if isinstance(result, Exception) or result is None:
+                continue
+            await ws_manager.broadcast({
+                "type": "metrics",
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "metrics": result,
+            })
 
     # ── Local task watch wrapper ─────────────────────────────────────
 

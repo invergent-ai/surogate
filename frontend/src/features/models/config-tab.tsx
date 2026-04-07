@@ -138,12 +138,12 @@ export function ConfigTab({ model }: { model: Model }) {
   const needsCompute = !model.source || model.source === "local_hub" || model.source === "huggingface";
 
   // Derive initial compute target from model's infra
-  const isCloud = !!model.infra && model.infra !== "k8s";
+  const isCloud = !!model.infra && model.infra !== "kubernetes";
   const [computeIdx, setComputeIdx] = useState(isCloud ? 1 : 0);
   const [cloud, setCloud] = useState(isCloud ? model.infra! : "");
   const [selectedOffer, setSelectedOffer] = useState<InstanceOffer | null>(null);
   const [localGpuCount, setLocalGpuCount] = useState(
-    !isCloud && model.gpu.count > 0 ? String(model.gpu.count) : "1"
+    !isCloud ? String(model.gpu.count) : "1"
   );
   const [engine, setEngine] = useState(model.engine !== "\u2014" ? model.engine : "");
 
@@ -163,13 +163,13 @@ export function ConfigTab({ model }: { model: Model }) {
     setSaving(true);
     const acc = computeIdx === 1 && selectedOffer && selectedOffer.gpu_name
       ? `${selectedOffer.gpu_name}:${selectedOffer.gpu_count}`
-      : computeIdx === 0
+      : computeIdx === 0 && localGpuCount !== "0"
         ? `GPU:${localGpuCount}`
         : undefined;
     await updateModel(model.id, {
       engine: engine || undefined,
       accelerators: acc,
-      infra: computeIdx === 1 ? (cloud || undefined) : "k8s",
+      infra: computeIdx === 1 ? (cloud || undefined) : "kubernetes",
       instance_type: computeIdx === 1 && selectedOffer ? selectedOffer.instance : undefined,
       region: computeIdx === 1 && selectedOffer ? selectedOffer.region : undefined,
       use_spot: selectedOffer?.spot ?? false,

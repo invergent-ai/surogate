@@ -6,13 +6,17 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import { useAppStore } from "@/stores/app-store";
 import { cn } from "@/utils/cn";
 
-const NAV_SECTIONS = [
+function useNavSections() {
+  const models = useAppStore((s) => s.models);
+  const modelCount = models.length;
+
+  return [
   {
     label: "OPERATE",
     items: [
       { path: "/studio", icon: "◫", label: "Dashboard", badge: null },
       { path: "/studio/agents", icon: "⬡", label: "Agents", badge: "12" },
-      { path: "/studio/models", icon: "◇", label: "Models", badge: "4" },
+      { path: "/studio/models", icon: "◇", label: "Models", badge: modelCount > 0 ? String(modelCount) : null },
       { path: "/studio/skills", icon: "⚡", label: "Skills & Tools", badge: "38" },
       { path: "/studio/compute", icon: "☁", label: "Compute", badge: null },
     ],
@@ -37,7 +41,8 @@ const NAV_SECTIONS = [
     label: "REGISTRY",
     items: [{ path: "/studio/hub", icon: "⊕", label: "Data Hub", badge: null }],
   },
-] as const;
+];
+}
 
 export function Navbar() {
   const [collapsed, setCollapsed] = useState(false);
@@ -45,6 +50,7 @@ export function Navbar() {
   const projects = useAppStore((s) => s.projects);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const project = projects.find((p) => p.id === activeProjectId);
+  const NAV_SECTIONS = useNavSections();
 
   return (
     <nav

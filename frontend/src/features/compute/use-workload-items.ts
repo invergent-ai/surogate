@@ -38,7 +38,7 @@ function modelToWorkloadItem(m: Model): ExtendedWorkload {
     priority: 0,
     gpu: gpuLabel,
     gpuCount: m.gpu.count,
-    location: m.infra && m.infra !== "k8s" ? m.infra : "local",
+    location: m.infra && m.infra !== "kubernetes" ? m.infra : "local",
     node: m.namespace !== "\u2014" ? m.namespace : "\u2014",
     eta: m.uptime !== "\u2014" ? `up ${m.uptime}` : "\u2014",
     startedAt: m.lastDeployed !== "\u2014" ? m.lastDeployed : null,

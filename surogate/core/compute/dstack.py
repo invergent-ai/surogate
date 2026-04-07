@@ -571,7 +571,7 @@ async def launch_service(
     try:
         # Create a fleet matching this service's requirements
         fleet_name = _dstack_name(svc.name, prefix="f")
-        fleet_backends = [svc.infra] if svc.infra and svc.infra != "k8s" else None
+        fleet_backends = [svc.infra] if svc.infra and svc.infra != "kubernetes" else None
         fleet_instance_types = [svc.instance_type] if svc.instance_type else None
         fleet_regions = [svc.region] if svc.region else None
         await _create_fleet_for_run(
@@ -1054,3 +1054,62 @@ async def get_active_run_statuses(project_name: str) -> dict[str, str]:
             project_name, exc_info=True,
         )
         return {}
+
+
+# ── Metrics ─────────────────────────────────────────────────────────
+
+
+async def get_run_metrics(
+    project_name: str,
+    run_name: str,
+    limit: int = 1,
+) -> Optional[dict]:
+    """Fetch the latest metrics for a dstack run.
+
+    Returns a dict of ``{metric_name: value}`` for the most recent sample,
+    or *None* if metrics are unavailable.
+    """
+    from dstack._internal.server.db import get_session_ctx as dstack_session_ctx
+    from dstack._internal.server.services.jobs import get_run_job_model
+    from dstack._internal.server.services.metrics import get_job_metrics
+    from dstack._internal.server.services.projects import get_project_model_by_name
+
+    try:
+        async with dstack_session_ctx() as dstack_session:
+            project = await get_project_model_by_name(
+                session=dstack_session, project_name=project_name,
+            )
+            if project is None:
+                return None
+
+            job_model = await get_run_job_model(
+                session=dstack_session,
+                project=project,
+                run_name=run_name,
+                run_id=None,
+                replica_num=0,
+                job_num=0,
+            )
+            if job_model is None:
+                return None
+
+            job_metrics = await get_job_metrics(
+                session=dstack_session,
+                job_model=job_model,
+                limit=limit,
+            )
+            if not job_metrics.metrics:
+                return None
+
+            # Flatten to {name: latest_value} for the most recent sample
+            result: dict = {}
+            for m in job_metrics.metrics:
+                if m.values:
+                    result[m.name] = m.values[0]
+            return result
+    except Exception:
+        logger.debug(
+            "Could not fetch metrics for run %s in project %s",
+            run_name, project_name, exc_info=True,
+        )
+        return None

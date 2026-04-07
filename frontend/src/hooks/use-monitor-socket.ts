@@ -21,6 +21,15 @@ interface TransitionMessage {
   data: Record<string, unknown>;
 }
 
+interface MetricsMessage {
+  type: "metrics";
+  entity_type: "model" | "job";
+  entity_id: string;
+  metrics: Record<string, number>;
+}
+
+type WsMessage = TransitionMessage | MetricsMessage;
+
 const RECONNECT_DELAY = 3_000;
 
 export function useMonitorSocket() {
@@ -43,14 +52,17 @@ export function useMonitorSocket() {
       wsRef.current = ws;
 
       ws.onmessage = (ev) => {
-        let msg: TransitionMessage;
+        let msg: WsMessage;
         try {
-          msg = JSON.parse(ev.data as string) as TransitionMessage;
+          msg = JSON.parse(ev.data as string) as WsMessage;
         } catch {
           return;
         }
-        if (msg.type !== "transition") return;
-        dispatch(msg);
+        if (msg.type === "transition") {
+          dispatch(msg);
+        } else if (msg.type === "metrics") {
+          dispatchMetrics(msg);
+        }
       };
 
       ws.onclose = () => {
@@ -152,6 +164,10 @@ function dispatchTask(
   ) {
     notifyTaskFinished(updated);
   }
+}
+
+function dispatchMetrics(msg: MetricsMessage) {
+  useAppStore.getState().pushMetrics(msg.entity_id, msg.metrics);
 }
 
 function notifyTaskFinished(task: LocalTask) {
