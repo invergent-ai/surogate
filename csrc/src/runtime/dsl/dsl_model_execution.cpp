@@ -837,10 +837,13 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     // The sizing simulation captures ~55% of actual backward peak (flash attention
     // backward workspace and accumulated temps are not fully modeled), so we use
     // base_multiplier=2 for both LoRA and full fine-tune.
-    const long base_multiplier = 2L;
+    // CPU-RAM centric: tighter multiplier since stack resets at each layer boundary.
+    const long base_multiplier = mOptions.CpuTraining ? 1L : 2L;
     long required_size = std::max(1024L * 1024,
                                   base_size * base_multiplier + moe_extra + safety_bytes + extra_tmp + attn_fallback_bytes);
-    const long slack_bytes = lora_stack_tight ? (256L * 1024 * 1024) : (512L * 1024 * 1024);
+    const long slack_bytes = mOptions.CpuTraining ? (128L * 1024 * 1024)
+                           : lora_stack_tight     ? (256L * 1024 * 1024)
+                           :                        (512L * 1024 * 1024);
     required_size += slack_bytes;  // extra slack for unmodeled temps
     const bool is_qwen3_hybrid_lora =
         lora_stack_tight &&
@@ -863,7 +866,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         moe_stack_slack = std::max(moe_stack_slack, mb * 1024 * 1024);
     }
     required_size += moe_stack_slack;
-    long min_stack_base = lora_stack_tight ? (512L * 1024 * 1024) : (3L * 1024 * 1024 * 1024);
+    long min_stack_base = mOptions.CpuTraining  ? (512L * 1024 * 1024)
+                        : lora_stack_tight     ? (512L * 1024 * 1024)
+                        :                        (3L * 1024 * 1024 * 1024);
     if (is_qwen3_hybrid_lora) {
         min_stack_base = std::max(min_stack_base, 1024L * 1024 * 1024);
     }
@@ -914,6 +919,22 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mGrads->configure(grad_config);
     }
 
+    // CPU-RAM centric training: enable per-layer gradient streaming only for full fine-tune.
+    // LoRA adapter gradients already live in the dedicated LoRA grad manager, so streaming
+    // frozen base-model grads here is unnecessary and can interfere with the LoRA path.
+    if (mGrads && mOptions.CpuTraining && !lora_enabled() && !mGrads->param_names().empty()) {
+        // For single-GPU, configure() may not have been called yet (it requires world_size > 1).
+        // Ensure the layer map is built by calling configure with minimal config.
+        if (comm.world_size() == 1) {
+            DslGradStoreConfig grad_config;
+            grad_config.num_shards = 1;
+            grad_config.shard_idx = 0;
+            grad_config.num_layers = mModelConfig.NumLayers;
+            mGrads->configure(grad_config);
+        }
+        mGrads->enable_streaming(*mParams);
+    }
+
     GraphExecutorOptions exec_opts;
     exec_opts.auto_backward = true;
     exec_opts.debug_print_backward = false;
@@ -932,9 +953,11 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
                       << ", heuristic=" << required_size / (1024 * 1024) << " MiB" << std::endl;
         }
         if (bwd_peak > 0) {
-            // Use bwd_peak/3 safety margin to account for dispatch-internal temps
-            // (e.g. fused matmul+swiglu backward) that are not represented in the graph.
-            const long safety = std::max(128L * 1024 * 1024, bwd_peak / 3);
+            // Safety margin for dispatch-internal temps not in the graph.
+            // cpu_training: tighter margin since stack resets at each layer boundary.
+            const long safety = mOptions.CpuTraining
+                ? std::max(64L * 1024 * 1024, bwd_peak / 8)
+                : std::max(128L * 1024 * 1024, bwd_peak / 3);
             const long needed = bwd_peak + safety;
             if (needed > required_size) {
                 if (options.DebugMemoryBreakdown && comm.rank() == 0) {

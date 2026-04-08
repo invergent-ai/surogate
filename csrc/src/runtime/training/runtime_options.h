@@ -52,6 +52,12 @@ struct RuntimeOptions {
     bool UseCudaGraphs = false;
     bool TriggerTimingEvents = false;
 
+    // CPU-RAM centric training: stream weights & gradients per-layer, run optimizer on CPU.
+    // Replaces the old per-component offload flags for user-facing config.
+    bool CpuTraining = false;
+
+    // Internal flags — driven by CpuTraining or legacy config paths.
+    // Not exposed in Python config; set programmatically.
     bool OffloadMaster = false;
     bool OffloadQuants = false;
     bool OffloadOptimizer = false;

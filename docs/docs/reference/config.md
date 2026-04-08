@@ -35,20 +35,62 @@ Recomputation trades compute for memory by recomputing activations during the ba
 | ----------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `recompute` | bool | `true`  | Enable activation recomputation. `false` saves all activations (fastest, most memory). `true` recomputes intermediates from checkpoints (saves VRAM, small compute overhead). |
 
-## Offloading Options
+## CPU-RAM Centric Training
 
-Offloading options move tensors to host (CPU) memory to reduce GPU memory usage at the cost of increased data transfer overhead.
+CPU-RAM centric training keeps model weights and optimizer state on CPU, streaming data to/from GPU per-layer. This allows training models that exceed GPU memory on a single GPU or across multiple GPUs with simple data parallelism (no ZeRO sharding required).
+
+| Option         | Type | Default | Description                                                                                                                                                                                                                                                                              |
+| -------------- | ---- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cpu_training` | bool | `false` | Enable CPU-RAM centric training. Streams weights from CPU per-layer during forward/backward, offloads gradients to CPU per-layer, and runs FP32 AdamW optimizer on CPU. Works with single-GPU and multi-GPU (data parallelism via per-layer NCCL all-reduce). Disables CUDA graphs. |
+
+**What `cpu_training` enables:**
+
+- **Weight streaming**: Base model weights stored in CPU pinned memory, loaded to GPU one layer at a time via double-buffered prefetch (overlaps H2D with compute).
+- **Gradient streaming** (FFT only): Parameter gradients copied to CPU per-layer during backward via double-buffered D2H, then recycled. GPU gradient memory is constant regardless of model depth.
+- **CPU optimizer** (FFT only): FP32 AdamW runs on CPU with OpenMP parallelization. No 8-bit quantization (CPU RAM is abundant).
+- **LoRA support**: With LoRA, only weight streaming is active (LoRA adapters and their optimizer stay on GPU since they're small).
+- **Multi-GPU**: Each GPU streams weights independently. Gradients are all-reduced per-layer on GPU (fast NVLink/PCIe) before D2H. All ranks run identical CPU optimizer updates, keeping weights in sync.
+
+**GPU memory usage with `cpu_training`:**
+
+| Component        | Without `cpu_training`      | With `cpu_training`                   |
+| ---------------- | --------------------------- | ------------------------------------- |
+| Model weights    | All layers on GPU           | ~2 layers (double-buffered prefetch)  |
+| Gradients (FFT)  | All layers on GPU           | ~2 layers (double-buffered D2H)       |
+| Optimizer state   | On GPU (8-bit quantized)    | On CPU (FP32, unlimited RAM)          |
+| Activations      | Per recompute settings      | Same                                  |
+| LoRA adapters    | On GPU                      | On GPU (unchanged, small)             |
+
+**Limitations:**
+
+- Not compatible with QLoRA (`qlora_bnb`, `qlora_fp8`, `qlora_fp4`) or pre-quantized models — these use a separate weight pipeline that doesn't support CPU streaming.
+- Not recommended for MoE models — per-layer expert weight streaming is too slow due to many small PCIe transfers. Use QLoRA with `qlora_offload_experts` instead.
+- Mutually exclusive with ZeRO sharding (`zero_level > 1`).
+
+**Example:**
+```yaml
+model: Qwen/Qwen3-8B
+cpu_training: true
+lora: true
+lora_rank: 16
+per_device_train_batch_size: 2
+sequence_len: 2048
+```
+
+## Offloading Options (Legacy)
+
+These options provide fine-grained control over CPU offloading. For most use cases, `cpu_training: true` is simpler and replaces these flags. These remain available for advanced configurations and backward compatibility.
 
 | Option               | Type | Default | Description                                                                                                                                                                                                                   |
 | -------------------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `offload_residual`   | bool | `false` | Offload residuals (of the FFN block) to pinned host memory. Combined with `recompute`, total activation memory becomes independent of network depth.                                                                          |
-| `offload_master`     | bool | `false` | Store master weights in pinned host memory.                                                                                                                                                                                   |
+| `offload_master`     | bool | `false` | **Legacy** — use `cpu_training` instead. Store master weights in pinned host memory.                                                                                                                                          |
 | `offload_quants`     | bool | `false` | Store quantized weights in pinned host memory. Requires `persistent_quants`.                                                                                                                                                  |
-| `offload_optimizer`  | bool | `false` | Store optimizer state in pinned host memory. Slows down optimizer step drastically, but with enough gradient accumulation steps, the overall contribution becomes negligible.                                                 |
-| `offload_grads`      | bool | `false` | Offload gradients to pinned host memory. Requires `shard_gradients=true` or `zero_level >= 2`.                                                                                                                                |
+| `offload_optimizer`  | bool | `false` | **Legacy** — use `cpu_training` instead. Store optimizer state in pinned host memory.                                                                                                                                         |
+| `offload_grads`      | bool | `false` | **Legacy** — use `cpu_training` instead. Offload gradients to pinned host memory.                                                                                                                                             |
 | `persistent_quants`  | bool | `false` | Avoid re-quantization of weights. Increases memory, but when combined with `offload_quants`, the additional memory is placed on the host. In PCIe settings, this can lead to significant speed-ups. Requires `shard_weights`. |
-| `use_zero_copy`      | bool | `false` | Use ZeroCopy memory access instead of double-buffered cudaMemcpy for offloaded optimizer states. DMA is slower on consumer cards but faster on professional cards.                                                            |
-| `use_write_combined` | bool | `false` | Use write-combined memory for offloaded tensors. May improve PCIe throughput in some situations.                                                                                                                              |
+| `use_zero_copy`      | bool | `false` | **Legacy** — use `cpu_training` instead. Use ZeroCopy memory access for offloaded optimizer states.                                                                                                                           |
+| `use_write_combined` | bool | `false` | **Legacy** — use `cpu_training` instead. Use write-combined memory for offloaded tensors.                                                                                                                                     |
 
 ## Multi-GPU Training (ZeRO) Options
 

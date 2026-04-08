@@ -296,6 +296,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
       mRecomputeLevel(options.Recompute),
       mLoraOnlyMode(lora_only_mode),
       mPrequantized(prequantized),
+      mCpuTraining(options.CpuTraining),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
     if (!mAllocator) {
@@ -705,7 +706,11 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     //
     const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
     const bool share_grads = recompute_enabled;
-    const bool share_res_ffn = false;  // ResidualManager manages these
+    // d_res_ffn cannot be shared with alternating buffers because zero_activation_gradients()
+    // zeroes all layers' d_res_ffn at backward start — with shared buffers, zeroing layer N-2
+    // destroys the loss gradient stored in layer N (same underlying buffer).
+    // TODO: fix zero_activation_gradients to handle shared buffers before enabling this.
+    const bool share_res_ffn = false;
     const bool share_mlp_down = recompute_enabled;
     const bool large_bwd_temps_on_stack = recompute_enabled;
 

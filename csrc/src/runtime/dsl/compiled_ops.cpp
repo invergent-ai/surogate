@@ -4641,6 +4641,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
         if (op.layer_start >= 0) {
             handle_layer_start(op.layer_start);
+
+            // CPU-RAM centric: bind rotating GPU gradient buffer for this layer
+            if (mGrads.is_streaming_grads()) {
+                mGrads.prepare_layer_grads(op.layer_start, mRunState.MainStream);
+                // Rebind gradient tensors in compiled executor (updates mTensors + mNamedTensors)
+                for (const auto& pname : mGrads.layer_grad_names(op.layer_start)) {
+                    std::string gname = "d_" + pname;
+                    bool dummy = false;
+                    Tensor* grad = mGrads.get_param_grad(pname, dummy);
+                    if (grad) bind_tensor(gname, *grad);
+                }
+            }
+
             if (mRecomputeEnabled && mRecomputeFn) {
                 const int layer_idx = op.layer_start;
                 if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
@@ -4954,14 +4967,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     // Release this layer's offloaded weights (if applicable)
                     handle_layer_end(op.layer_end);
 
-                    // Trigger async gradient reduction for this layer on side_stream.
-                    // This overlaps communication with the next layer's backward compute on MainStream.
-                    if (mComm && mComm->world_size() > 1) {
-                        // Record event on MainStream to ensure layer gradients are ready
+                    if (mGrads.is_streaming_grads()) {
+                        // CPU-RAM centric: reduce (multi-GPU) then D2H to CPU
+                        if (mComm && mComm->world_size() > 1) {
+                            CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                            CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                            mGrads.reduce_layer_grads(op.layer_end, mRunState.side_stream(), *mComm);
+                        }
+                        mGrads.offload_layer_grads(op.layer_end, mRunState.MainStream, mRunState.side_stream());
+                    } else if (mComm && mComm->world_size() > 1) {
+                        // Existing path: async gradient reduction on side_stream
                         CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
-                        // Wait for gradients on side_stream before starting reduction
                         CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-                        // Start async reduction on side_stream (overlaps with next layer backward on MainStream)
                         mGrads.notify_block(op.layer_end, mRunState.side_stream(), *mComm);
                     }
                 }
@@ -5083,6 +5100,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         if (mOptions.LMHeadChunks <= 1) {
             mWeightManager->release_lm_head(mRunState.MainStream);
         }
+    }
+
+    // CPU-RAM centric: offload non-block gradients (embedding, lm_head, final_norm) to CPU
+    if (mGrads.is_streaming_grads()) {
+        mGrads.offload_non_block_grads(mRunState.MainStream);
     }
 }
 

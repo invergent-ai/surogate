@@ -178,6 +178,7 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.offload_quants = options.OffloadQuants;
     mConfig.persistent_quants = options.PersistentQuants;
     mConfig.use_zero_copy = options.UseZeroCopy;
+    mConfig.cpu_training = options.CpuTraining;
     mConfig.enable_fp8_forward = options.fp8_forward_enabled();
 
     // Enable streaming if sharding weights with multiple GPUs
@@ -249,9 +250,13 @@ void DslWeightManager::allocate_weights(const Module& module,
 
         // Determine allocation location for master weights
         EAllocationType master_alloc = EAllocationType::ON_DEVICE;
-        if (mConfig.offload_master && entry.is_block) {
-            // PINNED gives cudaHostAlloc with mapped flag, enabling zero-copy access from GPU
-            master_alloc = EAllocationType::PINNED;
+        if (mConfig.offload_master) {
+            // PINNED gives cudaHostAlloc with mapped flag, enabling zero-copy access from GPU.
+            // For cpu_training: ALL weights (block + non-block) go to pinned CPU.
+            // For legacy offload_master: only block weights go to pinned CPU.
+            if (entry.is_block || mConfig.cpu_training) {
+                master_alloc = EAllocationType::PINNED;
+            }
         }
 
         // Replicate embeddings and lm_head when sharding to avoid per-step all-gather
@@ -280,6 +285,16 @@ void DslWeightManager::allocate_weights(const Module& module,
         } else if (entry.is_block && (mStreamWeights || mConfig.offload_master)) {
             // Work weights for blocks are allocated in prefetch buffers
             entry.work = Tensor{};  // Will be set during gather
+        } else if (mConfig.cpu_training && !entry.is_block) {
+            // CPU-RAM centric: only embedding/lm_head may share a GPU work buffer.
+            // final_norm is gathered alongside them in forward/backward, so sharing it
+            // would let the later gather clobber the earlier weight before use.
+            if (is_embedding_name(name) || is_lm_head_name(name)) {
+                entry.work = Tensor{};  // Will be set to the shared buffer below
+            } else {
+                entry.work = mAllocator->allocate(param_dtype, (name + "_work").c_str(),
+                                                  EAllocationType::ON_DEVICE, shape);
+            }
         } else {
             // Work weights on device (use param dtype for compute)
             entry.work = mAllocator->allocate(param_dtype, (name + "_work").c_str(),
@@ -294,6 +309,48 @@ void DslWeightManager::allocate_weights(const Module& module,
     std::sort(mParamOrder.begin(), mParamOrder.end());
     for (auto& layer_names : mBlockParamNames) {
         std::sort(layer_names.begin(), layer_names.end());
+    }
+
+    // CPU-RAM centric: allocate a shared GPU buffer for embedding/lm_head work weights.
+    // These are never live simultaneously. final_norm must keep its own buffer because
+    // the executor gathers embedding+final_norm in forward and final_norm+lm_head in
+    // backward before either pair is consumed.
+    if (mConfig.cpu_training) {
+        const ETensorDType work_dtype = mConfig.work_dtype;
+        std::size_t max_shared_non_block_bytes = 0;
+        std::vector<long> max_shared_non_block_shape;
+        for (auto& kv : mWeights) {
+            const auto& name = kv.first;
+            auto& entry = kv.second;
+            if (entry.is_block || entry.work.Data) continue;
+            if (!is_embedding_name(name) && !is_lm_head_name(name)) continue;
+            std::size_t bytes = 1;
+            std::vector<long> shape(entry.master.Sizes.begin(),
+                                    entry.master.Sizes.begin() + entry.master.Rank);
+            for (auto d : shape) bytes *= static_cast<std::size_t>(d);
+            bytes *= get_dtype_size(work_dtype);
+            if (bytes > max_shared_non_block_bytes) {
+                max_shared_non_block_bytes = bytes;
+                max_shared_non_block_shape = shape;
+            }
+        }
+        if (max_shared_non_block_bytes > 0) {
+            Tensor shared_buf = mAllocator->allocate(work_dtype, "embedding_lm_head_work_shared",
+                                                     EAllocationType::ON_DEVICE,
+                                                     max_shared_non_block_shape);
+            // Point only embedding/lm_head entries to this shared buffer.
+            // Each gather call overwrites it with the correct tensor before use.
+            for (auto& kv : mWeights) {
+                const auto& name = kv.first;
+                auto& entry = kv.second;
+                if (entry.is_block || entry.work.Data) continue;
+                if (!is_embedding_name(name) && !is_lm_head_name(name)) continue;
+                entry.work = Tensor::from_pointer(
+                    shared_buf.Data, shared_buf.Device, work_dtype,
+                    std::vector<long>(entry.master.Sizes.begin(),
+                                     entry.master.Sizes.begin() + entry.master.Rank));
+            }
+        }
     }
 }
 
@@ -506,6 +563,9 @@ void DslWeightManager::sync_work_from_master(cudaStream_t stream) {
         if ((mStreamWeights || mConfig.offload_master) && entry.is_block) {
             continue;  // Block weights are gathered on demand
         }
+        if (mConfig.cpu_training && !entry.is_block) {
+            continue;  // Non-block weights are gathered on demand in cpu_training
+        }
         convert_to_work(entry.master, entry.work, stream);
     }
 }
@@ -652,7 +712,8 @@ void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t st
     if ((!mStreamWeights && !mConfig.offload_master) || mEmbeddingName.empty()) {
         return;
     }
-    if (mEmbeddingsStatus.version == mVersion) {
+    // Skip cache check when cpu_training — shared buffer may have been overwritten by lm_head
+    if (!mConfig.cpu_training && mEmbeddingsStatus.version == mVersion) {
         return;
     }
 
@@ -701,7 +762,7 @@ void DslWeightManager::gather_final_norm(NCCLCommunicator& comm, cudaStream_t st
     if ((!mStreamWeights && !mConfig.offload_master) || mFinalNormName.empty()) {
         return;
     }
-    if (mFinalNormStatus.version == mVersion) {
+    if (!mConfig.cpu_training && mFinalNormStatus.version == mVersion) {
         return;
     }
 
@@ -750,7 +811,7 @@ void DslWeightManager::gather_lm_head(NCCLCommunicator& comm, cudaStream_t strea
     if ((!mStreamWeights && !mConfig.offload_master) || mLmHeadName.empty()) {
         return;
     }
-    if (mLmHeadStatus.version == mVersion) {
+    if (!mConfig.cpu_training && mLmHeadStatus.version == mVersion) {
         return;
     }
 

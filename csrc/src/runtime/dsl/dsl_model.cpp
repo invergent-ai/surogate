@@ -1031,7 +1031,8 @@ DslModel::DslModel(const PretrainedConfig& config,
                                             options.offload_alloc(),
                                             mNumShards,
                                             mConfig->TiedWordEmbeddings,
-                                            grad_dtype_override);
+                                            grad_dtype_override,
+                                            options.CpuTraining);
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {

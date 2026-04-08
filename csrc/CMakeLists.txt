@@ -420,6 +420,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/optimizers/adamw_8bit.cu
     src/runtime/optimizers/flash_adamw_8bit.cu
     src/runtime/optimizers/adamw.cu
+    src/runtime/optimizers/cpu_adamw.cpp
     src/runtime/optimizers/polar_express.cu
     src/runtime/optimizers/normuon.cu
     src/kernels/attention.cu

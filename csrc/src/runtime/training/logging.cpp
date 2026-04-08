@@ -931,17 +931,17 @@ void print_memory_breakdown(
     printf("Optimization Suggestions:\n");
     bool has_suggestions = false;
     if (categories["Activations (per-layer)"].bytes > 2ULL * 1024 * 1024 * 1024) {
-        printf("  - High activation memory (%.0f MiB): try --recompute-block or --recompute-ffn\n",
+        printf("  - High activation memory (%.0f MiB):\n",
                categories["Activations (per-layer)"].bytes / 1024.0 / 1024.0);
         has_suggestions = true;
     }
     if (categories["Gradients"].bytes > 1ULL * 1024 * 1024 * 1024) {
-        printf("  - High gradient memory (%.0f MiB): try --offload-gradients or --shard-gradients\n",
+        printf("  - High gradient memory (%.0f MiB):\n",
                categories["Gradients"].bytes / 1024.0 / 1024.0);
         has_suggestions = true;
     }
     if (categories["Optimizer State"].bytes > 1ULL * 1024 * 1024 * 1024) {
-        printf("  - High optimizer memory (%.0f MiB): try --offload-optimizer\n",
+        printf("  - High optimizer memory (%.0f MiB):\n",
                categories["Optimizer State"].bytes / 1024.0 / 1024.0);
         has_suggestions = true;
     }

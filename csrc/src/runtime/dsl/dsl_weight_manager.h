@@ -60,6 +60,7 @@ struct DslWeightManagerConfig {
     bool offload_quants = false;     ///< Offload quantized weights to CPU
     bool persistent_quants = false;  ///< Keep quantized weights instead of re-quantizing
     bool use_zero_copy = false;      ///< Use zero-copy for CPU-GPU transfers
+    bool cpu_training = false;       ///< CPU-RAM centric mode (offload ALL weights, not just blocks)
 
     // FP8 caching
     bool enable_fp8_forward = false;

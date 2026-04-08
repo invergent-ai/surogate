@@ -46,7 +46,8 @@ public:
                  EAllocationType offload_alloc = EAllocationType::PINNED,
                  int num_shards = 1,
                  bool tied_embeddings = false,
-                 std::optional<ETensorDType> grad_dtype_override = std::nullopt);
+                 std::optional<ETensorDType> grad_dtype_override = std::nullopt,
+                 bool cpu_training = false);
 
     /// Configure multi-GPU gradient reduction
     void configure(const DslGradStoreConfig& config);
@@ -99,6 +100,44 @@ public:
     /// Get sharded gradients for a specific layer (for optimizer with offloading)
     std::vector<Tensor*> get_layer_sharded_grads(int layer_idx);
 
+    // ========================================================================
+    // CPU-RAM centric gradient streaming (per-layer D2H)
+    // ========================================================================
+
+    /// Enable streaming mode: allocate rotating GPU buffers + CPU pinned storage.
+    /// Call after constructor and configure(), before first backward.
+    void enable_streaming(const DslParamStore& params);
+
+    /// Bind GPU buffer for this layer's gradients (call at layer_start in backward).
+    void prepare_layer_grads(int layer_idx, cudaStream_t stream);
+
+    /// Async D2H copy layer gradients to CPU (call at layer_end in backward).
+    void offload_layer_grads(int layer_idx, cudaStream_t compute_stream, cudaStream_t copy_stream);
+
+    /// Per-layer NCCL all-reduce (multi-GPU). Call at layer_end BEFORE offload.
+    void reduce_layer_grads(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
+
+    /// Copy non-block grads (embedding/lm_head/norm) to CPU. Call once after backward.
+    void offload_non_block_grads(cudaStream_t stream);
+
+    /// Wait for all outstanding D2H copies to complete.
+    void wait_all_offloads(cudaStream_t stream);
+
+    /// Get CPU gradient for optimizer.
+    const Tensor& get_cpu_grad(const std::string& name) const;
+
+    /// Get the full CPU gradient map (for norm computation).
+    const std::unordered_map<std::string, Tensor>& get_cpu_grads_map() const { return mCpuGrads; }
+
+    /// Layer gradient names (for rebinding in compiled executor).
+    const std::vector<std::string>& layer_grad_names(int layer_idx) const;
+
+    /// Is per-layer streaming active?
+    [[nodiscard]] bool is_streaming_grads() const { return mStreamGrads; }
+
+    /// GPU-side accumulated gradient norm (sum of squares). Updated during offload.
+    Tensor& layer_norm_accum() { return mLayerNormAccum; }
+
 private:
     void build_layer_grad_map();
     void build_zero_segments();
@@ -120,6 +159,7 @@ private:
 
     // Offload configuration (stored for deferred sharded allocation in configure())
     bool mOffloadGrads = false;
+    bool mCpuTraining = false;
     EAllocationType mOffloadAlloc = EAllocationType::PINNED;
 
     // Per-layer gradient organization (for overlapped reduction)
@@ -140,6 +180,43 @@ private:
         cudaEvent_t Event = nullptr;
     };
     std::array<BlockState, 2> mBlockStates;  ///< Double-buffer for overlapped layers
+
+    // ========================================================================
+    // CPU-RAM centric gradient streaming state
+    // ========================================================================
+    bool mStreamGrads = false;
+
+    // CPU pinned storage for ALL layers' gradients
+    std::unordered_map<std::string, Tensor> mCpuGrads;
+
+    // Double-buffered GPU gradient pool
+    static constexpr int kNumGradSlots = 2;
+    struct GradBufferSlot {
+        std::unordered_map<std::string, Tensor> buffers;  ///< base_name → GPU tensor
+        int layer_idx = -1;
+        cudaEvent_t d2h_done = nullptr;     ///< D2H copy complete (safe to reuse)
+        cudaEvent_t compute_done = nullptr; ///< backward + reduce done (safe to D2H)
+        cudaEvent_t reduce_done = nullptr;  ///< NCCL reduce done (safe to D2H, multi-GPU)
+    };
+    std::array<GradBufferSlot, kNumGradSlots> mGradSlots;
+    int mActiveGradSlot = 0;
+
+    // Per-layer gradient norm accumulator (single float on GPU)
+    Tensor mLayerNormAccum;
+
+    // CPU staging buffer for micro-step accumulation (pinned, max-layer sized)
+    std::unordered_map<std::string, Tensor> mCpuStagingBuffer;
+
+    // Track pending D2H operations for wait_all_offloads()
+    std::vector<cudaEvent_t> mPendingD2HEvents;
+
+    void allocate_streaming_buffers(const DslParamStore& params);
+    void create_streaming_events();
+    void destroy_streaming_events() noexcept;
+    bool is_block_grad(const std::string& name) const;
+
+    /// Strip layer index from param name: "blocks[5].attn_q_weight" → "blocks[].attn_q_weight"
+    static std::string base_grad_name(const std::string& name);
 };
 
 } // namespace dsl

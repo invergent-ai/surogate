@@ -204,6 +204,7 @@ private:
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
     bool mPrequantized = false;
+    bool mCpuTraining = false;
     bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
     ETensorDType mGradDtype = ETensorDType::BF16;

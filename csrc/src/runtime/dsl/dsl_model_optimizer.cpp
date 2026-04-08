@@ -14,6 +14,7 @@
 #include "runtime/optimizers/adamw.h"
 #include "runtime/optimizers/normuon.h"
 #include "runtime/optimizers/polar_express.h"
+#include "runtime/optimizers/cpu_adamw.h"
 #include "utilities/comm.h"
 #include "utilities/tensor.h"
 
@@ -645,6 +646,13 @@ void DslModel::update_with_config(NCCLCommunicator& comm, const optimizers::Opti
         mLoRAWeights->advance_sync_generation();
         return;
     }
+    // CPU-RAM centric training: route to CPU optimizer
+    if (mGrads && mGrads->is_streaming_grads()) {
+        update_cpu_adamw(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
+                         step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
+        return;
+    }
+
     switch (config.type) {
         case optimizers::OptimizerType::ADAMW:
             update_adamw(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
@@ -1489,6 +1497,117 @@ void DslModel::update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
             throw std::runtime_error("DslModel::update_normuon_graph: grad_scale is NaN/Inf");
         }
     }
+    record_event_if_not_capturing(rs.OptimizerDone, stream);
+}
+
+// ============================================================================
+// CPU-RAM centric optimizer (gradient streaming mode)
+// ============================================================================
+
+void DslModel::update_cpu_adamw(NCCLCommunicator& comm, float learning_rate,
+                                 float beta_1, float beta_2, int t,
+                                 float epsilon, float weight_decay, float grad_clip) {
+    auto& rs = *mRunState;
+    cudaStream_t stream = rs.MainStream;
+
+    // 1. Wait for backward done
+    wait_event_if_not_capturing(stream, rs.BackwardDone);
+
+    // 2. Wait for all D2H gradient copies to complete
+    mGrads->wait_all_offloads(stream);
+
+    // 3. Compute gradient norm on CPU from offloaded gradients
+    //    Apply HuggingFace-style token normalization: scale by 1/valid_tokens
+    //    (matches global_norm_sqrt_kernel behavior in the GPU path)
+    double norm_sq = optimizers::cpu_gradient_norm_squared(
+        mGrads->get_cpu_grads_map(), mGrads->param_names());
+
+    float raw_norm = static_cast<float>(std::sqrt(norm_sq));
+
+    // Read valid token count from GPU (accumulated by loss kernel)
+    float token_scale = 1.0f;
+    if (mUseTokenScale && rs.ValidTokenCount.Data) {
+        int valid_tokens = 0;
+        CUDA_CHECK(cudaMemcpy(&valid_tokens, rs.ValidTokenCount.Data, sizeof(int),
+                               cudaMemcpyDeviceToHost));
+        if (valid_tokens > 0) {
+            token_scale = 1.0f / static_cast<float>(valid_tokens);
+        }
+    } else {
+        // Fallback: use B * T * grad_accum_steps as total tokens
+        float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
+                           * static_cast<float>(std::max(1, rs.GradAccumSteps));
+        token_scale = 1.0f / total_tokens;
+    }
+
+    float scaled_norm = raw_norm * token_scale;
+
+    // Gradient clipping (against the scaled norm, matching GPU path)
+    float clip_scale = 1.0f;
+    if (grad_clip > 0.0f && scaled_norm > grad_clip) {
+        clip_scale = grad_clip / scaled_norm;
+    }
+
+    // Total scale = token normalization * clipping (same as GPU global_norm_sqrt_kernel)
+    float grad_scale = token_scale * clip_scale;
+
+    // Store for reporting (get_norm() reads from NormHost after NormDone)
+    if (rs.NormHost) {
+        rs.NormHost[0] = scaled_norm;
+    }
+    CUDA_CHECK(cudaEventRecord(rs.NormDone, stream));
+
+    // 4. Initialize CPU optimizer state if needed
+    if (!mCpuAdamWState.initialized) {
+        std::size_t total = 0;
+        for (const auto& name : mGrads->param_names()) {
+            total += mWeightManager->get_master(name).nelem();
+        }
+        mCpuAdamWState.m.resize(total, 0.0f);
+        mCpuAdamWState.v.resize(total, 0.0f);
+        mCpuAdamWState.total_params = total;
+        mCpuAdamWState.initialized = true;
+    }
+
+    // 5. Per-parameter CPU optimizer step
+    std::size_t offset = 0;
+    for (const auto& name : mGrads->param_names()) {
+        Tensor& master = mWeightManager->get_master(name);
+        const Tensor& grad = mGrads->get_cpu_grad(name);
+        const auto n = static_cast<std::size_t>(master.nelem());
+
+        if (master.DType == ETensorDType::FP32 && grad.DType == ETensorDType::FP32) {
+            optimizers::cpu_adamw_step(
+                master.get<float>(), grad.get<float>(),
+                mCpuAdamWState.m.data() + offset,
+                mCpuAdamWState.v.data() + offset,
+                n, learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale);
+        } else if (master.DType == ETensorDType::FP32 && grad.DType == ETensorDType::BF16) {
+            optimizers::cpu_adamw_step_bf16(
+                master.get<float>(), grad.Data,
+                mCpuAdamWState.m.data() + offset,
+                mCpuAdamWState.v.data() + offset,
+                n, learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale);
+        } else if (master.DType == ETensorDType::BF16) {
+            // BF16 master weights: read BF16, compute FP32, write BF16
+            optimizers::cpu_adamw_step_bf16_param(
+                master.Data, grad.Data,
+                mCpuAdamWState.m.data() + offset,
+                mCpuAdamWState.v.data() + offset,
+                n, learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale);
+        } else {
+            throw std::runtime_error("update_cpu_adamw: unsupported dtype combination for " + name +
+                " (master=" + std::to_string(static_cast<int>(master.DType)) +
+                ", grad=" + std::to_string(static_cast<int>(grad.DType)) + ")");
+        }
+        offset += n;
+    }
+
+    // 6. Sync updated master weights to GPU work copies (non-block only;
+    //    block weights are gathered on-demand during forward)
+    mWeightManager->invalidate();
+    mWeightManager->sync_work_from_master(stream);
+
     record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 

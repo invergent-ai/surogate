@@ -24,6 +24,7 @@
 #include "runtime/lora/lora_weights_manager.h"
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
+#include "runtime/optimizers/cpu_adamw.h"
 #include "runtime/training/model.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
@@ -273,6 +274,8 @@ private:
     void init_normuon_state(cudaStream_t stream);
     void update_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
                       int t, float epsilon, float weight_decay, float grad_clip);
+    void update_cpu_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
+                          int t, float epsilon, float weight_decay, float grad_clip);
     void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced);
     void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T);
@@ -370,6 +373,9 @@ private:
         Tensor state2;  // FP32 variance
     };
     std::unique_ptr<AdamWState> mAdamWState;
+
+    // CPU-RAM centric FP32 AdamW state (for cpu_training mode)
+    optimizers::CPUAdamWState mCpuAdamWState;
 
     // NorMuon optimizer state for full fine-tuning (hybrid: AdamW for 1D, NorMuon for 2D)
     struct FFTNorMuonState {

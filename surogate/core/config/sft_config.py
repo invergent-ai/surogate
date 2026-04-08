@@ -282,6 +282,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     recompute: Optional[bool] = True
 
     offload_residual: Optional[bool] = False
+
+    # CPU-RAM centric training: stream weights & gradients per-layer, run optimizer on CPU.
+    # Replaces offload_master/offload_optimizer/offload_grads/use_zero_copy/use_write_combined.
+    cpu_training: Optional[bool] = False
+
+    # Legacy offload flags (internal — driven by cpu_training when set)
     offload_master: Optional[bool] = False
     offload_quants: Optional[bool] = False
     persistent_quants: Optional[bool] = False
@@ -409,6 +415,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             self.recompute = bool(recompute_raw)
 
         self.offload_residual = cfg.get('offload_residual', self.offload_residual)
+        self.cpu_training = cfg.get('cpu_training', self.cpu_training)
         self.offload_master = cfg.get('offload_master', self.offload_master)
         self.offload_quants = cfg.get('offload_quants', self.offload_quants)
         self.persistent_quants = cfg.get('persistent_quants', self.persistent_quants)
@@ -559,17 +566,31 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                     break
 
         self._validate_chunking_config()
+
+        # CPU-RAM centric training: auto-set internal flags, validate constraints
+        if self.cpu_training:
+            self.offload_master = True
+            if not self.lora:
+                # FFT: stream gradients to CPU + CPU optimizer
+                self.offload_grads = True
+            # LoRA: base weight streaming via offload_master; LoRA grads + optimizer stay on GPU (small)
+            # Disable ZeRO sharding (not needed — all state on CPU), but keep
+            # zero_level=1 for multi-GPU gradient all-reduce (data parallelism).
+            if self.zero_level > 1:
+                self.zero_level = 1
+            self.shard_gradients = False
+            self.shard_weights = False
+
         if self.offload_optimizer and not self.use_zero_copy:
             logger.warning(
                 "offload_optimizer is enabled but use_zero_copy is false; "
                 "optimizer state will remain on device. Set use_zero_copy=true to offload.")
-        # Validate offload_grads requires gradient sharding (ZeRO-2 or higher)
-        if self.offload_grads:
+        # Validate offload_grads requires gradient sharding or cpu_training
+        if self.offload_grads and not self.cpu_training:
             shard_gradients = self.shard_gradients or self.zero_level >= 2
             if not shard_gradients:
                 raise ValueError(
-                    "offload_grads requires shard_gradients=true or zero_level >= 2. "
-                    "Gradient offloading is only supported with ZeRO-2 (gradient sharding) enabled."
+                    "offload_grads requires cpu_training=true, shard_gradients=true, or zero_level >= 2."
                 )
 
         self._validate_ep_config()
@@ -730,6 +751,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.runtime_config = _surogate.RuntimeOptions(
             recompute="true" if self.recompute else "false",
             offload_residual=self.offload_residual,
+            cpu_training=self.cpu_training,
             offload_master=self.offload_master,
             offload_quants=self.offload_quants,
             offload_optimizer=self.offload_optimizer,

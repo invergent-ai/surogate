@@ -306,6 +306,7 @@ NB_MODULE(_surogate, m) {
         "Backwards-compatibility: `LLamaOptions` is an alias of this class.")
         .def("__init__", [](RuntimeOptions *t, const std::string& recompute, bool offload_residual,
             bool use_cuda_graphs, bool trigger_timing_events,
+            bool cpu_training,
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
             bool init_projections_to_zero, bool debug_memory_breakdown, int lmhead_chunks, int attn_bwd_chunks, bool long_context,
@@ -332,18 +333,23 @@ NB_MODULE(_surogate, m) {
             // Parse recompute level
             RecomputeLevel recompute_level = RuntimeOptions::parse_recompute_level(recompute);
 
+            // When cpu_training is enabled, force internal offload flags
+            const bool eff_offload_master = cpu_training || offload_master;
+            const bool eff_offload_grads  = cpu_training || offload_grads;
+
             new (t) RuntimeOptions{
                 .Recompute = recompute_level,
                 .OffloadResidual = offload_residual,
                 .LMHeadChunks = lmhead_chunks,
                 .AttBwdChunks = attn_bwd_chunks,
                 .LongContext = long_context,
-                .UseCudaGraphs = use_cuda_graphs,
+                .UseCudaGraphs = cpu_training ? false : use_cuda_graphs,
                 .TriggerTimingEvents = trigger_timing_events,
-                .OffloadMaster = offload_master,
+                .CpuTraining = cpu_training,
+                .OffloadMaster = eff_offload_master,
                 .OffloadQuants = offload_quants,
                 .OffloadOptimizer = offload_optimizer,
-                .OffloadGrads = offload_grads,
+                .OffloadGrads = eff_offload_grads,
                 .UseZeroCopy = use_zero_copy,
                 .UseWriteCombined = use_write_combined,
                 .ShardWeights = shard_weights,
@@ -367,6 +373,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("offload_residual") = false,
              nb::arg("use_cuda_graphs") = true,
              nb::arg("trigger_timing_events") = false,
+             nb::arg("cpu_training") = false,
              nb::arg("offload_master") = false,
              nb::arg("offload_quants") = false,
              nb::arg("offload_optimizer") = false,
@@ -424,6 +431,7 @@ NB_MODULE(_surogate, m) {
         .def_rw("long_context", &RuntimeOptions::LongContext, "Enable tiled MLP execution for long context training (reduces memory at long seq_len).")
         .def_rw("use_cuda_graphs", &RuntimeOptions::UseCudaGraphs, "Enable CUDA graphs for steady-state execution.")
         .def_rw("trigger_timing_events", &RuntimeOptions::TriggerTimingEvents, "Log additional timing information.")
+        .def_rw("cpu_training", &RuntimeOptions::CpuTraining, "CPU-RAM centric training: stream weights & gradients per-layer, run optimizer on CPU.")
         .def_rw("offload_master", &RuntimeOptions::OffloadMaster, "Offload FP32 master weights (optimizer state).")
         .def_rw("offload_quants", &RuntimeOptions::OffloadQuants, "Offload quantized weights (if applicable).")
         .def_rw("offload_optimizer", &RuntimeOptions::OffloadOptimizer, "Offload optimizer state (momentum and variance buffers).")
