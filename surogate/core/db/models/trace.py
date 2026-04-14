@@ -1,4 +1,4 @@
-"""Trace domain: ChatTurn – hash-linked conversation tracking for proxied LLM calls."""
+"""Trace domain: ChatTurn – records every proxied chat-completion round-trip."""
 
 from __future__ import annotations
 
@@ -12,35 +12,11 @@ from surogate.core.db.base import Base, UUIDMixin
 
 
 class ChatTurn(UUIDMixin, Base):
-    """One request/response round-trip through the chat-completion proxy.
-
-    Turns are linked into a conversation DAG using dual-key indexing:
-
-    **Pass 1 – Strict match (no compaction):**
-
-    *   **parent_hash** – ``sha256(messages[:-1])``.  Matches a prior turn's
-        ``state_hash``, linking the two.  ``NULL`` for conversation roots.
-    *   **state_hash** – ``sha256(messages + [assistant_reply])``.
-        Becomes the ``parent_hash`` of the *next* turn.
-
-    **Pass 2 – Tail anchor (compaction recovery):**
-
-    *   **tail_hash** – ``sha256([last_user_msg, assistant_reply])``.
-        When the agent compacts older messages the full-context chain
-        breaks, but the most recent user+assistant pair is almost always
-        preserved.  Matching on this pair recovers the thread.
-
-    After a compaction match the proxy *heals* the chain by updating the
-    matched turn's ``state_hash`` so that subsequent Pass-1 lookups
-    succeed without hitting Pass 2 again.
-
-    Branching (regenerations, A/B tests) is free: two turns with the same
-    ``parent_hash`` but different responses simply create two children.
-    """
+    """One request/response round-trip through the chat-completion proxy."""
 
     __tablename__ = "chat_turns"
 
-    # ── Conversation linkage ──────────────────────────────────────────
+    # ── Conversation grouping ─────────────────────────────────────────
     conversation_id: Mapped[str] = mapped_column(
         sa.String(36), index=True,
         doc="Shared by every turn in the same conversation tree.",
@@ -50,12 +26,12 @@ class ChatTurn(UUIDMixin, Base):
         doc="sha256 of messages[:-1]; NULL for root turns.",
     )
     state_hash: Mapped[str] = mapped_column(
-        sa.String(64), index=True, unique=True,
+        sa.String(64), index=True,
         doc="sha256 of full message array including assistant reply.",
     )
     tail_hash: Mapped[str] = mapped_column(
         sa.String(64), index=True,
-        doc="sha256 of [last_user_msg, assistant_reply] pair (compaction fallback).",
+        doc="sha256 of [last_user_msg, assistant_reply] pair.",
     )
 
     # ── Caller identity ───────────────────────────────────────────────

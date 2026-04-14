@@ -218,12 +218,8 @@ export function createPlaygroundAdapter(modelIdOverride?: string): ChatModelAdap
         );
 
         for await (const chunk of stream) {
-          // Handle tool status events
-          const toolStatusText = (
-            chunk as unknown as { _toolStatus?: string }
-          )._toolStatus;
-          if (toolStatusText !== undefined) {
-            store.setToolStatus(toolStatusText || null);
+          // Skip tool status events
+          if ((chunk as unknown as { _toolStatus?: string })._toolStatus !== undefined) {
             continue;
           }
 
@@ -374,20 +370,6 @@ export function createPlaygroundAdapter(modelIdOverride?: string): ChatModelAdap
         const finalTokPerSec = meta?.timings?.predicted_per_second;
         const serverPromptEvalTime = meta?.timings?.prompt_ms;
 
-        if (
-          meta?.usage &&
-          typeof meta.usage.prompt_tokens === "number" &&
-          typeof meta.usage.completion_tokens === "number" &&
-          typeof meta.usage.total_tokens === "number"
-        ) {
-          usePlaygroundStore.getState().setContextUsage({
-            promptTokens: meta.usage.prompt_tokens,
-            completionTokens: meta.usage.completion_tokens,
-            totalTokens: meta.usage.total_tokens,
-            cachedTokens: meta.timings?.cache_n ?? 0,
-          });
-        }
-
         const finalTiming = buildTiming(
           streamStartTime,
           totalChunks,
@@ -440,7 +422,6 @@ export function createPlaygroundAdapter(modelIdOverride?: string): ChatModelAdap
         }
         throw err;
       } finally {
-        usePlaygroundStore.getState().setToolStatus(null);
         usePlaygroundStore.getState().setThreadRunning(threadKey, false);
       }
     },

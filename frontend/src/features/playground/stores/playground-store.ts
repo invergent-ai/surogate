@@ -19,43 +19,29 @@ function asFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+const DEFAULT_PARAMS: PlaygroundParams = {
+  temperature: 0.7,
+  topP: 0.9,
+  topK: 40,
+  maxTokens: 2048,
+  repPenalty: 1.0,
+};
+
 function loadPlaygroundParams(): PlaygroundParams {
-  if (!canUseStorage()) {
-    return {
-      temperature: 0.7,
-      topP: 0.9,
-      topK: 40,
-      maxTokens: 2048,
-      repPenalty: 1.0,
-    };
-  }
+  if (!canUseStorage()) return DEFAULT_PARAMS;
   try {
     const raw = localStorage.getItem(PARAMS_KEY);
-    if (!raw) {
-      return {
-        temperature: 0.7,
-        topP: 0.9,
-        topK: 40,
-        maxTokens: 2048,
-        repPenalty: 1.0,
-      };
-    }
+    if (!raw) return DEFAULT_PARAMS;
     const parsed = JSON.parse(raw) as Partial<PlaygroundParams>;
     return {
-      temperature: asFiniteNumber(parsed.temperature, 0.7),
-      topP: asFiniteNumber(parsed.topP, 0.9),
-      topK: asFiniteNumber(parsed.topK, 40),
-      maxTokens: asFiniteNumber(parsed.maxTokens, 2048),
-      repPenalty: asFiniteNumber(parsed.repPenalty, 1.0),
+      temperature: asFiniteNumber(parsed.temperature, DEFAULT_PARAMS.temperature),
+      topP: asFiniteNumber(parsed.topP, DEFAULT_PARAMS.topP),
+      topK: asFiniteNumber(parsed.topK, DEFAULT_PARAMS.topK),
+      maxTokens: asFiniteNumber(parsed.maxTokens, DEFAULT_PARAMS.maxTokens),
+      repPenalty: asFiniteNumber(parsed.repPenalty, DEFAULT_PARAMS.repPenalty),
     };
   } catch {
-    return {
-      temperature: 0.7,
-      topP: 0.9,
-      topK: 40,
-      maxTokens: 2048,
-      repPenalty: 1.0,
-    };
+    return DEFAULT_PARAMS;
   }
 }
 
@@ -94,13 +80,6 @@ type PlaygroundStore = {
   activePreset: string | null;
   params: PlaygroundParams;
   runningByThreadId: Record<string, boolean>;
-  toolStatus: string | null;
-  contextUsage: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-    cachedTokens: number;
-  } | null;
   activeThreadId: string | null;
 
   setSelectedModelId: (id: string | null) => void;
@@ -110,21 +89,17 @@ type PlaygroundStore = {
   setParams: (params: PlaygroundParams) => void;
   applyPreset: (presetId: string) => void;
   setThreadRunning: (threadId: string, running: boolean) => void;
-  setToolStatus: (status: string | null) => void;
-  setContextUsage: (usage: PlaygroundStore["contextUsage"]) => void;
   setActiveThreadId: (id: string | null) => void;
 };
 
 export const usePlaygroundStore = create<PlaygroundStore>((set) => ({
   selectedModelId: null,
   compareModelId: null,
-  showSessions: false,
+  showSessions: true,
   systemPrompt: loadSystemPrompt(),
   activePreset: "default",
   params: loadPlaygroundParams(),
   runningByThreadId: {},
-  toolStatus: null,
-  contextUsage: null,
   activeThreadId: null,
 
   setSelectedModelId: (selectedModelId) => set({ selectedModelId }),
@@ -174,8 +149,5 @@ export const usePlaygroundStore = create<PlaygroundStore>((set) => ({
       return { runningByThreadId: next };
     }),
 
-  setToolStatus: (toolStatus) => set({ toolStatus }),
-  setContextUsage: (contextUsage) => set({ contextUsage }),
-  setActiveThreadId: (activeThreadId) =>
-    set({ activeThreadId, contextUsage: null }),
+  setActiveThreadId: (activeThreadId) => set({ activeThreadId }),
 }));

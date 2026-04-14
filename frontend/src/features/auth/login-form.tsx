@@ -13,12 +13,6 @@ const AUTH_METHODS: { id: AuthMethod; label: string; disabled?: boolean }[] = [
   { id: "credentials", label: "Credentials" },
   { id: "sso", label: "SSO / OIDC", disabled: true },
 ];
-
-const SOCIAL_PROVIDERS = [
-  { label: "GitHub", icon: "⊞" },
-  { label: "Google", icon: "◇" },
-] as const;
-
 const SSO_PROVIDERS = ["Okta", "Azure AD", "Auth0", "Keycloak"] as const;
 
 type TokenResponse = {
@@ -112,7 +106,7 @@ export function LoginForm() {
           Sign in
         </h3>
         <p className="font-display text-xl text-muted-foreground">
-          Access your workspace and projects
+          Access your workspace
         </p>
       </div>
 
@@ -255,29 +249,6 @@ export function LoginForm() {
               "Sign in"
             )}
           </button>
-
-          {/* divider */}
-          <div className="flex items-center gap-3 my-6">
-            <div className="flex-1 h-px bg-line" />
-            <span className="font-display text-sm text-faint">
-              or continue with
-            </span>
-            <div className="flex-1 h-px bg-line" />
-          </div>
-
-          {/* social auth */}
-          <div className="grid grid-cols-2 gap-2.5">
-            {SOCIAL_PROVIDERS.map((s) => (
-              <button
-                key={s.label}
-                type="button"
-                className="py-2.5 rounded-lg border border-border bg-muted text-subtle font-display text-sm font-medium flex items-center justify-center gap-2 cursor-pointer transition-all duration-150 hover:border-primary/20 hover:bg-input-focus"
-              >
-                <span className="text-sm">{s.icon}</span>
-                {s.label}
-              </button>
-            ))}
-          </div>
         </form>
       )}
 
@@ -319,19 +290,6 @@ export function LoginForm() {
           </div>
         </div>
       )}
-
-      {/* footer */}
-      <div className="mt-8 text-center">
-        <p className="font-display text-sm text-faint">
-          Don&apos;t have an account?{" "}
-          <button
-            type="button"
-            className="bg-transparent border-none text-primary cursor-pointer text-sm font-display font-semibold"
-          >
-            Request access
-          </button>
-        </p>
-      </div>
     </>
   );
 }

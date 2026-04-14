@@ -7,14 +7,17 @@ import { cn } from "@/utils/cn";
 import { LoginForm } from "./login-form";
 
 const TAGS = [
-  { label: "Agent Deployment", icon: "⬡", delay: "0s" },
-  { label: "Model Fine-tuning", icon: "◬", delay: "0.6s" },
-  { label: "SFT / DPO / GRPO", icon: "◇", delay: "1.2s" },
-  { label: "Skills & MCP", icon: "⚡", delay: "1.8s" },
-  { label: "Conversation Analytics", icon: "⊡", delay: "2.4s" },
-  { label: "Evaluation Benchmarks", icon: "◈", delay: "3.0s" },
-  { label: "SkyPilot Compute", icon: "☁", delay: "3.6s" },
-  { label: "Model Hub", icon: "⊕", delay: "4.2s" },
+  { label: "Deployment", icon: "⬡", delay: "0s" },
+  { label: "Evolution", icon: "◬", delay: "0.6s" },
+  { label: "SFT / RL", icon: "◇", delay: "1.2s" },
+  { label: "Datasets", icon: "☁", delay: "2.1s" },
+  { label: "Tools & Skills", icon: "⚡", delay: "1.8s" },
+  { label: "Experts", icon: "⚡", delay: "1.4s" },
+  { label: "Analytics", icon: "⊡", delay: "2.4s" },
+  { label: "Evaluations", icon: "◈", delay: "3.0s" },
+  { label: "Cloud-native", icon: "☁", delay: "3.6s" },
+  { label: "Observability", icon: "☁", delay: "2.1s" },
+  { label: "Data Hub", icon: "⊕", delay: "4.2s" },
 ] as const;
 
 export function LoginPage() {
@@ -171,23 +174,23 @@ export function LoginPage() {
             />
             <div>
               <div className="font-display font-extrabold text-2xl text-foreground tracking-tight">
-                Surogate Studio
+                Surogate
               </div>
               <div className="font-mono text-sm text-muted-foreground tracking-[0.12em] uppercase">
-                Agent Development Platform
+                Build Reliable Agents
               </div>
             </div>
           </div>
 
-          <h2 className="font-display text-7xl font-extrabold text-foreground leading-[1.1] tracking-tight max-w-[650px]">
-            Build, train, and
+          <h2 className="mt-20 font-display text-7xl font-extrabold text-foreground leading-[1.1] tracking-tight max-w-[650px]">
+            Build, train, 
             <br />
-            deploy <span className="text-primary">AI agents</span>
+            and deploy 
             <br />
-            at enterprise scale.
+            <span className="text-primary">reliable Agents</span>
           </h2>
           <p className="font-display text-2xl text-muted-foreground mt-6 max-w-[50rem] leading-relaxed">
-            The authoring platform for enterprise production agents.
+            Create agents that solve complex tasks, adapt to new situations, and continuously evolve.
           </p>
         </div>
 

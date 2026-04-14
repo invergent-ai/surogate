@@ -396,12 +396,19 @@ function createDexieAdapter(
 
     async list() {
       let threads;
-      if (pairId) {
+      if (pairId && modelId) {
         threads = await db.threads
           .where("pairId")
           .equals(pairId)
-          .reverse()
+          .filter((t) => t.modelId === modelId)
           .sortBy("createdAt");
+        threads.reverse();
+      } else if (pairId) {
+        threads = await db.threads
+          .where("pairId")
+          .equals(pairId)
+          .sortBy("createdAt");
+        threads.reverse();
       } else {
         threads = await db.threads
           .orderBy("createdAt")
@@ -561,30 +568,6 @@ function ThreadHistoryProvider({
           return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
         });
 
-        // Restore context usage from last assistant message
-        const lastAssistant = [...msgs]
-          .reverse()
-          .find((m) => m.role === "assistant");
-        const savedUsage = (
-          lastAssistant?.metadata as Record<string, unknown>
-        )?.contextUsage as
-          | {
-              promptTokens: number;
-              completionTokens: number;
-              totalTokens: number;
-              cachedTokens: number;
-              modelId?: string;
-            }
-          | undefined;
-        const store = usePlaygroundStore.getState();
-        if (
-          savedUsage &&
-          (!savedUsage.modelId ||
-            savedUsage.modelId === store.selectedModelId)
-        ) {
-          store.setContextUsage(savedUsage);
-        }
-
         return ExportedMessageRepository.fromArray(
           msgs.map(toThreadMessage),
         );
@@ -683,6 +666,27 @@ function ThreadNewChatSwitch({
   return null;
 }
 
+function CompareThreadAutoSwitch(): ReactElement | null {
+  const aui = useAui();
+  const isLoading = useAuiState(({ threads }) => threads.isLoading);
+  const mainThreadId = useAuiState(({ threads }) => threads.mainThreadId);
+  const threadIds = useAuiState(({ threads }) => threads.threadIds);
+
+  useEffect(() => {
+    if (isLoading) return;
+    // If already on a valid thread, nothing to do
+    if (mainThreadId && threadIds.includes(mainThreadId)) return;
+    // Switch to first existing thread, or create a new one
+    if (threadIds.length > 0) {
+      aui.threads().switchToThread(threadIds[0]);
+    } else {
+      aui.threads().switchToNewThread();
+    }
+  }, [aui, isLoading, mainThreadId, threadIds]);
+
+  return null;
+}
+
 function ActiveThreadSync({
   enabled,
 }: { enabled: boolean }): ReactElement | null {
@@ -723,12 +727,14 @@ export function PlaygroundRuntimeProvider({
     [chatAdapter],
   );
 
+  const dexieAdapter = useMemo(
+    () => ({ ...createDexieAdapter(pairId, modelId), unstable_Provider: ThreadHistoryProvider }),
+    [pairId, modelId],
+  );
+
   const runtime = useRemoteThreadListRuntime({
     runtimeHook: useRuntimeHook,
-    adapter: {
-      ...createDexieAdapter(pairId, modelId),
-      unstable_Provider: ThreadHistoryProvider,
-    },
+    adapter: dexieAdapter,
   });
 
   return (
@@ -737,6 +743,9 @@ export function PlaygroundRuntimeProvider({
       {initialThreadId && <ThreadAutoSwitch threadId={initialThreadId} />}
       {!initialThreadId && newThreadNonce && (
         <ThreadNewChatSwitch nonce={newThreadNonce} />
+      )}
+      {pairId && !initialThreadId && !newThreadNonce && (
+        <CompareThreadAutoSwitch />
       )}
       {children}
     </AssistantRuntimeProvider>

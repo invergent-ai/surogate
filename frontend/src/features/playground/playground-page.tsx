@@ -3,17 +3,9 @@
 //
 import { Thread } from "@/components/assistant-ui/thread";
 import { PageHeader } from "@/components/page-header";
-import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
 import { useAppStore } from "@/stores/app-store";
 import { isProxyModel } from "@/utils/model";
 import { cn } from "@/utils/cn";
-import {
-  ColumnsIcon,
-  DownloadIcon,
-  LayoutListIcon,
-  Trash2Icon,
-} from "lucide-react";
 import { useSearch } from "@tanstack/react-router";
 import {
   type ReactElement,
@@ -24,7 +16,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { ContextUsageBar } from "./components/context-usage-bar";
 import { ModelInfoBar } from "./model-info-bar";
 import { ParametersPanel } from "./parameters-panel";
 import { DEFAULT_COLOR, type PlaygroundParams } from "./playground-data";
@@ -178,10 +169,8 @@ export function PlaygroundPage() {
   const systemPrompt = usePlaygroundStore((s) => s.systemPrompt);
   const activePreset = usePlaygroundStore((s) => s.activePreset);
   const params = usePlaygroundStore((s) => s.params);
-  const contextUsage = usePlaygroundStore((s) => s.contextUsage);
   const setSelectedModelId = usePlaygroundStore((s) => s.setSelectedModelId);
   const setCompareModelId = usePlaygroundStore((s) => s.setCompareModelId);
-  const toggleSessions = usePlaygroundStore((s) => s.toggleSessions);
   const setSystemPrompt = usePlaygroundStore((s) => s.setSystemPrompt);
   const setParams = usePlaygroundStore((s) => s.setParams);
   const applyPreset = usePlaygroundStore((s) => s.applyPreset);
@@ -213,25 +202,6 @@ export function PlaygroundPage() {
     [setParams],
   );
 
-  const handleSystemPromptChange = useCallback(
-    (value: string) => {
-      setSystemPrompt(value);
-    },
-    [setSystemPrompt],
-  );
-
-  const toggleCompare = useCallback(() => {
-    if (compareModelId) {
-      setCompareModelId(null);
-      setView({ mode: "single", newThreadNonce: crypto.randomUUID() });
-    } else {
-      const other = servingModels.find((m) => m.id !== effectiveModelId);
-      if (other) {
-        setCompareModelId(other.id);
-        setView({ mode: "compare", pairId: crypto.randomUUID() });
-      }
-    }
-  }, [compareModelId, servingModels, effectiveModelId, setCompareModelId]);
 
   const handleCompareModelChange = useCallback((modelId: string) => {
     setCompareModelId(modelId);
@@ -250,7 +220,6 @@ export function PlaygroundPage() {
       setCompareModelId(other.id);
     }
     setView({ mode: "compare", pairId: crypto.randomUUID() });
-    usePlaygroundStore.getState().setContextUsage(null);
   }, [servingModels, effectiveModelId, setCompareModelId]);
 
   const handleThreadSelect = useCallback(
@@ -333,51 +302,6 @@ export function PlaygroundPage() {
               );
             })}
 
-            <Separator orientation="vertical" className="mx-1 h-5" />
-
-            {/* Context usage */}
-            {contextUsage && model.contextWindow > 0 && (
-              <ContextUsageBar
-                used={contextUsage.totalTokens}
-                total={model.contextWindow}
-                cached={contextUsage.cachedTokens}
-                promptTokens={contextUsage.promptTokens}
-                completionTokens={contextUsage.completionTokens}
-              />
-            )}
-
-            <Separator orientation="vertical" className="mx-1 h-5" />
-
-            {/* Action buttons */}
-            <Button
-              variant={showSessions ? "secondary" : "outline"}
-              size="sm"
-              onClick={toggleSessions}
-            >
-              <LayoutListIcon className="size-3" data-icon="inline-start" />
-              Sessions
-            </Button>
-            <Button
-              variant={view.mode === "compare" ? "secondary" : "outline"}
-              size="sm"
-              onClick={toggleCompare}
-              disabled={servingModels.length < 2}
-            >
-              <ColumnsIcon className="size-3" data-icon="inline-start" />
-              Compare
-            </Button>
-            <Button variant="outline" size="sm" onClick={handleNewThread}>
-              <Trash2Icon className="size-3" data-icon="inline-start" />
-              Clear
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="border-amber-500/30 bg-amber-500/10 text-amber-500 hover:bg-amber-500/20"
-            >
-              <DownloadIcon className="size-3" data-icon="inline-start" />
-              Export
-            </Button>
           </div>
         }
       />
@@ -397,20 +321,10 @@ export function PlaygroundPage() {
         <div className="flex flex-1 flex-col overflow-hidden">
           {view.mode === "single" && (
             <>
-              <ModelInfoBar
-                model={model}
-                messageCount={0}
-                totalTokens={contextUsage?.totalTokens ?? 0}
-                avgLatency={0}
-                isStreaming={
-                  Object.keys(
-                    usePlaygroundStore.getState().runningByThreadId,
-                  ).length > 0
-                }
-              />
+              <ModelInfoBar model={model} />
               <SystemPromptSection
                 value={systemPrompt}
-                onChange={handleSystemPromptChange}
+                onChange={setSystemPrompt}
                 activePreset={activePreset}
                 onApplyPreset={applyPreset}
               />
@@ -435,17 +349,10 @@ export function PlaygroundPage() {
         </div>
 
         <ParametersPanel
-          model={model}
           params={params}
           onParamChange={handleParamChange}
           activePreset={activePreset}
           onApplyPreset={applyPreset}
-          stats={{
-            messageCount: 0,
-            totalTokens: contextUsage?.totalTokens ?? 0,
-            avgLatency: 0,
-            userTurns: 0,
-          }}
         />
       </div>
     </div>

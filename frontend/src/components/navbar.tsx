@@ -69,15 +69,15 @@ export function Navbar() {
         <img
           src="/login.svg"
           alt="Surogate"
-          className="w-7 h-7 rounded-md shrink-0"
+          className="w-14 h-14 rounded-md shrink-0"
         />
         {!collapsed && (
           <div>
-            <div className=" font-bold text-foreground tracking-tight">
-              Studio
+            <div className="font-bold text-xl tracking-tight">
+              Surogate
             </div>
-            <div className="text-muted-foreground tracking-[0.08em] uppercase">
-              Agent Platform
+            <div className="text-sm text-muted-foreground">
+              Reliable Agents
             </div>
           </div>
         )}

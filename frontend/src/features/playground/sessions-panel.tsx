@@ -5,7 +5,7 @@
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/utils/cn";
-import { ColumnsIcon, Trash2Icon } from "lucide-react";
+import { ColumnsIcon } from "lucide-react";
 import { db, useLiveQuery } from "./db";
 import type { PlaygroundView, ThreadRecord } from "./types";
 
@@ -138,13 +138,13 @@ export function SessionsPanel({
           <div
             key={item.id}
             className={cn(
-              "group flex w-full items-center gap-1.5 border-b border-border/50 px-3 py-2.5 transition-colors hover:bg-muted",
+              "group border-b border-border/50 px-3 py-2.5 transition-colors hover:bg-muted",
               activeId === item.id && "bg-muted",
             )}
           >
             <button
               type="button"
-              className="min-w-0 flex-1 text-left"
+              className="w-full text-left"
               onClick={() => onSelect(viewForItem(item))}
             >
               <div className="flex items-center gap-1.5">
@@ -155,18 +155,19 @@ export function SessionsPanel({
                   {item.title}
                 </span>
               </div>
-              <div className="mt-0.5 text-[9px] text-muted-foreground">
+            </button>
+            <div className="mt-0.5 flex items-center justify-between">
+              <span className="text-[9px] text-muted-foreground">
                 {new Date(item.createdAt).toLocaleDateString()}
-              </div>
-            </button>
-            <button
-              type="button"
-              className="shrink-0 rounded p-0.5 text-muted-foreground/40 opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
-              onClick={() => handleDelete(item)}
-              aria-label="Delete"
-            >
-              <Trash2Icon className="size-3" />
-            </button>
+              </span>
+              <button
+                type="button"
+                className="text-[9px] text-muted-foreground/40 opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+                onClick={() => handleDelete(item)}
+              >
+                Delete
+              </button>
+            </div>
           </div>
         ))}
         {items.length === 0 && (
