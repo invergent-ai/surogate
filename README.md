@@ -17,7 +17,7 @@
   </a>
 </p>
 
-<h3>⚡ Building Reliable Autonomous Agents </h3>
+<h3>⚡ Build Reliable Autonomous Agents </h3>
 <h4></h4>
 <div>
 <a href="https://surogate.ai">Home</a> ·
