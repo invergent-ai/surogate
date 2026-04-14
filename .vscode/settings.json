@@ -31,17 +31,6 @@
         "**/frontend/node_modules/**": true,
         "**/docs/build/**": true
     },
-    "makefile.configureOnOpen": false,
-    "C_Cpp.default.compilerPath": "/usr/bin/g++-13",
-    "C_Cpp.files.exclude": {
-        "**/.vscode": true,
-        "**/.vs": true,
-        "build/**": true,
-        "csrc/build/**": true,
-    },
-    "cmake.configureOnOpen": false,
-    "cmake.automaticReconfigure": false,
-    "cmake.buildBeforeRun": false,
     "git.ignoreLimitWarning": true,
     "[typescriptreact]": {
         "editor.defaultFormatter": "biomejs.biome"

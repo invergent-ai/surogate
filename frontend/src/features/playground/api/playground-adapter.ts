@@ -145,7 +145,7 @@ function findLatestUserImageBase64(
 
 // ── Adapter ──────────────────────────────────────────────────
 
-export function createPlaygroundAdapter(): ChatModelAdapter {
+export function createPlaygroundAdapter(modelIdOverride?: string): ChatModelAdapter {
   return {
     async *run({ messages, abortSignal, unstable_threadId }) {
       const store = usePlaygroundStore.getState();
@@ -153,8 +153,9 @@ export function createPlaygroundAdapter(): ChatModelAdapter {
 
       // Resolve the active model from the app store
       const allModels = useAppStore.getState().models;
+      const effectiveModelId = modelIdOverride ?? store.selectedModelId;
       const model = allModels.find(
-        (m) => m.id === store.selectedModelId,
+        (m) => m.id === effectiveModelId,
       );
 
       if (!model?.endpoint) {

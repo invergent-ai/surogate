@@ -1,15 +1,7 @@
 .idea/**
-cmake-build-debug/**
-build/**
-docs/structure.md
 /**/CLAUDE.md
-data/**
-logs/**
 *.log
 *.bin
-build*/**
-output*/**
-wandb/**
 __pycache__/
 *.pyc
 *.pyo
@@ -19,10 +11,8 @@ __pycache__/
 study/**
 unit-test-sol.json
 uv.lock
-.aim/
 .cache/**
 tmp/**
 *.log
-reverse*/
 surogate.db
 .claude/**

@@ -22,7 +22,7 @@ import {
 } from "@assistant-ui/react";
 import { createAssistantStream } from "assistant-stream";
 import mammoth from "mammoth";
-import { type ReactElement, type ReactNode, useEffect, useMemo } from "react";
+import { type ReactElement, type ReactNode, useCallback, useEffect, useMemo } from "react";
 import { extractText, getDocumentProxy } from "unpdf";
 import { authFetch } from "@/api/auth";
 import { useAppStore } from "@/stores/app-store";
@@ -650,12 +650,6 @@ function ThreadHistoryProvider({
 
 // ── Runtime Hook & Provider ──────────────────────────────────
 
-const chatAdapter = createPlaygroundAdapter();
-
-function useRuntimeHook(): ReturnType<typeof useLocalRuntime> {
-  return useLocalRuntime(chatAdapter);
-}
-
 // ── Thread Navigation Helpers ────────────────────────────────
 
 function ThreadAutoSwitch({
@@ -720,6 +714,15 @@ export function PlaygroundRuntimeProvider({
   initialThreadId?: string;
   newThreadNonce?: string;
 }): ReactElement {
+  const chatAdapter = useMemo(() => createPlaygroundAdapter(modelId), [modelId]);
+  const useRuntimeHook = useCallback(
+    function useRuntimeHook() {
+      // eslint-disable-next-line react-hooks/rules-of-hooks
+      return useLocalRuntime(chatAdapter);
+    },
+    [chatAdapter],
+  );
+
   const runtime = useRemoteThreadListRuntime({
     runtimeHook: useRuntimeHook,
     adapter: {

@@ -9,15 +9,9 @@ import yaml
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 
-if TYPE_CHECKING:
-    from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
-    from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
-    from surogate.core.config.sft_config import SFTConfig
-    SurogateConfig = Union[SFTConfig, GRPOInferenceConfig, GRPOOrchestratorConfig]
-
 logger = get_logger()
 
-def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
+def load_config(config_cls: Type[ServerConfig], path: str) -> ServerConfig:
     # Check if path is an HTTP(S) URL
     if path.startswith(('http://', 'https://')):
         logger.info(f"Fetching config from URL: {path}")

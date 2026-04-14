@@ -8,6 +8,7 @@ import { StatusDot } from "@/components/ui/status-dot";
 import { toStatus } from "./models-data";
 import type { Model } from "./models-data";
 import { getMetrics, getMetricsSummary, type MetricsBucket, type MetricsSummary } from "@/api/metrics";
+import { isProxyModel } from "@/utils/model";
 
 // ── Gauge ring (SVG donut) ─────────────────────────────────────
 
@@ -89,7 +90,9 @@ export function OverviewTab({ model }: { model: Model }) {
   const [buckets, setBuckets] = useState<MetricsBucket[]>([]);
   const [summary, setSummary] = useState<MetricsSummary | null>(null);
   const [loading, setLoading] = useState(true);
-
+  
+  const isProxy = isProxyModel(model);
+  
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -175,7 +178,8 @@ export function OverviewTab({ model }: { model: Model }) {
         {/* Left column */}
         <div className="flex flex-col gap-4">
           {/* GPU Resources */}
-          <section className="bg-muted/40 border border-border rounded-lg p-4">
+          { !isProxy && 
+            <section className="bg-muted/40 border border-border rounded-lg p-4">
             <div className="text-xs font-semibold text-foreground font-display mb-4">
               GPU Resources
             </div>
@@ -228,7 +232,8 @@ export function OverviewTab({ model }: { model: Model }) {
                   : "Model not currently serving \u2014 no GPU allocated"}
               </div>
             )}
-          </section>
+            </section>
+          }
 
           {/* Deployment Info */}
           <section className="bg-muted/40 border border-border rounded-lg p-4">

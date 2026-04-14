@@ -1,6 +1,0 @@
-model: "./reverse-text-qwen3-2"
-enable_lora: true
-max_lora_rank: 32
-max_model_len: 2048
-gpu_memory_utilization: 0.3
-port: 8007

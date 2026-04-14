@@ -23,7 +23,7 @@ export function ModelInfoBar({
 
   return (
     <div className="flex shrink-0 items-center justify-between border-b border-border bg-card px-5 py-1.5">
-      <div className="flex items-center gap-2 text-[10px]">
+      <div className="flex items-center gap-2 text-sm">
         <span
           className="inline-block size-1.5 shrink-0 rounded-full"
           style={{
@@ -35,13 +35,9 @@ export function ModelInfoBar({
           {model.displayName}
         </span>
         <span className="text-muted-foreground/40">·</span>
-        <span className="text-muted-foreground">
-          {model.paramCount} · {model.quantization}
-        </span>
-        <span className="text-muted-foreground/40">·</span>
         <span className="text-muted-foreground">{model.tps} tok/s</span>
       </div>
-      <div className="flex items-center gap-2.5 text-[9px] text-muted-foreground/60">
+      <div className="flex items-center gap-2.5 text-sm text-muted-foreground/60">
         <span>{messageCount} messages</span>
         <span>·</span>
         <span>{totalTokens.toLocaleString()} tokens</span>

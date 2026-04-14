@@ -81,9 +81,9 @@ class EvalRun(UUIDMixin, Base):
         sa.ForeignKey("projects.id"), index=True
     )
     name: Mapped[str] = mapped_column(sa.String(255))
-    model_id: Mapped[str] = mapped_column(sa.ForeignKey("models.id"))
+    model_id: Mapped[str] = mapped_column(sa.ForeignKey("deployed_models.id"))
     compare_model_id: Mapped[Optional[str]] = mapped_column(
-        sa.ForeignKey("models.id"), nullable=True
+        sa.ForeignKey("deployed_models.id"), nullable=True
     )
     status: Mapped[EvalRunStatus] = mapped_column(sa.Enum(EvalRunStatus))
     compute: Mapped[str] = mapped_column(sa.String(64))

@@ -5,60 +5,6 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Surogate CLI - Tokenize",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "surogate.cli.main",
-            "args": ["tokenize", "${workspaceFolder}/examples/pt/qwen3.yaml"],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "env": {"PYTHONPATH": "${workspaceFolder}"}
-        },
-        {
-            "name": "Surogate CLI - SFT",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "surogate.cli.main",
-            "args": ["sft", "${workspaceFolder}/examples/sft/qwen3vl-lora-bf16.yaml"],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "justMyCode": true,
-            "env": {"PYTHONPATH": "${workspaceFolder}"}
-        },
-        {
-            "name": "Surogate CLI - PT",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "surogate.cli.main",
-            "args": ["pt", "${workspaceFolder}/examples/pt/qwen3-bf16.yaml"],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "justMyCode": true,
-            "env": {"PYTHONPATH": "${workspaceFolder}"}
-        },
-        {
-            "name": "Surogate CLI - GRPO Inference",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "surogate.cli.main",
-            "args": ["grpo-infer", "${workspaceFolder}/examples/grpo/infer.yaml"],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "justMyCode": true,
-            "env": {"PYTHONPATH": "${workspaceFolder}"}
-        },
-        {
-            "name": "Surogate CLI - GRPO Orchestrator",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "surogate.cli.main",
-            "args": ["grpo-orch", "${workspaceFolder}/examples/grpo/orch.yaml"],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "justMyCode": true,
-            "env": {"PYTHONPATH": "${workspaceFolder}"}
-        },
-        {
             "name": "Surogate CLI - Server",
             "type": "debugpy",
             "request": "launch",

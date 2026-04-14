@@ -349,7 +349,7 @@ async def get_objects(client: ApiClient, repository: str, ref: str, prefix: Opti
     except ApiException as e:
         logger.error(f"Error retrieving LakeFS objects for repository '{repository}' and ref '{ref}': {e}")
         return ObjectStatsList(pagination=Pagination(has_more=False, next_offset="", results=0, max_per_page=0), results=[])
-    
+
 async def delete_object(client: ApiClient, repository: str, branch: str, path: str) -> bool:
     try:
         objects_api = lakefs_sdk.ObjectsApi(client)

@@ -1,11 +1,11 @@
 [project]
 name = "surogate"
 dynamic = ["version"]
-description = "Surogate LLMOps Toolkit"
+description = "AgentOps Platform"
 readme = "README.md"
 requires-python = ">=3.12"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
+license = "AGPL-3.0"
+license-files = ["LICENSE.AGPL-3.0"]
 authors = [
     { name = "Flavius Burca", email = "flavius@invergent.ai" }
 ]
@@ -13,12 +13,9 @@ maintainers = [
     { name = "Flavius Burca", email = "flavius@invergent.ai" }
 ]
 urls = { "Homepage" = "https://surogate.ai", "Repository" = "https://github.com/invergent-ai/surogate", "Issues" = "https://github.com/invergent-ai/surogate/issues" }
-keywords = ["machine learning", "large language model"]
+keywords = ["machine learning", "large language model", "agent"]
 classifiers = [
-    "Environment :: GPU :: NVIDIA CUDA :: 12",
-    "Environment :: GPU :: NVIDIA CUDA :: 13",
     "Operating System :: POSIX :: Linux",
-    "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Intended Audience :: Developers",
     "Intended Audience :: Information Technology",
@@ -39,59 +36,39 @@ dependencies = [
     "rich>=13.0.0",
     "psutil",
     "matplotlib",
-    "qwen-vl-utils==0.0.14",
     "pydantic",
-    "fsspec[http]>=2023.1.0,<=2025.3.0",
-    "s3fs>=2024.6.0,<2025.10.0",
-    "gcsfs>=2024.6.0,<2025.10.0",
-    "adlfs>=2024.7.0,<2025.8.0",
-    "ocifs==1.3.4",
     "densemax-lakefs-spec @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_spec-1.50.0-py3-none-any.whl",
     "densemax-lakefs-sdk @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_sdk-1.50.0-py3-none-any.whl",
-    "ray>=2.5.0",
-    "verifiers==0.1.11",
-    "wandb==0.25.1",
-    "sqlalchemy[asyncio]==2.0.0,<2.0.1",
-    "httpx>=0.27,<1.0"
+    "sqlalchemy[asyncio]",
+    "SQLAlchemy-Utils",
+    "httpx>=0.27,<1.0",
+    "torch",
+    "dstack[all]==0.20.16",
+    "prometheus-api-client",
+    "aiosqlite",
+    "starlette",
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 
-[build-system]
-requires = ["scikit-build-core>=0.11", "nanobind"]
-build-backend = "scikit_build_core.build"
+[tool.setuptools.packages.find]
+include = ["surogate*"]
 
 [tool.setuptools_scm]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 fallback_version = "0.0.1"
 
-[tool.scikit-build]
-minimum-version = "build-system.requires"
-metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
-wheel.py-api = "cp312"
-wheel.packages = ["surogate"]
-build.targets = ["_surogate"]
-build-dir = "build/{wheel_tag}"
-cmake.build-type = "Release"
-
-[tool.scikit-build.cmake.define]
-PYTHON_BINDING = "ON"
-USE_CUFILE = "OFF"
-CMAKE_CUDA_ARCHITECTURES = {env="CUDAARCHS"}
-
 [tool.uv]
 prerelease = "allow"
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "surogate/**/*.py" },
-    { file = "CMakeLists.txt" },
-    { file = "csrc/CMakeLists.txt" }
-]
-override-dependencies = [
-    "triton",
-    "torch",
-    "vllm",
 ]
 
-[project.entry-points."vllm.general_plugins"]
-surogate = "surogate.grpo.inference.patches:transformers_v5_compat"
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

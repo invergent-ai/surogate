@@ -5,7 +5,6 @@ import { Thread } from "@/components/assistant-ui/thread";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { isProxyModel } from "@/utils/model";
 import { cn } from "@/utils/cn";
@@ -303,7 +302,7 @@ export function PlaygroundPage() {
                   key={m.id}
                   type="button"
                   className={cn(
-                    "flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-display text-[10px] font-medium transition-all",
+                    "flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-display text-sm font-medium transition-all",
                     effectiveModelId === m.id
                       ? "font-semibold"
                       : "border-transparent text-muted-foreground hover:text-foreground",
@@ -352,7 +351,7 @@ export function PlaygroundPage() {
             {/* Action buttons */}
             <Button
               variant={showSessions ? "secondary" : "outline"}
-              size="xs"
+              size="sm"
               onClick={toggleSessions}
             >
               <LayoutListIcon className="size-3" data-icon="inline-start" />
@@ -360,20 +359,20 @@ export function PlaygroundPage() {
             </Button>
             <Button
               variant={view.mode === "compare" ? "secondary" : "outline"}
-              size="xs"
+              size="sm"
               onClick={toggleCompare}
               disabled={servingModels.length < 2}
             >
               <ColumnsIcon className="size-3" data-icon="inline-start" />
               Compare
             </Button>
-            <Button variant="outline" size="xs" onClick={handleNewThread}>
+            <Button variant="outline" size="sm" onClick={handleNewThread}>
               <Trash2Icon className="size-3" data-icon="inline-start" />
               Clear
             </Button>
             <Button
               variant="outline"
-              size="xs"
+              size="sm"
               className="border-amber-500/30 bg-amber-500/10 text-amber-500 hover:bg-amber-500/20"
             >
               <DownloadIcon className="size-3" data-icon="inline-start" />
