@@ -8,6 +8,7 @@ import { LoginForm } from "./login-form";
 
 const TAGS = [
   { label: "Deployment", icon: "⬡", delay: "0s" },
+  { label: "Multi-Channel", icon: "⬡", delay: "0.8s" },
   { label: "Evolution", icon: "◬", delay: "0.6s" },
   { label: "SFT / RL", icon: "◇", delay: "1.2s" },
   { label: "Datasets", icon: "☁", delay: "2.1s" },
@@ -214,7 +215,7 @@ export function LoginPage() {
             ))}
           </div>
           <div className="font-display mt-6 text-sm text-faint">
-            <a className="underline" href="https://surogate.ai" target="_blank">surogate.ai</a> v2.4.0 &middot; Copyright © 2026 Invergent SA &middot; All rights reserved.
+            <a className="underline" href="https://surogate.ai" target="_blank">surogate.ai</a> &middot; Copyright © 2026 <a className="underline" href="https://invergent.ai" target="_blank">Invergent SA</a>
           </div>
         </div>
       </div>
