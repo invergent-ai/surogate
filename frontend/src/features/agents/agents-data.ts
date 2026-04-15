@@ -59,9 +59,7 @@ export interface Agent {
   version: string;
   status: string;
   replicas: AgentReplicas;
-  namespace: string;
-  project: string;
-  projectColor: string;
+  projectId: string;
   model: string;
   modelBase: string;
   createdBy: string;
@@ -127,9 +125,7 @@ export const AGENTS: Agent[] = [
     version: "3.2.1",
     status: "running",
     replicas: { current: 3, desired: 3 },
-    namespace: "prod-cx",
-    project: "CX Support Agent",
-    projectColor: "#F59E0B",
+    projectId: "cx-support-agent",
     model: "llama-3.1-8b-cx",
     modelBase: "Llama 3.1 8B",
     createdBy: "A. Kovács",
@@ -192,9 +188,7 @@ export const AGENTS: Agent[] = [
     version: "2.7.0",
     status: "running",
     replicas: { current: 2, desired: 2 },
-    namespace: "prod-code",
-    project: "Code Assistant",
-    projectColor: "#3B82F6",
+    projectId: "code-assistant",
     model: "deepseek-r1-code",
     modelBase: "DeepSeek R1",
     createdBy: "M. Chen",
@@ -253,9 +247,7 @@ export const AGENTS: Agent[] = [
     version: "1.4.0-rc2",
     status: "deploying",
     replicas: { current: 1, desired: 2 },
-    namespace: "staging-da",
-    project: "Data Analyst Agent",
-    projectColor: "#8B5CF6",
+    projectId: "data-analyst-agent",
     model: "qwen-2.5-72b",
     modelBase: "Qwen 2.5 72B",
     createdBy: "R. Silva",
@@ -310,9 +302,7 @@ export const AGENTS: Agent[] = [
     version: "1.0.3",
     status: "running",
     replicas: { current: 1, desired: 1 },
-    namespace: "prod-cx",
-    project: "CX Support Agent",
-    projectColor: "#F59E0B",
+    projectId: "cx-support-agent",
     model: "llama-3.1-8b-cx",
     modelBase: "Llama 3.1 8B",
     createdBy: "L. Park",
@@ -363,9 +353,7 @@ export const AGENTS: Agent[] = [
     version: "0.9.1",
     status: "error",
     replicas: { current: 0, desired: 1 },
-    namespace: "staging-da",
-    project: "Data Analyst Agent",
-    projectColor: "#8B5CF6",
+    projectId: "data-analyst-agent",
     model: "guard-3b",
     modelBase: "LlamaGuard 3B",
     createdBy: "A. Kovács",

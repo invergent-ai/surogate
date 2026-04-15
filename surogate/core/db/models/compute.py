@@ -332,9 +332,6 @@ class DeployedModel(UUIDMixin, Base):
     hub_ref: Mapped[Optional[str]] = mapped_column(
         sa.String(512), nullable=True
     )
-    namespace: Mapped[Optional[str]] = mapped_column(
-        sa.String(128), nullable=True
-    )
     source: Mapped[Optional[ModelSource]] = mapped_column(
         sa.Enum(ModelSource), nullable=True
     )

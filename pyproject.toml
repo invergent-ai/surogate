@@ -38,6 +38,7 @@ dependencies = [
     "matplotlib",
     "pydantic>=2.4,<3",
     "surogates @ https://github.com/invergent-ai/surogates/releases/download/v0.2/surogates-0.2-py3-none-any.whl",
+    "pyhelm3",
     "densemax-lakefs-sdk @ https://github.com/invergent-ai/densemax-lakeFS/releases/download/v1.50.4/densemax_lakefs_sdk-1.50.4-py3-none-any.whl",
     "sqlalchemy[asyncio]",
     "SQLAlchemy-Utils",

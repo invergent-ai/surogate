@@ -63,9 +63,13 @@ _initialized = False
 _admin = None              # dstack UserModel
 _scheduler = None          # APScheduler instance
 _pipeline_manager = None   # Pipeline task manager
+_kubeconfig_path: str | None = None
 
 
-async def init_dstack(database_url: str | None = None) -> None:
+async def init_dstack(
+    database_url: str | None = None,
+    kubeconfig_path: str | None = None,
+) -> None:
     """Bootstrap dstack as an embedded library.
 
     1. Run Alembic migrations for dstack's own DB
@@ -74,12 +78,14 @@ async def init_dstack(database_url: str | None = None) -> None:
     4. Register the Kubernetes backend (from current kubeconfig)
     5. Start APScheduler background tasks
     """
-    global _initialized, _admin, _scheduler, _pipeline_manager
+    global _initialized, _admin, _scheduler, _pipeline_manager, _kubeconfig_path
     if _initialized:
         return
 
     if database_url:
         os.environ["DSTACK_DATABASE_URL"] = database_url
+    if kubeconfig_path:
+        _kubeconfig_path = kubeconfig_path
 
     from sqlalchemy import AsyncAdaptedQueuePool
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -162,8 +168,10 @@ async def ensure_kubernetes_backend(project) -> None:
     from dstack._internal.server.db import get_session_ctx
     from dstack._internal.server.services.backends import create_backend
 
-    # Read kubeconfig
-    kubeconfig_path = Path(os.environ.get("KUBECONFIG", "~/.kube/config")).expanduser()
+    # Prefer the surogate-configured kubeconfig (set by init_dstack), fall back to env
+    kubeconfig_path = Path(
+        _kubeconfig_path or os.environ.get("KUBECONFIG", "~/.kube/config")
+    ).expanduser()
     if not kubeconfig_path.exists():
         logger.info("No kubeconfig at %s — skipping K8s backend", kubeconfig_path)
         return
@@ -189,7 +197,7 @@ async def ensure_kubernetes_backend(project) -> None:
     k8s_config = KubernetesBackendConfigWithCreds(
         type="kubernetes",
         kubeconfig=KubeconfigConfig(data=kubeconfig_data),
-        namespace=os.environ.get("DSTACK_K8S_NAMESPACE", "dstack"),
+        namespace=project.namespace,
         proxy_jump=proxy_jump,
     )
 

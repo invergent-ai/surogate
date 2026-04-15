@@ -5,7 +5,8 @@
     "python-envs.pythonProjects": [],
     "python.analysis.include": [
         "./surogate/*.py",
-        "./venv/lib/python3.12/site-packages/sky/**/*.py",
+        "./venv/lib/python3.12/site-packages/dstack/**/*.py",
+        "./venv/lib/python3.12/site-packages/pyhelm3/**/*.py",
         "./venv/lib/python3.12/site-packages/prometheus_api_client/**/*.pyi",
     ],
     "python.terminal.activateEnvInCurrentTerminal": false,

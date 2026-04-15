@@ -21,7 +21,6 @@ class DeployedModelCreateRequest(BaseModel):
     engine: Optional[str] = None
     image: Optional[str] = None
     hub_ref: Optional[str] = None
-    namespace: Optional[str] = None
     source: Optional[str] = None
     serving_config: Optional[dict] = None
     generation_defaults: Optional[dict] = None
@@ -127,7 +126,6 @@ class DeployedModelResponse(BaseModel):
     uptime: str
     last_deployed: str
     deployed_by: str
-    namespace: str
     project_color: str
     endpoint: str
     image: str

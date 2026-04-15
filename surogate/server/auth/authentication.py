@@ -33,6 +33,41 @@ async def get_current_subject(
     )
 
 
+async def require_model_access(
+    model_id: str,
+    credentials: HTTPAuthorizationCredentials,
+    session: AsyncSession,
+) -> str:
+    """Accept a JWT (user) or an API key scoped to ``model:<model_id>``.
+
+    Returns a subject identifier: the username for JWTs, or
+    ``api-key:<key_id>`` for API keys.
+    """
+    from surogate.core.db.repository import api_keys as _api_keys_repo
+
+    token = credentials.credentials
+    if token.startswith("sk-agent-"):
+        key = await _api_keys_repo.verify_api_key(session, token)
+        if key is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key",
+            )
+        from surogate.core.db.repository.api_keys import model_scope
+        scope = model_scope(model_id)
+        if not key.scopes or scope not in key.scopes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API key not scoped for this model",
+            )
+        await _api_keys_repo.touch_last_used(session, key.id)
+        return f"api-key:{key.id}"
+
+    return await _get_current_subject(
+        credentials, session, allow_password_change=False,
+    )
+
+
 async def get_current_user_id(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     session: AsyncSession = Depends(get_session),

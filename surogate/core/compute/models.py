@@ -9,6 +9,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from surogate.core.compute import dstack as dstack_service
@@ -150,7 +151,6 @@ def build_model_response(
         uptime=_uptime(svc),
         last_deployed=_relative_time(model.last_deployed_at),
         deployed_by=model.deployed_by_id,
-        namespace=model.namespace or "\u2014",
         project_color="#6B7280",
         endpoint=_model_endpoint(model, svc),
         image=model.image or "\u2014",
@@ -199,7 +199,6 @@ async def create_model(
     engine: Optional[str] = None,
     image: Optional[str] = None,
     hub_ref: Optional[str] = None,
-    namespace: Optional[str] = None,
     source: Optional[str] = None,
     serving_config: Optional[dict] = None,
     generation_defaults: Optional[dict] = None,
@@ -275,7 +274,6 @@ async def create_model(
         engine=engine,
         image=image,
         hub_ref=hub_ref,
-        namespace=namespace,
         source=source,
         serving_config=serving_config,
         generation_defaults=generation_defaults,
@@ -536,6 +534,15 @@ async def start_model(
             await dstack_service.terminate_service(session, m.serving_service_id)
         except Exception:
             logger.warning(f"Failed to terminate old service for model {model_id}", exc_info=True)
+
+    # Ensure the project's k8s namespace exists before launching
+    from surogate.core.compute.helm import ensure_namespace
+    from surogate.core.db.models.platform import Project
+    project = (
+        await session.execute(sa.select(Project).where(Project.id == m.project_id))
+    ).scalar_one_or_none()
+    if project is not None and server_config is not None:
+        await ensure_namespace(project.namespace, server_config)
 
     params = _build_service_params(m, svc, **lakefs_kw)
     svc = await dstack_service.launch_service(session, svc, **params)

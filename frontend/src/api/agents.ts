@@ -138,3 +138,110 @@ export async function deleteAgent(agentId: string): Promise<void> {
     throw new Error(err?.detail ?? "Failed to delete agent");
   }
 }
+
+export async function startAgent(agentId: string): Promise<AgentResponse> {
+  const response = await authFetch(`/api/agents/agents/${agentId}/start`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to start agent");
+  }
+  return (await response.json()) as AgentResponse;
+}
+
+export async function stopAgent(agentId: string): Promise<AgentResponse> {
+  const response = await authFetch(`/api/agents/agents/${agentId}/stop`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to stop agent");
+  }
+  return (await response.json()) as AgentResponse;
+}
+
+// ── Users (surogates-db tenant users scoped to the agent's org) ────
+
+export interface AgentUserResponse {
+  id: string;
+  email: string;
+  display_name: string;
+  auth_provider: string;
+  created_at: string | null;
+}
+
+export interface AgentUserListResponse {
+  users: AgentUserResponse[];
+  total: number;
+}
+
+export interface AgentUserCreateRequest {
+  email: string;
+  display_name: string;
+  password?: string;
+}
+
+export interface AgentUserUpdateRequest {
+  display_name?: string;
+  password?: string;
+}
+
+export async function listAgentUsers(agentId: string): Promise<AgentUserListResponse> {
+  const response = await authFetch(`/api/agents/agents/${agentId}/users`);
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to fetch users");
+  }
+  return (await response.json()) as AgentUserListResponse;
+}
+
+export async function createAgentUser(
+  agentId: string,
+  body: AgentUserCreateRequest,
+): Promise<AgentUserResponse> {
+  const response = await authFetch(`/api/agents/agents/${agentId}/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to create user");
+  }
+  return (await response.json()) as AgentUserResponse;
+}
+
+export async function updateAgentUser(
+  agentId: string,
+  userId: string,
+  body: AgentUserUpdateRequest,
+): Promise<AgentUserResponse> {
+  const response = await authFetch(
+    `/api/agents/agents/${agentId}/users/${userId}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to update user");
+  }
+  return (await response.json()) as AgentUserResponse;
+}
+
+export async function deleteAgentUser(
+  agentId: string,
+  userId: string,
+): Promise<void> {
+  const response = await authFetch(
+    `/api/agents/agents/${agentId}/users/${userId}`,
+    { method: "DELETE" },
+  );
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to delete user");
+  }
+}

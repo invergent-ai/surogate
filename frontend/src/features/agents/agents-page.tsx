@@ -16,11 +16,11 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { cn } from "@/utils/cn";
 import { toStatus } from "./agents-data";
 import { AgentDetail, AgentEmptyState } from "./agent-detail";
 import type { Agent } from "./agents-data";
-import { DeployAgentDialog } from "./deploy-agent-dialog";
 import { useAppStore } from "@/stores/app-store";
 
 // ── Status filter buttons ──────────────────────────────────────
@@ -43,6 +43,8 @@ function AgentListItem({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const projectColor =
+    useAppStore((s) => s.projects.find((p) => p.id === agent.projectId)?.color) ?? "#F59E0B";
   return (
     <button type="button"
       onClick={onSelect}
@@ -57,9 +59,9 @@ function AgentListItem({
         <div
           className="w-[34px] h-[34px] rounded-lg shrink-0 flex items-center justify-center text-[15px] border"
           style={{
-            backgroundColor: `${agent.projectColor}12`,
-            borderColor: `${agent.projectColor}25`,
-            color: agent.projectColor,
+            backgroundColor: `${projectColor}12`,
+            borderColor: `${projectColor}25`,
+            color: projectColor,
           }}
         >
           &#x2B21;
@@ -166,6 +168,156 @@ function ScaleDialog({
   );
 }
 
+// ── Create modal ───────────────────────────────────────────────
+
+const SUROGATES_HARNESS = "surogates";
+
+function CreateAgentDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  const createAgent = useAppStore((s) => s.createAgent);
+  const models = useAppStore((s) => s.models);
+  const fetchModels = useAppStore((s) => s.fetchModels);
+  const agents = useAppStore((s) => s.agents);
+
+  useEffect(() => {
+    if (open) fetchModels();
+  }, [open, fetchModels]);
+
+  const [displayName, setDisplayName] = useState("");
+  const [slug, setSlug] = useState("");
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [description, setDescription] = useState("");
+  const [modelId, setModelId] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const slugify = (v: string) =>
+    v.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const effectiveSlug = slugTouched ? slug : slugify(displayName);
+
+  const projectAgentSlugs = new Set(
+    agents.filter((a) => a.projectId === activeProjectId).map((a) => a.name),
+  );
+  const slugTaken = !!effectiveSlug && projectAgentSlugs.has(effectiveSlug);
+
+  const handleClose = (v: boolean) => {
+    if (!v) {
+      setDisplayName("");
+      setSlug("");
+      setSlugTouched(false);
+      setDescription("");
+      setModelId("");
+      setSubmitting(false);
+    }
+    onOpenChange(v);
+  };
+
+  const handleCreate = async () => {
+    if (!activeProjectId || !effectiveSlug || !modelId || slugTaken) return;
+    setSubmitting(true);
+    const agent = await createAgent(activeProjectId, {
+      name: effectiveSlug,
+      harness: SUROGATES_HARNESS,
+      display_name: displayName || effectiveSlug,
+      description,
+      model_id: modelId,
+    });
+    setSubmitting(false);
+    if (agent) handleClose(false);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={handleClose}>
+      <DialogContent className="min-w-150">
+        <DialogHeader>
+          <DialogTitle>Deploy New Agent</DialogTitle>
+          <DialogDescription>Configure your Surogates agent</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div>
+            <label htmlFor="agent-display-name" className="text-xs font-medium text-muted-foreground mb-1 block">Display Name</label>
+            <Input
+              id="agent-display-name"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder="My Agent"
+              className="h-8 text-xs"
+            />
+          </div>
+          <div>
+            <label htmlFor="agent-slug" className="text-xs font-medium text-muted-foreground mb-1 block">
+              Slug <span className="text-muted-foreground/60">(unique within project)</span>
+            </label>
+            <Input
+              id="agent-slug"
+              value={effectiveSlug}
+              onChange={(e) => {
+                setSlug(slugify(e.target.value));
+                setSlugTouched(true);
+              }}
+              placeholder="my-agent"
+              className={cn(
+                "h-8 text-xs",
+                slugTaken && "border-destructive focus-visible:ring-destructive",
+              )}
+            />
+            {slugTaken && (
+              <div className="text-[10px] text-destructive mt-1">
+                Slug "{effectiveSlug}" is already used in this project.
+              </div>
+            )}
+          </div>
+          <div>
+            <label htmlFor="agent-description" className="text-xs font-medium text-muted-foreground mb-1 block">Description</label>
+            <Input
+              id="agent-description"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="What does this agent do?"
+              className="h-8 text-xs"
+            />
+          </div>
+          <div>
+            <span className="text-xs font-medium text-muted-foreground mb-1 block">Model</span>
+            <Select value={modelId} onValueChange={setModelId} disabled={models.length === 0}>
+              <SelectTrigger size="sm" className="w-full text-xs">
+                <SelectValue
+                  placeholder={
+                    models.length === 0 ? "No models available" : "Select a model..."
+                  }
+                />
+              </SelectTrigger>
+              <SelectContent>
+                {models.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    {m.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => handleClose(false)}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleCreate}
+            disabled={!effectiveSlug || !modelId || slugTaken || submitting}
+          >
+            {submitting ? "Creating..." : "Create Agent"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // ── Main page ──────────────────────────────────────────────────
 
 export function AgentsPage() {
@@ -177,7 +329,7 @@ export function AgentsPage() {
 
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterSearch, setFilterSearch] = useState("");
-  const [showDeployModal, setShowDeployModal] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
   const [showScaleModal, setShowScaleModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const deleteAgent = useAppStore((s) => s.deleteAgent);
@@ -215,7 +367,7 @@ export function AgentsPage() {
           </>
         }
         action={
-          <Button size="sm" onClick={() => setShowDeployModal(true)}>
+          <Button size="sm" onClick={() => setShowCreateModal(true)}>
             + Deploy Agent
           </Button>
         }
@@ -287,9 +439,9 @@ export function AgentsPage() {
       </div>
 
       {/* Modals */}
-      <DeployAgentDialog
-        open={showDeployModal}
-        onOpenChange={setShowDeployModal}
+      <CreateAgentDialog
+        open={showCreateModal}
+        onOpenChange={setShowCreateModal}
       />
       {selectedAgent && (
         <ScaleDialog

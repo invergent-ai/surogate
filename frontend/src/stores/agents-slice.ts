@@ -7,7 +7,7 @@ import * as agentsApi from "@/api/agents";
 import type { AgentResponse, AgentCreateRequest, AgentUpdateRequest } from "@/api/agents";
 import type { AppState } from "./app-store";
 
-function toAgent(a: AgentResponse): Agent {
+export function toAgent(a: AgentResponse): Agent {
   return {
     id: a.id,
     name: a.name,
@@ -19,9 +19,7 @@ function toAgent(a: AgentResponse): Agent {
       current: a.replicas?.current ?? 0,
       desired: a.replicas?.desired ?? 0,
     },
-    namespace: "",
-    project: a.project_name,
-    projectColor: "#F59E0B",
+    projectId: a.project_id,
     model: a.model_name,
     modelBase: "",
     createdBy: a.created_by_username,
@@ -67,6 +65,8 @@ export type AgentsSlice = {
   createAgent: (projectId: string, body: AgentCreateRequest) => Promise<Agent | null>;
   updateAgent: (agentId: string, body: AgentUpdateRequest) => Promise<Agent | null>;
   deleteAgent: (agentId: string) => Promise<boolean>;
+  startAgent: (agentId: string) => Promise<Agent | null>;
+  stopAgent: (agentId: string) => Promise<Agent | null>;
   setSelectedAgent: (agent: Agent | null) => void;
 };
 
@@ -137,6 +137,45 @@ export const createAgentsSlice: StateCreator<AppState, [], [], AgentsSlice> = (s
     } catch (e) {
       set({ error: (e as Error).message });
       return false;
+    }
+  },
+
+  startAgent: async (agentId: string) => {
+    set({ error: null });
+    set((s) => ({
+      agents: s.agents.map((a) => (a.id === agentId ? { ...a, status: "deploying" } : a)),
+      selectedAgent:
+        s.selectedAgent?.id === agentId
+          ? { ...s.selectedAgent, status: "deploying" }
+          : s.selectedAgent,
+    }));
+    try {
+      const raw = await agentsApi.startAgent(agentId);
+      const agent = toAgent(raw);
+      set((s) => ({
+        agents: s.agents.map((a) => (a.id === agentId ? agent : a)),
+        selectedAgent: s.selectedAgent?.id === agentId ? agent : s.selectedAgent,
+      }));
+      return agent;
+    } catch (e) {
+      set({ error: (e as Error).message });
+      return null;
+    }
+  },
+
+  stopAgent: async (agentId: string) => {
+    set({ error: null });
+    try {
+      const raw = await agentsApi.stopAgent(agentId);
+      const agent = toAgent(raw);
+      set((s) => ({
+        agents: s.agents.map((a) => (a.id === agentId ? agent : a)),
+        selectedAgent: s.selectedAgent?.id === agentId ? agent : s.selectedAgent,
+      }));
+      return agent;
+    } catch (e) {
+      set({ error: (e as Error).message });
+      return null;
     }
   },
 

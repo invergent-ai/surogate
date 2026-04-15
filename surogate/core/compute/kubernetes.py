@@ -28,12 +28,33 @@ k8_nodes: Optional[KubernetesNodesInfo] = None
 context: Optional[str] = None
 
 
-def init_kubernetes():
+def load_k8s_config(kubeconfig_path: Optional[str] = None) -> None:
+    """Load kube config, preferring in-cluster SA when present.
+
+    Idempotent by design — callers can invoke before constructing any
+    ``kubernetes.client`` API object without worrying about duplicate
+    loads.
+    """
+    from pathlib import Path
+    from kubernetes import config as k8s_config
+
+    try:
+        k8s_config.load_incluster_config()
+    except k8s_config.ConfigException:
+        resolved = (
+            str(Path(kubeconfig_path).expanduser()) if kubeconfig_path else None
+        )
+        k8s_config.load_kube_config(config_file=resolved)
+
+
+def init_kubernetes(kubeconfig_path: Optional[str] = None):
     """Discover K8s nodes and their GPU/CPU/memory resources.
 
     Uses the standard ``kubernetes`` client for node listing and
     dstack's label-based GPU detection helpers.
     """
+    from pathlib import Path
+
     from kubernetes import client as k8s_client, config as k8s_config
 
     global k8_nodes, context
@@ -42,9 +63,10 @@ def init_kubernetes():
         k8s_config.load_incluster_config()
         context = "incluster"
     except k8s_config.ConfigException:
-        contexts, active = k8s_config.list_kube_config_contexts()
+        resolved = str(Path(kubeconfig_path).expanduser()) if kubeconfig_path else None
+        contexts, active = k8s_config.list_kube_config_contexts(config_file=resolved)
         context = active["name"] if active else None
-        k8s_config.load_kube_config(context=context)
+        k8s_config.load_kube_config(config_file=resolved, context=context)
 
     api = k8s_client.CoreV1Api()
     nodes = api.list_node().items

@@ -8,12 +8,14 @@
 import { useEffect, useRef } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { transformModel, type RawModel } from "@/api/models";
+import type { AgentResponse } from "@/api/agents";
 import type { LocalTask } from "@/api/tasks";
+import { toAgent } from "@/stores/agents-slice";
 import { getAuthToken } from "@/features/auth";
 
 interface TransitionMessage {
   type: "transition";
-  entity_type: "model" | "job" | "task";
+  entity_type: "model" | "job" | "task" | "agent";
   entity_id: string;
   name: string;
   old_status: string;
@@ -102,6 +104,9 @@ function dispatch(msg: TransitionMessage) {
     case "task":
       dispatchTask(state, msg);
       break;
+    case "agent":
+      dispatchAgent(state, msg);
+      break;
   }
 }
 
@@ -138,6 +143,19 @@ function dispatchModel(
 }
 
 
+
+function dispatchAgent(
+  state: ReturnType<typeof useAppStore.getState>,
+  msg: TransitionMessage,
+) {
+  const updated = toAgent(msg.data as unknown as AgentResponse);
+
+  useAppStore.setState({
+    agents: state.agents.map((a) => (a.id === updated.id ? updated : a)),
+    selectedAgent:
+      state.selectedAgent?.id === updated.id ? updated : state.selectedAgent,
+  });
+}
 
 function dispatchJob(msg: TransitionMessage) {
   // Jobs don't have a dedicated slice with an entity list yet.

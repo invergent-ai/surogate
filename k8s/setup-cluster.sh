@@ -225,6 +225,9 @@ configure_garage() {
     GARAGE_SECRET_ACCESS_KEY=$(echo "$output" | awk -F': ' '/Secret key/ {print $2}' | tr -d ' ')
 
     "$KUBECTL" exec "$pod" -- /garage bucket allow --read --write --owner surogates --key surogates-key > /dev/null 2>&1 || true
+    # Agent sessions create a per-session bucket at runtime, so the
+    # key needs the ``create-bucket`` permission at the key level.
+    "$KUBECTL" exec "$pod" -- /garage key allow surogates-key --create-bucket > /dev/null 2>&1 || true
 }
 
 install_surogates() {
@@ -240,7 +243,7 @@ install_surogates() {
 
 create_server_config() {
     cat >"${SUROGATE_DIR}/config.yaml" <<EOF
-host: 127.0.0.1
+host: 0.0.0.0
 port: 8888
 database_url: postgresql+asyncpg://surogate:surogate@127.0.0.1:32432/surogate
 dstack_database_url: postgresql+asyncpg://dstack:dstack@127.0.0.1:32432/dstack
@@ -249,9 +252,6 @@ lakefs_endpoint: https://lakefs.k8s.localhost
 lakefs_s3_endpoint: https://lakefs-s3.k8s.localhost
 lakefs_access_key: $LAKEFS_ACCESS_KEY_ID
 lakefs_secret_key: $LAKEFS_SECRET_ACCESS_KEY
-agent_s3_endpoint: https://garage.k8s.localhost
-agent_s3_region: garage
-agent_s3_bucket: surogates
 agent_s3_access_key: $GARAGE_ACCESS_KEY_ID
 agent_s3_secret_key: $GARAGE_SECRET_ACCESS_KEY
 EOF

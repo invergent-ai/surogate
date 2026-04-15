@@ -14,6 +14,8 @@ import { OverviewTab } from "./overview-tab";
 import { MetricsTab } from "./metrics-tab";
 import { VersionsTab } from "./versions-tab";
 import { ConfigTab } from "./config-tab";
+import { UsersTab } from "./users-tab";
+import { useAppStore } from "@/stores/app-store";
 
 export function AgentDetail({
   agent,
@@ -24,6 +26,12 @@ export function AgentDetail({
   onScale: () => void;
   onDelete: () => void;
 }) {
+  const projectColor =
+    useAppStore((s) => s.projects.find((p) => p.id === agent.projectId)?.color) ?? "#F59E0B";
+  const startAgent = useAppStore((s) => s.startAgent);
+  const stopAgent = useAppStore((s) => s.stopAgent);
+  const canStart = agent.status !== "running" && agent.status !== "deploying";
+  const canStop = agent.status === "running";
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Header */}
@@ -33,9 +41,9 @@ export function AgentDetail({
             <div
               className="w-11 h-11 rounded-[10px] shrink-0 flex items-center justify-center text-xl border"
               style={{
-                backgroundColor: `${agent.projectColor}12`,
-                borderColor: `${agent.projectColor}30`,
-                color: agent.projectColor,
+                backgroundColor: `${projectColor}12`,
+                borderColor: `${projectColor}30`,
+                color: projectColor,
               }}
             >
               &#x2B21;
@@ -66,12 +74,19 @@ export function AgentDetail({
                 {agent.description}
               </p>
               <div className="flex gap-3 mt-1.5 text-[10px] text-muted-foreground/40">
-                <span>
-                  ns:{" "}
-                  <span className="text-muted-foreground">
-                    {agent.namespace}
+                {agent.endpoint && agent.endpoint !== "\u2014" && (
+                  <span>
+                    url:{" "}
+                    <a
+                      href={agent.endpoint}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-primary hover:underline"
+                    >
+                      {agent.endpoint.replace(/^https?:\/\//, "")}
+                    </a>
                   </span>
-                </span>
+                )}
                 <span>
                   model:{" "}
                   <span className="text-muted-foreground">{agent.model}</span>
@@ -92,6 +107,16 @@ export function AgentDetail({
             </div>
           </div>
           <div className="flex gap-1.5 shrink-0">
+            {canStart && (
+              <Button size="xs" onClick={() => startAgent(agent.id)}>
+                Start
+              </Button>
+            )}
+            {canStop && (
+              <Button variant="outline" size="xs" onClick={() => stopAgent(agent.id)}>
+                Stop
+              </Button>
+            )}
             {agent.status === "running" && (
               <Button variant="outline" size="xs" onClick={onScale}>
                 Scale
@@ -121,6 +146,7 @@ export function AgentDetail({
           <TabsList variant="line">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="skills">Skills & MCP</TabsTrigger>
+            <TabsTrigger value="users">Users</TabsTrigger>
             <TabsTrigger value="config">Config</TabsTrigger>
             <TabsTrigger value="versions">Versions</TabsTrigger>
             <TabsTrigger value="metrics">Metrics</TabsTrigger>
@@ -134,6 +160,9 @@ export function AgentDetail({
           <TabsContent value="skills" className="mt-0 space-y-4">
             <AgentSkillsTable skills={agent.skills} />
             <AgentMcpServers servers={agent.mcpServers} />
+          </TabsContent>
+          <TabsContent value="users" className="mt-0">
+            <UsersTab agentId={agent.id} />
           </TabsContent>
           <TabsContent value="config" className="mt-0">
             <ConfigTab agent={agent} />

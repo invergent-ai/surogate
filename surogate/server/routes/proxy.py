@@ -76,7 +76,11 @@ _UPSTREAM_BASES: dict[str, str] = {
 
 from surogate.core.db.engine import get_session as _get_session
 from surogate.core.db.repository import compute as _compute_repo
-from surogate.server.auth.authentication import get_current_subject as _get_current_subject
+from surogate.server.auth.authentication import (
+    require_model_access as _require_model_access,
+    security as _bearer_security,
+)
+from fastapi.security import HTTPAuthorizationCredentials as _HTTPAuthCreds
 
 
 class _ProxyModelInfo:
@@ -101,35 +105,62 @@ async def _get_proxy_model_info(
 ) -> _ProxyModelInfo:
     """Build an httpx client + headers targeting the upstream API.
 
-    Raises HTTPException if model is not a proxy model or config is incomplete.
+    Resolves the upstream for every model type:
+
+    * ``engine == "openrouter"`` — upstream is OpenRouter; the platform-
+      held key is injected as a Bearer header.
+    * ``engine == "openai_compat"`` — upstream is a user-provided
+      OpenAI-compatible URL with a user-provided key.
+    * Otherwise (dstack-served models with ``serving_service_id``) —
+      upstream is the in-cluster service endpoint; no auth header.
+
+    Raises HTTPException if the model has no resolvable upstream.
     """
+    from surogate.core.db.models.compute import ServingService
+
     model = await _compute_repo.get_deployed_model(session, model_id)
     if model is None:
         raise HTTPException(status_code=404, detail="Model not found")
 
     engine = model.engine
-    if engine not in ("openrouter", "openai_compat"):
-        raise HTTPException(status_code=400, detail="Model is not a proxy model")
-
     serving_config = model.serving_config or {}
-    api_key = serving_config.get("api_key", "")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="No API key configured for this model")
+    headers: dict[str, str] = {"Content-Type": "application/json"}
 
     if engine == "openrouter":
+        api_key = serving_config.get("api_key", "")
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="No API key configured for this model",
+            )
         base_url = _UPSTREAM_BASES["openrouter"]
-    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif engine == "openai_compat":
+        api_key = serving_config.get("api_key", "")
         base_url = serving_config.get("endpoint", "")
         if not base_url:
-            raise HTTPException(status_code=400, detail="No endpoint configured for this model")
+            raise HTTPException(
+                status_code=400,
+                detail="No endpoint configured for this model",
+            )
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    elif model.serving_service_id:
+        svc = await session.get(ServingService, model.serving_service_id)
+        if svc is None or not svc.endpoint:
+            raise HTTPException(
+                status_code=400,
+                detail="Model has no serving endpoint yet",
+            )
+        base_url = svc.endpoint.rstrip("/")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Model has no usable upstream (no engine, no serving service)",
+        )
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    # Match the OpenRouter SDK approach: no base_url on the client,
-    # full URL built per-request. Headers passed per-request too.
+    # Fresh client per request keeps the implementation simple;
+    # revisit pooling if proxy QPS becomes a bottleneck.
     client = httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(timeout=120.0, connect=10.0),
@@ -149,9 +180,10 @@ async def proxy_model_upstream(
     model_id: str,
     path: str,
     request: Request,
-    current_subject: str = Depends(_get_current_subject),
+    credentials: _HTTPAuthCreds = Depends(_bearer_security),
     session: AsyncSession = Depends(_get_session),
 ) -> Response:
+    await _require_model_access(model_id, credentials, session)
     """Proxy requests for upstream models (OpenRouter, OpenAI-compat URL).
 
     Streams the upstream response directly to the client, with

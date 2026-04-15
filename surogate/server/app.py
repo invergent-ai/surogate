@@ -36,8 +36,11 @@ logger = get_logger()
 
 
 async def init_app(config: ServerConfig):
-    await init_dstack(database_url=config.dstack_database_url)
-    init_kubernetes()
+    await init_dstack(
+        database_url=config.dstack_database_url,
+        kubeconfig_path=config.kubeconfig_path,
+    )
+    init_kubernetes(kubeconfig_path=config.kubeconfig_path)
 
 
 @asynccontextmanager
@@ -46,6 +49,9 @@ async def lifespan(app: FastAPI):
 
     config: ServerConfig = getattr(app.state, "config", None)
     engine = init_engine(config.database_url)
+
+    from surogate.core.surogates_client import SurogatesClient
+    app.state.surogates = SurogatesClient(config.surogates_database_url)
 
     await init_app(config)
 
@@ -64,10 +70,19 @@ async def lifespan(app: FastAPI):
     await monitor.start()
     app.state.serving_monitor = monitor
 
+    # Start background monitor for agent Helm releases
+    from surogate.core.compute.agent_monitor import AgentMonitor
+    agent_monitor = AgentMonitor(config, poll_interval=5.0)
+    agent_monitor.on_transition(notify_transition)
+    await agent_monitor.start()
+    app.state.agent_monitor = agent_monitor
+
     yield
 
+    await agent_monitor.stop()
     await monitor.stop()
     await shutdown_dstack()
+    await app.state.surogates.close()
     await engine.dispose()
 
 
