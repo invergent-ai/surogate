@@ -13,6 +13,7 @@ class ServerConfig:
     log_level: str = 'info'
     database_url: str = 'postgresql+asyncpg://surogate:surogate@127.0.0.1:32432/surogate'
     dstack_database_url: str = 'postgresql+asyncpg://dstack:dstack@127.0.0.1:32432/dstack'
+    surogates_database_url: str = 'postgresql+asyncpg://surogates:surogates@127.0.0.1:32432/surogates'
     lakefs_endpoint: Optional[str] = None
     lakefs_s3_endpoint: Optional[str] = None
     lakefs_k8s_s3_endpoint: Optional[str] = 'http://lakefs-s3.lakefs.svc'

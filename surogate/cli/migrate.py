@@ -13,8 +13,8 @@ logger = get_logger()
 _ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
 
 
-def _load_database_url(config_path: str | None) -> str:
-    """Resolve the database URL from a config file.
+def _load_config(config_path: str | None):
+    """Resolve ServerConfig from a config file.
 
     Falls back to ~/.surogate/config.yaml when no explicit path is given.
     """
@@ -30,8 +30,15 @@ def _load_database_url(config_path: str | None) -> str:
     from surogate.core.config.loader import load_config
     from surogate.core.config.server_config import ServerConfig
 
-    config = load_config(ServerConfig, config_path)
-    return config.database_url
+    return load_config(ServerConfig, config_path)
+
+
+def _run_surogates_migrations(surogates_db_url: str) -> None:
+    from surogates.config import DatabaseSettings
+    from surogates.db.engine import run_migrations
+
+    logger.info(f"Running Surogates migrations against {surogates_db_url}")
+    run_migrations(DatabaseSettings(url=surogates_db_url))
 
 
 def _alembic_cfg(db_url: str):
@@ -92,60 +99,74 @@ def prepare_command_parser(parser=None):
     return parser
 
 
-def _cmd_upgrade(db_url, args):
+def _cmd_upgrade(config, args):
     from alembic import command
 
     logger.info(f"Upgrading database to revision: {args.revision}")
-    command.upgrade(_alembic_cfg(db_url), args.revision)
+    command.upgrade(_alembic_cfg(config.database_url), args.revision)
     logger.info("Upgrade complete.")
+    _run_surogates_migrations(config.surogates_database_url)
 
 
-def _cmd_downgrade(db_url, args):
+def _cmd_downgrade(config, args):
     from alembic import command
 
     logger.info(f"Downgrading database to revision: {args.revision}")
-    command.downgrade(_alembic_cfg(db_url), args.revision)
+    command.downgrade(_alembic_cfg(config.database_url), args.revision)
     logger.info("Downgrade complete.")
 
 
-def _cmd_revision(db_url, args):
+def _cmd_revision(config, args):
     from alembic import command
 
     autogenerate = not args.no_autogenerate
     logger.info(f"Creating revision: {args.message}  (autogenerate={autogenerate})")
     command.revision(
-        _alembic_cfg(db_url),
+        _alembic_cfg(config.database_url),
         message=args.message,
         autogenerate=autogenerate,
     )
 
 
-def _cmd_current(db_url, args):
+def _cmd_current(config, args):
     from alembic import command
 
-    command.current(_alembic_cfg(db_url), verbose=True)
+    command.current(_alembic_cfg(config.database_url), verbose=True)
 
 
-def _cmd_history(db_url, args):
+def _cmd_history(config, args):
     from alembic import command
 
-    command.history(_alembic_cfg(db_url), verbose=args.verbose)
+    command.history(_alembic_cfg(config.database_url), verbose=args.verbose)
 
 
-def _cmd_heads(db_url, args):
+def _cmd_heads(config, args):
     from alembic import command
 
-    command.heads(_alembic_cfg(db_url), verbose=True)
+    command.heads(_alembic_cfg(config.database_url), verbose=True)
 
 
-def _cmd_create_all(db_url, args):
+def _cmd_create_all(config, args):
     import asyncio
     from surogate.core.db import init_engine, create_all_tables
+    from surogate.core.db.engine import get_session_factory
+    from surogate.core.db.repository import auth as auth_repository
+    from surogate.core.hub.lakefs import init_lakefs, seed_lakefs_user
 
-    logger.info(f"Creating all tables from model metadata ({db_url})")
-    init_engine(db_url)
-    asyncio.run(create_all_tables())
-    logger.info("All tables created.")
+    logger.info(f"Creating all tables from model metadata ({config.database_url})")
+    init_engine(config.database_url)
+
+    async def _seed():
+        await create_all_tables()
+        factory = get_session_factory()
+        async with factory() as session:
+            await auth_repository.seed_admin_user(session)
+            await init_lakefs(config)
+            await seed_lakefs_user("surogate", session, config)
+
+    asyncio.run(_seed())
+    logger.info("All tables created and seeded.")
+    _run_surogates_migrations(config.surogates_database_url)
 
 
 _ACTIONS = {
@@ -167,5 +188,5 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(1)
 
-    db_url = _load_database_url(args.config)
-    _ACTIONS[args.action](db_url, args)
+    config = _load_config(args.config)
+    _ACTIONS[args.action](config, args)

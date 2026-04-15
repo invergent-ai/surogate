@@ -244,6 +244,7 @@ host: 127.0.0.1
 port: 8888
 database_url: postgresql+asyncpg://surogate:surogate@127.0.0.1:32432/surogate
 dstack_database_url: postgresql+asyncpg://dstack:dstack@127.0.0.1:32432/dstack
+surogates_database_url: postgresql+asyncpg://surogates:surogates@127.0.0.1:32432/surogates
 lakefs_endpoint: https://lakefs.k8s.localhost
 lakefs_s3_endpoint: https://lakefs-s3.k8s.localhost
 lakefs_access_key: $LAKEFS_ACCESS_KEY_ID
