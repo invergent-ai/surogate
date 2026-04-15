@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class CreateProjectRequest(BaseModel):
@@ -21,9 +21,9 @@ class ProjectResponse(BaseModel):
     created_at: datetime
     dstack_project_name: Optional[str] = None
 
-    @validator("status", pre=True)
+    @field_validator("status", mode="before")
+    @classmethod
     def coerce_status(cls, v):
         return v.value if hasattr(v, "value") else str(v)
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)

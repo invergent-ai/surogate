@@ -2,7 +2,7 @@
 
 from typing import Dict, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # ── Requests ──────────────────────────────────────────────────────────
@@ -63,8 +63,7 @@ class JobResponse(BaseModel):
     use_spot: bool = False
     dstack_run_name: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class JobListResponse(BaseModel):
@@ -89,8 +88,7 @@ class ServingServiceResponse(BaseModel):
     requested_by: Optional[str] = None
     project: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ServingServiceListResponse(BaseModel):
@@ -134,9 +132,7 @@ class NodeResponse(BaseModel):
     mem: MemInfo
     workloads: list[WorkloadSlot]
 
-    class Config:
-        orm_mode = True
-        use_enum_values = True
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
 class CloudAccountResponse(BaseModel):
@@ -149,9 +145,7 @@ class CloudAccountResponse(BaseModel):
     monthly_budget: float = 0
     monthly_spend: float = 0
 
-    class Config:
-        orm_mode = True
-        use_enum_values = True
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
 class CloudInstanceResponse(BaseModel):
@@ -169,9 +163,7 @@ class CloudInstanceResponse(BaseModel):
     project_id: str = ""
     project_name: str = ""
 
-    class Config:
-        orm_mode = True
-        use_enum_values = True
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
 class PolicyResponse(BaseModel):
@@ -184,8 +176,7 @@ class PolicyResponse(BaseModel):
     last_triggered: Optional[str] = None
     trigger_count: int = 0
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CostByTypeItem(BaseModel):

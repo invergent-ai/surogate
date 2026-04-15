@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # ── Requests ──────────────────────────────────────────────────────────
@@ -142,8 +142,7 @@ class DeployedModelResponse(BaseModel):
     metrics_history: MetricsHistoryInfo = MetricsHistoryInfo()
     events: list[EventInfo] = []
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DeployedModelListResponse(BaseModel):

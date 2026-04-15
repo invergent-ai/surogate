@@ -36,9 +36,9 @@ dependencies = [
     "rich>=13.0.0",
     "psutil",
     "matplotlib",
-    "pydantic",
-    "densemax-lakefs-spec @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_spec-1.50.0-py3-none-any.whl",
-    "densemax-lakefs-sdk @ https://densemax.s3.eu-central-1.amazonaws.com/densemax_lakefs_sdk-1.50.0-py3-none-any.whl",
+    "pydantic>=2.4,<3",
+    "surogates @ https://github.com/invergent-ai/surogates/releases/download/v0.2/surogates-0.2-py3-none-any.whl",
+    "densemax-lakefs-sdk @ https://github.com/invergent-ai/densemax-lakeFS/releases/download/v1.50.4/densemax_lakefs_sdk-1.50.4-py3-none-any.whl",
     "sqlalchemy[asyncio]",
     "SQLAlchemy-Utils",
     "httpx>=0.27,<1.0",
@@ -58,11 +58,24 @@ version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 fallback_version = "0.0.1"
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
 [tool.uv]
 prerelease = "allow"
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "surogate/**/*.py" },
+]
+# dstack 0.20.x pins pydantic<2; we redirect its imports to pydantic.v1
+# (shipped with pydantic v2) via a meta-path finder in surogate/__init__.py,
+# so we override the pin to allow pydantic 2 to be installed.
+override-dependencies = [
+    "pydantic>=2.4,<3",
+    "pydantic-duality>=1.2.4,<2",
 ]
 
 [[tool.uv.index]]

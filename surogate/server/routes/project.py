@@ -21,7 +21,7 @@ async def get_user_projects(
 ) -> list[ProjectResponse]:
     """Fetch the list of projects the user has access to."""
     projects = await project_repository.get_user_projects(session, current_subject)
-    return [ProjectResponse.from_orm(p) for p in projects]
+    return [ProjectResponse.model_validate(p) for p in projects]
 
 
 def _slugify(name: str) -> str:
@@ -49,4 +49,4 @@ async def create_project(
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return ProjectResponse.from_orm(project)
+    return ProjectResponse.model_validate(project)

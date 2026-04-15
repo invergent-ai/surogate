@@ -72,6 +72,14 @@ class LocalTaskManager:
 
         # Pre-create LakeFS repo for import tasks
         if ttype in (LocalTaskType.import_model, LocalTaskType.import_dataset):
+            # HF model ids may arrive as "user/repo:filename.gguf" — the colon
+            # separates the repo from a specific GGUF file inside it. HF SDK
+            # rejects the colon form, so split it out into a separate param.
+            hf_id = params.get("hf_repo_id", "")
+            if ":" in hf_id and not params.get("gguf_file"):
+                repo, _, fname = hf_id.partition(":")
+                params["hf_repo_id"] = repo
+                params["gguf_file"] = fname
             await self._ensure_lakefs_repo(session, user_id, params, ttype)
 
         task = LocalTask(
@@ -251,6 +259,15 @@ class LocalTaskManager:
         repo_id = params.get("lakefs_repo_id", "")
         if not repo_id:
             raise ValueError("lakefs_repo_id is required")
+        # LakeFS repo names must match /^[a-zA-Z0-9][a-zA-Z0-9-.]{2,62}$/.
+        # HF ids often contain `/` and `:` (e.g. "unsloth/Qwen3:file.gguf"),
+        # which LakeFS rejects — fold them to `-` and trim to the length cap.
+        import re as _re
+        sanitized = _re.sub(r"[^a-zA-Z0-9.-]+", "-", repo_id).strip("-.")
+        if not sanitized or not sanitized[0].isalnum():
+            sanitized = "r-" + sanitized.lstrip("-.")
+        repo_id = sanitized[:63]
+        params["lakefs_repo_id"] = repo_id  # downstream tasks see the sanitized id
 
         repo_type = (
             REPO_TYPE_MODEL

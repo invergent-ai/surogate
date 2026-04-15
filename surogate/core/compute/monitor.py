@@ -170,7 +170,7 @@ class ServingMonitor:
             model = await repo.get_deployed_model_by_service(session, svc.id)
             if model is not None:
                 resp = build_model_response(model, svc)
-                data = resp.dict()
+                data = resp.model_dump()
                 await self._fire_callbacks("model", model.id, model.name, old_status, new_status, data)
 
     async def _sync_managed_jobs(
