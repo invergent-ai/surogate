@@ -1,0 +1,34 @@
+agent:
+  slug: "surogates"
+  domain: "k8s.localhost"
+
+# Run these components locally, not in-cluster.
+api:
+  enabled: false
+worker:
+  enabled: false
+mcpProxy:
+  enabled: false
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false
+jobs:
+  cleanupSessions:
+    enabled: false
+  resetIdleSessions:
+    enabled: false
+
+db:
+  url: "postgresql+asyncpg://surogates:surogates@surogates-db-postgresql.default.svc:5432/surogates"
+redis:
+  url: "redis://surogates-redis-master.default.svc:6379/0"
+
+auth:
+  jwtSecret: "dev-secret-do-not-use-in-production"
+
+sandbox:
+  backend: "kubernetes"
+  k8sNamespace: "surogates"
+
+logLevel: "DEBUG"

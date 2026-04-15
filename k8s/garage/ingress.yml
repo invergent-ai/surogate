@@ -1,0 +1,16 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: garage-s3
+  namespace: default
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`garage.k8s.localhost`)
+      kind: Rule
+      services:
+        - name: surogates-s3-garage-s3-api
+          port: 3900
+  tls:
+    secretName: traefik-tls-secret

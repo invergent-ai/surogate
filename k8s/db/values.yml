@@ -11,3 +11,6 @@ primary:
       create-surogate.sql: |
         CREATE USER surogate WITH PASSWORD 'surogate';
         CREATE DATABASE surogate OWNER surogate;
+      create-surogates.sql: |
+        CREATE USER surogates WITH PASSWORD 'surogates';
+        CREATE DATABASE surogates OWNER surogates;

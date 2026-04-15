@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export K3D_IMAGE="ghcr.io/invergent-ai/k3s-v1.35.3-k3s1-cuda-12.9.1-cudnn-runtime-ubuntu24.04"
 export SUROGATE_DIR="${HOME}/.surogate"
 export LAKEFS_DIR="${SUROGATE_DIR}/lakefs"
+export GARAGE_DIR="${SUROGATE_DIR}/garage"
 export HF_CACHE="${HOME}/.cache/huggingface"
 export CLUSTER_NAME="surogate"
 export SERVERS=1
@@ -30,14 +31,18 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
- if [ -d "$SUROGATE_DIR" ]; then
-    if [ -d "$SUROGATE_DIR/lakefs" ]; then
-        echo -e "${YELLOW}✖ WARN: Runtime directory '${SUROGATE_DIR}/lakefs' already exists.${NC}"
-    fi
-else
-    mkdir -p "${SUROGATE_DIR}/bin"
-    mkdir -p "${LAKEFS_DIR}"
+if [ -d "$SUROGATE_DIR/lakefs" ]; then
+    echo -e "${YELLOW}✖ WARN: Runtime directory '${SUROGATE_DIR}/lakefs' already exists.${NC}"
 fi
+if [ -d "$GARAGE_DIR" ]; then
+    echo -e "${YELLOW}✖ WARN: Runtime directory '${GARAGE_DIR}' already exists.${NC}"
+fi
+
+mkdir -p "${SUROGATE_DIR}/bin"
+mkdir -p "${LAKEFS_DIR}"
+mkdir -p "${GARAGE_DIR}/meta"
+mkdir -p "${GARAGE_DIR}/data"
+sudo chmod -R 777 "${GARAGE_DIR}"
 
 # Install kubectl
 if [ ! -f "${SUROGATE_DIR}/bin/kubectl" ]; then
@@ -82,11 +87,12 @@ setup_helm_repositories() {
     "$HELM" repo add nvidia https://helm.ngc.nvidia.com/nvidia
     "$HELM" repo add dcgm-exporter https://nvidia.github.io/dcgm-exporter/helm-charts
     "$HELM" repo add bitnami https://charts.bitnami.com/bitnami
+    "$HELM" repo add charts-derwitt-dev https://charts.derwitt.dev
     "$HELM" repo update
 }
 
 create_cluster() {
-    for host in k8s.localhost studio.k8s.localhost lakefs.k8s.localhost lakefs-s3.k8s.localhost metrics.k8s.localhost; do
+    for host in k8s.localhost studio.k8s.localhost lakefs.k8s.localhost lakefs-s3.k8s.localhost metrics.k8s.localhost surogates.k8s.localhost garage.k8s.localhost; do
         grep -qF "$host" /etc/hosts || sudo sh -c "echo '127.0.0.1 $host' >> /etc/hosts"
     done
     
@@ -166,7 +172,7 @@ install_lakefs() {
 install_gpu() {
     "$KUBECTL" create namespace nvidia-gpu-operator
     "$KUBECTL" apply -f "${SCRIPT_DIR}/gpu/configmap.yml"
-    "$HELM" install nvidia-gpu-operator nvidia/gpu-operator --version=v26.3.0 --wait -n nvidia-gpu-operator -f "${SCRIPT_DIR}/gpu/values.yml" > /dev/null
+    "$HELM" install nvidia-gpu-operator nvidia/gpu-operator --version=v26.3.0 -n nvidia-gpu-operator -f "${SCRIPT_DIR}/gpu/values.yml" > /dev/null
 }
 
 install_metrics() {
@@ -181,9 +187,55 @@ install_role() {
 }
 
 install_db() {
-    "$HELM" install surogate-db bitnami/postgresql --wait -f "${SCRIPT_DIR}/db/values.yml" > /dev/null
+    "$HELM" install surogate-db bitnami/postgresql -f "${SCRIPT_DIR}/db/values.yml" > /dev/null
     # if needed, you can retrieve the generated password for the 'postgres' user with:
     # export POSTGRES_PASSWORD=$("$KUBECTL" get secret --namespace surogate-db surogate-db-postgresql -o jsonpath="{.data.password}" | base64 -d)
+}
+
+install_redis() {
+    "$HELM" install surogates-redis bitnami/redis -f "${SCRIPT_DIR}/redis/values.yml" > /dev/null
+}
+
+install_garage() {
+    "$HELM" install surogates-s3 charts-derwitt-dev/garage --version 2.3.1 -f "${SCRIPT_DIR}/garage/values.yml" > /dev/null
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/garage/ingress.yml"
+}
+
+configure_garage() {
+    local pod node_id output
+    "$KUBECTL" rollout status daemonset/surogates-s3-garage --timeout=120s > /dev/null
+
+    pod=$("$KUBECTL" get pod -l app.kubernetes.io/instance=surogates-s3 -o jsonpath='{.items[0].metadata.name}')
+    node_id=$("$KUBECTL" exec "$pod" -- /garage status 2>/dev/null | awk 'NR>2 && $1 ~ /^[0-9a-f]+$/ {print $1; exit}')
+
+    if [ -z "$node_id" ]; then
+        echo -e "${RED}✖ ERROR: Could not determine Garage node id.${NC}"
+        return 1
+    fi
+
+    "$KUBECTL" exec "$pod" -- /garage layout assign -z dc1 -c 1G "$node_id" > /dev/null 2>&1 || true
+    "$KUBECTL" exec "$pod" -- /garage layout apply --version 1 > /dev/null 2>&1 || true
+    "$KUBECTL" exec "$pod" -- /garage bucket create surogates > /dev/null 2>&1 || true
+
+    if ! "$KUBECTL" exec "$pod" -- /garage key info surogates-key --show-secret > /dev/null 2>&1; then
+        "$KUBECTL" exec "$pod" -- /garage key create surogates-key > /dev/null
+    fi
+    output=$("$KUBECTL" exec "$pod" -- /garage key info surogates-key --show-secret)
+    GARAGE_ACCESS_KEY_ID=$(echo "$output" | awk -F': ' '/Key ID/ {print $2}' | tr -d ' ')
+    GARAGE_SECRET_ACCESS_KEY=$(echo "$output" | awk -F': ' '/Secret key/ {print $2}' | tr -d ' ')
+
+    "$KUBECTL" exec "$pod" -- /garage bucket allow --read --write --owner surogates --key surogates-key > /dev/null 2>&1 || true
+}
+
+install_surogates() {
+    "$KUBECTL" create namespace surogates
+    if [ -d "${SUROGATES_CHART_DIR:-/work/surogates/helm/surogates}" ]; then
+        "$HELM" upgrade --install surogates "${SUROGATES_CHART_DIR:-/work/surogates/helm/surogates}" \
+            --namespace surogates -f "${SCRIPT_DIR}/surogates/values.yml" > /dev/null
+        "$KUBECTL" apply -f "${SCRIPT_DIR}/surogates/ingress.yml"
+    else
+        echo -e "${YELLOW}✖ WARN: Surogates Helm chart not found; skipping surogates release (namespace created).${NC}"
+    fi
 }
 
 create_server_config() {
@@ -196,6 +248,11 @@ lakefs_endpoint: https://lakefs.k8s.localhost
 lakefs_s3_endpoint: https://lakefs-s3.k8s.localhost
 lakefs_access_key: $LAKEFS_ACCESS_KEY_ID
 lakefs_secret_key: $LAKEFS_SECRET_ACCESS_KEY
+agent_s3_endpoint: https://garage.k8s.localhost
+agent_s3_region: garage
+agent_s3_bucket: surogates
+agent_s3_access_key: $GARAGE_ACCESS_KEY_ID
+agent_s3_secret_key: $GARAGE_SECRET_ACCESS_KEY
 EOF
 }
 
@@ -219,10 +276,14 @@ export KUBECONFIG="$SUROGATE_DIR/kubeconfig"
 
 install_traefik
 install_db
+install_redis
+install_garage
+configure_garage
 install_gpu
 install_lakefs
 install_metrics
 install_role
+install_surogates
 create_server_config
 
 echo -e "${GREEN}✓ Cluster setup complete!${NC}"

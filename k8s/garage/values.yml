@@ -1,0 +1,53 @@
+garage:
+  replicationFactor: "1"
+  dbEngine: lmdb
+  consistencyMode: consistent
+  compressionLevel: "1"
+  rpc:
+    bindAddr: "[::]:3901"
+    secret:
+      create: true
+  s3:
+    api:
+      region: garage
+      rootDomain: ".s3.garage.localhost"
+    web:
+      rootDomain: ".web.garage.localhost"
+      index: "index.html"
+
+deployment:
+  kind: DaemonSet
+
+persistence:
+  enabled: true
+  meta:
+    hostPath: /var/lib/garage/meta
+  data:
+    hostPath: /var/lib/garage/data
+
+service:
+  type: ClusterIP
+  s3:
+    api:
+      port: 3900
+    web:
+      port: 3902
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: "OnRootMismatch"
+  runAsNonRoot: true
+
+monitoring:
+  metrics:
+    enabled: false

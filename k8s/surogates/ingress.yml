@@ -1,0 +1,19 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: surogates-api
+  namespace: surogates
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`surogates.k8s.localhost`)
+      kind: Rule
+      services:
+        - name: api-gateway
+          port: 8000
+      middlewares:
+        - name: secure-headers
+          namespace: kube-system
+  tls:
+    secretName: traefik-tls-secret

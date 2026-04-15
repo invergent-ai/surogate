@@ -22,6 +22,9 @@ volumes:
     nodeFilters:
     - server:0
     - agent:*
+  - volume: ${GARAGE_DIR}:/var/lib/garage # garage s3 persistent storage
+    nodeFilters:
+    - agent:*
 
 ports:
   - port: ${HTTP_PORT}:80 # http port host:container
@@ -36,12 +39,17 @@ ports:
   - port: 0.0.0.0:32432:32432 # postgresql
     nodeFilters:
       - agent:*
+  - port: 0.0.0.0:32379:32379 # redis (surogates queue)
+    nodeFilters:
+      - agent:*
 
 hostAliases:
   - ip: 127.0.0.1
     hostnames:
       - k8s.localhost
       - studio.k8s.localhost
+      - surogates.k8s.localhost
+      - garage.k8s.localhost
 
 options:
   k3d:
@@ -55,7 +63,7 @@ options:
     - arg: --disable=traefik
       nodeFilters:
       - server:*
-    - arg: --tls-san=localhost,127.0.0.1,k8s.localhost,cluster.localhost,k8s.localhost,studio.k8s.localhost,lakefs.k8s.localhost,lakefs-s3.k8s.localhost,metrics.k8s.localhost
+    - arg: --tls-san=localhost,127.0.0.1,k8s.localhost,cluster.localhost,k8s.localhost,studio.k8s.localhost,lakefs.k8s.localhost,lakefs-s3.k8s.localhost,metrics.k8s.localhost,surogates.k8s.localhost,garage.k8s.localhost
       nodeFilters:
       - server:*
     - arg: --kube-proxy-arg=metrics-bind-address=0.0.0.0
