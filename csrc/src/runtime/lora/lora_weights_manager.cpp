@@ -17,7 +17,8 @@
 namespace modules {
 
 ModularLoRAWeightsManager::ModularLoRAWeightsManager(const Config& config, TensorAllocator& allocator)
-    : mConfig(config), mAllocator(&allocator) {
+    : mConfig(config),
+      mAllocator(&allocator) {
     mMaster.config = config.lora_config;
     mWork.config = config.lora_config;
 
@@ -34,23 +35,27 @@ ModularLoRAWeightsManager::ModularLoRAWeightsManager(const Config& config, Tenso
     }
 }
 
-void ModularLoRAWeightsManager::allocate_layer_weights(
-    LoRALayerWeights<TensorShard>& shard,
-    LoRALayerWeights<Tensor>& work,
-    int in_features,
-    int out_features,
-    const std::string& name) {
-
+void ModularLoRAWeightsManager::allocate_layer_weights(LoRALayerWeights<TensorShard>& shard,
+                                                       LoRALayerWeights<Tensor>& work,
+                                                       int in_features,
+                                                       int out_features,
+                                                       const std::string& name) {
     const int r = mConfig.lora_config.rank;
     const ETensorDType master_dtype = mConfig.lora_config.dtype;
     const ETensorDType work_dtype = mConfig.work_dtype;
 
     // Data-parallel LoRA: replicate weights on all ranks (no sharding yet).
-    shard.A = TensorShard(mAllocator->allocate(master_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {r, in_features}));
-    shard.B = mAllocator->allocate_shard(master_dtype, /*shard_idx=*/0, /*num_shards=*/1, (name + "_B").c_str(), {out_features, r});
+    shard.A = TensorShard(
+        mAllocator->allocate(master_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {r, in_features}));
+    shard.B = mAllocator->allocate_shard(master_dtype,
+                                         /*shard_idx=*/0,
+                                         /*num_shards=*/1,
+                                         (name + "_B").c_str(),
+                                         {out_features, r});
 
     work.A = mAllocator->allocate(work_dtype, (name + "_A_work").c_str(), EAllocationType::ON_DEVICE, {r, in_features});
-    work.B = mAllocator->allocate(work_dtype, (name + "_B_work").c_str(), EAllocationType::ON_DEVICE, {out_features, r});
+    work.B =
+        mAllocator->allocate(work_dtype, (name + "_B_work").c_str(), EAllocationType::ON_DEVICE, {out_features, r});
 }
 
 void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
@@ -64,8 +69,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     const int q_out = Hq * Hs;
     const int kv_out = Hkv * Hs;
     int q_lora_out = q_out;
-    const bool use_shared_expert = mConfig.model_config &&
-                                   mConfig.model_config->moe_config.has_value() &&
+    const bool use_shared_expert = mConfig.model_config && mConfig.model_config->moe_config.has_value() &&
                                    mConfig.model_config->moe_config->use_shared_expert;
     const int shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
                              ? mConfig.model_config->moe_config->shared_expert_size
@@ -85,22 +89,22 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         auto contains_ci = [](std::string_view haystack, std::string_view needle) {
             std::string h(haystack);
             std::string n(needle);
-            std::transform(h.begin(), h.end(), h.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            std::transform(n.begin(), n.end(), n.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
             return h.find(n) != std::string::npos;
         };
         bt = mConfig.model_config->get_block_type(layer_idx);
         is_hybrid = (mConfig.model_config->architecture == ArchitectureType::Hybrid);
-        const bool is_qwen3_family =
-            contains_ci(mConfig.model_config->ModelTypeName, "qwen3") ||
-            contains_ci(mConfig.model_config->ArchitectureName, "qwen3");
-        is_qwen3_5 =
-            contains_ci(mConfig.model_config->ModelTypeName, "qwen3_5") ||
-            contains_ci(mConfig.model_config->ModelTypeName, "qwen3.5") ||
-            contains_ci(mConfig.model_config->ArchitectureName, "qwen3_5") ||
-            contains_ci(mConfig.model_config->ArchitectureName, "qwen3.5");
+        const bool is_qwen3_family = contains_ci(mConfig.model_config->ModelTypeName, "qwen3") ||
+                                     contains_ci(mConfig.model_config->ArchitectureName, "qwen3");
+        is_qwen3_5 = contains_ci(mConfig.model_config->ModelTypeName, "qwen3_5") ||
+                     contains_ci(mConfig.model_config->ModelTypeName, "qwen3.5") ||
+                     contains_ci(mConfig.model_config->ArchitectureName, "qwen3_5") ||
+                     contains_ci(mConfig.model_config->ArchitectureName, "qwen3.5");
         is_qwen3_hybrid = is_hybrid && is_qwen3_family;
     }
     if (is_qwen3_5) {
@@ -111,7 +115,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     // Attention LoRA: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
     // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
     const bool has_attention = (bt == BlockType::Dense || bt == BlockType::Attention ||
-                               ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
+                                ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
     if (has_attention) {
         if (mConfig.lora_config.applies_to_q()) {
             master.attention.q.emplace();
@@ -139,26 +143,21 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
     const bool has_global_moe = (mConfig.num_experts > 0);
     const bool layer_is_moe =
-        (bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
-        (bt == BlockType::Dense && has_global_moe);
+        (bt == BlockType::MoE || bt == BlockType::SwitchMoE) || (bt == BlockType::Dense && has_global_moe);
     // Dense MLP LoRA:
     // - Dense (non-MoE) or MLP block types
     // - Qwen3.5 hybrid blocks (both full-attention and linear-attention)
     //   contain standard MLP up/down/gate projections.
     const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_hybrid;
     const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_hybrid;
-    const bool layer_is_dense_mlp = (bt == BlockType::MLP) ||
-                                     (bt == BlockType::Dense && !has_global_moe) ||
-                                     layer_is_qwen3_linear_mlp ||
-                                     layer_is_qwen3_attention_mlp;
+    const bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
+                                    layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
 
     if (layer_is_moe && mConfig.num_experts > 0) {
         master.moe.use_grouped = true;
         work.moe.use_grouped = true;
-        const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
-                                   mConfig.lora_config.applies_to_gate_up() ||
-                                   mConfig.lora_config.applies_to_up() ||
-                                   mConfig.lora_config.applies_to_down();
+        const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() || mConfig.lora_config.applies_to_gate_up() ||
+                                  mConfig.lora_config.applies_to_up() || mConfig.lora_config.applies_to_down();
         if (has_mlp_lora) {
             allocate_grouped_moe_weights(master.moe.grouped, work.moe.grouped, layer_idx);
         }
@@ -172,22 +171,27 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         }
 
         if (use_shared_expert) {
-            const bool has_shared_lora = mConfig.lora_config.applies_to_up() ||
-                                         mConfig.lora_config.applies_to_down();
+            const bool has_shared_lora = mConfig.lora_config.applies_to_up() || mConfig.lora_config.applies_to_down();
             if (has_shared_lora) {
                 master.moe.shared.emplace();
                 work.moe.shared.emplace();
                 if (mConfig.lora_config.applies_to_up()) {
                     master.moe.shared->up.emplace();
                     work.moe.shared->up.emplace();
-                    allocate_layer_weights(*master.moe.shared->up, *work.moe.shared->up,
-                                           /*in=*/C, /*out=*/shared_D, prefix + "_shared_up");
+                    allocate_layer_weights(*master.moe.shared->up,
+                                           *work.moe.shared->up,
+                                           /*in=*/C,
+                                           /*out=*/shared_D,
+                                           prefix + "_shared_up");
                 }
                 if (mConfig.lora_config.applies_to_down()) {
                     master.moe.shared->down.emplace();
                     work.moe.shared->down.emplace();
-                    allocate_layer_weights(*master.moe.shared->down, *work.moe.shared->down,
-                                           /*in=*/shared_D, /*out=*/C, prefix + "_shared_down");
+                    allocate_layer_weights(*master.moe.shared->down,
+                                           *work.moe.shared->down,
+                                           /*in=*/shared_D,
+                                           /*out=*/C,
+                                           prefix + "_shared_down");
                 }
             }
         }
@@ -211,11 +215,9 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     // Non-Qwen3 Mamba/SSM blocks still do not have dedicated LoRA coverage here.
 }
 
-void ModularLoRAWeightsManager::allocate_grouped_moe_weights(
-    LoRAGroupedExpertWeights<TensorShard>& master_moe,
-    LoRAGroupedExpertWeights<Tensor>& work_moe,
-    int layer_idx) {
-
+void ModularLoRAWeightsManager::allocate_grouped_moe_weights(LoRAGroupedExpertWeights<TensorShard>& master_moe,
+                                                             LoRAGroupedExpertWeights<Tensor>& work_moe,
+                                                             int layer_idx) {
     const int C = mConfig.hidden_size;
     const int D = mConfig.effective_moe_intermediate();
     const int gate_up_out = 2 * D;
@@ -229,11 +231,20 @@ void ModularLoRAWeightsManager::allocate_grouped_moe_weights(
         m_layer.emplace();
         w_layer.emplace();
 
-        m_layer->A = TensorShard(mAllocator->allocate(master_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {num_experts, r, in}));
+        m_layer->A = TensorShard(mAllocator->allocate(master_dtype,
+                                                      (name + "_A").c_str(),
+                                                      EAllocationType::ON_DEVICE,
+                                                      {num_experts, r, in}));
         m_layer->B = mAllocator->allocate_shard(master_dtype, 0, 1, (name + "_B").c_str(), {num_experts, out, r});
 
-        w_layer->A = mAllocator->allocate(work_dtype, (name + "_A_work").c_str(), EAllocationType::ON_DEVICE, {num_experts, r, in});
-        w_layer->B = mAllocator->allocate(work_dtype, (name + "_B_work").c_str(), EAllocationType::ON_DEVICE, {num_experts, out, r});
+        w_layer->A = mAllocator->allocate(work_dtype,
+                                          (name + "_A_work").c_str(),
+                                          EAllocationType::ON_DEVICE,
+                                          {num_experts, r, in});
+        w_layer->B = mAllocator->allocate(work_dtype,
+                                          (name + "_B_work").c_str(),
+                                          EAllocationType::ON_DEVICE,
+                                          {num_experts, out, r});
     };
 
     if (mConfig.lora_config.applies_to_gate()) {
@@ -250,11 +261,10 @@ void ModularLoRAWeightsManager::allocate_grouped_moe_weights(
     }
 }
 
-void ModularLoRAWeightsManager::allocate_expert_weights(
-    LoRAExpertWeights<TensorShard>& master_expert,
-    LoRAExpertWeights<Tensor>& work_expert,
-    int layer_idx, int expert_idx) {
-
+void ModularLoRAWeightsManager::allocate_expert_weights(LoRAExpertWeights<TensorShard>& master_expert,
+                                                        LoRAExpertWeights<Tensor>& work_expert,
+                                                        int layer_idx,
+                                                        int expert_idx) {
     const int C = mConfig.hidden_size;
     const int D = mConfig.effective_moe_intermediate();
     const int gate_up_out = 2 * D;
@@ -268,7 +278,11 @@ void ModularLoRAWeightsManager::allocate_expert_weights(
     if (mConfig.lora_config.applies_to_gate_up()) {
         master_expert.gate_up.emplace();
         work_expert.gate_up.emplace();
-        allocate_layer_weights(*master_expert.gate_up, *work_expert.gate_up, /*in=*/C, /*out=*/gate_up_out, prefix + "_gate_up");
+        allocate_layer_weights(*master_expert.gate_up,
+                               *work_expert.gate_up,
+                               /*in=*/C,
+                               /*out=*/gate_up_out,
+                               prefix + "_gate_up");
     }
     if (mConfig.lora_config.applies_to_up()) {
         master_expert.up.emplace();
@@ -285,15 +299,14 @@ void ModularLoRAWeightsManager::allocate_expert_weights(
 void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
     if (!enabled()) return;
 
-    auto init_layer = [&](std::optional<LoRALayerWeights<TensorShard>>& layer,
-                          int in_features,
-                          unsigned long long subsequence) {
-        if (!layer.has_value()) return;
-        // std consistent with kaiming_uniform_(a=sqrt(5)) => bound = 1/sqrt(fan_in)
-        float std_a = 1.0f / std::sqrt(3.0f * static_cast<float>(in_features));
-        fill_normal(layer->A, layer->A.nelem(), 0.0f, std_a, seed, subsequence, nullptr);
-        fill_zero(layer->B, nullptr);
-    };
+    auto init_layer =
+        [&](std::optional<LoRALayerWeights<TensorShard>>& layer, int in_features, unsigned long long subsequence) {
+            if (!layer.has_value()) return;
+            // std consistent with kaiming_uniform_(a=sqrt(5)) => bound = 1/sqrt(fan_in)
+            float std_a = 1.0f / std::sqrt(3.0f * static_cast<float>(in_features));
+            fill_normal(layer->A, layer->A.nelem(), 0.0f, std_a, seed, subsequence, nullptr);
+            fill_zero(layer->B, nullptr);
+        };
 
     auto init_grouped = [&](std::optional<LoRAGroupedLayerWeights<TensorShard>>& layer,
                             int in_features,
@@ -307,8 +320,7 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
     const int D_moe = mConfig.effective_moe_intermediate();
-    const bool use_shared_expert = mConfig.model_config &&
-                                   mConfig.model_config->moe_config.has_value() &&
+    const bool use_shared_expert = mConfig.model_config && mConfig.model_config->moe_config.has_value() &&
                                    mConfig.model_config->moe_config->use_shared_expert;
     const int shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
                              ? mConfig.model_config->moe_config->shared_expert_size
@@ -389,8 +401,11 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
     auto sync_tensor = [&](Tensor& dst_t, const TensorShard& src_t, const char* name) {
         if (!dst_t.Data || !src_t.Data) return;
         if (dst_t.nelem() != src_t.nelem()) {
-            throw std::logic_error(fmt::format("ModularLoRAWeightsManager::get_block: {} nelem mismatch (dst={}, src={})",
-                                               name, dst_t.nelem(), src_t.nelem()));
+            throw std::logic_error(
+                fmt::format("ModularLoRAWeightsManager::get_block: {} nelem mismatch (dst={}, src={})",
+                            name,
+                            dst_t.nelem(),
+                            src_t.nelem()));
         }
 
         if (dst_t.DType == src_t.DType) {
@@ -407,9 +422,11 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
             return;
         }
 
-        throw std::logic_error(fmt::format(
-            "ModularLoRAWeightsManager::get_block: unsupported dtype cast for {} (src={}, dst={})",
-            name, dtype_to_str(src_t.DType), dtype_to_str(dst_t.DType)));
+        throw std::logic_error(
+            fmt::format("ModularLoRAWeightsManager::get_block: unsupported dtype cast for {} (src={}, dst={})",
+                        name,
+                        dtype_to_str(src_t.DType),
+                        dtype_to_str(dst_t.DType)));
     };
 
     auto sync_layer = [&](std::optional<LoRALayerWeights<Tensor>>& dst,
@@ -487,8 +504,7 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
     const std::size_t q_out = Hq * Hs;
     const std::size_t kv_out = Hkv * Hs;
     const std::size_t E = static_cast<std::size_t>(mConfig.num_experts);
-    const bool use_shared_expert = mConfig.model_config &&
-                                   mConfig.model_config->moe_config.has_value() &&
+    const bool use_shared_expert = mConfig.model_config && mConfig.model_config->moe_config.has_value() &&
                                    mConfig.model_config->moe_config->use_shared_expert;
     const std::size_t shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
                                      ? static_cast<std::size_t>(mConfig.model_config->moe_config->shared_expert_size)
@@ -533,8 +549,7 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
     return per_layer * static_cast<std::size_t>(mConfig.num_layers);
 }
 
-void ModularLoRAWeightsManager::iterate_tensors(
-    const std::function<void(std::string, const TensorShard&)>& callback) {
+void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
     if (!enabled()) return;
 
     for (int l = 0; l < (int)mMaster.blocks.size(); ++l) {
@@ -595,8 +610,10 @@ void ModularLoRAWeightsManager::iterate_tensors(
                     // A: [1, rank, in] -> [rank, in], B: [1, out, rank] -> [out, rank]
                     A_slice.Rank = layer->A.Rank - 1;
                     B_slice.Rank = layer->B.Rank - 1;
-                    for (int d = 0; d < A_slice.Rank; ++d) A_slice.Sizes[d] = A_slice.Sizes[d + 1];
-                    for (int d = 0; d < B_slice.Rank; ++d) B_slice.Sizes[d] = B_slice.Sizes[d + 1];
+                    for (int d = 0; d < A_slice.Rank; ++d)
+                        A_slice.Sizes[d] = A_slice.Sizes[d + 1];
+                    for (int d = 0; d < B_slice.Rank; ++d)
+                        B_slice.Sizes[d] = B_slice.Sizes[d + 1];
                     // Update global shape to match local shape (not sharded)
                     std::copy(A_slice.Sizes.begin(), A_slice.Sizes.end(), A_slice.GlobalShape.begin());
                     std::copy(B_slice.Sizes.begin(), B_slice.Sizes.end(), B_slice.GlobalShape.begin());
@@ -654,4 +671,4 @@ void ModularLoRAWeightsManager::iterate_tensors(
     }
 }
 
-} // namespace modules
+}  // namespace modules

@@ -87,12 +87,12 @@ enum class QuantizerIndex : int {
     FWD_SWIGLU = 3,  ///< Input to MLP down projection (SwiGLU output)
 
     // Backward gradients (E5M2)
-    BWD_D_RES_FFN = 4,   ///< Gradient after FFN residual
-    BWD_D_RES_ATT = 5,   ///< Gradient after attention residual
-    BWD_D_MLP_UP = 6,    ///< Gradient for MLP up output
-    BWD_D_QKV = 7,       ///< Gradient for QKV output
+    BWD_D_RES_FFN = 4,  ///< Gradient after FFN residual
+    BWD_D_RES_ATT = 5,  ///< Gradient after attention residual
+    BWD_D_MLP_UP = 6,   ///< Gradient for MLP up output
+    BWD_D_QKV = 7,      ///< Gradient for QKV output
 
-    NUM_QUANTIZERS_PER_LAYER = 8   ///< Number of quantizers per layer
+    NUM_QUANTIZERS_PER_LAYER = 8  ///< Number of quantizers per layer
 };
 
 constexpr int NUM_QUANTIZERS_PER_LAYER = static_cast<int>(QuantizerIndex::NUM_QUANTIZERS_PER_LAYER);
@@ -118,6 +118,6 @@ inline constexpr int get_total_quantizers(int num_layers) {
     return num_layers * NUM_QUANTIZERS_PER_LAYER;
 }
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_FP8_SCALING_CONFIG_H
+#endif  // SUROGATE_SRC_MODULES_FP8_SCALING_CONFIG_H

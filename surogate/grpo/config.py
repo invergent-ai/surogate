@@ -6,7 +6,7 @@ and runtime fields are inherited from SFTConfig.
 """
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 from surogate.core.config.sft_config import SFTConfig
 from surogate.utils.dict import DictDefault
@@ -24,6 +24,7 @@ class GRPOLossConfig:
     adv_tau: float = 1.0
     teacher_tau: float = 0.0
     kl_tau: float = 1e-3  # The tau for KL divergence
+
 
 @dataclass
 class NoiseSchedulerConfig:
@@ -52,10 +53,10 @@ class GRPOTrainConfig(SFTConfig):
     """
 
     # GRPO loss
-    loss: Optional[GRPOLossConfig] = None
+    loss: GRPOLossConfig | None = None
 
     # QeRL noise scheduler (Adaptive Quantization Noise)
-    noise_scheduler: Optional[NoiseSchedulerConfig] = None
+    noise_scheduler: NoiseSchedulerConfig | None = None
 
     # Prime-RL integration
     transport_type: Literal["filesystem", "zmq"] = "filesystem"
@@ -68,9 +69,9 @@ class GRPOTrainConfig(SFTConfig):
     doc_masking: bool = True
 
     def __init__(self, cfg: DictDefault):
-        # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid. 
-        # The advantage is often < 0.1, the clipped ratio is near 1.0 ± epsilon, and the loss mask removes prompt tokens. 
-        # The effective gradient per parameter ends up 10-100x smaller than SFT. 
+        # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid.
+        # The advantage is often < 0.1, the clipped ratio is near 1.0 ± epsilon, and the loss mask removes prompt tokens.
+        # The effective gradient per parameter ends up 10-100x smaller than SFT.
         # At that scale, BF16 rounding kills the signal.
         if "master_dtype" not in cfg:
             cfg["master_dtype"] = "fp32"
@@ -79,7 +80,7 @@ class GRPOTrainConfig(SFTConfig):
 
         cfg["sample_packing"] = "false"
         cfg["datasets"] = []
-        
+
         super().__init__(cfg)
 
         # Parse nested loss config

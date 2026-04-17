@@ -36,22 +36,28 @@ struct Tensor {
 
     [[nodiscard]] constexpr std::size_t nelem() const {
         std::size_t sz = 1;
-        for(int i = 0; i < Rank; ++i) {
+        for (int i = 0; i < Rank; ++i) {
             sz *= Sizes[i];
         }
         return sz;
     }
 
-    [[nodiscard]] bool is_null() const { return Data == nullptr; }
-    [[nodiscard]] bool has_value() const { return Data != nullptr; }
+    [[nodiscard]] bool is_null() const {
+        return Data == nullptr;
+    }
+    [[nodiscard]] bool has_value() const {
+        return Data != nullptr;
+    }
 
     static Tensor empty(ETensorDType dtype, const std::vector<long>& shape) {
         if (shape.size() > MAX_TENSOR_DIM) throw std::runtime_error("Tensor rank too large");
         Tensor t;
         t.DType = dtype;
         t.Rank = (int)shape.size();
-        for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[i];
-        for (int i = t.Rank; i < MAX_TENSOR_DIM; ++i) t.Sizes[i] = 1;
+        for (int i = 0; i < t.Rank; ++i)
+            t.Sizes[i] = shape[i];
+        for (int i = t.Rank; i < MAX_TENSOR_DIM; ++i)
+            t.Sizes[i] = 1;
         t.Data = nullptr;
         t.Device = -1;
         return t;
@@ -65,39 +71,38 @@ struct Tensor {
 
     //! this is a debugging function, copying the requested element from the GPU to the CPU
     //! for easier printing. Do **not** use it for anything else!
-    template<class TargetType>
+    template <class TargetType>
     TargetType at(long index) const;
 
     //! this is a debugging function, printing a few consecutive elements of the tensor.
     //! Do **not** use it for anything else!
-    void print_sample(long offset, long count=10) const;
+    void print_sample(long offset, long count = 10) const;
 
-    template<class TargetType>
+    template <class TargetType>
     [[nodiscard]] constexpr const TargetType* get() const {
-        if(dtype_from_type<TargetType> != DType) {
+        if (dtype_from_type<TargetType> != DType) {
             throw std::logic_error(std::string("DType mismatch (class): expected ") +
-                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType) +
-                "\n" + surogate::capture_stacktrace(2));
+                                   dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType) + "\n" +
+                                   surogate::capture_stacktrace(2));
         }
 
         return reinterpret_cast<const TargetType*>(Data);
     }
 
-    template<typename TargetType>
+    template <typename TargetType>
     [[nodiscard]] constexpr TargetType* get() {
-        if(dtype_from_type<TargetType> != DType) {
+        if (dtype_from_type<TargetType> != DType) {
             throw std::logic_error(std::string("DType mismatch (typename): expected ") +
-                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType) +
-                "\n" + surogate::capture_stacktrace(2));
+                                   dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType) + "\n" +
+                                   surogate::capture_stacktrace(2));
         }
 
         return reinterpret_cast<TargetType*>(Data);
     }
 
-    template<typename Container>
-    static Tensor from_pointer(std::byte* ptr, int device, ETensorDType dtype, const Container& shape)
-    {
-        if(shape.size() > MAX_TENSOR_DIM) {
+    template <typename Container>
+    static Tensor from_pointer(std::byte* ptr, int device, ETensorDType dtype, const Container& shape) {
+        if (shape.size() > MAX_TENSOR_DIM) {
             throw std::runtime_error("Tensor rank too large");
         }
 
@@ -114,14 +119,12 @@ struct Tensor {
     }
 
     float* scale() {
-        if(Stats == nullptr)
-            return nullptr;
+        if (Stats == nullptr) return nullptr;
         return Stats + 1;
     }
 
     const float* scale() const {
-        if(Stats == nullptr)
-            return nullptr;
+        if (Stats == nullptr) return nullptr;
         return Stats + 1;
     }
 };
@@ -132,19 +135,21 @@ Tensor slice(const Tensor& src, int dim, long start, long end);
 class TensorShard : public Tensor {
 public:
     TensorShard() = default;
-    TensorShard(const Tensor& src);   // implicit
+    TensorShard(const Tensor& src);  // implicit
 
-    template<typename Container>
+    template <typename Container>
     TensorShard(const Tensor& src, int idx, int num, const Container& global_shape)
-        : Tensor(src), GlobalShape{}, ShardIndex(idx), NumShards(num) {
+        : Tensor(src),
+          GlobalShape{},
+          ShardIndex(idx),
+          NumShards(num) {
         std::copy(global_shape.begin(), global_shape.end(), GlobalShape.begin());
         std::fill(GlobalShape.begin() + global_shape.size(), GlobalShape.end(), 1);
 
-        if(global_nelem() != src.nelem() * NumShards) {
+        if (global_nelem() != src.nelem() * NumShards) {
             throw std::logic_error("Invalid global shape");
         }
     }
-
 
     std::size_t global_nelem() const;
     std::ptrdiff_t shard_offset() const;
@@ -155,4 +160,4 @@ public:
 };
 
 TensorShard shard_view(const Tensor& src, int idx, int num);
-#endif //SUROGATE_SRC_UTILS_TENSOR_H
+#endif  //SUROGATE_SRC_UTILS_TENSOR_H

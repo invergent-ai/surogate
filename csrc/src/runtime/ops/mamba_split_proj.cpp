@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -30,7 +32,6 @@ void CompiledExecutor::dispatch_mamba_split_proj(const CompiledOp& op) {
     const int num_heads = op.attrs.mamba_num_heads;
     const int head_dim = op.attrs.mamba_head_dim;
 
-
     // Allocate all output tensors upfront (before any mTemps.push_back)
     // to avoid dangling pointers from vector reallocation.
     Tensor gate_t = mRunState.temp_alloc(proj.DType, {B, T, intermediate_size}, "mamba_split_proj_gate");
@@ -41,8 +42,16 @@ void CompiledExecutor::dispatch_mamba_split_proj(const CompiledOp& op) {
     mTemps.push_back(delta_t);
 
     // Call kernel
-    mamba_split_proj(gate_t, conv_t, delta_t, proj,
-                     B, T, intermediate_size, conv_dim, num_heads, head_dim,
+    mamba_split_proj(gate_t,
+                     conv_t,
+                     delta_t,
+                     proj,
+                     B,
+                     T,
+                     intermediate_size,
+                     conv_dim,
+                     num_heads,
+                     head_dim,
                      mRunState.MainStream);
 
     // Store outputs
@@ -73,11 +82,52 @@ void CompiledExecutor::dispatch_mamba_split_proj_backward(const CompiledOp& op) 
     mTemps.push_back(d_proj);
 
     // Call kernel — reduces d_delta [B, D, T] to per-head d_dt inline
-    mamba_pack_dproj(d_proj, d_gate, d_conv_in, d_delta,
-                     B, T, intermediate_size, conv_dim, num_heads, head_dim,
+    mamba_pack_dproj(d_proj,
+                     d_gate,
+                     d_conv_in,
+                     d_delta,
+                     B,
+                     T,
+                     intermediate_size,
+                     conv_dim,
+                     num_heads,
+                     head_dim,
                      mRunState.MainStream);
 
     store_tensor(op.outputs[0], d_proj);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Mamba split_proj backward rule
+// Forward: gate, conv_in, delta = mamba_split_proj(projected)
+// Backward: d_projected = mamba_split_proj_backward(d_gate, d_conv_in, d_delta)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_split_proj_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+
+        AttrMap attrs =
+            copy_attrs(fwd.attrs, {"intermediate_size", "conv_dim", "num_heads", "head_dim"}, "mamba_split_proj");
+
+        // d_outputs[0..2] are the gradients of the 3 forward outputs: gate, conv_in, delta
+        // d_inputs[0] is where to write the gradient of the forward input: projected
+        ops.push_back(make_operation("mamba_split_proj_backward_" + std::to_string(ctx.op_counter++),
+                                     "mamba_split_proj_backward",
+                                     "mamba_split_proj_backward",
+                                     {ctx.d_outputs[0], ctx.d_outputs[1], ctx.d_outputs[2]},
+                                     {ctx.d_inputs[0]},
+                                     attrs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("mamba_split_proj", ::dsl::mamba_split_proj_backward);

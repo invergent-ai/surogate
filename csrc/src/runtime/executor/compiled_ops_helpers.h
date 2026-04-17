@@ -52,15 +52,16 @@ float env_float(const char* name, float fallback);
 // Build a Tensor wrapping a raw GPU pointer with proper Rank/Device set.
 // IMPORTANT: Manual `Tensor{}` leaves Rank=0, Device=-1 which makes .bytes()
 // and .nelem() return wrong values. Always use this helper instead.
-inline Tensor make_raw_tensor(void* ptr, ETensorDType dtype,
-                              const std::vector<long>& shape, int device) {
+inline Tensor make_raw_tensor(void* ptr, ETensorDType dtype, const std::vector<long>& shape, int device) {
     Tensor t{};
     t.Data = static_cast<std::byte*>(ptr);
     t.DType = dtype;
     t.Rank = static_cast<int>(shape.size());
     t.Device = device;
-    for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[i];
-    for (int i = t.Rank; i < MAX_TENSOR_DIM; ++i) t.Sizes[i] = 1;
+    for (int i = 0; i < t.Rank; ++i)
+        t.Sizes[i] = shape[i];
+    for (int i = t.Rank; i < MAX_TENSOR_DIM; ++i)
+        t.Sizes[i] = 1;
     return t;
 }
 
@@ -87,17 +88,15 @@ inline Tensor make_persistent_tensor(DslRunState& run_state,
     }
 
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    const bool capturing =
-        (cudaStreamIsCapturing(run_state.MainStream, &capture_status) == cudaSuccess &&
-         capture_status != cudaStreamCaptureStatusNone);
+    const bool capturing = (cudaStreamIsCapturing(run_state.MainStream, &capture_status) == cudaSuccess &&
+                            capture_status != cudaStreamCaptureStatusNone);
 
     auto it = buffers.find(key);
     if (it == buffers.end() || sizes[key] < bytes) {
         if (capturing) {
-            throw std::runtime_error(
-                std::string(op_name ? op_name : "compiled_op")
-                + ": missing preallocated persistent buffer for '" + key
-                + "' during CUDA graph capture");
+            throw std::runtime_error(std::string(op_name ? op_name : "compiled_op") +
+                                     ": missing preallocated persistent buffer for '" + key +
+                                     "' during CUDA graph capture");
         }
         if (it != buffers.end() && it->second != nullptr) {
             CUDA_CHECK(cudaFree(it->second));
@@ -127,12 +126,9 @@ inline Tensor ensure_output_tensor_or_persistent(const Tensor& candidate,
     // segfault inside cudaMemcpy2DAsync. Always route backward outputs to
     // persistent buffers so they have stable lifetimes across the op chain.
     const bool is_backward = op_name != nullptr &&
-        (std::strstr(op_name, "_backward") != nullptr ||
-         std::strstr(op_name, "_grad") != nullptr);
+                             (std::strstr(op_name, "_backward") != nullptr || std::strstr(op_name, "_grad") != nullptr);
 
-    if (!is_backward &&
-        candidate.Data &&
-        candidate.DType == dtype &&
+    if (!is_backward && candidate.Data && candidate.DType == dtype &&
         static_cast<std::size_t>(candidate.nelem()) == tensor_shape_nelem(shape)) {
         return make_raw_tensor(candidate.Data, dtype, shape, candidate.Device);
     }

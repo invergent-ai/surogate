@@ -13,8 +13,8 @@ namespace recipes {
  * @brief Amax computation algorithm for delayed scaling.
  */
 enum class AmaxComputeAlgo {
-    MAX,          ///< Use maximum amax from history window
-    MOST_RECENT   ///< Use most recent amax value
+    MAX,         ///< Use maximum amax from history window
+    MOST_RECENT  ///< Use most recent amax value
 };
 
 /**
@@ -37,48 +37,52 @@ public:
      * @brief Configuration for FP8 hybrid recipe.
      */
     struct Config {
-        int margin = 0;                              ///< Margin for scale factor computation
-        int amax_history_len = 1024;                 ///< Length of amax history window
+        int margin = 0;                                            ///< Margin for scale factor computation
+        int amax_history_len = 1024;                               ///< Length of amax history window
         AmaxComputeAlgo amax_compute_algo = AmaxComputeAlgo::MAX;  ///< Algorithm for amax selection
-        bool reduce_amax = true;                     ///< Reduce amax across distributed group
+        bool reduce_amax = true;                                   ///< Reduce amax across distributed group
     };
 
-    FP8HybridRecipe() : mConfig{} {}
-    explicit FP8HybridRecipe(Config config) : mConfig(std::move(config)) {}
+    FP8HybridRecipe()
+        : mConfig{} {
+    }
+    explicit FP8HybridRecipe(Config config)
+        : mConfig(std::move(config)) {
+    }
 
-    [[nodiscard]] bool is_fp8_hybrid() const override { return true; }
+    [[nodiscard]] bool is_fp8_hybrid() const override {
+        return true;
+    }
 
-    [[nodiscard]] Format forward_format() const override { return Format::E4M3; }
-    [[nodiscard]] Format backward_format() const override { return Format::E5M2; }
+    [[nodiscard]] Format forward_format() const override {
+        return Format::E4M3;
+    }
+    [[nodiscard]] Format backward_format() const override {
+        return Format::E5M2;
+    }
 
     [[nodiscard]] QuantParams quant_fwd_input() const override {
-        return {
-            .random_hadamard_transform = false,
-            .stochastic_rounding = false,
-            .block_2d_quantization = false,
-            .power_2_scale = false,
-            .amax_epsilon = 0.0f
-        };
+        return {.random_hadamard_transform = false,
+                .stochastic_rounding = false,
+                .block_2d_quantization = false,
+                .power_2_scale = false,
+                .amax_epsilon = 0.0f};
     }
 
     [[nodiscard]] QuantParams quant_fwd_weight() const override {
-        return {
-            .random_hadamard_transform = false,
-            .stochastic_rounding = false,
-            .block_2d_quantization = false,
-            .power_2_scale = false,
-            .amax_epsilon = 0.0f
-        };
+        return {.random_hadamard_transform = false,
+                .stochastic_rounding = false,
+                .block_2d_quantization = false,
+                .power_2_scale = false,
+                .amax_epsilon = 0.0f};
     }
 
     [[nodiscard]] QuantParams quant_bwd_grad() const override {
-        return {
-            .random_hadamard_transform = false,
-            .stochastic_rounding = false,
-            .block_2d_quantization = false,
-            .power_2_scale = false,
-            .amax_epsilon = 0.0f
-        };
+        return {.random_hadamard_transform = false,
+                .stochastic_rounding = false,
+                .block_2d_quantization = false,
+                .power_2_scale = false,
+                .amax_epsilon = 0.0f};
     }
 
     [[nodiscard]] MatmulParams gemm_fprop() const override {
@@ -91,12 +95,20 @@ public:
         return {.use_split_accumulator = true};
     }
 
-    [[nodiscard]] bool requires_amax_history() const override { return true; }
-    [[nodiscard]] int amax_history_len() const override { return mConfig.amax_history_len; }
+    [[nodiscard]] bool requires_amax_history() const override {
+        return true;
+    }
+    [[nodiscard]] int amax_history_len() const override {
+        return mConfig.amax_history_len;
+    }
 
-    [[nodiscard]] std::string_view name() const override { return "fp8-hybrid"; }
+    [[nodiscard]] std::string_view name() const override {
+        return "fp8-hybrid";
+    }
 
-    [[nodiscard]] const Config& config() const { return mConfig; }
+    [[nodiscard]] const Config& config() const {
+        return mConfig;
+    }
 
     // =========================================================================
     // Matmul dispatch overrides

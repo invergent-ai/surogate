@@ -8,7 +8,7 @@
 
 #include <cmath>
 #include <numbers>
-#include <algorithm> // std::clamp
+#include <algorithm>  // std::clamp
 
 /**
  * @brief Interface for scalar schedules evaluated per training step.
@@ -42,7 +42,10 @@ public:
      * @brief Construct a constant schedule at @p peak_rate (no warmup/decay configured).
      * @param peak_rate Peak value returned by the schedule.
      */
-    explicit CosineSchedule(float peak_rate) : mPeakRate(peak_rate), mBaseRate(peak_rate) {}
+    explicit CosineSchedule(float peak_rate)
+        : mPeakRate(peak_rate),
+          mBaseRate(peak_rate) {
+    }
 
     /**
      * @brief Construct a cosine schedule with warmup and decay.
@@ -52,7 +55,11 @@ public:
      * @param base_rate Minimum value at the end of cosine decay (floor).
      */
     CosineSchedule(float peak_rate, int steps, int warmup, float base_rate)
-        : mPeakRate(peak_rate), mDecaySteps(steps), mWarmupSteps(warmup), mBaseRate(base_rate) {}
+        : mPeakRate(peak_rate),
+          mDecaySteps(steps),
+          mWarmupSteps(warmup),
+          mBaseRate(base_rate) {
+    }
 
     /**
      * @brief Evaluate schedule value at @p step.
@@ -60,7 +67,7 @@ public:
      * @return Scheduled value at @p step.
      */
     float eval(int step) const override {
-        if(step < mWarmupSteps) {
+        if (step < mWarmupSteps) {
             return mPeakRate * step / mWarmupSteps;
         }
         double pos = (double)(step - mWarmupSteps) / mDecaySteps;
@@ -93,7 +100,11 @@ public:
      * @param warmup Number of warmup steps (linear ramp from 0 to @p start).
      */
     explicit LinearSchedule(float start, float end, int steps, int warmup)
-        : mStart(start), mEnd(end), mDecaySteps(steps), mWarmupSteps(warmup) {  }
+        : mStart(start),
+          mEnd(end),
+          mDecaySteps(steps),
+          mWarmupSteps(warmup) {
+    }
 
     /**
      * @brief Evaluate schedule value at @p step.
@@ -101,12 +112,12 @@ public:
      * @return Scheduled value at @p step.
      */
     float eval(int step) const override {
-        if(step < mWarmupSteps) {
+        if (step < mWarmupSteps) {
             return mStart * step / mWarmupSteps;
         }
         double pos = (double)(step - mWarmupSteps) / mDecaySteps;
         pos = std::clamp(pos, 0.0, 1.0);
-        return mStart + (mEnd-mStart) * pos;
+        return mStart + (mEnd - mStart) * pos;
     }
 
 private:
@@ -116,4 +127,4 @@ private:
     int mDecaySteps;
 };
 
-#endif //SUROGATE_SRC_TRAINING_SCHEDULE_H
+#endif  //SUROGATE_SRC_TRAINING_SCHEDULE_H

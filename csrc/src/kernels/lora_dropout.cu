@@ -35,15 +35,10 @@
  * @param[in] seed Random seed for deterministic dropout mask generation
  * @param[in] nelem Total number of elements
  */
-template<typename T>
-__global__ void lora_dropout_scale_kernel(
-    T* __restrict__ data,
-    float dropout_prob,
-    float scale,
-    unsigned int seed,
-    long nelem)
-{
-    using vec_t = GenericVector<T, 16/sizeof(T)>;
+template <typename T>
+__global__ void
+lora_dropout_scale_kernel(T* __restrict__ data, float dropout_prob, float scale, unsigned int seed, long nelem) {
+    using vec_t = GenericVector<T, 16 / sizeof(T)>;
     long idx = (blockIdx.x * blockDim.x + threadIdx.x) * vec_t::size;
 
     if (idx + vec_t::size <= nelem) {
@@ -95,7 +90,8 @@ void lora_dropout_scale(Tensor& intermediate, float dropout_prob, unsigned int s
     // Clamp dropout probability to valid range
     if (dropout_prob >= 1.0f) {
         // Edge case: drop everything - zero the tensor
-        CUDA_CHECK(cudaMemsetAsync(intermediate.Data, 0, intermediate.nelem() * get_dtype_size(intermediate.DType), stream));
+        CUDA_CHECK(
+            cudaMemsetAsync(intermediate.Data, 0, intermediate.nelem() * get_dtype_size(intermediate.DType), stream));
         return;
     }
 
@@ -105,26 +101,35 @@ void lora_dropout_scale(Tensor& intermediate, float dropout_prob, unsigned int s
     constexpr int threads_per_block = 512;
     // Account for vectorization: each thread processes 16/sizeof(T) elements
     const int elements_per_thread = 16 / get_dtype_size(intermediate.DType);
-    const int num_blocks = (nelem + threads_per_block * elements_per_thread - 1) / (threads_per_block * elements_per_thread);
+    const int num_blocks =
+        (nelem + threads_per_block * elements_per_thread - 1) / (threads_per_block * elements_per_thread);
 
     switch (intermediate.DType) {
         case ETensorDType::FP32:
-            lora_dropout_scale_kernel<float><<<num_blocks, threads_per_block, 0, stream>>>(
-                reinterpret_cast<float*>(intermediate.Data),
-                dropout_prob, scale, seed, nelem);
+            lora_dropout_scale_kernel<float>
+                <<<num_blocks, threads_per_block, 0, stream>>>(reinterpret_cast<float*>(intermediate.Data),
+                                                               dropout_prob,
+                                                               scale,
+                                                               seed,
+                                                               nelem);
             break;
         case ETensorDType::BF16:
-            lora_dropout_scale_kernel<nv_bfloat16><<<num_blocks, threads_per_block, 0, stream>>>(
-                reinterpret_cast<nv_bfloat16*>(intermediate.Data),
-                dropout_prob, scale, seed, nelem);
+            lora_dropout_scale_kernel<nv_bfloat16>
+                <<<num_blocks, threads_per_block, 0, stream>>>(reinterpret_cast<nv_bfloat16*>(intermediate.Data),
+                                                               dropout_prob,
+                                                               scale,
+                                                               seed,
+                                                               nelem);
             break;
         case ETensorDType::FP16:
-            lora_dropout_scale_kernel<half><<<num_blocks, threads_per_block, 0, stream>>>(
-                reinterpret_cast<half*>(intermediate.Data),
-                dropout_prob, scale, seed, nelem);
+            lora_dropout_scale_kernel<half>
+                <<<num_blocks, threads_per_block, 0, stream>>>(reinterpret_cast<half*>(intermediate.Data),
+                                                               dropout_prob,
+                                                               scale,
+                                                               seed,
+                                                               nelem);
             break;
-        default:
-            throw std::runtime_error("lora_dropout_scale: unsupported dtype");
+        default: throw std::runtime_error("lora_dropout_scale: unsupported dtype");
     }
 
     CUDA_CHECK(cudaGetLastError());

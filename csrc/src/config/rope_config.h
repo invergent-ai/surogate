@@ -88,8 +88,7 @@ struct RoPEConfig {
      */
     [[nodiscard]] int rotary_dim(int head_dim) const {
         switch (mode) {
-            case Mode::FULL:
-                return head_dim;
+            case Mode::FULL: return head_dim;
             case Mode::PARTIAL:
                 // Round down to even number (RoPE works on pairs)
                 return (static_cast<int>(head_dim * partial_factor) / 2) * 2;
@@ -100,8 +99,7 @@ struct RoPEConfig {
                     return (static_cast<int>(head_dim * partial_factor) / 2) * 2;
                 }
                 return head_dim;
-            case Mode::NONE:
-                return 0;
+            case Mode::NONE: return 0;
         }
         return head_dim;  // Default fallback
     }
@@ -172,12 +170,8 @@ struct RoPEConfig {
      * @param theta Base frequency
      */
     static RoPEConfig multimodal(int temporal, int height, int width, float theta = 10000.0f) {
-        return RoPEConfig{
-            .mode = Mode::MULTIMODAL,
-            .mrope_section = {temporal, height, width},
-            .theta = theta
-        };
+        return RoPEConfig{.mode = Mode::MULTIMODAL, .mrope_section = {temporal, height, width}, .theta = theta};
     }
 };
 
-#endif // SUROGATE_SRC_CONFIG_ROPE_CONFIG_H
+#endif  // SUROGATE_SRC_CONFIG_ROPE_CONFIG_H

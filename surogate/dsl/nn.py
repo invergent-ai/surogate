@@ -32,46 +32,43 @@ from __future__ import annotations
 import contextvars
 import inspect
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Any, Sequence
+from dataclasses import dataclass
+from typing import Any
 
-from .tensor_type import Tensor, Array
-from .graph_builder import GraphBuilder, GraphRef, GraphNode
-from .dim import Dim, DimExpr, B, T
-from .specs import (
-    BlockSpec,
-    ModelSpec,
-    ModuleSpec,
-    ParamSpec,
-    ParamKind,
-    ForwardSpec,
-    IOSpec,
-    ActivationSlotSpec,
-    ActivationLayoutSpec,
-    ActivationScope,
-    SharePolicy,
-    HFConfigSpec,
-)
-from .tensor_type import TensorAnnotation
-from .hf import FuseMapping, fuse, stack_experts, transform
 from .decorators import (
     _block_registry,
-    _model_registry,
     _extract_constructor_params,
+    _model_registry,
 )
+from .dim import B, Dim, T
+from .graph_builder import GraphBuilder, GraphRef
+from .hf import fuse, stack_experts, transform
+from .specs import (
+    ActivationLayoutSpec,
+    ActivationScope,
+    ActivationSlotSpec,
+    BlockSpec,
+    ForwardSpec,
+    HFConfigSpec,
+    IOSpec,
+    ModelSpec,
+    ParamKind,
+    ParamSpec,
+    SharePolicy,
+)
+from .tensor_type import Tensor, TensorAnnotation
 
 # ============================================================================
 # Tracing context
 # ============================================================================
 
-_current_tracer: contextvars.ContextVar[Tracer | None] = contextvars.ContextVar(
-    "_current_tracer", default=None
-)
+_current_tracer: contextvars.ContextVar[Tracer | None] = contextvars.ContextVar("_current_tracer", default=None)
 
 
 # ============================================================================
 # Proxy — represents a tensor during forward tracing
 # ============================================================================
+
 
 @dataclass
 class Proxy:
@@ -80,6 +77,7 @@ class Proxy:
     Wraps a GraphRef so it can be passed to graph builder methods,
     while carrying a human-readable name for activation slot registration.
     """
+
     name: str
     ref: GraphRef
 
@@ -90,6 +88,7 @@ class Proxy:
 # ============================================================================
 # Tracer — accumulates graph, params, activation slots
 # ============================================================================
+
 
 class Tracer:
     """Records graph construction during Block/Model forward tracing."""
@@ -175,17 +174,19 @@ class Tracer:
         if isinstance(share_policy, str):
             share_policy = SharePolicy(share_policy)
 
-        self.forward_slots.append(ActivationSlotSpec(
-            name=full_name,
-            scope=scope,
-            shape=shape,
-            dtype=dtype,
-            aliases=[self.prefixed(a) for a in (aliases or [])],
-            save_for_backward=save,
-            share_policy=share_policy,
-            condition_expr=when,
-            description=description,
-        ))
+        self.forward_slots.append(
+            ActivationSlotSpec(
+                name=full_name,
+                scope=scope,
+                shape=shape,
+                dtype=dtype,
+                aliases=[self.prefixed(a) for a in (aliases or [])],
+                save_for_backward=save,
+                share_policy=share_policy,
+                condition_expr=when,
+                description=description,
+            )
+        )
         self._slot_names.add(full_name)
         return full_name
 
@@ -231,13 +232,15 @@ class Tracer:
             grad_name = f"d_{slot.name}"
             if grad_name in existing:
                 continue
-            self.gradient_slots.append(ActivationSlotSpec(
-                name=grad_name,
-                scope=grad_scope,
-                shape=slot.shape,
-                dtype=slot.dtype if slot.name == "loss" else None,
-                gradient_of=slot.name,
-            ))
+            self.gradient_slots.append(
+                ActivationSlotSpec(
+                    name=grad_name,
+                    scope=grad_scope,
+                    shape=slot.shape,
+                    dtype=slot.dtype if slot.name == "loss" else None,
+                    gradient_of=slot.name,
+                )
+            )
 
     # -- HF mapping registration --------------------------------------------
 
@@ -254,6 +257,7 @@ class Tracer:
 # ============================================================================
 # Module base class
 # ============================================================================
+
 
 class Module:
     """Base class for nn-style modules.
@@ -279,9 +283,7 @@ class Module:
 
     # -- tracing entry point -------------------------------------------------
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy | tuple[Proxy, ...]:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy | tuple[Proxy, ...]:
         """Emit graph nodes for this module. Override in subclasses."""
         raise NotImplementedError(f"{type(self).__name__}._trace()")
 
@@ -289,8 +291,7 @@ class Module:
         tracer = _current_tracer.get()
         if tracer is None:
             raise RuntimeError(
-                f"{type(self).__name__} can only be called during block/model "
-                "compilation (inside compile())"
+                f"{type(self).__name__} can only be called during block/model compilation (inside compile())"
             )
         tracer.push_prefix(self._name)
         try:
@@ -333,7 +334,10 @@ class Module:
 
     @staticmethod
     def _scale_by_param(
-        x: Proxy, param_name: str, *, name: str | None = None,
+        x: Proxy,
+        param_name: str,
+        *,
+        name: str | None = None,
     ) -> Proxy:
         """Element-wise multiply a proxy by a named parameter (e.g. a frozen scalar)."""
         tracer = _current_tracer.get()
@@ -361,8 +365,7 @@ class Module:
         return Proxy(out_name, ref)
 
     @staticmethod
-    def _matmul(x: Proxy, weight_name: str, *, transpose: str = "NT",
-                name: str | None = None) -> Proxy:
+    def _matmul(x: Proxy, weight_name: str, *, transpose: str = "NT", name: str | None = None) -> Proxy:
         """Matmul with a named weight parameter."""
         tracer = _current_tracer.get()
         g = tracer.graph
@@ -381,7 +384,11 @@ class Module:
 
     @staticmethod
     def _rmsnorm(
-        x: Proxy, weight_name: str, *, eps: float = 1e-6, name: str | None = None,
+        x: Proxy,
+        weight_name: str,
+        *,
+        eps: float = 1e-6,
+        name: str | None = None,
     ) -> Proxy:
         """Apply RMSNorm with a named weight parameter."""
         tracer = _current_tracer.get()
@@ -416,7 +423,11 @@ class Module:
 
     @staticmethod
     def _mask_scatter(
-        x: Proxy, mask: Proxy, values: Proxy, *, name: str | None = None,
+        x: Proxy,
+        mask: Proxy,
+        values: Proxy,
+        *,
+        name: str | None = None,
     ) -> Proxy:
         """Scatter values into x at positions indicated by mask."""
         tracer = _current_tracer.get()
@@ -449,13 +460,15 @@ class Module:
         # Map scope for global gradients
         if scope == ActivationScope.GLOBAL:
             scope = ActivationScope.GLOBAL_GRADIENT
-        tracer.gradient_slots.append(ActivationSlotSpec(
-            name=name,
-            scope=scope,
-            shape=shape,
-            dtype=dtype,
-            gradient_of=gradient_of,
-        ))
+        tracer.gradient_slots.append(
+            ActivationSlotSpec(
+                name=name,
+                scope=scope,
+                shape=shape,
+                dtype=dtype,
+                gradient_of=gradient_of,
+            )
+        )
 
 
 # ============================================================================
@@ -481,9 +494,7 @@ class RMSNorm(Module):
         self.eps = eps
         self.C = Dim("C")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy | tuple[Proxy, ...]:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy | tuple[Proxy, ...]:
         g = tracer.graph
         weight = tracer.register_param("weight", ("C",), quantizable=False)
 
@@ -494,22 +505,28 @@ class RMSNorm(Module):
             save_y = full_y_name in {"ln1", "ln"} or full_y_name.endswith("attn_norm_y")
 
             res_slot = tracer.register_activation(
-                "res", ("B", "T", "C"),
+                "res",
+                ("B", "T", "C"),
                 share_policy="when_recomputed",
             )
             y_slot = tracer.register_activation(
-                "y", ("B", "T", "C"),
+                "y",
+                ("B", "T", "C"),
                 save=save_y,
                 share_policy="when_recomputed",
             )
             rstd_slot = tracer.register_activation(
-                "rstd", ("B", "T"),
-                dtype="fp32", save=True,
+                "rstd",
+                ("B", "T"),
+                dtype="fp32",
+                save=True,
                 share_policy="per_layer",
             )
 
             res_ref, y_ref, rstd_ref = g.fused_residual_rmsnorm(
-                residual.ref, x.ref, weight,
+                residual.ref,
+                x.ref,
+                weight,
                 eps=self.eps,
                 res_out_name=res_slot,
                 y_name=y_slot,
@@ -524,18 +541,24 @@ class RMSNorm(Module):
             x = args[0]
 
             y_slot = tracer.register_activation(
-                "y", ("B", "T", "C"),
+                "y",
+                ("B", "T", "C"),
                 share_policy="when_recomputed",
             )
             rstd_slot = tracer.register_activation(
-                "rstd", ("B", "T"),
-                dtype="fp32", save=True,
+                "rstd",
+                ("B", "T"),
+                dtype="fp32",
+                save=True,
                 share_policy="per_layer",
             )
 
             y_ref, rstd_ref = g.rmsnorm(
-                x.ref, weight, eps=self.eps,
-                y_name=y_slot, rstd_name=rstd_slot,
+                x.ref,
+                weight,
+                eps=self.eps,
+                y_name=y_slot,
+                rstd_name=rstd_slot,
             )
             return Proxy(y_slot, y_ref)
 
@@ -587,9 +610,7 @@ class GQAAttention(Module):
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids = args
 
@@ -599,84 +620,114 @@ class GQAAttention(Module):
         out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
         out_b = tracer.register_param("out_bias", ("C",), when="use_qkv_bias")
         tracer.register_param(
-            "rope_freqs", ("MaxSeq", "D // 2", 2), dtype="fp32", frozen=True,
+            "rope_freqs",
+            ("MaxSeq", "D // 2", 2),
+            dtype="fp32",
+            frozen=True,
         )
 
         # -- activation slots ------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", "QKV"),
+            "qkv",
+            ("B", "T", "QKV"),
             aliases=["qkv_flat", "qkv_biased"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
         )
         qkv_rope_slot = tracer.register_activation(
-            "qkv_rope", ("B", "T", "QKV"),
-            save=True, share_policy="when_recomputed",
+            "qkv_rope",
+            ("B", "T", "QKV"),
+            save=True,
+            share_policy="when_recomputed",
         )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att",
+            ("B", "T", "AttnDim"),
             aliases=["att_flat", "attn"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", "Hq", "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="when_recomputed",
         )
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         if self.use_qkv_bias:
             qkv_flat = g.matmul_bias(
-                x_flat, qkv_w, qkv_b, transpose="NT",
+                x_flat,
+                qkv_w,
+                qkv_b,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
         else:
             qkv_flat = g.matmul(
-                x_flat, qkv_w, transpose="NT",
+                x_flat,
+                qkv_w,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
 
         qkv = g.view(
-            qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
+            qkv_flat,
+            shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
             out_name=qkv_slot,
         )
 
         qkv_rope = g.rope(
-            qkv, tracer.prefixed("rope_freqs"), position_ids.ref,
+            qkv,
+            tracer.prefixed("rope_freqs"),
+            position_ids.ref,
             rotary_dim="D",
             out_name=qkv_rope_slot,
         )
 
         attn_out, lse = g.flash_attention(
-            qkv_rope, causal=True,
+            qkv_rope,
+            causal=True,
             out_name=att_slot,
             lse_name=tracer.prefixed("lse"),
         )
 
         attn_flat = g.view(
-            attn_out, shape=[B * T, self.AttnDim],
+            attn_out,
+            shape=[B * T, self.AttnDim],
             out_name=tracer.prefixed("att_flat"),
         )
         if self.use_qkv_bias:
             out_flat = g.matmul_bias(
-                attn_flat, out_w, out_b, transpose="NT",
+                attn_flat,
+                out_w,
+                out_b,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         else:
             out_flat = g.matmul(
-                attn_flat, out_w, transpose="NT",
+                attn_flat,
+                out_w,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=att_out_slot,
         )
 
@@ -716,9 +767,7 @@ class GptOssAttention(Module):
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids = args
 
@@ -728,87 +777,117 @@ class GptOssAttention(Module):
         out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
         out_b = tracer.register_param("out_bias", ("C",), when="use_qkv_bias")
         tracer.register_param(
-            "rope_freqs", ("MaxSeq", "D // 2", 2), dtype="fp32", frozen=True,
+            "rope_freqs",
+            ("MaxSeq", "D // 2", 2),
+            dtype="fp32",
+            frozen=True,
         )
         tracer.register_param("sinks", ("Hq",))
 
         # -- activation slots ----------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", "QKV"),
+            "qkv",
+            ("B", "T", "QKV"),
             aliases=["qkv_flat", "qkv_biased"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
         )
         qkv_rope_slot = tracer.register_activation(
-            "qkv_rope", ("B", "T", "QKV"),
-            save=True, share_policy="when_recomputed",
+            "qkv_rope",
+            ("B", "T", "QKV"),
+            save=True,
+            share_policy="when_recomputed",
         )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att",
+            ("B", "T", "AttnDim"),
             aliases=["att_flat", "attn"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", "Hq", "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="when_recomputed",
         )
 
         # -- graph ---------------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         if self.use_qkv_bias:
             qkv_flat = g.matmul_bias(
-                x_flat, qkv_w, qkv_b, transpose="NT",
+                x_flat,
+                qkv_w,
+                qkv_b,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
         else:
             qkv_flat = g.matmul(
-                x_flat, qkv_w, transpose="NT",
+                x_flat,
+                qkv_w,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
 
         qkv = g.view(
-            qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
+            qkv_flat,
+            shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
             out_name=qkv_slot,
         )
 
         qkv_rope = g.rope(
-            qkv, tracer.prefixed("rope_freqs"), position_ids.ref,
+            qkv,
+            tracer.prefixed("rope_freqs"),
+            position_ids.ref,
             rotary_dim="D",
             out_name=qkv_rope_slot,
         )
 
         # FlashAttention with sink tokens
         attn_out, lse = g.flash_attention(
-            qkv_rope, causal=True,
+            qkv_rope,
+            causal=True,
             sinks=tracer.prefixed("sinks"),
             out_name=att_slot,
             lse_name=tracer.prefixed("lse"),
         )
 
         attn_flat = g.view(
-            attn_out, shape=[B * T, self.AttnDim],
+            attn_out,
+            shape=[B * T, self.AttnDim],
             out_name=tracer.prefixed("att_flat"),
         )
         if self.use_qkv_bias:
             out_flat = g.matmul_bias(
-                attn_flat, out_w, out_b, transpose="NT",
+                attn_flat,
+                out_w,
+                out_b,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         else:
             out_flat = g.matmul(
-                attn_flat, out_w, transpose="NT",
+                attn_flat,
+                out_w,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=att_out_slot,
         )
 
@@ -853,9 +932,7 @@ class Qwen3VLAttention(Module):
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids = args
 
@@ -867,67 +944,95 @@ class Qwen3VLAttention(Module):
         tracer.register_param("q_norm_weight", ("D",), quantizable=False)
         tracer.register_param("k_norm_weight", ("D",), quantizable=False)
         tracer.register_param(
-            "rope_freqs", ("MaxSeq", "D // 2", 2), dtype="fp32", frozen=True,
+            "rope_freqs",
+            ("MaxSeq", "D // 2", 2),
+            dtype="fp32",
+            frozen=True,
         )
 
         # -- activation slots ----------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", "QKV"),
+            "qkv",
+            ("B", "T", "QKV"),
             aliases=["qkv_flat", "qkv_biased"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
         )
         qkv_norm_slot = tracer.register_activation(
-            "qkv_norm", ("B", "T", "QKV"),
-            save=True, share_policy="when_recomputed",
+            "qkv_norm",
+            ("B", "T", "QKV"),
+            save=True,
+            share_policy="when_recomputed",
             description="QKV after QK-Norm",
         )
         tracer.register_activation(
-            "q_rstd", ("B", "T", "Hq"),
-            dtype="fp32", save=True, share_policy="when_recomputed",
+            "q_rstd",
+            ("B", "T", "Hq"),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "k_rstd", ("B", "T", "Hkv"),
-            dtype="fp32", save=True, share_policy="when_recomputed",
+            "k_rstd",
+            ("B", "T", "Hkv"),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
         )
         qkv_rope_slot = tracer.register_activation(
-            "qkv_rope", ("B", "T", "QKV"),
-            save=True, share_policy="when_recomputed",
+            "qkv_rope",
+            ("B", "T", "QKV"),
+            save=True,
+            share_policy="when_recomputed",
             description="QKV after QK-Norm + MRoPE",
         )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att",
+            ("B", "T", "AttnDim"),
             aliases=["att_flat", "attn"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", "Hq", "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="when_recomputed",
         )
 
         # -- graph ---------------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         if self.use_qkv_bias:
             qkv_flat = g.matmul_bias(
-                x_flat, qkv_w, qkv_b, transpose="NT",
+                x_flat,
+                qkv_w,
+                qkv_b,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
         else:
             qkv_flat = g.matmul(
-                x_flat, qkv_w, transpose="NT",
+                x_flat,
+                qkv_w,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
 
         qkv = g.view(
-            qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
+            qkv_flat,
+            shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
             out_name=qkv_slot,
         )
 
@@ -954,28 +1059,36 @@ class Qwen3VLAttention(Module):
 
         # Flash Attention
         attn_out, lse = g.flash_attention(
-            qkv_rope, causal=True,
+            qkv_rope,
+            causal=True,
             out_name=att_slot,
             lse_name=tracer.prefixed("lse"),
         )
 
         # Output projection
         attn_flat = g.view(
-            attn_out, shape=[B * T, self.AttnDim],
+            attn_out,
+            shape=[B * T, self.AttnDim],
             out_name=tracer.prefixed("att_flat"),
         )
         if self.use_qkv_bias:
             out_flat = g.matmul_bias(
-                attn_flat, out_w, out_b, transpose="NT",
+                attn_flat,
+                out_w,
+                out_b,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         else:
             out_flat = g.matmul(
-                attn_flat, out_w, transpose="NT",
+                attn_flat,
+                out_w,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=att_out_slot,
         )
 
@@ -1020,9 +1133,7 @@ class Qwen3Attention(Module):
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids = args
 
@@ -1032,70 +1143,102 @@ class Qwen3Attention(Module):
         out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
         out_b = tracer.register_param("out_bias", ("C",), when="use_qkv_bias")
         tracer.register_param(
-            "q_norm_weight", ("D",), quantizable=False, when="use_qk_norm",
+            "q_norm_weight",
+            ("D",),
+            quantizable=False,
+            when="use_qk_norm",
         )
         tracer.register_param(
-            "k_norm_weight", ("D",), quantizable=False, when="use_qk_norm",
+            "k_norm_weight",
+            ("D",),
+            quantizable=False,
+            when="use_qk_norm",
         )
         tracer.register_param(
-            "rope_freqs", ("MaxSeq", "D // 2", 2), dtype="fp32", frozen=True,
+            "rope_freqs",
+            ("MaxSeq", "D // 2", 2),
+            dtype="fp32",
+            frozen=True,
         )
 
         # -- activation slots ------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", "QKV"),
+            "qkv",
+            ("B", "T", "QKV"),
             aliases=["qkv_flat", "qkv_biased"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
         )
         qkv_rope_slot = tracer.register_activation(
-            "qkv_rope", ("B", "T", "QKV"),
-            save=True, share_policy="when_recomputed",
+            "qkv_rope",
+            ("B", "T", "QKV"),
+            save=True,
+            share_policy="when_recomputed",
             description="QKV after QK-Norm + RoPE",
         )
         tracer.register_activation(
-            "q_rstd", ("B", "T", "Hq"),
-            dtype="fp32", save=True, share_policy="when_recomputed",
+            "q_rstd",
+            ("B", "T", "Hq"),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
             when="use_qk_norm",
         )
         tracer.register_activation(
-            "k_rstd", ("B", "T", "Hkv"),
-            dtype="fp32", save=True, share_policy="when_recomputed",
+            "k_rstd",
+            ("B", "T", "Hkv"),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
             when="use_qk_norm",
         )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att",
+            ("B", "T", "AttnDim"),
             aliases=["att_flat", "attn"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", "Hq", "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="when_recomputed",
         )
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         if self.use_qkv_bias:
             qkv_flat = g.matmul_bias(
-                x_flat, qkv_w, qkv_b, transpose="NT",
+                x_flat,
+                qkv_w,
+                qkv_b,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
         else:
             qkv_flat = g.matmul(
-                x_flat, qkv_w, transpose="NT",
+                x_flat,
+                qkv_w,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
 
         qkv = g.view(
-            qkv_flat, shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
+            qkv_flat,
+            shape=[B, T, self.Hq + 2 * self.Hkv, self.D],
             out_name=qkv_slot,
         )
 
@@ -1113,32 +1256,42 @@ class Qwen3Attention(Module):
             )
         else:
             qkv_rope = g.rope(
-                qkv, tracer.prefixed("rope_freqs"), position_ids.ref,
+                qkv,
+                tracer.prefixed("rope_freqs"),
+                position_ids.ref,
                 out_name=qkv_rope_slot,
             )
 
         attn_out, lse = g.flash_attention(
-            qkv_rope, causal=True,
+            qkv_rope,
+            causal=True,
             out_name=att_slot,
             lse_name=tracer.prefixed("lse"),
         )
 
         attn_flat = g.view(
-            attn_out, shape=[B * T, self.AttnDim],
+            attn_out,
+            shape=[B * T, self.AttnDim],
             out_name=tracer.prefixed("att_flat"),
         )
         if self.use_qkv_bias:
             out_flat = g.matmul_bias(
-                attn_flat, out_w, out_b, transpose="NT",
+                attn_flat,
+                out_w,
+                out_b,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         else:
             out_flat = g.matmul(
-                attn_flat, out_w, transpose="NT",
+                attn_flat,
+                out_w,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=att_out_slot,
         )
 
@@ -1173,9 +1326,7 @@ class RMSNormPlus1(Module):
         self.eps = eps
         self.C = Dim("C")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy | tuple[Proxy, ...]:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy | tuple[Proxy, ...]:
         g = tracer.graph
         weight = tracer.register_param("weight", ("C",), quantizable=False)
 
@@ -1188,21 +1339,27 @@ class RMSNormPlus1(Module):
             residual, x = args
 
             res_slot = tracer.register_activation(
-                "res", ("B", "T", "C"),
+                "res",
+                ("B", "T", "C"),
                 share_policy="when_recomputed",
             )
             y_slot = tracer.register_activation(
-                "y", ("B", "T", "C"),
+                "y",
+                ("B", "T", "C"),
                 share_policy="when_recomputed",
             )
             rstd_slot = tracer.register_activation(
-                "rstd", ("B", "T"),
-                dtype="fp32", save=True,
+                "rstd",
+                ("B", "T"),
+                dtype="fp32",
+                save=True,
                 share_policy="per_layer",
             )
 
             res_ref, y_ref, rstd_ref = g.fused_residual_rmsnorm(
-                residual.ref, x.ref, weight_eff,
+                residual.ref,
+                x.ref,
+                weight_eff,
                 eps=self.eps,
                 res_out_name=res_slot,
                 y_name=y_slot,
@@ -1217,18 +1374,24 @@ class RMSNormPlus1(Module):
             x = args[0]
 
             y_slot = tracer.register_activation(
-                "y", ("B", "T", "C"),
+                "y",
+                ("B", "T", "C"),
                 share_policy="when_recomputed",
             )
             rstd_slot = tracer.register_activation(
-                "rstd", ("B", "T"),
-                dtype="fp32", save=True,
+                "rstd",
+                ("B", "T"),
+                dtype="fp32",
+                save=True,
                 share_policy="per_layer",
             )
 
             y_ref, rstd_ref = g.rmsnorm(
-                x.ref, weight_eff, eps=self.eps,
-                y_name=y_slot, rstd_name=rstd_slot,
+                x.ref,
+                weight_eff,
+                eps=self.eps,
+                y_name=y_slot,
+                rstd_name=rstd_slot,
             )
             return Proxy(y_slot, y_ref)
 
@@ -1297,9 +1460,7 @@ class Qwen3_5Attention(Module):
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids = args
 
@@ -1315,71 +1476,101 @@ class Qwen3_5Attention(Module):
         tracer.register_param("q_norm_weight", ("D",), quantizable=False)
         tracer.register_param("k_norm_weight", ("D",), quantizable=False)
         tracer.register_param(
-            "rope_freqs", ("MaxSeq", "RotaryDim // 2", 2), dtype="fp32",
-            frozen=True, quantizable=False,
+            "rope_freqs",
+            ("MaxSeq", "RotaryDim // 2", 2),
+            dtype="fp32",
+            frozen=True,
+            quantizable=False,
         )
 
         # -- activation slots ------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", "QKV"),
-            save=True, share_policy="when_recomputed",
+            "qkv",
+            ("B", "T", "QKV"),
+            save=True,
+            share_policy="when_recomputed",
         )
         qkv_rope_slot = tracer.register_activation(
-            "qkv_rope", ("B", "T", "QKV"),
-            save=True, share_policy="when_recomputed",
+            "qkv_rope",
+            ("B", "T", "QKV"),
+            save=True,
+            share_policy="when_recomputed",
         )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att",
+            ("B", "T", "AttnDim"),
             aliases=["att_flat"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", "Hq", "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="when_recomputed",
         )
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         # Separate Q/K/V projections
         if self.use_qkv_bias:
             q_proj = g.matmul_bias(
-                x_flat, q_proj_w, q_proj_b, transpose="NT",
+                x_flat,
+                q_proj_w,
+                q_proj_b,
+                transpose="NT",
                 out_name=tracer.prefixed("q_proj"),
             )
             k_proj = g.matmul_bias(
-                x_flat, k_proj_w, k_proj_b, transpose="NT",
+                x_flat,
+                k_proj_w,
+                k_proj_b,
+                transpose="NT",
                 out_name=tracer.prefixed("k_proj"),
             )
             v_proj = g.matmul_bias(
-                x_flat, v_proj_w, v_proj_b, transpose="NT",
+                x_flat,
+                v_proj_w,
+                v_proj_b,
+                transpose="NT",
                 out_name=tracer.prefixed("v_proj"),
             )
         else:
             q_proj = g.matmul(
-                x_flat, q_proj_w, transpose="NT",
+                x_flat,
+                q_proj_w,
+                transpose="NT",
                 out_name=tracer.prefixed("q_proj"),
             )
             k_proj = g.matmul(
-                x_flat, k_proj_w, transpose="NT",
+                x_flat,
+                k_proj_w,
+                transpose="NT",
                 out_name=tracer.prefixed("k_proj"),
             )
             v_proj = g.matmul(
-                x_flat, v_proj_w, transpose="NT",
+                x_flat,
+                v_proj_w,
+                transpose="NT",
                 out_name=tracer.prefixed("v_proj"),
             )
 
         # Split Q into Q + gate, reshape all to 4D
         q_proj_4d = g.view(
-            q_proj, shape=[B, T, self.Hq, 2 * self.D],
+            q_proj,
+            shape=[B, T, self.Hq, 2 * self.D],
             out_name=tracer.prefixed("q_proj_4d"),
         )
         q, gate_4d = g.split(q_proj_4d, split_size=[self.head_size, self.head_size], dim=3)
@@ -1392,15 +1583,20 @@ class Qwen3_5Attention(Module):
         # QK-Norm with weight+1 bias
         ones_d = g.ones(shape=[self.D], dtype="bf16")
         q_norm_eff = g.add(
-            tracer.prefixed("q_norm_weight"), ones_d,
+            tracer.prefixed("q_norm_weight"),
+            ones_d,
             out_name=tracer.prefixed("q_norm_weight_eff"),
         )
         k_norm_eff = g.add(
-            tracer.prefixed("k_norm_weight"), ones_d,
+            tracer.prefixed("k_norm_weight"),
+            ones_d,
             out_name=tracer.prefixed("k_norm_weight_eff"),
         )
         qkv_norm, _, _ = g.qkv_qk_norm(
-            qkv, q_norm_eff, k_norm_eff, eps=self.eps,
+            qkv,
+            q_norm_eff,
+            k_norm_eff,
+            eps=self.eps,
         )
 
         # Partial MRoPE
@@ -1415,7 +1611,8 @@ class Qwen3_5Attention(Module):
 
         # Flash Attention
         attn_out, lse = g.flash_attention(
-            qkv_rope, causal=True,
+            qkv_rope,
+            causal=True,
             out_name=att_slot,
             lse_name=tracer.prefixed("lse"),
         )
@@ -1425,23 +1622,30 @@ class Qwen3_5Attention(Module):
         gate_sigmoid = g.sigmoid(gate_4d)
         gated_attn_4d = g.mul(attn_4d, gate_sigmoid)
         gated_attn_flat = g.view(
-            gated_attn_4d, shape=[B * T, self.AttnDim],
+            gated_attn_4d,
+            shape=[B * T, self.AttnDim],
             out_name=tracer.prefixed("att_flat"),
         )
 
         # Output projection
         if self.use_qkv_bias:
             out_flat = g.matmul_bias(
-                gated_attn_flat, out_w, out_b, transpose="NT",
+                gated_attn_flat,
+                out_w,
+                out_b,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         else:
             out_flat = g.matmul(
-                gated_attn_flat, out_w, transpose="NT",
+                gated_attn_flat,
+                out_w,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=att_out_slot,
         )
 
@@ -1529,9 +1733,7 @@ class Gemma4Attention(Module):
         if k_eq_v:
             self._hf_mapping_defaults_ = self._hf_mapping_k_eq_v_
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids = args
 
@@ -1550,44 +1752,60 @@ class Gemma4Attention(Module):
         tracer.register_param("q_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param("k_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param(
-            "rope_freqs", (self.max_seq, self.RotaryDim // 2, 2), dtype="fp32",
-            frozen=True, quantizable=False,
+            "rope_freqs",
+            (self.max_seq, self.RotaryDim // 2, 2),
+            dtype="fp32",
+            frozen=True,
+            quantizable=False,
         )
 
         # -- activation slots ------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", _qkv_dim),
+            "qkv",
+            ("B", "T", _qkv_dim),
             aliases=["qkv_flat"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
         )
         qkv_rope_slot = tracer.register_activation(
-            "qkv_rope", ("B", "T", _full_qkv_dim),
-            save=True, share_policy="when_recomputed",
+            "qkv_rope",
+            ("B", "T", _full_qkv_dim),
+            save=True,
+            share_policy="when_recomputed",
         )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", _attn_dim),
+            "att",
+            ("B", "T", _attn_dim),
             aliases=["att_flat"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", self.num_query_heads, "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", self.num_query_heads, "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="when_recomputed",
         )
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         # Fused QKV projection
         qkv_flat = g.matmul(
-            x_flat, qkv_w, transpose="NT",
+            x_flat,
+            qkv_w,
+            transpose="NT",
             out_name=tracer.prefixed("qkv_flat"),
         )
 
@@ -1603,40 +1821,47 @@ class Gemma4Attention(Module):
                 out_name=qkv_slot,
             )
             q_part, k_raw = g.split(
-                qk, split_size=[self.num_query_heads, self.num_kv_heads], dim=2,
+                qk,
+                split_size=[self.num_query_heads, self.num_kv_heads],
+                dim=2,
             )
             v_raw = k_raw
 
             # Q-norm: direct weight (Gemma4 stores the full scale, no +1 offset)
-            q_flat_2d = g.view(q_part, shape=[B * T * self.num_query_heads, self.head_size],
-                               out_name=tracer.prefixed("q_flat"))
-            q_normed_flat, _ = g.rmsnorm(q_flat_2d, tracer.prefixed("q_norm_weight"),
-                                         eps=self.eps, y_name=tracer.prefixed("q_normed_flat"))
-            q_normed = g.view(q_normed_flat, shape=[B, T, self.num_query_heads, self.head_size],
-                              out_name=tracer.prefixed("q_normed"))
+            q_flat_2d = g.view(
+                q_part, shape=[B * T * self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_flat")
+            )
+            q_normed_flat, _ = g.rmsnorm(
+                q_flat_2d, tracer.prefixed("q_norm_weight"), eps=self.eps, y_name=tracer.prefixed("q_normed_flat")
+            )
+            q_normed = g.view(
+                q_normed_flat, shape=[B, T, self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_normed")
+            )
 
             # K-norm: direct weight
-            k_flat_2d = g.view(k_raw, shape=[B * T * self.num_kv_heads, self.head_size],
-                               out_name=tracer.prefixed("k_flat"))
-            k_normed_flat, _ = g.rmsnorm(k_flat_2d, tracer.prefixed("k_norm_weight"),
-                                         eps=self.eps, y_name=tracer.prefixed("k_normed_flat"))
-            k_normed = g.view(k_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size],
-                              out_name=tracer.prefixed("k_normed"))
+            k_flat_2d = g.view(
+                k_raw, shape=[B * T * self.num_kv_heads, self.head_size], out_name=tracer.prefixed("k_flat")
+            )
+            k_normed_flat, _ = g.rmsnorm(
+                k_flat_2d, tracer.prefixed("k_norm_weight"), eps=self.eps, y_name=tracer.prefixed("k_normed_flat")
+            )
+            k_normed = g.view(
+                k_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size], out_name=tracer.prefixed("k_normed")
+            )
 
             # V-norm: RMS-only (no learnable scale), on raw K
-            v_flat_2d = g.view(v_raw, shape=[B * T * self.num_kv_heads, self.head_size],
-                               out_name=tracer.prefixed("v_flat_2d"))
-            v_normed_flat, _ = g.rmsnorm(v_flat_2d, ones_d, eps=self.eps,
-                                         y_name=tracer.prefixed("v_normed_2d"))
-            v_normed = g.view(v_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size],
-                              out_name=tracer.prefixed("v_normed"))
+            v_flat_2d = g.view(
+                v_raw, shape=[B * T * self.num_kv_heads, self.head_size], out_name=tracer.prefixed("v_flat_2d")
+            )
+            v_normed_flat, _ = g.rmsnorm(v_flat_2d, ones_d, eps=self.eps, y_name=tracer.prefixed("v_normed_2d"))
+            v_normed = g.view(
+                v_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size], out_name=tracer.prefixed("v_normed")
+            )
 
-            qk_normed = g.concat(q_normed, k_normed, dim=2,
-                                 split_size=[self.num_query_heads,
-                                             self.num_kv_heads])
-            qkv_normed = g.concat(qk_normed, v_normed, dim=2,
-                                  split_size=[self.num_query_heads + self.num_kv_heads,
-                                              self.num_kv_heads])
+            qk_normed = g.concat(q_normed, k_normed, dim=2, split_size=[self.num_query_heads, self.num_kv_heads])
+            qkv_normed = g.concat(
+                qk_normed, v_normed, dim=2, split_size=[self.num_query_heads + self.num_kv_heads, self.num_kv_heads]
+            )
 
         else:
             # --- Standard mode: Q+K+V projection ---
@@ -1648,36 +1873,44 @@ class Gemma4Attention(Module):
 
             # QK-norm: direct weight (Gemma4 stores the full scale, no +1 offset)
             qkv_qk_normed, _, _ = g.qkv_qk_norm(
-                qkv, tracer.prefixed("q_norm_weight"),
-                tracer.prefixed("k_norm_weight"), eps=self.eps,
+                qkv,
+                tracer.prefixed("q_norm_weight"),
+                tracer.prefixed("k_norm_weight"),
+                eps=self.eps,
             )
 
             # V-norm: split V from QKV in flattened space, normalize, rejoin
             qk_dim = (self.num_query_heads + self.num_kv_heads) * self.head_size
             v_dim = self.num_kv_heads * self.head_size
             qkv_normed_flat = g.view(
-                qkv_qk_normed, shape=[B, T, qk_dim + v_dim],
+                qkv_qk_normed,
+                shape=[B, T, qk_dim + v_dim],
                 out_name=tracer.prefixed("qkv_normed_flat"),
             )
             qk_flat_3d, v_flat_3d = g.split(
-                qkv_normed_flat, split_size=[qk_dim, v_dim], dim=2,
+                qkv_normed_flat,
+                split_size=[qk_dim, v_dim],
+                dim=2,
             )
             v_flat_2d = g.view(
-                v_flat_3d, shape=[B * T * self.num_kv_heads, self.head_size],
+                v_flat_3d,
+                shape=[B * T * self.num_kv_heads, self.head_size],
                 out_name=tracer.prefixed("v_flat_2d"),
             )
             v_normed_2d, _ = g.rmsnorm(
-                v_flat_2d, ones_d, eps=self.eps,
+                v_flat_2d,
+                ones_d,
+                eps=self.eps,
                 y_name=tracer.prefixed("v_normed_2d"),
             )
             v_normed = g.view(
-                v_normed_2d, shape=[B, T, self.num_kv_heads * self.head_size],
+                v_normed_2d,
+                shape=[B, T, self.num_kv_heads * self.head_size],
                 out_name=tracer.prefixed("v_normed"),
             )
             qk_dim = (self.num_query_heads + self.num_kv_heads) * self.head_size
             v_dim = self.num_kv_heads * self.head_size
-            qkv_normed_3d = g.concat(qk_flat_3d, v_normed, dim=2,
-                                     split_size=[qk_dim, v_dim])
+            qkv_normed_3d = g.concat(qk_flat_3d, v_normed, dim=2, split_size=[qk_dim, v_dim])
             qkv_normed = g.view(
                 qkv_normed_3d,
                 shape=[B, T, self.num_query_heads + 2 * self.num_kv_heads, self.head_size],
@@ -1712,15 +1945,19 @@ class Gemma4Attention(Module):
 
         # Output projection
         attn_flat = g.view(
-            attn_out, shape=[B * T, self.AttnDim],
+            attn_out,
+            shape=[B * T, self.AttnDim],
             out_name=tracer.prefixed("att_flat"),
         )
         out_flat = g.matmul(
-            attn_flat, out_w, transpose="NT",
+            attn_flat,
+            out_w,
+            transpose="NT",
             out_name=tracer.prefixed("att_out_flat"),
         )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=att_out_slot,
         )
 
@@ -1773,9 +2010,7 @@ class Gemma4SharedKVAttention(Module):
         self.AttnDim = self.Hq * self.D
         self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids, kv_source = args
 
@@ -1788,45 +2023,52 @@ class Gemma4SharedKVAttention(Module):
         out_w = tracer.register_param("out_weight", ("C", _attn_dim))
         tracer.register_param("q_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param(
-            "rope_freqs", (self.max_seq, self.RotaryDim // 2, 2), dtype="fp32",
-            frozen=True, quantizable=False,
+            "rope_freqs",
+            (self.max_seq, self.RotaryDim // 2, 2),
+            dtype="fp32",
+            frozen=True,
+            quantizable=False,
         )
 
         # -- activation slots ------------------------------------------------
         att_slot = tracer.register_activation(
-            "att", ("B", "T", _attn_dim),
+            "att",
+            ("B", "T", _attn_dim),
             aliases=["att_flat"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", self.num_query_heads, "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", self.num_query_heads, "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="when_recomputed",
         )
 
         # -- graph -----------------------------------------------------------
-        x_flat = g.view(x.ref, shape=[B * T, self.C],
-                        out_name=tracer.prefixed("x_flat"))
+        x_flat = g.view(x.ref, shape=[B * T, self.C], out_name=tracer.prefixed("x_flat"))
 
         # Q projection
-        q_flat = g.matmul(x_flat, q_w, transpose="NT",
-                          out_name=tracer.prefixed("q_flat"))
-        q = g.view(q_flat, shape=[B, T, self.num_query_heads, self.head_size],
-                   out_name=tracer.prefixed("q_4d"))
+        q_flat = g.matmul(x_flat, q_w, transpose="NT", out_name=tracer.prefixed("q_flat"))
+        q = g.view(q_flat, shape=[B, T, self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_4d"))
 
         # Q-norm: direct weight scale (Gemma4 stores the full scale, no +1 offset)
-        q_rn_flat = g.view(q, shape=[B * T * self.num_query_heads, self.head_size],
-                           out_name=tracer.prefixed("q_rn_flat"))
-        q_normed_flat, _ = g.rmsnorm(q_rn_flat, tracer.prefixed("q_norm_weight"),
-                                     eps=self.eps,
-                                     y_name=tracer.prefixed("q_normed_flat"))
-        q_normed = g.view(q_normed_flat,
-                          shape=[B, T, self.num_query_heads, self.head_size],
-                          out_name=tracer.prefixed("q_normed"))
+        q_rn_flat = g.view(
+            q, shape=[B * T * self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_rn_flat")
+        )
+        q_normed_flat, _ = g.rmsnorm(
+            q_rn_flat, tracer.prefixed("q_norm_weight"), eps=self.eps, y_name=tracer.prefixed("q_normed_flat")
+        )
+        q_normed = g.view(
+            q_normed_flat, shape=[B, T, self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_normed")
+        )
 
         # Extract K,V from kv_source. Use dimension sizes (not head counts)
         # because the source tensor may be 3D (B,T,QKV) during backward replay.
@@ -1851,28 +2093,30 @@ class Gemma4SharedKVAttention(Module):
         # Apply RoPE to Q only (K,V already have RoPE from source layer).
         # The rope kernel applies to all heads of the input tensor, so we
         # pass Q alone [B, T, Hq, D] — no K/V contamination.
-        q_roped = g.rope(q_normed, tracer.prefixed("rope_freqs"),
-                         position_ids.ref, rotary_dim=self.RotaryDim,
-                         out_name=tracer.prefixed("q_roped"))
+        q_roped = g.rope(
+            q_normed,
+            tracer.prefixed("rope_freqs"),
+            position_ids.ref,
+            rotary_dim=self.RotaryDim,
+            out_name=tracer.prefixed("q_roped"),
+        )
 
         # Reassemble with source K,V for packed flash attention
-        qkv_final = g.concat(q_roped, kv_part, dim=2,
-                             split_size=[self.num_query_heads,
-                                         2 * self.num_kv_heads])
+        qkv_final = g.concat(q_roped, kv_part, dim=2, split_size=[self.num_query_heads, 2 * self.num_kv_heads])
 
         # Gemma4 uses softmax_scale=1.0 (see Gemma4Attention above for why).
         attn_out, lse = g.flash_attention(
-            qkv_final, causal=True, softmax_scale=1.0,
-            out_name=att_slot, lse_name=tracer.prefixed("lse"),
+            qkv_final,
+            causal=True,
+            softmax_scale=1.0,
+            out_name=att_slot,
+            lse_name=tracer.prefixed("lse"),
         )
 
         # Output projection
-        attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim],
-                           out_name=tracer.prefixed("att_flat"))
-        out_flat = g.matmul(attn_flat, out_w, transpose="NT",
-                            out_name=tracer.prefixed("att_out_flat"))
-        out = g.view(out_flat, shape=[B, T, self.C],
-                     out_name=att_out_slot)
+        attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim], out_name=tracer.prefixed("att_flat"))
+        out_flat = g.matmul(attn_flat, out_w, transpose="NT", out_name=tracer.prefixed("att_out_flat"))
+        out = g.view(out_flat, shape=[B, T, self.C], out_name=att_out_slot)
 
         return Proxy(att_out_slot, out)
 
@@ -1926,8 +2170,7 @@ class GatedDeltaNetMixer(Module):
 
         if linear_num_value_heads % linear_num_key_heads != 0:
             raise ValueError(
-                "GatedDeltaNetMixer requires linear_num_value_heads to be "
-                "divisible by linear_num_key_heads"
+                "GatedDeltaNetMixer requires linear_num_value_heads to be divisible by linear_num_key_heads"
             )
 
         self.C = Dim("C")
@@ -1942,9 +2185,7 @@ class GatedDeltaNetMixer(Module):
         self.ConvDim = self.KeyDim * 2 + self.ValueDim
         self.HeadRepeat = self.Hv // self.Hk
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args
 
@@ -1954,7 +2195,9 @@ class GatedDeltaNetMixer(Module):
         tracer.register_param("in_proj_b_weight", (self.Hv, "C"))
         tracer.register_param("in_proj_a_weight", (self.Hv, "C"))
         tracer.register_param(
-            "conv_weight", (self.ConvDim, 1, self.ConvK), quantizable=False,
+            "conv_weight",
+            (self.ConvDim, 1, self.ConvK),
+            quantizable=False,
         )
         tracer.register_param("A_log", (self.Hv,), dtype="fp32", quantizable=False)
         tracer.register_param("dt_bias", (self.Hv,), dtype="fp32", quantizable=False)
@@ -1963,24 +2206,29 @@ class GatedDeltaNetMixer(Module):
 
         # -- activation slots ------------------------------------------------
         out_slot = tracer.register_activation(
-            "out", ("B", "T", "C"),
+            "out",
+            ("B", "T", "C"),
             share_policy="per_layer",
             description="GatedDeltaNet mixer output",
         )
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         # QKV projection -> conv1d
         mixed_qkv_flat = g.matmul(
-            x_flat, tracer.prefixed("in_proj_qkv_weight"), transpose="NT",
+            x_flat,
+            tracer.prefixed("in_proj_qkv_weight"),
+            transpose="NT",
             out_name=tracer.prefixed("mixed_qkv_flat"),
         )
         mixed_qkv = g.view(
-            mixed_qkv_flat, shape=[B, T, self.ConvDim],
+            mixed_qkv_flat,
+            shape=[B, T, self.ConvDim],
             out_name=tracer.prefixed("mixed_qkv"),
         )
         mixed_qkv_cf = g.transpose(mixed_qkv, dim0=1, dim1=2)
@@ -1991,7 +2239,9 @@ class GatedDeltaNetMixer(Module):
             out_name=tracer.prefixed("conv_w2d"),
         )
         conv_out_cf = g.mamba_conv1d(
-            mixed_qkv_cf, conv_weight_2d, None,
+            mixed_qkv_cf,
+            conv_weight_2d,
+            None,
             activation="silu",
             out_name=tracer.prefixed("conv_out_cf"),
         )
@@ -2004,28 +2254,35 @@ class GatedDeltaNetMixer(Module):
             dim=2,
         )
         query = g.view(
-            q_flat, shape=[B, T, self.Hk, self.Kd],
+            q_flat,
+            shape=[B, T, self.Hk, self.Kd],
             out_name=tracer.prefixed("query"),
         )
         key = g.view(
-            k_flat, shape=[B, T, self.Hk, self.Kd],
+            k_flat,
+            shape=[B, T, self.Hk, self.Kd],
             out_name=tracer.prefixed("key"),
         )
         value = g.view(
-            v_flat, shape=[B, T, self.Hv, self.Vd],
+            v_flat,
+            shape=[B, T, self.Hv, self.Vd],
             out_name=tracer.prefixed("value"),
         )
 
         # Z gate
         z_flat = g.matmul(
-            x_flat, tracer.prefixed("in_proj_z_weight"), transpose="NT",
+            x_flat,
+            tracer.prefixed("in_proj_z_weight"),
+            transpose="NT",
             out_name=tracer.prefixed("z_flat"),
         )
         z = g.view(z_flat, shape=[B, T, self.Hv, self.Vd], out_name=tracer.prefixed("z"))
 
         # Beta (sigmoid)
         b_flat = g.matmul(
-            x_flat, tracer.prefixed("in_proj_b_weight"), transpose="NT",
+            x_flat,
+            tracer.prefixed("in_proj_b_weight"),
+            transpose="NT",
             out_name=tracer.prefixed("b_flat"),
         )
         b = g.view(b_flat, shape=[B, T, self.Hv], out_name=tracer.prefixed("b"))
@@ -2033,30 +2290,40 @@ class GatedDeltaNetMixer(Module):
 
         # Decay
         a_flat = g.matmul(
-            x_flat, tracer.prefixed("in_proj_a_weight"), transpose="NT",
+            x_flat,
+            tracer.prefixed("in_proj_a_weight"),
+            transpose="NT",
             out_name=tracer.prefixed("a_flat"),
         )
         a = g.view(a_flat, shape=[B, T, self.Hv], out_name=tracer.prefixed("a"))
         g_decay = g.qwen3_5_decay(
-            a, tracer.prefixed("A_log"), tracer.prefixed("dt_bias"),
+            a,
+            tracer.prefixed("A_log"),
+            tracer.prefixed("dt_bias"),
             out_name=tracer.prefixed("decay"),
         )
 
         # Repeat heads if needed
         if self.HeadRepeat > 1:
             query = g.repeat_interleave_heads(
-                query, repeats=self.HeadRepeat,
+                query,
+                repeats=self.HeadRepeat,
                 out_name=tracer.prefixed("query_rep"),
             )
             key = g.repeat_interleave_heads(
-                key, repeats=self.HeadRepeat,
+                key,
+                repeats=self.HeadRepeat,
                 out_name=tracer.prefixed("key_rep"),
             )
 
         # Chunked gated delta rule
         core_attn_out, _ = g.custom(
             "chunk_gated_delta_rule",
-            query, key, value, g_decay, beta,
+            query,
+            key,
+            value,
+            g_decay,
+            beta,
             num_outputs=2,
             scale=0.0,
             chunk_size=self.chunk_size,
@@ -2071,11 +2338,13 @@ class GatedDeltaNetMixer(Module):
             out_name=tracer.prefixed("core_flat"),
         )
         z_norm_flat = g.view(
-            z, shape=[B * T * self.Hv, self.Vd],
+            z,
+            shape=[B * T * self.Hv, self.Vd],
             out_name=tracer.prefixed("z_norm_flat"),
         )
         gated_flat = g.mamba_gated_rmsnorm(
-            core_flat, z_norm_flat,
+            core_flat,
+            z_norm_flat,
             tracer.prefixed("norm_weight"),
             eps=self.eps,
             n_groups=1,
@@ -2083,21 +2352,26 @@ class GatedDeltaNetMixer(Module):
             out_name=tracer.prefixed("gated_flat"),
         )
         gated = g.view(
-            gated_flat, shape=[B, T, self.ValueDim],
+            gated_flat,
+            shape=[B, T, self.ValueDim],
             out_name=tracer.prefixed("gated"),
         )
 
         # Output projection
         gated_bt_flat = g.view(
-            gated, shape=[B * T, self.ValueDim],
+            gated,
+            shape=[B * T, self.ValueDim],
             out_name=tracer.prefixed("gated_bt_flat"),
         )
         out_flat = g.matmul(
-            gated_bt_flat, out_proj_w, transpose="NT",
+            gated_bt_flat,
+            out_proj_w,
+            transpose="NT",
             out_name=tracer.prefixed("out_flat"),
         )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=out_slot,
         )
 
@@ -2124,9 +2398,7 @@ class SwiGLUMLP(Module):
         self.M = Dim("M")
         self.MUp = 2 * self.M
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args
 
@@ -2136,18 +2408,21 @@ class SwiGLUMLP(Module):
 
         # -- activation slots ------------------------------------------------
         up_slot = tracer.register_activation(
-            "up", ("B", "T", "MUp"),
+            "up",
+            ("B", "T", "MUp"),
             aliases=["up_flat"],
             share_policy="when_recomputed",
         )
         act_slot = tracer.register_activation(
-            "act", ("B", "T", "M"),
+            "act",
+            ("B", "T", "M"),
             aliases=["act_flat"],
             share_policy="when_recomputed",
             description="SwiGLU activation output",
         )
         down_slot = tracer.register_activation(
-            "down", ("B", "T", "C"),
+            "down",
+            ("B", "T", "C"),
             aliases=["down_flat"],
             share_policy="when_recomputed",
             description="MLP down projection output",
@@ -2155,28 +2430,36 @@ class SwiGLUMLP(Module):
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
         up_flat = g.matmul(
-            x_flat, up_w, transpose="NT",
+            x_flat,
+            up_w,
+            transpose="NT",
             out_name=tracer.prefixed("up_flat"),
         )
         up = g.view(
-            up_flat, shape=[B, T, self.MUp],
+            up_flat,
+            shape=[B, T, self.MUp],
             out_name=up_slot,
         )
         act = g.swiglu(up, out_name=act_slot)
         act_flat = g.view(
-            act, shape=[B * T, self.M],
+            act,
+            shape=[B * T, self.M],
             out_name=tracer.prefixed("act_flat"),
         )
         out_flat = g.matmul(
-            act_flat, down_w, transpose="NT",
+            act_flat,
+            down_w,
+            transpose="NT",
             out_name=tracer.prefixed("down_flat"),
         )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=down_slot,
         )
 
@@ -2205,9 +2488,7 @@ class GatedMLP(Module):
         self.C = Dim("C")
         self.M = Dim("M")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args
 
@@ -2216,7 +2497,9 @@ class GatedMLP(Module):
         down_w = tracer.register_param("down_weight", ("C", self.d_ff))
 
         down_slot = tracer.register_activation(
-            "down", ("B", "T", "C"), share_policy="when_recomputed",
+            "down",
+            ("B", "T", "C"),
+            share_policy="when_recomputed",
         )
 
         x_flat = g.view(x.ref, shape=[B * T, self.C], out_name=tracer.prefixed("x_flat"))
@@ -2278,9 +2561,7 @@ class MoEExpertsGated(Module):
         self.K = Dim("K")
         self.MUp = 2 * self.M
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
@@ -2291,101 +2572,139 @@ class MoEExpertsGated(Module):
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation(
-            "router_logits", ("B * T", "E"),
-            save=True, share_policy="fft_share",
+            "router_logits",
+            ("B * T", "E"),
+            save=True,
+            share_policy="fft_share",
             description="Router logits before softmax",
         )
         tracer.register_activation(
-            "router_probs", ("B * T", "E"),
-            save=True, share_policy="fft_share",
+            "router_probs",
+            ("B * T", "E"),
+            save=True,
+            share_policy="fft_share",
             description="Router probabilities",
         )
         tracer.register_activation(
-            "routing_weights", ("B * T", "K"),
-            save=True, share_policy="fft_share",
+            "routing_weights",
+            ("B * T", "K"),
+            save=True,
+            share_policy="fft_share",
             description="Routing weights for selected experts",
         )
         tracer.register_activation(
-            "routing_indices", ("B * T", "K"),
-            dtype="int32", save=True, share_policy="fft_share",
+            "routing_indices",
+            ("B * T", "K"),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
             description="Expert indices for each token",
         )
         tracer.register_activation(
-            "permuted_input", ("B * T * K", "C"),
-            save=True, share_policy="fft_share",
+            "permuted_input",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
             description="Permuted input for grouped GEMM",
         )
         tracer.register_activation(
-            "scatter_indices", ("B * T * K",),
-            dtype="int32", save=True, share_policy="fft_share",
+            "scatter_indices",
+            ("B * T * K",),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
             description="Indices for scattering back",
         )
         if self.ep_size > 1:
             tracer.register_activation(
-                "ep_recv_input", ("B * T * K", "C"),
-                save=True, share_policy="per_layer",
+                "ep_recv_input",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
                 when="ep_size > 1",
                 description="EP-dispatched input tokens",
             )
             tracer.register_activation(
-                "ep_recv_scatter", ("B * T * K",),
-                dtype="int32", save=True, share_policy="per_layer",
+                "ep_recv_scatter",
+                ("B * T * K",),
+                dtype="int32",
+                save=True,
+                share_policy="per_layer",
                 when="ep_size > 1",
                 description="EP-dispatched scatter indices",
             )
         tracer.register_activation(
-            "expert_gate_up", ("B * T * K", "MUp"),
-            save=True, share_policy="fft_share",
+            "expert_gate_up",
+            ("B * T * K", "MUp"),
+            save=True,
+            share_policy="fft_share",
             description="Expert gate+up projection output",
         )
         tracer.register_activation(
-            "expert_act", ("B * T * K", "M"),
-            save=True, share_policy="fft_share",
+            "expert_act",
+            ("B * T * K", "M"),
+            save=True,
+            share_policy="fft_share",
             description="Expert SwiGLU activation output",
         )
         tracer.register_activation(
-            "expert_down", ("B * T * K", "C"),
-            save=True, share_policy="fft_share",
+            "expert_down",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
             description="Expert down projection output",
         )
         if self.ep_size > 1:
             tracer.register_activation(
-                "ep_combined", ("B * T * K", "C"),
-                save=True, share_policy="per_layer",
+                "ep_combined",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
                 when="ep_size > 1",
                 description="EP-combined expert output",
             )
         out_slot = tracer.register_activation(
-            "out", ("B * T", "C"),
+            "out",
+            ("B * T", "C"),
             aliases=["out_flat"],
-            save=True, share_policy="fft_share",
+            save=True,
+            share_policy="fft_share",
             description="Combined MoE output",
         )
 
         # -- graph -----------------------------------------------------------
         router_logits = g.matmul(
-            x.ref, tracer.prefixed("router_weight"), transpose="NT",
+            x.ref,
+            tracer.prefixed("router_weight"),
+            transpose="NT",
             out_name=tracer.prefixed("router_logits"),
         )
         router_probs = g.moe_softmax(
-            router_logits, out_name=tracer.prefixed("router_probs"),
+            router_logits,
+            out_name=tracer.prefixed("router_probs"),
         )
         routing_weights, routing_indices = g.moe_topk(
-            router_probs, top_k=self.num_experts_per_tok,
+            router_probs,
+            top_k=self.num_experts_per_tok,
             normalize=self.norm_topk_prob,
             weights_name=tracer.prefixed("routing_weights"),
             indices_name=tracer.prefixed("routing_indices"),
         )
         permuted_input, scatter_indices = g.moe_permute(
-            x.ref, routing_indices, top_k=self.num_experts_per_tok,
+            x.ref,
+            routing_indices,
+            top_k=self.num_experts_per_tok,
             out_name=tracer.prefixed("permuted_input"),
             scatter_name=tracer.prefixed("scatter_indices"),
         )
 
         if self.ep_size > 1:
             ep_recv_input, ep_recv_scatter = g.ep_dispatch(
-                permuted_input, routing_indices, scatter_indices,
-                num_experts=self.num_experts, ep_size=self.ep_size,
+                permuted_input,
+                routing_indices,
+                scatter_indices,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
                 top_k=self.num_experts_per_tok,
                 out_name=tracer.prefixed("ep_recv_input"),
                 recv_scatter_name=tracer.prefixed("ep_recv_scatter"),
@@ -2397,35 +2716,45 @@ class MoEExpertsGated(Module):
             gemm_scatter = scatter_indices
 
         expert_gate_up = g.moe_grouped_gemm_gate_up(
-            gemm_input, tracer.prefixed("experts_gate_up"), gemm_scatter,
+            gemm_input,
+            tracer.prefixed("experts_gate_up"),
+            gemm_scatter,
             out_name=tracer.prefixed("expert_gate_up"),
         )
         if self.activation == "gelu":
             # GeLU-gated: split → gelu(gate) * up
             gate_half, up_half = g.split(
-                expert_gate_up, split_size=[self.d_ff, self.d_ff], dim=-1,
+                expert_gate_up,
+                split_size=[self.d_ff, self.d_ff],
+                dim=-1,
             )
             gate_act = g.gelu(gate_half)
             expert_act = g.mul(gate_act, up_half)
         else:
             expert_act = g.swiglu(
-                expert_gate_up, out_name=tracer.prefixed("expert_act"),
+                expert_gate_up,
+                out_name=tracer.prefixed("expert_act"),
             )
         expert_down = g.moe_grouped_gemm_down(
-            expert_act, tracer.prefixed("experts_down"), gemm_scatter,
+            expert_act,
+            tracer.prefixed("experts_down"),
+            gemm_scatter,
             out_name=tracer.prefixed("expert_down"),
         )
 
         if self.ep_size > 1:
             expert_down = g.ep_combine(
                 expert_down,
-                num_experts=self.num_experts, ep_size=self.ep_size,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
                 top_k=self.num_experts_per_tok,
                 out_name=tracer.prefixed("ep_combined"),
             )
 
         moe_out = g.moe_unpermute(
-            expert_down, routing_weights, scatter_indices,
+            expert_down,
+            routing_weights,
+            scatter_indices,
             top_k=self.num_experts_per_tok,
             out_name=out_slot,
         )
@@ -2479,9 +2808,7 @@ class Gemma4MoEExperts(Module):
         self.K = Dim("K")
         self.MUp = 2 * self.M
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
@@ -2490,52 +2817,76 @@ class Gemma4MoEExperts(Module):
         tracer.register_param("router_scale", ("C",), quantizable=False)
         tracer.register_param("per_expert_scale", ("E",), quantizable=False)
         tracer.register_param(
-            "experts_gate_up", ("E", "MUp", "C"), offload_group="moe_experts",
+            "experts_gate_up",
+            ("E", "MUp", "C"),
+            offload_group="moe_experts",
         )
         tracer.register_param(
-            "experts_down", ("E", "C", "M"), offload_group="moe_experts",
+            "experts_down",
+            ("E", "C", "M"),
+            offload_group="moe_experts",
         )
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation(
-            "router_logits", ("B * T", "E"),
-            save=True, share_policy="fft_share",
+            "router_logits",
+            ("B * T", "E"),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "routing_weights", ("B * T", "K"),
-            save=True, share_policy="fft_share",
+            "routing_weights",
+            ("B * T", "K"),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "routing_indices", ("B * T", "K"),
-            dtype="int32", save=True, share_policy="fft_share",
+            "routing_indices",
+            ("B * T", "K"),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "permuted_input", ("B * T * K", "C"),
-            save=True, share_policy="fft_share",
+            "permuted_input",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "scatter_indices", ("B * T * K",),
-            dtype="int32", save=True, share_policy="fft_share",
+            "scatter_indices",
+            ("B * T * K",),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "expert_gate_up", ("B * T * K", "MUp"),
-            save=True, share_policy="fft_share",
+            "expert_gate_up",
+            ("B * T * K", "MUp"),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "expert_down", ("B * T * K", "C"),
-            save=True, share_policy="fft_share",
+            "expert_down",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
         )
         out_slot = tracer.register_activation(
-            "out", ("B * T", "C"),
+            "out",
+            ("B * T", "C"),
             aliases=["out_flat"],
-            save=True, share_policy="fft_share",
+            save=True,
+            share_policy="fft_share",
         )
 
         # -- graph: Gemma4 router -------------------------------------------
         # 1. RMSNorm without learnable scale (ones weight)
         ones_c = g.ones(shape=[self.C], dtype="bf16")
         x_normed, _ = g.rmsnorm(
-            x.ref, ones_c, eps=self.eps,
+            x.ref,
+            ones_c,
+            eps=self.eps,
             y_name=tracer.prefixed("router_normed"),
         )
 
@@ -2545,14 +2896,18 @@ class Gemma4MoEExperts(Module):
 
         # 3. Router projection → softmax → topk
         router_logits = g.matmul(
-            x_scaled, tracer.prefixed("router_weight"), transpose="NT",
+            x_scaled,
+            tracer.prefixed("router_weight"),
+            transpose="NT",
             out_name=tracer.prefixed("router_logits"),
         )
         router_probs = g.moe_softmax(
-            router_logits, out_name=tracer.prefixed("router_probs"),
+            router_logits,
+            out_name=tracer.prefixed("router_probs"),
         )
         routing_weights, routing_indices = g.moe_topk(
-            router_probs, top_k=self.num_experts_per_tok,
+            router_probs,
+            top_k=self.num_experts_per_tok,
             normalize=True,
             weights_name=tracer.prefixed("routing_weights"),
             indices_name=tracer.prefixed("routing_indices"),
@@ -2568,30 +2923,40 @@ class Gemma4MoEExperts(Module):
 
         # -- graph: expert computation ---------------------------------------
         permuted_input, scatter_indices = g.moe_permute(
-            x.ref, routing_indices, top_k=self.num_experts_per_tok,
+            x.ref,
+            routing_indices,
+            top_k=self.num_experts_per_tok,
             out_name=tracer.prefixed("permuted_input"),
             scatter_name=tracer.prefixed("scatter_indices"),
         )
 
         expert_gate_up = g.moe_grouped_gemm_gate_up(
-            permuted_input, tracer.prefixed("experts_gate_up"), scatter_indices,
+            permuted_input,
+            tracer.prefixed("experts_gate_up"),
+            scatter_indices,
             out_name=tracer.prefixed("expert_gate_up"),
         )
 
         # GeLU-gated: split → gelu(gate) * up
         gate_half, up_half = g.split(
-            expert_gate_up, split_size=[self.d_ff, self.d_ff], dim=-1,
+            expert_gate_up,
+            split_size=[self.d_ff, self.d_ff],
+            dim=-1,
         )
         gate_act = g.gelu(gate_half)
         expert_act = g.mul(gate_act, up_half)
 
         expert_down = g.moe_grouped_gemm_down(
-            expert_act, tracer.prefixed("experts_down"), scatter_indices,
+            expert_act,
+            tracer.prefixed("experts_down"),
+            scatter_indices,
             out_name=tracer.prefixed("expert_down"),
         )
 
         moe_out = g.moe_unpermute(
-            expert_down, routing_weights, scatter_indices,
+            expert_down,
+            routing_weights,
+            scatter_indices,
             top_k=self.num_experts_per_tok,
             out_name=out_slot,
         )
@@ -2615,9 +2980,7 @@ class MoESharedExpert(Module):
         self.C = Dim("C")
         self.SharedM = Dim("SharedM")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
@@ -2626,38 +2989,54 @@ class MoESharedExpert(Module):
         tracer.register_param("down", ("C", "SharedM"))
 
         tracer.register_activation(
-            "gate_out", ("B * T", "SharedM"), share_policy="fft_share",
+            "gate_out",
+            ("B * T", "SharedM"),
+            share_policy="fft_share",
             when="use_shared_expert",
         )
         tracer.register_activation(
-            "up_out", ("B * T", "SharedM"), share_policy="fft_share",
+            "up_out",
+            ("B * T", "SharedM"),
+            share_policy="fft_share",
             when="use_shared_expert",
         )
         tracer.register_activation(
-            "gate_act", ("B * T", "SharedM"), share_policy="fft_share",
+            "gate_act",
+            ("B * T", "SharedM"),
+            share_policy="fft_share",
             when="use_shared_expert",
         )
         tracer.register_activation(
-            "hidden", ("B * T", "SharedM"), share_policy="fft_share",
+            "hidden",
+            ("B * T", "SharedM"),
+            share_policy="fft_share",
             when="use_shared_expert",
         )
         out_slot = tracer.register_activation(
-            "out", ("B * T", "C"), share_policy="fft_share",
+            "out",
+            ("B * T", "C"),
+            share_policy="fft_share",
             when="use_shared_expert",
         )
 
         shared_gate = g.matmul(
-            x.ref, tracer.prefixed("gate"), transpose="NT",
+            x.ref,
+            tracer.prefixed("gate"),
+            transpose="NT",
             out_name=tracer.prefixed("gate_out"),
         )
         shared_up = g.matmul(
-            x.ref, tracer.prefixed("up"), transpose="NT",
+            x.ref,
+            tracer.prefixed("up"),
+            transpose="NT",
             out_name=tracer.prefixed("up_out"),
         )
         shared_gate_act = g.silu(shared_gate, out_name=tracer.prefixed("gate_act"))
         shared_hidden = g.mul(shared_gate_act, shared_up)
         shared_out = g.matmul(
-            shared_hidden, tracer.prefixed("down"), transpose="NT",
+            shared_hidden,
+            tracer.prefixed("down"),
+            transpose="NT",
             out_name=out_slot,
         )
 
@@ -2697,9 +3076,7 @@ class GptOssMoEExperts(Module):
         self.K = Dim("K")
         self.MUp = 2 * self.M
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
@@ -2707,103 +3084,147 @@ class GptOssMoEExperts(Module):
         tracer.register_param("router_weight", ("E", "C"))
         tracer.register_param("router_bias", ("E",))
         tracer.register_param(
-            "experts_gate_up", ("E", "MUp", "C"), offload_group="moe_experts",
+            "experts_gate_up",
+            ("E", "MUp", "C"),
+            offload_group="moe_experts",
         )
         tracer.register_param(
-            "experts_gate_up_bias", ("E", "MUp"), offload_group="moe_experts",
+            "experts_gate_up_bias",
+            ("E", "MUp"),
+            offload_group="moe_experts",
         )
         tracer.register_param(
-            "experts_down", ("E", "C", "M"), offload_group="moe_experts",
+            "experts_down",
+            ("E", "C", "M"),
+            offload_group="moe_experts",
         )
         tracer.register_param(
-            "experts_down_bias", ("E", "C"), offload_group="moe_experts",
+            "experts_down_bias",
+            ("E", "C"),
+            offload_group="moe_experts",
         )
 
         # -- activation slots ----------------------------------------------------
         tracer.register_activation(
-            "router_logits", ("B * T", "E"),
-            save=True, share_policy="per_layer",
+            "router_logits",
+            ("B * T", "E"),
+            save=True,
+            share_policy="per_layer",
             description="Router logits",
         )
         tracer.register_activation(
-            "routing_weights", ("B * T", "K"),
-            save=True, share_policy="fft_share",
-        )
-        tracer.register_activation(
-            "routing_indices", ("B * T", "K"),
-            dtype="int32", save=True, share_policy="fft_share",
-        )
-        tracer.register_activation(
-            "permuted_input", ("B * T * K", "C"),
-            save=True, share_policy="fft_share",
-        )
-        tracer.register_activation(
-            "scatter_indices", ("B * T * K",),
-            dtype="int32", save=True, share_policy="fft_share",
-        )
-        if self.ep_size > 1:
-            tracer.register_activation(
-                "ep_recv_input", ("B * T * K", "C"),
-                save=True, share_policy="per_layer",
-                when="ep_size > 1",
-            )
-            tracer.register_activation(
-                "ep_recv_scatter", ("B * T * K",),
-                dtype="int32", save=True, share_policy="per_layer",
-                when="ep_size > 1",
-            )
-        tracer.register_activation(
-            "expert_gate_up", ("B * T * K", "MUp"),
+            "routing_weights",
+            ("B * T", "K"),
+            save=True,
             share_policy="fft_share",
         )
         tracer.register_activation(
-            "expert_gate_up_bias", ("B * T * K", "MUp"),
-            save=True, share_policy="fft_share",
+            "routing_indices",
+            ("B * T", "K"),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "expert_act", ("B * T * K", "M"),
-            save=True, share_policy="fft_share",
+            "permuted_input",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "scatter_indices",
+            ("B * T * K",),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
+        )
+        if self.ep_size > 1:
+            tracer.register_activation(
+                "ep_recv_input",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
+                when="ep_size > 1",
+            )
+            tracer.register_activation(
+                "ep_recv_scatter",
+                ("B * T * K",),
+                dtype="int32",
+                save=True,
+                share_policy="per_layer",
+                when="ep_size > 1",
+            )
+        tracer.register_activation(
+            "expert_gate_up",
+            ("B * T * K", "MUp"),
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "expert_gate_up_bias",
+            ("B * T * K", "MUp"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "expert_act",
+            ("B * T * K", "M"),
+            save=True,
+            share_policy="fft_share",
             description="GPT-OSS activation output",
         )
         tracer.register_activation(
-            "expert_down", ("B * T * K", "C"),
+            "expert_down",
+            ("B * T * K", "C"),
             share_policy="fft_share",
         )
         tracer.register_activation(
-            "expert_down_bias", ("B * T * K", "C"),
-            save=True, share_policy="fft_share",
+            "expert_down_bias",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
         )
         if self.ep_size > 1:
             tracer.register_activation(
-                "ep_combined", ("B * T * K", "C"),
-                save=True, share_policy="per_layer",
+                "ep_combined",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
                 when="ep_size > 1",
             )
         out_slot = tracer.register_activation(
-            "out", ("B * T", "C"),
+            "out",
+            ("B * T", "C"),
             aliases=["out_flat"],
-            save=True, share_policy="fft_share",
+            save=True,
+            share_policy="fft_share",
         )
 
         # -- graph ---------------------------------------------------------------
         # Router (with bias)
         router_logits = g.matmul_bias(
-            x.ref, tracer.prefixed("router_weight"),
-            tracer.prefixed("router_bias"), transpose="NT",
+            x.ref,
+            tracer.prefixed("router_weight"),
+            tracer.prefixed("router_bias"),
+            transpose="NT",
             out_name=tracer.prefixed("router_logits"),
         )
 
         # Top-k (softmax + sort_by_index, no normalize)
         routing_weights, routing_indices = g.moe_topk(
-            router_logits, top_k=self.num_experts_per_tok,
-            normalize=False, softmax=True, sort_by_index=True,
+            router_logits,
+            top_k=self.num_experts_per_tok,
+            normalize=False,
+            softmax=True,
+            sort_by_index=True,
             weights_name=tracer.prefixed("routing_weights"),
             indices_name=tracer.prefixed("routing_indices"),
         )
 
         # Permute
         permuted_input, scatter_indices = g.moe_permute(
-            x.ref, routing_indices, top_k=self.num_experts_per_tok,
+            x.ref,
+            routing_indices,
+            top_k=self.num_experts_per_tok,
             out_name=tracer.prefixed("permuted_input"),
             scatter_name=tracer.prefixed("scatter_indices"),
         )
@@ -2811,8 +3232,11 @@ class GptOssMoEExperts(Module):
         # EP dispatch
         if self.ep_size > 1:
             ep_recv_input, ep_recv_scatter = g.ep_dispatch(
-                permuted_input, routing_indices, scatter_indices,
-                num_experts=self.num_experts, ep_size=self.ep_size,
+                permuted_input,
+                routing_indices,
+                scatter_indices,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
                 top_k=self.num_experts_per_tok,
                 out_name=tracer.prefixed("ep_recv_input"),
                 recv_scatter_name=tracer.prefixed("ep_recv_scatter"),
@@ -2825,32 +3249,40 @@ class GptOssMoEExperts(Module):
 
         # Gate+up GEMM (interleaved)
         expert_gate_up = g.moe_grouped_gemm_gate_up(
-            gemm_input, tracer.prefixed("experts_gate_up"), gemm_scatter,
+            gemm_input,
+            tracer.prefixed("experts_gate_up"),
+            gemm_scatter,
             gate_up_interleaved=True,
             out_name=tracer.prefixed("expert_gate_up"),
         )
 
         # Gate+up bias
         expert_gate_up_bias = g.moe_expert_bias_add(
-            expert_gate_up, tracer.prefixed("experts_gate_up_bias"),
+            expert_gate_up,
+            tracer.prefixed("experts_gate_up_bias"),
             out_name=tracer.prefixed("expert_gate_up_bias"),
         )
 
         # GPT-OSS activation
         expert_act = g.gpt_oss_moe_act(
-            expert_gate_up_bias, alpha=1.702, limit=7.0,
+            expert_gate_up_bias,
+            alpha=1.702,
+            limit=7.0,
             out_name=tracer.prefixed("expert_act"),
         )
 
         # Down GEMM
         expert_down = g.moe_grouped_gemm_down(
-            expert_act, tracer.prefixed("experts_down"), gemm_scatter,
+            expert_act,
+            tracer.prefixed("experts_down"),
+            gemm_scatter,
             out_name=tracer.prefixed("expert_down"),
         )
 
         # Down bias
         expert_down_bias = g.moe_expert_bias_add(
-            expert_down, tracer.prefixed("experts_down_bias"),
+            expert_down,
+            tracer.prefixed("experts_down_bias"),
             out_name=tracer.prefixed("expert_down_bias"),
         )
 
@@ -2858,14 +3290,17 @@ class GptOssMoEExperts(Module):
         if self.ep_size > 1:
             expert_down_bias = g.ep_combine(
                 expert_down_bias,
-                num_experts=self.num_experts, ep_size=self.ep_size,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
                 top_k=self.num_experts_per_tok,
                 out_name=tracer.prefixed("ep_combined"),
             )
 
         # Unpermute
         moe_out = g.moe_unpermute(
-            expert_down_bias, routing_weights, scatter_indices,
+            expert_down_bias,
+            routing_weights,
+            scatter_indices,
             top_k=self.num_experts_per_tok,
             out_name=out_slot,
         )
@@ -2917,6 +3352,7 @@ class Mamba2Mixer(Module):
         self.dt_min = dt_min
         self.dt_max = dt_max
         import math as _math
+
         dt_max_default = 1e9
         if time_step_limit is None:
             time_step_limit = (0.0, dt_max_default)
@@ -2941,9 +3377,7 @@ class Mamba2Mixer(Module):
         # with attention dims (D, K) in hybrid models.
         self.C = Dim("C")  # d_model — shared with attention
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args
 
@@ -2967,57 +3401,79 @@ class Mamba2Mixer(Module):
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation(
-            "projected", ("B", "T", P),
-            save=True, share_policy="fft_share",
+            "projected",
+            ("B", "T", P),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "gate", ("B", "T", I),
-            save=True, share_policy="fft_share",
+            "gate",
+            ("B", "T", I),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "conv_out", ("B", D_conv, "T"),
-            save=True, share_policy="fft_share",
+            "conv_out",
+            ("B", D_conv, "T"),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "hidden_states", ("B", I, "T"),
-            save=True, share_policy="fft_share",
+            "hidden_states",
+            ("B", I, "T"),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "ssm_out", ("B", "T", I),
-            save=True, share_policy="fft_share",
+            "ssm_out",
+            ("B", "T", I),
+            save=True,
+            share_policy="fft_share",
         )
         tracer.register_activation(
-            "ssm_state", ("B", H, self.mamba_head_dim, self.ssm_state_size),
-            save=True, share_policy="fft_share",
+            "ssm_state",
+            ("B", H, self.mamba_head_dim, self.ssm_state_size),
+            save=True,
+            share_policy="fft_share",
             description="Final SSM state for caching",
         )
         tracer.register_activation(
-            "gated_out", ("B", "T", I),
-            save=True, share_policy="fft_share",
+            "gated_out",
+            ("B", "T", I),
+            save=True,
+            share_policy="fft_share",
         )
         out_slot = tracer.register_activation(
-            "out", ("B", "T", "C"),
+            "out",
+            ("B", "T", "C"),
             share_policy="per_layer",
             description="Mamba2 mixer output",
         )
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
         if self.use_bias:
             projected_flat = g.matmul_bias(
-                x_flat, in_proj_w, in_proj_b, transpose="NT",
+                x_flat,
+                in_proj_w,
+                in_proj_b,
+                transpose="NT",
                 out_name=tracer.prefixed("projected_flat"),
             )
         else:
             projected_flat = g.matmul(
-                x_flat, in_proj_w, transpose="NT",
+                x_flat,
+                in_proj_w,
+                transpose="NT",
                 out_name=tracer.prefixed("projected_flat"),
             )
         projected = g.view(
-            projected_flat, shape=[B, T, P],
+            projected_flat,
+            shape=[B, T, P],
             out_name=tracer.prefixed("projected"),
         )
 
@@ -3036,14 +3492,17 @@ class Mamba2Mixer(Module):
         # Causal 1D convolution
         if self.use_conv_bias:
             conv_out = g.mamba_conv1d(
-                conv_input, tracer.prefixed("conv_weight"),
+                conv_input,
+                tracer.prefixed("conv_weight"),
                 tracer.prefixed("conv_bias"),
                 activation="silu",
                 out_name=tracer.prefixed("conv_out"),
             )
         else:
             conv_out = g.mamba_conv1d(
-                conv_input, tracer.prefixed("conv_weight"), None,
+                conv_input,
+                tracer.prefixed("conv_weight"),
+                None,
                 activation="silu",
                 out_name=tracer.prefixed("conv_out"),
             )
@@ -3062,8 +3521,12 @@ class Mamba2Mixer(Module):
 
         # SSM scan
         ssm_out, ssm_state = g.mamba_ssm_scan(
-            hidden_states, dt, tracer.prefixed("A_log"),
-            ssm_B, ssm_C, tracer.prefixed("D_param"),
+            hidden_states,
+            dt,
+            tracer.prefixed("A_log"),
+            ssm_B,
+            ssm_C,
+            tracer.prefixed("D_param"),
             dt_bias=tracer.prefixed("dt_bias"),
             dt_softplus=True,
             dt_min=self.time_step_limit[0],
@@ -3079,13 +3542,16 @@ class Mamba2Mixer(Module):
 
         # Reshape SSM output
         ssm_out_flat = g.view(
-            ssm_out, shape=[B, T, I],
+            ssm_out,
+            shape=[B, T, I],
             out_name=tracer.prefixed("ssm_out_flat"),
         )
 
         # Gated RMSNorm
         gated_out = g.mamba_gated_rmsnorm(
-            ssm_out_flat, gate, tracer.prefixed("gated_norm_weight"),
+            ssm_out_flat,
+            gate,
+            tracer.prefixed("gated_norm_weight"),
             eps=self.eps,
             n_groups=self.n_groups,
             out_name=tracer.prefixed("gated_out"),
@@ -3093,21 +3559,28 @@ class Mamba2Mixer(Module):
 
         # Output projection
         gated_flat = g.view(
-            gated_out, shape=[B * T, I],
+            gated_out,
+            shape=[B * T, I],
             out_name=tracer.prefixed("gated_flat"),
         )
         if self.use_bias:
             out_flat = g.matmul_bias(
-                gated_flat, out_proj_w, out_proj_b, transpose="NT",
+                gated_flat,
+                out_proj_w,
+                out_proj_b,
+                transpose="NT",
                 out_name=tracer.prefixed("out_flat"),
             )
         else:
             out_flat = g.matmul(
-                gated_flat, out_proj_w, transpose="NT",
+                gated_flat,
+                out_proj_w,
+                transpose="NT",
                 out_name=tracer.prefixed("out_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=out_slot,
         )
 
@@ -3139,9 +3612,7 @@ class SimpleMLP(Module):
         self.C = Dim("C")
         self.M = Dim("M")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args
 
@@ -3153,18 +3624,23 @@ class SimpleMLP(Module):
 
         # -- activation slots ------------------------------------------------
         up_slot = tracer.register_activation(
-            "up", ("B", "T", "M"),
+            "up",
+            ("B", "T", "M"),
             aliases=["up_flat"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
         )
         act_slot = tracer.register_activation(
-            "act", ("B", "T", "M"),
+            "act",
+            ("B", "T", "M"),
             aliases=["act_flat"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
             description="MLP activation output",
         )
         down_slot = tracer.register_activation(
-            "down", ("B", "T", "C"),
+            "down",
+            ("B", "T", "C"),
             aliases=["down_flat"],
             share_policy="when_recomputed",
             description="MLP down projection output",
@@ -3172,23 +3648,30 @@ class SimpleMLP(Module):
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         # Up projection
         if self.use_bias:
             up_flat = g.matmul_bias(
-                x_flat, up_w, up_b, transpose="NT",
+                x_flat,
+                up_w,
+                up_b,
+                transpose="NT",
                 out_name=tracer.prefixed("up_flat"),
             )
         else:
             up_flat = g.matmul(
-                x_flat, up_w, transpose="NT",
+                x_flat,
+                up_w,
+                transpose="NT",
                 out_name=tracer.prefixed("up_flat"),
             )
         up = g.view(
-            up_flat, shape=[B, T, self.M],
+            up_flat,
+            shape=[B, T, self.M],
             out_name=up_slot,
         )
 
@@ -3199,21 +3682,28 @@ class SimpleMLP(Module):
 
         # Down projection
         act_flat = g.view(
-            act, shape=[B * T, self.M],
+            act,
+            shape=[B * T, self.M],
             out_name=tracer.prefixed("act_flat"),
         )
         if self.use_bias:
             out_flat = g.matmul_bias(
-                act_flat, down_w, down_b, transpose="NT",
+                act_flat,
+                down_w,
+                down_b,
+                transpose="NT",
                 out_name=tracer.prefixed("down_flat"),
             )
         else:
             out_flat = g.matmul(
-                act_flat, down_w, transpose="NT",
+                act_flat,
+                down_w,
+                transpose="NT",
                 out_name=tracer.prefixed("down_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=down_slot,
         )
 
@@ -3267,9 +3757,7 @@ class NemotronAttention(Module):
         self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, position_ids = args
 
@@ -3280,61 +3768,83 @@ class NemotronAttention(Module):
         out_b = tracer.register_param("out_bias", ("C",), when="attention_bias")
         if self.use_rope:
             tracer.register_param(
-                "rope_freqs", ("MaxSeq", "D // 2", 2), dtype="fp32", frozen=True,
+                "rope_freqs",
+                ("MaxSeq", "D // 2", 2),
+                dtype="fp32",
+                frozen=True,
             )
 
         # -- activation slots ------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", "QKV"),
+            "qkv",
+            ("B", "T", "QKV"),
             aliases=["qkv_flat"],
-            save=True, share_policy="per_layer",
+            save=True,
+            share_policy="per_layer",
         )
         if self.use_rope:
             tracer.register_activation(
-                "qkv_rope", ("B", "T", "QKV"),
-                save=True, share_policy="when_recomputed",
+                "qkv_rope",
+                ("B", "T", "QKV"),
+                save=True,
+                share_policy="when_recomputed",
             )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att",
+            ("B", "T", "AttnDim"),
             aliases=["att_flat", "attn"],
-            save=True, share_policy="always_recompute",
+            save=True,
+            share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
-            dtype="fp32", save=True, share_policy="always_recompute",
+            "lse",
+            ("B", "Hq", "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
-            "att_out", ("B", "T", "C"),
+            "att_out",
+            ("B", "T", "C"),
             aliases=["att_out_flat"],
             share_policy="fft_share",
         )
 
         # -- graph -----------------------------------------------------------
         x_flat = g.view(
-            x.ref, shape=[B * T, self.C],
+            x.ref,
+            shape=[B * T, self.C],
             out_name=tracer.prefixed("x_flat"),
         )
 
         if self.attention_bias:
             qkv_flat = g.matmul_bias(
-                x_flat, qkv_w, qkv_b, transpose="NT",
+                x_flat,
+                qkv_w,
+                qkv_b,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
         else:
             qkv_flat = g.matmul(
-                x_flat, qkv_w, transpose="NT",
+                x_flat,
+                qkv_w,
+                transpose="NT",
                 out_name=tracer.prefixed("qkv_flat"),
             )
 
         qkv = g.view(
-            qkv_flat, shape=[B, T, self.QKV],
+            qkv_flat,
+            shape=[B, T, self.QKV],
             out_name=qkv_slot,
         )
 
         # RoPE (optional - Nemotron-H attention does not use positional encoding)
         if self.use_rope:
             attn_input = g.rope(
-                qkv, tracer.prefixed("rope_freqs"), position_ids.ref,
+                qkv,
+                tracer.prefixed("rope_freqs"),
+                position_ids.ref,
                 rotary_dim=self.head_size,
                 out_name=tracer.prefixed("qkv_rope"),
             )
@@ -3343,28 +3853,36 @@ class NemotronAttention(Module):
 
         # FlashAttention
         attn_out, lse = g.flash_attention(
-            attn_input, causal=True,
+            attn_input,
+            causal=True,
             out_name=att_slot,
             lse_name=tracer.prefixed("lse"),
         )
 
         # Output projection
         attn_flat = g.view(
-            attn_out, shape=[B * T, self.AttnDim],
+            attn_out,
+            shape=[B * T, self.AttnDim],
             out_name=tracer.prefixed("att_flat"),
         )
         if self.attention_bias:
             out_flat = g.matmul_bias(
-                attn_flat, out_w, out_b, transpose="NT",
+                attn_flat,
+                out_w,
+                out_b,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         else:
             out_flat = g.matmul(
-                attn_flat, out_w, transpose="NT",
+                attn_flat,
+                out_w,
+                transpose="NT",
                 out_name=tracer.prefixed("att_out_flat"),
             )
         out = g.view(
-            out_flat, shape=[B, T, self.C],
+            out_flat,
+            shape=[B, T, self.C],
             out_name=att_out_slot,
         )
 
@@ -3411,9 +3929,7 @@ class NemotronMoEExperts(Module):
         self.E = Dim("E")
         self.K = Dim("K")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
@@ -3425,79 +3941,115 @@ class NemotronMoEExperts(Module):
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation(
-            "router_logits", ("B * T", "E"),
-            dtype="fp32", save=True, share_policy="when_recomputed",
+            "router_logits",
+            ("B * T", "E"),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "router_probs", ("B * T", "E"),
-            dtype="fp32", save=True, share_policy="when_recomputed",
+            "router_probs",
+            ("B * T", "E"),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "routing_weights", ("B * T", "K"),
-            dtype="fp32", save=True, share_policy="when_recomputed",
+            "routing_weights",
+            ("B * T", "K"),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "routing_indices", ("B * T", "K"),
-            dtype="int32", save=True, share_policy="when_recomputed",
+            "routing_indices",
+            ("B * T", "K"),
+            dtype="int32",
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "permuted_input", ("B * T * K", "C"),
-            save=True, share_policy="when_recomputed",
+            "permuted_input",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "scatter_indices", ("B * T * K",),
-            dtype="int32", save=True, share_policy="when_recomputed",
+            "scatter_indices",
+            ("B * T * K",),
+            dtype="int32",
+            save=True,
+            share_policy="when_recomputed",
         )
         if self.ep_size > 1:
             tracer.register_activation(
-                "ep_recv_input", ("B * T * K", "C"),
-                save=True, share_policy="per_layer",
+                "ep_recv_input",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
                 when="ep_size > 1",
             )
             tracer.register_activation(
-                "ep_recv_scatter", ("B * T * K",),
-                dtype="int32", save=True, share_policy="per_layer",
+                "ep_recv_scatter",
+                ("B * T * K",),
+                dtype="int32",
+                save=True,
+                share_policy="per_layer",
                 when="ep_size > 1",
             )
         tracer.register_activation(
-            "expert_up", ("B * T * K", "M"),
-            save=True, share_policy="when_recomputed",
+            "expert_up",
+            ("B * T * K", "M"),
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "expert_act", ("B * T * K", "M"),
-            save=True, share_policy="when_recomputed",
+            "expert_act",
+            ("B * T * K", "M"),
+            save=True,
+            share_policy="when_recomputed",
         )
         tracer.register_activation(
-            "expert_down", ("B * T * K", "C"),
-            save=True, share_policy="when_recomputed",
+            "expert_down",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="when_recomputed",
         )
         if self.ep_size > 1:
             tracer.register_activation(
-                "ep_combined", ("B * T * K", "C"),
-                save=True, share_policy="per_layer",
+                "ep_combined",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
                 when="ep_size > 1",
             )
         out_slot = tracer.register_activation(
-            "out", ("B * T", "C"),
+            "out",
+            ("B * T", "C"),
             aliases=["out_flat"],
-            save=True, share_policy="when_recomputed",
+            save=True,
+            share_policy="when_recomputed",
         )
 
         # -- graph -----------------------------------------------------------
         # Router (no bias on router matmul)
         router_logits = g.matmul(
-            x.ref, tracer.prefixed("router_weight"), transpose="NT",
+            x.ref,
+            tracer.prefixed("router_weight"),
+            transpose="NT",
             out_name=tracer.prefixed("router_logits"),
         )
 
         # Sigmoid routing
         router_probs = g.moe_sigmoid(
-            router_logits, out_name=tracer.prefixed("router_probs"),
+            router_logits,
+            out_name=tracer.prefixed("router_probs"),
         )
 
         # Top-k with correction bias and scaling factor
         routing_weights, routing_indices = g.moe_topk(
-            router_probs, top_k=self.num_experts_per_tok,
+            router_probs,
+            top_k=self.num_experts_per_tok,
             normalize=self.norm_topk_prob,
             scaling_factor=self.routed_scaling_factor,
             correction_bias=tracer.prefixed("e_score_correction_bias"),
@@ -3507,7 +4059,9 @@ class NemotronMoEExperts(Module):
 
         # Permute
         permuted_input, scatter_indices = g.moe_permute(
-            x.ref, routing_indices, top_k=self.num_experts_per_tok,
+            x.ref,
+            routing_indices,
+            top_k=self.num_experts_per_tok,
             out_name=tracer.prefixed("permuted_input"),
             scatter_name=tracer.prefixed("scatter_indices"),
         )
@@ -3515,8 +4069,11 @@ class NemotronMoEExperts(Module):
         # EP dispatch
         if self.ep_size > 1:
             ep_recv_input, ep_recv_scatter = g.ep_dispatch(
-                permuted_input, routing_indices, scatter_indices,
-                num_experts=self.num_experts, ep_size=self.ep_size,
+                permuted_input,
+                routing_indices,
+                scatter_indices,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
                 top_k=self.num_experts_per_tok,
                 out_name=tracer.prefixed("ep_recv_input"),
                 recv_scatter_name=tracer.prefixed("ep_recv_scatter"),
@@ -3529,22 +4086,28 @@ class NemotronMoEExperts(Module):
 
         # Expert up (simple grouped GEMM, NOT gate_up)
         expert_up = g.moe_grouped_gemm(
-            gemm_input, tracer.prefixed("experts_up"), gemm_scatter,
+            gemm_input,
+            tracer.prefixed("experts_up"),
+            gemm_scatter,
         )
 
         # Activation (relu2 by default)
         if self.activation == "relu2":
             expert_act = g.relu2(
-                expert_up, out_name=tracer.prefixed("expert_act"),
+                expert_up,
+                out_name=tracer.prefixed("expert_act"),
             )
         else:
             expert_act = g.silu(
-                expert_up, out_name=tracer.prefixed("expert_act"),
+                expert_up,
+                out_name=tracer.prefixed("expert_act"),
             )
 
         # Expert down
         expert_down = g.moe_grouped_gemm_down(
-            expert_act, tracer.prefixed("experts_down"), gemm_scatter,
+            expert_act,
+            tracer.prefixed("experts_down"),
+            gemm_scatter,
             out_name=tracer.prefixed("expert_down"),
         )
 
@@ -3552,14 +4115,17 @@ class NemotronMoEExperts(Module):
         if self.ep_size > 1:
             expert_down = g.ep_combine(
                 expert_down,
-                num_experts=self.num_experts, ep_size=self.ep_size,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
                 top_k=self.num_experts_per_tok,
                 out_name=tracer.prefixed("ep_combined"),
             )
 
         # Unpermute
         moe_out = g.moe_unpermute(
-            expert_down, routing_weights, scatter_indices,
+            expert_down,
+            routing_weights,
+            scatter_indices,
             top_k=self.num_experts_per_tok,
             out_name=out_slot,
         )
@@ -3588,9 +4154,7 @@ class NemotronSharedExpert(Module):
         self.C = Dim("C")
         self.SharedM = Dim("SharedM")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
@@ -3598,35 +4162,44 @@ class NemotronSharedExpert(Module):
         tracer.register_param("down", ("C", "SharedM"))
 
         tracer.register_activation(
-            "up_out", ("B * T", "SharedM"),
+            "up_out",
+            ("B * T", "SharedM"),
             share_policy="when_recomputed",
             when="use_shared_expert",
         )
         tracer.register_activation(
-            "act", ("B * T", "SharedM"),
+            "act",
+            ("B * T", "SharedM"),
             share_policy="when_recomputed",
             when="use_shared_expert",
         )
         out_slot = tracer.register_activation(
-            "out", ("B * T", "C"),
+            "out",
+            ("B * T", "C"),
             share_policy="when_recomputed",
             when="use_shared_expert",
         )
 
         shared_up = g.matmul(
-            x.ref, tracer.prefixed("up"), transpose="NT",
+            x.ref,
+            tracer.prefixed("up"),
+            transpose="NT",
             out_name=tracer.prefixed("up_out"),
         )
         if self.activation == "relu2":
             shared_act = g.relu2(
-                shared_up, out_name=tracer.prefixed("act"),
+                shared_up,
+                out_name=tracer.prefixed("act"),
             )
         else:
             shared_act = g.silu(
-                shared_up, out_name=tracer.prefixed("act"),
+                shared_up,
+                out_name=tracer.prefixed("act"),
             )
         shared_out = g.matmul(
-            shared_act, tracer.prefixed("down"), transpose="NT",
+            shared_act,
+            tracer.prefixed("down"),
+            transpose="NT",
             out_name=out_slot,
         )
 
@@ -3649,9 +4222,7 @@ class Linear(Module):
         self.C = Dim("in_dim")
         self.O = Dim("out_dim")
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (x,) = args
 
@@ -3660,7 +4231,9 @@ class Linear(Module):
             b = tracer.register_param("bias", ("O",), when="use_bias")
 
         out_slot = tracer.register_activation(
-            "out", ("B", "T", "O"), share_policy="when_recomputed",
+            "out",
+            ("B", "T", "O"),
+            share_policy="when_recomputed",
         )
 
         x_flat = g.view(x.ref, shape=[B * T, self.C], out_name=tracer.prefixed("x_flat"))
@@ -3685,19 +4258,20 @@ class Embedding(Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (token_ids,) = args
 
         # Keep token embeddings full-precision in QLoRA flows.
         w = tracer.register_param(
-            "weight", ("vocab_size", "d_model"), quantizable=False,
+            "weight",
+            ("vocab_size", "d_model"),
+            quantizable=False,
         )
 
         out_slot = tracer.register_activation(
-            "out", ("B", "T", "d_model"),
+            "out",
+            ("B", "T", "d_model"),
             scope=ActivationScope.GLOBAL,
             description="Embedded input",
         )
@@ -3725,7 +4299,10 @@ class ScaledEmbedding(Module):
     }
 
     def __init__(
-        self, vocab_size: int, d_model: int, embed_scale: float | None = None,
+        self,
+        vocab_size: int,
+        d_model: int,
+        embed_scale: float | None = None,
         dim_name: str = "d_model",
     ) -> None:
         super().__init__()
@@ -3734,19 +4311,20 @@ class ScaledEmbedding(Module):
         self.embed_scale = embed_scale if embed_scale is not None else float(d_model) ** 0.5
         self._dim_name = dim_name
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         (token_ids,) = args
         dim = self._dim_name
 
         w = tracer.register_param(
-            "weight", ("vocab_size", dim), quantizable=False,
+            "weight",
+            ("vocab_size", dim),
+            quantizable=False,
         )
 
         out_slot = tracer.register_activation(
-            "out", ("B", "T", dim),
+            "out",
+            ("B", "T", dim),
             scope=ActivationScope.GLOBAL,
             description="Scaled embedded input",
         )
@@ -3766,37 +4344,44 @@ class LMHead(Module):
     }
 
     def __init__(
-        self, vocab_size: int, d_model: int, softcap: float | None = None,
+        self,
+        vocab_size: int,
+        d_model: int,
+        softcap: float | None = None,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.softcap = softcap
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> Proxy:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         x, targets = args
 
         # Keep LM head full-precision in QLoRA flows.
         w = tracer.register_param(
-            "weight", ("vocab_size", "d_model"), quantizable=False,
+            "weight",
+            ("vocab_size", "d_model"),
+            quantizable=False,
         )
 
         loss_slot = tracer.register_activation(
-            "loss", ("B * T",),
+            "loss",
+            ("B * T",),
             dtype="fp32",
             scope=ActivationScope.GLOBAL,
             description="Cross-entropy loss per token",
         )
 
         x_flat = g.view(
-            x.ref, shape=["B * T", "d_model"],
+            x.ref,
+            shape=["B * T", "d_model"],
             out_name=tracer.prefixed("x_flat"),
         )
         loss = g.fused_lm_head_loss(
-            x_flat, w, targets.ref,
+            x_flat,
+            w,
+            targets.ref,
             compute_accuracy=True,
             softcap=self.softcap,
             out_name=loss_slot,
@@ -3852,8 +4437,7 @@ DENSE_BLOCK_NAME_REMAP: dict[str, str] = {
 # MoE block: same attn + norm, but moe instead of mlp
 MOE_BLOCK_NAME_REMAP: dict[str, str] = {
     # Inherit all attn_norm and self_attn mappings
-    **{k: v for k, v in DENSE_BLOCK_NAME_REMAP.items()
-       if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
+    **{k: v for k, v in DENSE_BLOCK_NAME_REMAP.items() if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
     # --- moe (MoEExpertsGated) -> strip moe_ prefix ---
     # Params
     "moe_router_weight": "router_weight",
@@ -3883,8 +4467,7 @@ MOE_BLOCK_NAME_REMAP: dict[str, str] = {
 # GPT-OSS MoE block: GptOssAttention (with sinks) + GptOssMoEExperts (with biases)
 GPT_OSS_BLOCK_NAME_REMAP: dict[str, str] = {
     # Inherit attn_norm, self_attn, mlp_norm mappings from dense
-    **{k: v for k, v in DENSE_BLOCK_NAME_REMAP.items()
-       if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
+    **{k: v for k, v in DENSE_BLOCK_NAME_REMAP.items() if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
     # GPT-OSS attention extra: sinks
     "self_attn_sinks": "sinks",
     # --- moe (GptOssMoEExperts) -> strip moe_ prefix ---
@@ -4230,8 +4813,7 @@ QWEN3_5_VL_MODEL_NAME_REMAP: dict[str, str] = {
 # Qwen3.5 MoE attention block: Qwen3_5Attention + MoE (replaces SwiGLUMLP)
 QWEN3_5_MOE_ATTN_BLOCK_REMAP: dict[str, str] = {
     # Inherit norm + attention mappings from Qwen3.5 attention block
-    **{k: v for k, v in QWEN3_5_ATTN_BLOCK_REMAP.items()
-       if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
+    **{k: v for k, v in QWEN3_5_ATTN_BLOCK_REMAP.items() if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
     # --- moe (MoEExpertsGated) -> strip moe_ prefix ---
     "moe_router_weight": "router_weight",
     "moe_experts_gate_up": "experts_gate_up",
@@ -4256,8 +4838,7 @@ QWEN3_5_MOE_ATTN_BLOCK_REMAP: dict[str, str] = {
 # Qwen3.5 MoE linear block: GatedDeltaNet + MoE (replaces SwiGLUMLP)
 QWEN3_5_MOE_LINEAR_BLOCK_REMAP: dict[str, str] = {
     # Inherit norm + linear attention mappings from Qwen3.5 linear block
-    **{k: v for k, v in QWEN3_5_LINEAR_BLOCK_REMAP.items()
-       if k.startswith(("attn_norm_", "mixer_", "mlp_norm_"))},
+    **{k: v for k, v in QWEN3_5_LINEAR_BLOCK_REMAP.items() if k.startswith(("attn_norm_", "mixer_", "mlp_norm_"))},
     # --- moe (MoEExpertsGated) -> strip moe_ prefix ---
     "moe_router_weight": "router_weight",
     "moe_experts_gate_up": "experts_gate_up",
@@ -4367,6 +4948,7 @@ GEMMA4_MODEL_NAME_REMAP: dict[str, str] = {
 # Block base class
 # ============================================================================
 
+
 class Block(Module):
     """Base class for transformer blocks.
 
@@ -4412,7 +4994,7 @@ class Block(Module):
     def compile(self, name_override: str | None = None) -> BlockSpec:
         """Trace forward and produce a BlockSpec."""
         tracer = Tracer()
-        tracer._name_remap = getattr(type(self), '_name_remap_', {})
+        tracer._name_remap = getattr(type(self), "_name_remap_", {})
         token = _current_tracer.set(tracer)
         try:
             # Build proxy inputs from forward() signature
@@ -4491,6 +5073,7 @@ class Block(Module):
 # Model base class
 # ============================================================================
 
+
 class Model(Module):
     """Base class for full models.
 
@@ -4512,7 +5095,7 @@ class Model(Module):
     def compile(self) -> ModelSpec:
         """Trace forward and produce a ModelSpec."""
         tracer = Tracer()
-        tracer._name_remap = getattr(type(self), '_name_remap_', {})
+        tracer._name_remap = getattr(type(self), "_name_remap_", {})
         token = _current_tracer.set(tracer)
         try:
             sig = inspect.signature(self.forward)
@@ -4571,6 +5154,7 @@ class Model(Module):
         hf_mapping_spec = None
         if tracer.hf_mappings:
             from .specs import HFMappingSpec
+
             hf_mapping_spec = HFMappingSpec(mappings=tracer.hf_mappings)
 
         spec = ModelSpec(
@@ -4593,6 +5177,7 @@ class Model(Module):
 # hf_config decorator for Model subclasses
 # ============================================================================
 
+
 def hf_config(
     architecture: str,
     model_type: str,
@@ -4612,6 +5197,7 @@ def hf_config(
         class Qwen3(nn.Model):
             ...
     """
+
     def decorator(cls: type) -> type:
         hf_cfg = HFConfigSpec(
             architecture=architecture,
@@ -4639,12 +5225,14 @@ def hf_config(
         _model_registry[cls.__name__] = lazy_spec
 
         return cls
+
     return decorator
 
 
 # ============================================================================
 # BlockStack — helper for stacking blocks in a model
 # ============================================================================
+
 
 class BlockStack(Module):
     """Calls StackedBlocks with the given block type.
@@ -4662,9 +5250,7 @@ class BlockStack(Module):
         # Instantiate one block to get its spec
         self._block_instance = block_cls(**block_kwargs)
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> tuple[Proxy, ...]:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> tuple[Proxy, ...]:
         g = tracer.graph
 
         # Register the block array as a param (ARRAY kind, not TENSOR).
@@ -4702,9 +5288,7 @@ class BlockStack(Module):
 
         if isinstance(result, GraphRef):
             return (Proxy("stacked_out", result),)
-        return tuple(
-            Proxy(f"stacked_out_{i}", r) for i, r in enumerate(result)
-        )
+        return tuple(Proxy(f"stacked_out_{i}", r) for i, r in enumerate(result))
 
 
 class HybridBlockStack(Module):
@@ -4750,9 +5334,7 @@ class HybridBlockStack(Module):
                 btype = param_name.replace("_blocks", "")
                 self._block_instances[btype] = (param_name, instance, count)
 
-    def _trace(
-        self, tracer: Tracer, *args: Proxy, **kwargs: Any
-    ) -> tuple[Proxy, ...]:
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> tuple[Proxy, ...]:
         g = tracer.graph
 
         # Register each block array as a param and compile block specs
@@ -4793,6 +5375,4 @@ class HybridBlockStack(Module):
 
         if isinstance(result, GraphRef):
             return (Proxy("stacked_out", result),)
-        return tuple(
-            Proxy(f"stacked_out_{i}", r) for i, r in enumerate(result)
-        )
+        return tuple(Proxy(f"stacked_out_{i}", r) for i, r in enumerate(result))

@@ -66,4 +66,3 @@ def parse_unknown_args(args: list[str], config_cls: type) -> tuple[list[str], li
                 i += 1
 
     return known_args, unknown_args
-

@@ -1,10 +1,9 @@
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from filelock import FileLock
-
-from surogate.utils.dict import DictDefault
 
 LOCK_FILE_NAME = "datasets.lock"
 READY_FILE_NAME = "datasets_ready.flag"

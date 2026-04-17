@@ -1,5 +1,6 @@
 import pickle
-from typing import TYPE_CHECKING, Generator, cast
+from collections.abc import Generator
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch.nn import Module

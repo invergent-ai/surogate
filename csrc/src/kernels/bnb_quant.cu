@@ -37,31 +37,41 @@
  * This distribution better matches neural network weight distributions.
  */
 __device__ __constant__ float d_nf4_dequant_lut[16] = {
-    -1.0f,                 // 0b0000
-    -0.6961928009986877f,  // 0b0001
-    -0.5250730514526367f,  // 0b0010
-    -0.39491748809814453f, // 0b0011
-    -0.28444138169288635f, // 0b0100
-    -0.18477343022823334f, // 0b0101
-    -0.09105003625154495f, // 0b0110
-    0.0f,                  // 0b0111
-    0.07958029955625534f,  // 0b1000
-    0.16093020141124725f,  // 0b1001
-    0.24611230194568634f,  // 0b1010
-    0.33791524171829224f,  // 0b1011
-    0.44070982933044434f,  // 0b1100
-    0.5626170039176941f,   // 0b1101
-    0.7229568362236023f,   // 0b1110
-    1.0f                   // 0b1111
+    -1.0f,                  // 0b0000
+    -0.6961928009986877f,   // 0b0001
+    -0.5250730514526367f,   // 0b0010
+    -0.39491748809814453f,  // 0b0011
+    -0.28444138169288635f,  // 0b0100
+    -0.18477343022823334f,  // 0b0101
+    -0.09105003625154495f,  // 0b0110
+    0.0f,                   // 0b0111
+    0.07958029955625534f,   // 0b1000
+    0.16093020141124725f,   // 0b1001
+    0.24611230194568634f,   // 0b1010
+    0.33791524171829224f,   // 0b1011
+    0.44070982933044434f,   // 0b1100
+    0.5626170039176941f,    // 0b1101
+    0.7229568362236023f,    // 0b1110
+    1.0f                    // 0b1111
 };
 
 // Host-side copy of NF4 lookup table for initialization
-static const float h_nf4_dequant_lut[16] = {
-    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
-    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
-    0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
-    0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f
-};
+static const float h_nf4_dequant_lut[16] = {-1.0f,
+                                            -0.6961928009986877f,
+                                            -0.5250730514526367f,
+                                            -0.39491748809814453f,
+                                            -0.28444138169288635f,
+                                            -0.18477343022823334f,
+                                            -0.09105003625154495f,
+                                            0.0f,
+                                            0.07958029955625534f,
+                                            0.16093020141124725f,
+                                            0.24611230194568634f,
+                                            0.33791524171829224f,
+                                            0.44070982933044434f,
+                                            0.5626170039176941f,
+                                            0.7229568362236023f,
+                                            1.0f};
 
 // ============================================================================
 // NF4 Quantization/Dequantization Device Functions
@@ -81,41 +91,41 @@ __device__ __forceinline__ unsigned char dQuantizeNF4(float x) {
     // Binary decision tree for NF4 quantization
     // Thresholds are midpoints between adjacent codebook values
     if (x > 0.03979014977812767f)
-        if (x > 0.3893125355243683f)         // 1
-            if (x > 0.6427869200706482f)     // 11
-                if (x > 0.8614784181118011f) // 111
+        if (x > 0.3893125355243683f)          // 1
+            if (x > 0.6427869200706482f)      // 11
+                if (x > 0.8614784181118011f)  // 111
                     return 0b1111;
                 else
                     return 0b1110;
-            else if (x > 0.5016634166240692f) // 110
+            else if (x > 0.5016634166240692f)  // 110
                 return 0b1101;
             else
                 return 0b1100;
-        else if (x > 0.2035212516784668f) // 10
-            if (x > 0.2920137718319893f)  // 101
+        else if (x > 0.2035212516784668f)  // 10
+            if (x > 0.2920137718319893f)   // 101
                 return 0b1011;
             else
                 return 0b1010;
-        else if (x > 0.1202552504837513f) // 100
+        else if (x > 0.1202552504837513f)  // 100
             return 0b1001;
         else
             return 0b1000;
-    else if (x > -0.33967943489551544f)     // 0
-        if (x > -0.13791173323988914f)      // 01
-            if (x > -0.045525018125772476f) // 011
+    else if (x > -0.33967943489551544f)      // 0
+        if (x > -0.13791173323988914f)       // 01
+            if (x > -0.045525018125772476f)  // 011
                 return 0b0111;
             else
                 return 0b0110;
-        else if (x > -0.23460740596055984f) // 010
+        else if (x > -0.23460740596055984f)  // 010
             return 0b0101;
         else
             return 0b0100;
-    else if (x > -0.6106329262256622f) // 00
-        if (x > -0.4599952697753906f)  // 001
+    else if (x > -0.6106329262256622f)  // 00
+        if (x > -0.4599952697753906f)   // 001
             return 0b0011;
         else
             return 0b0010;
-    else if (x > -0.8480964004993439f) // 000
+    else if (x > -0.8480964004993439f)  // 000
         return 0b0001;
     else
         return 0b0000;
@@ -156,12 +166,10 @@ __device__ __forceinline__ float dDequantizeNF4(unsigned char val) {
  * @param n Total number of elements
  */
 template <int BLOCK_SIZE, int THREADS>
-__global__ void kQuantizeBnBNF4Fused(
-    unsigned char* __restrict__ out,
-    float* __restrict__ absmax,
-    const nv_bfloat16* __restrict__ in,
-    const long n)
-{
+__global__ void kQuantizeBnBNF4Fused(unsigned char* __restrict__ out,
+                                     float* __restrict__ absmax,
+                                     const nv_bfloat16* __restrict__ in,
+                                     const long n) {
     // CUB block reduce for finding max
     typedef cub::BlockReduce<float, THREADS> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -185,7 +193,7 @@ __global__ void kQuantizeBnBNF4Fused(
     float local_vals[ELEMS_PER_THREAD];
     float thread_max = 0.0f;
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; i++) {
         const int local_idx = threadIdx.x * ELEMS_PER_THREAD + i;
         const long global_idx = base_elem + local_idx;
@@ -201,7 +209,9 @@ __global__ void kQuantizeBnBNF4Fused(
 
     // Phase 2: Reduce to find block absmax using CUB
     // Use a lambda for max reduction (compatible with all CUB versions)
-    auto max_op = [] __device__ (float a, float b) { return fmaxf(a, b); };
+    auto max_op = [] __device__(float a, float b) {
+        return fmaxf(a, b);
+    };
     float block_max = BlockReduce(temp_storage).Reduce(thread_max, max_op);
 
     // Thread 0 stores absmax and broadcasts via shared memory
@@ -220,7 +230,7 @@ __global__ void kQuantizeBnBNF4Fused(
     constexpr int BYTES_PER_THREAD = ELEMS_PER_THREAD / 2;
     const long base_out_byte = (base_elem / 2) + threadIdx.x * BYTES_PER_THREAD;
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < BYTES_PER_THREAD; i++) {
         const int val_idx = i * 2;
         const int local_elem_idx = threadIdx.x * ELEMS_PER_THREAD + val_idx;
@@ -253,13 +263,11 @@ __global__ void kQuantizeBnBNF4Fused(
  * @param blocksize Number of elements per quantization block
  * @param n Total number of elements
  */
-__global__ void kQuantizeBnBNF4Simple(
-    unsigned char* __restrict__ out,
-    float* __restrict__ absmax,
-    const nv_bfloat16* __restrict__ in,
-    const int blocksize,
-    const long n)
-{
+__global__ void kQuantizeBnBNF4Simple(unsigned char* __restrict__ out,
+                                      float* __restrict__ absmax,
+                                      const nv_bfloat16* __restrict__ in,
+                                      const int blocksize,
+                                      const long n) {
     // Each thread handles one packed byte (2 elements)
     const long packed_n = (n + 1) / 2;
     const long idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -295,12 +303,8 @@ __global__ void kQuantizeBnBNF4Simple(
  * @param blocksize Number of elements per quantization block
  * @param n Total number of elements
  */
-__global__ void kComputeAbsmax(
-    float* __restrict__ absmax,
-    const nv_bfloat16* __restrict__ in,
-    const int blocksize,
-    const long n)
-{
+__global__ void
+kComputeAbsmax(float* __restrict__ absmax, const nv_bfloat16* __restrict__ in, const int blocksize, const long n) {
     const long num_blocks = (n + blocksize - 1) / blocksize;
     const long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -333,13 +337,12 @@ __global__ void kComputeAbsmax(
  * @param blocksize_shift log2(blocksize) for fast division
  * @param n Total number of output elements
  */
-__global__ void kDequantizeBnBNF4Vectorized(
-    nv_bfloat162* __restrict__ out,  // Output as BF16x2 for vectorized stores
-    const uint32_t* __restrict__ in,  // Input as uint32 (4 packed bytes = 8 values)
-    const float* __restrict__ absmax,
-    const int blocksize_shift,
-    const long n)
-{
+__global__ void
+kDequantizeBnBNF4Vectorized(nv_bfloat162* __restrict__ out,   // Output as BF16x2 for vectorized stores
+                            const uint32_t* __restrict__ in,  // Input as uint32 (4 packed bytes = 8 values)
+                            const float* __restrict__ absmax,
+                            const int blocksize_shift,
+                            const long n) {
     // Each thread handles 4 packed bytes = 8 BF16 outputs
     const long idx = blockIdx.x * blockDim.x + threadIdx.x;
     const long elem_idx = idx * 8;
@@ -418,13 +421,11 @@ __global__ void kDequantizeBnBNF4Vectorized(
  * @param blocksize Number of elements per quantization block
  * @param n Total number of output elements
  */
-__global__ void kDequantizeBnBNF4Simple(
-    nv_bfloat16* __restrict__ out,
-    const unsigned char* __restrict__ in,
-    const float* __restrict__ absmax,
-    const int blocksize,
-    const long n)
-{
+__global__ void kDequantizeBnBNF4Simple(nv_bfloat16* __restrict__ out,
+                                        const unsigned char* __restrict__ in,
+                                        const float* __restrict__ absmax,
+                                        const int blocksize,
+                                        const long n) {
     const long packed_n = (n + 1) / 2;  // Number of packed bytes
     const long idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -471,14 +472,12 @@ __global__ void kDequantizeBnBNF4Simple(
  * @param n Number of absmax values
  * @param group_size Number of absmax values per quantization group (default 256)
  */
-__global__ void kQuantizeAbsmaxDouble(
-    unsigned char* __restrict__ out_absmax_quant,
-    float* __restrict__ out_absmax_scale,
-    float* __restrict__ out_absmax_offset,
-    const float* __restrict__ absmax,
-    const int n,
-    const int group_size = 256)
-{
+__global__ void kQuantizeAbsmaxDouble(unsigned char* __restrict__ out_absmax_quant,
+                                      float* __restrict__ out_absmax_scale,
+                                      float* __restrict__ out_absmax_offset,
+                                      const float* __restrict__ absmax,
+                                      const int n,
+                                      const int group_size = 256) {
     const int group_idx = blockIdx.x;
     const int base_idx = group_idx * group_size;
     const int end_idx = min(base_idx + group_size, n);
@@ -557,14 +556,12 @@ __global__ void kQuantizeAbsmaxDouble(
  * @param n Number of absmax values
  * @param group_size Number of absmax values per group
  */
-__global__ void kDequantizeAbsmaxDouble(
-    float* __restrict__ out_absmax,
-    const unsigned char* __restrict__ in_absmax_quant,
-    const float* __restrict__ in_absmax_scale,
-    const float* __restrict__ in_absmax_offset,
-    const int n,
-    const int group_size = 256)
-{
+__global__ void kDequantizeAbsmaxDouble(float* __restrict__ out_absmax,
+                                        const unsigned char* __restrict__ in_absmax_quant,
+                                        const float* __restrict__ in_absmax_scale,
+                                        const float* __restrict__ in_absmax_offset,
+                                        const int n,
+                                        const int group_size = 256) {
     const long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
@@ -596,16 +593,14 @@ __global__ void kDequantizeAbsmaxDouble(
  * @param absmax_group_size Group size for double quantization
  * @param n Total number of output elements
  */
-__global__ void kDequantizeBnBNF4DoubleVectorized(
-    nv_bfloat162* __restrict__ out,
-    const uint32_t* __restrict__ in,
-    const unsigned char* __restrict__ absmax_quant,
-    const float* __restrict__ absmax_scale,
-    const float* __restrict__ absmax_offset,
-    const int blocksize_shift,
-    const int absmax_group_size,
-    const long n)
-{
+__global__ void kDequantizeBnBNF4DoubleVectorized(nv_bfloat162* __restrict__ out,
+                                                  const uint32_t* __restrict__ in,
+                                                  const unsigned char* __restrict__ absmax_quant,
+                                                  const float* __restrict__ absmax_scale,
+                                                  const float* __restrict__ absmax_offset,
+                                                  const int blocksize_shift,
+                                                  const int absmax_group_size,
+                                                  const long n) {
     const long idx = blockIdx.x * blockDim.x + threadIdx.x;
     const long elem_idx = idx * 8;
 
@@ -689,16 +684,14 @@ __global__ void kDequantizeBnBNF4DoubleVectorized(
  * @param absmax_group_size Group size for double quantization (typically 256)
  * @param n Total number of output elements
  */
-__global__ void kDequantizeBnBNF4DoubleSimple(
-    nv_bfloat16* __restrict__ out,
-    const unsigned char* __restrict__ in,
-    const unsigned char* __restrict__ absmax_quant,
-    const float* __restrict__ absmax_scale,
-    const float* __restrict__ absmax_offset,
-    const int blocksize,
-    const int absmax_group_size,
-    const long n)
-{
+__global__ void kDequantizeBnBNF4DoubleSimple(nv_bfloat16* __restrict__ out,
+                                              const unsigned char* __restrict__ in,
+                                              const unsigned char* __restrict__ absmax_quant,
+                                              const float* __restrict__ absmax_scale,
+                                              const float* __restrict__ absmax_offset,
+                                              const int blocksize,
+                                              const int absmax_group_size,
+                                              const long n) {
     const long packed_n = (n + 1) / 2;  // Number of packed bytes
     const long idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -751,15 +744,14 @@ __global__ void kDequantizeBnBNF4DoubleSimple(
  * @param dp CUDA device properties
  * @param stream CUDA stream
  */
-void quantize_bnb_nf4(
-    unsigned char* out,
-    float* absmax,
-    const nv_bfloat16* in,
-    int M, int K,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_bnb_nf4(unsigned char* out,
+                      float* absmax,
+                      const nv_bfloat16* in,
+                      int M,
+                      int K,
+                      int block_size,
+                      const cudaDeviceProp& dp,
+                      cudaStream_t stream) {
     const long n = (long)M * K;
     const long num_absmax_blocks = (n + block_size - 1) / block_size;
 
@@ -770,29 +762,25 @@ void quantize_bnb_nf4(
         case 64: {
             // 64 elements / 32 threads = 2 elements per thread
             constexpr int THREADS = 32;
-            kQuantizeBnBNF4Fused<64, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(
-                out, absmax, in, n);
+            kQuantizeBnBNF4Fused<64, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(out, absmax, in, n);
             break;
         }
         case 128: {
             // 128 elements / 32 threads = 4 elements per thread
             constexpr int THREADS = 32;
-            kQuantizeBnBNF4Fused<128, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(
-                out, absmax, in, n);
+            kQuantizeBnBNF4Fused<128, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(out, absmax, in, n);
             break;
         }
         case 256: {
             // 256 elements / 64 threads = 4 elements per thread
             constexpr int THREADS = 64;
-            kQuantizeBnBNF4Fused<256, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(
-                out, absmax, in, n);
+            kQuantizeBnBNF4Fused<256, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(out, absmax, in, n);
             break;
         }
         case 512: {
             // 512 elements / 128 threads = 4 elements per thread
             constexpr int THREADS = 128;
-            kQuantizeBnBNF4Fused<512, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(
-                out, absmax, in, n);
+            kQuantizeBnBNF4Fused<512, THREADS><<<num_absmax_blocks, THREADS, 0, stream>>>(out, absmax, in, n);
             break;
         }
         default: {
@@ -829,20 +817,18 @@ void quantize_bnb_nf4(
  * @param dp CUDA device properties
  * @param stream CUDA stream
  */
-void dequantize_bnb_nf4(
-    nv_bfloat16* out,
-    const unsigned char* in,
-    const float* absmax,
-    int M, int K,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_bnb_nf4(nv_bfloat16* out,
+                        const unsigned char* in,
+                        const float* absmax,
+                        int M,
+                        int K,
+                        int block_size,
+                        const cudaDeviceProp& dp,
+                        cudaStream_t stream) {
     const long n = (long)M * K;
 
     // Check alignment for vectorized kernel (4-byte aligned)
-    const bool aligned = ((reinterpret_cast<uintptr_t>(out) % 4) == 0) &&
-                         ((reinterpret_cast<uintptr_t>(in) % 4) == 0);
+    const bool aligned = ((reinterpret_cast<uintptr_t>(out) % 4) == 0) && ((reinterpret_cast<uintptr_t>(in) % 4) == 0);
 
     // Use vectorized kernel for aligned data with sufficient elements
     // Each thread processes 8 elements, so we need n >= 8
@@ -854,18 +840,18 @@ void dequantize_bnb_nf4(
         // Host-side log2 for power-of-2 block sizes
         const int blocksize_shift = 31 - __builtin_clz(block_size);
 
-        kDequantizeBnBNF4Vectorized<<<num_blocks, THREADS, 0, stream>>>(
-            reinterpret_cast<nv_bfloat162*>(out),
-            reinterpret_cast<const uint32_t*>(in),
-            absmax, blocksize_shift, n);
+        kDequantizeBnBNF4Vectorized<<<num_blocks, THREADS, 0, stream>>>(reinterpret_cast<nv_bfloat162*>(out),
+                                                                        reinterpret_cast<const uint32_t*>(in),
+                                                                        absmax,
+                                                                        blocksize_shift,
+                                                                        n);
     } else {
         // Fallback: simple kernel for unaligned or small data
         const long packed_n = (n + 1) / 2;
         constexpr int THREADS = 256;
         const int num_blocks = (packed_n + THREADS - 1) / THREADS;
 
-        kDequantizeBnBNF4Simple<<<num_blocks, THREADS, 0, stream>>>(
-            out, in, absmax, block_size, n);
+        kDequantizeBnBNF4Simple<<<num_blocks, THREADS, 0, stream>>>(out, in, absmax, block_size, n);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -884,21 +870,23 @@ void dequantize_bnb_nf4(
  * @param dp CUDA device properties
  * @param stream CUDA stream
  */
-void quantize_absmax_double(
-    unsigned char* out_quant,
-    float* out_scale,
-    float* out_offset,
-    const float* absmax,
-    int num_absmax,
-    int group_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_absmax_double(unsigned char* out_quant,
+                            float* out_scale,
+                            float* out_offset,
+                            const float* absmax,
+                            int num_absmax,
+                            int group_size,
+                            const cudaDeviceProp& dp,
+                            cudaStream_t stream) {
     const int num_groups = (num_absmax + group_size - 1) / group_size;
     const int threads = 256;
 
-    kQuantizeAbsmaxDouble<<<num_groups, threads, 0, stream>>>(
-        out_quant, out_scale, out_offset, absmax, num_absmax, group_size);
+    kQuantizeAbsmaxDouble<<<num_groups, threads, 0, stream>>>(out_quant,
+                                                              out_scale,
+                                                              out_offset,
+                                                              absmax,
+                                                              num_absmax,
+                                                              group_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -914,21 +902,23 @@ void quantize_absmax_double(
  * @param dp CUDA device properties
  * @param stream CUDA stream
  */
-void dequantize_absmax_double(
-    float* out_absmax,
-    const unsigned char* in_quant,
-    const float* in_scale,
-    const float* in_offset,
-    int num_absmax,
-    int group_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_absmax_double(float* out_absmax,
+                              const unsigned char* in_quant,
+                              const float* in_scale,
+                              const float* in_offset,
+                              int num_absmax,
+                              int group_size,
+                              const cudaDeviceProp& dp,
+                              cudaStream_t stream) {
     const int threads = 256;
     const int num_blocks = (num_absmax + threads - 1) / threads;
 
-    kDequantizeAbsmaxDouble<<<num_blocks, threads, 0, stream>>>(
-        out_absmax, in_quant, in_scale, in_offset, num_absmax, group_size);
+    kDequantizeAbsmaxDouble<<<num_blocks, threads, 0, stream>>>(out_absmax,
+                                                                in_quant,
+                                                                in_scale,
+                                                                in_offset,
+                                                                num_absmax,
+                                                                group_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -950,23 +940,21 @@ void dequantize_absmax_double(
  * @param dp CUDA device properties
  * @param stream CUDA stream
  */
-void dequantize_bnb_nf4_double(
-    nv_bfloat16* out,
-    const unsigned char* in,
-    const unsigned char* absmax_quant,
-    const float* absmax_scale,
-    const float* absmax_offset,
-    int M, int K,
-    int block_size,
-    int absmax_group_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_bnb_nf4_double(nv_bfloat16* out,
+                               const unsigned char* in,
+                               const unsigned char* absmax_quant,
+                               const float* absmax_scale,
+                               const float* absmax_offset,
+                               int M,
+                               int K,
+                               int block_size,
+                               int absmax_group_size,
+                               const cudaDeviceProp& dp,
+                               cudaStream_t stream) {
     const long n = (long)M * K;
 
     // Check alignment for vectorized kernel
-    const bool aligned = ((reinterpret_cast<uintptr_t>(out) % 4) == 0) &&
-                         ((reinterpret_cast<uintptr_t>(in) % 4) == 0);
+    const bool aligned = ((reinterpret_cast<uintptr_t>(out) % 4) == 0) && ((reinterpret_cast<uintptr_t>(in) % 4) == 0);
 
     if (aligned && n >= 8) {
         // Vectorized kernel: each thread handles 8 BF16 outputs
@@ -976,19 +964,28 @@ void dequantize_bnb_nf4_double(
         // Host-side log2 for power-of-2 block sizes
         const int blocksize_shift = 31 - __builtin_clz(block_size);
 
-        kDequantizeBnBNF4DoubleVectorized<<<num_blocks, THREADS, 0, stream>>>(
-            reinterpret_cast<nv_bfloat162*>(out),
-            reinterpret_cast<const uint32_t*>(in),
-            absmax_quant, absmax_scale, absmax_offset,
-            blocksize_shift, absmax_group_size, n);
+        kDequantizeBnBNF4DoubleVectorized<<<num_blocks, THREADS, 0, stream>>>(reinterpret_cast<nv_bfloat162*>(out),
+                                                                              reinterpret_cast<const uint32_t*>(in),
+                                                                              absmax_quant,
+                                                                              absmax_scale,
+                                                                              absmax_offset,
+                                                                              blocksize_shift,
+                                                                              absmax_group_size,
+                                                                              n);
     } else {
         // Fallback: simple kernel
         const long packed_n = (n + 1) / 2;
         constexpr int THREADS = 256;
         const int num_blocks = (packed_n + THREADS - 1) / THREADS;
 
-        kDequantizeBnBNF4DoubleSimple<<<num_blocks, THREADS, 0, stream>>>(
-            out, in, absmax_quant, absmax_scale, absmax_offset, block_size, absmax_group_size, n);
+        kDequantizeBnBNF4DoubleSimple<<<num_blocks, THREADS, 0, stream>>>(out,
+                                                                          in,
+                                                                          absmax_quant,
+                                                                          absmax_scale,
+                                                                          absmax_offset,
+                                                                          block_size,
+                                                                          absmax_group_size,
+                                                                          n);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1000,14 +997,12 @@ void dequantize_bnb_nf4_double(
 /**
  * @brief Tensor-based wrapper for NF4 quantization.
  */
-void quantize_bnb_nf4(
-    Tensor& out,
-    Tensor& absmax,
-    const Tensor& in,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_bnb_nf4(Tensor& out,
+                      Tensor& absmax,
+                      const Tensor& in,
+                      int block_size,
+                      const cudaDeviceProp& dp,
+                      cudaStream_t stream) {
     if (in.DType != ETensorDType::BF16) {
         throw std::runtime_error("quantize_bnb_nf4: input must be BF16");
     }
@@ -1021,24 +1016,25 @@ void quantize_bnb_nf4(
     const int M = in.Sizes[0];
     const int K = (in.Rank == 2) ? in.Sizes[1] : 1;
 
-    quantize_bnb_nf4(
-        out.get<unsigned char>(),
-        absmax.get<float>(),
-        in.get<nv_bfloat16>(),
-        M, K, block_size, dp, stream);
+    quantize_bnb_nf4(out.get<unsigned char>(),
+                     absmax.get<float>(),
+                     in.get<nv_bfloat16>(),
+                     M,
+                     K,
+                     block_size,
+                     dp,
+                     stream);
 }
 
 /**
  * @brief Tensor-based wrapper for NF4 dequantization.
  */
-void dequantize_bnb_nf4(
-    Tensor& out,
-    const Tensor& in,
-    const Tensor& absmax,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_bnb_nf4(Tensor& out,
+                        const Tensor& in,
+                        const Tensor& absmax,
+                        int block_size,
+                        const cudaDeviceProp& dp,
+                        cudaStream_t stream) {
     if (out.DType != ETensorDType::BF16) {
         throw std::runtime_error("dequantize_bnb_nf4: output must be BF16");
     }
@@ -1052,11 +1048,14 @@ void dequantize_bnb_nf4(
     const int M = out.Sizes[0];
     const int K = (out.Rank == 2) ? out.Sizes[1] : 1;
 
-    dequantize_bnb_nf4(
-        out.get<nv_bfloat16>(),
-        in.get<unsigned char>(),
-        absmax.get<float>(),
-        M, K, block_size, dp, stream);
+    dequantize_bnb_nf4(out.get<nv_bfloat16>(),
+                       in.get<unsigned char>(),
+                       absmax.get<float>(),
+                       M,
+                       K,
+                       block_size,
+                       dp,
+                       stream);
 }
 
 /**

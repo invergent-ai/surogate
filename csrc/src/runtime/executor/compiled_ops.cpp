@@ -44,9 +44,7 @@
 
 namespace dsl {
 
-namespace {
-
-}  // namespace
+namespace {}  // namespace
 
 // MoE compact weight information (moved out of anonymous namespace for split files)
 MoeCompactInfo build_moe_compact_info(const int* expert_offsets_dev,
@@ -167,9 +165,7 @@ bool refresh_moe_experts_if_needed(int layer_idx,
     return refreshed;
 }
 
-const int* CompiledExecutor::get_or_sync_moe_host_offsets(int layer_idx,
-                                                           const int* device_offsets,
-                                                           int num_experts) {
+const int* CompiledExecutor::get_or_sync_moe_host_offsets(int layer_idx, const int* device_offsets, int num_experts) {
     if (layer_idx < 0 || num_experts <= 0 || !device_offsets) {
         return nullptr;
     }
@@ -347,12 +343,11 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
                                    DslGradStore& grads,
                                    const modules::ModelConfig& config,
                                    const RuntimeOptions& options)
-    : mRunState(run_state)
-    , mWeights(weights)
-    , mGrads(grads)
-    , mConfig(config)
-    , mOptions(options)
-{
+    : mRunState(run_state),
+      mWeights(weights),
+      mGrads(grads),
+      mConfig(config),
+      mOptions(options) {
     // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);
@@ -588,8 +583,8 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     if (base_field == "q_rstd") return &acts.q_rstd;
     if (base_field == "k_rstd") return &acts.k_rstd;
     if (base_field == "lse") return &acts.lse;
-    if (base_field == "ln1" || base_field == "ln1_flat" ||
-        base_field == "ln" || base_field == "ln_flat") return &acts.ln1;
+    if (base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat")
+        return &acts.ln1;
     if (base_field == "ln2" || base_field == "ln2_flat") return &acts.ln2;
     if (base_field == "qkv" || base_field == "qkv_norm") return &acts.qkv;
     if (base_field == "qkv_rope") {
@@ -608,7 +603,6 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     }
     return nullptr;
 }
-
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
     if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
@@ -647,143 +641,28 @@ void CompiledExecutor::handle_layer_end(int layer_idx) {
     }
 }
 
-
-
 // ============================================================================
 // Split-attention CUDA graph support
 // ============================================================================
 
-void CompiledExecutor::dispatch_forward_op(const CompiledOp& op,
-                                            const modules::ForwardHook* hook) {
-    switch (op.type) {
-        case CompiledOpType::Embedding:          dispatch_embedding(op); break;
-        case CompiledOpType::Zeros:              dispatch_zeros(op); break;
-        case CompiledOpType::Ones:               dispatch_ones(op); break;
-        case CompiledOpType::FusedResidualRMSNorm: dispatch_fused_residual_rmsnorm(op); break;
-        case CompiledOpType::RMSNorm:            dispatch_rmsnorm(op); break;
-        case CompiledOpType::LayerNorm:          dispatch_layernorm(op); break;
-        case CompiledOpType::View:               dispatch_view(op); break;
-        case CompiledOpType::Transpose:          dispatch_transpose(op); break;
-        case CompiledOpType::Split:              dispatch_split(op); break;
-        case CompiledOpType::Narrow:             dispatch_narrow(op); break;
-        case CompiledOpType::Concat:             dispatch_concat(op); break;
-        case CompiledOpType::Add:                dispatch_add(op); break;
-        case CompiledOpType::Matmul:
-        case CompiledOpType::MatmulBias:         dispatch_matmul(op, hook); break;
-        case CompiledOpType::BiasAdd:            dispatch_bias_add(op); break;
-        case CompiledOpType::SwiGLU:             dispatch_swiglu(op); break;
-        case CompiledOpType::GptOssMoeAct:       dispatch_gpt_oss_moe_act(op); break;
-        case CompiledOpType::Silu:               dispatch_silu(op); break;
-        case CompiledOpType::Gelu:               dispatch_gelu(op); break;
-        case CompiledOpType::Relu2:              dispatch_relu2(op); break;
-        case CompiledOpType::Mul:                dispatch_mul(op); break;
-        case CompiledOpType::Scale:              dispatch_scale(op); break;
-        case CompiledOpType::MaskScatter:        dispatch_mask_scatter(op); break;
-        case CompiledOpType::DeepstackInject:    dispatch_deepstack_inject(op); break;
-        case CompiledOpType::MatmulSwiGLU:       dispatch_matmul_swiglu(op, hook); break;
-        case CompiledOpType::QKVQKNorm:          dispatch_qkv_qk_norm(op); break;
-        case CompiledOpType::QKVQKNormRoPE:      dispatch_qkv_qk_norm_rope(op); break;
-        case CompiledOpType::MRoPE:              dispatch_mrope(op); break;
-        case CompiledOpType::RoPE:               dispatch_rope(op); break;
-        case CompiledOpType::FlashAttention:     dispatch_flash_attention(op); break;
-        case CompiledOpType::CrossEntropyLoss:   dispatch_cross_entropy_loss(op); break;
-        case CompiledOpType::FusedLMHeadLoss:    dispatch_fused_lm_head_loss(op); break;
-        case CompiledOpType::MoESoftmax:         dispatch_moe_softmax(op); break;
-        case CompiledOpType::MoESigmoid:         dispatch_moe_sigmoid(op); break;
-        case CompiledOpType::MoETopK:            dispatch_moe_topk(op); break;
-        case CompiledOpType::MoEPermute:         dispatch_moe_permute(op); break;
-        case CompiledOpType::MoEGroupedGemm:     dispatch_moe_grouped_gemm(op); break;
-        case CompiledOpType::MoEGroupedGemmGateUp: dispatch_moe_grouped_gemm_gate_up(op); break;
-        case CompiledOpType::MoEGroupedGemmDown: dispatch_moe_grouped_gemm_down(op); break;
-        case CompiledOpType::MoEUnpermute:       dispatch_moe_unpermute(op); break;
-        case CompiledOpType::MoEExpertBiasAdd:   dispatch_moe_expert_bias_add(op); break;
-        case CompiledOpType::EpDispatch:         dispatch_ep_dispatch(op); break;
-        case CompiledOpType::EpCombine:          dispatch_ep_combine(op); break;
-        case CompiledOpType::MambaSplitProj:     dispatch_mamba_split_proj(op); break;
-        case CompiledOpType::MambaConv1d:        dispatch_mamba_conv1d(op); break;
-        case CompiledOpType::MambaSplitConvOut:  dispatch_mamba_split_conv_out(op); break;
-        case CompiledOpType::MambaSsmScan:       dispatch_mamba_ssm_scan(op); break;
-        case CompiledOpType::MambaGatedRMSNorm:  dispatch_mamba_gated_rmsnorm(op); break;
-        case CompiledOpType::MambaOutProj:       dispatch_mamba_out_proj(op, hook); break;
-        case CompiledOpType::ChunkGatedDeltaRule: dispatch_chunk_gated_delta_rule(op); break;
-        case CompiledOpType::Qwen3_5Decay:       dispatch_qwen3_5_decay(op); break;
-        case CompiledOpType::RepeatInterleaveHeads: dispatch_repeat_interleave_heads(op); break;
-        default:
-            throw std::runtime_error("dispatch_forward_op: unsupported op type");
+void CompiledExecutor::dispatch_forward_op(const CompiledOp& op, const modules::ForwardHook* hook) {
+    if (!op.fn) {
+        std::ostringstream oss;
+        oss << "dispatch_forward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
+            << ")";
+        throw std::runtime_error(oss.str());
     }
+    op.fn(*this, op, static_cast<const void*>(hook));
 }
 
-void CompiledExecutor::dispatch_backward_op(const CompiledOp& op,
-                                             const modules::BackwardHook* hook) {
-    switch (op.type) {
-        // Explicit backward ops
-        case CompiledOpType::ViewBackward:         dispatch_view_backward(op); break;
-        case CompiledOpType::AddBackward:          dispatch_add_backward(op); break;
-        case CompiledOpType::MatmulBackward:       dispatch_matmul_backward(op, hook); break;
-        case CompiledOpType::BiasAddBackward:      dispatch_bias_add_backward(op); break;
-        case CompiledOpType::SwiGLUBackward:       dispatch_swiglu_backward(op); break;
-        case CompiledOpType::GptOssMoeActBackward: dispatch_gpt_oss_moe_act_backward(op); break;
-        case CompiledOpType::SiluBackward:         dispatch_silu_backward(op); break;
-        case CompiledOpType::GeluBackward:         dispatch_gelu_backward(op); break;
-        case CompiledOpType::Relu2Backward:        dispatch_relu2_backward(op); break;
-        case CompiledOpType::MulBackward:          dispatch_mul_backward(op); break;
-        case CompiledOpType::ScaleBackward:        dispatch_scale_backward(op); break;
-        case CompiledOpType::NarrowBackward:       dispatch_narrow_backward(op); break;
-        case CompiledOpType::MaskScatterBackward:  dispatch_mask_scatter_backward(op); break;
-        case CompiledOpType::DeepstackInjectBackward: dispatch_deepstack_inject_backward(op); break;
-        case CompiledOpType::MatmulSwiGLUBackward: dispatch_matmul_swiglu_backward(op, hook); break;
-        case CompiledOpType::QKVQKNormBackward:    dispatch_qkv_qk_norm_backward(op); break;
-        case CompiledOpType::RoPEBackward:         dispatch_rope_backward(op); break;
-        case CompiledOpType::QKVQKNormRoPEBackward: dispatch_qkv_qk_norm_rope_backward(op); break;
-        case CompiledOpType::MRoPEBackward:        dispatch_mrope_backward(op); break;
-        case CompiledOpType::FlashAttentionBackward: dispatch_flash_attention_backward(op); break;
-        case CompiledOpType::ZerosBackward:        dispatch_zeros_backward(op); break;
-        case CompiledOpType::FusedResidualRMSNormBackward: dispatch_fused_residual_rmsnorm_backward(op); break;
-        case CompiledOpType::RMSNormBackward:      dispatch_rmsnorm_backward(op); break;
-        case CompiledOpType::LayerNormBackward:    dispatch_layernorm_backward(op); break;
-        case CompiledOpType::EmbeddingBackward:    dispatch_embedding_backward(op); break;
-        case CompiledOpType::CrossEntropyLossBackward: dispatch_cross_entropy_loss_backward(op); break;
-        case CompiledOpType::FusedLMHeadLossBackward: dispatch_fused_lm_head_loss_backward(op); break;
-        // Forward ops that appear in backward graph (autodiff generates these)
-        case CompiledOpType::View:                 dispatch_view_backward(op); break;
-        case CompiledOpType::Transpose:            dispatch_transpose(op); break;
-        case CompiledOpType::Split:                dispatch_split(op); break;
-        case CompiledOpType::Narrow:               dispatch_narrow(op); break;
-        case CompiledOpType::Concat:               dispatch_concat(op); break;
-        case CompiledOpType::Add:                  dispatch_add(op); break;
-        case CompiledOpType::Zeros:                dispatch_zeros_backward(op); break;
-        case CompiledOpType::Ones:                 dispatch_zeros_backward(op); break;
-        // MoE backward operations
-        case CompiledOpType::MoESoftmaxBackward:   dispatch_moe_softmax_backward(op); break;
-        case CompiledOpType::MoESigmoidBackward:   dispatch_moe_sigmoid_backward(op); break;
-        case CompiledOpType::MoETopKBackward:      dispatch_moe_topk_backward(op); break;
-        case CompiledOpType::MoEPermuteBackward:   dispatch_moe_permute_backward(op); break;
-        case CompiledOpType::MoEGroupedGemmBackward: dispatch_moe_grouped_gemm_backward(op); break;
-        case CompiledOpType::MoEGroupedGemmGateUpBackward: dispatch_moe_grouped_gemm_gate_up_backward(op); break;
-        case CompiledOpType::MoEGroupedGemmDownBackward: dispatch_moe_grouped_gemm_down_backward(op); break;
-        case CompiledOpType::MoEUnpermuteBackward: dispatch_moe_unpermute_backward(op); break;
-        case CompiledOpType::MoEExpertBiasAddBackward: dispatch_moe_expert_bias_add_backward(op); break;
-        // Expert Parallelism backward operations
-        case CompiledOpType::EpDispatchBackward:   dispatch_ep_dispatch_backward(op); break;
-        case CompiledOpType::EpCombineBackward:    dispatch_ep_combine_backward(op); break;
-        // Mamba/SSM backward operations
-        case CompiledOpType::MambaSplitProjBackward: dispatch_mamba_split_proj_backward(op); break;
-        case CompiledOpType::MambaConv1dBackward:  dispatch_mamba_conv1d_backward(op); break;
-        case CompiledOpType::MambaSplitConvOutBackward: dispatch_mamba_split_conv_out_backward(op); break;
-        case CompiledOpType::MambaSsmScanBackward: dispatch_mamba_ssm_scan_backward(op); break;
-        case CompiledOpType::MambaGatedRMSNormBackward: dispatch_mamba_gated_rmsnorm_backward(op); break;
-        case CompiledOpType::MambaOutProjBackward: dispatch_mamba_out_proj_backward(op, hook); break;
-        // Qwen3.5 gated delta rule backward
-        case CompiledOpType::ChunkGatedDeltaRuleBackward: dispatch_chunk_gated_delta_rule_backward(op); break;
-        case CompiledOpType::Qwen3_5DecayBackward: dispatch_qwen3_5_decay_backward(op); break;
-        case CompiledOpType::RepeatInterleaveHeadsBackward: dispatch_repeat_interleave_heads_backward(op); break;
-        default: {
-            std::ostringstream oss;
-            oss << "dispatch_backward_op: unsupported op type "
-                << op_type_to_string(op.type) << " (id=" << op.op_id << ")";
-            throw std::runtime_error(oss.str());
-        }
+void CompiledExecutor::dispatch_backward_op(const CompiledOp& op, const modules::BackwardHook* hook) {
+    if (!op.fn) {
+        std::ostringstream oss;
+        oss << "dispatch_backward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
+            << ")";
+        throw std::runtime_error(oss.str());
     }
+    op.fn(*this, op, static_cast<const void*>(hook));
 }
 
 void CompiledExecutor::reset_segment_graphs() {
@@ -805,8 +684,7 @@ void CompiledExecutor::reset_segment_graphs() {
     mSegGraphT = 0;
 }
 
-void CompiledExecutor::resize_segment_graphs(const CompiledGraph& fwd_graph,
-                                              const CompiledGraph& bwd_graph) {
+void CompiledExecutor::resize_segment_graphs(const CompiledGraph& fwd_graph, const CompiledGraph& bwd_graph) {
     auto resize = [](std::vector<std::vector<SegmentGraphExec>>& layers,
                      const std::vector<std::vector<GraphSegment>>& segs) {
         layers.resize(segs.size());

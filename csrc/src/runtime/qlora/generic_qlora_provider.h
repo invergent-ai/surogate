@@ -39,10 +39,9 @@ public:
     /// @param config      Pipeline configuration
     /// @param pt_config   Pretrained model configuration
     /// @param allocator   Tensor allocator
-    GenericQLoRAProvider(
-        DslQLoRAPipelineConfig config,
-        const PretrainedConfig& pt_config,
-        std::shared_ptr<TensorAllocator> allocator);
+    GenericQLoRAProvider(DslQLoRAPipelineConfig config,
+                         const PretrainedConfig& pt_config,
+                         std::shared_ptr<TensorAllocator> allocator);
 
     ~GenericQLoRAProvider() override;
 
@@ -54,9 +53,7 @@ public:
 
     Tensor& resolve_param(std::string_view name, cudaStream_t stream) override;
 
-    void import_and_quantize(const std::string& file_name,
-                             NCCLCommunicator& comm,
-                             cudaStream_t stream) override;
+    void import_and_quantize(const std::string& file_name, NCCLCommunicator& comm, cudaStream_t stream) override;
 
     /// Import externally-owned quantized weights (e.g., from vLLM GPU memory).
     /// Non-quantizable weights (norms, biases) are still loaded from SafeTensors.
@@ -66,9 +63,8 @@ public:
 
     void invalidate_cache() override;
 
-    bool refresh_moe_experts(int layer_idx,
-                             const modules::SelectiveExpertInfo& selection,
-                             cudaStream_t stream) override;
+    bool
+    refresh_moe_experts(int layer_idx, const modules::SelectiveExpertInfo& selection, cudaStream_t stream) override;
 
     void prefetch_for_layer(int layer_idx, cudaStream_t stream) override;
 
@@ -90,8 +86,12 @@ public:
     // Direct access to the underlying weight manager
     // =========================================================================
 
-    GenericWeightManager* weight_manager() { return mWeightMgr.get(); }
-    const GenericWeightManager* weight_manager() const { return mWeightMgr.get(); }
+    GenericWeightManager* weight_manager() {
+        return mWeightMgr.get();
+    }
+    const GenericWeightManager* weight_manager() const {
+        return mWeightMgr.get();
+    }
 
 private:
     /// Build the layer → offload groups mapping from weight names.

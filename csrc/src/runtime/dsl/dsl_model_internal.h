@@ -30,7 +30,11 @@ void record_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream);
 
 // HuggingFace config value type
 struct HfValue {
-    enum class Kind { Int, Float, Bool };
+    enum class Kind {
+        Int,
+        Float,
+        Bool
+    };
     Kind kind;
     long i = 0;
     double f = 0.0;
@@ -77,10 +81,9 @@ std::string format_hf_name(std::string templ, int layer_idx, int expert_idx = -1
 
 // HuggingFace mapping helpers
 DslModel::MappingSpec parse_mapping_spec(const AttrValue& value);
-const DslModel::MappingSpec* find_mapping_spec(
-    const std::unordered_map<std::string, DslModel::MappingSpec>& mapping,
-    const std::string& internal_name,
-    int& layer_idx);
+const DslModel::MappingSpec* find_mapping_spec(const std::unordered_map<std::string, DslModel::MappingSpec>& mapping,
+                                               const std::string& internal_name,
+                                               int& layer_idx);
 
 // Tensor utilities
 Tensor slice_dim0(const Tensor& base, long offset, long length);
@@ -91,18 +94,18 @@ std::vector<long> infer_fuse_slices(const std::string& name, const PretrainedCon
 // QLoRA provider factory (DSL) - creates GenericQLoRAProvider backed by
 // GenericWeightManager. Builds pipeline config from the IR module's forward
 // graph params (shapes, quantizable flags, offload groups) and the HF mapping.
-std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
-    const Module& module,
-    const modules::ModelConfig& model_cfg,
-    const PretrainedConfig& pt_config,
-    const RuntimeOptions& options,
-    const modules::ModularLoRAConfig& lora_cfg,
-    const modules::QLoRAConfig& qlora_cfg,
-    const std::shared_ptr<TensorAllocator>& allocator,
-    const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping,
-    int shard_idx,
-    int num_shards,
-    const std::string& adapter_path = "");
+std::unique_ptr<QLoRAWeightProvider>
+create_dsl_qlora_provider(const Module& module,
+                          const modules::ModelConfig& model_cfg,
+                          const PretrainedConfig& pt_config,
+                          const RuntimeOptions& options,
+                          const modules::ModularLoRAConfig& lora_cfg,
+                          const modules::QLoRAConfig& qlora_cfg,
+                          const std::shared_ptr<TensorAllocator>& allocator,
+                          const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping,
+                          int shard_idx,
+                          int num_shards,
+                          const std::string& adapter_path = "");
 
 }  // namespace internal
 }  // namespace dsl

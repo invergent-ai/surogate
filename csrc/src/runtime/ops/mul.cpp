@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -28,22 +30,22 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
     if (a.nelem() != b.nelem()) {
         // Try to identify broadcast pattern: one tensor has trailing dim 1
         if (a.nelem() > b.nelem()) {
-            big = &a; small = &b;
+            big = &a;
+            small = &b;
         } else {
-            big = &b; small = &a;
+            big = &b;
+            small = &a;
         }
         // Validate: small must broadcast to big
         if (small->nelem() == 1) {
             // Scalar broadcast: out = big * scalar
             broadcast = true;
-        } else if (big->Rank == 2 && small->Rank == 2 &&
-            big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
+        } else if (big->Rank == 2 && small->Rank == 2 && big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
             broadcast = true;
         } else {
-            throw std::runtime_error(
-                "dispatch_mul: shape mismatch and unsupported broadcast pattern"
-                " (a.nelem=" + std::to_string(a.nelem()) +
-                ", b.nelem=" + std::to_string(b.nelem()) + ")");
+            throw std::runtime_error("dispatch_mul: shape mismatch and unsupported broadcast pattern"
+                                     " (a.nelem=" +
+                                     std::to_string(a.nelem()) + ", b.nelem=" + std::to_string(b.nelem()) + ")");
         }
     }
 
@@ -60,14 +62,15 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
         // Standard element-wise multiply
         const long n = static_cast<long>(a.nelem());
         if (a.DType == ETensorDType::BF16) {
-            elementwise_mul(out.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(),
-                            n, mRunState.MainStream);
+            elementwise_mul(out.get<nv_bfloat16>(),
+                            a.get<nv_bfloat16>(),
+                            b.get<nv_bfloat16>(),
+                            n,
+                            mRunState.MainStream);
         } else if (a.DType == ETensorDType::FP16) {
-            elementwise_mul(out.get<half>(), a.get<half>(), b.get<half>(),
-                            n, mRunState.MainStream);
+            elementwise_mul(out.get<half>(), a.get<half>(), b.get<half>(), n, mRunState.MainStream);
         } else if (a.DType == ETensorDType::FP32) {
-            elementwise_mul(out.get<float>(), a.get<float>(), b.get<float>(),
-                            n, mRunState.MainStream);
+            elementwise_mul(out.get<float>(), a.get<float>(), b.get<float>(), n, mRunState.MainStream);
         } else {
             throw std::runtime_error("dispatch_mul: unsupported dtype");
         }
@@ -77,22 +80,31 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
         float scale_val = 0.0f;
         if (small->DType == ETensorDType::BF16) {
             nv_bfloat16 h_val;
-            CUDA_CHECK(cudaMemcpyAsync(&h_val, small->Data, sizeof(nv_bfloat16),
-                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(&h_val,
+                                       small->Data,
+                                       sizeof(nv_bfloat16),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
             CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
             scale_val = static_cast<float>(h_val);
         } else if (small->DType == ETensorDType::FP32) {
-            CUDA_CHECK(cudaMemcpyAsync(&scale_val, small->Data, sizeof(float),
-                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(&scale_val, small->Data, sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
             CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         }
         const long n = static_cast<long>(big->nelem());
         if (big->DType == ETensorDType::BF16) {
-            moe_scale_forward(out.get<nv_bfloat16>(), big->get<nv_bfloat16>(), scale_val,
-                              static_cast<int>(n), mRunState.MainStream);
+            moe_scale_forward(out.get<nv_bfloat16>(),
+                              big->get<nv_bfloat16>(),
+                              scale_val,
+                              static_cast<int>(n),
+                              mRunState.MainStream);
         } else if (big->DType == ETensorDType::FP32) {
-            moe_scale_forward(out.get<float>(), big->get<float>(), scale_val,
-                              static_cast<int>(n), mRunState.MainStream);
+            moe_scale_forward(out.get<float>(),
+                              big->get<float>(),
+                              scale_val,
+                              static_cast<int>(n),
+                              mRunState.MainStream);
         } else {
             throw std::runtime_error("dispatch_mul scalar: unsupported dtype");
         }
@@ -101,14 +113,16 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
         const long N = bigger.Sizes[0];
         const long M = bigger.Sizes[1];
         if (bigger.DType == ETensorDType::BF16) {
-            scale_rows(out.get<nv_bfloat16>(), big->get<nv_bfloat16>(), small->get<nv_bfloat16>(),
-                       N, M, mRunState.MainStream);
+            scale_rows(out.get<nv_bfloat16>(),
+                       big->get<nv_bfloat16>(),
+                       small->get<nv_bfloat16>(),
+                       N,
+                       M,
+                       mRunState.MainStream);
         } else if (bigger.DType == ETensorDType::FP16) {
-            scale_rows(out.get<half>(), big->get<half>(), small->get<half>(),
-                       N, M, mRunState.MainStream);
+            scale_rows(out.get<half>(), big->get<half>(), small->get<half>(), N, M, mRunState.MainStream);
         } else if (bigger.DType == ETensorDType::FP32) {
-            scale_rows(out.get<float>(), big->get<float>(), small->get<float>(),
-                       N, M, mRunState.MainStream);
+            scale_rows(out.get<float>(), big->get<float>(), small->get<float>(), N, M, mRunState.MainStream);
         } else {
             throw std::runtime_error("dispatch_mul broadcast: unsupported dtype");
         }
@@ -142,12 +156,15 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
     Tensor* small = &b;
     int big_input_idx = 0;
     if (a.nelem() != b.nelem()) {
-        if (a.nelem() < b.nelem()) { big = &b; small = &a; big_input_idx = 1; }
+        if (a.nelem() < b.nelem()) {
+            big = &b;
+            small = &a;
+            big_input_idx = 1;
+        }
         if (small->nelem() == 1) {
             broadcast = true;
             scalar_broadcast = true;
-        } else if (big->Rank == 2 && small->Rank == 2 &&
-            big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
+        } else if (big->Rank == 2 && small->Rank == 2 && big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
             broadcast = true;
         } else {
             throw std::runtime_error("dispatch_mul_backward: unsupported broadcast pattern");
@@ -173,8 +190,16 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         Tensor d_b = allocate_like(1, b);
         const long n = static_cast<long>(d_out.nelem());
         if (d_out.DType == ETensorDType::BF16) {
-            elementwise_mul(d_a.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), b.get<nv_bfloat16>(), n, mRunState.MainStream);
-            elementwise_mul(d_b.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(), n, mRunState.MainStream);
+            elementwise_mul(d_a.get<nv_bfloat16>(),
+                            d_out.get<nv_bfloat16>(),
+                            b.get<nv_bfloat16>(),
+                            n,
+                            mRunState.MainStream);
+            elementwise_mul(d_b.get<nv_bfloat16>(),
+                            d_out.get<nv_bfloat16>(),
+                            a.get<nv_bfloat16>(),
+                            n,
+                            mRunState.MainStream);
         } else if (d_out.DType == ETensorDType::FP16) {
             elementwise_mul(d_a.get<half>(), d_out.get<half>(), b.get<half>(), n, mRunState.MainStream);
             elementwise_mul(d_b.get<half>(), d_out.get<half>(), a.get<half>(), n, mRunState.MainStream);
@@ -192,13 +217,16 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         float scale_val = 0.0f;
         if (small->DType == ETensorDType::BF16) {
             nv_bfloat16 h_val;
-            CUDA_CHECK(cudaMemcpyAsync(&h_val, small->Data, sizeof(nv_bfloat16),
-                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(&h_val,
+                                       small->Data,
+                                       sizeof(nv_bfloat16),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
             CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
             scale_val = static_cast<float>(h_val);
         } else if (small->DType == ETensorDType::FP32) {
-            CUDA_CHECK(cudaMemcpyAsync(&scale_val, small->Data, sizeof(float),
-                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(&scale_val, small->Data, sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
             CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         }
         int d_big_idx = big_input_idx;
@@ -207,11 +235,17 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         Tensor d_big = allocate_like(static_cast<std::size_t>(d_big_idx), *big);
         const long n = static_cast<long>(big->nelem());
         if (d_out.DType == ETensorDType::BF16) {
-            moe_scale_forward(d_big.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), scale_val,
-                              static_cast<int>(n), mRunState.MainStream);
+            moe_scale_forward(d_big.get<nv_bfloat16>(),
+                              d_out.get<nv_bfloat16>(),
+                              scale_val,
+                              static_cast<int>(n),
+                              mRunState.MainStream);
         } else if (d_out.DType == ETensorDType::FP32) {
-            moe_scale_forward(d_big.get<float>(), d_out.get<float>(), scale_val,
-                              static_cast<int>(n), mRunState.MainStream);
+            moe_scale_forward(d_big.get<float>(),
+                              d_out.get<float>(),
+                              scale_val,
+                              static_cast<int>(n),
+                              mRunState.MainStream);
         }
         if (op.outputs.size() > static_cast<std::size_t>(d_big_idx) && !op.outputs[d_big_idx].name.empty())
             store_tensor(op.outputs[d_big_idx], d_big);
@@ -237,8 +271,18 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         Tensor d_small = allocate_like(static_cast<std::size_t>(d_small_idx), *small);
 
         if (d_out.DType == ETensorDType::BF16) {
-            scale_rows(d_big.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), small->get<nv_bfloat16>(), N, M, mRunState.MainStream);
-            reduce_row_mul(d_small.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), big->get<nv_bfloat16>(), N, M, mRunState.MainStream);
+            scale_rows(d_big.get<nv_bfloat16>(),
+                       d_out.get<nv_bfloat16>(),
+                       small->get<nv_bfloat16>(),
+                       N,
+                       M,
+                       mRunState.MainStream);
+            reduce_row_mul(d_small.get<nv_bfloat16>(),
+                           d_out.get<nv_bfloat16>(),
+                           big->get<nv_bfloat16>(),
+                           N,
+                           M,
+                           mRunState.MainStream);
         } else if (d_out.DType == ETensorDType::FP16) {
             scale_rows(d_big.get<half>(), d_out.get<half>(), small->get<half>(), N, M, mRunState.MainStream);
             reduce_row_mul(d_small.get<half>(), d_out.get<half>(), big->get<half>(), N, M, mRunState.MainStream);
@@ -256,4 +300,37 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Multiply backward rule
+// Forward: C = A * B (elementwise)
+// Backward: dA = dC * B, dB = dC * A
+// -----------------------------------------------------------------------------
+std::vector<Operation> multiply_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    const std::string& A = fwd.inputs[0];
+    const std::string& B = fwd.inputs[1];
+
+    if (ctx.needs_grad(0) || ctx.needs_grad(1)) {
+        std::string a_ref = ctx.is_param(A) ? A : saved_ref(A);
+        std::string b_ref = ctx.is_param(B) ? B : saved_ref(B);
+        ops.push_back(
+            make_operation("mul_backward_" + std::to_string(ctx.op_counter++),
+                           "mul_backward",
+                           "mul_backward",
+                           {ctx.d_output, a_ref, b_ref},
+                           {ctx.needs_grad(0) ? ctx.d_inputs[0] : "", ctx.needs_grad(1) ? ctx.d_inputs[1] : ""}));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("multiply", ::dsl::multiply_backward);
+REGISTER_AUTODIFF("mul", ::dsl::multiply_backward);

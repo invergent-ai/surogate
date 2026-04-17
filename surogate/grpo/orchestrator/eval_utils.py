@@ -12,6 +12,7 @@ from surogate.grpo.utils.logger import get_logger
 from surogate.grpo.utils.monitor import get_monitor
 from surogate.grpo.utils.utils import capitalize
 
+
 def compute_eval_ckpt_step(
     ckpt_step: int,
     prev_ckpt_step: int,
@@ -36,6 +37,7 @@ def compute_eval_ckpt_step(
         else:
             return highest_interval_step
     return None
+
 
 def get_eval_sampling_args(sampling_config: GRPOEvalSamplingConfig) -> dict[str, Any]:
     """Get sampling args for evaluation."""

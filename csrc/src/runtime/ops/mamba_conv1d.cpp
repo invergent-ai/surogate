@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -60,9 +62,7 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
     }
 
     // Call kernel
-    mamba_causal_conv1d_forward(out_val, x, weight, bias,
-                                 B, T, conv_dim, kernel, silu,
-                                 mRunState.MainStream);
+    mamba_causal_conv1d_forward(out_val, x, weight, bias, B, T, conv_dim, kernel, silu, mRunState.MainStream);
 
     store_tensor(op.outputs[0], out_val);
 }
@@ -86,7 +86,8 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
     mTemps.push_back(dx);
 
     // Weight gradient is accumulated via atomicAdd — must zero-init (stack memory is stale)
-    Tensor dweight_fp32 = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim, kernel}, "mamba_conv1d_backward_dweight_fp32");
+    Tensor dweight_fp32 =
+        mRunState.temp_alloc(ETensorDType::FP32, {conv_dim, kernel}, "mamba_conv1d_backward_dweight_fp32");
     mTemps.push_back(dweight_fp32);
     fill_zero(dweight_fp32, mRunState.MainStream);
 
@@ -100,10 +101,18 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
     }
 
     // Call kernel
-    mamba_causal_conv1d_backward(dx, dweight_fp32, has_dbias ? &dbias_fp32 : nullptr,
-                                  x, weight, d_out,
-                                  B, T, conv_dim, kernel, silu,
-                                  mRunState.MainStream);
+    mamba_causal_conv1d_backward(dx,
+                                 dweight_fp32,
+                                 has_dbias ? &dbias_fp32 : nullptr,
+                                 x,
+                                 weight,
+                                 d_out,
+                                 B,
+                                 T,
+                                 conv_dim,
+                                 kernel,
+                                 silu,
+                                 mRunState.MainStream);
 
     store_tensor(op.outputs[0], dx);
     store_tensor(op.outputs[1], dweight_fp32);
@@ -112,4 +121,45 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Mamba conv1d backward rule
+// Forward: out = mamba_conv1d(x, weight, bias)
+// Backward: dx, dweight, dbias = mamba_conv1d_backward(d_out, x, weight)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_conv1d_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::string x = fwd.inputs[0];
+    std::string weight = fwd.inputs[1];
+    std::string bias = (fwd.inputs.size() > 2) ? fwd.inputs[2] : "";
+
+    std::string x_ref = ctx.is_param(x) ? x : saved_ref(x);
+    std::string weight_ref = ctx.is_param(weight) ? weight : saved_ref(weight);
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    if (fwd.inputs.size() > 2 && ctx.needs_grad(2)) {
+        outputs.push_back(ctx.d_inputs[2]);
+    }
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"activation"}, "mamba_conv1d");
+
+    ops.push_back(make_operation("mamba_conv1d_backward_" + std::to_string(ctx.op_counter++),
+                                 "mamba_conv1d_backward",
+                                 "mamba_conv1d_backward",
+                                 {ctx.d_output, x_ref, weight_ref},
+                                 outputs,
+                                 attrs));
+
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("mamba_conv1d", ::dsl::mamba_conv1d_backward);

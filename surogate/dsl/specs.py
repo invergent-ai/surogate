@@ -6,38 +6,43 @@ and the final IR. They capture all information needed to generate GraphIR.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, TYPE_CHECKING
 from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .tensor_type import TensorAnnotation, ArrayAnnotation
     from .graph_builder import GraphBuilder
+    from .tensor_type import TensorAnnotation
 
 
 class ParamKind(str, Enum):
     """Kind of module parameter."""
-    TENSOR = "tensor"           # Weight tensor [shape]
-    MODULE = "module"           # Submodule instance
-    ARRAY = "array"             # Array of tensors/modules [n] x Type
-    TIED = "tied"               # Tied to another parameter
+
+    TENSOR = "tensor"  # Weight tensor [shape]
+    MODULE = "module"  # Submodule instance
+    ARRAY = "array"  # Array of tensors/modules [n] x Type
+    TIED = "tied"  # Tied to another parameter
 
 
 class ActivationScope(str, Enum):
     """Scope of an activation slot."""
-    BLOCK = "block"             # Per-layer activation (in SimplifiedLayerActivations)
-    GLOBAL = "global"           # Global activation (in NonBlockActivations)
-    GRADIENT = "gradient"       # Per-layer gradient (in SimplifiedLayerGradients)
+
+    BLOCK = "block"  # Per-layer activation (in SimplifiedLayerActivations)
+    GLOBAL = "global"  # Global activation (in NonBlockActivations)
+    GRADIENT = "gradient"  # Per-layer gradient (in SimplifiedLayerGradients)
     GLOBAL_GRADIENT = "global_gradient"  # Global gradient (in NonBlockGradientBuffers)
 
 
 class ActivationMemoryHint(str, Enum):
     """Memory management hints for activation slots."""
-    PERSISTENT = "persistent"   # Keep in memory across forward/backward
-    SAVE = "save"               # Save for backward pass
-    RECOMPUTE = "recompute"     # Can be recomputed in backward
-    TEMPORARY = "temporary"     # Stack-allocated, freed after use
-    SHARED = "shared"           # Shares memory with another slot
+
+    PERSISTENT = "persistent"  # Keep in memory across forward/backward
+    SAVE = "save"  # Save for backward pass
+    RECOMPUTE = "recompute"  # Can be recomputed in backward
+    TEMPORARY = "temporary"  # Stack-allocated, freed after use
+    SHARED = "shared"  # Shares memory with another slot
 
 
 class SharePolicy(str, Enum):
@@ -47,11 +52,12 @@ class SharePolicy(str, Enum):
     to reduce memory usage. The policy determines when sharing is safe based on
     the recompute strategy and training mode (FFT vs LoRA).
     """
-    PER_LAYER = "per_layer"           # Always allocate per-layer (no sharing)
+
+    PER_LAYER = "per_layer"  # Always allocate per-layer (no sharing)
     WHEN_RECOMPUTED = "when_recomputed"  # Share when slot will be recomputed in backward
-    ALWAYS_SHARE = "always_share"     # Always share across layers (use with caution)
-    FFT_SHARE = "fft_share"           # Share only in FFT mode (not LoRA)
-    LORA_SHARE = "lora_share"         # Share only in LoRA mode (not FFT)
+    ALWAYS_SHARE = "always_share"  # Always share across layers (use with caution)
+    FFT_SHARE = "fft_share"  # Share only in FFT mode (not LoRA)
+    LORA_SHARE = "lora_share"  # Share only in LoRA mode (not FFT)
     ALWAYS_RECOMPUTE = "always_recompute"  # Share whenever recompute is enabled
 
 
@@ -182,7 +188,12 @@ class ActivationLayoutSpec:
 
     def get_recompute_list(self) -> list[str]:
         """Get list of slots that can be recomputed in backward."""
-        recompute_policies = {SharePolicy.WHEN_RECOMPUTED, SharePolicy.ALWAYS_RECOMPUTE, SharePolicy.FFT_SHARE, SharePolicy.LORA_SHARE}
+        recompute_policies = {
+            SharePolicy.WHEN_RECOMPUTED,
+            SharePolicy.ALWAYS_RECOMPUTE,
+            SharePolicy.FFT_SHARE,
+            SharePolicy.LORA_SHARE,
+        }
         return [slot.name for slot in self.slots if slot.share_policy in recompute_policies]
 
 
@@ -229,6 +240,7 @@ class ParamSpec:
 @dataclass
 class HFTransformSpec:
     """Specification for HuggingFace weight transformation."""
+
     kind: str  # "fuse", "split", "transform", "tied_to"
     sources: list[str] = field(default_factory=list)
     dim: int = 0
@@ -239,6 +251,7 @@ class HFTransformSpec:
 @dataclass
 class IOSpec:
     """Input/output specification for forward/backward."""
+
     name: str
     tensor_type: TensorAnnotation
     is_optional: bool = False
@@ -279,6 +292,7 @@ class BackwardSpec:
 @dataclass
 class ConstraintSpec:
     """Compile-time constraint specification."""
+
     condition: str  # Expression string: "C % H == 0"
     message: str
 
@@ -286,6 +300,7 @@ class ConstraintSpec:
 @dataclass
 class LetBindingSpec:
     """Let binding specification."""
+
     name: str
     expression: str  # "d_model // num_heads"
 
@@ -293,6 +308,7 @@ class LetBindingSpec:
 @dataclass
 class HFConfigSpec:
     """HuggingFace config mapping specification."""
+
     architecture: str  # "Qwen3ForCausalLM"
     model_type: str | None = None  # "qwen3"
     config_class: str | None = None  # "Qwen3Config"
@@ -303,6 +319,7 @@ class HFConfigSpec:
 @dataclass
 class HFMappingSpec:
     """HuggingFace weight mapping specification."""
+
     mappings: dict[str, str | HFTransformSpec] = field(default_factory=dict)
     # Key: internal param name (can include {layer} placeholder)
     # Value: HF path or transform spec
@@ -386,6 +403,7 @@ class ModelSpec(BaseModuleSpec):
 @dataclass
 class PrimitiveIOSpec:
     """Input/output specification for primitives."""
+
     # Can be named tuple: (A: [M, K], B: [K, N])
     # Or single tensor: [M, N]
     # Or empty: ()

@@ -6,6 +6,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -24,10 +27,11 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     // The compiled graph may have empty shapes for these intermediates, so we
     // allocate directly with the correct dimensions instead of using ensure_output_tensor.
     Tensor permuted = mRunState.temp_alloc(inp.DType,
-        {static_cast<long>(total_tokens), static_cast<long>(hidden_size)}, "moe_permute_out");
+                                           {static_cast<long>(total_tokens), static_cast<long>(hidden_size)},
+                                           "moe_permute_out");
     mTemps.push_back(permuted);
-    Tensor scatter_indices = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(total_tokens)}, "moe_permute_scatter_indices");
+    Tensor scatter_indices =
+        mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(total_tokens)}, "moe_permute_scatter_indices");
     mTemps.push_back(scatter_indices);
     const int num_experts = static_cast<int>(mConfig.NumExperts);
     int layer_idx_any = op.attrs.layer_idx;
@@ -61,12 +65,13 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     // Compute expert counts
     moe_compute_expert_counts(expert_counts.get<int>(),
                               routing_indices.get<int>(),
-                              num_tokens, top_k, num_experts, mRunState.MainStream);
+                              num_tokens,
+                              top_k,
+                              num_experts,
+                              mRunState.MainStream);
 
     // Compute expert offsets (prefix sum)
-    moe_compute_expert_offsets(expert_offsets.get<int>(),
-                               expert_counts.get<int>(),
-                               num_experts, mRunState.MainStream);
+    moe_compute_expert_offsets(expert_offsets.get<int>(), expert_counts.get<int>(), num_experts, mRunState.MainStream);
 
     // Build gather and scatter indices
     moe_build_indices(gather_indices.get<int>(),
@@ -74,7 +79,10 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                       routing_indices.get<int>(),
                       expert_offsets.get<int>(),
                       expert_positions.get<int>(),
-                      num_tokens, top_k, num_experts, mRunState.MainStream);
+                      num_tokens,
+                      top_k,
+                      num_experts,
+                      mRunState.MainStream);
 
     // Cache expert offsets on host for grouped GEMM fast path.
     if (num_experts > 0) {
@@ -98,12 +106,20 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
         moe_permute_tokens(permuted.get<nv_bfloat16>(),
                            inp.get<nv_bfloat16>(),
                            gather_indices.get<int>(),
-                           total_tokens, num_tokens, hidden_size, top_k, mRunState.MainStream);
+                           total_tokens,
+                           num_tokens,
+                           hidden_size,
+                           top_k,
+                           mRunState.MainStream);
     } else {
         moe_permute_tokens(permuted.get<float>(),
                            inp.get<float>(),
                            gather_indices.get<int>(),
-                           total_tokens, num_tokens, hidden_size, top_k, mRunState.MainStream);
+                           total_tokens,
+                           num_tokens,
+                           hidden_size,
+                           top_k,
+                           mRunState.MainStream);
     }
     // Persist per-layer routing buffers for backward (expert_offsets + gather_indices).
     {
@@ -137,8 +153,8 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                     mMoeSavedSizes[key] = bytes;
                 }
                 void* dst_buffer = mMoeSavedBuffers[key];
-                CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             };
             save_buffer("moe_expert_offsets", expert_offsets);
             save_buffer("moe_gather_indices", gather_indices);
@@ -169,8 +185,7 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
     Tensor& d_input = ensure_output_tensor(op.outputs[0]);
 
     Tensor* scatter_indices = nullptr;
-    if (scatter_indices_saved.Data != nullptr &&
-        scatter_indices_saved.DType == ETensorDType::INT32) {
+    if (scatter_indices_saved.Data != nullptr && scatter_indices_saved.DType == ETensorDType::INT32) {
         scatter_indices = &scatter_indices_saved;
     }
 
@@ -221,14 +236,20 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
             moe_permute_backward_from_scatter(d_input.get<nv_bfloat16>(),
                                               d_permuted.get<nv_bfloat16>(),
                                               scatter_indices->get<int>(),
-                                              total_tokens, num_tokens, hidden_size, top_k,
+                                              total_tokens,
+                                              num_tokens,
+                                              hidden_size,
+                                              top_k,
                                               mRunState.MainStream);
         } else {
             fill_zero(d_input, mRunState.MainStream);
             moe_permute_backward(d_input.get<nv_bfloat16>(),
                                  d_permuted.get<nv_bfloat16>(),
                                  gather_indices->get<int>(),
-                                 total_tokens, num_tokens, hidden_size, top_k,
+                                 total_tokens,
+                                 num_tokens,
+                                 hidden_size,
+                                 top_k,
                                  mRunState.MainStream);
         }
     } else {
@@ -236,19 +257,106 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
             moe_permute_backward_from_scatter(d_input.get<float>(),
                                               d_permuted.get<float>(),
                                               scatter_indices->get<int>(),
-                                              total_tokens, num_tokens, hidden_size, top_k,
+                                              total_tokens,
+                                              num_tokens,
+                                              hidden_size,
+                                              top_k,
                                               mRunState.MainStream);
         } else {
             fill_zero(d_input, mRunState.MainStream);
             moe_permute_backward(d_input.get<float>(),
                                  d_permuted.get<float>(),
                                  gather_indices->get<int>(),
-                                 total_tokens, num_tokens, hidden_size, top_k,
+                                 total_tokens,
+                                 num_tokens,
+                                 hidden_size,
+                                 top_k,
                                  mRunState.MainStream);
         }
     }
     store_tensor(op.outputs[0], d_input);
 }
 
+namespace {
 
+// -----------------------------------------------------------------------------
+// MoE Permute backward rule
+// Forward: permuted, scatter_indices = moe_permute(x, routing_indices, top_k)
+// Backward: d_x = moe_permute_backward(d_permuted, scatter_indices)
+// Note: routing_indices is not differentiable
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_permute_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string scatter_indices = fwd.outputs.size() > 1 ? fwd.outputs[1] : "scatter_indices";
+
+        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k"});
+
+        ops.push_back(make_operation("moe_permute_backward_" + std::to_string(ctx.op_counter++),
+                                     "moe_permute_backward",
+                                     "moe_permute_backward",
+                                     {ctx.d_outputs[0], saved_ref(scatter_indices)},
+                                     {ctx.d_inputs[0]},
+                                     attrs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("moe_permute", ::dsl::moe_permute_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// MoE Permute: (permuted, scatter_indices) = moe_permute(x, routing_indices)
+// Input[0]: x [num_tokens, hidden_size]
+// Input[1]: routing_indices [num_tokens, top_k]
+// Output[0]: permuted [num_tokens * top_k, hidden_size]
+// Output[1]: scatter_indices [num_tokens * top_k]
+// ------------------------------------------------------------------------
+const int _moe_permute_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "moe_permute";
+    sig.min_inputs = 2;
+    sig.max_inputs = 2;
+    sig.min_outputs = 2;
+    sig.max_outputs = 2;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap& attrs, const ShapeEnv&) {
+        if (inputs.size() < 2 || outputs.size() < 2) {
+            return std::make_optional(ShapeValidationError{"moe_permute: requires 2 inputs, 2 outputs"});
+        }
+        // Shape validation is complex due to dynamic routing; accept for now
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+const int _moe_permute_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "moe_permute_backward";
+    sig.min_inputs = 2;
+    sig.max_inputs = 2;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

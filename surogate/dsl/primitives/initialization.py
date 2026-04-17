@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
 from ..decorators import primitive
+from ..tensor_type import Tensor
 
 
 @primitive(impl="kernels.zeros")

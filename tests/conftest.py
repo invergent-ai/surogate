@@ -2,15 +2,9 @@ import pytest
 
 
 def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "gpu: tests that require GPU hardware"
-    )
-    config.addinivalue_line(
-        "markers", "multinode: tests that require multiple nodes"
-    )
-    config.addinivalue_line(
-        "markers", "slow: tests that are slow to run"
-    )
+    config.addinivalue_line("markers", "gpu: tests that require GPU hardware")
+    config.addinivalue_line("markers", "multinode: tests that require multiple nodes")
+    config.addinivalue_line("markers", "slow: tests that are slow to run")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -23,9 +17,4 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_addoption(parser):
-    parser.addoption(
-        "--no-gpu",
-        action="store_true",
-        default=False,
-        help="Skip tests that require GPU"
-    )
+    parser.addoption("--no-gpu", action="store_true", default=False, help="Skip tests that require GPU")

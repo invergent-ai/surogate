@@ -23,7 +23,6 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime_api.h>
 
-
 #include "utilities/utils.h"
 #include "kernel_utils.cuh"
 
@@ -41,12 +40,12 @@
  * @param count Number of elements.
  * @return Block-wide sum of squared elements.
  */
-template<class T>
+template <class T>
 __device__ float global_norm_squared_for_range(const T* data, size_t count) {
     size_t index = blockIdx.x * blockDim.x + threadIdx.x;
     size_t grid_width = blockDim.x * gridDim.x;
     float accumulator = 0.f;
-    for(size_t i = index; i < count; i += grid_width) {
+    for (size_t i = index; i < count; i += grid_width) {
         accumulator += (float)data[i] * (float)data[i];
     }
 
@@ -54,7 +53,7 @@ __device__ float global_norm_squared_for_range(const T* data, size_t count) {
     auto warp = cooperative_groups::tiled_partition<32>(block);
     accumulator = reduce_group_add(warp, accumulator);
     __shared__ float shared_accumulator[32];
-    if(warp.thread_rank() == 0) {
+    if (warp.thread_rank() == 0) {
         shared_accumulator[warp.meta_group_rank()] = accumulator;
     }
     __syncthreads();
@@ -79,13 +78,13 @@ __device__ float global_norm_squared_for_range(const T* data, size_t count) {
  * @param[in] data Input array.
  * @param count Number of elements.
  */
-template<class T>
+template <class T>
 __global__ void global_norm_squared_kernel(float* out, const T* data, size_t count) {
     float block_sum = global_norm_squared_for_range(data, count);
     // each block accumulates its partial sum to out[blockIdx]
     // we want to avoid using atomic addition here, so we combine this kernel with another kernel call
     // that sums up the partial block sums
-    if(threadIdx.x == 0) {
+    if (threadIdx.x == 0) {
         out[blockIdx.x] = out[blockIdx.x] + block_sum;
     }
 }
@@ -102,11 +101,11 @@ __global__ void global_norm_squared_kernel(float* out, const T* data, size_t cou
  * @param[in] data Input array.
  * @param count Number of elements to sum.
  */
-template<class floatX>
+template <class floatX>
 __global__ void deterministic_sum_kernel(float* out, const floatX* data, std::size_t count) {
-    assert(gridDim.x == 1);     // only a single block!
+    assert(gridDim.x == 1);  // only a single block!
     float thread_sum = 0;
-    for(size_t index = threadIdx.x; index < count; index += blockDim.x) {
+    for (size_t index = threadIdx.x; index < count; index += blockDim.x) {
         thread_sum += (float)data[index];
     }
 
@@ -114,12 +113,12 @@ __global__ void deterministic_sum_kernel(float* out, const floatX* data, std::si
     auto warp = cooperative_groups::tiled_partition<32>(block);
     float warp_sum = reduce_group_add(warp, thread_sum);
     __shared__ float shared_accumulator[32];
-    if(warp.thread_rank() == 0) {
+    if (warp.thread_rank() == 0) {
         shared_accumulator[warp.meta_group_rank()] = warp_sum;
     }
     __syncthreads();
     // block-level reduce
-    if(warp.meta_group_rank() == 0) {
+    if (warp.meta_group_rank() == 0) {
         float total = warp.thread_rank() < warp.meta_group_size() ? shared_accumulator[warp.thread_rank()] : 0.f;
         total = reduce_group_add(warp, total);
         if (threadIdx.x == 0) {
@@ -151,8 +150,8 @@ __global__ void deterministic_sum_kernel(float* out, const floatX* data, std::si
  * @param valid_token_count Accumulated count of non-masked tokens across all micro-batches.
  * @param total_tokens Unused (kept for API compatibility).
  */
-__global__ void global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_clip,
-                                        const int* valid_token_count, float total_tokens) {
+__global__ void
+global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_clip, const int* valid_token_count, float total_tokens) {
     (void)total_tokens;  // Unused in HuggingFace-style normalization
 
     float n_squared = out[0];
@@ -187,7 +186,6 @@ __global__ void global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_c
     }
 }
 
-
 // ----------------------------------------------------------------------------
 // Prescaled norm kernels (overflow-safe for large BF16 gradients)
 //
@@ -218,7 +216,7 @@ __device__ void atomicMaxFloat(float* addr, float val) {
  *
  * Uses warp/block reduction + atomicMax. Output must be zeroed before first call.
  */
-template<class T>
+template <class T>
 __global__ void global_amax_kernel(float* out, const T* data, size_t count) {
     size_t index = blockIdx.x * blockDim.x + threadIdx.x;
     size_t grid_width = blockDim.x * gridDim.x;
@@ -259,9 +257,9 @@ __global__ void global_amax_kernel(float* out, const T* data, size_t count) {
  * Computes sum((x * prescale)^2) where prescale is read from device memory.
  * Each prescaled element has |value| <= 1.0, preventing FP32 overflow.
  */
-template<class T>
-__global__ void global_norm_squared_prescaled_kernel(float* out, const T* data, size_t count,
-                                                      const float* prescale_device) {
+template <class T>
+__global__ void
+global_norm_squared_prescaled_kernel(float* out, const T* data, size_t count, const float* prescale_device) {
     const float prescale = *prescale_device;
     size_t index = blockIdx.x * blockDim.x + threadIdx.x;
     size_t grid_width = blockDim.x * gridDim.x;
@@ -300,9 +298,12 @@ __global__ void compute_prescale_kernel(float* prescale_out, const float* amax_i
  * The accumulated squared norm was prescaled: sum((x/amax)^2).
  * True norm = amax * sqrt(sum).
  */
-__global__ void global_norm_sqrt_prescaled_kernel(float* out, float* out_cpu, float grad_clip,
-                                                   const int* valid_token_count, float total_tokens,
-                                                   const float* amax_device) {
+__global__ void global_norm_sqrt_prescaled_kernel(float* out,
+                                                  float* out_cpu,
+                                                  float grad_clip,
+                                                  const int* valid_token_count,
+                                                  float total_tokens,
+                                                  const float* amax_device) {
     (void)total_tokens;
 
     float n_squared_prescaled = out[0];
@@ -332,7 +333,6 @@ __global__ void global_norm_sqrt_prescaled_kernel(float* out, float* out_cpu, fl
         *out_cpu = scaled_norm;
     }
 }
-
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -374,7 +374,7 @@ int get_max_num_block_sums(const cudaDeviceProp& dp) {
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-template<typename T>
+template <typename T>
 void global_norm_squared_imp(float* out, const T* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
     // out points to an array of get_max_num_block_sums elements
     const int block_size = 512;
@@ -383,7 +383,7 @@ void global_norm_squared_imp(float* out, const T* values, size_t count, const cu
     // for tiny tensors, using a device-wide grid is a waste of resources.
     const int max_useful_blocks = div_ceil(count, (size_t)block_size);
     const int grid_size = std::min(max_grid_size, max_useful_blocks);
-    assert(grid_size > 0);      // gives a better error than letting the call below fail
+    assert(grid_size > 0);  // gives a better error than letting the call below fail
 
     global_norm_squared_kernel<<<grid_size, block_size, 0, stream>>>(out, values, count);
     CUDA_CHECK(cudaGetLastError());
@@ -411,7 +411,11 @@ void global_norm_squared(float* out, const float* values, size_t count, const cu
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void global_norm_squared(float* out, const nv_bfloat16* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_norm_squared(float* out,
+                         const nv_bfloat16* values,
+                         size_t count,
+                         const cudaDeviceProp& dp,
+                         cudaStream_t stream) {
     global_norm_squared_imp(out, values, count, dp, stream);
 }
 
@@ -427,10 +431,14 @@ void global_norm_squared(float* out, const nv_bfloat16* values, size_t count, co
  * @param dp CUDA device properties (unused but kept for API consistency).
  * @param stream CUDA stream.
  */
-void global_norm_sqrt(float* out, float* out_cpu, float grad_clip,
-                      const int* valid_token_count, float total_tokens,
-                      const cudaDeviceProp& dp, cudaStream_t stream) {
-    global_norm_sqrt_kernel<<<1,  1, 0, stream>>>(out, out_cpu, grad_clip, valid_token_count, total_tokens);
+void global_norm_sqrt(float* out,
+                      float* out_cpu,
+                      float grad_clip,
+                      const int* valid_token_count,
+                      float total_tokens,
+                      const cudaDeviceProp& dp,
+                      cudaStream_t stream) {
+    global_norm_sqrt_kernel<<<1, 1, 0, stream>>>(out, out_cpu, grad_clip, valid_token_count, total_tokens);
 }
 
 /**
@@ -466,7 +474,7 @@ void deterministic_sum(float* out, const nv_bfloat16* values, std::size_t count,
 
 // --- Prescaled norm wrappers ---
 
-template<typename T>
+template <typename T>
 void global_amax_imp(float* out, const T* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
     const int block_size = 512;
     const int max_grid_size = get_max_num_block_sums(dp);
@@ -490,9 +498,13 @@ void compute_prescale(float* prescale_out, const float* amax_in, cudaStream_t st
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename T>
-void global_norm_squared_prescaled_imp(float* out, const T* values, size_t count, const float* prescale_device,
-                                        const cudaDeviceProp& dp, cudaStream_t stream) {
+template <typename T>
+void global_norm_squared_prescaled_imp(float* out,
+                                       const T* values,
+                                       size_t count,
+                                       const float* prescale_device,
+                                       const cudaDeviceProp& dp,
+                                       cudaStream_t stream) {
     const int block_size = 512;
     const int max_grid_size = get_max_num_block_sums(dp);
     const int max_useful_blocks = div_ceil(count, (size_t)block_size);
@@ -502,22 +514,39 @@ void global_norm_squared_prescaled_imp(float* out, const T* values, size_t count
     CUDA_CHECK(cudaGetLastError());
 }
 
-void global_norm_squared_prescaled(float* out, const float* values, size_t count, const float* prescale_device,
-                                    const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_norm_squared_prescaled(float* out,
+                                   const float* values,
+                                   size_t count,
+                                   const float* prescale_device,
+                                   const cudaDeviceProp& dp,
+                                   cudaStream_t stream) {
     global_norm_squared_prescaled_imp(out, values, count, prescale_device, dp, stream);
 }
 
-void global_norm_squared_prescaled(float* out, const nv_bfloat16* values, size_t count, const float* prescale_device,
-                                    const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_norm_squared_prescaled(float* out,
+                                   const nv_bfloat16* values,
+                                   size_t count,
+                                   const float* prescale_device,
+                                   const cudaDeviceProp& dp,
+                                   cudaStream_t stream) {
     global_norm_squared_prescaled_imp(out, values, count, prescale_device, dp, stream);
 }
 
-void global_norm_sqrt_prescaled(float* out, float* out_cpu, float grad_clip,
-                                 const int* valid_token_count, float total_tokens,
-                                 const float* amax_device,
-                                 const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_norm_sqrt_prescaled(float* out,
+                                float* out_cpu,
+                                float grad_clip,
+                                const int* valid_token_count,
+                                float total_tokens,
+                                const float* amax_device,
+                                const cudaDeviceProp& dp,
+                                cudaStream_t stream) {
     (void)dp;
-    global_norm_sqrt_prescaled_kernel<<<1, 1, 0, stream>>>(out, out_cpu, grad_clip, valid_token_count, total_tokens, amax_device);
+    global_norm_sqrt_prescaled_kernel<<<1, 1, 0, stream>>>(out,
+                                                           out_cpu,
+                                                           grad_clip,
+                                                           valid_token_count,
+                                                           total_tokens,
+                                                           amax_device);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -534,14 +563,12 @@ void global_norm_sqrt_prescaled(float* out, float* out_cpu, float grad_clip,
  * Iterates all tensors in a single kernel. Each block processes elements
  * across all tensors via grid-stride loop, then atomicMax to a single output.
  */
-template<int BLOCK_SIZE>
-__global__ void global_amax_multi_tensor_kernel(
-    float* __restrict__ amax_out,
-    const void* const* __restrict__ data_ptrs,
-    const size_t* __restrict__ sizes,
-    const int* __restrict__ dtype_flags,
-    int num_tensors)
-{
+template <int BLOCK_SIZE>
+__global__ void global_amax_multi_tensor_kernel(float* __restrict__ amax_out,
+                                                const void* const* __restrict__ data_ptrs,
+                                                const size_t* __restrict__ sizes,
+                                                const int* __restrict__ dtype_flags,
+                                                int num_tensors) {
     const size_t grid_width = static_cast<size_t>(blockDim.x) * gridDim.x;
     float local_max = 0.f;
 
@@ -595,15 +622,13 @@ __global__ void global_amax_multi_tensor_kernel(
  * sums to out[blockIdx.x]. Downstream deterministic_sum + global_norm_sqrt_prescaled
  * are unchanged.
  */
-template<int BLOCK_SIZE>
-__global__ void global_norm_squared_prescaled_multi_tensor_kernel(
-    float* __restrict__ out,
-    const void* const* __restrict__ data_ptrs,
-    const size_t* __restrict__ sizes,
-    const int* __restrict__ dtype_flags,
-    int num_tensors,
-    const float* __restrict__ prescale_device)
-{
+template <int BLOCK_SIZE>
+__global__ void global_norm_squared_prescaled_multi_tensor_kernel(float* __restrict__ out,
+                                                                  const void* const* __restrict__ data_ptrs,
+                                                                  const size_t* __restrict__ sizes,
+                                                                  const int* __restrict__ dtype_flags,
+                                                                  int num_tensors,
+                                                                  const float* __restrict__ prescale_device) {
     const float prescale = *prescale_device;
     const size_t grid_width = static_cast<size_t>(blockDim.x) * gridDim.x;
     float accumulator = 0.f;
@@ -645,14 +670,12 @@ __global__ void global_norm_squared_prescaled_multi_tensor_kernel(
  *
  * For dense gradient norm computation. Accumulates sum(x^2) across all tensors.
  */
-template<int BLOCK_SIZE>
-__global__ void global_norm_squared_multi_tensor_kernel(
-    float* __restrict__ out,
-    const void* const* __restrict__ data_ptrs,
-    const size_t* __restrict__ sizes,
-    const int* __restrict__ dtype_flags,
-    int num_tensors)
-{
+template <int BLOCK_SIZE>
+__global__ void global_norm_squared_multi_tensor_kernel(float* __restrict__ out,
+                                                        const void* const* __restrict__ data_ptrs,
+                                                        const size_t* __restrict__ sizes,
+                                                        const int* __restrict__ dtype_flags,
+                                                        int num_tensors) {
     const size_t grid_width = static_cast<size_t>(blockDim.x) * gridDim.x;
     float accumulator = 0.f;
 
@@ -688,33 +711,45 @@ __global__ void global_norm_squared_multi_tensor_kernel(
 
 // --- Multi-tensor launchers ---
 
-void global_amax_multi_tensor(float* amax_out, const void* const* data_ptrs,
-                               const size_t* sizes, const int* dtype_flags,
-                               int num_tensors, const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_amax_multi_tensor(float* amax_out,
+                              const void* const* data_ptrs,
+                              const size_t* sizes,
+                              const int* dtype_flags,
+                              int num_tensors,
+                              const cudaDeviceProp& dp,
+                              cudaStream_t stream) {
     if (num_tensors == 0) return;
     const int grid_size = get_max_num_block_sums(dp);
-    global_amax_multi_tensor_kernel<512><<<grid_size, 512, 0, stream>>>(
-        amax_out, data_ptrs, sizes, dtype_flags, num_tensors);
+    global_amax_multi_tensor_kernel<512>
+        <<<grid_size, 512, 0, stream>>>(amax_out, data_ptrs, sizes, dtype_flags, num_tensors);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void global_norm_squared_prescaled_multi_tensor(float* out, const void* const* data_ptrs,
-                                                 const size_t* sizes, const int* dtype_flags,
-                                                 int num_tensors, const float* prescale_device,
-                                                 const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_norm_squared_prescaled_multi_tensor(float* out,
+                                                const void* const* data_ptrs,
+                                                const size_t* sizes,
+                                                const int* dtype_flags,
+                                                int num_tensors,
+                                                const float* prescale_device,
+                                                const cudaDeviceProp& dp,
+                                                cudaStream_t stream) {
     if (num_tensors == 0) return;
     const int grid_size = get_max_num_block_sums(dp);
-    global_norm_squared_prescaled_multi_tensor_kernel<512><<<grid_size, 512, 0, stream>>>(
-        out, data_ptrs, sizes, dtype_flags, num_tensors, prescale_device);
+    global_norm_squared_prescaled_multi_tensor_kernel<512>
+        <<<grid_size, 512, 0, stream>>>(out, data_ptrs, sizes, dtype_flags, num_tensors, prescale_device);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void global_norm_squared_multi_tensor(float* out, const void* const* data_ptrs,
-                                       const size_t* sizes, const int* dtype_flags,
-                                       int num_tensors, const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_norm_squared_multi_tensor(float* out,
+                                      const void* const* data_ptrs,
+                                      const size_t* sizes,
+                                      const int* dtype_flags,
+                                      int num_tensors,
+                                      const cudaDeviceProp& dp,
+                                      cudaStream_t stream) {
     if (num_tensors == 0) return;
     const int grid_size = get_max_num_block_sums(dp);
-    global_norm_squared_multi_tensor_kernel<512><<<grid_size, 512, 0, stream>>>(
-        out, data_ptrs, sizes, dtype_flags, num_tensors);
+    global_norm_squared_multi_tensor_kernel<512>
+        <<<grid_size, 512, 0, stream>>>(out, data_ptrs, sizes, dtype_flags, num_tensors);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -64,11 +64,11 @@ const char* signal_name(int sig) {
     switch (sig) {
         case SIGSEGV: return "SIGSEGV (Segmentation fault)";
         case SIGABRT: return "SIGABRT (Abort)";
-        case SIGFPE:  return "SIGFPE (Floating-point exception)";
-        case SIGILL:  return "SIGILL (Illegal instruction)";
-        case SIGBUS:  return "SIGBUS (Bus error)";
+        case SIGFPE: return "SIGFPE (Floating-point exception)";
+        case SIGILL: return "SIGILL (Illegal instruction)";
+        case SIGBUS: return "SIGBUS (Bus error)";
         case SIGTRAP: return "SIGTRAP (Trap)";
-        default:      return "Unknown signal";
+        default: return "Unknown signal";
     }
 }
 
@@ -100,12 +100,10 @@ void record_for_decode(const char* object, uintptr_t offset) {
 #if BACKWARD_HAS_DW
 // Global dwfl handle for symbol resolution (initialized once)
 static Dwfl* g_dwfl = nullptr;
-static Dwfl_Callbacks g_dwfl_callbacks = {
-    .find_elf = dwfl_linux_proc_find_elf,
-    .find_debuginfo = dwfl_standard_find_debuginfo,
-    .section_address = nullptr,
-    .debuginfo_path = nullptr
-};
+static Dwfl_Callbacks g_dwfl_callbacks = {.find_elf = dwfl_linux_proc_find_elf,
+                                          .find_debuginfo = dwfl_standard_find_debuginfo,
+                                          .section_address = nullptr,
+                                          .debuginfo_path = nullptr};
 
 // Initialize libdw for the current process
 static void init_dwfl() {
@@ -119,8 +117,8 @@ static void init_dwfl() {
 
 // Resolve an address to function name, source file, and line number
 // Returns true if resolved, writes results to output buffers
-static bool resolve_address(void* addr, char* func_out, size_t func_size,
-                           char* file_out, size_t file_size, int* line_out) {
+static bool
+resolve_address(void* addr, char* func_out, size_t func_size, char* file_out, size_t file_size, int* line_out) {
     if (!g_dwfl) init_dwfl();
     if (!g_dwfl) return false;
 
@@ -336,8 +334,8 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
             char func_name[512] = {0};
             char source_file[512] = {0};
             int line_num = 0;
-            bool resolved = resolve_address(addr, func_name, sizeof(func_name),
-                                           source_file, sizeof(source_file), &line_num);
+            bool resolved =
+                resolve_address(addr, func_name, sizeof(func_name), source_file, sizeof(source_file), &line_num);
 
             if (dladdr(addr, &dl_info) && dl_info.dli_fname) {
                 // Show short filename for readability
@@ -423,7 +421,7 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
     _exit(128 + sig);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 void install_crash_handler() {
     bool expected = false;
@@ -479,4 +477,4 @@ void print_stacktrace(int max_frames) {
     printer.print(st, stderr);
 }
 
-} // namespace surogate
+}  // namespace surogate

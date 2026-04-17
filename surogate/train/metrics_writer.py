@@ -2,8 +2,8 @@ import json
 import os
 import time
 
-DEFAULT_METRICS_PATH = '/tmp/surogate_metrics.jsonl'
-ENV_METRICS_PATH = 'SUROGATE_METRICS_PATH'
+DEFAULT_METRICS_PATH = "/tmp/surogate_metrics.jsonl"
+ENV_METRICS_PATH = "SUROGATE_METRICS_PATH"
 
 
 class MetricsWriter:
@@ -22,14 +22,14 @@ class MetricsWriter:
             output_path = os.environ.get(ENV_METRICS_PATH, DEFAULT_METRICS_PATH)
         self._path = output_path
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        self._file = open(self._path, 'a')
+        self._file = open(self._path, "a")
 
     def track(self, step, epoch=None, **metrics):
-        entry = {'step': step, 'ts': time.time()}
+        entry = {"step": step, "ts": time.time()}
         if epoch is not None:
-            entry['epoch'] = epoch
+            entry["epoch"] = epoch
         entry.update(metrics)
-        self._file.write(json.dumps(entry) + '\n')
+        self._file.write(json.dumps(entry) + "\n")
         self._file.flush()
 
     def close(self):

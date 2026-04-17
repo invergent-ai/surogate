@@ -1,4 +1,4 @@
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, Literal, Required, TypedDict, Union
 
 import openai.types.chat
 from openai.types.chat.chat_completion import ChatCompletion, Choice
@@ -14,7 +14,6 @@ from openai.types.chat.chat_completion_message import FunctionCall
 from openai.types.chat.chat_completion_message_tool_call_union_param import ChatCompletionMessageToolCallUnionParam
 from openai.types.chat.chat_completion_system_message_param import ChatCompletionSystemMessageParam
 from openai.types.chat.chat_completion_user_message_param import ChatCompletionUserMessageParam
-from typing_extensions import Literal, Required
 
 
 def monkey_patch_oai_iterable_types():
@@ -28,21 +27,21 @@ def monkey_patch_oai_iterable_types():
     class ModdedChatCompletionDeveloperMessageParam(TypedDict, total=False):
         """Same as openai.types.chat.chat_completion_developer_message_param.ChatCompletionDeveloperMessageParam, but replacing typing.Iterable with list to not mess up Pydantic."""
 
-        content: Required[Union[str, list[ChatCompletionContentPartTextParam]]]
+        content: Required[str | list[ChatCompletionContentPartTextParam]]
         role: Required[Literal["developer"]]
         name: str
 
     class ModdedChatCompletionSystemMessageParam(TypedDict, total=False):
         """Same as openai.types.chat.chat_completion_system_message_param.ChatCompletionSystemMessageParam, but replacing typing.Iterable with list to not mess up Pydantic."""
 
-        content: Required[Union[str, list[ChatCompletionContentPartTextParam]]]
+        content: Required[str | list[ChatCompletionContentPartTextParam]]
         role: Required[Literal["system"]]
         name: str
 
     class ModdedChatCompletionUserMessageParam(TypedDict, total=False):
         """Same as openai.types.chat.chat_completion_user_message_param.ChatCompletionUserMessageParam, but replacing typing.Iterable with list to not mess up Pydantic."""
 
-        content: Required[Union[str, list[ChatCompletionContentPartParam]]]
+        content: Required[str | list[ChatCompletionContentPartParam]]
         role: Required[Literal["user"]]
         name: str
 
@@ -50,17 +49,17 @@ def monkey_patch_oai_iterable_types():
         """Same as openai.types.chat.chat_completion_assistant_message_param.ChatCompletionAssistantMessageParam, but replacing typing.Iterable with list to not mess up Pydantic."""
 
         role: Required[Literal["assistant"]]
-        audio: Optional[Audio]
-        content: Union[str, list[ContentArrayOfContentPart], None]
-        function_call: Optional[FunctionCall]
+        audio: Audio | None
+        content: str | list[ContentArrayOfContentPart] | None
+        function_call: FunctionCall | None
         name: str
-        refusal: Optional[str]
+        refusal: str | None
         tool_calls: list[ChatCompletionMessageToolCallUnionParam]
 
     class ModdedChatCompletionToolMessageParam(TypedDict, total=False):
         """Same as openai.types.chat.chat_completion_tool_message_param.ChatCompletionToolMessageParam, but replacing typing.Iterable with list to not mess up Pydantic."""
 
-        content: Required[Union[str, list[ChatCompletionContentPartTextParam]]]
+        content: Required[str | list[ChatCompletionContentPartTextParam]]
         role: Required[Literal["tool"]]
         tool_call_id: Required[str]
 
@@ -103,7 +102,7 @@ def monkey_patch_chat_completion_logprobs():
     class ChoiceAny(Choice):
         """Same as openai.types.chat.chat_completion.Choice, but without type validation for logprobs field."""
 
-        logprobs: Optional[Any] = None
+        logprobs: Any | None = None
 
     class ModdedChatCompletion(ChatCompletion):
         """Same as openai.types.chat.chat_completion.ChatCompletion, but using ChoiceAny instead of Choice."""

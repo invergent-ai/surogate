@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 
@@ -35,7 +37,8 @@ void CompiledExecutor::dispatch_qwen3_5_decay(const CompiledOp& op) {
     }
 
     Tensor out = ensure_output_tensor(op.outputs[0]);
-    if (out.Rank != 3 || out.Sizes[0] != B || out.Sizes[1] != T || out.Sizes[2] != H || out.DType != ETensorDType::FP32) {
+    if (out.Rank != 3 || out.Sizes[0] != B || out.Sizes[1] != T || out.Sizes[2] != H ||
+        out.DType != ETensorDType::FP32) {
         out = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "qwen3_5_decay_out");
         mTemps.push_back(out);
     }
@@ -142,8 +145,11 @@ void CompiledExecutor::dispatch_qwen3_5_decay_backward(const CompiledOp& op) {
             if (accumulate) {
                 vector_add_sr(dst, dst, src_use, 1.0f, static_cast<long>(dst.nelem()), 0, mRunState.MainStream);
             } else {
-                CUDA_CHECK(cudaMemcpyAsync(dst.Data, src_use.Data, dst.bytes(),
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(dst.Data,
+                                           src_use.Data,
+                                           dst.bytes(),
+                                           cudaMemcpyDeviceToDevice,
+                                           mRunState.MainStream));
             }
         }
         store_tensor(out_ref, dst);
@@ -153,20 +159,17 @@ void CompiledExecutor::dispatch_qwen3_5_decay_backward(const CompiledOp& op) {
     Tensor d_a_log_target = maybe_output(1, {H});
     Tensor d_dt_bias_target = maybe_output(2, {H});
 
-    Tensor d_a = d_a_target.Data && d_a_target.DType == a.DType
-        ? d_a_target
-        : alloc_temp(a.DType, {B, T, H});
+    Tensor d_a = d_a_target.Data && d_a_target.DType == a.DType ? d_a_target : alloc_temp(a.DType, {B, T, H});
 
     Tensor d_a_log = d_a_log_target.Data && d_a_log_target.DType == ETensorDType::FP32
-        ? d_a_log_target
-        : alloc_temp(ETensorDType::FP32, {H});
+                         ? d_a_log_target
+                         : alloc_temp(ETensorDType::FP32, {H});
 
     Tensor d_dt_bias = d_dt_bias_target.Data && d_dt_bias_target.DType == ETensorDType::FP32
-        ? d_dt_bias_target
-        : alloc_temp(ETensorDType::FP32, {H});
+                           ? d_dt_bias_target
+                           : alloc_temp(ETensorDType::FP32, {H});
 
-    qwen3_5_decay_backward(d_a, d_a_log, d_dt_bias,
-                           d_out, a, a_log, dt_bias, mRunState.MainStream);
+    qwen3_5_decay_backward(d_a, d_a_log, d_dt_bias, d_out, a, a_log, dt_bias, mRunState.MainStream);
 
     if (op.outputs.size() > 0 && !op.outputs[0].name.empty()) {
         if (d_a_target.Data && d_a_target.Data == d_a.Data) {
@@ -191,4 +194,42 @@ void CompiledExecutor::dispatch_qwen3_5_decay_backward(const CompiledOp& op) {
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Qwen3.5 decay backward rule
+// Forward: g = qwen3_5_decay(a, A_log, dt_bias)
+// Backward: d_a, d_A_log, d_dt_bias = qwen3_5_decay_backward(d_g, a, A_log, dt_bias)
+// -----------------------------------------------------------------------------
+std::vector<Operation> qwen3_5_decay_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 3) {
+        return ops;
+    }
+    if (!(ctx.needs_grad(0) || ctx.needs_grad(1) || ctx.needs_grad(2))) {
+        return ops;
+    }
+
+    const std::string& a = fwd.inputs[0];
+    const std::string& A_log = fwd.inputs[1];
+    const std::string& dt_bias = fwd.inputs[2];
+    const std::string a_ref = ctx.is_param(a) ? a : saved_ref(a);
+    const std::string a_log_ref = ctx.is_param(A_log) ? A_log : saved_ref(A_log);
+    const std::string dt_bias_ref = ctx.is_param(dt_bias) ? dt_bias : saved_ref(dt_bias);
+
+    ops.push_back(make_operation("qwen3_5_decay_backward_" + std::to_string(ctx.op_counter++),
+                                 "qwen3_5_decay_backward",
+                                 "qwen3_5_decay_backward",
+                                 {ctx.d_output, a_ref, a_log_ref, dt_bias_ref},
+                                 {ctx.needs_grad(0) ? ctx.d_inputs[0] : "",
+                                  ctx.needs_grad(1) ? ctx.d_inputs[1] : "",
+                                  ctx.needs_grad(2) ? ctx.d_inputs[2] : ""}));
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("qwen3_5_decay", ::dsl::qwen3_5_decay_backward_rule);

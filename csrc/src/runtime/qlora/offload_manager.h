@@ -68,9 +68,9 @@ struct GroupStats {
     int group_id = -1;
     GroupState state = GroupState::UNLOADED;
     int num_tensors = 0;
-    size_t total_bytes = 0;      // Total quantized data bytes
-    int64_t last_access_step = 0; // Step counter for LRU
-    int load_count = 0;           // Number of times loaded to GPU
+    size_t total_bytes = 0;        // Total quantized data bytes
+    int64_t last_access_step = 0;  // Step counter for LRU
+    int load_count = 0;            // Number of times loaded to GPU
 };
 
 /// Abstract interface for group-based offloading.
@@ -96,10 +96,7 @@ public:
     /// @param tensor    The quantized tensor to register (stored by pointer)
     /// @param group_id  Group identifier (e.g., expert index, layer index)
     /// @param name      Human-readable name for debugging
-    virtual void register_tensor(
-        QuantizedTensor* tensor,
-        int group_id,
-        const std::string& name = "") = 0;
+    virtual void register_tensor(QuantizedTensor* tensor, int group_id, const std::string& name = "") = 0;
 
     /// Load a group's tensors from CPU to GPU.
     ///
@@ -171,9 +168,8 @@ public:
 /// @param config     Offload configuration
 /// @param allocator  Tensor allocator for GPU/CPU memory
 /// @return           Offload manager instance (never null)
-std::unique_ptr<OffloadManager> create_offload_manager(
-    const OffloadConfig& config,
-    const std::shared_ptr<TensorAllocator>& allocator);
+std::unique_ptr<OffloadManager> create_offload_manager(const OffloadConfig& config,
+                                                       const std::shared_ptr<TensorAllocator>& allocator);
 
 }  // namespace qlora
 

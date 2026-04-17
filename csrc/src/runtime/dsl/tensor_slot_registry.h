@@ -33,19 +33,19 @@ public:
     /// @brief Entry in the slot registry
     struct SlotEntry {
         TensorSlot slot = TensorSlot::Mapped;
-        std::string canonical_name;          ///< Canonical name (if alias)
+        std::string canonical_name;  ///< Canonical name (if alias)
         ActivationScope scope = ActivationScope::Block;
-        std::vector<Dim> shape;              ///< Shape expression
-        std::optional<ETensorDType> dtype;   ///< Override dtype
+        std::vector<Dim> shape;             ///< Shape expression
+        std::optional<ETensorDType> dtype;  ///< Override dtype
         bool save_for_backward = false;
-        bool recompute_in_backward = false;  ///< Can be recomputed instead of saved
-        std::string recompute_policy;        // Derived from share_policy in init_from_layout
+        bool recompute_in_backward = false;                ///< Can be recomputed instead of saved
+        std::string recompute_policy;                      // Derived from share_policy in init_from_layout
         SharePolicy share_policy = SharePolicy::PerLayer;  ///< Cross-layer sharing policy
         ActivationMemoryHint memory_hint = ActivationMemoryHint::Persistent;
-        std::string shares_with;             ///< Slot to share memory with (if hint == Shared)
-        std::string gradient_of;             ///< For gradient slots
-        std::string alias_of;                ///< Optional alias target (reuse existing buffer)
-        std::string condition;               ///< Condition expression
+        std::string shares_with;  ///< Slot to share memory with (if hint == Shared)
+        std::string gradient_of;  ///< For gradient slots
+        std::string alias_of;     ///< Optional alias target (reuse existing buffer)
+        std::string condition;    ///< Condition expression
     };
 
     TensorSlotRegistry() = default;
@@ -71,10 +71,14 @@ public:
     std::string get_canonical_name(const std::string& name) const;
 
     /// @brief Get the save list (tensors to save for backward)
-    const std::vector<std::string>& get_save_list() const { return mSaveList; }
+    const std::vector<std::string>& get_save_list() const {
+        return mSaveList;
+    }
 
     /// @brief Get the recompute list (tensors that can be recomputed in backward)
-    const std::vector<std::string>& get_recompute_list() const { return mRecomputeList; }
+    const std::vector<std::string>& get_recompute_list() const {
+        return mRecomputeList;
+    }
 
     /// @brief Check if a slot can be recomputed in backward
     bool can_recompute(const std::string& name) const;
@@ -117,11 +121,13 @@ public:
     bool should_share(const std::string& name, bool lora_only_mode, bool recompute_enabled) const;
 
     /// @brief Check if the registry has been initialized from a DSL layout
-    bool has_dsl_layout() const { return mHasDslLayout; }
+    bool has_dsl_layout() const {
+        return mHasDslLayout;
+    }
 
     /// @brief Iterate over all registered slots
     /// @param func Callable with signature (const std::string& name, const SlotEntry& entry)
-    template<typename Func>
+    template <typename Func>
     void for_each(Func&& func) const {
         for (const auto& [name, entry] : mRegistry) {
             func(name, entry);

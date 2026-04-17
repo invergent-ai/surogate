@@ -1,18 +1,19 @@
 from pathlib import Path
 
+import datasets
+
 from surogate.core.config.sft_config import SFTConfig
 from surogate.train.tokenize import TokenizeDatasets
+from surogate.train.trainer import SurogateTrainerWrapper
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
-from surogate.train.trainer import SurogateTrainerWrapper
-import datasets
 
 datasets.logging.set_verbosity_warning()
 
 logger = get_logger()
 
-class SurogateSFT(TokenizeDatasets):
 
+class SurogateSFT(TokenizeDatasets):
     def __init__(self, config: SFTConfig, args: DictDefault):
         super().__init__(config=config, args=args)
 
@@ -86,11 +87,7 @@ class SurogateSFT(TokenizeDatasets):
         max_attempts = 10
         res = None
 
-        trainer = SurogateTrainerWrapper(
-            config=self.config,
-            train_files=train_files,
-            eval_files=eval_files
-        )
+        trainer = SurogateTrainerWrapper(config=self.config, train_files=train_files, eval_files=eval_files)
 
         while self.config.per_device_train_batch_size >= min_batch_size and attempt < max_attempts:
             attempt += 1
@@ -102,11 +99,13 @@ class SurogateSFT(TokenizeDatasets):
             except RuntimeError as e:
                 error_msg = str(e).lower()
                 is_oom = any(
-                    x in error_msg for x in ["out of memory", "oom", "cuda out of memory", "mps out of memory"])
+                    x in error_msg for x in ["out of memory", "oom", "cuda out of memory", "mps out of memory"]
+                )
                 if is_oom:
                     logger.warning(f"Out of memory error encountered during training attempt {attempt}.")
 
                     import gc
+
                     gc.collect()
 
                     current_batch = self.config.per_device_train_batch_size
@@ -125,16 +124,18 @@ class SurogateSFT(TokenizeDatasets):
                     self.config.per_device_train_batch_size = new_batch_size
                     self.config.gradient_accumulation_steps = new_grad_accum
 
-                    logger.info(f"Adjusting training configuration to recover from OOM:")
+                    logger.info("Adjusting training configuration to recover from OOM:")
                     logger.metric("New batch size", f"{current_batch} → {new_batch_size}")
                     logger.metric("New gradient accumulation", f"{current_grad_accum} → {new_grad_accum}")
-                    logger.metric("New effective batch size",
-                                    f"{current_batch * current_grad_accum} → {new_batch_size * new_grad_accum}")
+                    logger.metric(
+                        "New effective batch size",
+                        f"{current_batch * current_grad_accum} → {new_batch_size * new_grad_accum}",
+                    )
 
                     trainer = SurogateTrainerWrapper(
-                            config=self.config,
-                            train_files=train_files,
-                            eval_files=eval_files,
+                        config=self.config,
+                        train_files=train_files,
+                        eval_files=eval_files,
                     )
                 else:
                     raise
@@ -150,11 +151,12 @@ class SurogateSFT(TokenizeDatasets):
             logger.info("Training completed with adjusted batch size and/or gradient accumulation steps:")
             logger.metric("Batch size", f"{original_batch_size} → {final_batch}")
             logger.metric("Gradient accumulation", f"{original_grad_accum} → {final_grad_accum}")
-            logger.metric("Effective batch size",
-                          f"{original_batch_size * original_grad_accum} → {final_batch * final_grad_accum}")
+            logger.metric(
+                "Effective batch size",
+                f"{original_batch_size * original_grad_accum} → {final_batch * final_grad_accum}",
+            )
 
         return res
-
 
 
 def sft_main(config: SFTConfig, args: DictDefault):

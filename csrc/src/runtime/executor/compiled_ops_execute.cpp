@@ -52,24 +52,26 @@ namespace dsl {
 // regenerate activations. The data lives on the stack; the caller (backward)
 // must restore the stack checkpoint after consuming the data.
 // ---------------------------------------------------------------------------
-void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
+void CompiledExecutor::replay_layer_forward(int layer_idx,
+                                            long B,
+                                            long T,
                                             const CompiledGraph& fwd_graph,
                                             const modules::ForwardHook* hook) {
     static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
-        std::transform(h.begin(), h.end(), h.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        std::transform(n.begin(), n.end(), n.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         return h.find(n) != std::string::npos;
     };
     const bool is_qwen3_5_model =
-        contains_ci(mConfig.ModelTypeName, "qwen3_5") ||
-        contains_ci(mConfig.ModelTypeName, "qwen3.5") ||
-        contains_ci(mConfig.ArchitectureName, "qwen3_5") ||
-        contains_ci(mConfig.ArchitectureName, "qwen3.5");
+        contains_ci(mConfig.ModelTypeName, "qwen3_5") || contains_ci(mConfig.ModelTypeName, "qwen3.5") ||
+        contains_ci(mConfig.ArchitectureName, "qwen3_5") || contains_ci(mConfig.ArchitectureName, "qwen3.5");
     if (debug_replay) {
         fprintf(stderr, "[REPLAY] replay_layer_forward layer=%d B=%ld T=%ld\n", layer_idx, B, T);
     }
@@ -123,8 +125,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     auto replay_temp_mark = mTemps.size();
 
     // Find the op range for this layer
-    if (layer_idx < 0 ||
-        static_cast<std::size_t>(layer_idx) >= fwd_graph.layer_start_indices.size() ||
+    if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= fwd_graph.layer_start_indices.size() ||
         fwd_graph.layer_start_indices[static_cast<std::size_t>(layer_idx)] == SIZE_MAX) {
         // Layer not found in forward graph — restore state and return
         mTensors.swap(saved_tensors);
@@ -159,26 +160,16 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
             // Already bound?
             if (static_cast<std::size_t>(inp.tensor_id) < mTensors.size() && mTensors[inp.tensor_id].Data) continue;
 
-
             // Try to resolve from known sources
             Tensor resolved{};
 
             // Check slot type first
             switch (inp.slot) {
-                case TensorSlot::FreqCis:
-                    resolved = mRunState.non_block_activations().freq_cis;
-                    break;
-                case TensorSlot::Encoded:
-                    resolved = mRunState.non_block_activations().encoded;
-                    break;
-                case TensorSlot::TokenIDs:
-                    resolved = mRunState.Inputs;
-                    break;
-                case TensorSlot::PositionIDs:
-                    resolved = mRunState.PositionIDs;
-                    break;
-                default:
-                    break;
+                case TensorSlot::FreqCis: resolved = mRunState.non_block_activations().freq_cis; break;
+                case TensorSlot::Encoded: resolved = mRunState.non_block_activations().encoded; break;
+                case TensorSlot::TokenIDs: resolved = mRunState.Inputs; break;
+                case TensorSlot::PositionIDs: resolved = mRunState.PositionIDs; break;
+                default: break;
             }
 
             // If not resolved by slot, try by name
@@ -191,9 +182,12 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                         resolved = mRunState.get_residual(lyr, mRunState.MainStream);
                     } else {
                         auto& acts = mRunState.simplified_acts(lyr);
-                        if (base == "mlp_down" || base == "mlp_down_flat") resolved = acts.mlp_down;
-                        else if (base == "res_att" || base == "residual_att") resolved = acts.residual_att;
-                        else if (base == "att_out" || base == "att_out_flat") resolved = acts.att_out;
+                        if (base == "mlp_down" || base == "mlp_down_flat")
+                            resolved = acts.mlp_down;
+                        else if (base == "res_att" || base == "residual_att")
+                            resolved = acts.residual_att;
+                        else if (base == "att_out" || base == "att_out_flat")
+                            resolved = acts.att_out;
                     }
                 } else {
                     // Global tensors by name
@@ -216,20 +210,31 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                                 resolved = mRunState.get_residual(cross_lyr, mRunState.MainStream);
                             } else {
                                 auto& acts = mRunState.simplified_acts(cross_lyr);
-                                if (cross_field == "out" || cross_field == "out_flat" ||
-                                    cross_field == "mlp_down" || cross_field == "mlp_down_flat") resolved = acts.mlp_down;
-                                else if (cross_field == "res_att" || cross_field == "residual_att") resolved = acts.residual_att;
-                                else if (cross_field == "att_out" || cross_field == "att_out_flat") resolved = acts.att_out;
-                                else if (cross_field == "ln1" || cross_field == "ln1_flat" ||
-                                         cross_field == "ln" || cross_field == "ln_flat") resolved = acts.ln1;
-                                else if (cross_field == "ln2" || cross_field == "ln2_flat") resolved = acts.ln2;
-                                else if (cross_field == "qkv" || cross_field == "qkv_norm") resolved = acts.qkv;
-                                else if (cross_field == "qkv_rope") resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                                else if (cross_field == "att" || cross_field == "att_flat") resolved = acts.att;
-                                else if (cross_field == "mlp_up" || cross_field == "mlp_up_flat") resolved = acts.mlp_up;
-                                else if (cross_field == "swiglu") resolved = acts.swiglu;
+                                if (cross_field == "out" || cross_field == "out_flat" || cross_field == "mlp_down" ||
+                                    cross_field == "mlp_down_flat")
+                                    resolved = acts.mlp_down;
+                                else if (cross_field == "res_att" || cross_field == "residual_att")
+                                    resolved = acts.residual_att;
+                                else if (cross_field == "att_out" || cross_field == "att_out_flat")
+                                    resolved = acts.att_out;
+                                else if (cross_field == "ln1" || cross_field == "ln1_flat" || cross_field == "ln" ||
+                                         cross_field == "ln_flat")
+                                    resolved = acts.ln1;
+                                else if (cross_field == "ln2" || cross_field == "ln2_flat")
+                                    resolved = acts.ln2;
+                                else if (cross_field == "qkv" || cross_field == "qkv_norm")
+                                    resolved = acts.qkv;
+                                else if (cross_field == "qkv_rope")
+                                    resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
+                                else if (cross_field == "att" || cross_field == "att_flat")
+                                    resolved = acts.att;
+                                else if (cross_field == "mlp_up" || cross_field == "mlp_up_flat")
+                                    resolved = acts.mlp_up;
+                                else if (cross_field == "swiglu")
+                                    resolved = acts.swiglu;
                             }
-                        } catch (...) {}
+                        } catch (...) {
+                        }
                     }
                 }
             }
@@ -285,8 +290,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         const auto& op = fwd_graph.ops[idx];
 
         // Skip loss ops — these should never be replayed
-        if (op.type == CompiledOpType::CrossEntropyLoss ||
-            op.type == CompiledOpType::FusedLMHeadLoss) {
+        if (op.type == CompiledOpType::CrossEntropyLoss || op.type == CompiledOpType::FusedLMHeadLoss) {
             continue;
         }
 
@@ -302,68 +306,17 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
 
         try {
-            switch (op.type) {
-                case CompiledOpType::Embedding:           dispatch_embedding(op); break;
-                case CompiledOpType::Zeros:               dispatch_zeros(op); break;
-                case CompiledOpType::Ones:                dispatch_ones(op); break;
-                case CompiledOpType::FusedResidualRMSNorm: dispatch_fused_residual_rmsnorm(op); break;
-                case CompiledOpType::RMSNorm:            dispatch_rmsnorm(op); break;
-                case CompiledOpType::LayerNorm:           dispatch_layernorm(op); break;
-                case CompiledOpType::View:                dispatch_view(op); break;
-                case CompiledOpType::Transpose:           dispatch_transpose(op); break;
-                case CompiledOpType::Split:               dispatch_split(op); break;
-                case CompiledOpType::Narrow:              dispatch_narrow(op); break;
-                case CompiledOpType::Concat:              dispatch_concat(op); break;
-                case CompiledOpType::Add:                 dispatch_add(op); break;
-                case CompiledOpType::Matmul:
-                case CompiledOpType::MatmulBias:          dispatch_matmul(op, hook); break;
-                case CompiledOpType::BiasAdd:             dispatch_bias_add(op); break;
-                case CompiledOpType::SwiGLU:              dispatch_swiglu(op); break;
-                case CompiledOpType::GptOssMoeAct:        dispatch_gpt_oss_moe_act(op); break;
-                case CompiledOpType::Silu:                dispatch_silu(op); break;
-                case CompiledOpType::Gelu:                dispatch_gelu(op); break;
-                case CompiledOpType::Relu2:               dispatch_relu2(op); break;
-                case CompiledOpType::Mul:                 dispatch_mul(op); break;
-                case CompiledOpType::Scale:               dispatch_scale(op); break;
-                case CompiledOpType::MaskScatter:         dispatch_mask_scatter(op); break;
-                case CompiledOpType::DeepstackInject:     dispatch_deepstack_inject(op); break;
-                case CompiledOpType::MatmulSwiGLU:        dispatch_matmul_swiglu(op, hook); break;
-                case CompiledOpType::QKVQKNorm:           dispatch_qkv_qk_norm(op); break;
-                case CompiledOpType::QKVQKNormRoPE:       dispatch_qkv_qk_norm_rope(op); break;
-                case CompiledOpType::MRoPE:               dispatch_mrope(op); break;
-                case CompiledOpType::RoPE:                dispatch_rope(op); break;
-                case CompiledOpType::FlashAttention:       dispatch_flash_attention(op); break;
-                // MoE operations
-                case CompiledOpType::MoESoftmax:          dispatch_moe_softmax(op); break;
-                case CompiledOpType::MoESigmoid:          dispatch_moe_sigmoid(op); break;
-                case CompiledOpType::MoETopK:             dispatch_moe_topk(op); break;
-                case CompiledOpType::MoEPermute:          dispatch_moe_permute(op); break;
-                case CompiledOpType::MoEGroupedGemm:      dispatch_moe_grouped_gemm(op); break;
-                case CompiledOpType::MoEGroupedGemmGateUp: dispatch_moe_grouped_gemm_gate_up(op); break;
-                case CompiledOpType::MoEGroupedGemmDown:  dispatch_moe_grouped_gemm_down(op); break;
-                case CompiledOpType::MoEUnpermute:        dispatch_moe_unpermute(op); break;
-                case CompiledOpType::MoEExpertBiasAdd:    dispatch_moe_expert_bias_add(op); break;
-                // EP operations
-                case CompiledOpType::EpDispatch:          dispatch_ep_dispatch(op); break;
-                case CompiledOpType::EpCombine:           dispatch_ep_combine(op); break;
-                // Mamba/SSM operations
-                case CompiledOpType::MambaSplitProj:      dispatch_mamba_split_proj(op); break;
-                case CompiledOpType::MambaConv1d:         dispatch_mamba_conv1d(op); break;
-                case CompiledOpType::MambaSplitConvOut:   dispatch_mamba_split_conv_out(op); break;
-                case CompiledOpType::MambaSsmScan:        dispatch_mamba_ssm_scan(op); break;
-                case CompiledOpType::MambaGatedRMSNorm:   dispatch_mamba_gated_rmsnorm(op); break;
-                case CompiledOpType::MambaOutProj:        dispatch_mamba_out_proj(op, hook); break;
-                // Qwen3.5 gated delta rule
-                case CompiledOpType::ChunkGatedDeltaRule: dispatch_chunk_gated_delta_rule(op); break;
-                case CompiledOpType::Qwen3_5Decay:        dispatch_qwen3_5_decay(op); break;
-                case CompiledOpType::RepeatInterleaveHeads: dispatch_repeat_interleave_heads(op); break;
-                default: break;  // Skip unknown ops
+            // Dispatch via the function pointer baked into op.fn at graph
+            // compile time. Null fn means "no handler for this op in the
+            // forward direction" — silently skip, preserving the old
+            // replay_layer_forward `default: break` semantics.
+            if (op.fn) {
+                op.fn(*this, op, static_cast<const void*>(hook));
             }
         } catch (const std::exception& e) {
             std::ostringstream oss;
-            oss << "replay_layer_forward layer=" << layer_idx
-                << " op=" << (idx - start) << " (type=" << op_type_to_string(op.type)
-                << "): " << e.what();
+            oss << "replay_layer_forward layer=" << layer_idx << " op=" << (idx - start)
+                << " (type=" << op_type_to_string(op.type) << "): " << e.what();
             throw std::runtime_error(oss.str());
         }
     }
@@ -382,8 +335,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 return false;
             }
             const std::string base = strip_ssa_suffix(saved_field);
-            return base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat" ||
-                   base == "ln1_rstd" || base == "ln_rstd";
+            return base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat" || base == "ln1_rstd" ||
+                   base == "ln_rstd";
         };
         for (const auto& name : *mSaveList) {
             {
@@ -421,21 +374,36 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 const std::string base = strip_ssa_suffix(field);
                 auto& acts = mRunState.simplified_acts(lyr);
                 Tensor resolved{};
-                if (base == "ln1_rstd" || base == "ln_rstd") resolved = acts.ln1_rstd;
-                else if (base == "ln2_rstd") resolved = acts.ln2_rstd;
-                else if (base == "q_rstd") resolved = acts.q_rstd;
-                else if (base == "k_rstd") resolved = acts.k_rstd;
-                else if (base == "lse") resolved = acts.lse;
-                else if (base == "att" || base == "att_flat") resolved = acts.att;
-                else if (base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat") resolved = acts.ln1;
-                else if (base == "ln2" || base == "ln2_flat") resolved = acts.ln2;
-                else if (base == "qkv" || base == "qkv_norm") resolved = acts.qkv;
-                else if (base == "qkv_rope") resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                else if (base == "att_out" || base == "att_out_flat") resolved = acts.att_out;
-                else if (base == "mlp_up" || base == "mlp_up_flat") resolved = acts.mlp_up;
-                else if (base == "swiglu") resolved = acts.swiglu;
-                else if (base == "mlp_down" || base == "mlp_down_flat") resolved = acts.mlp_down;
-                else if (base == "res_att" || base == "residual_att") resolved = acts.residual_att;
+                if (base == "ln1_rstd" || base == "ln_rstd")
+                    resolved = acts.ln1_rstd;
+                else if (base == "ln2_rstd")
+                    resolved = acts.ln2_rstd;
+                else if (base == "q_rstd")
+                    resolved = acts.q_rstd;
+                else if (base == "k_rstd")
+                    resolved = acts.k_rstd;
+                else if (base == "lse")
+                    resolved = acts.lse;
+                else if (base == "att" || base == "att_flat")
+                    resolved = acts.att;
+                else if (base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat")
+                    resolved = acts.ln1;
+                else if (base == "ln2" || base == "ln2_flat")
+                    resolved = acts.ln2;
+                else if (base == "qkv" || base == "qkv_norm")
+                    resolved = acts.qkv;
+                else if (base == "qkv_rope")
+                    resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
+                else if (base == "att_out" || base == "att_out_flat")
+                    resolved = acts.att_out;
+                else if (base == "mlp_up" || base == "mlp_up_flat")
+                    resolved = acts.mlp_up;
+                else if (base == "swiglu")
+                    resolved = acts.swiglu;
+                else if (base == "mlp_down" || base == "mlp_down_flat")
+                    resolved = acts.mlp_down;
+                else if (base == "res_att" || base == "residual_att")
+                    resolved = acts.residual_att;
                 else if (base == "res_ffn" || base == "residual_ffn" || base == "res_in") {
                     resolved = mRunState.get_residual(lyr, mRunState.MainStream);
                 }
@@ -465,8 +433,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
 
             auto requires_persist = [&](const std::string& lookup_name) -> bool {
                 if (auto entry = mSlotRegistry->lookup(lookup_name)) {
-                    return entry->slot == TensorSlot::Mapped ||
-                           entry->memory_hint == ActivationMemoryHint::Shared;
+                    return entry->slot == TensorSlot::Mapped || entry->memory_hint == ActivationMemoryHint::Shared;
                 }
                 return false;
             };
@@ -517,8 +484,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
             if (bytes == 0) continue;
             void* persistent = nullptr;
             CUDA_CHECK(cudaMallocAsync(&persistent, bytes, mRunState.MainStream));
-            CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, bytes,
-                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             tensor.Data = static_cast<std::byte*>(persistent);
             mReplayCopiedBuffers.push_back(persistent);
         }
@@ -535,7 +501,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         int null_count = 0, live_count = 0;
         for (const auto& [sname, stensor] : *mSaved) {
-            int lyr = -1; std::string fld;
+            int lyr = -1;
+            std::string fld;
             if (parse_block_param(sname, lyr, fld) && lyr == layer_idx) {
                 if (stensor.Data) {
                     live_count++;
@@ -545,7 +512,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 }
             }
         }
-        if (debug_replay) fprintf(stderr, "[REPLAY] layer=%d saved stats: live=%d null=%d\n", layer_idx, live_count, null_count);
+        if (debug_replay)
+            fprintf(stderr, "[REPLAY] layer=%d saved stats: live=%d null=%d\n", layer_idx, live_count, null_count);
     }
 }
 
@@ -564,9 +532,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // whole-step captures like train_step_graphed that don't set mCapturing).
     cudaStreamCaptureStatus cleanup_capture_status = cudaStreamCaptureStatusNone;
     const bool cleanup_capturing =
-        mCapturing ||
-        (cudaStreamIsCapturing(mRunState.MainStream, &cleanup_capture_status) == cudaSuccess &&
-         cleanup_capture_status != cudaStreamCaptureStatusNone);
+        mCapturing || (cudaStreamIsCapturing(mRunState.MainStream, &cleanup_capture_status) == cudaSuccess &&
+                       cleanup_capture_status != cudaStreamCaptureStatusNone);
     if (!cleanup_capturing) {
         // Free retired shared EP buffers from previous steps (accumulated during reallocation).
         // Previous step is fully complete, so these are no longer referenced.
@@ -605,8 +572,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     if (full) {
         bool has_loss_op = false;
         for (const auto& op : graph.ops) {
-            if (op.type == CompiledOpType::CrossEntropyLoss ||
-                op.type == CompiledOpType::FusedLMHeadLoss) {
+            if (op.type == CompiledOpType::CrossEntropyLoss || op.type == CompiledOpType::FusedLMHeadLoss) {
                 has_loss_op = true;
                 break;
             }
@@ -666,9 +632,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // or by an outer full-step graph from train_step_graphed in py_train.cpp).
     cudaStreamCaptureStatus fwd_capture_status = cudaStreamCaptureStatusNone;
     const bool fwd_stream_capturing =
-        mCapturing ||
-        (cudaStreamIsCapturing(mRunState.MainStream, &fwd_capture_status) == cudaSuccess &&
-         fwd_capture_status != cudaStreamCaptureStatusNone);
+        mCapturing || (cudaStreamIsCapturing(mRunState.MainStream, &fwd_capture_status) == cudaSuccess &&
+                       fwd_capture_status != cudaStreamCaptureStatusNone);
 
     // Check if a tensor will be recomputed in backward (same logic as save_tensors).
     const bool recompute_enabled_flag = mRecomputeEnabled;
@@ -698,17 +663,18 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     auto contains_ci_local = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
-        std::transform(h.begin(), h.end(), h.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        std::transform(n.begin(), n.end(), n.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         return h.find(n) != std::string::npos;
     };
-    const bool is_qwen3_5_forward_replay_model =
-        contains_ci_local(mConfig.ModelTypeName, "qwen3_5") ||
-        contains_ci_local(mConfig.ModelTypeName, "qwen3.5") ||
-        contains_ci_local(mConfig.ArchitectureName, "qwen3_5") ||
-        contains_ci_local(mConfig.ArchitectureName, "qwen3.5");
+    const bool is_qwen3_5_forward_replay_model = contains_ci_local(mConfig.ModelTypeName, "qwen3_5") ||
+                                                 contains_ci_local(mConfig.ModelTypeName, "qwen3.5") ||
+                                                 contains_ci_local(mConfig.ArchitectureName, "qwen3_5") ||
+                                                 contains_ci_local(mConfig.ArchitectureName, "qwen3.5");
 
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
@@ -725,8 +691,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 return false;
             }
             const std::string base_field = strip_ssa_suffix(field);
-            return base_field == "ln1" || base_field == "ln1_flat" ||
-                   base_field == "ln" || base_field == "ln_flat" ||
+            return base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat" ||
                    base_field == "ln1_rstd" || base_field == "ln_rstd";
         };
 
@@ -752,8 +717,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 mMoeSavedSizes[name] = bytes;
             }
             void* dst_buffer = mMoeSavedBuffers[name];
-            CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
-                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor = src;
             saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
             (*mSaved)[name] = saved_tensor;
@@ -790,8 +754,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (base_field == "q_rstd") return acts.q_rstd;
             if (base_field == "k_rstd") return acts.k_rstd;
             if (base_field == "lse") return acts.lse;
-            if (base_field == "ln1" || base_field == "ln1_flat" ||
-                base_field == "ln" || base_field == "ln_flat") return acts.ln1;
+            if (base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat")
+                return acts.ln1;
             if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
             if (base_field == "qkv" || base_field == "qkv_norm") return acts.qkv;
             if (base_field == "qkv_rope") {
@@ -838,7 +802,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             return;
         }
-        
+
         int saved_count = 0;
         int recompute_count = 0;
         for (const auto& name : *mSaveList) {
@@ -890,8 +854,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 mMoeSavedSizes[name] = bytes;
             }
             void* dst_buffer = mMoeSavedBuffers[name];
-            CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes,
-                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor = src;
             saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
             (*mSaved)[name] = saved_tensor;
@@ -999,11 +962,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 }
             }
         }
-        std::cerr << "[WATCH_META] tensor='" << watch_tensor_name
-                  << "' tensor_id=" << watch_tensor_id
-                  << " input_refs=" << watch_input_refs
-                  << " output_refs=" << watch_output_refs
-                  << std::endl;
+        std::cerr << "[WATCH_META] tensor='" << watch_tensor_name << "' tensor_id=" << watch_tensor_id
+                  << " input_refs=" << watch_input_refs << " output_refs=" << watch_output_refs << std::endl;
     }
     auto try_bind_watch_tensor_id_from_ref = [&](const TensorRef& ref) {
         if (watch_tensor_id >= 0) {
@@ -1032,8 +992,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 try_bind_watch_tensor_id_from_ref(ref);
             }
         }
-        if (watch_tensor_id >= 0 &&
-            static_cast<std::size_t>(watch_tensor_id) < mTensors.size() &&
+        if (watch_tensor_id >= 0 && static_cast<std::size_t>(watch_tensor_id) < mTensors.size() &&
             mTensors[static_cast<std::size_t>(watch_tensor_id)].Data) {
             return &mTensors[static_cast<std::size_t>(watch_tensor_id)];
         }
@@ -1071,7 +1030,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
         Tensor amax = mRunState.temp_alloc(ETensorDType::FP32, {1}, "amax");
         CUDA_CHECK(cudaMemsetAsync(amax.Data, 0, sizeof(float), mRunState.MainStream));
-        global_amax(amax.get<float>(), t, static_cast<std::size_t>(t.nelem()), mRunState.DeviceProp, mRunState.MainStream);
+        global_amax(amax.get<float>(),
+                    t,
+                    static_cast<std::size_t>(t.nelem()),
+                    mRunState.DeviceProp,
+                    mRunState.MainStream);
         float host_amax = 0.0f;
         CUDA_CHECK(cudaMemcpyAsync(&host_amax,
                                    amax.get<float>(),
@@ -1112,12 +1075,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
             if (host_count > 0) {
                 std::ostringstream oss;
-                oss << "Non-finite detected in forward output tensor '" << ref.name
-                    << "' at op id=" << op.op_id
-                    << " type=" << op_type_to_string(op.type)
-                    << " count=" << host_count
-                    << " dtype=" << static_cast<int>(t->DType)
-                    << " shape=[";
+                oss << "Non-finite detected in forward output tensor '" << ref.name << "' at op id=" << op.op_id
+                    << " type=" << op_type_to_string(op.type) << " count=" << host_count
+                    << " dtype=" << static_cast<int>(t->DType) << " shape=[";
                 for (int d = 0; d < t->Rank; ++d) {
                     if (d > 0) oss << ",";
                     oss << t->Sizes[d];
@@ -1147,7 +1107,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 if (first_op.layer_start >= 0) {
                     if (first_op.layer_start < num_layers &&
                         !layer_active[static_cast<std::size_t>(first_op.layer_start)]) {
-                        layer_checkpoints[static_cast<std::size_t>(first_op.layer_start)] = mRunState.Stack.checkpoint();
+                        layer_checkpoints[static_cast<std::size_t>(first_op.layer_start)] =
+                            mRunState.Stack.checkpoint();
                         layer_temp_marks[static_cast<std::size_t>(first_op.layer_start)] = mTemps.size();
                         layer_active[static_cast<std::size_t>(first_op.layer_start)] = 1;
                     }
@@ -1157,8 +1118,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 // Handle layer end if the last op has one
                 const auto& last_op = graph.ops[tg.end_op_idx];
                 if (last_op.layer_end >= 0) {
-                    if (last_op.layer_end < num_layers &&
-                        layer_active[static_cast<std::size_t>(last_op.layer_end)]) {
+                    if (last_op.layer_end < num_layers && layer_active[static_cast<std::size_t>(last_op.layer_end)]) {
                         if (mDebugDumpLayerFn) mDebugDumpLayerFn(last_op.layer_end);
                         persist_saved_layer_tensors(last_op.layer_end);
                         mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(last_op.layer_end)]);
@@ -1191,14 +1151,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
 
         if (op_trace) {
-            std::cerr << "[OP " << idx << "] " << op_type_to_string(op.type)
-                      << " id=" << op.op_id << std::endl;
+            std::cerr << "[OP " << idx << "] " << op_type_to_string(op.type) << " id=" << op.op_id << std::endl;
         }
 
         // Handle layer boundaries
         if (op.layer_start >= 0) {
-            if (op.layer_start < num_layers &&
-                !layer_active[static_cast<std::size_t>(op.layer_start)]) {
+            if (op.layer_start < num_layers && !layer_active[static_cast<std::size_t>(op.layer_start)]) {
                 layer_checkpoints[static_cast<std::size_t>(op.layer_start)] = mRunState.Stack.checkpoint();
                 layer_temp_marks[static_cast<std::size_t>(op.layer_start)] = mTemps.size();
                 layer_active[static_cast<std::size_t>(op.layer_start)] = 1;
@@ -1210,8 +1168,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             // graph-breaking ops run eagerly. The normal loop still iterates
             // through these ops for layer_end handling, tensor persistence, and
             // pruning — but skips the per-op dispatch (already done here).
-            if (mSplitAttentionGraphs &&
-                !graph.layer_segments.empty() &&
+            if (mSplitAttentionGraphs && !graph.layer_segments.empty() &&
                 static_cast<std::size_t>(op.layer_start) < graph.layer_segments.size() &&
                 !graph.layer_segments[static_cast<std::size_t>(op.layer_start)].empty()) {
                 const int L = op.layer_start;
@@ -1245,9 +1202,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                 dispatch_forward_op(graph.ops[i], hook);
                             }
                         };
-                        trace_or_execute_cuda_graph_with_stack(
-                            run, mRunState.MainStream, sg.exec, true,
-                            mRunState.Stack, sg.checkpoint);
+                        trace_or_execute_cuda_graph_with_stack(run,
+                                                               mRunState.MainStream,
+                                                               sg.exec,
+                                                               true,
+                                                               mRunState.Stack,
+                                                               sg.checkpoint);
                         if (is_capture) {
                             // Save post-dispatch stack state. On replay,
                             // trace_or_execute restores to sg.checkpoint (pre-alloc)
@@ -1317,169 +1277,13 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
 
         try {
-            // Direct dispatch via switch (branch predictor friendly, no string compare)
-            switch (op.type) {
-                case CompiledOpType::Embedding:
-                    dispatch_embedding(op);
-                    break;
-                case CompiledOpType::Zeros:
-                    dispatch_zeros(op);
-                    break;
-                case CompiledOpType::Ones:
-                    dispatch_ones(op);
-                    break;
-                case CompiledOpType::FusedResidualRMSNorm:
-                    dispatch_fused_residual_rmsnorm(op);
-                    break;
-                case CompiledOpType::RMSNorm:
-                    dispatch_rmsnorm(op);
-                    break;
-                case CompiledOpType::LayerNorm:
-                    dispatch_layernorm(op);
-                    break;
-                case CompiledOpType::View:
-                    dispatch_view(op);
-                    break;
-                case CompiledOpType::Transpose:
-                    dispatch_transpose(op);
-                    break;
-                case CompiledOpType::Split:
-                    dispatch_split(op);
-                    break;
-                case CompiledOpType::Narrow:
-                    dispatch_narrow(op);
-                    break;
-                case CompiledOpType::Concat:
-                    dispatch_concat(op);
-                    break;
-                case CompiledOpType::Add:
-                    dispatch_add(op);
-                    break;
-                case CompiledOpType::Matmul:
-                case CompiledOpType::MatmulBias:
-                    dispatch_matmul(op, hook);
-                    break;
-                case CompiledOpType::BiasAdd:
-                    dispatch_bias_add(op);
-                    break;
-                case CompiledOpType::SwiGLU:
-                    dispatch_swiglu(op);
-                    break;
-                case CompiledOpType::GptOssMoeAct:
-                    dispatch_gpt_oss_moe_act(op);
-                    break;
-                case CompiledOpType::Silu:
-                    dispatch_silu(op);
-                    break;
-                case CompiledOpType::Gelu:
-                    dispatch_gelu(op);
-                    break;
-                case CompiledOpType::Relu2:
-                    dispatch_relu2(op);
-                    break;
-                case CompiledOpType::Mul:
-                    dispatch_mul(op);
-                    break;
-                case CompiledOpType::Scale:
-                    dispatch_scale(op);
-                    break;
-                case CompiledOpType::MaskScatter:
-                    dispatch_mask_scatter(op);
-                    break;
-                case CompiledOpType::DeepstackInject:
-                    dispatch_deepstack_inject(op);
-                    break;
-                case CompiledOpType::MatmulSwiGLU:
-                    dispatch_matmul_swiglu(op, hook);
-                    break;
-                case CompiledOpType::QKVQKNorm:
-                    dispatch_qkv_qk_norm(op);
-                    break;
-                case CompiledOpType::QKVQKNormRoPE:
-                    dispatch_qkv_qk_norm_rope(op);
-                    break;
-                case CompiledOpType::MRoPE:
-                    dispatch_mrope(op);
-                    break;
-                case CompiledOpType::RoPE:
-                    dispatch_rope(op);
-                    break;
-                case CompiledOpType::FlashAttention:
-                    dispatch_flash_attention(op);
-                    break;
-                case CompiledOpType::CrossEntropyLoss:
-                    dispatch_cross_entropy_loss(op);
-                    break;
-                case CompiledOpType::FusedLMHeadLoss:
-                    dispatch_fused_lm_head_loss(op);
-                    break;
-                // MoE operations
-                case CompiledOpType::MoESoftmax:
-                    dispatch_moe_softmax(op);
-                    break;
-                case CompiledOpType::MoESigmoid:
-                    dispatch_moe_sigmoid(op);
-                    break;
-                case CompiledOpType::MoETopK:
-                    dispatch_moe_topk(op);
-                    break;
-                case CompiledOpType::MoEPermute:
-                    dispatch_moe_permute(op);
-                    break;
-                case CompiledOpType::MoEGroupedGemm:
-                    dispatch_moe_grouped_gemm(op);
-                    break;
-                case CompiledOpType::MoEGroupedGemmGateUp:
-                    dispatch_moe_grouped_gemm_gate_up(op);
-                    break;
-                case CompiledOpType::MoEGroupedGemmDown:
-                    dispatch_moe_grouped_gemm_down(op);
-                    break;
-                case CompiledOpType::MoEUnpermute:
-                    dispatch_moe_unpermute(op);
-                    break;
-                case CompiledOpType::MoEExpertBiasAdd:
-                    dispatch_moe_expert_bias_add(op);
-                    break;
-                // Expert Parallelism forward operations
-                case CompiledOpType::EpDispatch:
-                    dispatch_ep_dispatch(op);
-                    break;
-                case CompiledOpType::EpCombine:
-                    dispatch_ep_combine(op);
-                    break;
-                // Mamba/SSM forward operations
-                case CompiledOpType::MambaSplitProj:
-                    dispatch_mamba_split_proj(op);
-                    break;
-                case CompiledOpType::MambaConv1d:
-                    dispatch_mamba_conv1d(op);
-                    break;
-                case CompiledOpType::MambaSplitConvOut:
-                    dispatch_mamba_split_conv_out(op);
-                    break;
-                case CompiledOpType::MambaSsmScan:
-                    dispatch_mamba_ssm_scan(op);
-                    break;
-                case CompiledOpType::MambaGatedRMSNorm:
-                    dispatch_mamba_gated_rmsnorm(op);
-                    break;
-                case CompiledOpType::MambaOutProj:
-                    dispatch_mamba_out_proj(op, hook);
-                    break;
-                // Qwen3.5 gated delta rule forward operations
-                case CompiledOpType::ChunkGatedDeltaRule:
-                    dispatch_chunk_gated_delta_rule(op);
-                    break;
-                case CompiledOpType::Qwen3_5Decay:
-                    dispatch_qwen3_5_decay(op);
-                    break;
-                case CompiledOpType::RepeatInterleaveHeads:
-                    dispatch_repeat_interleave_heads(op);
-                    break;
-                default:
-                    throw std::runtime_error("CompiledExecutor: unsupported forward op type");
+            // Phase 2a: dispatch via the function pointer baked into
+            // op.fn at graph compile time. One indirect call, no switch.
+            if (!op.fn) {
+                throw std::runtime_error(std::string("CompiledExecutor: no dispatch fn for forward op type ") +
+                                         op_type_to_string(op.type));
             }
+            op.fn(*this, op, static_cast<const void*>(hook));
             check_nonfinite_refs(op, op.outputs);
             if (watch_tensor_enabled) {
                 bool watch_post_valid = false;
@@ -1498,8 +1302,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 const bool nf_changed = watch_pre_valid && watch_post_valid && watch_pre_nf != watch_post_nf;
                 const bool amax_changed = watch_pre_valid && watch_post_valid &&
                                           std::fabs(watch_post_amax - watch_pre_amax) > watch_amax_delta;
-                const bool alarm = watch_post_valid &&
-                    (watch_post_nf > 0 || !std::isfinite(watch_post_amax) || watch_post_amax >= watch_alarm_amax);
+                const bool alarm = watch_post_valid && (watch_post_nf > 0 || !std::isfinite(watch_post_amax) ||
+                                                        watch_post_amax >= watch_alarm_amax);
 
                 if (became_invalid || became_valid || nf_changed || amax_changed || alarm) {
                     std::ostringstream in_list;
@@ -1512,27 +1316,17 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                         if (ro > 0) out_list << ",";
                         out_list << op.outputs[ro].name << "#" << op.outputs[ro].tensor_id;
                     }
-                    std::cerr << "[WATCH] tensor='" << watch_tensor_name
-                              << "' op_idx=" << idx
-                              << " op_id=" << op.op_id
-                              << " type=" << op_type_to_string(op.type)
-                              << " pre_valid=" << (watch_pre_valid ? 1 : 0)
-                              << " post_valid=" << (watch_post_valid ? 1 : 0)
-                              << " pre_nf=" << watch_pre_nf
-                              << " post_nf=" << watch_post_nf
-                              << " pre_amax=" << watch_pre_amax
-                              << " post_amax=" << watch_post_amax
-                              << " inputs=[" << in_list.str() << "]"
-                              << " outputs=[" << out_list.str() << "]"
-                              << std::endl;
+                    std::cerr << "[WATCH] tensor='" << watch_tensor_name << "' op_idx=" << idx << " op_id=" << op.op_id
+                              << " type=" << op_type_to_string(op.type) << " pre_valid=" << (watch_pre_valid ? 1 : 0)
+                              << " post_valid=" << (watch_post_valid ? 1 : 0) << " pre_nf=" << watch_pre_nf
+                              << " post_nf=" << watch_post_nf << " pre_amax=" << watch_pre_amax
+                              << " post_amax=" << watch_post_amax << " inputs=[" << in_list.str() << "]" << " outputs=["
+                              << out_list.str() << "]" << std::endl;
                 }
                 if (alarm && watch_abort_on_alarm) {
                     std::ostringstream oss_watch;
-                    oss_watch << "Watch tensor '" << watch_tensor_name
-                              << "' alarm after op idx=" << idx
-                              << " id=" << op.op_id
-                              << " type=" << op_type_to_string(op.type)
-                              << " nf=" << watch_post_nf
+                    oss_watch << "Watch tensor '" << watch_tensor_name << "' alarm after op idx=" << idx
+                              << " id=" << op.op_id << " type=" << op_type_to_string(op.type) << " nf=" << watch_post_nf
                               << " amax=" << watch_post_amax;
                     throw std::runtime_error(oss_watch.str());
                 }
@@ -1542,9 +1336,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 auto post_err = cudaGetLastError();
                 if (post_err != cudaSuccess) {
                     std::ostringstream oss2;
-                    oss2 << "CompiledExecutor forward op " << idx
-                         << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
-                         << "): left sticky CUDA error: " << cudaGetErrorString(post_err);
+                    oss2 << "CompiledExecutor forward op " << idx << " (type=" << op_type_to_string(op.type)
+                         << ", id=" << op.op_id << "): left sticky CUDA error: " << cudaGetErrorString(post_err);
                     throw std::runtime_error(oss2.str());
                 }
             }
@@ -1555,12 +1348,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             throw std::runtime_error(oss.str());
         }
 
-        skip_dispatch:
+    skip_dispatch:
 
         // Handle layer end
         if (op.layer_end >= 0) {
-            if (op.layer_end < num_layers &&
-                layer_active[static_cast<std::size_t>(op.layer_end)]) {
+            if (op.layer_end < num_layers && layer_active[static_cast<std::size_t>(op.layer_end)]) {
                 // Debug dump per-layer tensors before shared buffers are overwritten.
                 if (mDebugDumpLayerFn) {
                     mDebugDumpLayerFn(op.layer_end);
@@ -1605,13 +1397,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 while (std::getline(ss, token, ',')) {
                     // trim ASCII whitespace
                     std::size_t b = 0;
-                    while (b < token.size() &&
-                           std::isspace(static_cast<unsigned char>(token[b]))) {
+                    while (b < token.size() && std::isspace(static_cast<unsigned char>(token[b]))) {
                         ++b;
                     }
                     std::size_t e = token.size();
-                    while (e > b &&
-                           std::isspace(static_cast<unsigned char>(token[e - 1]))) {
+                    while (e > b && std::isspace(static_cast<unsigned char>(token[e - 1]))) {
                         --e;
                     }
                     if (e > b) {
@@ -1725,11 +1515,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // Skip MoE expert_offsets
             if (meta.is_moe_offsets()) continue;
             // Skip cross-layer gradients for earlier layers
-            if (current_layer >= 0 && meta.is_d_blocks() &&
-                meta.block_layer_idx >= 0 && meta.block_layer_idx < current_layer) continue;
+            if (current_layer >= 0 && meta.is_d_blocks() && meta.block_layer_idx >= 0 &&
+                meta.block_layer_idx < current_layer)
+                continue;
             // Skip saved tensors for earlier layers
-            if (current_layer >= 0 && meta.is_blocks() &&
-                meta.block_layer_idx >= 0 && meta.block_layer_idx < current_layer) continue;
+            if (current_layer >= 0 && meta.is_blocks() && meta.block_layer_idx >= 0 &&
+                meta.block_layer_idx < current_layer)
+                continue;
             // Skip tensors with unparseable layer index (be safe)
             if ((meta.is_d_blocks() || meta.is_blocks()) && meta.block_layer_idx < 0) continue;
             if (mRunState.Stack.owns(t.Data) && !mRunState.Stack.is_live(t.Data)) {
@@ -1750,8 +1542,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // d_logits is stored in the output buffer after loss backward (only when lmhead_chunks == 1)
     auto& output = mRunState.non_block_activations().output;
     if (!output.Data) {
-        throw std::runtime_error("CompiledExecutor: output tensor has no data (B=" +
-                                std::to_string(mB) + ", T=" + std::to_string(mT) + ")");
+        throw std::runtime_error("CompiledExecutor: output tensor has no data (B=" + std::to_string(mB) +
+                                 ", T=" + std::to_string(mT) + ")");
     }
 
     if (mOptions.LMHeadChunks <= 1) {
@@ -1760,8 +1552,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         // Also provide flattened version for matmul backward ops
         Tensor logits_flat = view_tensor(output, {mB * mT, static_cast<long>(mConfig.VocabSize)});
         if (logits_flat.Rank != 2) {
-            throw std::runtime_error("CompiledExecutor: d_logits_flat has wrong rank=" +
-                                    std::to_string(logits_flat.Rank) + " expected 2");
+            throw std::runtime_error(
+                "CompiledExecutor: d_logits_flat has wrong rank=" + std::to_string(logits_flat.Rank) + " expected 2");
         }
         bind_tensor("d_logits_flat", logits_flat);
     }
@@ -1771,14 +1563,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     Tensor& d_ln_final_buf = mRunState.non_block_gradients().d_ln_final;
     Tensor& d_embeddings_buf = mRunState.non_block_gradients().d_embeddings;
 
-    Tensor d_ln_final_flat = view_tensor(d_ln_final_buf,
-                                         {mB * mT, static_cast<long>(mConfig.HiddenSize)});
+    Tensor d_ln_final_flat = view_tensor(d_ln_final_buf, {mB * mT, static_cast<long>(mConfig.HiddenSize)});
 
     // Helper to determine target buffer based on gradient_of field
     auto get_target_buffer = [&](const std::string& grad_of) -> Tensor* {
         // Final norm gradients (xF, ln_final, residual_final)
-        if (grad_of == "xF" || grad_of == "ln_final" || grad_of == "xF_flat" ||
-            grad_of == "residual_final" || grad_of == "final_residual") {
+        if (grad_of == "xF" || grad_of == "ln_final" || grad_of == "xF_flat" || grad_of == "residual_final" ||
+            grad_of == "final_residual") {
             return &d_ln_final_buf;
         }
         // Embedding output gradients (x0, encoded) — always bind to persistent buffer
@@ -1804,8 +1595,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     // DSL-driven binding for any additional gradient slots declared in the Python model
     if (mSlotRegistry && mSlotRegistry->has_dsl_layout()) {
-        mSlotRegistry->for_each([&](const std::string& slot_name,
-                                    const TensorSlotRegistry::SlotEntry& entry) {
+        mSlotRegistry->for_each([&](const std::string& slot_name, const TensorSlotRegistry::SlotEntry& entry) {
             if (entry.scope != ActivationScope::GlobalGradient) return;
             // Skip if already bound above
             if (mCurrentGraph) {
@@ -1855,8 +1645,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 }
             }
             if (!stacked.empty()) {
-                std::sort(stacked.begin(), stacked.end(),
-                          [](const auto& a, const auto& b) { return a.first < b.first; });
+                std::sort(stacked.begin(), stacked.end(), [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
                 if (stacked.size() == 1) {
                     if (last_grads.d_res_att.Data) {
                         bind_tensor("d_" + stacked[0].second, last_grads.d_res_att);
@@ -1898,8 +1689,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
 
         // Copy data from CPU to GPU
-        CUDA_CHECK(cudaMemcpyAsync(mMoEExpertOffsetsGPU, mMoEExpertOffsetsData.data(),
-                                   needed_bytes, cudaMemcpyHostToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(mMoEExpertOffsetsGPU,
+                                   mMoEExpertOffsetsData.data(),
+                                   needed_bytes,
+                                   cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
 
         // Create tensor wrapper pointing to persistent buffer
@@ -1962,10 +1756,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             case TensorSlot::BlockDLN2:
             case TensorSlot::BlockDResAtt:
             case TensorSlot::BlockDResFFN:
-            case TensorSlot::DLoss:
-                return true;
-            default:
-                return false;
+            case TensorSlot::DLoss: return true;
+            default: return false;
         }
     };
 
@@ -2092,8 +1884,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Optional extreme-magnitude threshold: flag when any backward-op output
     // contains a finite value with |x| > this. Useful for finding ops that
     // produce sane-looking (non-NaN) but astronomical gradients.
-    const float debug_extreme_threshold =
-        env_float("SUROGATE_DEBUG_BACKWARD_EXTREME", 0.0f);
+    const float debug_extreme_threshold = env_float("SUROGATE_DEBUG_BACKWARD_EXTREME", 0.0f);
     const bool debug_extreme_backward = debug_extreme_threshold > 0.0f;
     auto count_nonfinite_of = [&](const Tensor& t) -> int {
         Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1}, "non_finite_count");
@@ -2115,15 +1906,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         CUDA_CHECK(cudaMemsetAsync(cnt.Data, 0, sizeof(int), mRunState.MainStream));
         const int n = static_cast<int>(t.nelem());
         if (t.DType == ETensorDType::BF16) {
-            count_above_threshold(cnt.get<int>(), t.get<nv_bfloat16>(), n, threshold,
-                                  mRunState.MainStream);
+            count_above_threshold(cnt.get<int>(), t.get<nv_bfloat16>(), n, threshold, mRunState.MainStream);
         } else {
-            count_above_threshold(cnt.get<int>(), t.get<float>(), n, threshold,
-                                  mRunState.MainStream);
+            count_above_threshold(cnt.get<int>(), t.get<float>(), n, threshold, mRunState.MainStream);
         }
         int host = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&host, cnt.get<int>(), sizeof(int),
-                                   cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(&host, cnt.get<int>(), sizeof(int), cudaMemcpyDeviceToHost, mRunState.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         mRunState.temp_free(cnt);
         return host;
@@ -2151,10 +1939,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 // Emit a diagnostic but do NOT throw — extreme magnitudes are
                 // often legitimate mid-training. The goal is just to pinpoint
                 // the first op in the backward chain that inflates grads.
-                fprintf(stderr,
+                fprintf(
+                    stderr,
                     "[EXTREME] backward op '%s' (id=%s type=%s): output '%s' has %d values with |x|>%.3g (nelem=%zu)\n",
-                    op.op_id.c_str(), op.op_id.c_str(), op_type_to_string(op.type),
-                    ref.name.c_str(), extreme_count, debug_extreme_threshold, (size_t)t->nelem());
+                    op.op_id.c_str(),
+                    op.op_id.c_str(),
+                    op_type_to_string(op.type),
+                    ref.name.c_str(),
+                    extreme_count,
+                    debug_extreme_threshold,
+                    (size_t)t->nelem());
             }
 
             if (host_count > 0) {
@@ -2164,8 +1958,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 for (const auto& in_ref : op.inputs) {
                     if (in_ref.name.empty()) continue;
                     const Tensor* ti = nullptr;
-                    if (in_ref.tensor_id >= 0 &&
-                        static_cast<std::size_t>(in_ref.tensor_id) < mTensors.size() &&
+                    if (in_ref.tensor_id >= 0 && static_cast<std::size_t>(in_ref.tensor_id) < mTensors.size() &&
                         mTensors[in_ref.tensor_id].Data) {
                         ti = &mTensors[in_ref.tensor_id];
                     }
@@ -2185,13 +1978,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         continue;
                     }
                     if (!ti->Data) {
-                        inputs_oss << "\n  input '" << in_ref.name << "' <no data> dtype="
-                                   << static_cast<int>(ti->DType);
+                        inputs_oss << "\n  input '" << in_ref.name
+                                   << "' <no data> dtype=" << static_cast<int>(ti->DType);
                         continue;
                     }
                     if (ti->DType != ETensorDType::BF16 && ti->DType != ETensorDType::FP32) {
-                        inputs_oss << "\n  input '" << in_ref.name << "' <skipped dtype="
-                                   << static_cast<int>(ti->DType) << ">";
+                        inputs_oss << "\n  input '" << in_ref.name << "' <skipped dtype=" << static_cast<int>(ti->DType)
+                                   << ">";
                         continue;
                     }
                     int ic = count_nonfinite_of(*ti);
@@ -2199,12 +1992,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                << " dtype=" << static_cast<int>(ti->DType);
                 }
                 std::ostringstream oss;
-                oss << "Non-finite detected in backward output tensor '" << ref.name
-                    << "' at op id=" << op.op_id
-                    << " type=" << op_type_to_string(op.type)
-                    << " count=" << host_count
-                    << " dtype=" << static_cast<int>(t->DType)
-                    << " shape=[";
+                oss << "Non-finite detected in backward output tensor '" << ref.name << "' at op id=" << op.op_id
+                    << " type=" << op_type_to_string(op.type) << " count=" << host_count
+                    << " dtype=" << static_cast<int>(t->DType) << " shape=[";
                 for (int d = 0; d < t->Rank; ++d) {
                     if (d > 0) oss << ",";
                     oss << t->Sizes[d];
@@ -2224,9 +2014,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     }
     cudaStreamCaptureStatus bwd_capture_status = cudaStreamCaptureStatusNone;
     const bool bwd_stream_capturing =
-        mCapturing ||
-        (cudaStreamIsCapturing(mRunState.MainStream, &bwd_capture_status) == cudaSuccess &&
-         bwd_capture_status != cudaStreamCaptureStatusNone);
+        mCapturing || (cudaStreamIsCapturing(mRunState.MainStream, &bwd_capture_status) == cudaSuccess &&
+                       bwd_capture_status != cudaStreamCaptureStatusNone);
 
     std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
     std::vector<bool> layer_seen_any(num_layers, false);
@@ -2247,7 +2036,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             }
         }
     }
-    
+
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
@@ -2308,18 +2097,21 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mRecomputeEnabled && mRecomputeFn) {
                 const int layer_idx = op.layer_start;
                 if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                if (debug_replay) {
-                    fprintf(stderr, "[BWD] layer_start=%d for op %zu type=%s\n",
-                            layer_idx, idx, op_type_to_string(op.type));
+                    if (debug_replay) {
+                        fprintf(stderr,
+                                "[BWD] layer_start=%d for op %zu type=%s\n",
+                                layer_idx,
+                                idx,
+                                op_type_to_string(op.type));
+                    }
+                    if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
+                        clear_shared_grads(layer_idx);
+                        layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
+                    }
+                    mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
+                    mLastRecomputeLayer = layer_idx;
                 }
-                if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
-                    clear_shared_grads(layer_idx);
-                    layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                }
-                mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
-                mLastRecomputeLayer = layer_idx;
             }
-        }
 
             // Note: backward always runs through the normal dispatch loop (no segment
             // graph shortcut) because backward tensor lifetime management (cross-layer
@@ -2334,10 +2126,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             const int effective_layer_idx = (layer_idx >= 0) ? layer_idx : layer_idx_any;
             if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
                 if (debug_replay) {
-                    fprintf(stderr, "[BWD] op_layer_detect=%d (non_grad=%d any=%d) for op %zu type=%s\n",
-                            effective_layer_idx, layer_idx, layer_idx_any, idx, op_type_to_string(op.type));
+                    fprintf(stderr,
+                            "[BWD] op_layer_detect=%d (non_grad=%d any=%d) for op %zu type=%s\n",
+                            effective_layer_idx,
+                            layer_idx,
+                            layer_idx_any,
+                            idx,
+                            op_type_to_string(op.type));
                 }
-                if (effective_layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
+                if (effective_layer_idx < num_layers &&
+                    !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
                     clear_shared_grads(effective_layer_idx);
                     layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;
                 }
@@ -2347,236 +2145,27 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
 
         try {
-            switch (op.type) {
-                // Explicit backward ops
-                case CompiledOpType::ViewBackward:
-                    dispatch_view_backward(op);
-                    break;
-                case CompiledOpType::AddBackward:
-                    dispatch_add_backward(op);
-                    break;
-                case CompiledOpType::CrossEntropyLossBackward:
-                    dispatch_cross_entropy_loss_backward(op);
-                    break;
-                case CompiledOpType::FusedLMHeadLossBackward:
-                    dispatch_fused_lm_head_loss_backward(op);
-                    break;
-                case CompiledOpType::MatmulBackward:
-                    dispatch_matmul_backward(op, hook);
-                    // After the first matmul_backward (LM-head backward), free the output tensor
-                    // to reclaim ~1.2GB of stack memory. The d_logits data has been consumed.
-                    if (idx == 1) {
-                        mRunState.temp_free(mRunState.non_block_activations().output);
-                        mTemps.clear();
-                        // Update initial_checkpoint to reflect the freed output tensor
-                        // This prevents subsequent checkpoint restores from re-allocating it
-                        initial_checkpoint = mRunState.Stack.checkpoint();
-                    }
-                    break;
-                case CompiledOpType::BiasAddBackward:
-                    dispatch_bias_add_backward(op);
-                    break;
-                case CompiledOpType::SwiGLUBackward:
-                    dispatch_swiglu_backward(op);
-                    break;
-                case CompiledOpType::GptOssMoeActBackward:
-                    dispatch_gpt_oss_moe_act_backward(op);
-                    break;
-                case CompiledOpType::SiluBackward:
-                    dispatch_silu_backward(op);
-                    break;
-                case CompiledOpType::GeluBackward:
-                    dispatch_gelu_backward(op);
-                    break;
-                case CompiledOpType::Relu2Backward:
-                    dispatch_relu2_backward(op);
-                    break;
-                case CompiledOpType::MulBackward:
-                    dispatch_mul_backward(op);
-                    break;
-                case CompiledOpType::ScaleBackward:
-                    dispatch_scale_backward(op);
-                    break;
-                case CompiledOpType::NarrowBackward:
-                    dispatch_narrow_backward(op);
-                    break;
-                case CompiledOpType::MaskScatterBackward:
-                    dispatch_mask_scatter_backward(op);
-                    break;
-                case CompiledOpType::DeepstackInjectBackward:
-                    dispatch_deepstack_inject_backward(op);
-                    break;
-                case CompiledOpType::MatmulSwiGLUBackward:
-                    dispatch_matmul_swiglu_backward(op, hook);
-                    break;
-                case CompiledOpType::QKVQKNormBackward:
-                    dispatch_qkv_qk_norm_backward(op);
-                    break;
-                case CompiledOpType::RoPEBackward:
-                    dispatch_rope_backward(op);
-                    break;
-                case CompiledOpType::QKVQKNormRoPEBackward:
-                    dispatch_qkv_qk_norm_rope_backward(op);
-                    break;
-                case CompiledOpType::MRoPEBackward:
-                    dispatch_mrope_backward(op);
-                    break;
-                case CompiledOpType::FlashAttentionBackward:
-                    dispatch_flash_attention_backward(op);
-                    break;
-                case CompiledOpType::ZerosBackward:
-                    dispatch_zeros_backward(op);
-                    break;
-                case CompiledOpType::FusedResidualRMSNormBackward:
-                    dispatch_fused_residual_rmsnorm_backward(op);
-                    break;
-                case CompiledOpType::RMSNormBackward:
-                    dispatch_rmsnorm_backward(op);
-                    break;
-                case CompiledOpType::LayerNormBackward:
-                    dispatch_layernorm_backward(op);
-                    break;
-                case CompiledOpType::EmbeddingBackward:
-                    dispatch_embedding_backward(op);
-                    break;
+            // Phase 2a: dispatch via the function pointer baked into
+            // op.fn at backward-graph compile time. One indirect call,
+            // no switch.
+            if (!op.fn) {
+                std::ostringstream oss;
+                oss << "CompiledExecutor: no dispatch fn for backward op at idx " << idx
+                    << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
+                throw std::runtime_error(oss.str());
+            }
+            op.fn(*this, op, static_cast<const void*>(hook));
 
-                // Forward ops that appear in backward graph (autodiff generates these)
-                // View/reshape is the same operation in forward and backward - just reshapes gradient
-                case CompiledOpType::View:
-                    dispatch_view_backward(op);
-                    break;
-                case CompiledOpType::Transpose:
-                    dispatch_transpose(op);
-                    break;
-                // Split/concat/narrow may appear in backward graphs via autodiff rules.
-                case CompiledOpType::Split:
-                    dispatch_split(op);
-                    break;
-                case CompiledOpType::Narrow:
-                    dispatch_narrow(op);
-                    break;
-                case CompiledOpType::Concat:
-                    dispatch_concat(op);
-                    break;
-                // "add" ops in the backward graph are gradient-accumulation nodes,
-                // so we must execute them as forward add (sum inputs), not add-backward.
-                case CompiledOpType::Add:
-                    dispatch_add(op);
-                    break;
-                // Zeros in backward: may be a true no-op (gradient of zeros init)
-                // or a split backward zero-fill (needs actual allocation).
-                case CompiledOpType::Zeros:
-                    dispatch_zeros(op);
-                    break;
-                // Ones in backward is a no-op
-                case CompiledOpType::Ones:
-                    dispatch_zeros_backward(op);
-                    break;
-
-                // MoE backward operations
-                case CompiledOpType::MoESoftmaxBackward:
-                    dispatch_moe_softmax_backward(op);
-                    break;
-                case CompiledOpType::MoESigmoidBackward:
-                    dispatch_moe_sigmoid_backward(op);
-                    break;
-                case CompiledOpType::MoETopKBackward:
-                    dispatch_moe_topk_backward(op);
-                    break;
-                case CompiledOpType::MoEPermuteBackward:
-                    dispatch_moe_permute_backward(op);
-                    break;
-                case CompiledOpType::MoEGroupedGemmBackward:
-                    dispatch_moe_grouped_gemm_backward(op);
-                    break;
-                case CompiledOpType::MoEGroupedGemmGateUpBackward:
-                    dispatch_moe_grouped_gemm_gate_up_backward(op);
-                    break;
-                case CompiledOpType::MoEGroupedGemmDownBackward:
-                    dispatch_moe_grouped_gemm_down_backward(op);
-                    break;
-                case CompiledOpType::MoEUnpermuteBackward:
-                    dispatch_moe_unpermute_backward(op);
-                    break;
-                case CompiledOpType::MoEExpertBiasAddBackward:
-                    dispatch_moe_expert_bias_add_backward(op);
-                    break;
-
-                // Expert Parallelism backward operations
-                case CompiledOpType::EpDispatchBackward:
-                    dispatch_ep_dispatch_backward(op);
-                    break;
-                case CompiledOpType::EpCombineBackward:
-                    dispatch_ep_combine_backward(op);
-                    break;
-
-                // MoE forward ops that may appear in backward graph
-                case CompiledOpType::MoESoftmax:
-                case CompiledOpType::MoESigmoid:
-                case CompiledOpType::MoETopK:
-                case CompiledOpType::MoEPermute:
-                case CompiledOpType::MoEGroupedGemm:
-                case CompiledOpType::MoEGroupedGemmGateUp:
-                case CompiledOpType::MoEGroupedGemmDown:
-                case CompiledOpType::MoEUnpermute:
-                case CompiledOpType::EpDispatch:
-                case CompiledOpType::EpCombine:
-                case CompiledOpType::Silu:
-                case CompiledOpType::Relu2:
-                case CompiledOpType::Mul:
-                    // These forward MoE/EP ops may appear in backward graph due to autodiff
-                    throw std::runtime_error("CompiledExecutor: MoE/EP forward op in backward graph not yet supported");
-
-                // Mamba/SSM backward operations
-                case CompiledOpType::MambaSplitProjBackward:
-                    dispatch_mamba_split_proj_backward(op);
-                    break;
-                case CompiledOpType::MambaConv1dBackward:
-                    dispatch_mamba_conv1d_backward(op);
-                    break;
-                case CompiledOpType::MambaSplitConvOutBackward:
-                    dispatch_mamba_split_conv_out_backward(op);
-                    break;
-                case CompiledOpType::MambaSsmScanBackward:
-                    dispatch_mamba_ssm_scan_backward(op);
-                    break;
-                case CompiledOpType::MambaGatedRMSNormBackward:
-                    dispatch_mamba_gated_rmsnorm_backward(op);
-                    break;
-                case CompiledOpType::MambaOutProjBackward:
-                    dispatch_mamba_out_proj_backward(op, hook);
-                    break;
-
-                case CompiledOpType::ChunkGatedDeltaRuleBackward:
-                    dispatch_chunk_gated_delta_rule_backward(op);
-                    break;
-                case CompiledOpType::Qwen3_5DecayBackward:
-                    dispatch_qwen3_5_decay_backward(op);
-                    break;
-                case CompiledOpType::RepeatInterleaveHeadsBackward:
-                    dispatch_repeat_interleave_heads_backward(op);
-                    break;
-
-                // Mamba forward ops that may appear in backward graph
-                case CompiledOpType::MambaSplitProj:
-                case CompiledOpType::MambaConv1d:
-                case CompiledOpType::MambaSplitConvOut:
-                case CompiledOpType::MambaSsmScan:
-                case CompiledOpType::MambaGatedRMSNorm:
-                case CompiledOpType::MambaOutProj:
-                case CompiledOpType::ChunkGatedDeltaRule:
-                case CompiledOpType::Qwen3_5Decay:
-                case CompiledOpType::RepeatInterleaveHeads:
-                    // These forward Mamba/GDN ops may appear in backward graph due to autodiff
-                    throw std::runtime_error(
-                        "CompiledExecutor: Mamba/GatedDelta forward op in backward graph not yet supported");
-
-                default: {
-                    std::ostringstream oss;
-                    oss << "CompiledExecutor: unsupported backward op type at idx " << idx
-                        << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
-                    throw std::runtime_error(oss.str());
-                }
+            // Post-dispatch side effect: after the first matmul_backward
+            // (LM-head backward) free the output tensor to reclaim the
+            // ~1.2 GB of stack memory its d_logits payload occupies.
+            // This depends on local backward-loop state
+            // (initial_checkpoint, mTemps) and cannot live inside the
+            // dispatch function, so we key it off op.type here.
+            if (op.type == CompiledOpType::MatmulBackward && idx == 1) {
+                mRunState.temp_free(mRunState.non_block_activations().output);
+                mTemps.clear();
+                initial_checkpoint = mRunState.Stack.checkpoint();
             }
             check_nonfinite_refs(op, op.outputs);
 
@@ -2585,9 +2174,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 auto op_err = cudaDeviceSynchronize();
                 if (op_err != cudaSuccess) {
                     std::ostringstream oss;
-                    oss << "CompiledExecutor backward op " << idx
-                        << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
-                        << "): CUDA error after execution: " << cudaGetErrorString(op_err);
+                    oss << "CompiledExecutor backward op " << idx << " (type=" << op_type_to_string(op.type)
+                        << ", id=" << op.op_id << "): CUDA error after execution: " << cudaGetErrorString(op_err);
                     throw std::runtime_error(oss.str());
                 }
             }
@@ -2620,8 +2208,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             const std::size_t nbytes = tensor.bytes();
                             std::byte* persistent = nullptr;
                             CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&persistent), nbytes));
-                            CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, nbytes,
-                                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                            CUDA_CHECK(cudaMemcpyAsync(persistent,
+                                                       tensor.Data,
+                                                       nbytes,
+                                                       cudaMemcpyDeviceToDevice,
+                                                       mRunState.MainStream));
                             tensor.Data = persistent;
                             // Track for cleanup at end of backward
                             mPersistedBackwardTensors.push_back(persistent);
@@ -2681,9 +2272,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 auto err = cudaGetLastError();
                 if (err != cudaSuccess) {
                     std::ostringstream oss2;
-                    oss2 << "CompiledExecutor backward op " << idx
-                         << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
-                         << "): CUDA error: " << cudaGetErrorString(err);
+                    oss2 << "CompiledExecutor backward op " << idx << " (type=" << op_type_to_string(op.type)
+                         << ", id=" << op.op_id << "): CUDA error: " << cudaGetErrorString(err);
                     throw std::runtime_error(oss2.str());
                 }
             }
@@ -2706,21 +2296,17 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             oss << "]";
             throw std::runtime_error(oss.str());
         }
-
     }
 
     if (op_profile && !op_profile_total_ms.empty()) {
         std::vector<std::pair<std::string, double>> totals(op_profile_total_ms.begin(), op_profile_total_ms.end());
-        std::sort(totals.begin(), totals.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::sort(totals.begin(), totals.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
         std::cerr << "[OP PROFILE][backward] totals:\n";
         for (const auto& [name, total_ms] : totals) {
             const std::size_t count = op_profile_counts[name];
             const double avg_ms = count > 0 ? (total_ms / static_cast<double>(count)) : 0.0;
-            std::cerr << "  " << name
-                      << " total=" << total_ms << "ms"
-                      << " count=" << count
-                      << " avg=" << avg_ms << "ms\n";
+            std::cerr << "  " << name << " total=" << total_ms << "ms" << " count=" << count << " avg=" << avg_ms
+                      << "ms\n";
         }
     }
     if (op_profile) {

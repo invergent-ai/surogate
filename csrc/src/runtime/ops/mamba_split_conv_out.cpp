@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -42,9 +44,7 @@ void CompiledExecutor::dispatch_mamba_split_conv_out(const CompiledOp& op) {
     mTemps.push_back(c_t);
 
     // Call kernel
-    mamba_split_conv_out(u_t, b_t, c_t, conv_out,
-                         B, T, D, groups, dstate,
-                         mRunState.MainStream);
+    mamba_split_conv_out(u_t, b_t, c_t, conv_out, B, T, D, groups, dstate, mRunState.MainStream);
 
     store_tensor(op.outputs[0], u_t);
     store_tensor(op.outputs[1], b_t);
@@ -62,8 +62,7 @@ void CompiledExecutor::dispatch_mamba_split_conv_out_backward(const CompiledOp& 
     const int dstate = op.attrs.ssm_state_size;
     const int D = op.attrs.intermediate_size;
     const int B = (mB > 0) ? static_cast<int>(mB) : static_cast<int>(d_u.Sizes[0]);
-    const int T = (mT > 0) ? static_cast<int>(mT)
-                           : static_cast<int>(d_u.nelem() / (static_cast<long>(B) * D));
+    const int T = (mT > 0) ? static_cast<int>(mT) : static_cast<int>(d_u.nelem() / (static_cast<long>(B) * D));
     const int conv_dim = D + 2 * groups * dstate;
 
     // Allocate output
@@ -71,11 +70,42 @@ void CompiledExecutor::dispatch_mamba_split_conv_out_backward(const CompiledOp& 
     mTemps.push_back(d_conv_out);
 
     // Call kernel (d_B and d_C are expected to be FP32 from selective_scan backward)
-    mamba_pack_conv_out(d_conv_out, d_u, d_B, d_C,
-                        B, T, D, groups, dstate,
-                        mRunState.MainStream);
+    mamba_pack_conv_out(d_conv_out, d_u, d_B, d_C, B, T, D, groups, dstate, mRunState.MainStream);
 
     store_tensor(op.outputs[0], d_conv_out);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Mamba split_conv_out backward rule
+// Forward: u, B, C = mamba_split_conv_out(conv_out)
+// Backward: d_conv_out = mamba_split_conv_out_backward(d_u, d_B, d_C)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_split_conv_out_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+
+        AttrMap attrs =
+            copy_attrs(fwd.attrs, {"intermediate_size", "n_groups", "ssm_state_size"}, "mamba_split_conv_out");
+
+        // d_outputs[0..2] are the gradients of the 3 forward outputs: u, B, C
+        // d_inputs[0] is where to write the gradient of the forward input: conv_out
+        ops.push_back(make_operation("mamba_split_conv_out_backward_" + std::to_string(ctx.op_counter++),
+                                     "mamba_split_conv_out_backward",
+                                     "mamba_split_conv_out_backward",
+                                     {ctx.d_outputs[0], ctx.d_outputs[1], ctx.d_outputs[2]},
+                                     {ctx.d_inputs[0]},
+                                     attrs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("mamba_split_conv_out", ::dsl::mamba_split_conv_out_backward);

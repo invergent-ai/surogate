@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Optional
 
 from surogate.grpo.config import NoiseSchedulerConfig
 from surogate.utils.logger import get_logger
@@ -34,8 +33,8 @@ class SurogateWeightBroadcast:
         output_dir: str,
         adapter_only: bool = True,
         max_async_level: int = 1,
-        noise_config: Optional[NoiseSchedulerConfig] = None,
-        base_model_dir: Optional[str] = None,
+        noise_config: NoiseSchedulerConfig | None = None,
+        base_model_dir: str | None = None,
         max_steps: int = 0,
     ):
         # The orchestrator's scheduler polls {orch_output_dir}/broadcasts/step_{step}/STABLE
@@ -83,6 +82,7 @@ class SurogateWeightBroadcast:
         # accept the next batch.  In prime-rl's normal flow this is done by
         # FileSystemWeightBroadcast.broadcast_weights().
         from surogate.grpo.runs import get_multi_run_manager
+
         mrm = get_multi_run_manager()
         for idx in mrm.used_idxs:
             mrm.ready_to_update[idx] = False
@@ -103,10 +103,12 @@ class SurogateWeightBroadcast:
         if self.adapter_only:
             # Write sigma file — vLLM worker applies noise in-place on GPU
             from surogate.grpo.noise_scheduler import write_noise_sigma
+
             write_noise_sigma(save_dir, sigma)
             logger.info(f"QeRL noise: wrote sigma={sigma:.6f} for step {step}")
         else:
             from surogate.grpo.noise_scheduler import inject_noise_model
+
             n = inject_noise_model(save_dir, sigma)
             if n > 0:
                 logger.info(f"QeRL noise: injected sigma={sigma:.6f} into {n} norm tensors (step {step})")
@@ -122,6 +124,7 @@ class SurogateWeightBroadcast:
                 return int(p.name.split("_", 1)[1])
             except (IndexError, ValueError):
                 return -1
+
         step_dirs = sorted(self.broadcast_dir.iterdir(), key=_step_num)
         # Keep max_async_level + 1 most recent directories
         keep = self.max_async_level + 1
@@ -149,8 +152,8 @@ class ColocateWeightBroadcast:
         self,
         output_dir: str,
         max_async_level: int = 1,
-        noise_config: Optional[NoiseSchedulerConfig] = None,
-        base_model_dir: Optional[str] = None,
+        noise_config: NoiseSchedulerConfig | None = None,
+        base_model_dir: str | None = None,
         max_steps: int = 0,
     ):
         parent = Path(output_dir)
@@ -194,6 +197,7 @@ class ColocateWeightBroadcast:
 
         # Reset ready_to_update
         from surogate.grpo.runs import get_multi_run_manager
+
         mrm = get_multi_run_manager()
         for idx in mrm.used_idxs:
             mrm.ready_to_update[idx] = False
@@ -224,6 +228,7 @@ class ColocateWeightBroadcast:
                 return int(p.name.split("_", 1)[1])
             except (IndexError, ValueError):
                 return -1
+
         step_dirs = sorted(self.broadcast_dir.iterdir(), key=_step_num)
         keep = self.max_async_level + 1
         to_remove = step_dirs[:-keep] if len(step_dirs) > keep else []

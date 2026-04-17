@@ -15,8 +15,8 @@ public:
     DeviceMemoryStack() = default;
     DeviceMemoryStack(std::byte* memory, std::size_t amount, int device_id);
 
-    std::byte* allocate(std::size_t amount, const char* name="<unnamed>");
-    Tensor allocate(ETensorDType dtype, const std::vector<long>& shape, const char* name="<unnamed>");
+    std::byte* allocate(std::size_t amount, const char* name = "<unnamed>");
+    Tensor allocate(ETensorDType dtype, const std::vector<long>& shape, const char* name = "<unnamed>");
 
     void free(std::byte* ptr);
     void free(Tensor& tensor);
@@ -45,8 +45,12 @@ public:
     };
     using AllocationList = std::vector<sAllocRecord>;
 
-    const AllocationList& get_high_mark() const { return mHighMark; }
-    void set_high_mark(const AllocationList& list) { mHighMark = list; }
+    const AllocationList& get_high_mark() const {
+        return mHighMark;
+    }
+    void set_high_mark(const AllocationList& list) {
+        mHighMark = list;
+    }
 
     std::vector<std::pair<std::string, long>> get_allocation_stats() const;
 
@@ -64,5 +68,4 @@ private:
     std::vector<sAllocRecord> mHighMark;
 };
 
-
-#endif //SUROGATE_SRC_UTILITIES_STACK_H
+#endif  //SUROGATE_SRC_UTILITIES_STACK_H

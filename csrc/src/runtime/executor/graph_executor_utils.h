@@ -77,11 +77,13 @@ void free_temps(ExecState& st);
 // Ensures temp_alloc returns the same addresses across graph replays by
 // saving/restoring the stack allocator state.
 // ---------------------------------------------------------------------------
-template<typename Function>
-inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStream_t stream,
-                                                    cudaGraphExec_t& instance, bool enabled,
-                                                    DeviceMemoryStack& stack,
-                                                    DeviceMemoryStack::Checkpoint& checkpoint) {
+template <typename Function>
+inline void trace_or_execute_cuda_graph_with_stack(Function&& function,
+                                                   cudaStream_t stream,
+                                                   cudaGraphExec_t& instance,
+                                                   bool enabled,
+                                                   DeviceMemoryStack& stack,
+                                                   DeviceMemoryStack::Checkpoint& checkpoint) {
     if (!enabled) {
         function();
         return;

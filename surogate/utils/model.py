@@ -1,8 +1,8 @@
 import math
 import re
-from typing import Optional
 
 from transformers import PretrainedConfig
+
 
 def estimate_model_parameters(config: PretrainedConfig) -> int:
     # Dense components
@@ -10,20 +10,20 @@ def estimate_model_parameters(config: PretrainedConfig) -> int:
 
     # Attention parameters (always dense)
     attn_params_per_layer = (
-            config.hidden_size * config.hidden_size * 3 +  # Q, K, V
-            config.hidden_size * config.hidden_size         # Output projection
+        config.hidden_size * config.hidden_size * 3  # Q, K, V
+        + config.hidden_size * config.hidden_size  # Output projection
     )
 
     # Normalization parameters
     norm_params_per_layer = config.hidden_size * 2  # Pre and post attention
 
     # FFN parameters
-    if getattr(config, 'use_moe', False):
+    if getattr(config, "use_moe", False):
         # MoE: gating + experts
         gate_params = config.hidden_size
         expert_params = (
-                                config.hidden_size * config.intermediate_size * 3  # Gate, up, down
-                        ) * config.num_experts
+            config.hidden_size * config.intermediate_size * 3  # Gate, up, down
+        ) * config.num_experts
         ffn_params_per_layer = gate_params + expert_params
     else:
         # Dense FFN
@@ -34,21 +34,22 @@ def estimate_model_parameters(config: PretrainedConfig) -> int:
 
     # Final components
     final_norm = config.hidden_size
-    lm_head = 0 if getattr(config, 'tie_word_embeddings', True) else config.vocab_size * config.hidden_size
+    lm_head = 0 if getattr(config, "tie_word_embeddings", True) else config.vocab_size * config.hidden_size
 
-    num_layers = getattr(config, 'num_layers', None) or getattr(config, 'num_hidden_layers', None) or 0
+    num_layers = getattr(config, "num_layers", None) or getattr(config, "num_hidden_layers", None) or 0
     return embed_params + (params_per_layer * num_layers) + final_norm + lm_head
 
+
 def recommend_training_params(
-    model_size_b: float,          # e.g., 4, 7, 8, 13, 70 (Billion params)
-    dataset_size: int,            # Number of training samples
-    quantization: str = "bf16",   # "4bit", "8bit", "bf16", "fp16"
-    seq_len: int = 4096,          # Context length
-    num_gpus: int = 1,            # Total GPUs available
-    vram_per_gpu_gb: int = 24,    # Memory per GPU (e.g., 24, 32, 40, 80)
+    model_size_b: float,  # e.g., 4, 7, 8, 13, 70 (Billion params)
+    dataset_size: int,  # Number of training samples
+    quantization: str = "bf16",  # "4bit", "8bit", "bf16", "fp16"
+    seq_len: int = 4096,  # Context length
+    num_gpus: int = 1,  # Total GPUs available
+    vram_per_gpu_gb: int = 24,  # Memory per GPU (e.g., 24, 32, 40, 80)
     offload_to_nvme: bool = False,
     nvme_path: str = "/tmp/deepspeed_offload",
-    conservative: bool = True,    # Use conservative estimates (recommended)
+    conservative: bool = True,  # Use conservative estimates (recommended)
 ):
     """
     Recommend training hyperparameters and DeepSpeed config based on hardware constraints.
@@ -144,7 +145,7 @@ def recommend_training_params(
 
     # Activation memory per sample (bytes), with gradient checkpointing
     # Key insight: attention scores scale as O(seq^2)
-    attn_mem_per_sample = num_heads * (seq_len ** 2) * 2 / 1e9  # GB
+    attn_mem_per_sample = num_heads * (seq_len**2) * 2 / 1e9  # GB
     hidden_mem_per_sample = seq_len * hidden_dim * 2 * 4 / 1e9  # GB (few layers kept)
 
     act_per_sample = attn_mem_per_sample + hidden_mem_per_sample
@@ -230,21 +231,19 @@ def recommend_training_params(
             "initial_scale_power": 16,
             "loss_scale_window": 1000,
             "hysteresis": 2,
-            "min_loss_scale": 1
+            "min_loss_scale": 1,
         },
-        "bf16": {
-            "enabled": quantization == "bf16"
-        },
+        "bf16": {"enabled": quantization == "bf16"},
         "zero_optimization": {
             "stage": ds_stage,
             "allgather_partitions": True,
-            "allgather_bucket_size": 1e7,   # 10MB - smaller to reduce peak memory
+            "allgather_bucket_size": 1e7,  # 10MB - smaller to reduce peak memory
             "overlap_comm": True,
             "reduce_scatter": True,
-            "reduce_bucket_size": 1e7,      # 10MB
+            "reduce_bucket_size": 1e7,  # 10MB
             "contiguous_gradients": True,
             "round_robin_gradients": True,
-        }
+        },
     }
 
     # --- Add offload settings if needed ---
@@ -263,13 +262,15 @@ def recommend_training_params(
 
     # --- Stage 3 specific settings (conservative) ---
     if ds_stage == 3:
-        ds_config["zero_optimization"].update({
-            "stage3_prefetch_bucket_size": 1e6,          # 1MB - very conservative
-            "stage3_param_persistence_threshold": 0,     # offload all params
-            "stage3_max_live_parameters": 5e7,           # 50M params max in GPU memory
-            "stage3_max_reuse_distance": 5e8,
-            "stage3_gather_16bit_weights_on_model_save": True,
-        })
+        ds_config["zero_optimization"].update(
+            {
+                "stage3_prefetch_bucket_size": 1e6,  # 1MB - very conservative
+                "stage3_param_persistence_threshold": 0,  # offload all params
+                "stage3_max_live_parameters": 5e7,  # 50M params max in GPU memory
+                "stage3_max_reuse_distance": 5e8,
+                "stage3_gather_16bit_weights_on_model_save": True,
+            }
+        )
 
     # --- Memory breakdown for debugging ---
     memory_breakdown = {
@@ -297,16 +298,16 @@ def recommend_training_params(
         "memory_breakdown": memory_breakdown,
     }
 
-def get_model_name(model_id_or_path: str) -> Optional[str]:
-    assert isinstance(model_id_or_path, str), f'model_id_or_path: {model_id_or_path}'
+
+def get_model_name(model_id_or_path: str) -> str | None:
+    assert isinstance(model_id_or_path, str), f"model_id_or_path: {model_id_or_path}"
     # compat hf hub
-    model_id_or_path = model_id_or_path.rstrip('/')
-    match_ = re.search('/models--.+?--(.+?)/snapshots/', model_id_or_path)
+    model_id_or_path = model_id_or_path.rstrip("/")
+    match_ = re.search("/models--.+?--(.+?)/snapshots/", model_id_or_path)
     if match_ is not None:
         return match_.group(1)
 
-    model_name = model_id_or_path.rsplit('/', 1)[-1]
+    model_name = model_id_or_path.rsplit("/", 1)[-1]
     # compat modelscope snapshot_download
-    model_name = model_name.replace('___', '.')
+    model_name = model_name.replace("___", ".")
     return model_name
-

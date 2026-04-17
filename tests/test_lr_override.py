@@ -5,18 +5,22 @@ import math
 
 import pytest
 
-from surogate.train.lr_schedule import LRSchedule
 from surogate.train.loss_guard import LossGuard
-
+from surogate.train.lr_schedule import LRSchedule
 
 # ---------------------------------------------------------------------------
 # LRSchedule override tests
 # ---------------------------------------------------------------------------
 
+
 def _make_schedule(**kwargs):
     defaults = dict(
-        base_lr=1e-3, max_steps=1000, warmup_steps=100,
-        cooldown_steps=100, final_lr=1e-5, schedule_type="cosine",
+        base_lr=1e-3,
+        max_steps=1000,
+        warmup_steps=100,
+        cooldown_steps=100,
+        final_lr=1e-5,
+        schedule_type="cosine",
     )
     defaults.update(kwargs)
     return LRSchedule(**defaults)
@@ -89,6 +93,7 @@ class TestLRScheduleOverride:
 # LossGuard escalation tests
 # ---------------------------------------------------------------------------
 
+
 class _FakeLogger:
     def __init__(self):
         self.warnings = []
@@ -106,10 +111,17 @@ def _make_guard(sched=None, **kwargs):
         sched = _make_schedule()
     logger = _FakeLogger()
     defaults = dict(
-        window=20, warmup=10, cooldown=5, max_reductions=3,
-        max_overrides=2, grace_period=50,
-        loss_std_mult=3.0, loss_abs_min=0.5,
-        grad_relative=10.0, grad_absolute=100.0, lr_factor=0.5,
+        window=20,
+        warmup=10,
+        cooldown=5,
+        max_reductions=3,
+        max_overrides=2,
+        grace_period=50,
+        loss_std_mult=3.0,
+        loss_abs_min=0.5,
+        grad_relative=10.0,
+        grad_absolute=100.0,
+        lr_factor=0.5,
     )
     defaults.update(kwargs)
     return LossGuard(sched, logger, **defaults), sched, logger
@@ -181,7 +193,7 @@ class TestLossGuardEscalation:
 
     def test_non_finite_triggers_reduction(self):
         guard, sched, logger = _make_guard()
-        guard.step(float('nan'), 1.0, 0)
+        guard.step(float("nan"), 1.0, 0)
         # Non-finite should still trigger (override or permanent)
         assert len(logger.warnings) == 1
 
@@ -194,9 +206,7 @@ class TestLossGuardEscalation:
         assert len(logger.warnings) == 1
 
     def test_max_reductions_respected(self):
-        guard, sched, logger = _make_guard(
-            max_overrides=0, max_reductions=2, cooldown=1
-        )
+        guard, sched, logger = _make_guard(max_overrides=0, max_reductions=2, cooldown=1)
         self._fill_history(guard, 15, loss=2.0, grad=1.0)
 
         # First permanent reduction

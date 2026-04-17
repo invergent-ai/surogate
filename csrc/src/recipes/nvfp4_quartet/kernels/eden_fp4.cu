@@ -14,11 +14,13 @@
 namespace quartet {
 
 // Standalone EDEN FP4 quantization kernel
-__global__ void eden_fp4_kernel(
-    __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr,
-    const nv_bfloat16* x_ptr, const float* amax_ptr,
-    float scale_override, std::uint64_t seed, int nvecs)
-{
+__global__ void eden_fp4_kernel(__nv_fp4x4_e2m1* y_ptr,
+                                __nv_fp8_e4m3* scale_ptr,
+                                const nv_bfloat16* x_ptr,
+                                const float* amax_ptr,
+                                float scale_override,
+                                std::uint64_t seed,
+                                int nvecs) {
     constexpr int HADAMARD_DIM = 128;
 
     using bf16x8 = GenericVector<nv_bfloat16, 8>;
@@ -27,7 +29,7 @@ __global__ void eden_fp4_kernel(
 
     float global_abs_max = *amax_ptr;
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if(idx >= nvecs) return;
+    if (idx >= nvecs) return;
 
     float scales_max = 255.99f;
     float val_max = 6.f / scale_override;
@@ -51,23 +53,24 @@ __global__ void eden_fp4_kernel(
     // Quantize to FP4 with RTN (not stochastic rounding)
     for (int k = 0; k < bf16x8::size; k += 2) {
         float2 src;
-        src.x = static_cast<float>(x[k+0]) * factor;
-        src.y = static_cast<float>(x[k+1]) * factor;
-        unsigned char bits = __nv_cvt_float2_to_fp4x2(src, __nv_fp4_interpretation_t::__NV_E2M1, cudaRoundMode::cudaRoundNearest);
-        result[k/2] = bits;
-        x_scaled[k+0] = src.x;
-        x_scaled[k+1] = src.y;
+        src.x = static_cast<float>(x[k + 0]) * factor;
+        src.y = static_cast<float>(x[k + 1]) * factor;
+        unsigned char bits =
+            __nv_cvt_float2_to_fp4x2(src, __nv_fp4_interpretation_t::__NV_E2M1, cudaRoundMode::cudaRoundNearest);
+        result[k / 2] = bits;
+        x_scaled[k + 0] = src.x;
+        x_scaled[k + 1] = src.y;
     }
 
     // Calculate EDEN correction factor: sum(x^2) / sum(x * q)
     float x_y = 0.f;
     float x_x = 0.f;
     for (int k = 0; k < bf16x8::size; k += 2) {
-        x_x += x_scaled[k+0] * x_scaled[k+0];
-        x_x += x_scaled[k+1] * x_scaled[k+1];
-        float2 cvt_back = __nv_cvt_fp4x2_to_float2(result[k/2]);
-        x_y += x_scaled[k+0] * cvt_back.x;
-        x_y += x_scaled[k+1] * cvt_back.y;
+        x_x += x_scaled[k + 0] * x_scaled[k + 0];
+        x_x += x_scaled[k + 1] * x_scaled[k + 1];
+        float2 cvt_back = __nv_cvt_fp4x2_to_float2(result[k / 2]);
+        x_y += x_scaled[k + 0] * cvt_back.x;
+        x_y += x_scaled[k + 1] * cvt_back.y;
     }
 
     // Reduce over hadamard dimension (128 elements = 16 threads * 8 elements)
@@ -93,18 +96,27 @@ __global__ void eden_fp4_kernel(
     result.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * idx);
 }
 
-void eden_fp4(
-    __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr,
-    const nv_bfloat16* x_ptr, const float* amax_ptr,
-    float scale_override, long seed, long nelem, cudaStream_t stream)
-{
+void eden_fp4(__nv_fp4x4_e2m1* y_ptr,
+              __nv_fp8_e4m3* scale_ptr,
+              const nv_bfloat16* x_ptr,
+              const float* amax_ptr,
+              float scale_override,
+              long seed,
+              long nelem,
+              cudaStream_t stream) {
     if (nelem % 8 != 0) {
         throw std::runtime_error("eden_fp4: nelem must be divisible by 8");
     }
     int n_vecs = nelem / 8;
     int block_size = 256;
     int n_blocks = (n_vecs + block_size - 1) / block_size;
-    eden_fp4_kernel<<<n_blocks, block_size, 0, stream>>>(y_ptr, scale_ptr, x_ptr, amax_ptr, scale_override, seed, n_vecs);
+    eden_fp4_kernel<<<n_blocks, block_size, 0, stream>>>(y_ptr,
+                                                         scale_ptr,
+                                                         x_ptr,
+                                                         amax_ptr,
+                                                         scale_override,
+                                                         seed,
+                                                         n_vecs);
     QUARTET_CUDA_CHECK(cudaGetLastError());
 }
 

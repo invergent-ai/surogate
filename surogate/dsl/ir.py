@@ -10,20 +10,18 @@ The Schedule IR is produced by the scheduling phase for execution.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Union, Set, Tuple
 from enum import Enum, auto
+from typing import Any
 
 from .types import (
     Dtype,
-    Shape,
-    TensorTypeSpec,
-    MemoryMode,
-    HookPoint,
     HookMode,
+    HookPoint,
+    MemoryMode,
+    Shape,
     ShardStrategy,
-    TransposeMode,
+    TensorTypeSpec,
 )
-
 
 # =============================================================================
 # Kernel Types (Operations)
@@ -115,7 +113,7 @@ class TensorRef:
 
     name: str
     dtype: Dtype = Dtype.BF16
-    shape: Optional[Shape] = None
+    shape: Shape | None = None
     is_param: bool = False  # True if this is a weight/parameter
     is_input: bool = False  # True if this is a graph input
     is_output: bool = False  # True if this is a graph output
@@ -133,23 +131,23 @@ class OpNode:
     name: str  # Operation name (for debugging)
 
     # Inputs and outputs
-    inputs: List[str]  # Names of input tensors
-    outputs: List[str]  # Names of output tensors
+    inputs: list[str]  # Names of input tensors
+    outputs: list[str]  # Names of output tensors
 
     # Operation attributes
-    attrs: Dict[str, Any] = field(default_factory=dict)
+    attrs: dict[str, Any] = field(default_factory=dict)
 
     # Annotations from DSL
     memory_mode: MemoryMode = MemoryMode.TEMPORARY
-    hook_point: Optional[HookPoint] = None
-    hook_mode: Optional[HookMode] = None
-    shard_strategy: Optional[ShardStrategy] = None
+    hook_point: HookPoint | None = None
+    hook_mode: HookMode | None = None
+    shard_strategy: ShardStrategy | None = None
 
     # Layer index (for multi-layer models)
-    layer_idx: Optional[int] = None
+    layer_idx: int | None = None
 
     # Source location (for debugging)
-    source_loc: Optional[str] = None
+    source_loc: str | None = None
 
     def __str__(self) -> str:
         inputs_str = ", ".join(self.inputs)
@@ -178,34 +176,34 @@ class GraphIR:
     name: str
 
     # Tensors
-    inputs: Dict[str, TensorRef] = field(default_factory=dict)
-    outputs: Dict[str, TensorRef] = field(default_factory=dict)
-    params: Dict[str, TensorRef] = field(default_factory=dict)
-    intermediates: Dict[str, TensorRef] = field(default_factory=dict)
+    inputs: dict[str, TensorRef] = field(default_factory=dict)
+    outputs: dict[str, TensorRef] = field(default_factory=dict)
+    params: dict[str, TensorRef] = field(default_factory=dict)
+    intermediates: dict[str, TensorRef] = field(default_factory=dict)
 
     # Operations (nodes in topological order)
-    nodes: List[OpNode] = field(default_factory=list)
+    nodes: list[OpNode] = field(default_factory=list)
 
     # Edges (explicit data flow)
-    edges: List[Edge] = field(default_factory=list)
+    edges: list[Edge] = field(default_factory=list)
 
     # Saved tensors for backward
-    save_list: List[str] = field(default_factory=list)
+    save_list: list[str] = field(default_factory=list)
 
     # Recompute list
-    recompute_list: List[str] = field(default_factory=list)
+    recompute_list: list[str] = field(default_factory=list)
 
     # Metadata
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def get_node(self, node_id: str) -> Optional[OpNode]:
+    def get_node(self, node_id: str) -> OpNode | None:
         """Get node by ID."""
         for node in self.nodes:
             if node.id == node_id:
                 return node
         return None
 
-    def get_tensor(self, name: str) -> Optional[TensorRef]:
+    def get_tensor(self, name: str) -> TensorRef | None:
         """Get tensor reference by name."""
         if name in self.inputs:
             return self.inputs[name]
@@ -217,11 +215,11 @@ class GraphIR:
             return self.intermediates[name]
         return None
 
-    def topological_sort(self) -> List[OpNode]:
+    def topological_sort(self) -> list[OpNode]:
         """Return nodes in topological order."""
         # Build dependency graph
-        deps: Dict[str, Set[str]] = {node.id: set() for node in self.nodes}
-        tensor_producer: Dict[str, str] = {}
+        deps: dict[str, set[str]] = {node.id: set() for node in self.nodes}
+        tensor_producer: dict[str, str] = {}
 
         for node in self.nodes:
             for out in node.outputs:
@@ -257,9 +255,9 @@ class BufferKind(Enum):
     """Kind of buffer in Schedule IR."""
 
     ACTIVATION = auto()  # Activation tensor
-    GRADIENT = auto()    # Gradient tensor
-    WEIGHT = auto()      # Model parameter
-    WORKSPACE = auto()   # Temporary workspace
+    GRADIENT = auto()  # Gradient tensor
+    WEIGHT = auto()  # Model parameter
+    WORKSPACE = auto()  # Temporary workspace
 
 
 @dataclass
@@ -273,10 +271,10 @@ class BufferDecl:
 
     # Lifetime information
     lifetime_start: int = 0  # First op index using this buffer
-    lifetime_end: int = -1   # Last op index using this buffer
+    lifetime_end: int = -1  # Last op index using this buffer
 
     # Aliasing
-    aliases: List[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
     alias_offset: int = 0  # Offset into aliased buffer
 
 
@@ -293,8 +291,8 @@ class SyncKind(Enum):
     """Kind of synchronization point."""
 
     STREAM_SYNC = auto()  # CUDA stream synchronization
-    NCCL_WAIT = auto()    # NCCL communication wait
-    EVENT_WAIT = auto()   # CUDA event wait
+    NCCL_WAIT = auto()  # NCCL communication wait
+    EVENT_WAIT = auto()  # CUDA event wait
 
 
 @dataclass
@@ -303,15 +301,15 @@ class SyncPoint:
 
     after_op: int  # Operation index after which to sync
     kind: SyncKind
-    comm_group: Optional[str] = None
+    comm_group: str | None = None
 
 
 class StreamAssignment(Enum):
     """CUDA stream assignment for operations."""
 
     COMPUTE = auto()  # Main compute stream
-    NCCL = auto()     # NCCL communication stream
-    COPY = auto()     # Memory copy stream
+    NCCL = auto()  # NCCL communication stream
+    COPY = auto()  # Memory copy stream
     OVERLAP = auto()  # Overlap stream for async ops
 
 
@@ -320,8 +318,8 @@ class RecomputeSegment:
     """Segment of operations to recompute."""
 
     start_op: int  # First op to recompute
-    end_op: int    # Last op to recompute
-    frontier_buffers: List[str]  # Buffers available at start
+    end_op: int  # Last op to recompute
+    frontier_buffers: list[str]  # Buffers available at start
 
 
 @dataclass
@@ -333,21 +331,21 @@ class ScheduledOp:
     kernel_type: KernelType
 
     # Buffer references
-    inputs: List[BufferRef]
-    outputs: List[BufferRef]
+    inputs: list[BufferRef]
+    outputs: list[BufferRef]
 
     # Scheduling info
     stream: StreamAssignment = StreamAssignment.COMPUTE
 
     # Recompute info (if this op is part of recompute)
-    recompute: Optional[RecomputeSegment] = None
+    recompute: RecomputeSegment | None = None
 
     # Original node info
-    original_node_id: Optional[str] = None
-    layer_idx: Optional[int] = None
+    original_node_id: str | None = None
+    layer_idx: int | None = None
 
     # Hook info
-    hook_point: Optional[HookPoint] = None
+    hook_point: HookPoint | None = None
 
 
 @dataclass
@@ -360,26 +358,26 @@ class ScheduleIR:
     name: str
 
     # Buffers
-    buffers: Dict[str, BufferDecl] = field(default_factory=dict)
+    buffers: dict[str, BufferDecl] = field(default_factory=dict)
 
     # Scheduled operations
-    ops: List[ScheduledOp] = field(default_factory=list)
+    ops: list[ScheduledOp] = field(default_factory=list)
 
     # Synchronization points
-    sync_points: List[SyncPoint] = field(default_factory=list)
+    sync_points: list[SyncPoint] = field(default_factory=list)
 
     # Activation layout (generated struct)
-    activation_struct: Dict[str, Tuple[int, int, Dtype]] = field(default_factory=dict)
+    activation_struct: dict[str, tuple[int, int, Dtype]] = field(default_factory=dict)
     total_activation_size: int = 0
 
     # Gradient layout
-    gradient_struct: Dict[str, Tuple[int, int, Dtype]] = field(default_factory=dict)
+    gradient_struct: dict[str, tuple[int, int, Dtype]] = field(default_factory=dict)
     total_gradient_size: int = 0
 
     # Weight mapping (name -> buffer)
-    weight_mapping: Dict[str, str] = field(default_factory=dict)
+    weight_mapping: dict[str, str] = field(default_factory=dict)
 
-    def compute_memory_usage(self) -> Dict[str, int]:
+    def compute_memory_usage(self) -> dict[str, int]:
         """Compute memory usage by category."""
         usage = {
             "activations": 0,
@@ -413,28 +411,28 @@ class ModuleIR:
     name: str
 
     # Module parameters
-    params: List[TensorRef] = field(default_factory=list)
-    config: Dict[str, Any] = field(default_factory=dict)
+    params: list[TensorRef] = field(default_factory=list)
+    config: dict[str, Any] = field(default_factory=dict)
 
     # Forward graph
-    forward_graph: Optional[GraphIR] = None
+    forward_graph: GraphIR | None = None
 
     # Backward graph (if defined)
-    backward_graph: Optional[GraphIR] = None
+    backward_graph: GraphIR | None = None
 
     # Scheduled versions (after scheduling phase)
-    forward_schedule: Optional[ScheduleIR] = None
-    backward_schedule: Optional[ScheduleIR] = None
+    forward_schedule: ScheduleIR | None = None
+    backward_schedule: ScheduleIR | None = None
 
     # HuggingFace mapping
-    hf_weight_mapping: Dict[str, Any] = field(default_factory=dict)
-    hf_export_mapping: Dict[str, Any] = field(default_factory=dict)
-    hf_config_mapping: Dict[str, Any] = field(default_factory=dict)
+    hf_weight_mapping: dict[str, Any] = field(default_factory=dict)
+    hf_export_mapping: dict[str, Any] = field(default_factory=dict)
+    hf_config_mapping: dict[str, Any] = field(default_factory=dict)
 
     # Metadata
     is_block: bool = False
     is_model: bool = False
-    extends: Optional[str] = None
+    extends: str | None = None
 
 
 # =============================================================================
@@ -447,19 +445,19 @@ class CompilationContext:
     """Context for IR compilation/lowering."""
 
     # Symbol table (name -> type)
-    symbols: Dict[str, TensorTypeSpec] = field(default_factory=dict)
+    symbols: dict[str, TensorTypeSpec] = field(default_factory=dict)
 
     # Module parameters (resolved values)
-    module_params: Dict[str, Any] = field(default_factory=dict)
+    module_params: dict[str, Any] = field(default_factory=dict)
 
     # Current layer index (for block instantiation)
-    layer_idx: Optional[int] = None
+    layer_idx: int | None = None
 
     # Imported modules
-    imports: Dict[str, "ModuleIR"] = field(default_factory=dict)
+    imports: dict[str, "ModuleIR"] = field(default_factory=dict)
 
     # Standard library primitives
-    primitives: Dict[str, "PrimitiveSpec"] = field(default_factory=dict)
+    primitives: dict[str, "PrimitiveSpec"] = field(default_factory=dict)
 
     # Counter for generating unique node IDs
     _node_counter: int = 0
@@ -469,7 +467,7 @@ class CompilationContext:
         self._node_counter += 1
         return f"node_{self._node_counter}"
 
-    def resolve_symbol(self, name: str) -> Optional[TensorTypeSpec]:
+    def resolve_symbol(self, name: str) -> TensorTypeSpec | None:
         """Resolve a symbol to its type."""
         return self.symbols.get(name)
 
@@ -486,18 +484,18 @@ class PrimitiveSpec:
     kernel_type: KernelType
 
     # IO specification
-    input_types: Dict[str, TensorTypeSpec] = field(default_factory=dict)
-    output_types: Dict[str, TensorTypeSpec] = field(default_factory=dict)
+    input_types: dict[str, TensorTypeSpec] = field(default_factory=dict)
+    output_types: dict[str, TensorTypeSpec] = field(default_factory=dict)
 
     # Default attributes
-    default_attrs: Dict[str, Any] = field(default_factory=dict)
+    default_attrs: dict[str, Any] = field(default_factory=dict)
 
     # What to save for backward
-    save: List[str] = field(default_factory=list)
+    save: list[str] = field(default_factory=list)
 
     # Backward specification
-    backward_kernel: Optional[KernelType] = None
+    backward_kernel: KernelType | None = None
 
     # Implementation
-    forward_impl: Optional[str] = None
-    backward_impl: Optional[str] = None
+    forward_impl: str | None = None
+    backward_impl: str | None = None

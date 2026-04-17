@@ -38,8 +38,7 @@ void nccl_check(ncclResult_t status, const char* file, int line) {
 }
 #define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
 
-struct NCCLCommunicator::CommandBuffer
-{
+struct NCCLCommunicator::CommandBuffer {
     struct Gather {
         std::byte* Src;
         std::byte* Dst;
@@ -51,7 +50,6 @@ struct NCCLCommunicator::CommandBuffer
         std::byte* Tensor;
         std::size_t Elements;
     };
-
 
     struct Send {
         const std::byte* Tensor;
@@ -88,9 +86,12 @@ struct NCCLCommunicator::CommandBuffer
  *
  * @throws std::runtime_error If NCCL initialization fails.
  */
-NCCLCommunicator::NCCLCommunicator(int rank, int world, const void* nccl_id, int local_device) :
-    mRank(rank), mWorld(world), mLocalRank(local_device >= 0 ? local_device : rank), mNcclComm(nullptr), mCmdBuf(std::make_unique<CommandBuffer>())
-{
+NCCLCommunicator::NCCLCommunicator(int rank, int world, const void* nccl_id, int local_device)
+    : mRank(rank),
+      mWorld(world),
+      mLocalRank(local_device >= 0 ? local_device : rank),
+      mNcclComm(nullptr),
+      mCmdBuf(std::make_unique<CommandBuffer>()) {
     // Use local_device for CUDA device selection (supports multi-node where device != global rank)
     CUDA_CHECK(cudaSetDevice(mLocalRank));
     ncclCheck(ncclCommInitRank(&mNcclComm, mWorld, *reinterpret_cast<const ncclUniqueId*>(nccl_id), mRank));
@@ -115,9 +116,7 @@ NCCLCommunicator::~NCCLCommunicator() {
     // I haven't found a fix, so here we just make sure that the hang gets localized
     // to a helper thread (which we leak, but generally ~NCCLCommunicator is expected
     // to run at program shutdown anyway)
-    auto terminate_future = std::async(std::launch::async, [this]() {
-        this->terminate_nccl();
-    });
+    auto terminate_future = std::async(std::launch::async, [this]() { this->terminate_nccl(); });
 
     if (terminate_future.wait_for(std::chrono::seconds(2)) == std::future_status::timeout) {
         fprintf(stderr, "NCCL termination timed out, detaching\n");
@@ -184,9 +183,18 @@ void NCCLCommunicator::terminate_nccl() {
         ncclCheck(ncclCommFinalize(mNcclComm));
         ncclCheck(ncclCommDestroy(mNcclComm));
     } else {
-        if (mWeightTransferComm) { ncclCommAbort(mWeightTransferComm); mWeightTransferComm = nullptr; }
-        if (mDPComm) { ncclCommAbort(mDPComm); mDPComm = nullptr; }
-        if (mEPComm) { ncclCommAbort(mEPComm); mEPComm = nullptr; }
+        if (mWeightTransferComm) {
+            ncclCommAbort(mWeightTransferComm);
+            mWeightTransferComm = nullptr;
+        }
+        if (mDPComm) {
+            ncclCommAbort(mDPComm);
+            mDPComm = nullptr;
+        }
+        if (mEPComm) {
+            ncclCommAbort(mEPComm);
+            mEPComm = nullptr;
+        }
         ncclCheck(ncclCommAbort(mNcclComm));
     }
 }
@@ -239,14 +247,11 @@ struct NCCLCommunicator::CommandVisitor {
      */
     void operator()(CommandBuffer::ScatterReduce& cmd) const {
         switch (cmd.DType) {
-        case ETensorDType::FP32:
-            Comm->scatter_grad(reinterpret_cast<float*>(cmd.Tensor), cmd.Elements);
-            break;
-        case ETensorDType::BF16:
-            Comm->scatter_grad(reinterpret_cast<nv_bfloat16*>(cmd.Tensor), cmd.Elements);
-            break;
-        default:
-            throw std::runtime_error("scatter: Unsupported dtype");
+            case ETensorDType::FP32: Comm->scatter_grad(reinterpret_cast<float*>(cmd.Tensor), cmd.Elements); break;
+            case ETensorDType::BF16:
+                Comm->scatter_grad(reinterpret_cast<nv_bfloat16*>(cmd.Tensor), cmd.Elements);
+                break;
+            default: throw std::runtime_error("scatter: Unsupported dtype");
         }
     }
 
@@ -275,7 +280,6 @@ struct NCCLCommunicator::CommandVisitor {
     void operator()(CommandBuffer::AllReduce& cmd) const {
         Comm->all_reduce_avg_impl(cmd.Tensor, cmd.Elements, cmd.DType);
     }
-
 };
 
 /**
@@ -307,12 +311,11 @@ struct NCCLCommunicator::CommandVisitor {
  */
 void NCCLCommunicator::execute_transaction(cudaEvent_t signal) {
     // Check if this transaction contains NCCL collective operations that require throttling
-    bool has_collectives = std::any_of(mCmdBuf->Commands.begin(), mCmdBuf->Commands.end(),
-        [](const auto& cmd) {
-            return std::holds_alternative<CommandBuffer::ScatterReduce>(cmd) ||
-                   std::holds_alternative<CommandBuffer::Gather>(cmd) ||
-                   std::holds_alternative<CommandBuffer::AllReduce>(cmd);
-        });
+    bool has_collectives = std::any_of(mCmdBuf->Commands.begin(), mCmdBuf->Commands.end(), [](const auto& cmd) {
+        return std::holds_alternative<CommandBuffer::ScatterReduce>(cmd) ||
+               std::holds_alternative<CommandBuffer::Gather>(cmd) ||
+               std::holds_alternative<CommandBuffer::AllReduce>(cmd);
+    });
 
     // Synchronize CPU threads before enqueuing collective operations
     if (has_collectives) {
@@ -322,7 +325,7 @@ void NCCLCommunicator::execute_transaction(cudaEvent_t signal) {
     on_execute_transaction(*mCmdBuf);
 
     CommandVisitor visitor{this};
-    for (auto& cmd: mCmdBuf->Commands) {
+    for (auto& cmd : mCmdBuf->Commands) {
         std::visit(visitor, cmd);
     }
 
@@ -348,7 +351,8 @@ void NCCLCommunicator::schedule_reduce_scatter(Tensor& tensor) {
         throw std::runtime_error("scatter: Source tensor is null");
     }
 
-    mCmdBuf->Commands.emplace_back(CommandBuffer::ScatterReduce{.DType = tensor.DType, .Tensor = tensor.Data, .Elements = tensor.nelem()});
+    mCmdBuf->Commands.emplace_back(
+        CommandBuffer::ScatterReduce{.DType = tensor.DType, .Tensor = tensor.Data, .Elements = tensor.nelem()});
 }
 
 /**
@@ -369,7 +373,10 @@ void NCCLCommunicator::schedule_all_gather(const TensorShard& src, Tensor& tgt) 
     }
 
     if (src.DType != tgt.DType) {
-        fprintf(stderr, "[DEBUG] all_gather dtype mismatch: src.DType=%d tgt.DType=%d\n", (int)src.DType, (int)tgt.DType);
+        fprintf(stderr,
+                "[DEBUG] all_gather dtype mismatch: src.DType=%d tgt.DType=%d\n",
+                (int)src.DType,
+                (int)tgt.DType);
         throw std::runtime_error("gather: Mismatched dtypes");
     }
 
@@ -388,7 +395,8 @@ void NCCLCommunicator::schedule_all_reduce_avg(Tensor& tensor) {
         throw std::runtime_error("schedule_all_reduce_avg: Tensor is null");
     }
 
-    mCmdBuf->Commands.emplace_back(CommandBuffer::AllReduce{.DType = tensor.DType, .Tensor = tensor.Data, .Elements = tensor.nelem()});
+    mCmdBuf->Commands.emplace_back(
+        CommandBuffer::AllReduce{.DType = tensor.DType, .Tensor = tensor.Data, .Elements = tensor.nelem()});
 }
 
 /**
@@ -465,8 +473,8 @@ void NCCLCommunicator::init_ep_groups(int ep_size) {
     }
 
     if (mWorld % ep_size != 0) {
-        throw std::runtime_error(fmt::format(
-            "init_ep_groups: ep_size ({}) must divide world_size ({})", ep_size, mWorld));
+        throw std::runtime_error(
+            fmt::format("init_ep_groups: ep_size ({}) must divide world_size ({})", ep_size, mWorld));
     }
 
     mEPSize = ep_size;
@@ -514,8 +522,11 @@ void NCCLCommunicator::init_ep_groups(int ep_size) {
     ncclCheck(ncclCommInitRank(&mWeightTransferComm, mEPSize, wt_id, mEPRank));
 
     if (mRank == 0) {
-        fprintf(stderr, "[EP] Initialized EP groups: ep_size=%d, dp_size=%d, world_size=%d\n",
-                mEPSize, mDPSize, mWorld);
+        fprintf(stderr,
+                "[EP] Initialized EP groups: ep_size=%d, dp_size=%d, world_size=%d\n",
+                mEPSize,
+                mDPSize,
+                mWorld);
     }
 }
 
@@ -532,9 +543,12 @@ void NCCLCommunicator::init_ep_groups(int ep_size) {
  * @param elem_size Size of each element in bytes.
  * @param stream CUDA stream for the NCCL operations.
  */
-void NCCLCommunicator::all_to_all_single(const std::byte* send, std::byte* recv,
-                                          const int* send_splits, const int* recv_splits,
-                                          int elem_size, cudaStream_t stream) {
+void NCCLCommunicator::all_to_all_single(const std::byte* send,
+                                         std::byte* recv,
+                                         const int* send_splits,
+                                         const int* recv_splits,
+                                         int elem_size,
+                                         cudaStream_t stream) {
     if (!mEPComm) {
         throw std::runtime_error("all_to_all_single: EP comm not initialized (call init_ep_groups first)");
     }
@@ -585,19 +599,12 @@ void NCCLCommunicator::all_reduce_avg_dp(Tensor& tensor, cudaStream_t stream) {
 
     ncclDataType_t nccl_dtype;
     switch (tensor.DType) {
-        case ETensorDType::FP32:
-            nccl_dtype = ncclFloat;
-            break;
-        case ETensorDType::BF16:
-            nccl_dtype = ncclBfloat16;
-            break;
-        case ETensorDType::FP16:
-            nccl_dtype = ncclFloat16;
-            break;
+        case ETensorDType::FP32: nccl_dtype = ncclFloat; break;
+        case ETensorDType::BF16: nccl_dtype = ncclBfloat16; break;
+        case ETensorDType::FP16: nccl_dtype = ncclFloat16; break;
         default:
-            throw std::runtime_error(fmt::format(
-                "NCCLCommunicator::all_reduce_avg_dp: unsupported tensor dtype {}",
-                dtype_to_str(tensor.DType)));
+            throw std::runtime_error(fmt::format("NCCLCommunicator::all_reduce_avg_dp: unsupported tensor dtype {}",
+                                                 dtype_to_str(tensor.DType)));
     }
 
     ncclCheck(ncclAllReduce(tensor.Data, tensor.Data, tensor.nelem(), nccl_dtype, ncclAvg, mDPComm, stream));
@@ -641,24 +648,17 @@ void NCCLCommunicator::weight_transfer_group_end() {
  * @throws std::runtime_error if tensor dtype is not supported.
  */
 void NCCLCommunicator::all_reduce_avg(Tensor& tensor, cudaStream_t stream) {
-    if (mWorld == 1) return; // No-op for single GPU
+    if (mWorld == 1) return;  // No-op for single GPU
 
     ncclDataType_t nccl_dtype;
     switch (tensor.DType) {
-        case ETensorDType::FP32:
-            nccl_dtype = ncclFloat;
-            break;
-        case ETensorDType::BF16:
-            nccl_dtype = ncclBfloat16;
-            break;
-        case ETensorDType::FP16:
-            nccl_dtype = ncclFloat16;
-            break;
+        case ETensorDType::FP32: nccl_dtype = ncclFloat; break;
+        case ETensorDType::BF16: nccl_dtype = ncclBfloat16; break;
+        case ETensorDType::FP16: nccl_dtype = ncclFloat16; break;
         default:
             fprintf(stderr, "[DEBUG] all_reduce_avg ERROR: unsupported dtype %d\n", (int)tensor.DType);
-            throw std::runtime_error(fmt::format(
-                "NCCLCommunicator::all_reduce_avg: unsupported tensor dtype {}",
-                dtype_to_str(tensor.DType)));
+            throw std::runtime_error(fmt::format("NCCLCommunicator::all_reduce_avg: unsupported tensor dtype {}",
+                                                 dtype_to_str(tensor.DType)));
     }
 
     ncclCheck(ncclAllReduce(tensor.Data, tensor.Data, tensor.nelem(), nccl_dtype, ncclAvg, mNcclComm, stream));
@@ -678,19 +678,12 @@ void NCCLCommunicator::all_reduce_avg(Tensor& tensor, cudaStream_t stream) {
 void NCCLCommunicator::all_reduce_avg_impl(std::byte* data, std::size_t elements, ETensorDType dtype) {
     ncclDataType_t nccl_dtype;
     switch (dtype) {
-        case ETensorDType::FP32:
-            nccl_dtype = ncclFloat;
-            break;
-        case ETensorDType::BF16:
-            nccl_dtype = ncclBfloat16;
-            break;
-        case ETensorDType::FP16:
-            nccl_dtype = ncclFloat16;
-            break;
+        case ETensorDType::FP32: nccl_dtype = ncclFloat; break;
+        case ETensorDType::BF16: nccl_dtype = ncclBfloat16; break;
+        case ETensorDType::FP16: nccl_dtype = ncclFloat16; break;
         default:
-            throw std::runtime_error(fmt::format(
-                "NCCLCommunicator::all_reduce_avg_impl: unsupported dtype {}",
-                static_cast<int>(dtype)));
+            throw std::runtime_error(
+                fmt::format("NCCLCommunicator::all_reduce_avg_impl: unsupported dtype {}", static_cast<int>(dtype)));
     }
 
     ncclCheck(ncclAllReduce(data, data, elements, nccl_dtype, ncclAvg, mNcclComm, mCommsStream));
@@ -708,12 +701,7 @@ void NCCLCommunicator::scatter_grad(float* value, std::size_t size) {
     assert(size % mWorld == 0);
     size_t shard_size = size / mWorld;
     ptrdiff_t shard_offset = (ptrdiff_t)shard_size * mRank;
-    ncclCheck(ncclReduceScatter(
-        value, value + shard_offset,
-        shard_size,
-        ncclFloat, ncclAvg,
-        mNcclComm, mCommsStream
-    ));
+    ncclCheck(ncclReduceScatter(value, value + shard_offset, shard_size, ncclFloat, ncclAvg, mNcclComm, mCommsStream));
 }
 
 /**
@@ -728,12 +716,8 @@ void NCCLCommunicator::scatter_grad(nv_bfloat16* value, std::size_t size) {
     assert(size % mWorld == 0);
     size_t shard_size = size / mWorld;
     ptrdiff_t shard_offset = (ptrdiff_t)shard_size * mRank;
-    ncclCheck(ncclReduceScatter(
-        value, value + shard_offset,
-        shard_size,
-        ncclBfloat16, ncclAvg,
-        mNcclComm, mCommsStream
-    ));
+    ncclCheck(
+        ncclReduceScatter(value, value + shard_offset, shard_size, ncclBfloat16, ncclAvg, mNcclComm, mCommsStream));
 }
 
 /**
@@ -745,16 +729,13 @@ void NCCLCommunicator::scatter_grad(nv_bfloat16* value, std::size_t size) {
  *
  * @note If @p src == @p dst, performs an in-place all-gather by offsetting @p src to the local shard.
  */
-void NCCLCommunicator::gather_weight(const std::byte* src, std::byte* dst,  std::size_t size) {
+void NCCLCommunicator::gather_weight(const std::byte* src, std::byte* dst, std::size_t size) {
     assert(size % mWorld == 0);
     size_t shard_size = size / mWorld;
-    if(src == dst) {
-        src += shard_size * mRank; // in-place
+    if (src == dst) {
+        src += shard_size * mRank;  // in-place
     }
-    ncclCheck(ncclAllGather(src,
-                            dst,
-                            shard_size, ncclInt8,
-                            mNcclComm, mCommsStream));
+    ncclCheck(ncclAllGather(src, dst, shard_size, ncclInt8, mNcclComm, mCommsStream));
 }
 
 /**
@@ -798,21 +779,14 @@ void NCCLCommunicator::wait_on_comms(cudaStream_t compute_stream) {
  */
 void NCCLCommunicator::schedule_destructive_all_to_all(const Tensor& tensor) {
     std::size_t shard_size = (ptrdiff_t)tensor.bytes() / world_size();
-    for(int n = 1; n < world_size(); ++n) {
+    for (int n = 1; n < world_size(); ++n) {
         int dst = (n + rank()) % world_size();
         int src = (rank() - n + world_size()) % world_size();
         int store = (rank() + n - 1 + world_size()) % world_size();
-        mCmdBuf->Commands.emplace_back(CommandBuffer::Send{
-            .Tensor = tensor.Data + dst * shard_size,
-            .Bytes = shard_size,
-            .Target = dst
-            }
-            );
-        mCmdBuf->Commands.emplace_back(CommandBuffer::Recv{
-            .Tensor = tensor.Data + store * shard_size,
-            .Bytes = shard_size,
-            .Source = src
-        });
+        mCmdBuf->Commands.emplace_back(
+            CommandBuffer::Send{.Tensor = tensor.Data + dst * shard_size, .Bytes = shard_size, .Target = dst});
+        mCmdBuf->Commands.emplace_back(
+            CommandBuffer::Recv{.Tensor = tensor.Data + store * shard_size, .Bytes = shard_size, .Source = src});
     }
 }
 
@@ -834,21 +808,21 @@ class NCCLCommunicatorImpl : public NCCLCommunicator {
 public:
     struct SharedState {
         std::unique_ptr<std::barrier<>> Barrier;
-        std::vector<std::byte*> Buffer;     // one pointer per thread
+        std::vector<std::byte*> Buffer;  // one pointer per thread
         std::vector<std::exception_ptr> Exceptions;
         std::mutex Mutex;
-        int NumNodes = 1;                   // number of nodes (1 = single node)
-        int NodeRank = 0;                   // this node's rank
-        int LocalGPUs = 0;                  // GPUs per node
+        int NumNodes = 1;   // number of nodes (1 = single node)
+        int NodeRank = 0;   // this node's rank
+        int LocalGPUs = 0;  // GPUs per node
 
         // GPU staging buffers for host gather/all-gather in multi-node mode (Ray)
         // Allocated once at init, reused for all operations
-        void* d_gather_send = nullptr;      // size = kMaxGatherObjectSize * LocalGPUs
-        void* d_gather_recv = nullptr;      // size = kMaxGatherObjectSize * world_size
+        void* d_gather_send = nullptr;  // size = kMaxGatherObjectSize * LocalGPUs
+        void* d_gather_recv = nullptr;  // size = kMaxGatherObjectSize * world_size
         static constexpr size_t kMaxGatherObjectSize = 4096;
 
         // Device buffer for NCCL barrier (ncclAllReduce requires device memory)
-        char* d_barrier_buf = nullptr;      // 1 byte for barrier AllReduce
+        char* d_barrier_buf = nullptr;  // 1 byte for barrier AllReduce
 
         // Node master NCCL communicator for cross-node operations in Ray mode
         ncclComm_t NodeMasterComm = nullptr;
@@ -872,9 +846,13 @@ public:
      * @param nccl_id Pointer to shared ncclUniqueId used for ncclCommInitRank.
      * @param state Shared synchronization/exchange state shared by all local ranks.
      */
-    NCCLCommunicatorImpl(int local_rank, int global_rank, int global_world,
-                         bool memcpy_allgather, bool memcpy_send_recv,
-                         const void* nccl_id, std::shared_ptr<SharedState> state);
+    NCCLCommunicatorImpl(int local_rank,
+                         int global_rank,
+                         int global_world,
+                         bool memcpy_allgather,
+                         bool memcpy_send_recv,
+                         const void* nccl_id,
+                         std::shared_ptr<SharedState> state);
 
     /**
      * @brief Drops out of the shared barrier on destruction (if present).
@@ -886,9 +864,15 @@ public:
      */
     void barrier() override;
 
-    int num_nodes() const override { return mShare->NumNodes; }
-    int node_rank() const override { return mShare->NodeRank; }
-    int num_local_gpus() const override { return mShare->LocalGPUs; }
+    int num_nodes() const override {
+        return mShare->NumNodes;
+    }
+    int node_rank() const override {
+        return mShare->NodeRank;
+    }
+    int num_local_gpus() const override {
+        return mShare->LocalGPUs;
+    }
 
     /**
      * @brief Throttle launch queue by synchronizing local CPU threads.
@@ -930,13 +914,16 @@ public:
      */
     void on_finish_transaction(cudaEvent_t signal) override;
 
-    [[nodiscard]] int local_rank() const { return mLocalRank; }
-    [[nodiscard]] bool is_node_master() const { return mLocalRank == 0; }
+    [[nodiscard]] int local_rank() const {
+        return mLocalRank;
+    }
+    [[nodiscard]] bool is_node_master() const {
+        return mLocalRank == 0;
+    }
 
     void local_barrier() override;
 
 private:
-
     std::shared_ptr<SharedState> mShare;
     int mLocalRank;
     bool mAllGatherUseMemcpy = false;
@@ -962,20 +949,23 @@ private:
     std::vector<sRecvParams> mRecvParams;
 };
 
-NCCLCommunicatorImpl::NCCLCommunicatorImpl(
-    int local_rank, int global_rank, int global_world,
-    bool memcpy_allgather, bool memcpy_send_recv,
-    const void* nccl_id, std::shared_ptr<SharedState> state)
+NCCLCommunicatorImpl::NCCLCommunicatorImpl(int local_rank,
+                                           int global_rank,
+                                           int global_world,
+                                           bool memcpy_allgather,
+                                           bool memcpy_send_recv,
+                                           const void* nccl_id,
+                                           std::shared_ptr<SharedState> state)
     : NCCLCommunicator(global_rank, global_world, nccl_id, local_rank)  // Pass local_rank as device
-    , mShare(std::move(state))
-    , mLocalRank(local_rank)
-    , mAllGatherUseMemcpy(memcpy_allgather)
-    , mSendRecvUseMemcpy(memcpy_send_recv)
-{
+      ,
+      mShare(std::move(state)),
+      mLocalRank(local_rank),
+      mAllGatherUseMemcpy(memcpy_allgather),
+      mSendRecvUseMemcpy(memcpy_send_recv) {
 }
 
 NCCLCommunicatorImpl::~NCCLCommunicatorImpl() {
-    if(mShare && mShare->Barrier) {
+    if (mShare && mShare->Barrier) {
         mShare->Barrier->arrive_and_drop();
     }
 }
@@ -992,8 +982,13 @@ void NCCLCommunicatorImpl::barrier() {
         // NCCL-based barrier: all-reduce a single byte on device memory
         // Only local_rank 0 on each node participates in cross-node NCCL
         if (is_node_master() && mShare->NodeMasterComm && mShare->d_barrier_buf) {
-            ncclCheck(ncclAllReduce(mShare->d_barrier_buf, mShare->d_barrier_buf, 1, ncclChar, ncclSum,
-                                    mShare->NodeMasterComm, stream()));
+            ncclCheck(ncclAllReduce(mShare->d_barrier_buf,
+                                    mShare->d_barrier_buf,
+                                    1,
+                                    ncclChar,
+                                    ncclSum,
+                                    mShare->NodeMasterComm,
+                                    stream()));
             CUDA_CHECK(cudaStreamSynchronize(stream()));
         }
         local_barrier();  // Sync local threads after cross-node barrier
@@ -1016,7 +1011,8 @@ void NCCLCommunicatorImpl::gather_bytes_host(std::byte* recv, const std::byte* o
 
         if (size > NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize) {
             throw std::runtime_error(fmt::format("gather_bytes_host: object size {} exceeds max {}",
-                                                 size, NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize));
+                                                 size,
+                                                 NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize));
         }
 
         // Step 1: Local gather via shared memory (same as single-node)
@@ -1031,17 +1027,27 @@ void NCCLCommunicatorImpl::gather_bytes_host(std::byte* recv, const std::byte* o
         // Step 2: NCCL gather from node masters to global rank 0
         if (is_node_master() && mShare->NodeMasterComm) {
             // Copy local data to GPU staging buffer
-            CUDA_CHECK(cudaMemcpyAsync(mShare->d_gather_send, local_gather.data(),
-                                       local_gpus * size, cudaMemcpyHostToDevice, stream()));
+            CUDA_CHECK(cudaMemcpyAsync(mShare->d_gather_send,
+                                       local_gather.data(),
+                                       local_gpus * size,
+                                       cudaMemcpyHostToDevice,
+                                       stream()));
 
             // Use NCCL all-gather (no native gather, so gather = allgather + discard on non-root)
-            ncclCheck(ncclAllGather(mShare->d_gather_send, mShare->d_gather_recv,
-                                    local_gpus * size, ncclChar, mShare->NodeMasterComm, stream()));
+            ncclCheck(ncclAllGather(mShare->d_gather_send,
+                                    mShare->d_gather_recv,
+                                    local_gpus * size,
+                                    ncclChar,
+                                    mShare->NodeMasterComm,
+                                    stream()));
 
             // Copy result back to host (only rank 0 needs it)
             if (rank() == 0) {
-                CUDA_CHECK(cudaMemcpyAsync(recv, mShare->d_gather_recv,
-                                           world_size() * size, cudaMemcpyDeviceToHost, stream()));
+                CUDA_CHECK(cudaMemcpyAsync(recv,
+                                           mShare->d_gather_recv,
+                                           world_size() * size,
+                                           cudaMemcpyDeviceToHost,
+                                           stream()));
             }
             CUDA_CHECK(cudaStreamSynchronize(stream()));
         }
@@ -1068,7 +1074,8 @@ void NCCLCommunicatorImpl::all_gather_bytes_host(std::byte* recv, const std::byt
 
         if (size > NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize) {
             throw std::runtime_error(fmt::format("all_gather_bytes_host: object size {} exceeds max {}",
-                                                 size, NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize));
+                                                 size,
+                                                 NCCLCommunicatorImpl::SharedState::kMaxGatherObjectSize));
         }
 
         // Step 1: Local all-gather via shared memory
@@ -1084,14 +1091,21 @@ void NCCLCommunicatorImpl::all_gather_bytes_host(std::byte* recv, const std::byt
 
         // Step 2: NCCL all-gather from node masters
         if (is_node_master() && mShare->NodeMasterComm) {
-            CUDA_CHECK(cudaMemcpyAsync(mShare->d_gather_send, local_data.data(),
-                                       local_gpus * size, cudaMemcpyHostToDevice, stream()));
+            CUDA_CHECK(cudaMemcpyAsync(mShare->d_gather_send,
+                                       local_data.data(),
+                                       local_gpus * size,
+                                       cudaMemcpyHostToDevice,
+                                       stream()));
 
-            ncclCheck(ncclAllGather(mShare->d_gather_send, mShare->d_gather_recv,
-                                    local_gpus * size, ncclChar, mShare->NodeMasterComm, stream()));
+            ncclCheck(ncclAllGather(mShare->d_gather_send,
+                                    mShare->d_gather_recv,
+                                    local_gpus * size,
+                                    ncclChar,
+                                    mShare->NodeMasterComm,
+                                    stream()));
 
-            CUDA_CHECK(cudaMemcpyAsync(recv, mShare->d_gather_recv,
-                                       total_gpus * size, cudaMemcpyDeviceToHost, stream()));
+            CUDA_CHECK(
+                cudaMemcpyAsync(recv, mShare->d_gather_recv, total_gpus * size, cudaMemcpyDeviceToHost, stream()));
             CUDA_CHECK(cudaStreamSynchronize(stream()));
         }
         local_barrier();
@@ -1141,7 +1155,8 @@ void NCCLCommunicatorImpl::gather_weight(const std::byte* src, std::byte* tgt, s
         std::size_t shard_size = size / world_size();
         for (int i = 0; i < world_size(); ++i) {
             if (tgt + shard_size * i != wgt_list[i]) {
-                CUDA_CHECK(cudaMemcpyAsync(tgt + shard_size * i, wgt_list[i], shard_size, cudaMemcpyDeviceToDevice, stream()));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(tgt + shard_size * i, wgt_list[i], shard_size, cudaMemcpyDeviceToDevice, stream()));
             }
         }
     } else {
@@ -1202,7 +1217,8 @@ void NCCLCommunicatorImpl::on_finish_transaction(cudaEvent_t signal) {
                 if (recv_param.Size != send.Size) {
                     throw std::runtime_error("Size mismatch in recv/send");
                 }
-                CUDA_CHECK(cudaMemcpyAsync(recv_param.Data, send.Data, recv_param.Size, cudaMemcpyDeviceToDevice, stream()));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(recv_param.Data, send.Data, recv_param.Size, cudaMemcpyDeviceToDevice, stream()));
                 send.Matched = true;
                 break;
             }
@@ -1235,7 +1251,9 @@ class CommunicatorThreadsPackImpl : public CommunicatorThreadsPack {
 public:
     CommunicatorThreadsPackImpl(std::vector<std::jthread> threads,
                                 std::shared_ptr<NCCLCommunicatorImpl::SharedState> state)
-        : mThreads(std::move(threads)), mState(std::move(state)) {}
+        : mThreads(std::move(threads)),
+          mState(std::move(state)) {
+    }
 
     ~CommunicatorThreadsPackImpl() override {
         try {
@@ -1302,7 +1320,9 @@ namespace {
  * @return Thread pack for caller to manage.
  */
 std::unique_ptr<CommunicatorThreadsPackImpl>
-launch_communicators_impl(int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
+launch_communicators_impl(int ngpus,
+                          bool memcpy_allgather,
+                          bool memcpy_send_recv,
                           std::function<void(NCCLCommunicator& comm)> work) {
     // Detect available GPUs
     int gpus_available = 0;
@@ -1338,9 +1358,8 @@ launch_communicators_impl(int ngpus, bool memcpy_allgather, bool memcpy_send_rec
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
                 }
 
-                NCCLCommunicatorImpl comm(local_rank, local_rank, ngpus,
-                                          memcpy_allgather, memcpy_send_recv,
-                                          &nccl_id, shared_state);
+                NCCLCommunicatorImpl
+                    comm(local_rank, local_rank, ngpus, memcpy_allgather, memcpy_send_recv, &nccl_id, shared_state);
                 work(comm);
                 shared_state->Barrier->arrive_and_wait();
             } catch (...) {
@@ -1353,13 +1372,15 @@ launch_communicators_impl(int ngpus, bool memcpy_allgather, bool memcpy_send_rec
     return std::make_unique<CommunicatorThreadsPackImpl>(std::move(threads), shared_state);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 /**
  * @brief Run distributed training with one thread per local GPU (blocking).
  */
-void NCCLCommunicator::run_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
-                                          std::function<void(NCCLCommunicator& comm)> work) {
+void NCCLCommunicator::run_communicators(int ngpus,
+                                         bool memcpy_allgather,
+                                         bool memcpy_send_recv,
+                                         std::function<void(NCCLCommunicator& comm)> work) {
     auto pack = launch_communicators_impl(ngpus, memcpy_allgather, memcpy_send_recv, std::move(work));
     pack->join();
 }
@@ -1369,10 +1390,11 @@ void NCCLCommunicator::run_communicators(int ngpus, bool memcpy_allgather, bool 
  *
  * For single-node operation. Use launch_communicators_multinode() for multi-node via Ray.
  */
-std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators(
-    int ngpus, bool memcpy_allgather, bool memcpy_send_recv,
-    std::function<void(NCCLCommunicator& comm)> work) {
-
+std::unique_ptr<CommunicatorThreadsPack>
+NCCLCommunicator::launch_communicators(int ngpus,
+                                       bool memcpy_allgather,
+                                       bool memcpy_send_recv,
+                                       std::function<void(NCCLCommunicator& comm)> work) {
     return launch_communicators_impl(ngpus, memcpy_allgather, memcpy_send_recv, std::move(work));
 }
 
@@ -1398,15 +1420,14 @@ std::array<std::byte, 128> NCCLCommunicator::generate_nccl_id() {
  * - Computes global_world = num_nodes * ngpus
  * - Creates node master communicator via ncclCommSplit from the global communicator
  */
-std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_multinode(
-    int ngpus,
-    int node_rank,
-    int num_nodes,
-    const void* nccl_id,
-    bool memcpy_allgather,
-    bool memcpy_send_recv,
-    std::function<void(NCCLCommunicator& comm)> work) {
-
+std::unique_ptr<CommunicatorThreadsPack>
+NCCLCommunicator::launch_communicators_multinode(int ngpus,
+                                                 int node_rank,
+                                                 int num_nodes,
+                                                 const void* nccl_id,
+                                                 bool memcpy_allgather,
+                                                 bool memcpy_send_recv,
+                                                 std::function<void(NCCLCommunicator& comm)> work) {
     // Detect available GPUs
     int gpus_available = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
@@ -1431,8 +1452,11 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
     int global_world = num_nodes * ngpus;
 
     if (node_rank == 0) {
-        fprintf(stderr, "Ray multi-node training: %d nodes, %d GPUs per node, %d total GPUs\n",
-                num_nodes, ngpus, global_world);
+        fprintf(stderr,
+                "Ray multi-node training: %d nodes, %d GPUs per node, %d total GPUs\n",
+                num_nodes,
+                ngpus,
+                global_world);
     }
 
     // Create shared state for local threads
@@ -1477,9 +1501,13 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
                 }
 
-                NCCLCommunicatorImpl comm(local_rank, global_rank, global_world,
-                                          memcpy_allgather, memcpy_send_recv,
-                                          &owned_nccl_id, shared_state);
+                NCCLCommunicatorImpl comm(local_rank,
+                                          global_rank,
+                                          global_world,
+                                          memcpy_allgather,
+                                          memcpy_send_recv,
+                                          &owned_nccl_id,
+                                          shared_state);
 
                 // Create NodeMasterComm via ncclCommSplit from the global communicator.
                 // This is a collective — ALL ranks must call it. Ranks with local_rank=0
@@ -1488,10 +1516,9 @@ std::unique_ptr<CommunicatorThreadsPack> NCCLCommunicator::launch_communicators_
                 // which causes interference in NCCL 2.29+ when two roots coexist in one process.
                 if (num_nodes > 1) {
                     int split_color = (local_rank == 0) ? 0 : NCCL_SPLIT_NOCOLOR;
-                    int split_key   = (local_rank == 0) ? node_rank : 0;
+                    int split_key = (local_rank == 0) ? node_rank : 0;
                     ncclComm_t node_master_comm = nullptr;
-                    ncclCheck(ncclCommSplit(comm.comm(), split_color, split_key,
-                                           &node_master_comm, nullptr));
+                    ncclCheck(ncclCommSplit(comm.comm(), split_color, split_key, &node_master_comm, nullptr));
                     if (local_rank == 0) {
                         shared_state->NodeMasterComm = node_master_comm;
                     }

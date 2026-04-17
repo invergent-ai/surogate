@@ -1,35 +1,39 @@
-from pathlib import Path
-from typing import Annotated, Any, Literal, TypeAlias, Optional, List, Dict, Union
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, TypeAlias
+
 from surogate.utils.dict import DictDefault
+
 
 @dataclass
 class GRPOModelConfig:
     """
     Configuration for a model.
-    
-    Args: 
+
+    Args:
         name: Name or path of the HF model to use.
         lora_adapter: Name of the LoRA adapter. If None, auto-generated from rank and alpha.
         lora_rank: LoRA rank for this run. Must be <= trainer's max rank. If None, uses trainer's rank.
         lora_alpha: LoRA alpha for this run. If None, uses trainer's alpha.
     """
-    name: Optional[str] = None
-    lora_adapter: Optional[str] = None
-    lora_rank: Optional[int] = None
-    lora_alpha: Optional[int] = None
-    
-    def __init__(self, cfg: DictDefault):   
+
+    name: str | None = None
+    lora_adapter: str | None = None
+    lora_rank: int | None = None
+    lora_alpha: int | None = None
+
+    def __init__(self, cfg: DictDefault):
         self.name = cfg.get("name", self.name)
         self.lora_adapter = cfg.get("lora_adapter", self.lora_adapter)
         self.lora_rank = cfg.get("lora_rank", self.lora_rank)
         self.lora_alpha = cfg.get("lora_alpha", self.lora_alpha)
-    
+
+
 @dataclass
 class GRPOClientConfig:
     """
     Configures the GRPO orchestrator client for RL training.
-    
+
     Args:
         timeout: Timeout in seconds. Defaults to 1200 seconds.
         base_url: Base URLs to use for the OpenAI API. By default, it is set to a single server on localhost at port 8000 which matches the default local vLLM server configuration. If you specify more than one URL, the client will round-robin (chat) completion requests across all servers.
@@ -37,12 +41,13 @@ class GRPOClientConfig:
         headers: Headers to use for the OpenAI API. By default, it is set to an empty dictionary.
         skip_model_check: Whether to skip checking if the model is available in the inference pool. Useful for external APIs or API Keys that don't support the /models endpoint.
     """
-    timeout: Optional[int] = 1200
-    base_url: Optional[List[str]] = field(default_factory=lambda: ["http://localhost:8000/v1"])
-    api_key_var: Optional[str] = "VLLM_API_KEY"
-    headers: Optional[Dict[str, str]] = field(default_factory=dict)
-    skip_model_check: Optional[bool] = False
-    
+
+    timeout: int | None = 1200
+    base_url: list[str] | None = field(default_factory=lambda: ["http://localhost:8000/v1"])
+    api_key_var: str | None = "VLLM_API_KEY"
+    headers: dict[str, str] | None = field(default_factory=dict)
+    skip_model_check: bool | None = False
+
     def __init__(self, cfg: DictDefault):
         self.timeout = cfg.get("timeout", 1200)
         self.base_url = cfg.get("base_url", ["http://localhost:8000/v1"])
@@ -55,15 +60,16 @@ class GRPOClientConfig:
 class TeacherModelConfig(GRPOModelConfig, GRPOClientConfig):
     """
     Configures the teacher model for computing teacher logprobs (e.g. for distillation).
-    
+
     Args:
-        model: The model configuration for the teacher model.  
+        model: The model configuration for the teacher model.
         client: The OAI client configuration for the teacher model.
     """
-    model: Optional[GRPOModelConfig] = None
-    client: Optional[GRPOClientConfig] = None
-    
-    def __init__(self, cfg: DictDefault):   
+
+    model: GRPOModelConfig | None = None
+    client: GRPOClientConfig | None = None
+
+    def __init__(self, cfg: DictDefault):
         self.model = GRPOModelConfig(cfg.get("model", {}))
         self.client = GRPOClientConfig(cfg.get("client", {}))
 
@@ -72,19 +78,20 @@ class TeacherModelConfig(GRPOModelConfig, GRPOClientConfig):
 class GRPOTemperatureSchedulerConfig:
     """
     Configures temperature scheduling over training steps. Use this OR sampling.temperature, not both.
-    
+
     Args:
         type: Schedule shape. Linear interpolates linearly; cosine uses smooth, monotonic curve.
         start_temperature: Temperature at step 0.
         end_temperature: Temperature at the final step.
         total_steps: Number of steps to reach end_temperature. Defaults to orchestrator max_steps if None.
     """
-    type: Optional[Literal["linear", "cosine"]] = "linear"
-    start_temperature: Optional[float] = None
-    end_temperature: Optional[float] = None
-    total_steps: Optional[int] = None
-    
-    def __init__(self, cfg: DictDefault):   
+
+    type: Literal["linear", "cosine"] | None = "linear"
+    start_temperature: float | None = None
+    end_temperature: float | None = None
+    total_steps: int | None = None
+
+    def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
         self.start_temperature = cfg.get("start_temperature", self.start_temperature)
         self.end_temperature = cfg.get("end_temperature", self.end_temperature)
@@ -95,7 +102,7 @@ class GRPOTemperatureSchedulerConfig:
 class GRPOSamplingConfig:
     """
     Configures how tokens are sampled from the model for training. Largely follows the vLLM sampling parameters.
-    
+
     Args:
         temperature: Constant temperature for sampling. Defaults to 1.0 if neither this nor temp_scheduler is set. Cannot be set together with temp_scheduler.
         temp_scheduler: Temperature schedule over training steps. Set this OR temperature, not both.
@@ -104,18 +111,19 @@ class GRPOSamplingConfig:
         max_tokens: Maximum number of output tokens to generate per turn. If None, will generate until maximum context length or EOS token is hit.
         min_tokens: Minimum number of output tokens to generate per sequence.
         seed: Random seed for sampling. If None, a random seed will be used.
-        extra_body: Extra body to pass with each request to the inference server. By default, it is set to an empty dictionary. 
+        extra_body: Extra body to pass with each request to the inference server. By default, it is set to an empty dictionary.
     """
-    temperature: Optional[float] = None
-    temp_scheduler: Optional[GRPOTemperatureSchedulerConfig] = None
-    top_p: Optional[float] = 1.0
-    repetition_penalty: Optional[float] = 1.0
-    max_tokens: Optional[int] = None
-    min_tokens: Optional[int] = 0
-    seed: Optional[int] = None
-    extra_body: Optional[Dict[str, Any]] = field(default_factory=dict)
-    
-    def __init__(self, cfg: DictDefault):   
+
+    temperature: float | None = None
+    temp_scheduler: GRPOTemperatureSchedulerConfig | None = None
+    top_p: float | None = 1.0
+    repetition_penalty: float | None = 1.0
+    max_tokens: int | None = None
+    min_tokens: int | None = 0
+    seed: int | None = None
+    extra_body: dict[str, Any] | None = field(default_factory=dict)
+
+    def __init__(self, cfg: DictDefault):
         self.temperature = cfg.get("temperature", self.temperature)
         if cfg.get("temp_scheduler") is not None:
             self.temp_scheduler = GRPOTemperatureSchedulerConfig(cfg.get("temp_scheduler"))
@@ -126,11 +134,12 @@ class GRPOSamplingConfig:
         self.seed = cfg.get("seed", self.seed)
         self.extra_body = cfg.get("extra_body", {})
 
+
 @dataclass
 class GRPOEnvConfig:
     """
     Configures an environment for training.
-    
+
     Args:
         id: ID of the environment to use.
         args: Arguments to pass to the environment.
@@ -139,29 +148,31 @@ class GRPOEnvConfig:
         extra_env_kwargs: Extra kwargs passed to an env (e.g. seq_len, score_rollouts). This field is auto-populated with the seq_len, and score_rollouts for training envs on the orchestrator. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server.
         max_retries: Maximum number of times the environment will retry a failed rollout.
     """
-    id: Optional[str] = None
-    args: Optional[Dict[str, Any]] = field(default_factory=dict)
-    name: Optional[str] = None
-    address: Optional[str] = None
-    extra_env_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
-    max_retries: Optional[int] = 0
-    
+
+    id: str | None = None
+    args: dict[str, Any] | None = field(default_factory=dict)
+    name: str | None = None
+    address: str | None = None
+    extra_env_kwargs: dict[str, Any] | None = field(default_factory=dict)
+    max_retries: int | None = 0
+
     @property
     def resolved_name(self) -> str:
         return self.name or self.id.split("@")[0]
-    
-    def __init__(self, cfg: DictDefault):   
+
+    def __init__(self, cfg: DictDefault):
         self.id = cfg.get("id", self.id)
         self.args = cfg.get("args", {})
         self.name = cfg.get("name", self.name)
         self.address = cfg.get("address", self.address)
         self.extra_env_kwargs = cfg.get("extra_env_kwargs", {})
         self.max_retries = cfg.get("max_retries", self.max_retries)
-        
+
         if self.resolved_name == "all":
             raise ValueError(
                 'Environment name "all" is reserved for global metric aggregation. Use a different name or id.'
             )
+
 
 @dataclass
 class GRPOEvalEnvConfig(GRPOEnvConfig):
@@ -178,22 +189,23 @@ class GRPOEvalEnvConfig(GRPOEnvConfig):
             environment. If None, falls back to eval.rollouts_per_example.
         skip_first: Number of initial examples to skip. Defaults to 0.
     """
-    num_examples: Optional[int] = None
-    rollouts_per_example: Optional[int] = None
-    skip_first: Optional[int] = 0
+
+    num_examples: int | None = None
+    rollouts_per_example: int | None = None
+    skip_first: int | None = 0
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
         self.num_examples = cfg.get("num_examples", self.num_examples)
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
         self.skip_first = cfg.get("skip_first", self.skip_first)
-    
-    
+
+
 @dataclass
 class GRPOEvalSamplingConfig:
     """
     Configures how tokens are sampled from the model for evaluation. Largely follows the vLLM sampling parameters.
-    
+
     Args:
         temperature: Scales the output probability distribution. Lower values => more deterministic, higher values => more random. If 0, will sample greedily. Defaults to None, which means we fall back to the inference server's default value.
         repetition_penalty: Penalty for repeating tokens. Values > 1.0 discourage repetition, values < 1.0 encourage repetition, and 1.0 means no penalty. Defaults to None, which means we fall back to the inference server's default value.
@@ -206,17 +218,18 @@ class GRPOEvalSamplingConfig:
         seed: Random seed for sampling. If None, a random seed will be used. Defaults to None, which means we fall back to the inference server's default value.
         extra_body: Extra body to use for the OpenAI API. By default, it is set to an empty dictionary.
     """
-    temperature: Optional[float] = None
-    repetition_penalty: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    min_p: Optional[float] = None
-    max_tokens: Optional[int] = None
-    min_tokens: Optional[int] = None
-    reasoning_effort: Optional[Literal['minimal', 'low', 'medium', 'high']] = None
-    seed: Optional[int] = None
-    extra_body: Optional[Dict[str, Any]] = None
-    
+
+    temperature: float | None = None
+    repetition_penalty: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    max_tokens: int | None = None
+    min_tokens: int | None = None
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
+    seed: int | None = None
+    extra_body: dict[str, Any] | None = None
+
     def __init__(self, cfg: DictDefault):
         self.temperature = cfg.get("temperature", self.temperature)
         self.repetition_penalty = cfg.get("repetition_penalty", self.repetition_penalty)
@@ -229,11 +242,12 @@ class GRPOEvalSamplingConfig:
         self.seed = cfg.get("seed", self.seed)
         self.extra_body = cfg.get("extra_body", self.extra_body)
 
+
 @dataclass
 class GRPOEvalConfig:
     """
     Configures evaluation using verifiers environments.
-    
+
     Args:
         env: List of environment configurations for evaluation.
         sampling: Shared sampling configuration for evals; can differ from training sampling.
@@ -244,15 +258,16 @@ class GRPOEvalConfig:
         skip_eval_on_resume: If True and resuming the orchestrator from a checkpoint, skip the (potentially redundant) online eval that would otherwise run immediately at the resumed checkpoint step.
         cancel_inflight_rollouts_on_eval: Whether to cancel in-flight training rollouts before starting online evals. This is useful to avoid congestion (e.g. do not have training + eval rollouts happening at the same time) but leads to slower training steps as rollouts get cancelled and the pipeline has to fill up after each eval.
     """
-    env: Optional[List[GRPOEvalEnvConfig]] = None
-    sampling: Optional[GRPOEvalSamplingConfig] = None
-    num_examples: Optional[int] = -1
-    rollouts_per_example: Optional[int] = 1
-    interval: Optional[int] = 100
-    eval_base_model: Optional[bool] = True
-    skip_eval_on_resume: Optional[bool] = True
-    cancel_inflight_rollouts_on_eval: Optional[bool] = False
-    
+
+    env: list[GRPOEvalEnvConfig] | None = None
+    sampling: GRPOEvalSamplingConfig | None = None
+    num_examples: int | None = -1
+    rollouts_per_example: int | None = 1
+    interval: int | None = 100
+    eval_base_model: bool | None = True
+    skip_eval_on_resume: bool | None = True
+    cancel_inflight_rollouts_on_eval: bool | None = False
+
     def __init__(self, cfg: DictDefault):
         env_cfgs = cfg.get("env", [])
         self.env = [GRPOEvalEnvConfig(env_cfg) for env_cfg in env_cfgs]
@@ -262,13 +277,16 @@ class GRPOEvalConfig:
         self.interval = cfg.get("interval", self.interval)
         self.eval_base_model = cfg.get("eval_base_model", self.eval_base_model)
         self.skip_eval_on_resume = cfg.get("skip_eval_on_resume", self.skip_eval_on_resume)
-        self.cancel_inflight_rollouts_on_eval = cfg.get("cancel_inflight_rollouts_on_eval", self.cancel_inflight_rollouts_on_eval)
+        self.cancel_inflight_rollouts_on_eval = cfg.get(
+            "cancel_inflight_rollouts_on_eval", self.cancel_inflight_rollouts_on_eval
+        )
+
 
 @dataclass
 class GRPOBufferConfig:
     """
     Configures the buffer for the orchestrator.
-    
+
     Args:
         seed: Random seed to use for the buffer. If set, the sampling from the buffer will be deterministic.
         env_ratios: Ratios for sampling from each environment. If None, samples uniformly across all available problems (not environments).
@@ -279,15 +297,16 @@ class GRPOBufferConfig:
         online_difficulty_filtering: Whether to filter rollouts based on difficulty. If True, rollouts with average reward 0.0 or 1.0 are not added to the buffer.
         hash_keys: Keys to use for computing example hashes. Will be used to match examples from buffer checkpoints and determine buffer resume behavior.
     """
-    seed: Optional[int] = None
-    env_ratios: Optional[List[float]] = None
-    easy_threshold: Optional[float] = None
-    hard_threshold: Optional[float] = None
-    easy_fraction: Optional[float] = 0.0
-    hard_fraction: Optional[float] = 0.0
-    online_difficulty_filtering: Optional[bool] = False
-    hash_keys: Optional[List[str]] = field(default_factory=lambda: ["task", "prompt"])
-    
+
+    seed: int | None = None
+    env_ratios: list[float] | None = None
+    easy_threshold: float | None = None
+    hard_threshold: float | None = None
+    easy_fraction: float | None = 0.0
+    hard_fraction: float | None = 0.0
+    online_difficulty_filtering: bool | None = False
+    hash_keys: list[str] | None = field(default_factory=lambda: ["task", "prompt"])
+
     def __init__(self, cfg: DictDefault):
         self.seed = cfg.get("seed", self.seed)
         self.env_ratios = cfg.get("env_ratios", self.env_ratios)
@@ -298,74 +317,78 @@ class GRPOBufferConfig:
         self.online_difficulty_filtering = cfg.get("online_difficulty_filtering", self.online_difficulty_filtering)
         self.hash_keys = cfg.get("hash_keys", ["task", "prompt"])
         self.__post_init__()
-    
+
     def __post_init__(self):
         if self.easy_threshold is not None and self.hard_threshold is not None:
             assert self.easy_threshold > self.hard_threshold, "easy_threshold must be greater than hard_threshold."
-            
+
         if self.env_ratios is not None:
             assert all(ratio > 0 for ratio in self.env_ratios), "All env_ratios must be positive."
-    
+
 
 @dataclass
 class GRPOVerificationConfig:
     """Configures rollout verification and rubric scoring."""
-    
-    enabled: Optional[bool] = True
-    
+
+    enabled: bool | None = True
+
     def __init__(self, cfg: DictDefault):
         self.enabled = cfg.get("enabled", self.enabled)
-    
-@dataclass    
+
+
+@dataclass
 class GRPOAdvantageConfig:
     """Config for the default advantage."""
-    
-    type: Optional[Literal["default"]] = "default"
-    length_weighted_mean: Optional[bool] = False
-    
+
+    type: Literal["default"] | None = "default"
+    length_weighted_mean: bool | None = False
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
         self.length_weighted_mean = cfg.get("length_weighted_mean", self.length_weighted_mean)
-        
+
+
 @dataclass
 class GRPOCustomAdvantageConfig:
     """
     Config for a custom external advantage function.
-    
+
     Args:
         type: Must be "custom" for this advantage type.
         import_path: Import path to the advantage function (e.g., 'my_module.my_advantage').
         kwargs: Kwargs to pass to the advantage function.
     """
-    
-    type: Optional[Literal["custom"]] = "custom"
-    import_path: Optional[str] = None
-    kwargs: Optional[Dict[str, Any]] = None
-    
+
+    type: Literal["custom"] | None = "custom"
+    import_path: str | None = None
+    kwargs: dict[str, Any] | None = None
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
         self.import_path = cfg.get("import_path", self.import_path)
         self.kwargs = cfg.get("kwargs", self.kwargs)
-    
+
 
 AdvantageConfigType: TypeAlias = GRPOAdvantageConfig | GRPOCustomAdvantageConfig
-    
+
+
 @dataclass
 class GRPOGibberishFilterConfig:
     """
     Flags rare tokens generated at high entropy (Section 5.2, https://arxiv.org/abs/2510.02387).
-    
+
     Args:
         type: Must be "gibberish" for this filter type.
         enforce: If True, mask detected rollouts so they don't contribute to training. If False, only track detection metrics.
         token_id_threshold: Token IDs above this are candidates for gibberish. BPE tokens are sorted by merge order.
         logprob_offset: Offset from uniform distribution logprob. Threshold = -log(vocab_size) - logprob_offset.
     """
-    type: Optional[Literal["gibberish"]] = "gibberish"
-    enforce: Optional[bool] = False
-    token_id_threshold: Optional[int] = 100_000
-    logprob_offset: Optional[float] = 2.0
-    
+
+    type: Literal["gibberish"] | None = "gibberish"
+    enforce: bool | None = False
+    token_id_threshold: int | None = 100_000
+    logprob_offset: float | None = 2.0
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
         self.enforce = cfg.get("enforce", self.enforce)
@@ -379,31 +402,34 @@ class GRPORepetitionFilterConfig:
     Flags rollouts where the model gets stuck in a repetition loop, emitting high-confidence tokens
     for an extended stretch. A rollout is flagged when `window` consecutive tokens are each sampled
     with probability above `prob_threshold`. (Section 3.2, https://arxiv.org/abs/2506.13585)
-    
+
     Args:
         type: Must be "repetition" for this filter type.
         enforce: If True, mask detected rollouts so they don't contribute to training. If False, only track detection metrics.
         window: Number of consecutive high-probability steps before flagging.
         prob_threshold: Probability threshold for high-confidence tokens. Tokens sampled with probability above this are considered repetitive. Consecutive such tokens count toward the window.
     """
-    type: Optional[Literal["repetition"]] = "repetition"
-    enforce: Optional[bool] = False
-    window: Optional[int] = 3_000
-    prob_threshold: Optional[float] = 0.99
-    
+
+    type: Literal["repetition"] | None = "repetition"
+    enforce: bool | None = False
+    window: int | None = 3_000
+    prob_threshold: float | None = 0.99
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
         self.enforce = cfg.get("enforce", self.enforce)
         self.window = cfg.get("window", self.window)
         self.prob_threshold = cfg.get("prob_threshold", self.prob_threshold)
 
+
 FilterConfigType: TypeAlias = GRPOGibberishFilterConfig | GRPORepetitionFilterConfig
+
 
 @dataclass
 class GRPOLogConfig:
     """
     Configures the GRPO logger.
-    
+
     Args:
         level: Logging level for the process. Will determine the logging verbosity and format.
         vf_level: Logging level for the verifiers package. Will determine the logging verbosity and format.
@@ -411,14 +437,15 @@ class GRPOLogConfig:
         env_worker_logs: Whether env workers log to files. If True, workers write to logs/env_workers/{env_name}.log.
         log_data: Whether to log the first data sample to the logger.
         json_logging: Emit JSON logs (newline-delimited) for log aggregation (Loki, Grafana, etc.).
-    """    
-    level: Optional[str] = "info"
-    vf_level: Optional[str] = "info"
-    file: Optional[bool] = True
-    env_worker_logs: Optional[bool] = False
-    log_data: Optional[bool] = False
-    json_logging: Optional[bool] = False
-    
+    """
+
+    level: str | None = "info"
+    vf_level: str | None = "info"
+    file: bool | None = True
+    env_worker_logs: bool | None = False
+    log_data: bool | None = False
+    json_logging: bool | None = False
+
     def __init__(self, cfg: DictDefault):
         self.level = cfg.get("level", self.level)
         self.vf_level = cfg.get("vf_level", self.vf_level)
@@ -426,12 +453,13 @@ class GRPOLogConfig:
         self.env_worker_logs = cfg.get("env_worker_logs", self.env_worker_logs)
         self.log_data = cfg.get("log_data", self.log_data)
         self.json_logging = cfg.get("json_logging", self.json_logging)
-     
+
+
 @dataclass
 class GRPOReportingConfig:
     """
     Configures logging to W&B and other reporting platforms.
-    
+
     Args:
         project: The W&B project to log to.
         offline: Whether to run W&B in offline mode.
@@ -440,14 +468,15 @@ class GRPOReportingConfig:
         distributions: Whether to log distributions (like rewards, advantages, etc.).
         interval: Step interval at which to log samples and distributions.
     """
-    project: Optional[str] = "Surogate"
-    name: Optional[str] = None
-    offline: Optional[bool] = False
-    run_name: Optional[str] = None
-    samples: Optional[bool] = None
-    distributions: Optional[bool] = None
-    interval: Optional[int] = 10
-    
+
+    project: str | None = "Surogate"
+    name: str | None = None
+    offline: bool | None = False
+    run_name: str | None = None
+    samples: bool | None = None
+    distributions: bool | None = None
+    interval: int | None = 10
+
     def __init__(self, cfg: DictDefault):
         self.project = cfg.get("project", self.project)
         self.name = cfg.get("name", self.name)
@@ -456,13 +485,13 @@ class GRPOReportingConfig:
         self.samples = cfg.get("samples", self.samples)
         self.distributions = cfg.get("distributions", self.distributions)
         self.interval = cfg.get("interval", self.interval)
-        
+
 
 @dataclass
 class GRPOCheckpointConfig:
     """
     Configures checkpointing for the orchestrator.
-    
+
     Args:
         interval: Interval at which to save the checkpoint.
         resume_step: Step to resume orchestrator from. If None, will start from scratch. If -1, will restart from latest checkpoint available.
@@ -472,14 +501,15 @@ class GRPOCheckpointConfig:
         skip_progress: Whether to skip loading the progress from checkpoint.
         skip_buffer: Whether to skip loading the buffer from checkpoint.
     """
-    interval: Optional[int] = None
-    resume_step: Optional[int] = None
-    wait_for_weights_timeout: Optional[int] = None
-    keep_last: Optional[int] = None
-    keep_interval: Optional[int] = None
-    skip_progress: Optional[bool] = False
-    skip_buffer: Optional[bool] = False
-    
+
+    interval: int | None = None
+    resume_step: int | None = None
+    wait_for_weights_timeout: int | None = None
+    keep_last: int | None = None
+    keep_interval: int | None = None
+    skip_progress: bool | None = False
+    skip_buffer: bool | None = False
+
     def __init__(self, cfg: DictDefault):
         self.interval = cfg.get("interval", self.interval)
         self.resume_step = cfg.get("resume_step", self.resume_step)
@@ -488,22 +518,23 @@ class GRPOCheckpointConfig:
         self.keep_interval = cfg.get("keep_interval", self.keep_interval)
         self.skip_progress = cfg.get("skip_progress", self.skip_progress)
         self.skip_buffer = cfg.get("skip_buffer", self.skip_buffer)
-    
+
 
 @dataclass
 class GRPOValConfig:
     """
     Configures the validation of the model.
-    
+
     Args:
         num_examples: Number of examples to use for validation. If -1, will use all examples.
         rollouts_per_example: Number of samples to generate per example for validation.
         interval: Interval at which to validate the model.
     """
-    num_examples: Optional[int] = 16
-    rollouts_per_example: Optional[int] = 1
-    interval: Optional[int] = 10
-    
+
+    num_examples: int | None = 16
+    rollouts_per_example: int | None = 1
+    interval: int | None = 10
+
     def __init__(self, cfg: DictDefault):
         self.num_examples = cfg.get("num_examples", self.num_examples)
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
@@ -513,19 +544,22 @@ class GRPOValConfig:
 @dataclass
 class FileSystemWeightBroadcastConfig:
     """Configures the filesystem weight broadcast."""
-    type: Optional[Literal["filesystem"]] = "filesystem"
-    
+
+    type: Literal["filesystem"] | None = "filesystem"
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
+
 
 @dataclass
 class NCCLWeightBroadcastConfig:
     """Configures the NCCL weight broadcast."""
-    type: Optional[Literal["nccl"]] = "nccl"
-    host: Optional[str] = "localhost"
-    port: Optional[int] = 29501
-    timeout: Optional[int] = 1200
-    
+
+    type: Literal["nccl"] | None = "nccl"
+    host: str | None = "localhost"
+    port: int | None = 29501
+    timeout: int | None = 1200
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
         self.host = cfg.get("host", self.host)
@@ -536,7 +570,8 @@ class NCCLWeightBroadcastConfig:
 @dataclass
 class ColocateWeightBroadcastConfig:
     """Configures colocate weight broadcast (zero-copy shared GPU memory)."""
-    type: Optional[Literal["colocate"]] = "colocate"
+
+    type: Literal["colocate"] | None = "colocate"
 
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
@@ -546,40 +581,43 @@ class ColocateWeightBroadcastConfig:
 class FileSystemTransportConfig:
     """Configures filesystem-based transport for training examples."""
 
-    type: Optional[Literal["filesystem"]] = "filesystem"
-    
+    type: Literal["filesystem"] | None = "filesystem"
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
-    
+
+
 @dataclass
 class ZMQTransportConfig:
     """
     Configures ZMQ-based transport for training examples.
-    
+
     Args:
         host: Hostname for ZMQ transport. Default is localhost.
         port: Port for ZMQ transport. Default is 5555.
         hwm: High-water mark (max messages in queue) for ZMQ transport. Default is 10.
     """
 
-    type: Optional[Literal["zmq"]] = "zmq"
-    host: Optional[str] = "localhost"
-    port: Optional[int] = 5555
-    hwm: Optional[int] = 10
-    
+    type: Literal["zmq"] | None = "zmq"
+    host: str | None = "localhost"
+    port: int | None = 5555
+    hwm: int | None = 10
+
     def __init__(self, cfg: DictDefault):
         self.type = cfg.get("type", self.type)
         self.host = cfg.get("host", self.host)
         self.port = cfg.get("port", self.port)
         self.hwm = cfg.get("hwm", self.hwm)
 
+
 TransportConfigType: TypeAlias = FileSystemTransportConfig | ZMQTransportConfig
+
 
 @dataclass
 class GRPOOrchestratorConfig:
     """
     GRPO orchestrator configuration.
-    
+
     Args:
         client: The OAI client configuration
         teacher_model: The teacher model configuration for computing teacher logprobs (e.g. for distillation). If provided, teacher logprobs will be computed using the specified model. If None, no teacher model will be used.
@@ -603,79 +641,83 @@ class GRPOOrchestratorConfig:
         max_inflight_rollouts: Maximum number of rollouts to keep in-flight. Required for token-based batching. If batch_size is set and this is unset, defaults to batch_size * oversampling_factor (or batch_size when oversampling_factor is unset).
         verification: Rollout verification configuration
     """
-    
-    client: Optional[GRPOClientConfig] = None
-    model: Optional[GRPOModelConfig] = None
-    teacher_model: Optional[TeacherModelConfig] = None
-    learning_rate: Optional[float] = 1e-4
-    sampling: Optional[GRPOSamplingConfig] = None
-    env: Optional[List[GRPOEnvConfig]] = None
-    eval: Optional[GRPOEvalConfig] = None
-    buffer: Optional[GRPOBufferConfig] = None
-    verification: Optional[GRPOVerificationConfig] = None
-    advantage: Optional[GRPOAdvantageConfig | GRPOCustomAdvantageConfig] = None
-    filters: Optional[List[GRPOGibberishFilterConfig | GRPORepetitionFilterConfig]] = None
-    log: Optional[GRPOLogConfig] = None
-    report_to: Optional[GRPOReportingConfig] = None
-    ckpt: Optional[GRPOCheckpointConfig] = None
-    val: Optional[GRPOValConfig] = None
-    weight_broadcast: Optional[FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | ColocateWeightBroadcastConfig] = None
-    rollout_transport: Optional[FileSystemTransportConfig | ZMQTransportConfig] = None
-    output_dir: Optional[str] = "outputs/run_default"
-    max_concurrent: Optional[int] = None
-    tasks_per_minute: Optional[float] = None
-    batch_size: Optional[int] = 128
-    oversampling_factor: Optional[float] = None
-    rollouts_per_example: Optional[int] = 1
-    sequence_len: Optional[int] = 2048
-    num_train_workers: Optional[int] = 1
-    max_steps: Optional[int] = None
-    max_off_policy_steps: Optional[int] = 8
-    max_async_level: Optional[int] = 1
-    strict_async_level: Optional[bool] = False
-    bench: Optional[bool] = False
-    seed: Optional[int] = 42
-    use_token_client: Optional[bool] = True
-    token_batch_size: Optional[int] = None
-    max_inflight_rollouts: Optional[int] = None
-    
+
+    client: GRPOClientConfig | None = None
+    model: GRPOModelConfig | None = None
+    teacher_model: TeacherModelConfig | None = None
+    learning_rate: float | None = 1e-4
+    sampling: GRPOSamplingConfig | None = None
+    env: list[GRPOEnvConfig] | None = None
+    eval: GRPOEvalConfig | None = None
+    buffer: GRPOBufferConfig | None = None
+    verification: GRPOVerificationConfig | None = None
+    advantage: GRPOAdvantageConfig | GRPOCustomAdvantageConfig | None = None
+    filters: list[GRPOGibberishFilterConfig | GRPORepetitionFilterConfig] | None = None
+    log: GRPOLogConfig | None = None
+    report_to: GRPOReportingConfig | None = None
+    ckpt: GRPOCheckpointConfig | None = None
+    val: GRPOValConfig | None = None
+    weight_broadcast: (
+        FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | ColocateWeightBroadcastConfig | None
+    ) = None
+    rollout_transport: FileSystemTransportConfig | ZMQTransportConfig | None = None
+    output_dir: str | None = "outputs/run_default"
+    max_concurrent: int | None = None
+    tasks_per_minute: float | None = None
+    batch_size: int | None = 128
+    oversampling_factor: float | None = None
+    rollouts_per_example: int | None = 1
+    sequence_len: int | None = 2048
+    num_train_workers: int | None = 1
+    max_steps: int | None = None
+    max_off_policy_steps: int | None = 8
+    max_async_level: int | None = 1
+    strict_async_level: bool | None = False
+    bench: bool | None = False
+    seed: int | None = 42
+    use_token_client: bool | None = True
+    token_batch_size: int | None = None
+    max_inflight_rollouts: int | None = None
+
     def __init__(self, cfg: DictDefault):
         self.client = GRPOClientConfig(cfg.get("client", {}))
         self.model = GRPOModelConfig(cfg.get("model", {}))
-            
+
         if cfg.get("teacher_model") is not None:
             self.teacher_model = TeacherModelConfig(cfg.get("teacher_model"))
-            
+
         self.learning_rate = cfg.get("learning_rate", self.learning_rate)
         self.sampling = GRPOSamplingConfig(cfg.get("sampling", {}))
-            
+
         env_cfgs = cfg.get("env", [])
         self.env = [GRPOEnvConfig(env_cfg) for env_cfg in env_cfgs]
-        
+
         if cfg.get("eval") is not None:
             self.eval = GRPOEvalConfig(cfg.get("eval"))
-            
+
         self.buffer = GRPOBufferConfig(cfg.get("buffer", {}))
-        
+
         if cfg.get("verification") is not None:
             self.verification = GRPOVerificationConfig(cfg.get("verification", {}))
         else:
             self.verification = GRPOVerificationConfig({})
-            
+
         if cfg.get("advantage") is not None:
             if cfg.get("advantage").get("type") == "custom":
                 self.advantage = GRPOCustomAdvantageConfig(cfg.get("advantage", {}))
             else:
-                self.advantage = GRPOAdvantageConfig(cfg.get("advantage", {}))   
+                self.advantage = GRPOAdvantageConfig(cfg.get("advantage", {}))
         else:
             self.advantage = GRPOAdvantageConfig({})
-        
+
         if cfg.get("filters") is not None:
             self.filters = []
             for filter_cfg in cfg.get("filters"):
                 if filter_cfg.get("type") not in ["gibberish", "repetition"]:
-                    raise ValueError(f"Unsupported filter type: {filter_cfg.get('type')}. Supported types are 'gibberish' and 'repetition'.")
-                
+                    raise ValueError(
+                        f"Unsupported filter type: {filter_cfg.get('type')}. Supported types are 'gibberish' and 'repetition'."
+                    )
+
                 if filter_cfg.get("type") == "gibberish":
                     filter_config = GRPOGibberishFilterConfig(filter_cfg)
                 else:
@@ -684,18 +726,18 @@ class GRPOOrchestratorConfig:
                 self.filters.append(filter_config)
         else:
             self.filters = [GRPOGibberishFilterConfig({}), GRPORepetitionFilterConfig({})]
- 
+
         self.log = GRPOLogConfig(cfg.get("log", {}))
-        
+
         if cfg.get("report_to") is not None:
             self.report_to = GRPOReportingConfig(cfg.get("report_to", {}))
-        
+
         if cfg.get("ckpt") is not None:
             self.ckpt = GRPOCheckpointConfig(cfg.get("ckpt"))
-        
-        if cfg.get("val") is not None:    
+
+        if cfg.get("val") is not None:
             self.val = GRPOValConfig(cfg.get("val"))
-        
+
         if cfg.get("weight_broadcast") is not None:
             wb_type = cfg.get("weight_broadcast").get("type")
             if wb_type == "nccl":
@@ -706,7 +748,7 @@ class GRPOOrchestratorConfig:
                 self.weight_broadcast = FileSystemWeightBroadcastConfig(cfg.get("weight_broadcast", {}))
         else:
             self.weight_broadcast = FileSystemWeightBroadcastConfig({})
-        
+
         if cfg.get("rollout_transport") is not None:
             if cfg.get("rollout_transport").get("type") == "zmq":
                 self.rollout_transport = ZMQTransportConfig(cfg.get("rollout_transport", {}))
@@ -714,7 +756,7 @@ class GRPOOrchestratorConfig:
                 self.rollout_transport = FileSystemTransportConfig(cfg.get("rollout_transport", {}))
         else:
             self.rollout_transport = FileSystemTransportConfig({})
-        
+
         self.output_dir = Path(cfg.get("output_dir", self.output_dir))
         self.max_concurrent = cfg.get("max_concurrent", self.max_concurrent)
         self.tasks_per_minute = cfg.get("tasks_per_minute", self.tasks_per_minute)
@@ -723,7 +765,7 @@ class GRPOOrchestratorConfig:
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
         self.sequence_len = cfg.get("sequence_len", self.sequence_len)
         configured_num_train_workers = cfg.get("num_train_workers")
-        
+
         if configured_num_train_workers is not None:
             self.num_train_workers = configured_num_train_workers
         elif self.rollout_transport.type == "zmq":
@@ -740,7 +782,7 @@ class GRPOOrchestratorConfig:
                 self.num_train_workers = 1
         else:
             self.num_train_workers = self.num_train_workers
-            
+
         self.max_steps = cfg.get("max_steps", self.max_steps)
         self.max_off_policy_steps = cfg.get("max_off_policy_steps", self.max_off_policy_steps)
         self.max_async_level = cfg.get("max_async_level", self.max_async_level)
@@ -750,33 +792,33 @@ class GRPOOrchestratorConfig:
         self.use_token_client = cfg.get("use_token_client", self.use_token_client)
         self.token_batch_size = cfg.get("token_batch_size", self.token_batch_size)
         self.max_inflight_rollouts = cfg.get("max_inflight_rollouts", self.max_inflight_rollouts)
-        
+
         self.__post_init__()
 
     def __post_init__(self):
         types = [f.type for f in self.filters]
         if len(types) != len(set(types)):
             raise ValueError(f"Duplicate filter types: {types}. Each filter type may only appear once.")
-        
+
         if self.max_concurrent is not None and self.max_concurrent < self.rollouts_per_example:
             raise ValueError("max_concurrent must be at least the number of rollouts per example")
 
         if self.weight_broadcast.type == "nccl":
             if not self.max_async_level == 1:
                 raise ValueError("max_async_level must be 1 for NCCL broadcast")
-            
+
         has_rollout_batch = self.batch_size is not None
         has_token_batch = self.token_batch_size is not None
         if has_rollout_batch and has_token_batch:
             raise ValueError("Set exactly one of batch_size or token_batch_size")
-        
+
         if not has_rollout_batch and not has_token_batch:
             self.batch_size = 128
-            
+
         if has_token_batch:
             if self.oversampling_factor is not None:
                 raise ValueError("oversampling_factor can only be set when batch_size is set")
-            
+
             if self.max_inflight_rollouts is None:
                 raise ValueError("max_inflight_rollouts must be set when token_batch_size is set")
         else:
@@ -786,19 +828,17 @@ class GRPOOrchestratorConfig:
             if self.max_inflight_rollouts is not None and self.oversampling_factor is not None:
                 expected_max_inflight_rollouts = int(self.batch_size * self.oversampling_factor)
                 if self.max_inflight_rollouts != expected_max_inflight_rollouts:
-                    raise ValueError(
-                        "max_inflight_rollouts conflicts with oversampling_factor * batch_size"
-                    )
+                    raise ValueError("max_inflight_rollouts conflicts with oversampling_factor * batch_size")
             if self.max_inflight_rollouts is None:
                 oversampling_factor = self.oversampling_factor if self.oversampling_factor is not None else 1.0
                 self.max_inflight_rollouts = int(self.batch_size * oversampling_factor)
-        
+
         if self.max_inflight_rollouts is not None and self.max_inflight_rollouts < self.rollouts_per_example:
             raise ValueError("max_inflight_rollouts must be at least the number of rollouts per example")
-        
+
         if self.buffer.env_ratios is not None:
             assert len(self.buffer.env_ratios) == len(self.env), "env_ratios length must match number of environments"
-        
+
         if self.bench:
             self.max_steps = 4  # Run for 1 warmup step + 3 evaluation steps
             self.max_async_level = int(1e9)  # Never wait for RL weight checkpoints
@@ -810,7 +850,7 @@ class GRPOOrchestratorConfig:
 
         train_extra_env_kwargs = dict(
             max_seq_len=self.sequence_len,
-            score_rollouts=not self.verification.enabled,  
+            score_rollouts=not self.verification.enabled,
         )
         for env in self.env:
             # extra_env_kwargs is not meant to be used by the user, we shamelessly override here
@@ -830,22 +870,21 @@ class GRPOOrchestratorConfig:
             scheduler = self.sampling.temp_scheduler
             if scheduler.total_steps is None and self.max_steps is None:
                 raise ValueError("temp_scheduler.total_steps must be set when max_steps is None")
-            
+
         if not self.verification and self.buffer.online_difficulty_filtering:
             raise ValueError(
                 "verification.enabled cannot be False when buffer.online_difficulty_filtering is True. "
                 "These features depend on rewards which are disabled when verification.enabled=False."
             )
-            
+
         if not self.verification and self.buffer.easy_threshold is not None:
             raise ValueError(
-            "verification.enabled cannot be False when buffer.easy_threshold is set. "
-            "Easy threshold depends on rewards which are disabled when verification.enabled=False."
-        )
-             
+                "verification.enabled cannot be False when buffer.easy_threshold is set. "
+                "Easy threshold depends on rewards which are disabled when verification.enabled=False."
+            )
+
         if not self.verification and self.buffer.hard_threshold is not None:
             raise ValueError(
                 "verification.enabled cannot be False when buffer.hard_threshold is set. "
                 "Hard threshold depends on rewards which are disabled when verification.enabled=False."
             )
-            

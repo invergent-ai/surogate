@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import glob
 import os
 import shutil
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -23,6 +22,7 @@ def _get_ray():
     if _ray is None:
         try:
             import ray
+
             _ray = ray
         except ImportError:
             raise ImportError("Ray is required for distributed training.")
@@ -37,7 +37,7 @@ def _serialize_config_value(value: Any) -> Any:
     Skips C++ objects that can't be serialized (they'll be reconstructed on workers).
     """
     # Skip C++ objects
-    if hasattr(value, '__module__') and 'surogate._surogate' in str(value.__module__):
+    if hasattr(value, "__module__") and "surogate._surogate" in str(value.__module__):
         return None
 
     # Convert Path to string
@@ -63,10 +63,11 @@ def _serialize_config_value(value: Any) -> Any:
 @dataclass
 class NodeTrainingResult:
     """Result from a single node's training."""
+
     node_rank: int
     final_loss: float
     final_step: int
-    checkpoint_path: Optional[str] = None
+    checkpoint_path: str | None = None
 
 
 def _create_barrier_actor(num_nodes: int):
@@ -86,7 +87,7 @@ def _create_barrier_actor(num_nodes: int):
             self.arrived = 0
             self.generation = 0
 
-        def arrive(self) -> Tuple[int, int]:
+        def arrive(self) -> tuple[int, int]:
             """
             Register arrival at barrier. Returns (generation, arrived_count).
             Non-blocking - caller must poll check_ready() separately.
@@ -120,24 +121,24 @@ def _detect_nccl_interface(node_rank: int = 0):
     """
     import os
     import subprocess
+
     from surogate.utils.logger import get_logger
+
     logger = get_logger()
 
     try:
         import ray
+
         ray_ip = ray.util.get_node_ip_address()
-        result = subprocess.run(
-            ['ip', '-4', '-o', 'addr', 'show'],
-            capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.strip().split('\n'):
+        result = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().split("\n"):
             parts = line.split()
             if len(parts) >= 4:
                 iface = parts[1]
-                ip = parts[3].split('/')[0]
+                ip = parts[3].split("/")[0]
                 if ip == ray_ip:
-                    if 'NCCL_SOCKET_IFNAME' not in os.environ:
-                        os.environ['NCCL_SOCKET_IFNAME'] = iface
+                    if "NCCL_SOCKET_IFNAME" not in os.environ:
+                        os.environ["NCCL_SOCKET_IFNAME"] = iface
                         logger.info(f"Node {node_rank}: Auto-detected NCCL interface {iface} ({ip})")
                     return iface, ip
         logger.warning(f"Node {node_rank}: Could not find interface for Ray IP {ray_ip}")
@@ -157,9 +158,9 @@ class NodeTrainer:
 
     def __init__(
         self,
-        config_dict: Dict[str, Any],
-        train_files: List[str],
-        eval_files: Optional[List[str]],
+        config_dict: dict[str, Any],
+        train_files: list[str],
+        eval_files: list[str] | None,
         node_rank: int,
         num_nodes: int,
         gpus_per_node: int,
@@ -194,7 +195,7 @@ class NodeTrainer:
 
         All multimodal models currently supported (Qwen3-VL) use 3-plane MRoPE.
         """
-        if getattr(config.model_info, 'is_multimodal', False):
+        if getattr(config.model_info, "is_multimodal", False):
             return 3
         return 1
 
@@ -204,12 +205,13 @@ class NodeTrainer:
         from surogate.core.config.sft_config import SFTConfig
         from surogate.utils.dict import DictDefault
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
 
         # Reconstruct config from dict (workers rebuild config objects locally)
         config = SFTConfig(DictDefault(self.config_dict))
         config.__post_init__()
-        
+
         logger.info(f"Node {self.node_rank}: Model download complete, weights at {config.model_dir}")
 
         self._train_vision = bool(config.train_vision and config.is_multimodal)
@@ -253,19 +255,24 @@ class NodeTrainer:
         - NCCL_RAS_ENABLE: RAS subsystem can interfere with bootstrap listeners
         """
         import os
+
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
 
         # Set NCCL env vars BEFORE ncclGetUniqueId() — the bootstrap root listener
         # starts inside that call and inherits the current environment.
-        os.environ['NCCL_RAS_ENABLE'] = '0'
-        os.environ['NCCL_IB_DISABLE'] = '0'
+        os.environ["NCCL_RAS_ENABLE"] = "0"
+        os.environ["NCCL_IB_DISABLE"] = "0"
 
         # Detect and set the correct network interface BEFORE generating IDs
         _detect_nccl_interface(self.node_rank)
 
         from surogate import _surogate
-        logger.info(f"Node {self.node_rank}: Generating NCCL ID with NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}")
+
+        logger.info(
+            f"Node {self.node_rank}: Generating NCCL ID with NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}"
+        )
         nccl_id = _surogate.generate_nccl_id()
         self.nccl_id = nccl_id
         logger.info(f"Node {self.node_rank}: Generated NCCL ID: {nccl_id[:16].hex()}")
@@ -284,6 +291,7 @@ class NodeTrainer:
         """
         from surogate.utils.hf import get_model_weights_path
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
 
         logger.info(f"Node {self.node_rank}: Starting model download...")
@@ -303,37 +311,44 @@ class NodeTrainer:
         """
         import os
         import time
+
         from surogate import _surogate
-        from surogate.utils.tensor import to_surogate_dtype
         from surogate.utils.logger import get_logger
+        from surogate.utils.tensor import to_surogate_dtype
+
         logger = get_logger()
-                
+
         # Ensure NCCL_DEBUG is set - use TRACE for maximum verbosity
-        os.environ['NCCL_DEBUG'] = 'WARN'
+        os.environ["NCCL_DEBUG"] = "WARN"
         # os.environ['NCCL_DEBUG_SUBSYS'] = 'ALL'
         # Write NCCL debug output to a file for inspection
         # os.environ['NCCL_DEBUG_FILE'] = f'/tmp/nccl_debug_node_{self.node_rank}.log'
 
         # Disable InfiniBand/RoCE and force TCP sockets for cross-node communication
         # This is more reliable for debugging multi-node issues
-        os.environ['NCCL_IB_DISABLE'] = '0'
+        os.environ["NCCL_IB_DISABLE"] = "0"
 
         # Disable NCCL RAS (Reliability, Availability, Serviceability) subsystem
         # RAS can cause "connection closed by peer" issues during initialization
         # See: https://github.com/NVIDIA/nccl/issues/1718
-        os.environ['NCCL_RAS_ENABLE'] = '0'
+        os.environ["NCCL_RAS_ENABLE"] = "0"
 
         # Configure NCCL network settings for multi-node communication
         import socket
+
         hostname = socket.gethostname()
 
         # Ensure NCCL_SOCKET_IFNAME is set (may already be set by generate_nccl_ids on node 0)
         detected_iface, detected_ip = _detect_nccl_interface(self.node_rank)
 
         local_ip = detected_ip or socket.gethostbyname(hostname)
-        logger.info(f"Node {self.node_rank}: Local IP={local_ip}, hostname={hostname}, NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}")
+        logger.info(
+            f"Node {self.node_rank}: Local IP={local_ip}, hostname={hostname}, NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}"
+        )
 
-        logger.info(f"Node {self.node_rank}: Entering init_trainer at {time.time()}, NCCL_DEBUG={os.environ.get('NCCL_DEBUG', 'NOT SET')}, NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}")
+        logger.info(
+            f"Node {self.node_rank}: Entering init_trainer at {time.time()}, NCCL_DEBUG={os.environ.get('NCCL_DEBUG', 'NOT SET')}, NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME', 'NOT SET')}"
+        )
 
         # Use cached model weights path from download_model()
         model_weights_path = self._model_weights_path
@@ -350,19 +365,11 @@ class NodeTrainer:
         if not self._train_vision:
             if self.tokenize_on_node:
                 self._train_loader = _surogate.DataLoader(
-                    self._train_files,
-                    self.chunk_size,
-                    rank=0,
-                    world_size=1,
-                    seed=self._config.train_seed
+                    self._train_files, self.chunk_size, rank=0, world_size=1, seed=self._config.train_seed
                 )
                 if self._eval_files:
                     self._eval_loader = _surogate.DataLoader(
-                        self._eval_files,
-                        self.chunk_size,
-                        rank=0,
-                        world_size=1,
-                        seed=self._config.eval_seed
+                        self._eval_files, self.chunk_size, rank=0, world_size=1, seed=self._config.eval_seed
                     )
             else:
                 # strided access across shared pre-tokenized files
@@ -371,7 +378,7 @@ class NodeTrainer:
                     self.chunk_size,
                     rank=self.node_rank,
                     world_size=self.num_nodes,
-                    seed=self._config.train_seed
+                    seed=self._config.train_seed,
                 )
                 if self._eval_files:
                     self._eval_loader = _surogate.DataLoader(
@@ -379,7 +386,7 @@ class NodeTrainer:
                         self.chunk_size,
                         rank=self.node_rank,
                         world_size=self.num_nodes,
-                        seed=self._config.eval_seed
+                        seed=self._config.eval_seed,
                     )
         else:
             self._train_loader = None
@@ -387,6 +394,7 @@ class NodeTrainer:
 
         # Create model config
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
+
         dsl_extra = {}
         if getattr(self._config, "ep_size", 1) > 1:
             dsl_extra["ep_size"] = self._config.ep_size
@@ -395,6 +403,7 @@ class NodeTrainer:
 
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
+
         jit_manifests = compile_jit_kernels(ir_json)
         if jit_manifests:
             self._config.runtime_config.jit_kernel_manifests = jit_manifests
@@ -404,7 +413,12 @@ class NodeTrainer:
         )
 
         # Determine if using LoRA
-        use_lora = self._config.lora and self._config.lora_rank and self._config.lora_alpha and self._config.lora_target_modules
+        use_lora = (
+            self._config.lora
+            and self._config.lora_rank
+            and self._config.lora_alpha
+            and self._config.lora_target_modules
+        )
 
         # Check for checkpoint resumption
         # find_latest_checkpoint returns -1 when no checkpoint exists;
@@ -415,7 +429,9 @@ class NodeTrainer:
             if self.start_step >= 0:
                 logger.info(f"Node {self.node_rank}: Found checkpoint at step {self.start_step}")
             else:
-                logger.warning(f"Node {self.node_rank}: No checkpoint found to resume from. Starting training from beginning.")
+                logger.warning(
+                    f"Node {self.node_rank}: No checkpoint found to resume from. Starting training from beginning."
+                )
 
         # Create the trainer with NCCL multi-node support
         if self.num_nodes > 1:
@@ -427,7 +443,9 @@ class NodeTrainer:
 
             # Multi-node: use NCCL ID for cross-node coordination
             # The node-master communicator is derived via ncclCommSplit internally.
-            logger.info(f"Node {self.node_rank}: Starting NCCL initialization with {self.num_nodes} nodes, node_rank={self.node_rank}, local_gpus={local_gpus}")
+            logger.info(
+                f"Node {self.node_rank}: Starting NCCL initialization with {self.num_nodes} nodes, node_rank={self.node_rank}, local_gpus={local_gpus}"
+            )
             self._trainer = _surogate.SurogateTrainer.create_multinode(
                 ngpu=local_gpus,
                 node_rank=self.node_rank,
@@ -441,7 +459,7 @@ class NodeTrainer:
                 memcpy_all_gather=self._config.memcpy_all_gather,
                 memcpy_send_recv=self._config.memcpy_send_recv,
                 lora_config=self._config.lora_config if use_lora else None,
-                qlora_config=self._config.qlora_config if use_lora else None
+                qlora_config=self._config.qlora_config if use_lora else None,
             )
             logger.info(f"Node {self.node_rank}: NCCL initialization completed successfully")
         else:
@@ -456,7 +474,7 @@ class NodeTrainer:
                 memcpy_all_gather=self._config.memcpy_all_gather,
                 memcpy_send_recv=self._config.memcpy_send_recv,
                 lora_config=self._config.lora_config if use_lora else None,
-                qlora_config=self._config.qlora_config if use_lora else None
+                qlora_config=self._config.qlora_config if use_lora else None,
             )
 
         # Load checkpoint or import weights
@@ -481,7 +499,9 @@ class NodeTrainer:
                     weights_path = model_weights_path
             logger.info(f"Node {self.node_rank}: Importing base model weights from {weights_path}...")
             if self._config.adapter_path:
-                logger.info(f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights...")
+                logger.info(
+                    f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights..."
+                )
                 self._trainer.set_adapter_path(self._config.adapter_path)
             self._trainer.import_weights(weights_path)
             logger.info(f"Node {self.node_rank}: Loading checkpoint from step {self.start_step}...")
@@ -490,19 +510,25 @@ class NodeTrainer:
         else:
             # Import weights from pretrained model
             if self._config.adapter_path:
-                logger.info(f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights...")
+                logger.info(
+                    f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights..."
+                )
                 self._trainer.set_adapter_path(self._config.adapter_path)
             self._trainer.import_weights(model_weights_path)
 
         if self._train_vision:
-            (self._mm_hf_model,
-             self._mm_processor,
-             self._mm_template_processor,
-             self._mm_vision_device,
-             self._mm_rope_fn) = init_mm_helpers(self._config)
+            (
+                self._mm_hf_model,
+                self._mm_processor,
+                self._mm_template_processor,
+                self._mm_vision_device,
+                self._mm_rope_fn,
+            ) = init_mm_helpers(self._config)
             pad_token_id = self._config.tokenizer.pad_token_id
             if pad_token_id is None:
-                pad_token_id = self._config.tokenizer.eos_token_id if self._config.tokenizer.eos_token_id is not None else 0
+                pad_token_id = (
+                    self._config.tokenizer.eos_token_id if self._config.tokenizer.eos_token_id is not None else 0
+                )
             global_batch = self._config.per_device_train_batch_size * local_gpus
             self._mm_batcher = OnTheFlyMultimodalBatcher(
                 dataset=self._mm_train_dataset,
@@ -522,7 +548,7 @@ class NodeTrainer:
 
         logger.info(f"Node {self.node_rank}: Completed init_trainer at {time.time()}")
 
-    def _tokenize_node_data(self, config: "SFTConfig") -> Tuple[List[str], Optional[List[str]]]:
+    def _tokenize_node_data(self, config: SFTConfig) -> tuple[list[str], list[str] | None]:
         """
         Tokenize this node's shard of the dataset.
 
@@ -536,11 +562,13 @@ class NodeTrainer:
             Tuple of (train_files, eval_files) paths for this node.
         """
         import tempfile
+
         from surogate.train.tokenize import TokenizeDatasets
         from surogate.utils.dict import DictDefault
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
-        
+
         # Determine base output directory for tokenized data on this worker
         # Priority: distributed.worker_output_dir > /tmp/surogate-{run_name}
         if config.distributed and config.distributed.worker_output_dir:
@@ -584,7 +612,7 @@ class NodeTrainer:
         self,
         step: int,
         lr: float,
-    ) -> Tuple[float, float]:
+    ) -> tuple[float, float]:
         """
         Execute one training step on this node.
 
@@ -619,14 +647,16 @@ class NodeTrainer:
                 normuon_momentum=config.normuon_momentum,
                 normuon_beta2=config.normuon_beta2,
                 normuon_lr=lr,
-                normuon_cautious_wd=config.normuon_cautious_wd
+                normuon_cautious_wd=config.normuon_cautious_wd,
             )
             result = self._trainer.update_with_config(opt_config, step + 1)
-            return result['loss'], result['norm']
+            return result["loss"], result["norm"]
 
         use_full_step_graphs = True
         if use_full_step_graphs and config.optimizer not in ("adamw", "adamw_8bit", "normuon"):
-            raise RuntimeError("DSL training requires optimizer 'adamw', 'adamw_8bit' or 'normuon' for full-step execution.")
+            raise RuntimeError(
+                "DSL training requires optimizer 'adamw', 'adamw_8bit' or 'normuon' for full-step execution."
+            )
 
         # Allocate token buffers
         micro_steps = config.gradient_accumulation_steps if use_full_step_graphs else 1
@@ -664,14 +694,14 @@ class NodeTrainer:
             normuon_momentum=config.normuon_momentum,
             normuon_beta2=config.normuon_beta2,
             normuon_lr=lr,
-            normuon_cautious_wd=config.normuon_cautious_wd
+            normuon_cautious_wd=config.normuon_cautious_wd,
         )
         if use_full_step_graphs:
             result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
         else:
             result = self._trainer.update_with_config(opt_config, step + 1)
 
-        return result['loss'], result['norm']
+        return result["loss"], result["norm"]
 
     def get_num_tokens(self) -> int:
         if self._train_vision:
@@ -691,20 +721,22 @@ class NodeTrainer:
             return total
         return 0
 
-    def get_moe_stats(self) -> Dict[str, Any]:
+    def get_moe_stats(self) -> dict[str, Any]:
         """Get MoE training statistics from the last forward pass."""
         if self._trainer is not None:
             return self._trainer.get_moe_stats()
-        return {'valid': False}
+        return {"valid": False}
 
-    def validate(self, max_steps: int = 100) -> Tuple[float, int]:
+    def validate(self, max_steps: int = 100) -> tuple[float, int]:
         """Run validation and return (mean_loss, batches_processed)."""
         if self._train_vision:
             if self._mm_eval_dataset is None:
                 return 0.0, 0
             pad_token_id = self._config.tokenizer.pad_token_id
             if pad_token_id is None:
-                pad_token_id = self._config.tokenizer.eos_token_id if self._config.tokenizer.eos_token_id is not None else 0
+                pad_token_id = (
+                    self._config.tokenizer.eos_token_id if self._config.tokenizer.eos_token_id is not None else 0
+                )
             global_batch = self._config.per_device_train_batch_size * self.local_gpus
             eval_batcher = OnTheFlyMultimodalBatcher(
                 dataset=self._mm_eval_dataset,
@@ -764,9 +796,9 @@ class NodeTrainer:
         """Save checkpoint (only node 0 saves the full model)."""
         self._trainer.save_checkpoint(path, step)
 
-    def get_dataset_info(self) -> Dict[str, Any]:
+    def get_dataset_info(self) -> dict[str, Any]:
         """Get dataset info for logging (train/eval token counts)."""
-        info: Dict[str, Any] = {}
+        info: dict[str, Any] = {}
         if self._train_loader is not None:
             info["train_tokens"] = self._train_loader.num_tokens
         if self._eval_loader is not None:
@@ -779,7 +811,7 @@ class NodeTrainer:
             return self._trainer.get_allocator_info(gpu_idx)
         return None
 
-    def get_gpu_info(self) -> List[Any]:
+    def get_gpu_info(self) -> list[Any]:
         """Get GPU info for all local GPUs."""
         if self._trainer is not None:
             return self._trainer.get_gpu_info()
@@ -788,6 +820,7 @@ class NodeTrainer:
     def cleanup_old_checkpoints(self, checkpoint_dir: str, save_total_limit: int) -> int:
         """Clean up old checkpoints, keeping the most recent ones."""
         from surogate import _surogate
+
         return _surogate.clean_old_checkpoints(checkpoint_dir, save_total_limit, -1)
 
     def cleanup_trainer(self) -> None:
@@ -807,6 +840,7 @@ class NodeTrainer:
         in any synchronization.
         """
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
         logger.info(f"Node {self.node_rank}: export_model called")
         if self._trainer is not None:
@@ -825,6 +859,7 @@ class NodeTrainer:
         in the barrier synchronization.
         """
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
         logger.info(f"Node {self.node_rank}: export_adapter called")
         if self._trainer is not None:
@@ -833,6 +868,7 @@ class NodeTrainer:
             logger.info(f"Node {self.node_rank}: Adapter export complete")
             return self.node_rank == 0  # Only node 0 actually writes the file
         return False
+
 
 class RayDistributedTrainer:
     """
@@ -844,11 +880,11 @@ class RayDistributedTrainer:
 
     def __init__(
         self,
-        config: "SFTConfig",
-        train_files: List[str],
-        eval_files: Optional[List[str]] = None,
+        config: SFTConfig,
+        train_files: list[str],
+        eval_files: list[str] | None = None,
         ray_address: str = "auto",
-        num_nodes: Optional[int] = None,
+        num_nodes: int | None = None,
         gpus_per_node: int = 0,  # 0 = use config.gpus
         tokenize_on_node: bool = False,  # If True, each node tokenizes its own data shard
     ):
@@ -867,8 +903,9 @@ class RayDistributedTrainer:
                 reduces driver memory pressure and enables parallel tokenization.
         """
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
-        
+
         ray = _get_ray()
 
         # Initialize Ray if not already done
@@ -886,17 +923,17 @@ class RayDistributedTrainer:
         if num_nodes is None:
             # Auto-detect from Ray cluster
             nodes = ray.nodes()
-            num_nodes = len([n for n in nodes if n.get('Alive', False)])
+            num_nodes = len([n for n in nodes if n.get("Alive", False)])
 
         self.num_nodes = num_nodes
-        self.node_trainers: List[ray.actor.ActorHandle] = []
+        self.node_trainers: list[ray.actor.ActorHandle] = []
 
         # Create serializable config dict (exclude non-serializable C++ objects)
         # Workers will reconstruct runtime_config, lora_config, qlora_config from the dict
         config_dict = {}
         for key, value in config.__dict__.items():
             # Skip non-serializable C++ objects (will be reconstructed on workers)
-            if key in ('runtime_config', 'lora_config', 'qlora_config'):
+            if key in ("runtime_config", "lora_config", "qlora_config"):
                 continue
             # Recursively serialize the value
             serialized = _serialize_config_value(value)
@@ -913,24 +950,22 @@ class RayDistributedTrainer:
 
     def _setup_workers(self) -> None:
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
-        
+
         """Create Ray actors for each node."""
         ray = _get_ray()
 
         # Create one actor per node with GPU resources
         gpus_per_node = self.gpus_per_node
 
-        @ray.remote(
-            num_gpus=gpus_per_node,
-            runtime_env={"env_vars": {"NCCL_DEBUG": "WARN"}}
-        )
+        @ray.remote(num_gpus=gpus_per_node, runtime_env={"env_vars": {"NCCL_DEBUG": "WARN"}})
         class NodeTrainerActor:
             def __init__(
                 self,
-                config_dict: Dict[str, Any],
-                train_files: List[str],
-                eval_files: Optional[List[str]],
+                config_dict: dict[str, Any],
+                train_files: list[str],
+                eval_files: list[str] | None,
                 node_rank: int,
                 num_nodes: int,
                 gpus_per_node: int,
@@ -960,8 +995,9 @@ class RayDistributedTrainer:
 
             def wait_at_barrier(self, barrier_actor) -> None:
                 """Wait at a barrier until all nodes arrive (used before NCCL init)."""
-                import ray
                 import time
+
+                import ray
 
                 # Register arrival and get the generation we're waiting for
                 my_gen, count = ray.get(barrier_actor.arrive.remote())
@@ -977,10 +1013,10 @@ class RayDistributedTrainer:
                 """Get the starting step (0 for fresh training, >0 for resumed from checkpoint)."""
                 return max(0, self.trainer.start_step)
 
-            def train_step(self, step: int, lr: float) -> Tuple[float, float]:
+            def train_step(self, step: int, lr: float) -> tuple[float, float]:
                 return self.trainer.train_step(step, lr)
 
-            def validate(self, max_steps: int = 100) -> Tuple[float, int]:
+            def validate(self, max_steps: int = 100) -> tuple[float, int]:
                 return self.trainer.validate(max_steps)
 
             def save_checkpoint(self, path: str, step: int) -> None:
@@ -996,11 +1032,11 @@ class RayDistributedTrainer:
                 """Get the number of tokens in the training dataset."""
                 return self.trainer.get_num_tokens()
 
-            def get_moe_stats(self) -> Dict[str, Any]:
+            def get_moe_stats(self) -> dict[str, Any]:
                 """Get MoE training statistics from the last forward pass."""
                 return self.trainer.get_moe_stats()
 
-            def get_dataset_info(self) -> Dict[str, Any]:
+            def get_dataset_info(self) -> dict[str, Any]:
                 """Get dataset info for logging."""
                 return self.trainer.get_dataset_info()
 
@@ -1013,16 +1049,21 @@ class RayDistributedTrainer:
                 infos = self.trainer.get_gpu_info()
                 return [
                     {
-                        "clock": g.clock, "max_clock": g.max_clock,
-                        "power": g.power, "power_limit": g.power_limit,
-                        "fan": g.fan, "temperature": g.temperature,
+                        "clock": g.clock,
+                        "max_clock": g.max_clock,
+                        "power": g.power,
+                        "power_limit": g.power_limit,
+                        "fan": g.fan,
+                        "temperature": g.temperature,
                         "temp_slowdown": g.temp_slowdown,
-                        "mem_free": g.mem_free, "mem_total": g.mem_total,
+                        "mem_free": g.mem_free,
+                        "mem_total": g.mem_total,
                         "mem_reserved": g.mem_reserved,
                         "gpu_utilization": g.gpu_utilization,
                         "mem_utilization": g.mem_utilization,
                         "throttle_reason": g.throttle_reason,
-                        "pcie_rx": g.pcie_rx, "pcie_tx": g.pcie_tx,
+                        "pcie_rx": g.pcie_rx,
+                        "pcie_tx": g.pcie_tx,
                     }
                     for g in infos
                 ]
@@ -1034,7 +1075,7 @@ class RayDistributedTrainer:
         # Use a STRICT_SPREAD placement group so Ray places exactly one actor per
         # physical node.  Each bundle requests the GPUs that one actor needs; the
         # STRICT_SPREAD strategy guarantees that every bundle lands on a different node.
-        from ray.util.placement_group import placement_group, placement_group_table
+        from ray.util.placement_group import placement_group
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         bundles = [{"GPU": gpus_per_node, "CPU": 1} for _ in range(self.num_nodes)]
@@ -1128,10 +1169,7 @@ class RayDistributedTrainer:
         config = self._config
         local_gpus = self.gpus_per_node
         tokens_per_step_per_node = (
-            config.per_device_train_batch_size *
-            config.sequence_len *
-            local_gpus *
-            config.gradient_accumulation_steps
+            config.per_device_train_batch_size * config.sequence_len * local_gpus * config.gradient_accumulation_steps
         )
         total_tokens_per_step = tokens_per_step_per_node * self.num_nodes
 
@@ -1140,6 +1178,7 @@ class RayDistributedTrainer:
         if config.from_scratch:
             # Chinchilla token budget (optimal tokens ≈ 20 × params)
             from surogate.utils.model import estimate_model_parameters
+
             num_params = estimate_model_parameters(config.model_info.config)
             chinchilla_tokens = 20 * num_params
 
@@ -1155,6 +1194,7 @@ class RayDistributedTrainer:
             raise ValueError("train_vision requires max_steps when dataset length is unknown.")
         elif config.epoch_adjustment and config.from_scratch:
             import math as _math
+
             chinchilla_epochs = max(1, _math.ceil(chinchilla_tokens / max(num_tokens, 1)))
             if chinchilla_epochs != config.num_epochs:
                 logger.info(
@@ -1183,7 +1223,7 @@ class RayDistributedTrainer:
             cooldown_steps=config.cooldown_steps,
             final_lr=config.learning_rate * config.final_lr_fraction,
             schedule_type=config.lr_scheduler_type,
-            wsd_decay_steps_fraction=config.wsd_decay_steps_fraction
+            wsd_decay_steps_fraction=config.wsd_decay_steps_fraction,
         )
 
         # Auto LR reduction guard
@@ -1197,14 +1237,21 @@ class RayDistributedTrainer:
             num_experts_per_tok=config.moe_num_experts_per_tok,
         )
         advisor = TrainingAdvisor(
-            logger, phase_detector, gradient_tracker, plateau_detector,
-            loss_guard, moe_monitor, lr_schedule, max_steps,
+            logger,
+            phase_detector,
+            gradient_tracker,
+            plateau_detector,
+            loss_guard,
+            moe_monitor,
+            lr_schedule,
+            max_steps,
             warmup_steps=warmup_steps,
         )
 
         # Early stopping
         if config.early_stop:
             from surogate.train.early_stopping import EarlyStopping
+
             early_stopping = EarlyStopping(logger, num_params, total_tokens_per_step)
         else:
             early_stopping = None
@@ -1213,7 +1260,9 @@ class RayDistributedTrainer:
         if self.eval_files:
             has_eval = True
         elif config.train_vision:
-            has_eval = bool(config.validation_datasets) or (config.validation_split_ratio and config.validation_split_ratio > 0)
+            has_eval = bool(config.validation_datasets) or (
+                config.validation_split_ratio and config.validation_split_ratio > 0
+            )
 
         with training_logger_context(config) as train_logger:
             # log_cmd and log_options are already called by training_logger_context.
@@ -1232,7 +1281,7 @@ class RayDistributedTrainer:
                 if alloc_info is not None:
                     train_logger.log_allocator(alloc_info)
 
-            logger.info(f"Starting distributed training...")
+            logger.info("Starting distributed training...")
             logger.info(f"  Nodes: {self.num_nodes}")
             logger.info(f"  GPUs per node: {local_gpus}")
             logger.info(f"  Total GPUs: {self.num_nodes * local_gpus}")
@@ -1241,23 +1290,30 @@ class RayDistributedTrainer:
             logger.info(f"  Max steps: {max_steps}")
             logger.info(f"  Recipe: {config.recipe}")
             logger.info(f"  Optimizer: {config.optimizer}")
-            logger.info(f"  LR schedule: {config.lr_scheduler_type} (warmup={warmup_steps}, cooldown={config.cooldown_steps})")
+            logger.info(
+                f"  LR schedule: {config.lr_scheduler_type} (warmup={warmup_steps}, cooldown={config.cooldown_steps})"
+            )
 
             if config.from_scratch:
                 planned_tokens = max_steps * total_tokens_per_step
                 ratio = planned_tokens / max(chinchilla_tokens, 1)
+
                 def _fmt(n):
-                    if n >= 1e12: return f"{n/1e12:.1f}T"
-                    if n >= 1e9: return f"{n/1e9:.1f}B"
-                    if n >= 1e6: return f"{n/1e6:.1f}M"
-                    return f"{n/1e3:.1f}K"
+                    if n >= 1e12:
+                        return f"{n / 1e12:.1f}T"
+                    if n >= 1e9:
+                        return f"{n / 1e9:.1f}B"
+                    if n >= 1e6:
+                        return f"{n / 1e6:.1f}M"
+                    return f"{n / 1e3:.1f}K"
+
                 logger.info(
                     f"  Chinchilla budget: {_fmt(chinchilla_tokens)} tokens (20 × {_fmt(num_params)} params) | "
                     f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
                 )
 
             if config.lora and config.lora_config:
-                logger.info(f"LoRA enabled:")
+                logger.info("LoRA enabled:")
                 logger.info(f"  Rank: {config.lora_config.rank}")
                 logger.info(f"  Alpha: {config.lora_config.alpha}")
                 logger.info(f"  Scaling: {config.lora_config.scaling:.4f}")
@@ -1326,8 +1382,13 @@ class RayDistributedTrainer:
                 if step % config.logging_steps == 0:
                     if metrics.moe is not None:
                         train_logger.log_step_moe(
-                            metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                            metrics.grad_norm, metrics.loss, metrics.lr,
+                            metrics.step,
+                            metrics.epoch,
+                            metrics.tokens,
+                            metrics.elapsed_ms,
+                            metrics.grad_norm,
+                            metrics.loss,
+                            metrics.lr,
                             metrics.moe.aux_loss,
                             metrics.moe.z_loss,
                             metrics.moe.load_imbalance,
@@ -1335,8 +1396,13 @@ class RayDistributedTrainer:
                         )
                     else:
                         train_logger.log_step(
-                            metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                            metrics.grad_norm, metrics.loss, metrics.lr,
+                            metrics.step,
+                            metrics.epoch,
+                            metrics.tokens,
+                            metrics.elapsed_ms,
+                            metrics.grad_norm,
+                            metrics.loss,
+                            metrics.lr,
                         )
 
                 # Log GPU utilization from node 0
@@ -1360,7 +1426,9 @@ class RayDistributedTrainer:
                     batches_processed = eval_results[0][1]  # All nodes process same number of batches
                     eval_elapsed_ms = int((time.time() - eval_start) * 1000)
                     epoch = step / steps_per_epoch if steps_per_epoch > 0 else 0.0
-                    eval_tokens = batches_processed * config.per_device_train_batch_size * config.sequence_len * local_gpus
+                    eval_tokens = (
+                        batches_processed * config.per_device_train_batch_size * config.sequence_len * local_gpus
+                    )
                     train_logger.log_eval(step, epoch, eval_tokens, eval_elapsed_ms, avg_eval_loss)
                     logger.info(f"  Eval loss: {avg_eval_loss:.4f}")
                     if early_stopping is not None and early_stopping.check_eval(avg_eval_loss, step):
@@ -1417,11 +1485,14 @@ class RayDistributedTrainer:
                         if adapter_file.exists():
                             logger.info(f"LoRA adapter saved to {adapter_dir} (export timed out but file exists)")
                         else:
-                            logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
+                            logger.warning(
+                                f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed."
+                            )
 
                     # Merge adapter into base model if requested (only on head node)
                     if config.merge_adapter:
                         from surogate.utils.adapter_merge import merge_adapter
+
                         merged_dir = Path(config.output_dir)
                         try:
                             merge_adapter(
@@ -1429,7 +1500,7 @@ class RayDistributedTrainer:
                                 adapter_path=adapter_dir,
                                 output_path=str(merged_dir),
                                 max_shard_size="5GB",
-                                cpu_offload=True
+                                cpu_offload=True,
                             )
                             generate_training_plot(config.log_file, merged_dir / "training_plot.png")
                         except Exception as e:
@@ -1463,7 +1534,9 @@ class RayDistributedTrainer:
                             self._copy_tokenizer_files(config.model_dir, config.output_dir)
                             generate_training_plot(config.log_file, Path(config.output_dir) / "training_plot.png")
                         else:
-                            logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
+                            logger.warning(
+                                f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed."
+                            )
 
                 logger.info(f"\nTraining complete! Logs saved to {config.log_file}")
             except Exception as e:
@@ -1477,12 +1550,19 @@ class RayDistributedTrainer:
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
         """Copy tokenizer and vocab files from source model to output directory."""
         from surogate.utils.logger import get_logger
+
         logger = get_logger()
         tokenizer_files = [
-            "config.json", "preprocessor_config.json",
-            "tokenizer.json", "tokenizer_config.json",
-            "special_tokens_map.json", "vocab.json", "merges.txt",
-            "added_tokens.json", "chat_template.jinja", "generation_config.json"
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "added_tokens.json",
+            "chat_template.jinja",
+            "generation_config.json",
         ]
         src_path = Path(src_dir)
         dst_path = Path(dst_dir)

@@ -69,56 +69,64 @@ public:
         int skip_quant_last_layers = 0;
     };
 
-    NVFP4QuartetRecipe() : mConfig{} {}
-    explicit NVFP4QuartetRecipe(Config config) : mConfig(std::move(config)) {}
+    NVFP4QuartetRecipe()
+        : mConfig{} {
+    }
+    explicit NVFP4QuartetRecipe(Config config)
+        : mConfig(std::move(config)) {
+    }
 
     // =========================================================================
     // Type checking
     // =========================================================================
 
-    [[nodiscard]] bool is_nvfp4() const override { return false; }  // Different from standard NVFP4
-    [[nodiscard]] bool is_nvfp4_cutlass() const override { return true; }  // Uses CUTLASS backend
-    [[nodiscard]] bool is_nvfp4_quartet() const { return true; }
+    [[nodiscard]] bool is_nvfp4() const override {
+        return false;
+    }  // Different from standard NVFP4
+    [[nodiscard]] bool is_nvfp4_cutlass() const override {
+        return true;
+    }  // Uses CUTLASS backend
+    [[nodiscard]] bool is_nvfp4_quartet() const {
+        return true;
+    }
 
     // =========================================================================
     // Format specification
     // =========================================================================
 
-    [[nodiscard]] Format forward_format() const override { return Format::E2M1; }
-    [[nodiscard]] Format backward_format() const override { return Format::E2M1; }
+    [[nodiscard]] Format forward_format() const override {
+        return Format::E2M1;
+    }
+    [[nodiscard]] Format backward_format() const override {
+        return Format::E2M1;
+    }
 
     // =========================================================================
     // Quantization parameters
     // =========================================================================
 
     [[nodiscard]] QuantParams quant_fwd_input() const override {
-        return {
-            .random_hadamard_transform = false,   // Forward uses standard RTN quantization (no Hadamard/EDEN)
-            .stochastic_rounding = false,         // RTN for FP4 values
-            .block_2d_quantization = false,
-            .power_2_scale = false,
-            .amax_epsilon = 0.0f
-        };
+        return {.random_hadamard_transform = false,  // Forward uses standard RTN quantization (no Hadamard/EDEN)
+                .stochastic_rounding = false,        // RTN for FP4 values
+                .block_2d_quantization = false,
+                .power_2_scale = false,
+                .amax_epsilon = 0.0f};
     }
 
     [[nodiscard]] QuantParams quant_fwd_weight() const override {
-        return {
-            .random_hadamard_transform = false,   // No RHT for weights (per TE recipe)
-            .stochastic_rounding = false,         // RTN for weights
-            .block_2d_quantization = false,
-            .power_2_scale = false,
-            .amax_epsilon = 0.0f
-        };
+        return {.random_hadamard_transform = false,  // No RHT for weights (per TE recipe)
+                .stochastic_rounding = false,        // RTN for weights
+                .block_2d_quantization = false,
+                .power_2_scale = false,
+                .amax_epsilon = 0.0f};
     }
 
     [[nodiscard]] QuantParams quant_bwd_grad() const override {
-        return {
-            .random_hadamard_transform = true,    // Re-randomized Hadamard per backward pass
-            .stochastic_rounding = false,         // KEY: RTN for FP4 values, SR on scales only
-            .block_2d_quantization = false,
-            .power_2_scale = false,
-            .amax_epsilon = 0.0f
-        };
+        return {.random_hadamard_transform = true,  // Re-randomized Hadamard per backward pass
+                .stochastic_rounding = false,       // KEY: RTN for FP4 values, SR on scales only
+                .block_2d_quantization = false,
+                .power_2_scale = false,
+                .amax_epsilon = 0.0f};
     }
 
     // =========================================================================
@@ -139,30 +147,48 @@ public:
     // State requirements
     // =========================================================================
 
-    [[nodiscard]] bool requires_block_scales() const override { return true; }
-    [[nodiscard]] bool requires_hadamard_workspace() const override { return true; }
+    [[nodiscard]] bool requires_block_scales() const override {
+        return true;
+    }
+    [[nodiscard]] bool requires_hadamard_workspace() const override {
+        return true;
+    }
 
-    [[nodiscard]] EMatmulBackend matmul_backend() const override { return mConfig.backend; }
+    [[nodiscard]] EMatmulBackend matmul_backend() const override {
+        return mConfig.backend;
+    }
 
     // =========================================================================
     // Recipe metadata
     // =========================================================================
 
-    [[nodiscard]] std::string_view name() const override { return "nvfp4-quartet"; }
+    [[nodiscard]] std::string_view name() const override {
+        return "nvfp4-quartet";
+    }
 
-    [[nodiscard]] const Config& config() const { return mConfig; }
+    [[nodiscard]] const Config& config() const {
+        return mConfig;
+    }
 
     /// @brief Get Hadamard dimension (128 for Quartet-II)
-    [[nodiscard]] int hadamard_dim() const { return mConfig.hadamard_dim; }
+    [[nodiscard]] int hadamard_dim() const {
+        return mConfig.hadamard_dim;
+    }
 
     /// @brief Get forward scale override
-    [[nodiscard]] float forward_scale_override() const { return mConfig.forward_scale_override; }
+    [[nodiscard]] float forward_scale_override() const {
+        return mConfig.forward_scale_override;
+    }
 
     /// @brief Get backward scale override (~1.054 for EDEN)
-    [[nodiscard]] float backward_scale_override() const { return mConfig.backward_scale_override; }
+    [[nodiscard]] float backward_scale_override() const {
+        return mConfig.backward_scale_override;
+    }
 
     /// @brief Get maximum scale value for EDEN
-    [[nodiscard]] float scales_max() const { return mConfig.scales_max; }
+    [[nodiscard]] float scales_max() const {
+        return mConfig.scales_max;
+    }
 
     // =========================================================================
     // Matmul dispatch overrides

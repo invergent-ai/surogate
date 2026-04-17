@@ -23,7 +23,9 @@ class TensorAllocator;
 class DataLoader;
 struct RuntimeOptions;
 
-namespace modules { class FP8ScalingState; }
+namespace modules {
+class FP8ScalingState;
+}  // namespace modules
 
 typedef struct cudnnContext* cudnnHandle_t;
 typedef struct cublasLtContext* cublasLtHandle_t;
@@ -45,18 +47,27 @@ public:
     virtual void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) = 0;
 
     //! \brief Runs the forward pass and calculates the loss w.r.t. `targets`.
-    virtual float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) = 0;
+    virtual float
+    validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) = 0;
 
     //! \brief Runs the backward pass
     //! \details This function is asynchronous. You need to wait on `run_state.BackwardDone`
     //! before accessing any of the results (or run subsequent work on `run_state.MainStream`).
     //! However, it is guaranteed that `inputs` and `targets` have been copied to the GPU-side buffer
     //! before this function returns.
-    virtual void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
+    virtual void
+    backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
 
     //! \brief Runs the AdamW update step.
     //! \details Runs asynchronously, signalling completion through the OptimizerDone event.
-    virtual void update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon, float weight_decay, float grad_clip) = 0;
+    virtual void update(NCCLCommunicator& comm,
+                        float learning_rate,
+                        float beta_1,
+                        float beta_2,
+                        int t,
+                        float epsilon,
+                        float weight_decay,
+                        float grad_clip) = 0;
 
     //! \brief Runs the optimizer update with full configuration.
     //! \details Supports AdamW 8-bit and NorMuon (hybrid AdamW/NorMuon) optimizers.
@@ -132,25 +143,33 @@ public:
     //! @param B Batch size
     //! @param T Sequence length
     //! @param allocate_optimizer Whether to allocate optimizer state
-    virtual void allocate_run_state(const struct RuntimeOptions& options, NCCLCommunicator& comm,
-                                     int B, int T, bool allocate_optimizer) {
+    virtual void allocate_run_state(const struct RuntimeOptions& options,
+                                    NCCLCommunicator& comm,
+                                    int B,
+                                    int T,
+                                    bool allocate_optimizer) {
         // Default no-op for models that allocate run state in constructor
     }
 
     //! Check if LoRA training is enabled (default: false)
-    [[nodiscard]] virtual bool lora_enabled() const { return false; }
+    [[nodiscard]] virtual bool lora_enabled() const {
+        return false;
+    }
 
     //! Save LoRA adapter to a checkpoint directory (no-op for non-LoRA models)
-    virtual void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {}
+    virtual void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {
+    }
 
     //! Load LoRA adapter from a checkpoint directory (no-op for non-LoRA models)
-    virtual void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {}
+    virtual void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {
+    }
 
     //! Prepare optimizer state buffers for checkpoint loading.
     //! Must be called before loading optimizer state from safetensors files.
     //! This allocates state buffers based on model structure so they can receive checkpoint data.
     //! Default no-op for models that don't need pre-allocation.
-    virtual void prepare_optimizer_for_checkpoint_load() {}
+    virtual void prepare_optimizer_for_checkpoint_load() {
+    }
 
     //! Get the model type identifier
     virtual std::string_view model_type() const = 0;
@@ -159,7 +178,6 @@ public:
     virtual IRunState& get_run_state() const = 0;
 };
 
-
 /*!
  *  \brief Architecture-agnostic base class for model run states
  *  \details Contains model run data that is independent of the actual
@@ -167,13 +185,23 @@ public:
  */
 class IRunState {
     friend class IModel;
-    friend std::string save_checkpoint(std::string checkpoint_directory, int step, IModel& model,
-        const DataLoader* loader, NCCLCommunicator& comm);
-    friend void load_checkpoint(std::string checkpoint_directory, int step, IModel& model,
-        DataLoader* loader, NCCLCommunicator& comm);
+    friend std::string save_checkpoint(std::string checkpoint_directory,
+                                       int step,
+                                       IModel& model,
+                                       const DataLoader* loader,
+                                       NCCLCommunicator& comm);
+    friend void load_checkpoint(std::string checkpoint_directory,
+                                int step,
+                                IModel& model,
+                                DataLoader* loader,
+                                NCCLCommunicator& comm);
+
 public:
     IRunState() = default;
-    IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, long seq_len, std::shared_ptr<TensorAllocator> alloc);
+    IRunState(std::unique_ptr<PretrainedConfig> config,
+              long batch_size,
+              long seq_len,
+              std::shared_ptr<TensorAllocator> alloc);
     ~IRunState();
 
     IRunState(const IRunState&) = delete;
@@ -198,33 +226,33 @@ public:
     float get_accuracy() const;
 
     // temporary buffers
-    Tensor temp_alloc(ETensorDType dtype, const std::vector<long>& shape, const char* name="<unnamed>");
+    Tensor temp_alloc(ETensorDType dtype, const std::vector<long>& shape, const char* name = "<unnamed>");
     void temp_acquire(Tensor& target);
     void temp_free(Tensor& tensor);
 
     std::unique_ptr<PretrainedConfig> Config;
-    long B;     //!< Batch size
-    long T;     //!< Sequence length
+    long B;                  //!< Batch size
+    long T;                  //!< Sequence length
     int GradAccumSteps = 1;  //!< Most recent grad-accumulation steps (for loss/grad normalization)
     int WorldSize = 1;       //!< Data-parallel world size (used for masked-token normalization)
 
     std::shared_ptr<TensorAllocator> Allocator;
     DeviceMemoryStack Stack;
 
-    Tensor Inputs;                      // (B, T) Int32
-    Tensor PositionIDs;                 // (B, T) or (3, B, T) Int32 - explicit position IDs
-    Tensor Targets;                     // (B, T) Int32
-    Tensor VisualPosMasks;              // (B, T) Int32 - positions of visual tokens
-    Tensor VisualEmbeds;                // (B*T, C) model dtype - visual embeddings (ordered by mask)
-    std::vector<Tensor> DeepstackVisualEmbeds; // (B*T, C) per deepstack layer
-    Tensor Losses;                      // (B, T) FP32
-    Tensor ValidTokenCount;             // (1,) Int32 - count of non-masked tokens
-    Tensor CorrectCount;                // (1,) Int32 - count of correct predictions
+    Tensor Inputs;                              // (B, T) Int32
+    Tensor PositionIDs;                         // (B, T) or (3, B, T) Int32 - explicit position IDs
+    Tensor Targets;                             // (B, T) Int32
+    Tensor VisualPosMasks;                      // (B, T) Int32 - positions of visual tokens
+    Tensor VisualEmbeds;                        // (B*T, C) model dtype - visual embeddings (ordered by mask)
+    std::vector<Tensor> DeepstackVisualEmbeds;  // (B*T, C) per deepstack layer
+    Tensor Losses;                              // (B, T) FP32
+    Tensor ValidTokenCount;                     // (1,) Int32 - count of non-masked tokens
+    Tensor CorrectCount;                        // (1,) Int32 - count of correct predictions
 
-    float* NormHost = nullptr;          // single value
-    float* GradScaleHost = nullptr;     // grad_scale for deferred NaN check
-    float* LossHost = nullptr;          // single value
-    float* AccuracyHost = nullptr;      // single value for accuracy
+    float* NormHost = nullptr;       // single value
+    float* GradScaleHost = nullptr;  // grad_scale for deferred NaN check
+    float* LossHost = nullptr;       // single value
+    float* AccuracyHost = nullptr;   // single value for accuracy
 
     std::pair<float, float> record_step(float loss, float norm);
 
@@ -233,11 +261,11 @@ public:
 
     cudaStream_t MainStream = nullptr;
 
-    cudaEvent_t ForwardDone   = nullptr;       //!< recorded at the end of the forward pass
-    cudaEvent_t BackwardDone  = nullptr;       //!< recorded at the end of the backward pass
-    cudaEvent_t TransferDone  = nullptr;       //!< recorded once CPU-side buffers have been copied to GPU
-    cudaEvent_t NormDone      = nullptr;       //!< recorded after norm calculation completes
-    cudaEvent_t OptimizerDone = nullptr;       //!< recorded after the optimizer completes
+    cudaEvent_t ForwardDone = nullptr;    //!< recorded at the end of the forward pass
+    cudaEvent_t BackwardDone = nullptr;   //!< recorded at the end of the backward pass
+    cudaEvent_t TransferDone = nullptr;   //!< recorded once CPU-side buffers have been copied to GPU
+    cudaEvent_t NormDone = nullptr;       //!< recorded after norm calculation completes
+    cudaEvent_t OptimizerDone = nullptr;  //!< recorded after the optimizer completes
 
     cudnnHandle_t CudnnHandle = nullptr;
     cublasLtHandle_t CublasLtHandle = nullptr;
@@ -248,7 +276,7 @@ public:
     void setup_timing_events(int micro_steps);
 
     cudaEvent_t TimingOptimizerStart = nullptr;
-    cudaEvent_t TimingOptimizerEnd   = nullptr;
+    cudaEvent_t TimingOptimizerEnd = nullptr;
     std::vector<cudaEvent_t> TimingForwardStart;
     std::vector<cudaEvent_t> TimingForwardEnd;
     std::vector<cudaEvent_t> TimingHeadStart;
@@ -256,12 +284,12 @@ public:
     std::vector<cudaEvent_t> TimingBackwardStart;
     std::vector<cudaEvent_t> TimingBackwardEnd;
 
-    Tensor Inputs_CPU;      // (B, T) Int32
-    Tensor PositionIDs_CPU; // (B, T) or (3, B, T) Int32
-    Tensor Targets_CPU;     // (B, T) Int32
-    Tensor VisualPosMasks_CPU; // (B, T) Int32
-    Tensor VisualEmbeds_CPU;   // (B*T, C) model dtype
-    std::vector<Tensor> DeepstackVisualEmbeds_CPU; // (B*T, C) per deepstack layer
+    Tensor Inputs_CPU;                              // (B, T) Int32
+    Tensor PositionIDs_CPU;                         // (B, T) or (3, B, T) Int32
+    Tensor Targets_CPU;                             // (B, T) Int32
+    Tensor VisualPosMasks_CPU;                      // (B, T) Int32
+    Tensor VisualEmbeds_CPU;                        // (B*T, C) model dtype
+    std::vector<Tensor> DeepstackVisualEmbeds_CPU;  // (B*T, C) per deepstack layer
 
     // =========================================================================
     // Virtual accessors for recipe-driven matmul dispatch
@@ -270,28 +298,44 @@ public:
     // Default implementations return nullptr/false. ModularRunState overrides.
 
     /// @brief Check if FP8 forward buffers are available
-    [[nodiscard]] virtual bool has_fp8_forward() const { return false; }
+    [[nodiscard]] virtual bool has_fp8_forward() const {
+        return false;
+    }
 
     /// @brief Check if FP8 HYBRID backward mode is enabled
-    [[nodiscard]] virtual bool has_fp8_hybrid_backward() const { return false; }
+    [[nodiscard]] virtual bool has_fp8_hybrid_backward() const {
+        return false;
+    }
 
     /// @brief Check if FP8 delayed scaling is enabled
-    [[nodiscard]] virtual bool has_fp8_delayed_scaling() const { return false; }
+    [[nodiscard]] virtual bool has_fp8_delayed_scaling() const {
+        return false;
+    }
 
     /// @brief Check if FP4 forward is enabled
-    [[nodiscard]] virtual bool has_fp4_forward() const { return false; }
+    [[nodiscard]] virtual bool has_fp4_forward() const {
+        return false;
+    }
 
     /// @brief Check if FP4 backward is enabled
-    [[nodiscard]] virtual bool has_fp4_backward() const { return false; }
+    [[nodiscard]] virtual bool has_fp4_backward() const {
+        return false;
+    }
 
     /// @brief Check if activation quant buffers are allocated
-    [[nodiscard]] virtual bool has_activation_quants() const { return false; }
+    [[nodiscard]] virtual bool has_activation_quants() const {
+        return false;
+    }
 
     /// @brief Check if gradient quant buffers are allocated
-    [[nodiscard]] virtual bool has_grad_quants() const { return false; }
+    [[nodiscard]] virtual bool has_grad_quants() const {
+        return false;
+    }
 
     /// @brief Get FP8 forward quant buffer for a matmul operation (nullptr if not available)
-    [[nodiscard]] virtual Tensor* get_fp8_forward_buffer(int /*op*/) { return nullptr; }
+    [[nodiscard]] virtual Tensor* get_fp8_forward_buffer(int /*op*/) {
+        return nullptr;
+    }
 
     /// @brief Get FP4 forward buffers for a matmul operation (data, scales, amax)
     [[nodiscard]] virtual std::tuple<Tensor*, Tensor*, float*> get_fp4_forward_buffers(int /*op*/) {
@@ -299,16 +343,24 @@ public:
     }
 
     /// @brief Get Hadamard workspace for FP4 operations (nullptr if not available)
-    [[nodiscard]] virtual Tensor* get_hadamard_workspace() { return nullptr; }
+    [[nodiscard]] virtual Tensor* get_hadamard_workspace() {
+        return nullptr;
+    }
 
     /// @brief Get activation quant buffer for a layer (nullptr if not available)
-    [[nodiscard]] virtual Tensor* get_activation_quant_buffer(int /*layer_idx*/, int /*op*/) { return nullptr; }
+    [[nodiscard]] virtual Tensor* get_activation_quant_buffer(int /*layer_idx*/, int /*op*/) {
+        return nullptr;
+    }
 
     /// @brief Get gradient quant buffer for a matmul operation (nullptr if not available)
-    [[nodiscard]] virtual Tensor* get_gradient_quant_buffer(int /*op*/) { return nullptr; }
+    [[nodiscard]] virtual Tensor* get_gradient_quant_buffer(int /*op*/) {
+        return nullptr;
+    }
 
     /// @brief Get FP8 scaling state for delayed scaling (nullptr if not available)
-    [[nodiscard]] virtual modules::FP8ScalingState* get_fp8_scaling_state() { return nullptr; }
+    [[nodiscard]] virtual modules::FP8ScalingState* get_fp8_scaling_state() {
+        return nullptr;
+    }
 
     // =========================================================================
     // MoE Metrics (for monitoring MoE training)
@@ -316,27 +368,32 @@ public:
 
     /// @brief MoE training statistics (accumulated across layers per step)
     struct MoEStats {
-        float aux_loss = 0.0f;           ///< Load balancing auxiliary loss (summed across layers)
-        float z_loss = 0.0f;             ///< Router z-loss (summed across layers)
-        float expert_utilization = 0.0f; ///< Fraction of experts that received tokens (0-1)
-        float load_imbalance = 0.0f;     ///< max(token_counts) / mean(token_counts)
-        int num_layers = 0;              ///< Number of MoE layers in model
-        bool valid = false;              ///< True if stats were computed this step
+        float aux_loss = 0.0f;            ///< Load balancing auxiliary loss (summed across layers)
+        float z_loss = 0.0f;              ///< Router z-loss (summed across layers)
+        float expert_utilization = 0.0f;  ///< Fraction of experts that received tokens (0-1)
+        float load_imbalance = 0.0f;      ///< max(token_counts) / mean(token_counts)
+        int num_layers = 0;               ///< Number of MoE layers in model
+        bool valid = false;               ///< True if stats were computed this step
     };
 
     /// @brief Get MoE stats from the last forward pass (only valid for MoE models)
-    [[nodiscard]] virtual MoEStats get_moe_stats() const { return {}; }
+    [[nodiscard]] virtual MoEStats get_moe_stats() const {
+        return {};
+    }
 
     /// @brief Reset MoE stats for next step
-    virtual void reset_moe_stats() {}
+    virtual void reset_moe_stats() {
+    }
 
     /// @brief Check if this is an MoE model
-    [[nodiscard]] virtual bool is_moe_model() const { return false; }
+    [[nodiscard]] virtual bool is_moe_model() const {
+        return false;
+    }
 
 private:
     // ring-buffers that keep a history of past losses
     struct OutlierDetector {
-        OutlierDetector(int window_size=100);
+        OutlierDetector(int window_size = 100);
 
         void record(float value);
         float eval(float value) const;
@@ -356,4 +413,4 @@ private:
     OutlierDetector NormOutliers;
 };
 
-#endif //SUROGATE_SRC_TRAINING_MODEL_H
+#endif  //SUROGATE_SRC_TRAINING_MODEL_H

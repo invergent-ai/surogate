@@ -126,19 +126,34 @@ class MultiPacker(BasePacker):
     def _validate_sample(self, sample: TrainingSample) -> tuple[bool, str | None]:
         sample_length = len(sample.prompt_ids) + len(sample.completion_ids)
         if len(sample.prompt_mask) != len(sample.prompt_ids):
-            return (False, f"prompt mask length != prompt ids length ({len(sample.prompt_mask)} != {len(sample.prompt_ids)})")
+            return (
+                False,
+                f"prompt mask length != prompt ids length ({len(sample.prompt_mask)} != {len(sample.prompt_ids)})",
+            )
         if len(sample.completion_mask) != len(sample.completion_ids):
-            return (False, f"completion mask length != completion ids length ({len(sample.completion_mask)} != {len(sample.completion_ids)})")
+            return (
+                False,
+                f"completion mask length != completion ids length ({len(sample.completion_mask)} != {len(sample.completion_ids)})",
+            )
         if len(sample.completion_logprobs) != len(sample.completion_ids):
-            return (False, f"completion logprobs length != completion ids length ({len(sample.completion_logprobs)} != {len(sample.completion_ids)})")
+            return (
+                False,
+                f"completion logprobs length != completion ids length ({len(sample.completion_logprobs)} != {len(sample.completion_ids)})",
+            )
         if len(sample.completion_temperatures) != len(sample.completion_ids):
-            return (False, f"completion temperatures length != completion ids length ({len(sample.completion_temperatures)} != {len(sample.completion_ids)})")
+            return (
+                False,
+                f"completion temperatures length != completion ids length ({len(sample.completion_temperatures)} != {len(sample.completion_ids)})",
+            )
         if sample_length == 0:
             return False, "sample with no tokens"
         if sample_length > self.seq_len:
             return (False, f"sample length {sample_length} exceeds max sequence length {self.seq_len}")
         if sample.teacher_logprobs is not None and len(sample.teacher_logprobs) != sample_length:
-            return (False, f"teacher logprobs length != sample length ({len(sample.teacher_logprobs)} != {sample_length})")
+            return (
+                False,
+                f"teacher logprobs length != sample length ({len(sample.teacher_logprobs)} != {sample_length})",
+            )
         return True, None
 
     def _get_batch(self) -> None:

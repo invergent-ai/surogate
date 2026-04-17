@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from .. import nn
-from ..nn import VL_MODEL_NAME_REMAP
-from ..specs import ActivationScope
+from ..blocks.qwen3_vl import Qwen3VLBlock
 from ..hf import build_dense_block_mappings
 from ..modules.attention import Qwen3Attention
-from ..blocks.qwen3_vl import Qwen3VLBlock
+from ..nn import VL_MODEL_NAME_REMAP
+from ..specs import ActivationScope
 
 
 @nn.hf_config(
@@ -81,7 +81,8 @@ class Qwen3VLModel(nn.Model):
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.BlockStack(
-            n_layers, Qwen3VLBlock,
+            n_layers,
+            Qwen3VLBlock,
             d_model=d_model,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
@@ -111,15 +112,13 @@ class Qwen3VLModel(nn.Model):
         # IO slots
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
-        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                                  aliases=["labels"])
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
         self._register_activation("visual_pos_masks", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("visual_embeds", ("B * T", "d_model"), scope=G)
         self._register_activation("deepstack_visual_embeds_0", ("B * T", "d_model"), scope=G)
         self._register_activation("deepstack_visual_embeds_1", ("B * T", "d_model"), scope=G)
         self._register_activation("deepstack_visual_embeds_2", ("B * T", "d_model"), scope=G)
-        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
-                                  scope=G, aliases=["rope_freqs"])
+        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32", scope=G, aliases=["rope_freqs"])
 
         # Global intermediate slots
         _h = ("B", "T", "d_model")
@@ -130,10 +129,8 @@ class Qwen3VLModel(nn.Model):
         self._register_activation("residual_final", _h, scope=G)
         self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
         self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                                  save=True, scope=G)
-        self._register_activation("loss", ("B * T",), dtype="fp32",
-                                  aliases=["losses"], scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
         # Embedding + visual injection
         x = self.embedding(token_ids)
@@ -143,7 +140,9 @@ class Qwen3VLModel(nn.Model):
 
         # Stacked blocks with deepstack visual args
         x, residual = self.blocks(
-            x, residual, position_ids,
+            x,
+            residual,
+            position_ids,
             visual_pos_masks,
             deepstack_visual_embeds_0,
             deepstack_visual_embeds_1,

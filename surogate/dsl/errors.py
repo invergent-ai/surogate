@@ -8,7 +8,6 @@ Error codes follow the specification:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
 
 
 class ErrorCode(str, Enum):
@@ -78,11 +77,11 @@ class WarningCode(str, Enum):
 class SourceLocation:
     """Source location for error reporting."""
 
-    file: Optional[str]
+    file: str | None
     line: int
     column: int
-    end_line: Optional[int] = None
-    end_column: Optional[int] = None
+    end_line: int | None = None
+    end_column: int | None = None
 
     def __str__(self) -> str:
         if self.file:
@@ -97,8 +96,8 @@ class DSLError(Exception):
         self,
         code: ErrorCode,
         message: str,
-        location: Optional[SourceLocation] = None,
-        hint: Optional[str] = None,
+        location: SourceLocation | None = None,
+        hint: str | None = None,
     ):
         self.code = code
         self.message = message
@@ -122,8 +121,8 @@ class DSLSyntaxError(DSLError):
     def __init__(
         self,
         message: str,
-        location: Optional[SourceLocation] = None,
-        hint: Optional[str] = None,
+        location: SourceLocation | None = None,
+        hint: str | None = None,
     ):
         super().__init__(ErrorCode.E001, message, location, hint)
 
@@ -134,8 +133,8 @@ class DSLTypeError(DSLError):
     def __init__(
         self,
         message: str,
-        location: Optional[SourceLocation] = None,
-        hint: Optional[str] = None,
+        location: SourceLocation | None = None,
+        hint: str | None = None,
     ):
         super().__init__(ErrorCode.E003, message, location, hint)
 
@@ -146,8 +145,8 @@ class DSLShapeError(DSLError):
     def __init__(
         self,
         message: str,
-        location: Optional[SourceLocation] = None,
-        hint: Optional[str] = None,
+        location: SourceLocation | None = None,
+        hint: str | None = None,
     ):
         super().__init__(ErrorCode.E004, message, location, hint)
 
@@ -159,8 +158,8 @@ class DSLResolutionError(DSLError):
         self,
         code: ErrorCode,
         message: str,
-        location: Optional[SourceLocation] = None,
-        hint: Optional[str] = None,
+        location: SourceLocation | None = None,
+        hint: str | None = None,
     ):
         super().__init__(code, message, location, hint)
 
@@ -171,8 +170,8 @@ class DSLUndefinedError(DSLResolutionError):
     def __init__(
         self,
         name: str,
-        location: Optional[SourceLocation] = None,
-        hint: Optional[str] = None,
+        location: SourceLocation | None = None,
+        hint: str | None = None,
     ):
         super().__init__(
             ErrorCode.E002,
@@ -189,8 +188,8 @@ class DSLGradientError(DSLError):
         self,
         code: ErrorCode,
         message: str,
-        location: Optional[SourceLocation] = None,
-        hint: Optional[str] = None,
+        location: SourceLocation | None = None,
+        hint: str | None = None,
     ):
         super().__init__(code, message, location, hint)
 
@@ -202,7 +201,7 @@ class DSLConstraintError(DSLError):
         self,
         constraint_expr: str,
         error_message: str,
-        location: Optional[SourceLocation] = None,
+        location: SourceLocation | None = None,
     ):
         super().__init__(
             ErrorCode.E027,
@@ -217,7 +216,7 @@ class DSLWarning:
 
     code: WarningCode
     message: str
-    location: Optional[SourceLocation] = None
+    location: SourceLocation | None = None
 
     def __str__(self) -> str:
         loc_str = f" at {self.location}" if self.location else ""
@@ -234,7 +233,7 @@ class WarningCollector:
         self,
         code: WarningCode,
         message: str,
-        location: Optional[SourceLocation] = None,
+        location: SourceLocation | None = None,
     ):
         self.warnings.append(DSLWarning(code, message, location))
 

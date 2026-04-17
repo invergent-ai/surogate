@@ -28,7 +28,7 @@
 // CUDA kernels
 
 /// @brief Function pointer type for warp reduction operations.
-using reduction_func_t = float (*) (float);
+using reduction_func_t = float (*)(float);
 
 /**
  * @brief Block-wide reduction using warp shuffles and shared memory.
@@ -48,8 +48,8 @@ using reduction_func_t = float (*) (float);
  * @param out_of_bounds Value for inactive lanes in final reduction (e.g., -INFINITY for max, 0 for sum).
  * @return The reduced value (same on all threads).
  */
-template<reduction_func_t warp_reduction>
-__device__ inline float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
+template <reduction_func_t warp_reduction>
+__device__ inline float blockReduce(float val, bool final_sync = false, float out_of_bounds = 0.0f) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     __shared__ float shared_val[32];
@@ -58,17 +58,18 @@ __device__ inline float blockReduce(float val, bool final_sync=false, float out_
     const int num_warps = blockDim.x / 32;
 
     float warp_val = warp_reduction(val);
-    if (lane_id == 0) { shared_val[warp_id] = warp_val; }
+    if (lane_id == 0) {
+        shared_val[warp_id] = warp_val;
+    }
     __syncthreads();
     warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
     float block_val = warp_reduction(warp_val);
 
     if (final_sync) {
-        __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
+        __syncthreads();  // only needed in loops when effectively reusing shared memory etc.
     }
     return block_val;
 }
-
 
 /**
  * @brief Parameters for numerically stable softmax computation.
@@ -77,8 +78,8 @@ __device__ inline float blockReduce(float val, bool final_sync=false, float out_
  * softmax as: prob[i] = exp(logit[i] - Offset) * Scale
  */
 struct SoftmaxParams {
-    float Scale;  ///< Reciprocal of sum of exponentials (1 / sum(exp(x - max)))
-    float Offset; ///< Maximum logit value for numerical stability
+    float Scale;   ///< Reciprocal of sum of exponentials (1 / sum(exp(x - max)))
+    float Offset;  ///< Maximum logit value for numerical stability
 };
 
 /**
@@ -96,25 +97,25 @@ struct SoftmaxParams {
  * @param P Padded vocabulary size (for memory alignment).
  * @return SoftmaxParams containing Scale (1/sum) and Offset (max).
  */
-template<class floatX>
+template <class floatX>
 __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
     const floatX* x = inp + idx * P;
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
-    int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
+    int i = (V + x128::size - 1) / x128::size + threadIdx.x - blockDim.x;
 
     // special-case loop to handle the unaligned elements at the end of the array
     // this lets us skip the bounds check in the main loop below, which improves performance
-    while ((i+1)*static_cast<int>(x128::size) > V) {
-        for(int k = 0; k < x128::size; ++k) {
-            if (i*x128::size+k >= V) {
-                break; // bounds checking against real V (rather than padded P)
+    while ((i + 1) * static_cast<int>(x128::size) > V) {
+        for (int k = 0; k < x128::size; ++k) {
+            if (i * x128::size + k >= V) {
+                break;  // bounds checking against real V (rather than padded P)
             }
-            float v = (float)x[i*x128::size+k];
+            float v = (float)x[i * x128::size + k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
             thread_sumval *= expf((old_maxval - thread_maxval));
@@ -125,8 +126,8 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
 
     // main loop for the bulk of the iterations (no bounds checking required!)
     for (; i >= 0; i -= blockDim.x) {
-        x128 packed_x = x128::load(x + i * x128::size); // load and keep in cache until fused_classifier loop
-        for(int k = 0; k < x128::size; ++k) {
+        x128 packed_x = x128::load(x + i * x128::size);  // load and keep in cache until fused_classifier loop
+        for (int k = 0; k < x128::size; ++k) {
             float v = (float)packed_x[k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
@@ -175,30 +176,36 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
  * @param P Padded vocabulary size.
  */
 template <class floatX, bool WriteDLogits = true, bool WriteProbs = false>
-__global__ void __launch_bounds__(1024, 1)
-    fused_classifier_kernel5(floatX* logits, float* losses, floatX* probs,
-                             const float dloss, const int* targets, int* valid_token_count,
-                             int* correct_count,
-                             int BT, int V, int P, std::bool_constant<WriteDLogits>) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+__global__ void __launch_bounds__(1024, 1) fused_classifier_kernel5(floatX* logits,
+                                                                    float* losses,
+                                                                    floatX* probs,
+                                                                    const float dloss,
+                                                                    const int* targets,
+                                                                    int* valid_token_count,
+                                                                    int* correct_count,
+                                                                    int BT,
+                                                                    int V,
+                                                                    int P,
+                                                                    std::bool_constant<WriteDLogits>) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     // note: idx is small enough that it easily fits into 32 bit;
     // by making it a long here, we ensure that any offsets calculated with it (e.g., idx * P)
     // are done is 64 bit
-    int64_t idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
+    int64_t idx = gridDim.x - (blockIdx.x + 1);  // reverse order for cache hits on matmul data
     int ix = targets[idx];
-    if(ix == -100) {
-        if (WriteDLogits){
+    if (ix == -100) {
+        if (WriteDLogits) {
             x128 zero = x128::zeros();
-            for (int i = threadIdx.x; i < V/x128::size; i += blockDim.x) {
+            for (int i = threadIdx.x; i < V / x128::size; i += blockDim.x) {
                 zero.store(logits + idx * P + i * x128::size);
             }
         }
-        return;     // mask
+        return;  // mask
     }
     assert(0 <= ix && ix < V);
 
     // Count this as a valid token (one thread per block to avoid races)
-    if(threadIdx.x == 0 && valid_token_count != nullptr) {
+    if (threadIdx.x == 0 && valid_token_count != nullptr) {
         atomicAdd(valid_token_count, 1);
     }
 
@@ -267,7 +274,7 @@ __global__ void __launch_bounds__(1024, 1)
     __syncthreads();
 
     // calculate the probability needed for the loss and update (single-threaded)
-    if(threadIdx.x == 0) {
+    if (threadIdx.x == 0) {
         float logit_val = (float)logits[idx * P + ix];
         float prob = expf(logit_val - sp.Offset) * sp.Scale;
         float loss_contrib = -logf(prob);
@@ -281,19 +288,19 @@ __global__ void __launch_bounds__(1024, 1)
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     // Note: logits_vec already declared above for argmax computation
-    for (int i = threadIdx.x; i < V/x128::size; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V / x128::size; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // it will be overwritten by the logits gradients which is when we reduce cache persistence
-        x128 packed_logits_vec = x128::load(logits_vec + i * x128::size); // rely on cs of store128cs
+        x128 packed_logits_vec = x128::load(logits_vec + i * x128::size);  // rely on cs of store128cs
         x128 packed_probs;
-        for(int k = 0; k < x128::size; ++k) {
-            int element = i*x128::size + k;
+        for (int k = 0; k < x128::size; ++k) {
+            int element = i * x128::size + k;
             float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
             packed_probs[k] = (floatX)prob;
             float indicator = (element == ix) ? 1.0f : 0.0f;
             packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
         }
-        if (WriteDLogits){
+        if (WriteDLogits) {
             // reduce cache persistence for the overwritten logits
             // to maximise the probability that logits remain in cache between prepare_softmax and here
             packed_logits_vec.store_cs(logits + idx * P + i * x128::size);
@@ -305,12 +312,12 @@ __global__ void __launch_bounds__(1024, 1)
 
     // handle remaining elements after the last multiple of x128::size
     // e.g. if V = 8003, and x128::size = 8, we need to handle the last 3 elements
-    int unaligned_start = V & ~(x128::size - 1); // round down to multiple of x128::size
+    int unaligned_start = V & ~(x128::size - 1);  // round down to multiple of x128::size
     for (int i = threadIdx.x + unaligned_start; i < V; i += blockDim.x) {
         float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;
-        if (WriteDLogits){
+        if (WriteDLogits) {
             __stcs(logits + idx * P + i, (floatX)dlogit);
         }
         if (WriteProbs) {
@@ -342,18 +349,43 @@ __global__ void __launch_bounds__(1024, 1)
  * @param stream CUDA stream for asynchronous execution.
  */
 template <typename Type>
-void fused_classifier_imp(Type* logits, float* losses,
-                      const float dloss, const int* targets, int* valid_token_count,
-                      int* correct_count,
-                      int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
+void fused_classifier_imp(Type* logits,
+                          float* losses,
+                          const float dloss,
+                          const int* targets,
+                          int* valid_token_count,
+                          int* correct_count,
+                          int BT,
+                          int V,
+                          int P,
+                          bool write_dlogits,
+                          cudaStream_t stream) {
     const int block_size = 1024;
     const int grid_size = BT;
-    if(write_dlogits) {
-        fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (Type*) NULL, dloss, targets, valid_token_count,
-                                                                       correct_count, BT, V, P, std::bool_constant<true>());
+    if (write_dlogits) {
+        fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits,
+                                                                       losses,
+                                                                       (Type*)NULL,
+                                                                       dloss,
+                                                                       targets,
+                                                                       valid_token_count,
+                                                                       correct_count,
+                                                                       BT,
+                                                                       V,
+                                                                       P,
+                                                                       std::bool_constant<true>());
     } else {
-        fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (Type*) NULL, dloss, targets, valid_token_count,
-                                                                       correct_count, BT, V, P, std::bool_constant<false>());
+        fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits,
+                                                                       losses,
+                                                                       (Type*)NULL,
+                                                                       dloss,
+                                                                       targets,
+                                                                       valid_token_count,
+                                                                       correct_count,
+                                                                       BT,
+                                                                       V,
+                                                                       P,
+                                                                       std::bool_constant<false>());
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -374,17 +406,41 @@ void fused_classifier_imp(Type* logits, float* losses,
  * @param write_dlogits If true, writes gradients to logits.
  * @param stream CUDA stream.
  */
-void fused_classifier(float* logits, float* losses,
-                      const float dloss, const int* targets, int* valid_token_count,
-                      int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
+void fused_classifier(float* logits,
+                      float* losses,
+                      const float dloss,
+                      const int* targets,
+                      int* valid_token_count,
+                      int BT,
+                      int V,
+                      int P,
+                      bool write_dlogits,
+                      cudaStream_t stream) {
     fused_classifier_imp(logits, losses, dloss, targets, valid_token_count, nullptr, BT, V, P, write_dlogits, stream);
 }
 
-void fused_classifier(float* logits, float* losses,
-                      const float dloss, const int* targets, int* valid_token_count,
+void fused_classifier(float* logits,
+                      float* losses,
+                      const float dloss,
+                      const int* targets,
+                      int* valid_token_count,
                       int* correct_count,
-                      int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
-    fused_classifier_imp(logits, losses, dloss, targets, valid_token_count, correct_count, BT, V, P, write_dlogits, stream);
+                      int BT,
+                      int V,
+                      int P,
+                      bool write_dlogits,
+                      cudaStream_t stream) {
+    fused_classifier_imp(logits,
+                         losses,
+                         dloss,
+                         targets,
+                         valid_token_count,
+                         correct_count,
+                         BT,
+                         V,
+                         P,
+                         write_dlogits,
+                         stream);
 }
 
 /**
@@ -403,26 +459,56 @@ void fused_classifier(float* logits, float* losses,
  * @param write_dlogits If true, writes gradients to logits.
  * @param stream CUDA stream.
  */
-void fused_classifier(nv_bfloat16* logits, float* losses,
-                      const float dloss, const int* targets, int* valid_token_count,
-                      int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
+void fused_classifier(nv_bfloat16* logits,
+                      float* losses,
+                      const float dloss,
+                      const int* targets,
+                      int* valid_token_count,
+                      int BT,
+                      int V,
+                      int P,
+                      bool write_dlogits,
+                      cudaStream_t stream) {
     fused_classifier_imp(logits, losses, dloss, targets, valid_token_count, nullptr, BT, V, P, write_dlogits, stream);
 }
 
-void fused_classifier(nv_bfloat16* logits, float* losses,
-                      const float dloss, const int* targets, int* valid_token_count,
+void fused_classifier(nv_bfloat16* logits,
+                      float* losses,
+                      const float dloss,
+                      const int* targets,
+                      int* valid_token_count,
                       int* correct_count,
-                      int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
-    fused_classifier_imp(logits, losses, dloss, targets, valid_token_count, correct_count, BT, V, P, write_dlogits, stream);
+                      int BT,
+                      int V,
+                      int P,
+                      bool write_dlogits,
+                      cudaStream_t stream) {
+    fused_classifier_imp(logits,
+                         losses,
+                         dloss,
+                         targets,
+                         valid_token_count,
+                         correct_count,
+                         BT,
+                         V,
+                         P,
+                         write_dlogits,
+                         stream);
 }
 
 // ----------------------------------------------------------------------------
 // Cross-entropy forward/backward (non-fused with matmul) helpers
 
 template <class floatX>
-__global__ void cross_entropy_forward_kernel(const floatX* logits, float* losses, float* logsumexp,
-                                             const int* targets, int* valid_token_count,
-                                             int* correct_count, int BT, int V, int P) {
+__global__ void cross_entropy_forward_kernel(const floatX* logits,
+                                             float* losses,
+                                             float* logsumexp,
+                                             const int* targets,
+                                             int* valid_token_count,
+                                             int* correct_count,
+                                             int BT,
+                                             int V,
+                                             int P) {
     int idx = static_cast<int>(blockIdx.x);
     if (idx >= BT) {
         return;
@@ -513,9 +599,14 @@ __global__ void cross_entropy_forward_kernel(const floatX* logits, float* losses
 }
 
 template <class floatX>
-__global__ void cross_entropy_backward_kernel(floatX* dlogits, const floatX* logits, const float* logsumexp,
-                                              const float* dloss, const int* targets,
-                                              int BT, int V, int P) {
+__global__ void cross_entropy_backward_kernel(floatX* dlogits,
+                                              const floatX* logits,
+                                              const float* logsumexp,
+                                              const float* dloss,
+                                              const int* targets,
+                                              int BT,
+                                              int V,
+                                              int P) {
     // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
     // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
     int idx = static_cast<int>(blockIdx.x);
@@ -550,9 +641,16 @@ __global__ void cross_entropy_backward_kernel(floatX* dlogits, const floatX* log
 }
 
 template <class floatX>
-__global__ void chunked_cross_entropy_forward_kernel(const floatX* logits, float* losses, float* chunk_logsumexp,
-                                                     const int* targets, int* valid_token_count,
-                                                     int BT, int V, int P, int n_chunks, int chunk_size) {
+__global__ void chunked_cross_entropy_forward_kernel(const floatX* logits,
+                                                     float* losses,
+                                                     float* chunk_logsumexp,
+                                                     const int* targets,
+                                                     int* valid_token_count,
+                                                     int BT,
+                                                     int V,
+                                                     int P,
+                                                     int n_chunks,
+                                                     int chunk_size) {
     int row_idx = static_cast<int>(blockIdx.x);
     int chunk_idx = static_cast<int>(blockIdx.y);
     int start = chunk_idx * chunk_size;
@@ -593,9 +691,7 @@ __global__ void chunked_cross_entropy_forward_kernel(const floatX* logits, float
     }
 }
 
-__global__ void logsumexp_reduce_kernel(float* logsumexp_out,
-                                        const float* chunk_logsumexp,
-                                        int BT, int n_chunks) {
+__global__ void logsumexp_reduce_kernel(float* logsumexp_out, const float* chunk_logsumexp, int BT, int n_chunks) {
     int row_idx = static_cast<int>(blockIdx.x);
     if (row_idx >= BT) {
         return;
@@ -620,8 +716,7 @@ __global__ void logsumexp_reduce_kernel(float* logsumexp_out,
     }
 }
 
-__global__ void finalize_loss_kernel(float* losses, const float* logsumexp,
-                                     const int* targets, int BT) {
+__global__ void finalize_loss_kernel(float* losses, const float* logsumexp, const int* targets, int BT) {
     int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= BT) {
         return;
@@ -632,9 +727,15 @@ __global__ void finalize_loss_kernel(float* losses, const float* logsumexp,
 }
 
 template <class floatX>
-__global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits, const floatX* logits, const float* logsumexp,
-                                                      const float* dloss, const int* targets,
-                                                      int BT, int V, int P, int chunk_size) {
+__global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits,
+                                                      const floatX* logits,
+                                                      const float* logsumexp,
+                                                      const float* dloss,
+                                                      const int* targets,
+                                                      int BT,
+                                                      int V,
+                                                      int P,
+                                                      int chunk_size) {
     // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
     // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
     int row_idx = static_cast<int>(blockIdx.x);
@@ -666,8 +767,8 @@ __global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits, const flo
 }
 
 template <class floatX>
-__global__ void argmax_correct_kernel(const floatX* logits, const int* targets,
-                                      int* correct_count, int BT, int V, int P) {
+__global__ void
+argmax_correct_kernel(const floatX* logits, const int* targets, int* correct_count, int BT, int V, int P) {
     int idx = static_cast<int>(blockIdx.x);
     if (idx >= BT) {
         return;
@@ -733,56 +834,122 @@ __global__ void argmax_correct_kernel(const floatX* logits, const int* targets,
 // ----------------------------------------------------------------------------
 // Kernel launchers
 
-void fused_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
-                                 const int* targets, int* valid_token_count,
+void fused_cross_entropy_forward(float* logits,
+                                 float* losses,
+                                 float* logsumexp,
+                                 const int* targets,
+                                 int* valid_token_count,
                                  int* correct_count,
-                                 int BT, int V, int P, cudaStream_t stream) {
+                                 int BT,
+                                 int V,
+                                 int P,
+                                 cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
-    cross_entropy_forward_kernel<<<grid_size, block_size, 0, stream>>>(
-        logits, losses, logsumexp, targets, valid_token_count, correct_count, BT, V, P);
+    cross_entropy_forward_kernel<<<grid_size, block_size, 0, stream>>>(logits,
+                                                                       losses,
+                                                                       logsumexp,
+                                                                       targets,
+                                                                       valid_token_count,
+                                                                       correct_count,
+                                                                       BT,
+                                                                       V,
+                                                                       P);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void fused_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
-                                 const int* targets, int* valid_token_count,
+void fused_cross_entropy_forward(nv_bfloat16* logits,
+                                 float* losses,
+                                 float* logsumexp,
+                                 const int* targets,
+                                 int* valid_token_count,
                                  int* correct_count,
-                                 int BT, int V, int P, cudaStream_t stream) {
+                                 int BT,
+                                 int V,
+                                 int P,
+                                 cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
-    cross_entropy_forward_kernel<<<grid_size, block_size, 0, stream>>>(
-        logits, losses, logsumexp, targets, valid_token_count, correct_count, BT, V, P);
+    cross_entropy_forward_kernel<<<grid_size, block_size, 0, stream>>>(logits,
+                                                                       losses,
+                                                                       logsumexp,
+                                                                       targets,
+                                                                       valid_token_count,
+                                                                       correct_count,
+                                                                       BT,
+                                                                       V,
+                                                                       P);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void fused_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
-                                  const float* dloss, const int* targets,
-                                  int BT, int V, int P, cudaStream_t stream) {
+void fused_cross_entropy_backward(float* dlogits,
+                                  const float* logits,
+                                  const float* logsumexp,
+                                  const float* dloss,
+                                  const int* targets,
+                                  int BT,
+                                  int V,
+                                  int P,
+                                  cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
-    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(
-        dlogits, logits, logsumexp, dloss, targets, BT, V, P);
+    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(dlogits,
+                                                                        logits,
+                                                                        logsumexp,
+                                                                        dloss,
+                                                                        targets,
+                                                                        BT,
+                                                                        V,
+                                                                        P);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void fused_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
-                                  const float* dloss, const int* targets,
-                                  int BT, int V, int P, cudaStream_t stream) {
+void fused_cross_entropy_backward(nv_bfloat16* dlogits,
+                                  const nv_bfloat16* logits,
+                                  const float* logsumexp,
+                                  const float* dloss,
+                                  const int* targets,
+                                  int BT,
+                                  int V,
+                                  int P,
+                                  cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
-    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(
-        dlogits, logits, logsumexp, dloss, targets, BT, V, P);
+    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(dlogits,
+                                                                        logits,
+                                                                        logsumexp,
+                                                                        dloss,
+                                                                        targets,
+                                                                        BT,
+                                                                        V,
+                                                                        P);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void chunked_cross_entropy_forward(float* logits, float* losses, float* logsumexp,
-                                   float* chunk_logsumexp, const int* targets,
-                                   int* valid_token_count, int* correct_count,
-                                   int BT, int V, int P, int n_chunks, cudaStream_t stream) {
+void chunked_cross_entropy_forward(float* logits,
+                                   float* losses,
+                                   float* logsumexp,
+                                   float* chunk_logsumexp,
+                                   const int* targets,
+                                   int* valid_token_count,
+                                   int* correct_count,
+                                   int BT,
+                                   int V,
+                                   int P,
+                                   int n_chunks,
+                                   cudaStream_t stream) {
     const int block_size = 256;
     dim3 grid(BT, n_chunks);
-    chunked_cross_entropy_forward_kernel<<<grid, block_size, 0, stream>>>(
-        logits, losses, chunk_logsumexp, targets, valid_token_count, BT, V, P, n_chunks, CROSS_ENTROPY_MAX_FUSED_SIZE);
+    chunked_cross_entropy_forward_kernel<<<grid, block_size, 0, stream>>>(logits,
+                                                                          losses,
+                                                                          chunk_logsumexp,
+                                                                          targets,
+                                                                          valid_token_count,
+                                                                          BT,
+                                                                          V,
+                                                                          P,
+                                                                          n_chunks,
+                                                                          CROSS_ENTROPY_MAX_FUSED_SIZE);
     CUDA_CHECK(cudaGetLastError());
 
     logsumexp_reduce_kernel<<<BT, block_size, 0, stream>>>(logsumexp, chunk_logsumexp, BT, n_chunks);
@@ -794,20 +961,35 @@ void chunked_cross_entropy_forward(float* logits, float* losses, float* logsumex
     CUDA_CHECK(cudaGetLastError());
 
     if (correct_count) {
-        argmax_correct_kernel<<<BT, block_size, 0, stream>>>(
-            logits, targets, correct_count, BT, V, P);
+        argmax_correct_kernel<<<BT, block_size, 0, stream>>>(logits, targets, correct_count, BT, V, P);
         CUDA_CHECK(cudaGetLastError());
     }
 }
 
-void chunked_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* logsumexp,
-                                   float* chunk_logsumexp, const int* targets,
-                                   int* valid_token_count, int* correct_count,
-                                   int BT, int V, int P, int n_chunks, cudaStream_t stream) {
+void chunked_cross_entropy_forward(nv_bfloat16* logits,
+                                   float* losses,
+                                   float* logsumexp,
+                                   float* chunk_logsumexp,
+                                   const int* targets,
+                                   int* valid_token_count,
+                                   int* correct_count,
+                                   int BT,
+                                   int V,
+                                   int P,
+                                   int n_chunks,
+                                   cudaStream_t stream) {
     const int block_size = 256;
     dim3 grid(BT, n_chunks);
-    chunked_cross_entropy_forward_kernel<<<grid, block_size, 0, stream>>>(
-        logits, losses, chunk_logsumexp, targets, valid_token_count, BT, V, P, n_chunks, CROSS_ENTROPY_MAX_FUSED_SIZE);
+    chunked_cross_entropy_forward_kernel<<<grid, block_size, 0, stream>>>(logits,
+                                                                          losses,
+                                                                          chunk_logsumexp,
+                                                                          targets,
+                                                                          valid_token_count,
+                                                                          BT,
+                                                                          V,
+                                                                          P,
+                                                                          n_chunks,
+                                                                          CROSS_ENTROPY_MAX_FUSED_SIZE);
     CUDA_CHECK(cudaGetLastError());
 
     logsumexp_reduce_kernel<<<BT, block_size, 0, stream>>>(logsumexp, chunk_logsumexp, BT, n_chunks);
@@ -819,33 +1001,56 @@ void chunked_cross_entropy_forward(nv_bfloat16* logits, float* losses, float* lo
     CUDA_CHECK(cudaGetLastError());
 
     if (correct_count) {
-        argmax_correct_kernel<<<BT, block_size, 0, stream>>>(
-            logits, targets, correct_count, BT, V, P);
+        argmax_correct_kernel<<<BT, block_size, 0, stream>>>(logits, targets, correct_count, BT, V, P);
         CUDA_CHECK(cudaGetLastError());
     }
 }
 
-void chunked_cross_entropy_backward(float* dlogits, const float* logits, const float* logsumexp,
-                                    const float* dloss, const int* targets,
-                                    int BT, int V, int P, cudaStream_t stream) {
+void chunked_cross_entropy_backward(float* dlogits,
+                                    const float* logits,
+                                    const float* logsumexp,
+                                    const float* dloss,
+                                    const int* targets,
+                                    int BT,
+                                    int V,
+                                    int P,
+                                    cudaStream_t stream) {
     const int block_size = 256;
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
     dim3 grid(BT, n_blocks);
-    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(
-        dlogits, logits, logsumexp, dloss, targets,
-        BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(dlogits,
+                                                                           logits,
+                                                                           logsumexp,
+                                                                           dloss,
+                                                                           targets,
+                                                                           BT,
+                                                                           V,
+                                                                           P,
+                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void chunked_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* logits, const float* logsumexp,
-                                    const float* dloss, const int* targets,
-                                    int BT, int V, int P, cudaStream_t stream) {
+void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
+                                    const nv_bfloat16* logits,
+                                    const float* logsumexp,
+                                    const float* dloss,
+                                    const int* targets,
+                                    int BT,
+                                    int V,
+                                    int P,
+                                    cudaStream_t stream) {
     const int block_size = 256;
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
     dim3 grid(BT, n_blocks);
-    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(
-        dlogits, logits, logsumexp, dloss, targets,
-        BT, V, P, CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(dlogits,
+                                                                           logits,
+                                                                           logsumexp,
+                                                                           dloss,
+                                                                           targets,
+                                                                           BT,
+                                                                           V,
+                                                                           P,
+                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -871,14 +1076,18 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits, const nv_bfloat16* log
  * @param P        Padded vocabulary size (stride).
  */
 template <class floatX>
-__global__ void extract_logprobs_kernel(const floatX* logits, float* logprobs,
-                                         const int* targets, int BT, int V, int P) {
+__global__ void
+extract_logprobs_kernel(const floatX* logits, float* logprobs, const int* targets, int BT, int V, int P) {
     int64_t idx = static_cast<int64_t>(blockIdx.x);
-    if (idx >= static_cast<int64_t>(BT)) { return; }
+    if (idx >= static_cast<int64_t>(BT)) {
+        return;
+    }
 
     int ix = targets[idx];
     if (ix == -100) {
-        if (threadIdx.x == 0) { logprobs[idx] = 0.0f; }
+        if (threadIdx.x == 0) {
+            logprobs[idx] = 0.0f;
+        }
         return;
     }
 
@@ -890,15 +1099,25 @@ __global__ void extract_logprobs_kernel(const floatX* logits, float* logprobs,
     }
 }
 
-void extract_logprobs(const float* logits, float* logprobs, const int* targets,
-                      int BT, int V, int P, cudaStream_t stream) {
+void extract_logprobs(const float* logits,
+                      float* logprobs,
+                      const int* targets,
+                      int BT,
+                      int V,
+                      int P,
+                      cudaStream_t stream) {
     const int block_size = 256;
     extract_logprobs_kernel<<<BT, block_size, 0, stream>>>(logits, logprobs, targets, BT, V, P);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void extract_logprobs(const nv_bfloat16* logits, float* logprobs, const int* targets,
-                      int BT, int V, int P, cudaStream_t stream) {
+void extract_logprobs(const nv_bfloat16* logits,
+                      float* logprobs,
+                      const int* targets,
+                      int BT,
+                      int V,
+                      int P,
+                      cudaStream_t stream) {
     const int block_size = 256;
     extract_logprobs_kernel<<<BT, block_size, 0, stream>>>(logits, logprobs, targets, BT, V, P);
     CUDA_CHECK(cudaGetLastError());
@@ -908,8 +1127,7 @@ void extract_logprobs(const nv_bfloat16* logits, float* logprobs, const int* tar
 // Per-token temperature scaling (in-place): logits[idx, :] *= inv_temperature[idx]
 
 template <class floatX>
-__global__ void scale_logits_rows_kernel(floatX* logits, const float* inv_temperature,
-                                         int BT, int V, int P) {
+__global__ void scale_logits_rows_kernel(floatX* logits, const float* inv_temperature, int BT, int V, int P) {
     const int row = static_cast<int>(blockIdx.x);
     const int col = static_cast<int>(blockIdx.y) * blockDim.x + threadIdx.x;
     if (row >= BT || col >= V) {
@@ -922,8 +1140,7 @@ __global__ void scale_logits_rows_kernel(floatX* logits, const float* inv_temper
     logits[idx] = static_cast<floatX>(v);
 }
 
-void scale_logits_rows(float* logits, const float* inv_temperature,
-                       int BT, int V, int P, cudaStream_t stream) {
+void scale_logits_rows(float* logits, const float* inv_temperature, int BT, int V, int P, cudaStream_t stream) {
     if (!inv_temperature) return;
     const int block_size = 256;
     dim3 grid(BT, (V + block_size - 1) / block_size);
@@ -931,8 +1148,7 @@ void scale_logits_rows(float* logits, const float* inv_temperature,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void scale_logits_rows(nv_bfloat16* logits, const float* inv_temperature,
-                       int BT, int V, int P, cudaStream_t stream) {
+void scale_logits_rows(nv_bfloat16* logits, const float* inv_temperature, int BT, int V, int P, cudaStream_t stream) {
     if (!inv_temperature) return;
     const int block_size = 256;
     dim3 grid(BT, (V + block_size - 1) / block_size);
@@ -976,9 +1192,7 @@ void launch_softcap_logits_fp32(float* data, float softcap, long n, cudaStream_t
 // using the saved capped logits. Operates in-place on `d_logits`.
 // ---------------------------------------------------------------------------
 template <typename TDLogits, typename TCap>
-__global__ void softcap_logits_backward_kernel(TDLogits* d_logits,
-                                               const TCap* capped,
-                                               float inv_softcap, long n) {
+__global__ void softcap_logits_backward_kernel(TDLogits* d_logits, const TCap* capped, float inv_softcap, long n) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx < n) {
         float y = static_cast<float>(capped[idx]) * inv_softcap;  // tanh(raw/cap)
@@ -988,20 +1202,24 @@ __global__ void softcap_logits_backward_kernel(TDLogits* d_logits,
     }
 }
 
-void launch_softcap_logits_backward_bf16(nv_bfloat16* d_logits, const nv_bfloat16* capped,
-                                         float softcap, long n, cudaStream_t stream) {
+void launch_softcap_logits_backward_bf16(nv_bfloat16* d_logits,
+                                         const nv_bfloat16* capped,
+                                         float softcap,
+                                         long n,
+                                         cudaStream_t stream) {
     const int block_size = 256;
     int grid = static_cast<int>((n + block_size - 1) / block_size);
-    softcap_logits_backward_kernel<<<grid, block_size, 0, stream>>>(
-        d_logits, capped, 1.0f / softcap, n);
+    softcap_logits_backward_kernel<<<grid, block_size, 0, stream>>>(d_logits, capped, 1.0f / softcap, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_softcap_logits_backward_fp32(float* d_logits, const float* capped,
-                                         float softcap, long n, cudaStream_t stream) {
+void launch_softcap_logits_backward_fp32(float* d_logits,
+                                         const float* capped,
+                                         float softcap,
+                                         long n,
+                                         cudaStream_t stream) {
     const int block_size = 256;
     int grid = static_cast<int>((n + block_size - 1) / block_size);
-    softcap_logits_backward_kernel<<<grid, block_size, 0, stream>>>(
-        d_logits, capped, 1.0f / softcap, n);
+    softcap_logits_backward_kernel<<<grid, block_size, 0, stream>>>(d_logits, capped, 1.0f / softcap, n);
     CUDA_CHECK(cudaGetLastError());
 }

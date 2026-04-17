@@ -1,16 +1,17 @@
-import sys
 import argparse
+import sys
+
 
 def prepare_command_parser(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
-        
+
     parser.add_argument(
         "env",
         type=str,
         help="The environment id to init",
     )
-    
+
     parser.add_argument(
         "--path",
         "-p",
@@ -18,8 +19,9 @@ def prepare_command_parser(parser=None):
         default="./environments",
         help="Path to environments directory (default: ./environments)",
     )
-    
+
     return parser
+
 
 _README_TEMPLATE = """\
 # {env_id_dash}
@@ -49,7 +51,7 @@ surogate vf-eval \
   -m <model_id_or_path> \
   -n 20 -r 3 -t 1024 -T 0.7 \
   -a '{{"key": "value"}}'  # env-specific args as JSON \
-  {env_id_dash} 
+  {env_id_dash}
 ```
 
 Notes:
@@ -73,10 +75,11 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 
 """
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = prepare_command_parser().parse_args(sys.argv[1:])
 
     import verifiers.scripts.init as vf_init
+
     vf_init.README_TEMPLATE = _README_TEMPLATE
     vf_init.init_environment(
         args.env,

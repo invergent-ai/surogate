@@ -17,6 +17,7 @@ from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
+
 @runtime_checkable
 class InferencePool(Protocol):
     """Protocol for inference pools."""
@@ -101,7 +102,7 @@ async def setup_inference_pool(
     client_config: GRPOClientConfig, model_name: str, client_type: str = "openai_chat_completions"
 ) -> InferencePool:
     """Create an inference pool from config."""
-    
+
     logger.info(
         f"Initializing static inference pool (base_url={', '.join(client_config.base_url)}, "
         f"api_key_var={client_config.api_key_var}, headers={client_config.headers})"
@@ -113,7 +114,9 @@ async def setup_inference_pool(
     )
 
 
-def setup_clients(client_config: GRPOClientConfig, client_type: str = "openai_chat_completions") -> list[vf.ClientConfig]:
+def setup_clients(
+    client_config: GRPOClientConfig, client_type: str = "openai_chat_completions"
+) -> list[vf.ClientConfig]:
     def setup_client(client_idx: int, base_url: str) -> vf.ClientConfig:
         return vf.ClientConfig(
             client_idx=client_idx,
@@ -279,6 +282,7 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
 
 async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) -> None:
     """Make a HTTP post request to the vLLM server to unload a LoRA adapter."""
+
     async def _unload_lora_adapter(admin_client: AsyncClient) -> None:
         logger.debug(f"Sending request to unload LoRA adapter {lora_name}")
         await admin_client.post("/v1/unload_lora_adapter", json={"lora_name": lora_name})
@@ -290,6 +294,7 @@ async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) 
 
 async def init_nccl_broadcast(admin_clients: list[AsyncClient], host: str, port: int, timeout: int) -> None:
     """Make a HTTP post request to the vLLM server to initialize the NCCL broadcast."""
+
     async def _init_nccl_broadcast(
         admin_client: AsyncClient, host: str, port: int, client_num: int, timeout: int
     ) -> None:

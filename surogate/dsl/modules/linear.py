@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
-from ..decorators import module, forward, save, Param
+from ..decorators import Param, forward, module, save
+from ..dim import B, Dim, T
 from ..graph_builder import graph
-from ..dim import Dim, B, T
+from ..tensor_type import Tensor
 
 
 @module
@@ -33,7 +33,7 @@ class Linear:
 
     @forward
     @save("x")
-    def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "O"]:
+    def forward(self, x: Tensor[B, T, C]) -> Tensor[B, T, O]:
         with graph() as g:
             # Flatten batch dimensions
             x_flat = g.view(x, shape=[B * T, self.C])

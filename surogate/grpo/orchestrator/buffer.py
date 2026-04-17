@@ -16,6 +16,7 @@ from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
+
 class Buffer:
     """A buffer for storing rollouts and metadata."""
 
@@ -100,7 +101,7 @@ class Buffer:
         """Loads pool assignments and rollouts."""
 
         def read_jsonl(path: Path) -> list[dict]:
-            with open(path, "r") as f:
+            with open(path) as f:
                 return [json.loads(line) for line in f]
 
         saved_easy_examples = read_jsonl(path / "easy_examples.jsonl")
@@ -138,9 +139,7 @@ class Buffer:
 
             if any(saved_easy_examples):
                 num_moved = move_saved_pool(saved_easy_examples, self.easy_examples)
-                logger.debug(
-                    f"Loaded {num_moved}/{len(saved_easy_examples)} example(s) to easy pool from checkpoint."
-                )
+                logger.debug(f"Loaded {num_moved}/{len(saved_easy_examples)} example(s) to easy pool from checkpoint.")
                 if num_moved != len(saved_easy_examples):
                     num_not_moved = len(saved_easy_examples) - num_moved
                     logger.warning(
@@ -149,9 +148,7 @@ class Buffer:
 
             if any(saved_hard_examples):
                 num_moved = move_saved_pool(saved_hard_examples, self.hard_examples)
-                logger.debug(
-                    f"Moved {num_moved}/{len(saved_hard_examples)} example(s) to hard pool from checkpoint."
-                )
+                logger.debug(f"Moved {num_moved}/{len(saved_hard_examples)} example(s) to hard pool from checkpoint.")
                 if num_moved != len(saved_hard_examples):
                     num_not_moved = len(saved_hard_examples) - num_moved
                     logger.warning(

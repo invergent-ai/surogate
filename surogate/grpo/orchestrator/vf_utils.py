@@ -48,7 +48,7 @@ def spawn_env_server(
             log_file_level,
         ),
         kwargs=dict(address=address, json_logging=json_logging),
-        daemon=False, # cannot run daemon because env server uses subprocesses
+        daemon=False,  # cannot run daemon because env server uses subprocesses
     )
     process.start()
 
@@ -77,7 +77,6 @@ async def wait_for_env_servers(env_clients: list[EnvClient]) -> None:
     await asyncio.gather(*[env_client.wait_for_server_startup() for env_client in env_clients])
 
 
-
 async def run_rollout(
     env: vf.Environment,
     client: vf.ClientConfig,
@@ -102,8 +101,8 @@ async def run_rollout(
         max_retries=max_retries,
         state_columns=state_columns,
     )
-    
-    
+
+
 async def run_group(
     env: vf.Environment,
     client: vf.ClientConfig,

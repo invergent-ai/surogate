@@ -6,10 +6,11 @@ defined using the Python DSL decorators.
 """
 
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .specs import ModuleSpec, BlockSpec, ModelSpec, PrimitiveSpec
+    from .specs import BlockSpec, ModelSpec, ModuleSpec, PrimitiveSpec
 
 
 class Registry:
@@ -63,12 +64,7 @@ class Registry:
 
     def get_any(self, name: str) -> ModuleSpec | BlockSpec | ModelSpec | PrimitiveSpec | None:
         """Get any definition by name (checks all registries)."""
-        return (
-            self._modules.get(name)
-            or self._blocks.get(name)
-            or self._models.get(name)
-            or self._primitives.get(name)
-        )
+        return self._modules.get(name) or self._blocks.get(name) or self._models.get(name) or self._primitives.get(name)
 
     # =========================================================================
     # Listing
@@ -116,12 +112,7 @@ class Registry:
 
     def __len__(self) -> int:
         """Total number of registered definitions."""
-        return (
-            len(self._modules)
-            + len(self._blocks)
-            + len(self._models)
-            + len(self._primitives)
-        )
+        return len(self._modules) + len(self._blocks) + len(self._models) + len(self._primitives)
 
 
 # Global registry instance

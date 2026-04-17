@@ -23,7 +23,7 @@ Tensor tensor_from_device_ptr(ETensorDType dt, std::byte* ptr, const std::vector
     return Tensor::from_pointer(ptr, /*device=*/0, dt, shape);
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("qk_norm+rope fused forward matches baseline (fp32)", "[kernels][qk_norm][rope][fp32]") {
     const auto& cfg = testing_config::get_test_config();
@@ -56,17 +56,41 @@ TEST_CASE("qk_norm+rope fused forward matches baseline (fp32)", "[kernels][qk_no
     thrust::device_vector<float> d_kw = to_device(h_kw);
     thrust::device_vector<float> d_freqs = to_device(h_freqs);
 
-    Tensor qkv_base = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qkv_base.data())), {B, T, qkv_channels});
-    Tensor q_rstd_base = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_q_rstd_base.data())), {B, T, Hq});
-    Tensor k_rstd_base = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_k_rstd_base.data())), {B, T, Hkv});
-    Tensor q_weight = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qw.data())), {HS});
-    Tensor k_weight = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_kw.data())), {HS});
-    Tensor freqs = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_freqs.data())), {T, HS});
+    Tensor qkv_base = tensor_from_device_ptr(ETensorDType::FP32,
+                                             reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qkv_base.data())),
+                                             {B, T, qkv_channels});
+    Tensor q_rstd_base =
+        tensor_from_device_ptr(ETensorDType::FP32,
+                               reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_q_rstd_base.data())),
+                               {B, T, Hq});
+    Tensor k_rstd_base =
+        tensor_from_device_ptr(ETensorDType::FP32,
+                               reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_k_rstd_base.data())),
+                               {B, T, Hkv});
+    Tensor q_weight = tensor_from_device_ptr(ETensorDType::FP32,
+                                             reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qw.data())),
+                                             {HS});
+    Tensor k_weight = tensor_from_device_ptr(ETensorDType::FP32,
+                                             reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_kw.data())),
+                                             {HS});
+    Tensor freqs = tensor_from_device_ptr(ETensorDType::FP32,
+                                          reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_freqs.data())),
+                                          {T, HS});
 
     // Baseline: QK-norm then RoPE
     const int q_rows = Hq * HS;
     qkv_head_rmsnorm_forward(qkv_base, q_rstd_base, q_weight, eps, B, T, qkv_channels, Hq, HS, /*channel_offset=*/0, 0);
-    qkv_head_rmsnorm_forward(qkv_base, k_rstd_base, k_weight, eps, B, T, qkv_channels, Hkv, HS, /*channel_offset=*/q_rows, 0);
+    qkv_head_rmsnorm_forward(qkv_base,
+                             k_rstd_base,
+                             k_weight,
+                             eps,
+                             B,
+                             T,
+                             qkv_channels,
+                             Hkv,
+                             HS,
+                             /*channel_offset=*/q_rows,
+                             0);
     rope_forward(qkv_base, qkv_base, freqs, /*position_ids=*/nullptr, /*abs_max_ptr=*/nullptr, B, T, Hq, Hkv, HS, 0);
 
     // Fused buffers
@@ -74,12 +98,33 @@ TEST_CASE("qk_norm+rope fused forward matches baseline (fp32)", "[kernels][qk_no
     thrust::device_vector<float> d_q_rstd_fused(q_rstd_elems);
     thrust::device_vector<float> d_k_rstd_fused(k_rstd_elems);
 
-    Tensor qkv_fused = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qkv_fused.data())), {B, T, qkv_channels});
-    Tensor q_rstd_fused = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_q_rstd_fused.data())), {B, T, Hq});
-    Tensor k_rstd_fused = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_k_rstd_fused.data())), {B, T, Hkv});
+    Tensor qkv_fused =
+        tensor_from_device_ptr(ETensorDType::FP32,
+                               reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qkv_fused.data())),
+                               {B, T, qkv_channels});
+    Tensor q_rstd_fused =
+        tensor_from_device_ptr(ETensorDType::FP32,
+                               reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_q_rstd_fused.data())),
+                               {B, T, Hq});
+    Tensor k_rstd_fused =
+        tensor_from_device_ptr(ETensorDType::FP32,
+                               reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_k_rstd_fused.data())),
+                               {B, T, Hkv});
 
-    qkv_qk_norm_rope_forward(qkv_fused, q_rstd_fused, k_rstd_fused, q_weight, k_weight, freqs, /*position_ids=*/nullptr,
-                             eps, B, T, Hq, Hkv, HS, 0);
+    qkv_qk_norm_rope_forward(qkv_fused,
+                             q_rstd_fused,
+                             k_rstd_fused,
+                             q_weight,
+                             k_weight,
+                             freqs,
+                             /*position_ids=*/nullptr,
+                             eps,
+                             B,
+                             T,
+                             Hq,
+                             Hkv,
+                             HS,
+                             0);
 
     std::vector<float> h_base = from_device(d_qkv_base);
     std::vector<float> h_fused = from_device(d_qkv_fused);
@@ -131,16 +176,38 @@ TEST_CASE("qk_norm+rope fused backward matches baseline (fp32)", "[kernels][qk_n
     thrust::device_vector<float> d_kw = to_device(h_kw);
     thrust::device_vector<float> d_freqs = to_device(h_freqs);
 
-    Tensor qkv_rope = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qkv_rope.data())), {B, T, qkv_channels});
-    Tensor q_rstd = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qr.data())), {B, T, Hq});
-    Tensor k_rstd = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_kr.data())), {B, T, Hkv});
-    Tensor q_weight = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qw.data())), {HS});
-    Tensor k_weight = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_kw.data())), {HS});
-    Tensor freqs = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_freqs.data())), {T, HS});
+    Tensor qkv_rope = tensor_from_device_ptr(ETensorDType::FP32,
+                                             reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qkv_rope.data())),
+                                             {B, T, qkv_channels});
+    Tensor q_rstd = tensor_from_device_ptr(ETensorDType::FP32,
+                                           reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qr.data())),
+                                           {B, T, Hq});
+    Tensor k_rstd = tensor_from_device_ptr(ETensorDType::FP32,
+                                           reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_kr.data())),
+                                           {B, T, Hkv});
+    Tensor q_weight = tensor_from_device_ptr(ETensorDType::FP32,
+                                             reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_qw.data())),
+                                             {HS});
+    Tensor k_weight = tensor_from_device_ptr(ETensorDType::FP32,
+                                             reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_kw.data())),
+                                             {HS});
+    Tensor freqs = tensor_from_device_ptr(ETensorDType::FP32,
+                                          reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_freqs.data())),
+                                          {T, HS});
 
     const int q_rows = Hq * HS;
     qkv_head_rmsnorm_forward(qkv_rope, q_rstd, q_weight, eps, B, T, qkv_channels, Hq, HS, /*channel_offset=*/0, 0);
-    qkv_head_rmsnorm_forward(qkv_rope, k_rstd, k_weight, eps, B, T, qkv_channels, Hkv, HS, /*channel_offset=*/q_rows, 0);
+    qkv_head_rmsnorm_forward(qkv_rope,
+                             k_rstd,
+                             k_weight,
+                             eps,
+                             B,
+                             T,
+                             qkv_channels,
+                             Hkv,
+                             HS,
+                             /*channel_offset=*/q_rows,
+                             0);
     rope_forward(qkv_rope, qkv_rope, freqs, /*position_ids=*/nullptr, /*abs_max_ptr=*/nullptr, B, T, Hq, Hkv, HS, 0);
 
     // Random dy in post-RoPE space.
@@ -155,38 +222,140 @@ TEST_CASE("qk_norm+rope fused backward matches baseline (fp32)", "[kernels][qk_n
     thrust::device_vector<float> d_dwq(HS);
     thrust::device_vector<float> d_dwk(HS);
 
-    Tensor dy_pre = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dy_pre.data())), {B, T, qkv_channels});
-    Tensor out_pre = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_out_pre.data())), {B, T, qkv_channels});
-    Tensor dwq = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwq.data())), {HS});
-    Tensor dwk = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwk.data())), {HS});
+    Tensor dy_pre = tensor_from_device_ptr(ETensorDType::FP32,
+                                           reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dy_pre.data())),
+                                           {B, T, qkv_channels});
+    Tensor out_pre = tensor_from_device_ptr(ETensorDType::FP32,
+                                            reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_out_pre.data())),
+                                            {B, T, qkv_channels});
+    Tensor dwq = tensor_from_device_ptr(ETensorDType::FP32,
+                                        reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwq.data())),
+                                        {HS});
+    Tensor dwk = tensor_from_device_ptr(ETensorDType::FP32,
+                                        reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwk.data())),
+                                        {HS});
 
     rope_backward(dy_pre, dy_pre, freqs, /*position_ids=*/nullptr, /*abs_max_ptr=*/nullptr, B, T, Hq, Hkv, HS, 0);
     rope_backward(out_pre, qkv_rope, freqs, /*position_ids=*/nullptr, /*abs_max_ptr=*/nullptr, B, T, Hq, Hkv, HS, 0);
 
-    qkv_head_rmsnorm_backward_dweight(dwq, dy_pre, out_pre, q_weight, B, T, qkv_channels, Hq, HS, /*channel_offset=*/0, /*accumulate=*/false, 0);
-    qkv_head_rmsnorm_backward_dweight(dwk, dy_pre, out_pre, k_weight, B, T, qkv_channels, Hkv, HS, /*channel_offset=*/q_rows, /*accumulate=*/false, 0);
+    qkv_head_rmsnorm_backward_dweight(dwq,
+                                      dy_pre,
+                                      out_pre,
+                                      q_weight,
+                                      B,
+                                      T,
+                                      qkv_channels,
+                                      Hq,
+                                      HS,
+                                      /*channel_offset=*/0,
+                                      /*accumulate=*/false,
+                                      0);
+    qkv_head_rmsnorm_backward_dweight(dwk,
+                                      dy_pre,
+                                      out_pre,
+                                      k_weight,
+                                      B,
+                                      T,
+                                      qkv_channels,
+                                      Hkv,
+                                      HS,
+                                      /*channel_offset=*/q_rows,
+                                      /*accumulate=*/false,
+                                      0);
 
-    qkv_head_rmsnorm_backward_dx(dy_pre, out_pre, q_weight, q_rstd, B, T, qkv_channels, Hq, HS, /*channel_offset=*/0, 0);
-    qkv_head_rmsnorm_backward_dx(dy_pre, out_pre, k_weight, k_rstd, B, T, qkv_channels, Hkv, HS, /*channel_offset=*/q_rows, 0);
+    qkv_head_rmsnorm_backward_dx(dy_pre,
+                                 out_pre,
+                                 q_weight,
+                                 q_rstd,
+                                 B,
+                                 T,
+                                 qkv_channels,
+                                 Hq,
+                                 HS,
+                                 /*channel_offset=*/0,
+                                 0);
+    qkv_head_rmsnorm_backward_dx(dy_pre,
+                                 out_pre,
+                                 k_weight,
+                                 k_rstd,
+                                 B,
+                                 T,
+                                 qkv_channels,
+                                 Hkv,
+                                 HS,
+                                 /*channel_offset=*/q_rows,
+                                 0);
 
     // Fused backward (in-place dx) from dy_rope + out_rope.
     thrust::device_vector<float> d_dy_fused = to_device(h_dy);
     thrust::device_vector<float> d_dwq2(HS);
     thrust::device_vector<float> d_dwk2(HS);
 
-    Tensor dy_fused = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dy_fused.data())), {B, T, qkv_channels});
-    Tensor dwq2 = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwq2.data())), {HS});
-    Tensor dwk2 = tensor_from_device_ptr(ETensorDType::FP32, reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwk2.data())), {HS});
+    Tensor dy_fused = tensor_from_device_ptr(ETensorDType::FP32,
+                                             reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dy_fused.data())),
+                                             {B, T, qkv_channels});
+    Tensor dwq2 = tensor_from_device_ptr(ETensorDType::FP32,
+                                         reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwq2.data())),
+                                         {HS});
+    Tensor dwk2 = tensor_from_device_ptr(ETensorDType::FP32,
+                                         reinterpret_cast<std::byte*>(thrust::raw_pointer_cast(d_dwk2.data())),
+                                         {HS});
 
-    qkv_head_rmsnorm_rope_backward_dweight(dwq2, dy_fused, qkv_rope, q_weight, freqs, /*position_ids=*/nullptr,
-                                          B, T, qkv_channels, Hq, HS, /*channel_offset=*/0, /*accumulate=*/false, 0);
-    qkv_head_rmsnorm_rope_backward_dweight(dwk2, dy_fused, qkv_rope, k_weight, freqs, /*position_ids=*/nullptr,
-                                          B, T, qkv_channels, Hkv, HS, /*channel_offset=*/q_rows, /*accumulate=*/false, 0);
+    qkv_head_rmsnorm_rope_backward_dweight(dwq2,
+                                           dy_fused,
+                                           qkv_rope,
+                                           q_weight,
+                                           freqs,
+                                           /*position_ids=*/nullptr,
+                                           B,
+                                           T,
+                                           qkv_channels,
+                                           Hq,
+                                           HS,
+                                           /*channel_offset=*/0,
+                                           /*accumulate=*/false,
+                                           0);
+    qkv_head_rmsnorm_rope_backward_dweight(dwk2,
+                                           dy_fused,
+                                           qkv_rope,
+                                           k_weight,
+                                           freqs,
+                                           /*position_ids=*/nullptr,
+                                           B,
+                                           T,
+                                           qkv_channels,
+                                           Hkv,
+                                           HS,
+                                           /*channel_offset=*/q_rows,
+                                           /*accumulate=*/false,
+                                           0);
 
-    qkv_head_rmsnorm_rope_backward_dx(dy_fused, qkv_rope, q_weight, q_rstd, freqs, /*position_ids=*/nullptr,
-                                      B, T, qkv_channels, Hq, HS, /*channel_offset=*/0, 0);
-    qkv_head_rmsnorm_rope_backward_dx(dy_fused, qkv_rope, k_weight, k_rstd, freqs, /*position_ids=*/nullptr,
-                                      B, T, qkv_channels, Hkv, HS, /*channel_offset=*/q_rows, 0);
+    qkv_head_rmsnorm_rope_backward_dx(dy_fused,
+                                      qkv_rope,
+                                      q_weight,
+                                      q_rstd,
+                                      freqs,
+                                      /*position_ids=*/nullptr,
+                                      B,
+                                      T,
+                                      qkv_channels,
+                                      Hq,
+                                      HS,
+                                      /*channel_offset=*/0,
+                                      0);
+    qkv_head_rmsnorm_rope_backward_dx(dy_fused,
+                                      qkv_rope,
+                                      k_weight,
+                                      k_rstd,
+                                      freqs,
+                                      /*position_ids=*/nullptr,
+                                      B,
+                                      T,
+                                      qkv_channels,
+                                      Hkv,
+                                      HS,
+                                      /*channel_offset=*/q_rows,
+                                      0);
 
     // Compare dW (component-wise) and dx for Q+K channels.
     std::vector<float> h_dwq0 = from_device(d_dwq);
@@ -200,8 +369,8 @@ TEST_CASE("qk_norm+rope fused backward matches baseline (fp32)", "[kernels][qk_n
         REQUIRE(h_dwk1[i] == Catch::Approx(h_dwk0[i]).margin(5e-4f));
     }
 
-    std::vector<float> h_dx0 = from_device(d_dy_pre);   // dy_pre now holds dx_pre for Q/K
-    std::vector<float> h_dx1 = from_device(d_dy_fused); // dy_fused now holds dx_pre for Q/K
+    std::vector<float> h_dx0 = from_device(d_dy_pre);    // dy_pre now holds dx_pre for Q/K
+    std::vector<float> h_dx1 = from_device(d_dy_fused);  // dy_fused now holds dx_pre for Q/K
 
     const size_t tokens = static_cast<size_t>(B) * static_cast<size_t>(T);
     for (size_t tok = 0; tok < tokens; ++tok) {
@@ -216,4 +385,3 @@ TEST_CASE("qk_norm+rope fused backward matches baseline (fp32)", "[kernels][qk_n
         }
     }
 }
-

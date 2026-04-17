@@ -1,6 +1,6 @@
+import argparse
 import os
 import sys
-import argparse
 
 from surogate.utils.logger import get_logger
 
@@ -11,17 +11,16 @@ def prepare_command_parser(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
 
-    parser.add_argument('--base-model', required=True,
-                        help='Path to base model directory or HuggingFace model ID')
-    parser.add_argument('--checkpoint-dir', required=True,
-                        help='Path to a LoRA checkpoint directory (e.g. output/step_00000050)')
-    parser.add_argument('--output', required=True,
-                        help='Output directory for the merged model')
+    parser.add_argument("--base-model", required=True, help="Path to base model directory or HuggingFace model ID")
+    parser.add_argument(
+        "--checkpoint-dir", required=True, help="Path to a LoRA checkpoint directory (e.g. output/step_00000050)"
+    )
+    parser.add_argument("--output", required=True, help="Output directory for the merged model")
 
     return parser
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = prepare_command_parser().parse_args(sys.argv[1:])
 
     from surogate.utils.adapter_merge import merge_adapter
@@ -31,11 +30,14 @@ if __name__ == '__main__':
     if not os.path.isdir(base_model_path):
         try:
             from huggingface_hub import snapshot_download
+
             logger.info(f"Downloading base model from HuggingFace: {base_model_path}")
             base_model_path = snapshot_download(base_model_path)
         except Exception as e:
-            logger.error(f"Base model path '{args.base_model}' is not a local directory "
-                         f"and could not be downloaded from HuggingFace: {e}")
+            logger.error(
+                f"Base model path '{args.base_model}' is not a local directory "
+                f"and could not be downloaded from HuggingFace: {e}"
+            )
             sys.exit(1)
 
     # Validate checkpoint

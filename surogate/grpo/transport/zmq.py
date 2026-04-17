@@ -3,9 +3,14 @@ from time import time
 
 import zmq
 
-from surogate.grpo.runs import get_multi_run_manager
-from surogate.grpo.transport.base import MicroBatchReceiver, MicroBatchSender, TrainingBatchReceiver, TrainingBatchSender
 from surogate.core.config.grpo_orch_config import ZMQTransportConfig
+from surogate.grpo.runs import get_multi_run_manager
+from surogate.grpo.transport.base import (
+    MicroBatchReceiver,
+    MicroBatchSender,
+    TrainingBatchReceiver,
+    TrainingBatchSender,
+)
 from surogate.grpo.transport.types import MicroBatch, TrainingBatch
 
 LOG_FREQ_SECONDS = 10

@@ -47,14 +47,14 @@ void LazyAllocator::allocate(Tensor* target, ETensorDType dtype, const std::vect
 Tensor LazyAllocator::commit(TensorAllocator& storage, EAllocationType type, const char* name) {
     std::size_t total_size = 0;
     constexpr std::size_t page_size = 4096;
-    for(auto& target: mTargets) {
+    for (auto& target : mTargets) {
         std::size_t tgt_size = div_ceil(target->bytes(), page_size) * page_size;
         total_size += tgt_size;
     }
 
     Tensor backing = storage.allocate(ETensorDType::BYTE, name, type, {(long)total_size});
     auto* ptr = backing.get<std::byte>();
-    for(auto& target: mTargets) {
+    for (auto& target : mTargets) {
         target->Data = ptr;
         target->Device = backing.Device;
         ptr += div_ceil(target->bytes(), page_size) * page_size;
@@ -80,14 +80,14 @@ Tensor LazyAllocator::commit(TensorAllocator& storage, EAllocationType type, con
 Tensor LazyAllocator::commit(DeviceMemoryStack& storage, const char* name) {
     std::size_t total_size = 0;
     constexpr std::size_t page_size = 4096;
-    for(auto& target: mTargets) {
+    for (auto& target : mTargets) {
         std::size_t tgt_size = div_ceil(target->bytes(), page_size) * page_size;
         total_size += tgt_size;
     }
 
     Tensor backing = storage.allocate(ETensorDType::BYTE, {(long)total_size}, name);
     auto* ptr = backing.get<std::byte>();
-    for(auto& target: mTargets) {
+    for (auto& target : mTargets) {
         target->Data = ptr;
         target->Device = backing.Device;
         ptr += div_ceil(target->bytes(), page_size) * page_size;

@@ -19,18 +19,20 @@ from __future__ import annotations
 import math
 
 from .. import nn
-from ..nn import NEMOTRON_MODEL_NAME_REMAP
-from ..specs import ActivationScope
-from ..hf import (
-    build_mamba_mappings, build_simple_mlp_mappings, build_attn_mappings,
-    stack_experts,
-)
 from ..blocks.nemotron_h import (
-    NemotronHMamba2Block,
     NemotronHAttentionBlock,
+    NemotronHMamba2Block,
     NemotronHMLPBlock,
     NemotronHMoEBlock,
 )
+from ..hf import (
+    build_attn_mappings,
+    build_mamba_mappings,
+    build_simple_mlp_mappings,
+    stack_experts,
+)
+from ..nn import NEMOTRON_MODEL_NAME_REMAP
+from ..specs import ActivationScope
 
 
 def parse_hybrid_pattern(pattern: str) -> list[str]:
@@ -57,8 +59,7 @@ def parse_hybrid_pattern(pattern: str) -> list[str]:
         elif char == "E":
             block_types.append("moe")
         else:
-            raise ValueError(f"Invalid character '{char}' in hybrid_override_pattern. "
-                           f"Expected 'M', '*', '-', or 'E'")
+            raise ValueError(f"Invalid character '{char}' in hybrid_override_pattern. Expected 'M', '*', '-', or 'E'")
     return block_types
 
 
@@ -139,13 +140,11 @@ class NemotronHModel(nn.Model):
     _hf_block_mappings_ = {
         # Common to all blocks - Nemotron uses 'norm.weight' directly
         "norm_weight": "backbone.layers.{layer}.norm.weight",
-
         # Mamba2 block weights (from Mamba2Mixer._hf_mapping_defaults_)
         **build_mamba_mappings(
             layer_prefix="backbone.layers.{layer}",
             mamba_suffix="mixer",
         ),
-
         # Attention block weights (from GQAAttention._hf_mapping_defaults_)
         **build_attn_mappings(
             layer_prefix="backbone.layers.{layer}",
@@ -153,13 +152,11 @@ class NemotronHModel(nn.Model):
         ),
         # Nemotron attention also has output bias (beyond GQAAttention defaults)
         "out_bias": "backbone.layers.{layer}.mixer.o_proj.bias",
-
         # MLP block weights (from SimpleMLP._hf_mapping_defaults_)
         **build_simple_mlp_mappings(
             layer_prefix="backbone.layers.{layer}",
             mlp_suffix="mixer",
         ),
-
         # MoE block weights (NemotronMoEBlock uses experts_up, not experts_gate_up)
         # Nemotron MoE uses relu2 activation (no gate), so only up_proj and down_proj
         "router_weight": "backbone.layers.{layer}.mixer.gate.weight",
@@ -173,7 +170,6 @@ class NemotronHModel(nn.Model):
         # Shared expert (optional, present when use_shared_expert=True)
         "shared_expert_up": "backbone.layers.{layer}.mixer.shared_experts.up_proj.weight",
         "shared_expert_down": "backbone.layers.{layer}.mixer.shared_experts.down_proj.weight",
-
         # Model-level weight mappings
         "embedding": "backbone.embeddings.weight",
         "final_norm": "backbone.norm_f.weight",
@@ -277,8 +273,7 @@ class NemotronHModel(nn.Model):
         self.block_types = parse_hybrid_pattern(hybrid_pattern)
         if len(self.block_types) != n_layers:
             raise ValueError(
-                f"hybrid_override_pattern length ({len(self.block_types)}) "
-                f"must match n_layers ({n_layers})"
+                f"hybrid_override_pattern length ({len(self.block_types)}) must match n_layers ({n_layers})"
             )
 
         # Count block types for array parameters
@@ -302,65 +297,81 @@ class NemotronHModel(nn.Model):
         # Build block configs for HybridBlockStack
         block_configs = []
         if self.has_mamba_blocks:
-            block_configs.append((
-                "mamba_blocks", NemotronHMamba2Block, self.n_mamba_blocks,
-                dict(
-                    d_model=d_model,
-                    mamba_num_heads=mamba_num_heads,
-                    mamba_head_dim=mamba_head_dim,
-                    ssm_state_size=ssm_state_size,
-                    n_groups=n_groups,
-                    conv_kernel=conv_kernel,
-                    chunk_size=chunk_size,
-                    eps=eps,
-                    dt_min=time_step_min,
-                    dt_max=time_step_max,
-                    time_step_limit=time_step_limit,
-                    use_conv_bias=use_conv_bias,
-                    use_bias=use_mamba_bias,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "mamba_blocks",
+                    NemotronHMamba2Block,
+                    self.n_mamba_blocks,
+                    dict(
+                        d_model=d_model,
+                        mamba_num_heads=mamba_num_heads,
+                        mamba_head_dim=mamba_head_dim,
+                        ssm_state_size=ssm_state_size,
+                        n_groups=n_groups,
+                        conv_kernel=conv_kernel,
+                        chunk_size=chunk_size,
+                        eps=eps,
+                        dt_min=time_step_min,
+                        dt_max=time_step_max,
+                        time_step_limit=time_step_limit,
+                        use_conv_bias=use_conv_bias,
+                        use_bias=use_mamba_bias,
+                    ),
+                )
+            )
         if self.has_attn_blocks:
-            block_configs.append((
-                "attn_blocks", NemotronHAttentionBlock, self.n_attn_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
-                    max_seq=max_seq,
-                    eps=eps,
-                    attention_bias=attention_bias,
-                    use_rope=use_rope,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "attn_blocks",
+                    NemotronHAttentionBlock,
+                    self.n_attn_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=head_dim,
+                        max_seq=max_seq,
+                        eps=eps,
+                        attention_bias=attention_bias,
+                        use_rope=use_rope,
+                    ),
+                )
+            )
         if self.has_mlp_blocks:
-            block_configs.append((
-                "mlp_blocks", NemotronHMLPBlock, self.n_mlp_blocks,
-                dict(
-                    d_model=d_model,
-                    d_ff=d_ff,
-                    eps=eps,
-                    activation=mlp_activation,
-                    mlp_bias=mlp_bias,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "mlp_blocks",
+                    NemotronHMLPBlock,
+                    self.n_mlp_blocks,
+                    dict(
+                        d_model=d_model,
+                        d_ff=d_ff,
+                        eps=eps,
+                        activation=mlp_activation,
+                        mlp_bias=mlp_bias,
+                    ),
+                )
+            )
         if self.has_moe_blocks:
-            block_configs.append((
-                "moe_blocks", NemotronHMoEBlock, self.n_moe_blocks,
-                dict(
-                    d_model=d_model,
-                    moe_intermediate_size=moe_intermediate_size,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    shared_expert_intermediate_size=shared_expert_intermediate_size,
-                    eps=eps,
-                    mlp_bias=mlp_bias,
-                    activation=mlp_activation,
-                    routed_scaling_factor=routed_scaling_factor,
-                    ep_size=ep_size,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "moe_blocks",
+                    NemotronHMoEBlock,
+                    self.n_moe_blocks,
+                    dict(
+                        d_model=d_model,
+                        moe_intermediate_size=moe_intermediate_size,
+                        num_experts=num_experts,
+                        num_experts_per_tok=num_experts_per_tok,
+                        shared_expert_intermediate_size=shared_expert_intermediate_size,
+                        eps=eps,
+                        mlp_bias=mlp_bias,
+                        activation=mlp_activation,
+                        routed_scaling_factor=routed_scaling_factor,
+                        ep_size=ep_size,
+                    ),
+                )
+            )
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
@@ -377,11 +388,9 @@ class NemotronHModel(nn.Model):
         # IO slots
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", ("T",), dtype="int32", scope=G)
-        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                                  aliases=["labels"])
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
         if self.use_rope:
-            self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
-                                      scope=G, aliases=["rope_freqs"])
+            self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32", scope=G, aliases=["rope_freqs"])
 
         # Global intermediate slots
         _h = ("B", "T", "d_model")
@@ -392,10 +401,8 @@ class NemotronHModel(nn.Model):
         self._register_activation("residual_final", _h, scope=G)
         self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
         self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                                  save=True, scope=G)
-        self._register_activation("loss", ("B * T",), dtype="fp32",
-                                  aliases=["losses"], scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
         x = self.embedding(token_ids)
         residual = self._zeros(["B", "T", "d_model"])
@@ -448,8 +455,7 @@ def from_hf_config(config: dict) -> NemotronHModel:
         time_step_max=time_step_max,
         max_seq=config.get("max_position_embeddings", 4096),
         eps=config.get("layer_norm_epsilon", 1e-5),
-        hybrid_pattern=config.get("hybrid_override_pattern",
-                                  "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"),
+        hybrid_pattern=config.get("hybrid_override_pattern", "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"),
         attention_bias=config.get("attention_bias", False),
         mlp_bias=config.get("mlp_bias", False),
         use_conv_bias=config.get("use_conv_bias", True),

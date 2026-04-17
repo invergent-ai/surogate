@@ -16,7 +16,7 @@ namespace fe = cudnn_frontend;
 /**
  * @brief Checks a cuDNN status code and throws on error.
  */
-static void cuDNNCheck_(cudnnStatus_t error, const char *file, int line) {
+static void cuDNNCheck_(cudnnStatus_t error, const char* file, int line) {
     if (error != CUDNN_STATUS_SUCCESS) {
         printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, cudnnGetErrorString(error));
         exit(EXIT_FAILURE);
@@ -27,8 +27,8 @@ static void cuDNNCheck_(cudnnStatus_t error, const char *file, int line) {
 /**
  * @brief Checks a cuDNN frontend error object and throws on error.
  */
-static void checkCudnnFE(const fe::error_object& e, const char *file, int line) {
-    if(!e.is_good()) {
+static void checkCudnnFE(const fe::error_object& e, const char* file, int line) {
+    if (!e.is_good()) {
         printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, e.err_msg.c_str());
         exit(EXIT_FAILURE);
     }
@@ -39,13 +39,13 @@ static void checkCudnnFE(const fe::error_object& e, const char *file, int line) 
  * @brief Unique identifiers for FP4 matmul graph tensors.
  */
 enum FP4UIDs {
-    FP4_A_UID,              ///< Input tensor A (FP4 packed data)
-    FP4_B_UID,              ///< Input tensor B (FP4 packed data)
-    FP4_SCALE_A_UID,        ///< Block descale tensor for A (FP8 E4M3)
-    FP4_SCALE_B_UID,        ///< Block descale tensor for B (FP8 E4M3)
-    FP4_GLOBAL_SCALE_A_UID, ///< Global scale for A (scalar FP32)
-    FP4_GLOBAL_SCALE_B_UID, ///< Global scale for B (scalar FP32)
-    FP4_D_UID,              ///< Output tensor D (BF16)
+    FP4_A_UID,               ///< Input tensor A (FP4 packed data)
+    FP4_B_UID,               ///< Input tensor B (FP4 packed data)
+    FP4_SCALE_A_UID,         ///< Block descale tensor for A (FP8 E4M3)
+    FP4_SCALE_B_UID,         ///< Block descale tensor for B (FP8 E4M3)
+    FP4_GLOBAL_SCALE_A_UID,  ///< Global scale for A (scalar FP32)
+    FP4_GLOBAL_SCALE_B_UID,  ///< Global scale for B (scalar FP32)
+    FP4_D_UID,               ///< Output tensor D (BF16)
 };
 
 /**
@@ -113,12 +113,12 @@ static fe::DataType_t get_output_dtype(int dtype_id) {
  * @param cudnn_handle cuDNN handle for graph building
  * @return Shared pointer to the cached or newly built cuDNN graph
  */
-static auto lookup_cache_or_build_fp4_matmul_graph(
-    int64_t M, int64_t N, int64_t K,
-    int32_t block_size,
-    int output_dtype_id,
-    cudnnHandle_t cudnn_handle)
-{
+static auto lookup_cache_or_build_fp4_matmul_graph(int64_t M,
+                                                   int64_t N,
+                                                   int64_t K,
+                                                   int32_t block_size,
+                                                   int output_dtype_id,
+                                                   cudnnHandle_t cudnn_handle) {
     thread_local fp4_matmul_cache_type fp4_matmul_cache;
 
     auto key = std::make_tuple(M, N, K, block_size, output_dtype_id);
@@ -141,17 +141,16 @@ static auto lookup_cache_or_build_fp4_matmul_graph(
     auto output_dtype = get_output_dtype(output_dtype_id);
 
     auto graph = std::make_shared<fe::graph::Graph>();
-    graph->set_intermediate_data_type(fe::DataType_t::FLOAT)
-          .set_compute_data_type(fe::DataType_t::FLOAT);
+    graph->set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
 
     // Tensor A: input {M, K} row-major
     // FP4 is packed 2 values per byte, but cuDNN handles this internally
     auto tensor_a = graph->tensor(fe::graph::Tensor_attributes()
-        .set_name("tensor_a")
-        .set_data_type(fe::DataType_t::FP4_E2M1)
-        .set_dim({1, M, K})
-        .set_stride({M * K, K, 1})
-        .set_uid(FP4_A_UID));
+                                      .set_name("tensor_a")
+                                      .set_data_type(fe::DataType_t::FP4_E2M1)
+                                      .set_dim({1, M, K})
+                                      .set_stride({M * K, K, 1})
+                                      .set_uid(FP4_A_UID));
 
     // Tensor B: weight {N, K} stored row-major, interpreted as {K, N} column-major
     // cuDNN matmul: D[M,N] = A[M,K] @ B[K,N]
@@ -160,51 +159,48 @@ static auto lookup_cache_or_build_fp4_matmul_graph(
     // But since cuDNN expects dims {K, N} with column-major strides:
     // dims = {K, N}, strides = {1, K} means stride-1 on K dimension
     auto tensor_b = graph->tensor(fe::graph::Tensor_attributes()
-        .set_name("tensor_b")
-        .set_data_type(fe::DataType_t::FP4_E2M1)
-        .set_dim({1, K, N})
-        .set_stride({K * N, 1, K})
-        .set_uid(FP4_B_UID));
+                                      .set_name("tensor_b")
+                                      .set_data_type(fe::DataType_t::FP4_E2M1)
+                                      .set_dim({1, K, N})
+                                      .set_stride({K * N, 1, K})
+                                      .set_uid(FP4_B_UID));
 
     // Block descale tensor for A (input): {rounded_m, rounded_block_scale_k}
     auto block_descale_a = graph->tensor(fe::graph::Tensor_attributes()
-        .set_name("block_descale_a")
-        .set_data_type(fe::DataType_t::FP8_E4M3)
-        .set_dim({1, rounded_m, rounded_block_scale_k})
-        .set_stride({rounded_m * rounded_block_scale_k, rounded_block_scale_k, 1})
-        .set_reordering_type(fe::TensorReordering_t::F8_128x4)
-        .set_uid(FP4_SCALE_A_UID));
+                                             .set_name("block_descale_a")
+                                             .set_data_type(fe::DataType_t::FP8_E4M3)
+                                             .set_dim({1, rounded_m, rounded_block_scale_k})
+                                             .set_stride({rounded_m * rounded_block_scale_k, rounded_block_scale_k, 1})
+                                             .set_reordering_type(fe::TensorReordering_t::F8_128x4)
+                                             .set_uid(FP4_SCALE_A_UID));
 
     // Block descale tensor for B (weight): K-major layout expected by cuDNN for FP4 matmul.
     // (K/16, N) with F8_128x4 reordering (specialized for B operand).
     auto block_descale_b = graph->tensor(fe::graph::Tensor_attributes()
-        .set_name("block_descale_b")
-        .set_data_type(fe::DataType_t::FP8_E4M3)
-        .set_dim({1, rounded_block_scale_k, rounded_n})
-        .set_stride({rounded_n * rounded_block_scale_k, 1, rounded_block_scale_k})
-        .set_reordering_type(fe::TensorReordering_t::F8_128x4)
-        .set_uid(FP4_SCALE_B_UID));
+                                             .set_name("block_descale_b")
+                                             .set_data_type(fe::DataType_t::FP8_E4M3)
+                                             .set_dim({1, rounded_block_scale_k, rounded_n})
+                                             .set_stride({rounded_n * rounded_block_scale_k, 1, rounded_block_scale_k})
+                                             .set_reordering_type(fe::TensorReordering_t::F8_128x4)
+                                             .set_uid(FP4_SCALE_B_UID));
 
     // Block scale dequantization for both operands
-    auto dequant_attr = fe::graph::Block_scale_dequantize_attributes()
-        .set_block_size(block_size);
+    auto dequant_attr = fe::graph::Block_scale_dequantize_attributes().set_block_size(block_size);
 
     auto dequant_a = graph->block_scale_dequantize(tensor_a, block_descale_a, dequant_attr);
     auto dequant_b = graph->block_scale_dequantize(tensor_b, block_descale_b, dequant_attr);
 
     // Matrix multiplication: D = A @ B
-    auto matmul_attr = fe::graph::Matmul_attributes()
-        .set_name("FP4_GEMM")
-        .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto matmul_attr = fe::graph::Matmul_attributes().set_name("FP4_GEMM").set_compute_data_type(fe::DataType_t::FLOAT);
 
     auto tensor_d = graph->matmul(dequant_a, dequant_b, matmul_attr);
 
     // Configure output tensor: {M, N} row-major
     tensor_d->set_output(true)
-            .set_data_type(output_dtype)
-            .set_dim({1, M, N})
-            .set_stride({M * N, N, 1})
-            .set_uid(FP4_D_UID);
+        .set_data_type(output_dtype)
+        .set_dim({1, M, N})
+        .set_stride({M * N, N, 1})
+        .set_uid(FP4_D_UID);
 
     checkCudnnFE(graph->validate());
 
@@ -228,11 +224,7 @@ static auto lookup_cache_or_build_fp4_matmul_graph(
  * @param cudnn_handle cuDNN handle
  * @return Required workspace size in bytes
  */
-std::size_t fp4_matmul_get_workspace_size(
-    int M, int N, int K,
-    int block_size,
-    cudnnHandle_t cudnn_handle)
-{
+std::size_t fp4_matmul_get_workspace_size(int M, int N, int K, int block_size, cudnnHandle_t cudnn_handle) {
     auto graph = lookup_cache_or_build_fp4_matmul_graph(M, N, K, block_size, 1, cudnn_handle);
     return graph->get_workspace_size();
 }
@@ -267,21 +259,21 @@ std::size_t fp4_matmul_get_workspace_size(
  * @param cudnn_handle cuDNN handle
  * @param stream CUDA stream for execution
  */
-void fp4_matmul(
-    nv_bfloat16* d,
-    const uint8_t* a,
-    const uint8_t* b,
-    const __nv_fp8_e4m3* scale_a,
-    const __nv_fp8_e4m3* scale_b,
-    [[maybe_unused]] float global_scale_a,
-    [[maybe_unused]] float global_scale_b,
-    std::byte* workspace,
-    [[maybe_unused]] std::size_t workspace_size,
-    int M, int N, int K,
-    int block_size,
-    cudnnHandle_t cudnn_handle,
-    cudaStream_t stream)
-{
+void fp4_matmul(nv_bfloat16* d,
+                const uint8_t* a,
+                const uint8_t* b,
+                const __nv_fp8_e4m3* scale_a,
+                const __nv_fp8_e4m3* scale_b,
+                [[maybe_unused]] float global_scale_a,
+                [[maybe_unused]] float global_scale_b,
+                std::byte* workspace,
+                [[maybe_unused]] std::size_t workspace_size,
+                int M,
+                int N,
+                int K,
+                int block_size,
+                cudnnHandle_t cudnn_handle,
+                cudaStream_t stream) {
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
     // Get or build the cached graph
@@ -306,21 +298,21 @@ void fp4_matmul(
 /**
  * @brief Execute FP4 block-scaled matmul with FP32 output.
  */
-void fp4_matmul_f32(
-    float* d,
-    const uint8_t* a,
-    const uint8_t* b,
-    const __nv_fp8_e4m3* scale_a,
-    const __nv_fp8_e4m3* scale_b,
-    [[maybe_unused]] float global_scale_a,
-    [[maybe_unused]] float global_scale_b,
-    std::byte* workspace,
-    [[maybe_unused]] std::size_t workspace_size,
-    int M, int N, int K,
-    int block_size,
-    cudnnHandle_t cudnn_handle,
-    cudaStream_t stream)
-{
+void fp4_matmul_f32(float* d,
+                    const uint8_t* a,
+                    const uint8_t* b,
+                    const __nv_fp8_e4m3* scale_a,
+                    const __nv_fp8_e4m3* scale_b,
+                    [[maybe_unused]] float global_scale_a,
+                    [[maybe_unused]] float global_scale_b,
+                    std::byte* workspace,
+                    [[maybe_unused]] std::size_t workspace_size,
+                    int M,
+                    int N,
+                    int K,
+                    int block_size,
+                    cudnnHandle_t cudnn_handle,
+                    cudaStream_t stream) {
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
     // Get or build the cached graph with FP32 output
@@ -341,44 +333,52 @@ void fp4_matmul_f32(
 /**
  * @brief Tensor-based wrapper for FP4 matmul.
  */
-void fp4_matmul(
-    Tensor& d,
-    const Tensor& a,
-    const Tensor& b,
-    const Tensor& scale_a,
-    const Tensor& scale_b,
-    float global_scale_a,
-    float global_scale_b,
-    Tensor& workspace,
-    int M, int N, int K,
-    int block_size,
-    cudnnHandle_t cudnn_handle,
-    cudaStream_t stream)
-{
+void fp4_matmul(Tensor& d,
+                const Tensor& a,
+                const Tensor& b,
+                const Tensor& scale_a,
+                const Tensor& scale_b,
+                float global_scale_a,
+                float global_scale_b,
+                Tensor& workspace,
+                int M,
+                int N,
+                int K,
+                int block_size,
+                cudnnHandle_t cudnn_handle,
+                cudaStream_t stream) {
     if (d.DType == ETensorDType::BF16) {
-        fp4_matmul(
-            d.get<nv_bfloat16>(),
-            a.get<uint8_t>(),
-            b.get<uint8_t>(),
-            scale_a.get<__nv_fp8_e4m3>(),
-            scale_b.get<__nv_fp8_e4m3>(),
-            global_scale_a, global_scale_b,
-            workspace.get<std::byte>(),
-            workspace.bytes(),
-            M, N, K, block_size,
-            cudnn_handle, stream);
+        fp4_matmul(d.get<nv_bfloat16>(),
+                   a.get<uint8_t>(),
+                   b.get<uint8_t>(),
+                   scale_a.get<__nv_fp8_e4m3>(),
+                   scale_b.get<__nv_fp8_e4m3>(),
+                   global_scale_a,
+                   global_scale_b,
+                   workspace.get<std::byte>(),
+                   workspace.bytes(),
+                   M,
+                   N,
+                   K,
+                   block_size,
+                   cudnn_handle,
+                   stream);
     } else if (d.DType == ETensorDType::FP32) {
-        fp4_matmul_f32(
-            d.get<float>(),
-            a.get<uint8_t>(),
-            b.get<uint8_t>(),
-            scale_a.get<__nv_fp8_e4m3>(),
-            scale_b.get<__nv_fp8_e4m3>(),
-            global_scale_a, global_scale_b,
-            workspace.get<std::byte>(),
-            workspace.bytes(),
-            M, N, K, block_size,
-            cudnn_handle, stream);
+        fp4_matmul_f32(d.get<float>(),
+                       a.get<uint8_t>(),
+                       b.get<uint8_t>(),
+                       scale_a.get<__nv_fp8_e4m3>(),
+                       scale_b.get<__nv_fp8_e4m3>(),
+                       global_scale_a,
+                       global_scale_b,
+                       workspace.get<std::byte>(),
+                       workspace.bytes(),
+                       M,
+                       N,
+                       K,
+                       block_size,
+                       cudnn_handle,
+                       stream);
     } else {
         throw std::runtime_error("fp4_matmul: unsupported output dtype (must be BF16 or FP32)");
     }

@@ -13,4 +13,3 @@ async def safe_cancel(task: asyncio.Task) -> None:
 async def safe_cancel_all(tasks: list[asyncio.Task]) -> None:
     """Safely cancels and awaits all asyncio.Tasks."""
     await asyncio.gather(*[safe_cancel(task) for task in tasks])
-    

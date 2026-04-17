@@ -43,8 +43,9 @@ class TestStepMetrics:
         assert m.tokens_per_second == 0.0
 
     def test_to_dict_without_moe(self):
-        m = StepMetrics(step=42, epoch=1.5, loss=2.3, grad_norm=0.5,
-                        lr=1e-4, tokens=8192, elapsed_ms=100, phase="converging")
+        m = StepMetrics(
+            step=42, epoch=1.5, loss=2.3, grad_norm=0.5, lr=1e-4, tokens=8192, elapsed_ms=100, phase="converging"
+        )
         d = m.to_dict()
         assert d["step"] == 42
         assert d["epoch"] == 1.5

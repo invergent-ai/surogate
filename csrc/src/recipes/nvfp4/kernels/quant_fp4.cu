@@ -76,21 +76,26 @@ __device__ __forceinline__ float rcp_approx_ftz(float a) {
  */
 __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
     uint32_t val;
-    asm volatile(
-        "{\n"
-        ".reg .b8 byte0;\n"
-        ".reg .b8 byte1;\n"
-        ".reg .b8 byte2;\n"
-        ".reg .b8 byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-        "}"
-        : "=r"(val)
-        : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
-          "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7]));
+    asm volatile("{\n"
+                 ".reg .b8 byte0;\n"
+                 ".reg .b8 byte1;\n"
+                 ".reg .b8 byte2;\n"
+                 ".reg .b8 byte3;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+                 "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+                 "}"
+                 : "=r"(val)
+                 : "f"(array[0]),
+                   "f"(array[1]),
+                   "f"(array[2]),
+                   "f"(array[3]),
+                   "f"(array[4]),
+                   "f"(array[5]),
+                   "f"(array[6]),
+                   "f"(array[7]));
     return val;
 }
 
@@ -192,19 +197,26 @@ __device__ __forceinline__ uint8_t quantize_fp4_e2m1_sr(float val, float u) {
     float lo = 0.0f;
     float hi = 0.5f;
     if (x < 0.5f) {
-        lo = 0.0f; hi = 0.5f;
+        lo = 0.0f;
+        hi = 0.5f;
     } else if (x < 1.0f) {
-        lo = 0.5f; hi = 1.0f;
+        lo = 0.5f;
+        hi = 1.0f;
     } else if (x < 1.5f) {
-        lo = 1.0f; hi = 1.5f;
+        lo = 1.0f;
+        hi = 1.5f;
     } else if (x < 2.0f) {
-        lo = 1.5f; hi = 2.0f;
+        lo = 1.5f;
+        hi = 2.0f;
     } else if (x < 3.0f) {
-        lo = 2.0f; hi = 3.0f;
+        lo = 2.0f;
+        hi = 3.0f;
     } else if (x < 4.0f) {
-        lo = 3.0f; hi = 4.0f;
+        lo = 3.0f;
+        hi = 4.0f;
     } else {
-        lo = 4.0f; hi = 6.0f;
+        lo = 4.0f;
+        hi = 6.0f;
     }
 
     // If x is exactly representable (or in a degenerate interval), keep it.
@@ -286,7 +298,7 @@ __device__ __forceinline__ size_t scale_swizzled_offset(size_t row_idx, size_t c
     return ((rb * cbg_cnt + cbg) * kRowsPerBaseBlockCol + d3) * 16 + d4 * kColsPerBaseBlockCol + d5;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // Four Over Six (4/6) Adaptive Block Scaling Constants and Helpers
@@ -312,7 +324,8 @@ __device__ __forceinline__ float compute_global_encode_scale_4o6(float global_am
  * For max=6: decode_scale = block_amax / 6 * tensor_scale / global_amax = block_amax * 256 / global_amax
  * For max=4: decode_scale = block_amax / 4 * tensor_scale / global_amax = block_amax * 384 / global_amax
  */
-__device__ __forceinline__ float compute_decode_scale_4o6(float block_amax, float global_encode_scale, float selected_max) {
+__device__ __forceinline__ float
+compute_decode_scale_4o6(float block_amax, float global_encode_scale, float selected_max) {
     return block_amax * rcp_approx_ftz(selected_max) * global_encode_scale;
 }
 
@@ -325,9 +338,8 @@ __device__ __forceinline__ float compute_decode_scale_4o6(float block_amax, floa
  * @param metric 0=MSE, 1=L1, 2=AbsMax
  * @return Error value
  */
-__device__ __forceinline__ float compute_quant_error_4o6(
-    const float* values, int count, float encode_scale, float decode_scale, int metric)
-{
+__device__ __forceinline__ float
+compute_quant_error_4o6(const float* values, int count, float encode_scale, float decode_scale, int metric) {
     float error = 0.0f;
     float max_error = 0.0f;
 
@@ -351,7 +363,7 @@ __device__ __forceinline__ float compute_quant_error_4o6(
     return (metric == 2) ? max_error : error;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // 4/6 Block Quantization Kernel
@@ -363,14 +375,15 @@ __device__ __forceinline__ float compute_quant_error_4o6(
  * For each 16-element block, evaluates both max=4 and max=6 scaling and selects
  * the option with lower quantization error.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_block_4o6_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int scale_cols, int metric)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_block_4o6_kernel(uint8_t* __restrict__ out_fp4,
+                                              __nv_fp8_e4m3* __restrict__ block_scales,
+                                              const float* __restrict__ global_amax_in,
+                                              const nv_bfloat16* __restrict__ in,
+                                              int M,
+                                              int K,
+                                              int scale_cols,
+                                              int metric) {
     const int tile_row = blockIdx.x;
     const int tile_col = blockIdx.y;
 
@@ -422,10 +435,12 @@ __global__ void quantize_fp4_block_4o6_kernel(
         float decode_scale_6 = compute_decode_scale_4o6(block_amax, global_encode_scale, 6.0f);
         float decode_scale_4 = compute_decode_scale_4o6(block_amax, global_encode_scale, 4.0f);
 
-        float encode_scale_6 = (decode_scale_6 * global_decode_scale != 0.0f) ?
-            rcp_approx_ftz(decode_scale_6 * global_decode_scale) : 0.0f;
-        float encode_scale_4 = (decode_scale_4 * global_decode_scale != 0.0f) ?
-            rcp_approx_ftz(decode_scale_4 * global_decode_scale) : 0.0f;
+        float encode_scale_6 = (decode_scale_6 * global_decode_scale != 0.0f)
+                                   ? rcp_approx_ftz(decode_scale_6 * global_decode_scale)
+                                   : 0.0f;
+        float encode_scale_4 = (decode_scale_4 * global_decode_scale != 0.0f)
+                                   ? rcp_approx_ftz(decode_scale_4 * global_decode_scale)
+                                   : 0.0f;
 
         // Reconstruct scales for error computation
         float recon_scale_6 = decode_scale_6 * global_decode_scale;
@@ -442,7 +457,8 @@ __global__ void quantize_fp4_block_4o6_kernel(
         // Store scale as FP8 E4M3
         __nv_fp8_e4m3 scale_fp8;
         float clamped_scale = fminf(fmaxf(selected_decode_scale, 1.0f / 128.0f), 480.0f);
-        scale_fp8.__x = __nv_cvt_float_to_fp8(clamped_scale, __nv_saturation_t::__NV_SATFINITE,
+        scale_fp8.__x = __nv_cvt_float_to_fp8(clamped_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
                                               __nv_fp8_interpretation_t::__NV_E4M3);
 
         const int scale_row = global_row;
@@ -483,15 +499,16 @@ __global__ void quantize_fp4_block_4o6_kernel(
  * @param global_encode_scale Pre-computed global encode scale.
  * @param global_decode_scale Pre-computed global decode scale.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_block_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    float* __restrict__ global_amax,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int scale_cols,
-    float global_encode_scale, float global_decode_scale)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_block_kernel(uint8_t* __restrict__ out_fp4,
+                                          __nv_fp8_e4m3* __restrict__ block_scales,
+                                          float* __restrict__ global_amax,
+                                          const nv_bfloat16* __restrict__ in,
+                                          int M,
+                                          int K,
+                                          int scale_cols,
+                                          float global_encode_scale,
+                                          float global_decode_scale) {
     // Each CUDA block handles one (TILE_SIZE x TILE_SIZE) tile
     const int tile_row = blockIdx.x;
     const int tile_col = blockIdx.y;
@@ -530,7 +547,7 @@ __global__ void quantize_fp4_block_kernel(
         float block_amax = 0.0f;
         float values[FP4_BLOCK_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -546,7 +563,9 @@ __global__ void quantize_fp4_block_kernel(
 
         // Store scale as FP8 E4M3
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
+                                              __nv_fp8_interpretation_t::__NV_E4M3);
 
         // Compute scale position (with swizzling for cuBLAS compatibility)
         const int scale_row = global_row;
@@ -557,7 +576,7 @@ __global__ void quantize_fp4_block_kernel(
         // Phase 3: Quantize and pack FP4 values
         const int out_col_start = block_col_start / FP4_VALUES_PER_BYTE;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
@@ -588,14 +607,14 @@ __global__ void quantize_fp4_block_kernel(
  * Reads the true global amax (computed separately) and computes the global encode/decode
  * scales inside the kernel. This avoids host synchronization and is CUDA-graph capture safe.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_block_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int scale_cols)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_block_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                               __nv_fp8_e4m3* __restrict__ block_scales,
+                                               const float* __restrict__ global_amax_in,
+                                               const nv_bfloat16* __restrict__ in,
+                                               int M,
+                                               int K,
+                                               int scale_cols) {
     // Each CUDA block handles one (TILE_SIZE x TILE_SIZE) tile
     const int tile_row = blockIdx.x;
     const int tile_col = blockIdx.y;
@@ -635,7 +654,7 @@ __global__ void quantize_fp4_block_auto_kernel(
         float block_amax = 0.0f;
         float values[FP4_BLOCK_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -647,7 +666,8 @@ __global__ void quantize_fp4_block_auto_kernel(
         float encode_scale = compute_encode_scale_fp4(decode_scale, global_decode_scale);
 
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
                                               __nv_fp8_interpretation_t::__NV_E4M3);
 
         const int scale_row = global_row;
@@ -658,7 +678,7 @@ __global__ void quantize_fp4_block_auto_kernel(
         // Phase 3: Quantize and pack FP4 values
         const int out_col_start = block_col_start / FP4_VALUES_PER_BYTE;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
@@ -679,14 +699,14 @@ __global__ void quantize_fp4_block_auto_kernel(
  * @param scale_cols Number of columns in scale tensor.
  * @param global_decode_scale Global decode scale.
  */
-template<int TILE_SIZE = 128>
-__global__ void dequantize_fp4_block_kernel(
-    nv_bfloat16* __restrict__ out,
-    const uint8_t* __restrict__ in_fp4,
-    const __nv_fp8_e4m3* __restrict__ block_scales,
-    int M, int K, int scale_cols,
-    float global_decode_scale)
-{
+template <int TILE_SIZE = 128>
+__global__ void dequantize_fp4_block_kernel(nv_bfloat16* __restrict__ out,
+                                            const uint8_t* __restrict__ in_fp4,
+                                            const __nv_fp8_e4m3* __restrict__ block_scales,
+                                            int M,
+                                            int K,
+                                            int scale_cols,
+                                            float global_decode_scale) {
     const long total_elements = (long)M * K;
 
     for (long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += gridDim.x * blockDim.x) {
@@ -724,16 +744,17 @@ __global__ void dequantize_fp4_block_kernel(
  * Uses Philox RNG for stochastic rounding to reduce quantization bias
  * during gradient computation.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_block_stochastic_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    float* __restrict__ global_amax,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int scale_cols,
-    float global_encode_scale, float global_decode_scale,
-    unsigned int seed)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_block_stochastic_kernel(uint8_t* __restrict__ out_fp4,
+                                                     __nv_fp8_e4m3* __restrict__ block_scales,
+                                                     float* __restrict__ global_amax,
+                                                     const nv_bfloat16* __restrict__ in,
+                                                     int M,
+                                                     int K,
+                                                     int scale_cols,
+                                                     float global_encode_scale,
+                                                     float global_decode_scale,
+                                                     unsigned int seed) {
     // Initialize RNG state
     curandStatePhilox4_32_10_t rng_state;
     curand_init(seed, blockIdx.x * blockDim.x + threadIdx.x, 0, &rng_state);
@@ -773,7 +794,7 @@ __global__ void quantize_fp4_block_stochastic_kernel(
         float block_amax = 0.0f;
         float values[FP4_BLOCK_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -787,7 +808,9 @@ __global__ void quantize_fp4_block_stochastic_kernel(
         float encode_scale = compute_encode_scale_fp4(decode_scale, global_decode_scale);
 
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
+                                              __nv_fp8_interpretation_t::__NV_E4M3);
 
         const int scale_row = global_row;
         const int scale_col = (col_start / FP4_BLOCK_SIZE) + block_col;
@@ -797,7 +820,7 @@ __global__ void quantize_fp4_block_stochastic_kernel(
         // Phase 3: Quantize with stochastic rounding
         const int out_col_start = block_col_start / FP4_VALUES_PER_BYTE;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             const float rand0 = curand_uniform(&rng_state);
             const float rand1 = curand_uniform(&rng_state);
@@ -833,15 +856,15 @@ __global__ void quantize_fp4_block_stochastic_kernel(
  * Like quantize_fp4_block_stochastic_kernel, but reads global amax from device memory and
  * computes global encode/decode scales inside the kernel (capture-safe).
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_block_stochastic_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int scale_cols,
-    unsigned int seed)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_block_stochastic_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                                          __nv_fp8_e4m3* __restrict__ block_scales,
+                                                          const float* __restrict__ global_amax_in,
+                                                          const nv_bfloat16* __restrict__ in,
+                                                          int M,
+                                                          int K,
+                                                          int scale_cols,
+                                                          unsigned int seed) {
     curandStatePhilox4_32_10_t rng_state;
     curand_init(seed, blockIdx.x * blockDim.x + threadIdx.x, 0, &rng_state);
 
@@ -882,7 +905,7 @@ __global__ void quantize_fp4_block_stochastic_auto_kernel(
         float block_amax = 0.0f;
         float values[FP4_BLOCK_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -893,7 +916,8 @@ __global__ void quantize_fp4_block_stochastic_auto_kernel(
         float encode_scale = compute_encode_scale_fp4(decode_scale, global_decode_scale);
 
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
                                               __nv_fp8_interpretation_t::__NV_E4M3);
 
         const int scale_row = global_row;
@@ -903,7 +927,7 @@ __global__ void quantize_fp4_block_stochastic_auto_kernel(
 
         const int out_col_start = block_col_start / FP4_VALUES_PER_BYTE;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             const float rand0 = curand_uniform(&rng_state);
             const float rand1 = curand_uniform(&rng_state);
@@ -944,15 +968,17 @@ __global__ void quantize_fp4_block_stochastic_auto_kernel(
  * @param global_encode_scale Pre-computed global encode scale.
  * @param global_decode_scale Pre-computed global decode scale.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_weight_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    float* __restrict__ global_amax,
-    const nv_bfloat16* __restrict__ in,
-    int N, int K, int scale_rows, int scale_cols,
-    float global_encode_scale, float global_decode_scale)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_weight_kernel(uint8_t* __restrict__ out_fp4,
+                                           __nv_fp8_e4m3* __restrict__ block_scales,
+                                           float* __restrict__ global_amax,
+                                           const nv_bfloat16* __restrict__ in,
+                                           int N,
+                                           int K,
+                                           int scale_rows,
+                                           int scale_cols,
+                                           float global_encode_scale,
+                                           float global_decode_scale) {
     // Each CUDA block handles one (TILE_SIZE x TILE_SIZE) tile
     // Tile indices are in terms of the weight matrix (N, K)
     const int tile_row = blockIdx.x;  // Along N dimension
@@ -974,7 +1000,7 @@ __global__ void quantize_fp4_weight_kernel(
     // For weight quantization, we compute scales along the K dimension (columns)
     // Each block of 16 consecutive K values (for a given N) shares one scale
     // Scale layout: (K/16, N) column-major for cuDNN
-    const int num_block_rows = (row_end - row_start);  // N direction
+    const int num_block_rows = (row_end - row_start);                          // N direction
     const int num_block_cols = div_ceil(col_end - col_start, FP4_BLOCK_SIZE);  // K/16 direction
     const int total_blocks = num_block_rows * num_block_cols;
 
@@ -984,7 +1010,7 @@ __global__ void quantize_fp4_weight_kernel(
         const int block_row = block_idx / num_block_cols;  // N index within tile
         const int block_col = block_idx % num_block_cols;  // K/16 index within tile
 
-        const int global_row = row_start + block_row;  // N index
+        const int global_row = row_start + block_row;                        // N index
         const int block_col_start = col_start + block_col * FP4_BLOCK_SIZE;  // K start
         const int block_col_end = min(block_col_start + FP4_BLOCK_SIZE, col_end);
         const int block_width = block_col_end - block_col_start;
@@ -993,7 +1019,7 @@ __global__ void quantize_fp4_weight_kernel(
         float block_amax = 0.0f;
         float values[FP4_BLOCK_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -1009,7 +1035,9 @@ __global__ void quantize_fp4_weight_kernel(
 
         // Store scale as FP8 E4M3
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
+                                              __nv_fp8_interpretation_t::__NV_E4M3);
 
         // Compute scale position for cuDNN's B operand scale tensor.
         // cuDNN expects the B scale tensor to be provided in F8_128x4 reordering. Empirically, treating
@@ -1023,7 +1051,7 @@ __global__ void quantize_fp4_weight_kernel(
         // Phase 3: Quantize and pack FP4 values (same as regular quantization)
         const int out_col_start = block_col_start / FP4_VALUES_PER_BYTE;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
@@ -1054,14 +1082,15 @@ __global__ void quantize_fp4_weight_kernel(
  * Reads the true global amax (computed separately) and computes the global encode/decode
  * scales inside the kernel. Does not write to global_amax_in.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_weight_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int N, int K, int scale_rows, int scale_cols)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_weight_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                                __nv_fp8_e4m3* __restrict__ block_scales,
+                                                const float* __restrict__ global_amax_in,
+                                                const nv_bfloat16* __restrict__ in,
+                                                int N,
+                                                int K,
+                                                int scale_rows,
+                                                int scale_cols) {
     (void)scale_cols;  // Layout size is implied by swizzle; only total allocation matters.
 
     const int tile_row = blockIdx.x;
@@ -1101,7 +1130,7 @@ __global__ void quantize_fp4_weight_auto_kernel(
         float block_amax = 0.0f;
         float values[FP4_BLOCK_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -1112,7 +1141,8 @@ __global__ void quantize_fp4_weight_auto_kernel(
         float encode_scale = compute_encode_scale_fp4(decode_scale, global_decode_scale);
 
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
                                               __nv_fp8_interpretation_t::__NV_E4M3);
 
         const int k_block_idx = (col_start / FP4_BLOCK_SIZE) + block_col;
@@ -1121,7 +1151,7 @@ __global__ void quantize_fp4_weight_auto_kernel(
         block_scales[scale_offset] = scale_fp8;
 
         const int out_col_start = block_col_start / FP4_VALUES_PER_BYTE;
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
@@ -1138,15 +1168,17 @@ __global__ void quantize_fp4_weight_auto_kernel(
  *
  * Scale tensor layout matches cuDNN's B operand expectation: (K/16, N) with F8_128x4 swizzle.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_weight_2d_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    float* __restrict__ global_amax,
-    const nv_bfloat16* __restrict__ in,
-    int N, int K, int scale_rows, int scale_cols,
-    float global_encode_scale, float global_decode_scale)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_weight_2d_kernel(uint8_t* __restrict__ out_fp4,
+                                              __nv_fp8_e4m3* __restrict__ block_scales,
+                                              float* __restrict__ global_amax,
+                                              const nv_bfloat16* __restrict__ in,
+                                              int N,
+                                              int K,
+                                              int scale_rows,
+                                              int scale_cols,
+                                              float global_encode_scale,
+                                              float global_decode_scale) {
     const int tile_row = blockIdx.x;  // along N
     const int tile_col = blockIdx.y;  // along K
 
@@ -1180,7 +1212,7 @@ __global__ void quantize_fp4_weight_2d_kernel(
         float block_amax = 0.0f;
         for (int n = n0; n < n1; ++n) {
             const long row_base = (long)n * K;
-            #pragma unroll
+#pragma unroll
             for (int k = k0; k < k1; ++k) {
                 float v = (float)in[row_base + k];
                 block_amax = fmaxf(block_amax, fabsf(v));
@@ -1193,7 +1225,9 @@ __global__ void quantize_fp4_weight_2d_kernel(
         float encode_scale = compute_encode_scale_fp4(decode_scale, global_decode_scale);
 
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
+                                              __nv_fp8_interpretation_t::__NV_E4M3);
 
         const int k_block_idx = (k0 / FP4_BLOCK_SIZE);  // K/16 index in the full matrix
 
@@ -1239,14 +1273,15 @@ __global__ void quantize_fp4_weight_2d_kernel(
  * Reads the true global amax (computed separately) and computes the global encode/decode
  * scales inside the kernel. Does not write to global_amax_in.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_fp4_weight_2d_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    __nv_fp8_e4m3* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int N, int K, int scale_rows, int scale_cols)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_fp4_weight_2d_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                                   __nv_fp8_e4m3* __restrict__ block_scales,
+                                                   const float* __restrict__ global_amax_in,
+                                                   const nv_bfloat16* __restrict__ in,
+                                                   int N,
+                                                   int K,
+                                                   int scale_rows,
+                                                   int scale_cols) {
     (void)scale_cols;
 
     const int tile_row = blockIdx.x;
@@ -1286,7 +1321,7 @@ __global__ void quantize_fp4_weight_2d_auto_kernel(
         float block_amax = 0.0f;
         for (int n = n0; n < n1; ++n) {
             const long row_base = (long)n * K;
-            #pragma unroll
+#pragma unroll
             for (int k = k0; k < k1; ++k) {
                 float v = (float)in[row_base + k];
                 block_amax = fmaxf(block_amax, fabsf(v));
@@ -1297,7 +1332,8 @@ __global__ void quantize_fp4_weight_2d_auto_kernel(
         float encode_scale = compute_encode_scale_fp4(decode_scale, global_decode_scale);
 
         __nv_fp8_e4m3 scale_fp8;
-        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
+        scale_fp8.__x = __nv_cvt_float_to_fp8(decode_scale,
+                                              __nv_saturation_t::__NV_SATFINITE,
                                               __nv_fp8_interpretation_t::__NV_E4M3);
 
         const int k_block_idx = (k0 / FP4_BLOCK_SIZE);
@@ -1340,17 +1376,16 @@ __global__ void quantize_fp4_weight_2d_auto_kernel(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_fp4_block(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    float global_encode_scale,
-    float global_decode_scale,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_block(uint8_t* out_fp4,
+                        __nv_fp8_e4m3* block_scales,
+                        float* global_amax,
+                        const nv_bfloat16* in,
+                        int M,
+                        int K,
+                        float global_encode_scale,
+                        float global_decode_scale,
+                        const cudaDeviceProp& dp,
+                        cudaStream_t stream) {
     // Calculate scale tensor dimensions
     const int scale_rows = div_ceil(M, FP4_TILE_DIM);
     const int scale_cols = div_ceil(div_ceil(K, FP4_BLOCK_SIZE), 4) * 4;  // Align to 4
@@ -1362,9 +1397,15 @@ void quantize_fp4_block(
     // Initialize global amax
     CUDA_CHECK(cudaMemsetAsync(global_amax, 0, sizeof(float), stream));
 
-    quantize_fp4_block_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, scale_cols,
-        global_encode_scale, global_decode_scale);
+    quantize_fp4_block_kernel<128><<<grid, threads_per_block, 0, stream>>>(out_fp4,
+                                                                           block_scales,
+                                                                           global_amax,
+                                                                           in,
+                                                                           M,
+                                                                           K,
+                                                                           scale_cols,
+                                                                           global_encode_scale,
+                                                                           global_decode_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1386,15 +1427,14 @@ void abs_max(float* scale, const nv_bfloat16* in, long N, const cudaDeviceProp& 
  * which is needed for alpha scaling after matmul. The quantization kernel computes
  * a separate tile-reduced amax internally but does NOT overwrite global_amax.
  */
-void quantize_fp4_block_auto_scale(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_block_auto_scale(uint8_t* out_fp4,
+                                   __nv_fp8_e4m3* block_scales,
+                                   float* global_amax,
+                                   const nv_bfloat16* in,
+                                   int M,
+                                   int K,
+                                   const cudaDeviceProp& dp,
+                                   cudaStream_t stream) {
     // 1) Compute true global amax (needed for alpha scaling post-matmul).
     abs_max(global_amax, in, (long)M * K, dp, stream);
 
@@ -1405,8 +1445,8 @@ void quantize_fp4_block_auto_scale(
     dim3 grid(scale_rows, div_ceil(K, FP4_TILE_DIM));
     constexpr int threads_per_block = 256;
 
-    quantize_fp4_block_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, scale_cols);
+    quantize_fp4_block_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1416,16 +1456,15 @@ void quantize_fp4_block_auto_scale(
  * Uses tensor scale 1536 (= 384 * 4) instead of standard 2688 (= 448 * 6).
  * For dequantization, use global_decode_scale = amax / 1536.
  */
-void quantize_fp4_block_4o6_auto_scale(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    int metric,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_block_4o6_auto_scale(uint8_t* out_fp4,
+                                       __nv_fp8_e4m3* block_scales,
+                                       float* global_amax,
+                                       const nv_bfloat16* in,
+                                       int M,
+                                       int K,
+                                       int metric,
+                                       const cudaDeviceProp& dp,
+                                       cudaStream_t stream) {
     // 1) Compute true global amax
     abs_max(global_amax, in, (long)M * K, dp, stream);
 
@@ -1436,45 +1475,47 @@ void quantize_fp4_block_4o6_auto_scale(
     dim3 grid(scale_rows, div_ceil(K, FP4_TILE_DIM));
     constexpr int threads_per_block = 256;
 
-    quantize_fp4_block_4o6_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, scale_cols, metric);
+    quantize_fp4_block_4o6_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, scale_cols, metric);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Host launcher for FP4 block dequantization.
  */
-void dequantize_fp4_block(
-    nv_bfloat16* out,
-    const uint8_t* in_fp4,
-    const __nv_fp8_e4m3* block_scales,
-    float global_decode_scale,
-    int M, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_fp4_block(nv_bfloat16* out,
+                          const uint8_t* in_fp4,
+                          const __nv_fp8_e4m3* block_scales,
+                          float global_decode_scale,
+                          int M,
+                          int K,
+                          const cudaDeviceProp& dp,
+                          cudaStream_t stream) {
     const int scale_cols = div_ceil(div_ceil(K, FP4_BLOCK_SIZE), 4) * 4;
 
     const int threads_per_block = 256;
-    const int num_blocks = std::max(2 * dp.multiProcessorCount,
-                                     (int)((M * (long)K + threads_per_block - 1) / threads_per_block));
+    const int num_blocks =
+        std::max(2 * dp.multiProcessorCount, (int)((M * (long)K + threads_per_block - 1) / threads_per_block));
 
-    dequantize_fp4_block_kernel<128><<<num_blocks, threads_per_block, 0, stream>>>(
-        out, in_fp4, block_scales, M, K, scale_cols, global_decode_scale);
+    dequantize_fp4_block_kernel<128><<<num_blocks, threads_per_block, 0, stream>>>(out,
+                                                                                   in_fp4,
+                                                                                   block_scales,
+                                                                                   M,
+                                                                                   K,
+                                                                                   scale_cols,
+                                                                                   global_decode_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Kernel: scatter row-major FP8 scales into F8_128x4 swizzled layout.
  */
-__global__ void swizzle_fp8_scales_kernel(
-    __nv_fp8_e4m3* __restrict__ out_swizzled,
-    const __nv_fp8_e4m3* __restrict__ in_rowmajor,
-    int scale_rows, int scale_cols)
-{
+__global__ void swizzle_fp8_scales_kernel(__nv_fp8_e4m3* __restrict__ out_swizzled,
+                                          const __nv_fp8_e4m3* __restrict__ in_rowmajor,
+                                          int scale_rows,
+                                          int scale_cols) {
     const long total = (long)scale_rows * scale_cols;
-    for (long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
-         idx += (long)gridDim.x * blockDim.x) {
+    for (long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (long)gridDim.x * blockDim.x) {
         const int row = idx / scale_cols;
         const int col = idx % scale_cols;
         const size_t swizzled = scale_swizzled_offset(row, col, scale_cols);
@@ -1485,12 +1526,10 @@ __global__ void swizzle_fp8_scales_kernel(
 /**
  * @brief Swizzle FP8 block scales from row-major to F8_128x4 layout (in-place).
  */
-void swizzle_fp8_scales_rowmajor_to_f8_128x4(
-    __nv_fp8_e4m3* scales,
-    int scale_rows,
-    int scale_cols,
-    cudaStream_t stream)
-{
+void swizzle_fp8_scales_rowmajor_to_f8_128x4(__nv_fp8_e4m3* scales,
+                                             int scale_rows,
+                                             int scale_cols,
+                                             cudaStream_t stream) {
     const long total = (long)scale_rows * scale_cols;
     if (total == 0) return;
 
@@ -1517,25 +1556,19 @@ void swizzle_fp8_scales_rowmajor_to_f8_128x4(
  * Used to normalize block scales when merging components with different
  * global scales into a single stacked tensor.
  */
-__global__ void rescale_fp8_kernel(
-    __nv_fp8_e4m3* __restrict__ scales, long count, float factor)
-{
-    for (long idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < count; idx += (long)gridDim.x * blockDim.x) {
-        float val = __half2float(
-            __nv_cvt_fp8_to_halfraw(scales[idx].__x, __nv_fp8_interpretation_t::__NV_E4M3));
+__global__ void rescale_fp8_kernel(__nv_fp8_e4m3* __restrict__ scales, long count, float factor) {
+    for (long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < count; idx += (long)gridDim.x * blockDim.x) {
+        float val = __half2float(__nv_cvt_fp8_to_halfraw(scales[idx].__x, __nv_fp8_interpretation_t::__NV_E4M3));
         val *= factor;
-        scales[idx].__x = __nv_cvt_float_to_fp8(
-            val, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+        scales[idx].__x =
+            __nv_cvt_float_to_fp8(val, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
     }
 }
 
 /**
  * @brief Rescale FP8 E4M3 block scales in-place by a float factor.
  */
-void rescale_fp8_scales(
-    __nv_fp8_e4m3* scales, long count, float factor, cudaStream_t stream)
-{
+void rescale_fp8_scales(__nv_fp8_e4m3* scales, long count, float factor, cudaStream_t stream) {
     if (count == 0 || std::abs(factor - 1.0f) < 1e-7f) return;
 
     const int threads = 256;
@@ -1547,18 +1580,17 @@ void rescale_fp8_scales(
 /**
  * @brief Host launcher for FP4 block quantization with stochastic rounding.
  */
-void quantize_fp4_block_stochastic(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    float global_encode_scale,
-    float global_decode_scale,
-    unsigned int seed,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_block_stochastic(uint8_t* out_fp4,
+                                   __nv_fp8_e4m3* block_scales,
+                                   float* global_amax,
+                                   const nv_bfloat16* in,
+                                   int M,
+                                   int K,
+                                   float global_encode_scale,
+                                   float global_decode_scale,
+                                   unsigned int seed,
+                                   const cudaDeviceProp& dp,
+                                   cudaStream_t stream) {
     const int scale_rows = div_ceil(M, FP4_TILE_DIM);
     const int scale_cols = div_ceil(div_ceil(K, FP4_BLOCK_SIZE), 4) * 4;
 
@@ -1567,22 +1599,28 @@ void quantize_fp4_block_stochastic(
 
     CUDA_CHECK(cudaMemsetAsync(global_amax, 0, sizeof(float), stream));
 
-    quantize_fp4_block_stochastic_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, scale_cols,
-        global_encode_scale, global_decode_scale, seed);
+    quantize_fp4_block_stochastic_kernel<128><<<grid, threads_per_block, 0, stream>>>(out_fp4,
+                                                                                      block_scales,
+                                                                                      global_amax,
+                                                                                      in,
+                                                                                      M,
+                                                                                      K,
+                                                                                      scale_cols,
+                                                                                      global_encode_scale,
+                                                                                      global_decode_scale,
+                                                                                      seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void quantize_fp4_block_stochastic_auto_scale(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    unsigned int seed,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_block_stochastic_auto_scale(uint8_t* out_fp4,
+                                              __nv_fp8_e4m3* block_scales,
+                                              float* global_amax,
+                                              const nv_bfloat16* in,
+                                              int M,
+                                              int K,
+                                              unsigned int seed,
+                                              const cudaDeviceProp& dp,
+                                              cudaStream_t stream) {
     // 1) True global amax for alpha scaling.
     abs_max(global_amax, in, (long)M * K, dp, stream);
 
@@ -1592,8 +1630,8 @@ void quantize_fp4_block_stochastic_auto_scale(
     dim3 grid(scale_rows, div_ceil(K, FP4_TILE_DIM));
     constexpr int threads_per_block = 256;
 
-    quantize_fp4_block_stochastic_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, scale_cols, seed);
+    quantize_fp4_block_stochastic_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, scale_cols, seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1618,17 +1656,16 @@ void quantize_fp4_block_stochastic_auto_scale(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_fp4_weight(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int N, int K,
-    float global_encode_scale,
-    float global_decode_scale,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_weight(uint8_t* out_fp4,
+                         __nv_fp8_e4m3* block_scales,
+                         float* global_amax,
+                         const nv_bfloat16* in,
+                         int N,
+                         int K,
+                         float global_encode_scale,
+                         float global_decode_scale,
+                         const cudaDeviceProp& dp,
+                         cudaStream_t stream) {
     // Scale tensor dimensions: (K/16, N) for cuDNN column-major layout
     // K/16 is the row dimension (along K blocks), N is the column dimension
     const int scale_rows = div_ceil(div_ceil(K, FP4_BLOCK_SIZE), 4) * 4;  // K/16 aligned to 4
@@ -1641,23 +1678,29 @@ void quantize_fp4_weight(
     // Initialize global amax
     CUDA_CHECK(cudaMemsetAsync(global_amax, 0, sizeof(float), stream));
 
-    quantize_fp4_weight_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, N, K, scale_rows, scale_cols,
-        global_encode_scale, global_decode_scale);
+    quantize_fp4_weight_kernel<128><<<grid, threads_per_block, 0, stream>>>(out_fp4,
+                                                                            block_scales,
+                                                                            global_amax,
+                                                                            in,
+                                                                            N,
+                                                                            K,
+                                                                            scale_rows,
+                                                                            scale_cols,
+                                                                            global_encode_scale,
+                                                                            global_decode_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void quantize_fp4_weight_2d(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int N, int K,
-    float global_encode_scale,
-    float global_decode_scale,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_weight_2d(uint8_t* out_fp4,
+                            __nv_fp8_e4m3* block_scales,
+                            float* global_amax,
+                            const nv_bfloat16* in,
+                            int N,
+                            int K,
+                            float global_encode_scale,
+                            float global_decode_scale,
+                            const cudaDeviceProp& dp,
+                            cudaStream_t stream) {
     const int scale_rows = div_ceil(div_ceil(K, FP4_BLOCK_SIZE), 4) * 4;  // K/16 aligned to 4
     const int scale_cols = div_ceil(N, FP4_TILE_DIM) * FP4_TILE_DIM;      // N aligned to 128
 
@@ -1666,9 +1709,16 @@ void quantize_fp4_weight_2d(
 
     CUDA_CHECK(cudaMemsetAsync(global_amax, 0, sizeof(float), stream));
 
-    quantize_fp4_weight_2d_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, N, K, scale_rows, scale_cols,
-        global_encode_scale, global_decode_scale);
+    quantize_fp4_weight_2d_kernel<128><<<grid, threads_per_block, 0, stream>>>(out_fp4,
+                                                                               block_scales,
+                                                                               global_amax,
+                                                                               in,
+                                                                               N,
+                                                                               K,
+                                                                               scale_rows,
+                                                                               scale_cols,
+                                                                               global_encode_scale,
+                                                                               global_decode_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1687,15 +1737,14 @@ void quantize_fp4_weight_2d(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_fp4_weight_auto_scale(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int N, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_weight_auto_scale(uint8_t* out_fp4,
+                                    __nv_fp8_e4m3* block_scales,
+                                    float* global_amax,
+                                    const nv_bfloat16* in,
+                                    int N,
+                                    int K,
+                                    const cudaDeviceProp& dp,
+                                    cudaStream_t stream) {
     // 1) True global amax for alpha scaling.
     abs_max(global_amax, in, (long)N * K, dp, stream);
 
@@ -1706,20 +1755,19 @@ void quantize_fp4_weight_auto_scale(
     dim3 grid(div_ceil(N, FP4_TILE_DIM), div_ceil(K, FP4_TILE_DIM));
     constexpr int threads_per_block = 256;
 
-    quantize_fp4_weight_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, N, K, scale_rows, scale_cols);
+    quantize_fp4_weight_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, N, K, scale_rows, scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void quantize_fp4_weight_2d_auto_scale(
-    uint8_t* out_fp4,
-    __nv_fp8_e4m3* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int N, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_weight_2d_auto_scale(uint8_t* out_fp4,
+                                       __nv_fp8_e4m3* block_scales,
+                                       float* global_amax,
+                                       const nv_bfloat16* in,
+                                       int N,
+                                       int K,
+                                       const cudaDeviceProp& dp,
+                                       cudaStream_t stream) {
     // 1) True global amax for alpha scaling.
     abs_max(global_amax, in, (long)N * K, dp, stream);
 
@@ -1730,8 +1778,8 @@ void quantize_fp4_weight_2d_auto_scale(
     dim3 grid(div_ceil(N, FP4_TILE_DIM), div_ceil(K, FP4_TILE_DIM));
     constexpr int threads_per_block = 256;
 
-    quantize_fp4_weight_2d_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, N, K, scale_rows, scale_cols);
+    quantize_fp4_weight_2d_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, N, K, scale_rows, scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1742,16 +1790,14 @@ void quantize_fp4_weight_2d_auto_scale(
 /**
  * @brief Tensor-based wrapper for FP4 block quantization.
  */
-void quantize_fp4_block(
-    Tensor& out_fp4,
-    Tensor& block_scales,
-    Tensor& global_amax,
-    const Tensor& in,
-    float global_encode_scale,
-    float global_decode_scale,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_fp4_block(Tensor& out_fp4,
+                        Tensor& block_scales,
+                        Tensor& global_amax,
+                        const Tensor& in,
+                        float global_encode_scale,
+                        float global_decode_scale,
+                        const cudaDeviceProp& dp,
+                        cudaStream_t stream) {
     if (in.DType != ETensorDType::BF16) {
         throw std::runtime_error("quantize_fp4_block: input must be BF16");
     }
@@ -1768,27 +1814,27 @@ void quantize_fp4_block(
     const int M = in.Sizes[0];
     const int K = in.Sizes[1];
 
-    quantize_fp4_block(
-        out_fp4.get<uint8_t>(),
-        block_scales.get<__nv_fp8_e4m3>(),
-        global_amax.get<float>(),
-        in.get<nv_bfloat16>(),
-        M, K,
-        global_encode_scale, global_decode_scale,
-        dp, stream);
+    quantize_fp4_block(out_fp4.get<uint8_t>(),
+                       block_scales.get<__nv_fp8_e4m3>(),
+                       global_amax.get<float>(),
+                       in.get<nv_bfloat16>(),
+                       M,
+                       K,
+                       global_encode_scale,
+                       global_decode_scale,
+                       dp,
+                       stream);
 }
 
 /**
  * @brief Tensor-based wrapper for FP4 block dequantization.
  */
-void dequantize_fp4_block(
-    Tensor& out,
-    const Tensor& in_fp4,
-    const Tensor& block_scales,
-    float global_decode_scale,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_fp4_block(Tensor& out,
+                          const Tensor& in_fp4,
+                          const Tensor& block_scales,
+                          float global_decode_scale,
+                          const cudaDeviceProp& dp,
+                          cudaStream_t stream) {
     if (out.DType != ETensorDType::BF16) {
         throw std::runtime_error("dequantize_fp4_block: output must be BF16");
     }
@@ -1802,13 +1848,14 @@ void dequantize_fp4_block(
     const int M = out.Sizes[0];
     const int K = out.Sizes[1];
 
-    dequantize_fp4_block(
-        out.get<nv_bfloat16>(),
-        in_fp4.get<uint8_t>(),
-        block_scales.get<__nv_fp8_e4m3>(),
-        global_decode_scale,
-        M, K,
-        dp, stream);
+    dequantize_fp4_block(out.get<nv_bfloat16>(),
+                         in_fp4.get<uint8_t>(),
+                         block_scales.get<__nv_fp8_e4m3>(),
+                         global_decode_scale,
+                         M,
+                         K,
+                         dp,
+                         stream);
 }
 
 // ============================================================================
@@ -1828,13 +1875,11 @@ void dequantize_fp4_block(
  *
  * @tparam T Output tensor element type (nv_bfloat16 or float)
  */
-template<typename T>
-__global__ void fp4_alpha_scale_kernel(
-    T* __restrict__ out,
-    const float* __restrict__ global_amax_a,
-    const float* __restrict__ global_amax_b,
-    long N)
-{
+template <typename T>
+__global__ void fp4_alpha_scale_kernel(T* __restrict__ out,
+                                       const float* __restrict__ global_amax_a,
+                                       const float* __restrict__ global_amax_b,
+                                       long N) {
     // FP4_MAX = 6.0, FP8_E4M3_MAX = 448.0
     // factor = 6.0 * 6.0 * 448.0 * 448.0 = 7,225,344.0
     constexpr float factor = 6.0f * 6.0f * 448.0f * 448.0f;
@@ -1869,69 +1914,50 @@ __global__ void fp4_alpha_scale_kernel(
  * @param dp CUDA device properties
  * @param stream CUDA stream
  */
-void fp4_alpha_scale(
-    nv_bfloat16* out,
-    const float* global_amax_a,
-    const float* global_amax_b,
-    long N,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void fp4_alpha_scale(nv_bfloat16* out,
+                     const float* global_amax_a,
+                     const float* global_amax_b,
+                     long N,
+                     const cudaDeviceProp& dp,
+                     cudaStream_t stream) {
     const int threads_per_block = 256;
-    const int num_blocks = std::min(
-        (int)((N + threads_per_block - 1) / threads_per_block),
-        2 * dp.multiProcessorCount);
+    const int num_blocks = std::min((int)((N + threads_per_block - 1) / threads_per_block), 2 * dp.multiProcessorCount);
 
-    fp4_alpha_scale_kernel<nv_bfloat16><<<num_blocks, threads_per_block, 0, stream>>>(
-        out, global_amax_a, global_amax_b, N);
+    fp4_alpha_scale_kernel<nv_bfloat16>
+        <<<num_blocks, threads_per_block, 0, stream>>>(out, global_amax_a, global_amax_b, N);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Host launcher for FP4 alpha scaling (FP32 version).
  */
-void fp4_alpha_scale(
-    float* out,
-    const float* global_amax_a,
-    const float* global_amax_b,
-    long N,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void fp4_alpha_scale(float* out,
+                     const float* global_amax_a,
+                     const float* global_amax_b,
+                     long N,
+                     const cudaDeviceProp& dp,
+                     cudaStream_t stream) {
     const int threads_per_block = 256;
-    const int num_blocks = std::min(
-        (int)((N + threads_per_block - 1) / threads_per_block),
-        2 * dp.multiProcessorCount);
+    const int num_blocks = std::min((int)((N + threads_per_block - 1) / threads_per_block), 2 * dp.multiProcessorCount);
 
-    fp4_alpha_scale_kernel<float><<<num_blocks, threads_per_block, 0, stream>>>(
-        out, global_amax_a, global_amax_b, N);
+    fp4_alpha_scale_kernel<float><<<num_blocks, threads_per_block, 0, stream>>>(out, global_amax_a, global_amax_b, N);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Tensor-based wrapper for FP4 alpha scaling.
  */
-void fp4_alpha_scale(
-    Tensor& out,
-    const Tensor& global_amax_a,
-    const Tensor& global_amax_b,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void fp4_alpha_scale(Tensor& out,
+                     const Tensor& global_amax_a,
+                     const Tensor& global_amax_b,
+                     const cudaDeviceProp& dp,
+                     cudaStream_t stream) {
     long N = (long)out.nelem();
 
     if (out.DType == ETensorDType::BF16) {
-        fp4_alpha_scale(
-            out.get<nv_bfloat16>(),
-            global_amax_a.get<float>(),
-            global_amax_b.get<float>(),
-            N, dp, stream);
+        fp4_alpha_scale(out.get<nv_bfloat16>(), global_amax_a.get<float>(), global_amax_b.get<float>(), N, dp, stream);
     } else if (out.DType == ETensorDType::FP32) {
-        fp4_alpha_scale(
-            out.get<float>(),
-            global_amax_a.get<float>(),
-            global_amax_b.get<float>(),
-            N, dp, stream);
+        fp4_alpha_scale(out.get<float>(), global_amax_a.get<float>(), global_amax_b.get<float>(), N, dp, stream);
     } else {
         throw std::runtime_error("fp4_alpha_scale: unsupported output dtype (must be BF16 or FP32)");
     }
@@ -1958,13 +1984,11 @@ void fp4_alpha_scale(
  * @param[in] global_amax_b Global amax of tensor B (device pointer)
  * @param N Number of elements
  */
-__global__ void fp4_alpha_scale_convert_kernel(
-    nv_bfloat16* __restrict__ out_bf16,
-    const float* __restrict__ in_f32,
-    const float* __restrict__ global_amax_a,
-    const float* __restrict__ global_amax_b,
-    long N)
-{
+__global__ void fp4_alpha_scale_convert_kernel(nv_bfloat16* __restrict__ out_bf16,
+                                               const float* __restrict__ in_f32,
+                                               const float* __restrict__ global_amax_a,
+                                               const float* __restrict__ global_amax_b,
+                                               long N) {
     constexpr float factor = 6.0f * 6.0f * 448.0f * 448.0f;
 
     __shared__ float s_alpha;
@@ -2018,23 +2042,23 @@ __global__ void fp4_alpha_scale_convert_kernel(
  * @param dp CUDA device properties
  * @param stream CUDA stream
  */
-void fp4_alpha_scale_convert(
-    nv_bfloat16* out_bf16,
-    const float* in_f32,
-    const float* global_amax_a,
-    const float* global_amax_b,
-    long N,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void fp4_alpha_scale_convert(nv_bfloat16* out_bf16,
+                             const float* in_f32,
+                             const float* global_amax_a,
+                             const float* global_amax_b,
+                             long N,
+                             const cudaDeviceProp& dp,
+                             cudaStream_t stream) {
     const int threads_per_block = 256;
     // Use more blocks on datacenter GPUs for better occupancy
-    const int num_blocks = std::min(
-        (int)((N / 4 + threads_per_block - 1) / threads_per_block),
-        4 * dp.multiProcessorCount);
+    const int num_blocks =
+        std::min((int)((N / 4 + threads_per_block - 1) / threads_per_block), 4 * dp.multiProcessorCount);
 
-    fp4_alpha_scale_convert_kernel<<<num_blocks, threads_per_block, 0, stream>>>(
-        out_bf16, in_f32, global_amax_a, global_amax_b, N);
+    fp4_alpha_scale_convert_kernel<<<num_blocks, threads_per_block, 0, stream>>>(out_bf16,
+                                                                                 in_f32,
+                                                                                 global_amax_a,
+                                                                                 global_amax_b,
+                                                                                 N);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2044,11 +2068,9 @@ void fp4_alpha_scale_convert(
  * Computes alpha = (global_amax_a * global_amax_b) / (FP4_MAX^2 * FP8_MAX^2)
  * and stores it to a device buffer for use with CUTLASS epilogue fusion.
  */
-__global__ void compute_fp4_alpha_kernel(
-    float* __restrict__ alpha_out,
-    const float* __restrict__ global_amax_a,
-    const float* __restrict__ global_amax_b)
-{
+__global__ void compute_fp4_alpha_kernel(float* __restrict__ alpha_out,
+                                         const float* __restrict__ global_amax_a,
+                                         const float* __restrict__ global_amax_b) {
     // FP4_MAX = 6.0, FP8_E4M3_MAX = 448.0
     // factor = 6.0 * 6.0 * 448.0 * 448.0 = 7,225,344.0
     constexpr float factor = 6.0f * 6.0f * 448.0f * 448.0f;
@@ -2069,14 +2091,8 @@ __global__ void compute_fp4_alpha_kernel(
  * @param global_amax_b Global amax of tensor B (device pointer)
  * @param stream CUDA stream
  */
-void compute_fp4_alpha(
-    float* alpha_out,
-    const float* global_amax_a,
-    const float* global_amax_b,
-    cudaStream_t stream)
-{
-    compute_fp4_alpha_kernel<<<1, 1, 0, stream>>>(
-        alpha_out, global_amax_a, global_amax_b);
+void compute_fp4_alpha(float* alpha_out, const float* global_amax_a, const float* global_amax_b, cudaStream_t stream) {
+    compute_fp4_alpha_kernel<<<1, 1, 0, stream>>>(alpha_out, global_amax_a, global_amax_b);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2086,11 +2102,9 @@ void compute_fp4_alpha(
  * For 4/6 quantization, the tensor scale factor is 1536 instead of 2688:
  * alpha = (global_amax_a * global_amax_b) / (1536 * 1536)
  */
-__global__ void compute_fp4_alpha_4o6_kernel(
-    float* __restrict__ alpha_out,
-    const float* __restrict__ global_amax_a,
-    const float* __restrict__ global_amax_b)
-{
+__global__ void compute_fp4_alpha_4o6_kernel(float* __restrict__ alpha_out,
+                                             const float* __restrict__ global_amax_a,
+                                             const float* __restrict__ global_amax_b) {
     // 4/6 tensor scale factor = 384 * 4 = 1536
     // factor = 1536^2 = 2,359,296
     constexpr float factor = 1536.0f * 1536.0f;
@@ -2106,14 +2120,11 @@ __global__ void compute_fp4_alpha_4o6_kernel(
  * For 4/6 quantization, the tensor scale is 1536 instead of 2688.
  * alpha = (global_amax_a * global_amax_b) / (1536^2)
  */
-void compute_fp4_alpha_4o6(
-    float* alpha_out,
-    const float* global_amax_a,
-    const float* global_amax_b,
-    cudaStream_t stream)
-{
-    compute_fp4_alpha_4o6_kernel<<<1, 1, 0, stream>>>(
-        alpha_out, global_amax_a, global_amax_b);
+void compute_fp4_alpha_4o6(float* alpha_out,
+                           const float* global_amax_a,
+                           const float* global_amax_b,
+                           cudaStream_t stream) {
+    compute_fp4_alpha_4o6_kernel<<<1, 1, 0, stream>>>(alpha_out, global_amax_a, global_amax_b);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2121,44 +2132,34 @@ void compute_fp4_alpha_4o6(
 // Quartet-II style tensor-scale helpers
 // ============================================================================
 
-__global__ void compute_fp4_tensor_scale_kernel(
-    float* __restrict__ tensor_scale_out,
-    const float* __restrict__ global_amax,
-    float fp4_max,
-    float fp8_max)
-{
+__global__ void compute_fp4_tensor_scale_kernel(float* __restrict__ tensor_scale_out,
+                                                const float* __restrict__ global_amax,
+                                                float fp4_max,
+                                                float fp8_max) {
     const float denom = fp4_max * fp8_max;
     const float amax = *global_amax;
     *tensor_scale_out = (denom != 0.0f) ? (amax / denom) : 0.0f;
 }
 
-void compute_fp4_tensor_scale(
-    float* tensor_scale_out,
-    const float* global_amax,
-    float fp4_max,
-    float fp8_max,
-    cudaStream_t stream)
-{
-    compute_fp4_tensor_scale_kernel<<<1, 1, 0, stream>>>(
-        tensor_scale_out, global_amax, fp4_max, fp8_max);
+void compute_fp4_tensor_scale(float* tensor_scale_out,
+                              const float* global_amax,
+                              float fp4_max,
+                              float fp8_max,
+                              cudaStream_t stream) {
+    compute_fp4_tensor_scale_kernel<<<1, 1, 0, stream>>>(tensor_scale_out, global_amax, fp4_max, fp8_max);
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void compute_fp4_alpha_from_tensor_scale_kernel(
-    float* __restrict__ alpha_out,
-    const float* __restrict__ tensor_scale_a,
-    const float* __restrict__ tensor_scale_b)
-{
+__global__ void compute_fp4_alpha_from_tensor_scale_kernel(float* __restrict__ alpha_out,
+                                                           const float* __restrict__ tensor_scale_a,
+                                                           const float* __restrict__ tensor_scale_b) {
     *alpha_out = (*tensor_scale_a) * (*tensor_scale_b);
 }
 
-void compute_fp4_alpha_from_tensor_scale(
-    float* alpha_out,
-    const float* tensor_scale_a,
-    const float* tensor_scale_b,
-    cudaStream_t stream)
-{
-    compute_fp4_alpha_from_tensor_scale_kernel<<<1, 1, 0, stream>>>(
-        alpha_out, tensor_scale_a, tensor_scale_b);
+void compute_fp4_alpha_from_tensor_scale(float* alpha_out,
+                                         const float* tensor_scale_a,
+                                         const float* tensor_scale_b,
+                                         cudaStream_t stream) {
+    compute_fp4_alpha_from_tensor_scale_kernel<<<1, 1, 0, stream>>>(alpha_out, tensor_scale_a, tensor_scale_b);
     CUDA_CHECK(cudaGetLastError());
 }

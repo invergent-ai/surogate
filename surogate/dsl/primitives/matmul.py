@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
 from ..decorators import primitive, save
+from ..tensor_type import Tensor
 from .common import TransposeMode
 
 
 @primitive(impl="kernels.matmul")
 def matmul(
-    A: Tensor["M", "K"],
-    B: Tensor["K", "N"],
+    A: Tensor[M, K],
+    B: Tensor[K, N],
     *,
     transpose: TransposeMode = TransposeMode.NN,
     accumulate: bool = False,
     alpha: float = 1.0,
     beta: float = 0.0,
-) -> Tensor["M", "N"]:
+) -> Tensor[M, N]:
     """General matrix multiplication: C = alpha * op(A) @ op(B) + beta * C
 
     Transpose modes:
@@ -31,32 +31,32 @@ def matmul(
 @matmul.backward
 @save("A", "B")
 def matmul_backward(
-    d_C: Tensor["M", "N"],
-    A: Tensor["M", "K"],
-    B: Tensor["K", "N"],
-) -> tuple[Tensor["M", "K"], Tensor["K", "N"]]:
+    d_C: Tensor[M, N],
+    A: Tensor[M, K],
+    B: Tensor[K, N],
+) -> tuple[Tensor[M, K], Tensor[K, N]]:
     """Backward pass for matmul."""
     ...
 
 
 @primitive(impl="kernels.batched_matmul")
 def batched_matmul(
-    A: Tensor["B", "M", "K"],
-    B: Tensor["B", "K", "N"],
+    A: Tensor[B, M, K],
+    B: Tensor[B, K, N],
     *,
     transpose: TransposeMode = TransposeMode.NN,
-) -> Tensor["B", "M", "N"]:
+) -> Tensor[B, M, N]:
     """Batched matrix multiplication."""
     ...
 
 
 @primitive(impl="kernels.matmul_swiglu")
 def matmul_swiglu(
-    A: Tensor["*", "K"],
-    B: Tensor["2*M", "K"],
+    A: Tensor["*", K],
+    B: Tensor[2 * M, K],
     *,
     transpose: TransposeMode = TransposeMode.NT,
-) -> Tensor["*", "M"]:
+) -> Tensor["*", M]:
     """Fused matmul + SwiGLU activation.
 
     Computes: swiglu(A @ B^T) where B contains fused [up, gate] weights.
@@ -73,11 +73,11 @@ def matmul_swiglu(
 @matmul_swiglu.backward
 @save("A", "B")
 def matmul_swiglu_backward(
-    d_out: Tensor["*", "M"],
-    A: Tensor["*", "K"],
-    B: Tensor["2*M", "K"],
-    up_output: Tensor["*", "2*M"],
-) -> tuple[Tensor["*", "K"], Tensor["2*M", "K"]]:
+    d_out: Tensor["*", M],
+    A: Tensor["*", K],
+    B: Tensor[2 * M, K],
+    up_output: Tensor["*", 2 * M],
+) -> tuple[Tensor["*", K], Tensor[2 * M, K]]:
     """Backward pass for fused matmul + swiglu.
 
     Note: up_output is the intermediate matmul result needed for swiglu backward.

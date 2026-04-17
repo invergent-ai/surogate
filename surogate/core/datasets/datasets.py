@@ -1,17 +1,27 @@
 import os
 from contextlib import contextmanager
-from typing import List
 
-from datasets import Dataset, IterableDataset, DatasetDict, IterableDatasetDict, interleave_datasets, disable_caching, \
-    enable_caching
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    disable_caching,
+    enable_caching,
+    interleave_datasets,
+)
 
-from surogate.core.config.dataset_config import DatasetConfig, ConversationDatasetConfig, InstructionDatasetConfig, \
-    TextDatasetConfig
+from surogate.core.config.dataset_config import (
+    ConversationDatasetConfig,
+    DatasetConfig,
+    InstructionDatasetConfig,
+    TextDatasetConfig,
+)
 from surogate.core.config.enums import SurogateDatasetType
-from surogate.core.datasets.preprocessor.conversation import ConversationPreprocessor
-from surogate.core.datasets.preprocessor.instruction import InstructionPreprocessor
 from surogate.core.datasets.loader import load_dataset_with_config
 from surogate.core.datasets.lock import FileLockLoader
+from surogate.core.datasets.preprocessor.conversation import ConversationPreprocessor
+from surogate.core.datasets.preprocessor.instruction import InstructionPreprocessor
 from surogate.core.datasets.preprocessor.text import TextPreprocessor
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -19,7 +29,7 @@ from surogate.utils.logger import get_logger
 logger = get_logger()
 
 
-def load_datasets(cfg: List[DatasetConfig], args: DictDefault, temp_path: str, seed: int) -> Dataset | IterableDataset:
+def load_datasets(cfg: list[DatasetConfig], args: DictDefault, temp_path: str, seed: int) -> Dataset | IterableDataset:
     # Prepare datasets (with file locking logic for multiple ranks)
     loader = FileLockLoader(temp_path)
     try:
@@ -32,7 +42,7 @@ def load_datasets(cfg: List[DatasetConfig], args: DictDefault, temp_path: str, s
     return dataset
 
 
-def _load_and_prepare_datasets(cfg: List[DatasetConfig], args: DictDefault, seed: int) -> Dataset | IterableDataset:
+def _load_and_prepare_datasets(cfg: list[DatasetConfig], args: DictDefault, seed: int) -> Dataset | IterableDataset:
     datasets = []
     for dataset_config in cfg:
         dataset_wrapper = _load_and_prepare_single_dataset(args, dataset_config)
@@ -51,8 +61,7 @@ def _load_and_prepare_single_dataset(args: DictDefault, ds_cfg: DatasetConfig) -
             dataset = dataset[ds_cfg.split]
         else:
             raise ValueError(
-                f"no {ds_cfg.split} split found for dataset {ds_cfg.path}, you may "
-                "specify a split with 'split: ...'"
+                f"no {ds_cfg.split} split found for dataset {ds_cfg.path}, you may specify a split with 'split: ...'"
             )
 
     if ds_cfg.samples:
@@ -66,16 +75,15 @@ def wrap_dataset(ds_cfg: DatasetConfig, dataset: Dataset | IterableDataset) -> D
     ds_cfg.validate_columns(ds_columns)
 
     if ds_cfg.type == SurogateDatasetType.conversation:
-        ds_cfg = ds_cfg if isinstance(ds_cfg, ConversationDatasetConfig) else ConversationDatasetConfig(
-            **ds_cfg.__dict__)
+        ds_cfg = (
+            ds_cfg if isinstance(ds_cfg, ConversationDatasetConfig) else ConversationDatasetConfig(**ds_cfg.__dict__)
+        )
         processor = ConversationPreprocessor(ds_cfg)
     elif ds_cfg.type == SurogateDatasetType.instruction:
-        ds_cfg = ds_cfg if isinstance(ds_cfg, InstructionDatasetConfig) else InstructionDatasetConfig(
-            **ds_cfg.__dict__)
+        ds_cfg = ds_cfg if isinstance(ds_cfg, InstructionDatasetConfig) else InstructionDatasetConfig(**ds_cfg.__dict__)
         processor = InstructionPreprocessor(ds_cfg)
     elif ds_cfg.type == SurogateDatasetType.text:
-        ds_cfg = ds_cfg if isinstance(ds_cfg, TextDatasetConfig) else TextDatasetConfig(
-            **ds_cfg.__dict__)
+        ds_cfg = ds_cfg if isinstance(ds_cfg, TextDatasetConfig) else TextDatasetConfig(**ds_cfg.__dict__)
         processor = TextPreprocessor(ds_cfg)
     else:
         raise ValueError(f"Unsupported dataset type: {ds_cfg.type}")

@@ -20,11 +20,11 @@ namespace qlora {
 
 /// Quantization format identifier.
 enum class QuantFormat : int {
-    NONE = 0,     // Not quantized (full precision)
-    BNB_NF4,      // bitsandbytes NF4 with optional double quantization
-    FP8_PER_BLOCK,// Per-block FP8 E4M3 with block scales
-    FP4_BLOCK_2D, // Two-level block scaling FP4 E2M1 (Blackwell)
-    HF_MXFP4,    // HF pre-quantized MXFP4: packed FP4 + E8M0 shared exponents per 32 elements
+    NONE = 0,       // Not quantized (full precision)
+    BNB_NF4,        // bitsandbytes NF4 with optional double quantization
+    FP8_PER_BLOCK,  // Per-block FP8 E4M3 with block scales
+    FP4_BLOCK_2D,   // Two-level block scaling FP4 E2M1 (Blackwell)
+    HF_MXFP4,       // HF pre-quantized MXFP4: packed FP4 + E8M0 shared exponents per 32 elements
 };
 
 /// Storage for a single quantized tensor.
@@ -80,7 +80,9 @@ struct QuantizedTensor {
     float global_scale = 1.0f;
 
     /// Number of elements in the original (unquantized) tensor.
-    [[nodiscard]] long nelem() const { return static_cast<long>(M) * K; }
+    [[nodiscard]] long nelem() const {
+        return static_cast<long>(M) * K;
+    }
 
     /// Number of quantization blocks.
     [[nodiscard]] long num_blocks() const {
@@ -97,20 +99,24 @@ struct QuantizedTensor {
     }
 
     /// Whether this tensor has been quantized.
-    [[nodiscard]] bool is_quantized() const { return format != QuantFormat::NONE; }
+    [[nodiscard]] bool is_quantized() const {
+        return format != QuantFormat::NONE;
+    }
 
     /// Whether this tensor's buffers are on the host (CPU).
-    [[nodiscard]] bool is_on_host() const { return !data.is_null() && data.Device < 0; }
+    [[nodiscard]] bool is_on_host() const {
+        return !data.is_null() && data.Device < 0;
+    }
 };
 
 /// Metadata about a weight parameter from the DSL IR.
 struct WeightParamInfo {
-    std::string name;        // Internal parameter name (e.g., "blocks[0].qkv_weight")
-    int M = 0;               // Rows
-    int K = 0;               // Cols
-    bool quantizable = true; // Whether this weight can be quantized
-    int offload_group = -1;  // -1 = no offloading, >= 0 = group ID
-    int layer_idx = -1;      // Layer index for block parameters (-1 for global)
+    std::string name;         // Internal parameter name (e.g., "blocks[0].qkv_weight")
+    int M = 0;                // Rows
+    int K = 0;                // Cols
+    bool quantizable = true;  // Whether this weight can be quantized
+    int offload_group = -1;   // -1 = no offloading, >= 0 = group ID
+    int layer_idx = -1;       // Layer index for block parameters (-1 for global)
 };
 
 }  // namespace qlora

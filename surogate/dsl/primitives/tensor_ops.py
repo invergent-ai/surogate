@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
 from ..decorators import primitive
+from ..tensor_type import Tensor
 
 
 @primitive(impl="kernels.view")
@@ -14,17 +14,17 @@ def view(x: Tensor["*"], *, shape: list[int | str]) -> Tensor["*"]:
 
 @primitive(impl="kernels.transpose")
 def transpose(
-    x: Tensor["D0", "D1"],
+    x: Tensor[D0, D1],
     *,
     dim0: int = 0,
     dim1: int = 1,
-) -> Tensor["D1", "D0"]:
+) -> Tensor[D1, D0]:
     """Transpose two dimensions."""
     ...
 
 
 @transpose.backward
-def transpose_backward(d_out: Tensor["D1", "D0"]) -> Tensor["D0", "D1"]:
+def transpose_backward(d_out: Tensor[D1, D0]) -> Tensor[D0, D1]:
     """Backward pass for transpose (just transpose back)."""
     ...
 
@@ -48,7 +48,7 @@ def split(
 
 @primitive(impl="kernels.repeat_interleave_heads")
 def repeat_interleave_heads(
-    x: Tensor["B", "T", "H", "D"],
+    x: Tensor[B, T, H, D],
     *,
     repeats: int,
 ) -> Tensor["*"]:

@@ -32,8 +32,14 @@ void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cuda
 void reduce_loss(DslRunState& rs, long B, long T, NCCLCommunicator& comm);
 
 // LoRA RMSNorm recomputation
-Tensor recompute_lora_rmsnorm(::modules::LoRARunState& lora_rs, const Tensor& residual, const Tensor& weight,
-                              float eps, int B, int T, int C, cudaStream_t stream);
+Tensor recompute_lora_rmsnorm(::modules::LoRARunState& lora_rs,
+                              const Tensor& residual,
+                              const Tensor& weight,
+                              float eps,
+                              int B,
+                              int T,
+                              int C,
+                              cudaStream_t stream);
 
 }  // namespace dsl
 

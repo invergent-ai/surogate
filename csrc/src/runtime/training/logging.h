@@ -33,11 +33,10 @@ struct MemoryBreakdownContext {
     int seq_length = 0;
     std::size_t qlora_quantized_bytes = 0;  ///< QLoRA quantized weight bytes (0 if not QLoRA)
     float qlora_savings_ratio = 0.0f;       ///< QLoRA memory savings ratio (0 if not QLoRA)
-    bool enabled = false;                    ///< Whether to print detailed breakdown
+    bool enabled = false;                   ///< Whether to print detailed breakdown
 };
 
-class TrainingRunLogger
-{
+class TrainingRunLogger {
 public:
     enum EVerbosity {
         SILENT = -2,
@@ -54,24 +53,30 @@ public:
     void set_training_tokens(long total_tokens);
 
     void log_cmd(int argc, const char** argv);
-    void log_options(const std::vector<std::pair<std::string_view, std::variant<bool, std::int64_t, float, std::string>>>& options);
+    void log_options(
+        const std::vector<std::pair<std::string_view, std::variant<bool, std::int64_t, float, std::string>>>& options);
     void log_gpu_model(NCCLCommunicator& comm);
     void log_dataset(const DataLoader& train_loader, const DataLoader& eval_loader);
     void log_step(int step, float epoch, int step_tokens, int duration_ms, float norm, float loss, float lr);
-    void log_step(int step, float epoch, int step_tokens, int duration_ms, float norm, float loss, float lr,
-                  float moe_aux_loss, float moe_z_loss, float moe_load_imbalance, float moe_expert_utilization);
+    void log_step(int step,
+                  float epoch,
+                  int step_tokens,
+                  int duration_ms,
+                  float norm,
+                  float loss,
+                  float lr,
+                  float moe_aux_loss,
+                  float moe_z_loss,
+                  float moe_load_imbalance,
+                  float moe_expert_utilization);
     void log_eval(int step, float epoch, int eval_tokens, int duration_ms, float loss);
     void log_moe_stats(int step, float aux_loss, float z_loss, float expert_utilization, float load_imbalance);
     void log_gpu_state(int step, int gpu_id, const GPUUtilInfo& gpu_util);
-    void log_allocator(
-        const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
-        const std::vector<std::pair<std::string, long>>& stack_info
-        );
-    void log_allocator(
-        const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
-        const std::vector<std::pair<std::string, long>>& stack_info,
-        const MemoryBreakdownContext& breakdown_ctx
-        );
+    void log_allocator(const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
+                       const std::vector<std::pair<std::string, long>>& stack_info);
+    void log_allocator(const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
+                       const std::vector<std::pair<std::string, long>>& stack_info,
+                       const MemoryBreakdownContext& breakdown_ctx);
     void log_abs_maxes(int step, const std::vector<std::pair<std::string, float>>& abs_maxes);
 
     // call at the beginning and end of a section of processing.
@@ -79,11 +84,13 @@ public:
     class RAII_Section {
     public:
         ~RAII_Section() noexcept {
-            if(mLogger)
-                mLogger->log_section_end();
+            if (mLogger) mLogger->log_section_end();
         };
+
     private:
-        RAII_Section(TrainingRunLogger* l) : mLogger(l) {}
+        RAII_Section(TrainingRunLogger* l)
+            : mLogger(l) {
+        }
         RAII_Section(RAII_Section&&) = default;
         TrainingRunLogger* mLogger;
 
@@ -94,6 +101,7 @@ public:
     void log_message(int step, const std::string& msg);
     RAII_Section log_section_start(int step, const std::string& info);
     void log_section_end();
+
 private:
     void log_line(std::string_view line);
     std::string mFileName;
@@ -132,4 +140,4 @@ private:
     std::chrono::steady_clock::time_point mSectionStart;
 };
 
-#endif //SUROGATE_TRAINING_LOGGING_H
+#endif  //SUROGATE_TRAINING_LOGGING_H

@@ -34,7 +34,7 @@ class ModularLoRAGradsManager;
 struct LoRARunState;
 struct MatmulContext;
 enum class MatmulOp;
-}
+}  // namespace modules
 namespace dsl {
 class DslRunState;
 class DslParamStore;
@@ -45,7 +45,7 @@ class CompiledExecutor;
 struct CompiledGraph;
 struct FP8WeightCacheEntry;
 struct FP4WeightCacheEntry;
-}
+}  // namespace dsl
 
 namespace dsl {
 
@@ -66,24 +66,37 @@ public:
     virtual ~IGraphExecutor() = default;
 
     virtual void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) = 0;
-    virtual float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) = 0;
-    virtual void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
+    virtual float
+    validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) = 0;
+    virtual void
+    backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
 
     // Hook-enabled forward/backward methods (matching ModularModel interface)
-    virtual void forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
+    virtual void forward_with_hook(Tensor inputs,
+                                   Tensor position_ids,
+                                   NCCLCommunicator& comm,
+                                   int micro_step,
                                    const modules::ForwardHook& hook) {
         // Default: forward without hooks
         forward(inputs, position_ids, comm, micro_step);
     }
 
-    virtual float validate_with_hook(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm,
-                                     int micro_step, const modules::ForwardHook& hook) {
+    virtual float validate_with_hook(Tensor inputs,
+                                     Tensor position_ids,
+                                     Tensor targets,
+                                     NCCLCommunicator& comm,
+                                     int micro_step,
+                                     const modules::ForwardHook& hook) {
         // Default: validate without hooks
         return validate(inputs, position_ids, targets, comm, micro_step);
     }
 
-    virtual void backward_with_hook(Tensor inputs, Tensor targets, NCCLCommunicator& comm,
-                                    int grad_accum_steps, int micro_step, const modules::BackwardHook& hook) {
+    virtual void backward_with_hook(Tensor inputs,
+                                    Tensor targets,
+                                    NCCLCommunicator& comm,
+                                    int grad_accum_steps,
+                                    int micro_step,
+                                    const modules::BackwardHook& hook) {
         // Default: backward without hooks
         backward(inputs, targets, comm, grad_accum_steps, micro_step);
     }
@@ -99,27 +112,40 @@ public:
     virtual void set_rng_state(const std::vector<std::byte>& state) = 0;
 
     // Control internal CUDA graph usage (forward/backward graphs inside DSL executor).
-    virtual void set_internal_graphs_enabled(bool enabled) { (void)enabled; }
-    virtual bool internal_graphs_enabled() const { return false; }
+    virtual void set_internal_graphs_enabled(bool enabled) {
+        (void)enabled;
+    }
+    virtual bool internal_graphs_enabled() const {
+        return false;
+    }
 
     /// Whether the compiled graph contains ops that are not CUDA-graph-capture-safe
     /// (e.g. JIT Triton kernels in ChunkGatedDeltaRule / Qwen3_5Decay).
     /// When true, full-step graph capture must be skipped.
-    virtual bool has_capture_unsafe_ops() const { return false; }
+    virtual bool has_capture_unsafe_ops() const {
+        return false;
+    }
 
     // Optional LoRA state wiring (no-op for implementations that don't support it).
     virtual void set_lora_state(const modules::ModularLoRAConfig*,
                                 modules::ModularLoRAWeightsManager*,
                                 modules::ModularLoRAGradsManager*,
-                                modules::LoRARunState*) {}
+                                modules::LoRARunState*) {
+    }
 
     // Set optional hook context (opaque pointer passed to hooks)
-    virtual void set_hook_context(void* context) { (void)context; }
+    virtual void set_hook_context(void* context) {
+        (void)context;
+    }
 
     /// Total bytes of untracked persistent saved buffers (raw cudaMalloc).
-    virtual size_t saved_buffers_total_bytes() const { return 0; }
+    virtual size_t saved_buffers_total_bytes() const {
+        return 0;
+    }
     /// Number of persistent saved buffers.
-    virtual int saved_buffers_count() const { return 0; }
+    virtual int saved_buffers_count() const {
+        return 0;
+    }
     /// Per-buffer sizes for diagnostics.
     virtual const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const {
         static const std::unordered_map<std::string, size_t> empty;
@@ -127,9 +153,11 @@ public:
     }
 
     /// Document masking for packed sequences (Flash Attention varlen).
-    virtual void set_doc_masking(const std::int32_t* /*cu_seqlens_cpu*/, int /*num_docs*/,
-                                 int /*max_seqlen*/, int /*total_q*/) {}
-    virtual void clear_doc_masking() {}
+    virtual void
+    set_doc_masking(const std::int32_t* /*cu_seqlens_cpu*/, int /*num_docs*/, int /*max_seqlen*/, int /*total_q*/) {
+    }
+    virtual void clear_doc_masking() {
+    }
 };
 
 class GraphExecutor final : public IGraphExecutor {
@@ -156,17 +184,34 @@ public:
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
 
     // Hook-enabled methods (matching ModularModel interface for LoRA integration)
-    void forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
+    void forward_with_hook(Tensor inputs,
+                           Tensor position_ids,
+                           NCCLCommunicator& comm,
+                           int micro_step,
                            const modules::ForwardHook& hook) override;
-    float validate_with_hook(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm,
-                             int micro_step, const modules::ForwardHook& hook) override;
-    void backward_with_hook(Tensor inputs, Tensor targets, NCCLCommunicator& comm,
-                            int grad_accum_steps, int micro_step, const modules::BackwardHook& hook) override;
+    float validate_with_hook(Tensor inputs,
+                             Tensor position_ids,
+                             Tensor targets,
+                             NCCLCommunicator& comm,
+                             int micro_step,
+                             const modules::ForwardHook& hook) override;
+    void backward_with_hook(Tensor inputs,
+                            Tensor targets,
+                            NCCLCommunicator& comm,
+                            int grad_accum_steps,
+                            int micro_step,
+                            const modules::BackwardHook& hook) override;
 
-    void set_hook_context(void* context) override { mHookContext = context; }
+    void set_hook_context(void* context) override {
+        mHookContext = context;
+    }
 
-    bool has_derived_backward() const override { return mDerivedBackward.has_value(); }
-    const Graph* backward_graph() const override { return mBackward; }
+    bool has_derived_backward() const override {
+        return mDerivedBackward.has_value();
+    }
+    const Graph* backward_graph() const override {
+        return mBackward;
+    }
 
     std::vector<std::byte> rng_state() const;
     void set_rng_state(const std::vector<std::byte>& state);
@@ -185,14 +230,15 @@ public:
     /// logprobs_cpu:  CPU output buffer, shape [B*T]; receives log P(target|context).
     ///                Masked positions (target == -100) receive 0.
     /// hook:          Optional LoRA forward hook (nullptr to skip LoRA, e.g. reference model).
-    void execute_logprobs_forward(long B, long T,
-                                   const std::int32_t* input_ids_cpu,
-                                   const std::int32_t* targets_cpu,
-                                   float* logprobs_cpu,
-                                   const modules::ForwardHook* hook,
-                                   NCCLCommunicator& comm,
-                                   const std::int32_t* position_ids_cpu = nullptr,
-                                   const float* temperatures_cpu = nullptr);
+    void execute_logprobs_forward(long B,
+                                  long T,
+                                  const std::int32_t* input_ids_cpu,
+                                  const std::int32_t* targets_cpu,
+                                  float* logprobs_cpu,
+                                  const modules::ForwardHook* hook,
+                                  NCCLCommunicator& comm,
+                                  const std::int32_t* position_ids_cpu = nullptr,
+                                  const float* temperatures_cpu = nullptr);
 
     /// Execute a backward pass with custom per-token d_loss values (for GRPO).
     ///
@@ -204,12 +250,14 @@ public:
     ///   Values represent dL_GRPO/d(log_prob_policy)[t] for each token.
     ///   Masked positions should be 0.
     /// hook: Optional backward hook (for LoRA gradient computation; may be nullptr).
-    void backward_with_custom_dloss(Tensor inputs, Tensor targets,
-                                     const float* per_token_grads_cpu,
-                                     NCCLCommunicator& comm,
-                                     int grad_accum_steps, int micro_step,
-                                     const modules::BackwardHook* hook,
-                                     const float* temperatures_cpu = nullptr);
+    void backward_with_custom_dloss(Tensor inputs,
+                                    Tensor targets,
+                                    const float* per_token_grads_cpu,
+                                    NCCLCommunicator& comm,
+                                    int grad_accum_steps,
+                                    int micro_step,
+                                    const modules::BackwardHook* hook,
+                                    const float* temperatures_cpu = nullptr);
 
     /// Estimate the peak stack usage during backward execution.
     ///
@@ -224,8 +272,7 @@ public:
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.
     /// Copies to GPU and propagates to CompiledExecutor.
-    void set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs,
-                         int max_seqlen, int total_q);
+    void set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q);
     void clear_doc_masking();
     void set_inv_temperature_context(const float* inv_temperature_gpu);
 
@@ -238,15 +285,20 @@ private:
     const LayerForwardPlan* forward_plan(int layer_idx) const;
 
     // Internal hook invocation helpers
-    void invoke_forward_hook(int layer_idx, modules::ForwardHookPoint point, cudaStream_t stream,
+    void invoke_forward_hook(int layer_idx,
+                             modules::ForwardHookPoint point,
+                             cudaStream_t stream,
                              const modules::ForwardHook* hook) {
         if (hook && *hook) {
             (*hook)(layer_idx, stream, point, mHookContext);
         }
     }
 
-    void invoke_backward_hook(int layer_idx, bool accumulate, modules::BackwardHookPoint point,
-                              cudaStream_t stream, const modules::BackwardHook* hook) {
+    void invoke_backward_hook(int layer_idx,
+                              bool accumulate,
+                              modules::BackwardHookPoint point,
+                              cudaStream_t stream,
+                              const modules::BackwardHook* hook) {
         if (hook && *hook) {
             (*hook)(layer_idx, accumulate, stream, point, mHookContext);
         }
@@ -297,8 +349,8 @@ private:
     // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCacheT;  ///< Backward dinp (transposed layout)
-    std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;    ///< Forward pass (normal layout)
-    std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;   ///< Backward dgrad (transposed layout)
+    std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;   ///< Forward pass (normal layout)
+    std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;  ///< Backward dgrad (transposed layout)
 
     unsigned int next_rng_seed();
 
@@ -310,7 +362,8 @@ private:
     // FP4 weight cache helpers (for NVFP4 recipe on Blackwell+)
     void prime_fp4_weight_cache(const std::vector<char>& required);
     const FP4WeightCacheEntry* get_fp4_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
-    const FP4WeightCacheEntry* get_fp4_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
+    const FP4WeightCacheEntry*
+    get_fp4_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
 
     // Weight prefetching for layer-by-layer execution
     void prefetch_layer_weights(int layer_idx, cudaStream_t stream);
@@ -344,7 +397,7 @@ private:
     std::vector<LayerBoundary> mLayerBoundaries;  // Sorted by start_op_idx
 
     // CUDA graph capture (optional)
-    bool mGraphsEnabled = false; // Forward graphs
+    bool mGraphsEnabled = false;  // Forward graphs
     bool mBackwardGraphsEnabled = false;
     bool mBackwardGraphCapturable = true;
     std::size_t mBackwardGraphCut = 0;
@@ -353,7 +406,7 @@ private:
     long mGraphB = 0;
     long mGraphT = 0;
     cudaGraphExec_t mForwardGraph = nullptr;
-    cudaGraphExec_t mBackwardGraph[2]{nullptr, nullptr}; // [0]=accumulate false, [1]=true
+    cudaGraphExec_t mBackwardGraph[2]{nullptr, nullptr};  // [0]=accumulate false, [1]=true
     DeviceMemoryStack::Checkpoint mForwardCheckpoint{};
     DeviceMemoryStack::Checkpoint mBackwardCheckpoint[2]{};
 
@@ -372,10 +425,13 @@ private:
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);
-    void execute_forward(long B, long T, NCCLCommunicator& comm, bool full,
-                         const modules::ForwardHook* hook);
-    void execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
-                          int micro_step, const modules::BackwardHook* hook,
+    void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);
+    void execute_backward(long B,
+                          long T,
+                          NCCLCommunicator& comm,
+                          int grad_accum_steps,
+                          int micro_step,
+                          const modules::BackwardHook* hook,
                           bool skip_zeroing = false);
 };
 

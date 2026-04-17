@@ -23,24 +23,26 @@ namespace {
 class cu_error : public std::runtime_error {
 public:
     cu_error(CUresult err, const std::string& arg)
-        : std::runtime_error(arg), code(err) {}
+        : std::runtime_error(arg),
+          code(err) {
+    }
     CUresult code;
 };
 
-void cu_throw_on_error(CUresult status, const char* statement,
-                       const char* file, int line) {
+void cu_throw_on_error(CUresult status, const char* statement, const char* file, int line) {
     if (status == CUDA_SUCCESS) return;
 
     const char* name = nullptr;
-    const char* msg  = nullptr;
+    const char* msg = nullptr;
     cuGetErrorName(status, &name);
     cuGetErrorString(status, &msg);
-    throw cu_error(
-        status,
-        fmt::format("CUDA Driver Error at {}:{}: {} returned {} ({})",
-                     file, line, statement,
-                     name ? name : "unknown",
-                     msg  ? msg  : "unknown"));
+    throw cu_error(status,
+                   fmt::format("CUDA Driver Error at {}:{}: {} returned {} ({})",
+                               file,
+                               line,
+                               statement,
+                               name ? name : "unknown",
+                               msg ? msg : "unknown"));
 }
 
 #define CU_CHECK(status) cu_throw_on_error(status, #status, __FILE__, __LINE__)
@@ -52,17 +54,14 @@ void cu_throw_on_error(CUresult status, const char* statement,
 std::vector<char> read_binary_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
-        throw std::runtime_error(
-            fmt::format("JitKernel: cannot open '{}'", path));
+        throw std::runtime_error(fmt::format("JitKernel: cannot open '{}'", path));
     }
     auto size = static_cast<std::streamsize>(f.tellg());
     f.seekg(0);
     std::vector<char> buf(size);
     f.read(buf.data(), size);
     if (!f) {
-        throw std::runtime_error(
-            fmt::format("JitKernel: failed to read '{}' ({} bytes)",
-                        path, size));
+        throw std::runtime_error(fmt::format("JitKernel: failed to read '{}' ({} bytes)", path, size));
     }
     return buf;
 }
@@ -85,22 +84,19 @@ void ensure_cuda_context() {
 // JitKernel: static factory methods
 // ---------------------------------------------------------------------------
 
-JitKernel JitKernel::load_cubin(const std::string& path,
-                                const JitKernelMeta& meta) {
+JitKernel JitKernel::load_cubin(const std::string& path, const JitKernelMeta& meta) {
     auto data = read_binary_file(path);
     return load_cubin(data.data(), data.size(), meta);
 }
 
-JitKernel JitKernel::load_ptx(const std::string& path,
-                               const JitKernelMeta& meta) {
+JitKernel JitKernel::load_ptx(const std::string& path, const JitKernelMeta& meta) {
     auto data = read_binary_file(path);
     // PTX is text — ensure null-terminated for cuModuleLoadDataEx
     data.push_back('\0');
     return load_ptx(data.data(), data.size(), meta);
 }
 
-JitKernel JitKernel::load_cubin(const void* data, size_t /*size*/,
-                                const JitKernelMeta& meta) {
+JitKernel JitKernel::load_cubin(const void* data, size_t /*size*/, const JitKernelMeta& meta) {
     ensure_cuda_context();
     JitKernel k;
     k.meta_ = meta;
@@ -109,35 +105,29 @@ JitKernel JitKernel::load_cubin(const void* data, size_t /*size*/,
     return k;
 }
 
-JitKernel JitKernel::load_ptx(const void* data, size_t /*size*/,
-                               const JitKernelMeta& meta) {
+JitKernel JitKernel::load_ptx(const void* data, size_t /*size*/, const JitKernelMeta& meta) {
     ensure_cuda_context();
     JitKernel k;
     k.meta_ = meta;
 
     // JIT-compile PTX with default options.
     // Add options here if you need to control max registers, opt level, etc.
-    CU_CHECK(cuModuleLoadDataEx(&k.module_, data,
-                                0, nullptr, nullptr));
+    CU_CHECK(cuModuleLoadDataEx(&k.module_, data, 0, nullptr, nullptr));
     k.init_function();
     return k;
 }
 
-JitKernel JitKernel::load_library(const std::string& path,
-                                  const JitKernelMeta& meta) {
+JitKernel JitKernel::load_library(const std::string& path, const JitKernelMeta& meta) {
     auto data = read_binary_file(path);
     return load_library(data.data(), data.size(), meta);
 }
 
-JitKernel JitKernel::load_library(const void* data, size_t /*size*/,
-                                  const JitKernelMeta& meta) {
+JitKernel JitKernel::load_library(const void* data, size_t /*size*/, const JitKernelMeta& meta) {
     ensure_cuda_context();
     JitKernel k;
     k.meta_ = meta;
 
-    CU_CHECK(cuLibraryLoadData(&k.library_, data,
-                                nullptr, nullptr, 0,
-                                nullptr, nullptr, 0));
+    CU_CHECK(cuLibraryLoadData(&k.library_, data, nullptr, nullptr, 0, nullptr, nullptr, 0));
 
     CUkernel kern = nullptr;
     CU_CHECK(cuLibraryGetKernel(&kern, k.library_, meta.name.c_str()));
@@ -145,10 +135,8 @@ JitKernel JitKernel::load_library(const void* data, size_t /*size*/,
 
     // Allow large dynamic shared memory (>48 KB) if requested
     if (meta.shared_mem_bytes > 48 * 1024) {
-        CU_CHECK(cuFuncSetAttribute(
-            k.function_,
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            meta.shared_mem_bytes));
+        CU_CHECK(
+            cuFuncSetAttribute(k.function_, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, meta.shared_mem_bytes));
     }
 
     return k;
@@ -159,9 +147,9 @@ JitKernel JitKernel::load_manifest(const std::string& manifest_path) {
     auto j = nlohmann::json::parse(data.begin(), data.end());
 
     JitKernelMeta meta;
-    meta.name              = j.at("name").get<std::string>();
-    meta.num_warps         = j.value("num_warps", 4);
-    meta.shared_mem_bytes  = j.value("shared_mem", 0);
+    meta.name = j.at("name").get<std::string>();
+    meta.num_warps = j.value("num_warps", 4);
+    meta.shared_mem_bytes = j.value("shared_mem", 0);
     meta.extra_null_params = j.value("extra_null_params", 0);
 
     // Resolve cubin/ptx path relative to the manifest directory
@@ -173,17 +161,14 @@ JitKernel JitKernel::load_manifest(const std::string& manifest_path) {
 
     if (j.contains("cubin")) {
         auto cubin_path = (dir / j.at("cubin").get<std::string>()).string();
-        return use_library_api ? load_library(cubin_path, meta)
-                               : load_cubin(cubin_path, meta);
+        return use_library_api ? load_library(cubin_path, meta) : load_cubin(cubin_path, meta);
     }
     if (j.contains("ptx")) {
         auto ptx_path = (dir / j.at("ptx").get<std::string>()).string();
         return load_ptx(ptx_path, meta);
     }
 
-    throw std::runtime_error(
-        fmt::format("JitKernel: manifest '{}' has neither 'cubin' nor 'ptx' key",
-                    manifest_path));
+    throw std::runtime_error(fmt::format("JitKernel: manifest '{}' has neither 'cubin' nor 'ptx' key", manifest_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -191,15 +176,12 @@ JitKernel JitKernel::load_manifest(const std::string& manifest_path) {
 // ---------------------------------------------------------------------------
 
 void JitKernel::init_function() {
-    CU_CHECK(cuModuleGetFunction(&function_, module_,
-                                  meta_.name.c_str()));
+    CU_CHECK(cuModuleGetFunction(&function_, module_, meta_.name.c_str()));
 
     // Allow large dynamic shared memory (>48 KB) if requested
     if (meta_.shared_mem_bytes > 48 * 1024) {
-        CU_CHECK(cuFuncSetAttribute(
-            function_,
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            meta_.shared_mem_bytes));
+        CU_CHECK(
+            cuFuncSetAttribute(function_, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, meta_.shared_mem_bytes));
     }
 }
 
@@ -216,21 +198,23 @@ JitKernel::JitKernel(JitKernel&& o) noexcept
       library_(o.library_),
       function_(o.function_),
       meta_(std::move(o.meta_)) {
-    o.module_   = nullptr;
-    o.library_  = nullptr;
+    o.module_ = nullptr;
+    o.library_ = nullptr;
     o.function_ = nullptr;
 }
 
 JitKernel& JitKernel::operator=(JitKernel&& o) noexcept {
     if (this != &o) {
-        if (library_) cuLibraryUnload(library_);
-        else if (module_) cuModuleUnload(module_);
-        module_   = o.module_;
-        library_  = o.library_;
+        if (library_)
+            cuLibraryUnload(library_);
+        else if (module_)
+            cuModuleUnload(module_);
+        module_ = o.module_;
+        library_ = o.library_;
         function_ = o.function_;
-        meta_     = std::move(o.meta_);
-        o.module_   = nullptr;
-        o.library_  = nullptr;
+        meta_ = std::move(o.meta_);
+        o.module_ = nullptr;
+        o.library_ = nullptr;
         o.function_ = nullptr;
     }
     return *this;
@@ -245,27 +229,27 @@ void JitKernel::launch(dim3 grid, void** args, cudaStream_t stream) const {
     launch(grid, dim3(block_x, 1, 1), meta_.shared_mem_bytes, args, stream);
 }
 
-void JitKernel::launch(dim3 grid, dim3 block, int shared_mem_bytes,
-                        void** args, cudaStream_t stream) const {
-    CU_CHECK(cuLaunchKernel(
-        function_,
-        grid.x,  grid.y,  grid.z,
-        block.x, block.y, block.z,
-        static_cast<unsigned int>(shared_mem_bytes),
-        stream,
-        args,
-        nullptr));
+void JitKernel::launch(dim3 grid, dim3 block, int shared_mem_bytes, void** args, cudaStream_t stream) const {
+    CU_CHECK(cuLaunchKernel(function_,
+                            grid.x,
+                            grid.y,
+                            grid.z,
+                            block.x,
+                            block.y,
+                            block.z,
+                            static_cast<unsigned int>(shared_mem_bytes),
+                            stream,
+                            args,
+                            nullptr));
 }
 
-void JitKernel::launch_triton(dim3 grid, void** user_args, int num_user_args,
-                               cudaStream_t stream) const {
+void JitKernel::launch_triton(dim3 grid, void** user_args, int num_user_args, cudaStream_t stream) const {
     int block_x = meta_.num_warps * 32;
     int extra = meta_.extra_null_params;
 
     if (extra == 0) {
         // No scratch params — launch directly
-        launch(grid, dim3(block_x, 1, 1), meta_.shared_mem_bytes,
-               user_args, stream);
+        launch(grid, dim3(block_x, 1, 1), meta_.shared_mem_bytes, user_args, stream);
         return;
     }
 
@@ -282,6 +266,5 @@ void JitKernel::launch_triton(dim3 grid, void** user_args, int num_user_args,
         args[i] = &null_scratch;
     }
 
-    launch(grid, dim3(block_x, 1, 1), meta_.shared_mem_bytes,
-           args.data(), stream);
+    launch(grid, dim3(block_x, 1, 1), meta_.shared_mem_bytes, args.data(), stream);
 }

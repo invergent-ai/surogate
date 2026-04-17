@@ -1,15 +1,14 @@
 import collections
 import json
 from pathlib import Path
-from typing import Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-def load_log(log_file: Union[str, Path]) -> dict:
+def load_log(log_file: str | Path) -> dict:
     """Load and parse a training log JSON file."""
-    with open(log_file, "r") as f:
+    with open(log_file) as f:
         log_data = json.load(f)
 
     result = collections.defaultdict(list)
@@ -30,7 +29,7 @@ def extract_over_step(data: list[dict], key: str) -> tuple[list, list]:
     return steps, values
 
 
-def generate_training_plot(log_file: Union[str, Path], output_file: Union[str, Path]) -> None:
+def generate_training_plot(log_file: str | Path, output_file: str | Path) -> None:
     """
     Generate a training plot from a log file and save it to the output file.
 
@@ -60,7 +59,7 @@ def generate_training_plot(log_file: Union[str, Path], output_file: Union[str, P
             bad = ~np.isfinite(clean)
             if bad.any() and not bad.all():
                 clean[bad] = np.interp(np.flatnonzero(bad), np.flatnonzero(~bad), clean[~bad])
-            smoothed = np.convolve(clean, np.ones(2 * smoothing + 1) / (2 * smoothing + 1), mode='valid')
+            smoothed = np.convolve(clean, np.ones(2 * smoothing + 1) / (2 * smoothing + 1), mode="valid")
             plt.plot(steps[smoothing:-smoothing], smoothed, c=cmap(0), linewidth=3, label="Training loss")
         else:
             plt.plot(steps, losses, c=cmap(0), linewidth=3, label="Training loss")
@@ -68,12 +67,12 @@ def generate_training_plot(log_file: Union[str, Path], output_file: Union[str, P
     # Plot validation loss
     if "eval" in log_data and log_data["eval"]:
         steps, losses = extract_over_step(log_data["eval"], "loss")
-        plt.plot(steps, losses, c=cmap(1), linewidth=3, marker='o', label="Validation loss")
+        plt.plot(steps, losses, c=cmap(1), linewidth=3, marker="o", label="Validation loss")
 
     plt.legend()
     plt.xlabel("Step")
     plt.ylabel("Loss")
     plt.title("Training Run")
     plt.grid(True, alpha=0.3)
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
     plt.close()

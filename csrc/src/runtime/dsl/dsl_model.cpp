@@ -54,8 +54,7 @@ std::string_view trim_optional(std::string_view name) {
 }
 
 bool ends_with(std::string_view value, std::string_view suffix) {
-    return value.size() >= suffix.size() &&
-           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 bool graph_has_kernel(const Module& module, std::string_view kernel) {
@@ -83,50 +82,36 @@ bool is_qlora_param_name(std::string_view name) {
         if (!field.empty() && field.back() == '?') {
             field.pop_back();
         }
-        if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" ||
-            field == "mlp_up_weight" || field == "mlp_down_weight" ||
-            field == "up_weight" || field == "down_weight" ||
-            field == "ln1_weight" || field == "ln2_weight" ||
-            field == "q_norm_weight" || field == "k_norm_weight" ||
+        if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" || field == "mlp_up_weight" ||
+            field == "mlp_down_weight" || field == "up_weight" || field == "down_weight" || field == "ln1_weight" ||
+            field == "ln2_weight" || field == "q_norm_weight" || field == "k_norm_weight" ||
             field == "experts_gate_up" || field == "experts_up" || field == "experts_down" ||
-            field == "shared_expert_gate" || field == "shared_expert_up" ||
-            field == "shared_expert_down") {
+            field == "shared_expert_gate" || field == "shared_expert_up" || field == "shared_expert_down") {
             return true;
         }
-        if (ends_with(field, "in_proj_weight") ||
-            ends_with(field, "in_proj_bias") ||
-            ends_with(field, "out_proj_weight") ||
-            ends_with(field, "out_proj_bias") ||
-            ends_with(field, "conv1d_weight") ||
-            ends_with(field, "conv1d_bias") ||
-            ends_with(field, "conv_weight") ||
-            ends_with(field, "conv_bias") ||
-            ends_with(field, "A_log") ||
-            ends_with(field, "D") ||
-            ends_with(field, "D_param") ||
-            ends_with(field, "dt_bias") ||
-            ends_with(field, "gated_norm_weight") ||
+        if (ends_with(field, "in_proj_weight") || ends_with(field, "in_proj_bias") ||
+            ends_with(field, "out_proj_weight") || ends_with(field, "out_proj_bias") ||
+            ends_with(field, "conv1d_weight") || ends_with(field, "conv1d_bias") || ends_with(field, "conv_weight") ||
+            ends_with(field, "conv_bias") || ends_with(field, "A_log") || ends_with(field, "D") ||
+            ends_with(field, "D_param") || ends_with(field, "dt_bias") || ends_with(field, "gated_norm_weight") ||
             ends_with(field, "norm_weight")) {
             return true;
         }
         // Qwen3.5 hybrid: full-attention block params
-        if (field == "full_q_proj_weight" || field == "full_k_proj_weight" ||
-            field == "full_v_proj_weight" || field == "full_out_weight" ||
-            field == "full_q_proj_bias" || field == "full_k_proj_bias" ||
+        if (field == "full_q_proj_weight" || field == "full_k_proj_weight" || field == "full_v_proj_weight" ||
+            field == "full_out_weight" || field == "full_q_proj_bias" || field == "full_k_proj_bias" ||
             field == "full_v_proj_bias" || field == "full_out_bias") {
             return true;
         }
         // Qwen3.5 hybrid: linear-attention (Gated DeltaNet) block params
-        if (field == "lin_in_proj_qkv_weight" || field == "lin_in_proj_z_weight" ||
-            field == "lin_in_proj_b_weight" || field == "lin_in_proj_a_weight" ||
-            field == "lin_out_weight") {
+        if (field == "lin_in_proj_qkv_weight" || field == "lin_in_proj_z_weight" || field == "lin_in_proj_b_weight" ||
+            field == "lin_in_proj_a_weight" || field == "lin_out_weight") {
             return true;
         }
         return false;
     }
-    return clean == "embedding" || clean == "embeddings" || clean == "embed_tokens" ||
-           clean == "final_norm" || clean == "final_norm_weight" || clean == "norm" ||
-           clean == "lm_head" || clean == "lm_head_weight";
+    return clean == "embedding" || clean == "embeddings" || clean == "embed_tokens" || clean == "final_norm" ||
+           clean == "final_norm_weight" || clean == "norm" || clean == "lm_head" || clean == "lm_head_weight";
 }
 
 struct DslConfigView {
@@ -327,8 +312,14 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
             if (field != "qkv_weight" || info.shape.size() < 2) continue;
             long qkv = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
             if (qkv == 0) continue;
-            if (first_qkv == 0) { first_qkv = qkv; continue; }
-            if (qkv != first_qkv) { has_varying_dims = true; break; }
+            if (first_qkv == 0) {
+                first_qkv = qkv;
+                continue;
+            }
+            if (qkv != first_qkv) {
+                has_varying_dims = true;
+                break;
+            }
         }
 
         // Also check mlp weights for variation
@@ -341,8 +332,14 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
                 if (field != "mlp_down_weight" || info.shape.size() < 2) continue;
                 long m = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
                 if (m == 0) continue;
-                if (first_mlp == 0) { first_mlp = m; continue; }
-                if (m != first_mlp) { has_varying_dims = true; break; }
+                if (first_mlp == 0) {
+                    first_mlp = m;
+                    continue;
+                }
+                if (m != first_mlp) {
+                    has_varying_dims = true;
+                    break;
+                }
             }
         }
 
@@ -420,8 +417,7 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
                 for (const auto& out : op.outputs) {
                     int out_layer = -1;
                     std::string out_field;
-                    if (internal::parse_block_param(out, out_layer, out_field) &&
-                        out_layer != inp_layer) {
+                    if (internal::parse_block_param(out, out_layer, out_field) && out_layer != inp_layer) {
                         runtime.kv_source_layers.insert(inp_layer);
                         break;
                     }
@@ -482,21 +478,22 @@ std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std:
     overrides.reserve(pattern.size());
     for (int i = 0; i < static_cast<int>(pattern.size()); ++i) {
         switch (pattern[i]) {
-            case 'M': overrides.push_back(modules::LayerOverride::mamba(i));     break;
+            case 'M': overrides.push_back(modules::LayerOverride::mamba(i)); break;
             case 'A': overrides.push_back(modules::LayerOverride::attention(i)); break;
-            case 'P': overrides.push_back(modules::LayerOverride::mlp(i));       break;
-            case 'E': overrides.push_back(modules::LayerOverride::moe(i));       break;
+            case 'P': overrides.push_back(modules::LayerOverride::mlp(i)); break;
+            case 'E': overrides.push_back(modules::LayerOverride::moe(i)); break;
             default:
-                throw std::runtime_error(
-                    fmt::format("Invalid character '{}' at index {} in hybrid_pattern. "
-                                "Expected 'M', 'A', 'P', or 'E'.", pattern[i], i));
+                throw std::runtime_error(fmt::format("Invalid character '{}' at index {} in hybrid_pattern. "
+                                                     "Expected 'M', 'A', 'P', or 'E'.",
+                                                     pattern[i],
+                                                     i));
         }
     }
     return overrides;
 }
 
-std::optional<std::vector<modules::LayerOverride>> parse_layer_types_to_overrides(
-    const std::vector<std::string>& layer_types) {
+std::optional<std::vector<modules::LayerOverride>>
+parse_layer_types_to_overrides(const std::vector<std::string>& layer_types) {
     std::vector<modules::LayerOverride> overrides;
     overrides.reserve(layer_types.size());
 
@@ -540,9 +537,8 @@ std::optional<std::vector<modules::LayerOverride>> parse_layer_types_to_override
     return overrides;
 }
 
-modules::ModelConfig build_model_config(const Module& module,
-                                        const PretrainedConfig& base,
-                                        const DslRuntimeConfig& runtime) {
+modules::ModelConfig
+build_model_config(const Module& module, const PretrainedConfig& base, const DslRuntimeConfig& runtime) {
     const auto view = parse_dsl_config(module);
     modules::ModelConfig cfg;
     cfg.original_config = base.clone();
@@ -615,9 +611,8 @@ modules::ModelConfig build_model_config(const Module& module,
         modules::MoEConfig moe;
         moe.num_experts = runtime.num_experts;
         moe.top_k = runtime.num_experts_per_tok > 0 ? runtime.num_experts_per_tok : 1;
-        moe.moe_intermediate_size = runtime.moe_intermediate_size > 0
-                                        ? runtime.moe_intermediate_size
-                                        : cfg.IntermediateSize;
+        moe.moe_intermediate_size =
+            runtime.moe_intermediate_size > 0 ? runtime.moe_intermediate_size : cfg.IntermediateSize;
         moe.norm_topk_prob = runtime.norm_topk_prob;
         moe.use_shared_expert = runtime.use_shared_expert;
         moe.shared_expert_size = runtime.shared_expert_intermediate;
@@ -639,8 +634,7 @@ modules::ModelConfig build_model_config(const Module& module,
         auto overrides = parse_hybrid_pattern_to_overrides(*view.hybrid_pattern);
         if (static_cast<int>(overrides.size()) != cfg.NumLayers) {
             throw std::runtime_error(
-                fmt::format("hybrid_pattern length ({}) != NumLayers ({})",
-                            overrides.size(), cfg.NumLayers));
+                fmt::format("hybrid_pattern length ({}) != NumLayers ({})", overrides.size(), cfg.NumLayers));
         }
         // Propagate global MoE config to MoE layer overrides
         if (cfg.moe_config.has_value()) {
@@ -658,7 +652,10 @@ modules::ModelConfig build_model_config(const Module& module,
         {
             auto first = cfg.layer_overrides[0].block_type;
             for (const auto& ov : cfg.layer_overrides) {
-                if (ov.block_type != first) { has_multiple_types = true; break; }
+                if (ov.block_type != first) {
+                    has_multiple_types = true;
+                    break;
+                }
             }
         }
         if (has_multiple_types) {
@@ -706,13 +703,13 @@ MappingSpec to_pipeline_mapping(const DslModel::MappingSpec& src) {
     using SK = DslModel::MappingSpec::Kind;
     using DK = MappingSpec::Kind;
     switch (src.kind) {
-        case SK::Direct:       dst.kind = DK::Direct; break;
-        case SK::Fuse:         dst.kind = DK::Fuse; break;
-        case SK::Split:        dst.kind = DK::Split; break;
-        case SK::Transform:    dst.kind = DK::Transform; break;
-        case SK::TiedTo:       dst.kind = DK::TiedTo; break;
+        case SK::Direct: dst.kind = DK::Direct; break;
+        case SK::Fuse: dst.kind = DK::Fuse; break;
+        case SK::Split: dst.kind = DK::Split; break;
+        case SK::Transform: dst.kind = DK::Transform; break;
+        case SK::TiedTo: dst.kind = DK::TiedTo; break;
         case SK::StackExperts: dst.kind = DK::StackExperts; break;
-        default:               dst.kind = DK::Unknown; break;
+        default: dst.kind = DK::Unknown; break;
     }
     dst.source = src.source;
     dst.sources = src.sources;
@@ -727,8 +724,7 @@ MappingSpec to_pipeline_mapping(const DslModel::MappingSpec& src) {
 }
 
 /// Build a MappingTable from DslModel's parsed HF mapping.
-MappingTable build_mapping_table(
-    const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping) {
+MappingTable build_mapping_table(const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping) {
     MappingTable table;
     table.reserve(hf_mapping.size());
     for (const auto& kv : hf_mapping) {
@@ -738,9 +734,7 @@ MappingTable build_mapping_table(
 }
 
 /// Build QuantizerConfig from QLoRAConfig and runtime options.
-qlora::QuantizerConfig build_quantizer_config(
-    const modules::QLoRAConfig& qlora_cfg,
-    const RuntimeOptions& options) {
+qlora::QuantizerConfig build_quantizer_config(const modules::QLoRAConfig& qlora_cfg, const RuntimeOptions& options) {
     qlora::QuantizerConfig qcfg;
 
     if (qlora_cfg.is_bnb()) {
@@ -789,8 +783,7 @@ qlora::QuantizerConfig build_quantizer_config(
 ///
 /// Iterates the IR's forward graph params, resolves shapes using the module's
 /// config, and creates a WeightLoadSpec for each QLoRA-managed parameter.
-std::vector<qlora::WeightLoadSpec> build_weight_specs(
-    const Module& module) {
+std::vector<qlora::WeightLoadSpec> build_weight_specs(const Module& module) {
     if (!module.forward.has_value()) {
         return {};
     }
@@ -885,19 +878,18 @@ int count_router_fp_weights(const Module& module) {
 
 namespace internal {
 
-std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
-    const Module& module,
-    const modules::ModelConfig& model_cfg,
-    const PretrainedConfig& pt_config,
-    const RuntimeOptions& options,
-    const modules::ModularLoRAConfig& lora_cfg,
-    const modules::QLoRAConfig& qlora_cfg,
-    const std::shared_ptr<TensorAllocator>& allocator,
-    const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping,
-    int shard_idx,
-    int num_shards,
-    const std::string& adapter_path) {
-
+std::unique_ptr<QLoRAWeightProvider>
+create_dsl_qlora_provider(const Module& module,
+                          const modules::ModelConfig& model_cfg,
+                          const PretrainedConfig& pt_config,
+                          const RuntimeOptions& options,
+                          const modules::ModularLoRAConfig& lora_cfg,
+                          const modules::QLoRAConfig& qlora_cfg,
+                          const std::shared_ptr<TensorAllocator>& allocator,
+                          const std::unordered_map<std::string, DslModel::MappingSpec>& hf_mapping,
+                          int shard_idx,
+                          int num_shards,
+                          const std::string& adapter_path) {
     // Build the pipeline configuration
     qlora::DslQLoRAPipelineConfig config;
     config.mapping = build_mapping_table(hf_mapping);
@@ -916,8 +908,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     // Only slice actual expert weights (name contains "experts"), not other 3D
     // weights like conv1d in linear attention layers.
     auto is_expert_name = [](const std::string& n) {
-        return n.find("experts") != std::string::npos ||
-               n.find("expert_gate_up") != std::string::npos ||
+        return n.find("experts") != std::string::npos || n.find("expert_gate_up") != std::string::npos ||
                n.find("expert_down") != std::string::npos;
     };
     if (config.ep_size > 1) {
@@ -941,9 +932,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
         config.modules_to_not_convert = qlora_cfg.modules_to_not_convert;
 
         switch (qlora_cfg.strategy) {
-            case modules::QLoRAQuantStrategy::PrequantFP8:
-                config.scale_suffix = "_scale_inv";
-                break;
+            case modules::QLoRAQuantStrategy::PrequantFP8: config.scale_suffix = "_scale_inv"; break;
             case modules::QLoRAQuantStrategy::PrequantNVFP4:
                 config.scale_suffix = "_scale";
                 config.scale2_suffix = "_scale_2";
@@ -957,8 +946,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
                 config.scale_suffix = ".absmax";
                 config.bnb_prequant_double_quant = qlora_cfg.bnb_double_quant;
                 break;
-            default:
-                break;
+            default: break;
         }
     }
 
@@ -1009,7 +997,8 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
             auto idx_start = bracket + 7;  // length of "blocks["
             try {
                 spec.offload_group = std::stoi(spec.name.substr(idx_start, close - idx_start));
-            } catch (...) {}
+            } catch (...) {
+            }
         }
     }
 
@@ -1017,29 +1006,31 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     // Only one layer's weights are needed at a time (forward or backward),
     // so cache_size=4 (one per weight type: QKV, Out, GateUp, Down) matches
     // the old provider's shared-buffer approach.
-    const int num_quantizable = static_cast<int>(std::count_if(
-        config.weight_specs.begin(), config.weight_specs.end(),
-        [](const qlora::WeightLoadSpec& s) { return s.quantize; }));
+    const int num_quantizable = static_cast<int>(
+        std::count_if(config.weight_specs.begin(), config.weight_specs.end(), [](const qlora::WeightLoadSpec& s) {
+            return s.quantize;
+        }));
     if (num_quantizable > 4) {
         config.weight_manager_config.max_dequant_cache_size = 4;
     }
 
-    const char* format_label =
-        qlora_cfg.is_bnb() ? "BnB-NF4" :
-        qlora_cfg.is_fp8() ? "FP8" :
-        qlora_cfg.is_fp4() ? "FP4" :
-        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantFP8 ? "Prequant-FP8" :
-        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantNVFP4 ? "Prequant-NVFP4" :
-        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantMXFP4 ? "Prequant-MXFP4" :
-        qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantBnBNF4 ? "Prequant-BnB-NF4" :
-        "none";
+    const char* format_label = qlora_cfg.is_bnb()                                                  ? "BnB-NF4"
+                               : qlora_cfg.is_fp8()                                                ? "FP8"
+                               : qlora_cfg.is_fp4()                                                ? "FP4"
+                               : qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantFP8    ? "Prequant-FP8"
+                               : qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantNVFP4  ? "Prequant-NVFP4"
+                               : qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantMXFP4  ? "Prequant-MXFP4"
+                               : qlora_cfg.strategy == modules::QLoRAQuantStrategy::PrequantBnBNF4 ? "Prequant-BnB-NF4"
+                                                                                                   : "none";
 
-    fprintf(stderr, "[QLoRA] Generic provider: %d weight specs (%d quantizable), "
-                    "format=%s, shard=%d/%d%s\n",
+    fprintf(stderr,
+            "[QLoRA] Generic provider: %d weight specs (%d quantizable), "
+            "format=%s, shard=%d/%d%s\n",
             static_cast<int>(config.weight_specs.size()),
             num_quantizable,
             format_label,
-            shard_idx+1, num_shards,
+            shard_idx + 1,
+            num_shards,
             config.prequantized ? " [pre-quantized]" : "");
     const int router_fp = count_router_fp_weights(module);
     if (router_fp > 0) {
@@ -1049,8 +1040,7 @@ std::unique_ptr<QLoRAWeightProvider> create_dsl_qlora_provider(
     // Adapter merging (stacked LoRA)
     config.adapter_path = adapter_path;
 
-    return std::make_unique<qlora::GenericQLoRAProvider>(
-        std::move(config), pt_config, allocator);
+    return std::make_unique<qlora::GenericQLoRAProvider>(std::move(config), pt_config, allocator);
 }
 
 }  // namespace internal
@@ -1093,9 +1083,8 @@ DslModel::DslModel(const PretrainedConfig& config,
     // Expert Parallelism: set EPSize and compute NumLocalExperts
     mModelConfig.EPSize = mOptions.EPSize;
     if (mModelConfig.NumExperts > 0) {
-        mModelConfig.NumLocalExperts = (mModelConfig.EPSize > 1)
-            ? mModelConfig.NumExperts / mModelConfig.EPSize
-            : mModelConfig.NumExperts;
+        mModelConfig.NumLocalExperts =
+            (mModelConfig.EPSize > 1) ? mModelConfig.NumExperts / mModelConfig.EPSize : mModelConfig.NumExperts;
     }
 
     // Keep base PretrainedConfig in sync with DSL-resolved ModelConfig.
@@ -1130,25 +1119,26 @@ DslModel::DslModel(const PretrainedConfig& config,
     // DEBUG: Log weight manager decision
     if (options.DebugMemoryBreakdown) {
         std::cerr << "[DEBUG-MODEL] use_weight_manager=" << use_weight_manager
-                  << " (ShardWeights=" << options.ShardWeights
-                  << ", OffloadMaster=" << options.OffloadMaster
-                  << ", is_quantized=" << mQLoRAConfig.is_quantized()
-                  << ", lora=" << lora_config.has_value()
-                  << ")" << std::endl;
+                  << " (ShardWeights=" << options.ShardWeights << ", OffloadMaster=" << options.OffloadMaster
+                  << ", is_quantized=" << mQLoRAConfig.is_quantized() << ", lora=" << lora_config.has_value() << ")"
+                  << std::endl;
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[DEBUG-MODEL] Before param alloc: GPU used="
-                  << (total_mem - free_mem)/(1024*1024) << " MiB, free="
-                  << free_mem/(1024*1024) << " MiB" << std::endl;
+        std::cerr << "[DEBUG-MODEL] Before param alloc: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
+                  << " MiB, free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }
 
-    mParams = std::make_unique<DslParamStore>(*mModule, mModule->forward.value(),
-                                              options, *mConfig, mAllocator,
+    mParams = std::make_unique<DslParamStore>(*mModule,
+                                              mModule->forward.value(),
+                                              options,
+                                              *mConfig,
+                                              mAllocator,
                                               lora_config ? &*lora_config : nullptr,
                                               external_params.empty() ? nullptr : &external_params,
                                               use_weight_manager);
     std::optional<ETensorDType> grad_dtype_override = options.GradientType;
-    mGrads = std::make_unique<DslGradStore>(*mParams, mAllocator,
+    mGrads = std::make_unique<DslGradStore>(*mParams,
+                                            mAllocator,
                                             options.OffloadGrads,
                                             options.offload_alloc(),
                                             mNumShards,
@@ -1158,9 +1148,14 @@ DslModel::DslModel(const PretrainedConfig& config,
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {
-        mWeightManager = std::make_unique<DslWeightManager>(
-            *mModule, mModule->forward.value(), options, *mConfig, mAllocator,
-            lora_config ? &*lora_config : nullptr, mShardIdx, mNumShards);
+        mWeightManager = std::make_unique<DslWeightManager>(*mModule,
+                                                            mModule->forward.value(),
+                                                            options,
+                                                            *mConfig,
+                                                            mAllocator,
+                                                            lora_config ? &*lora_config : nullptr,
+                                                            mShardIdx,
+                                                            mNumShards);
         mParams->set_weight_manager(mWeightManager.get());
     }
 
@@ -1168,9 +1163,8 @@ DslModel::DslModel(const PretrainedConfig& config,
     if (options.DebugMemoryBreakdown) {
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[DEBUG-MODEL] After param+grad+wm alloc: GPU used="
-                  << (total_mem - free_mem)/(1024*1024) << " MiB, free="
-                  << free_mem/(1024*1024) << " MiB" << std::endl;
+        std::cerr << "[DEBUG-MODEL] After param+grad+wm alloc: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
+                  << " MiB, free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }
 
     if (lora_config.has_value() && lora_config->enabled()) {
@@ -1195,8 +1189,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             wm.num_experts = mModelConfig.moe_config->num_experts;
             wm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0
-                                        ? mModelConfig.moe_config->moe_intermediate_size
-                                        : mModelConfig.IntermediateSize;
+                                           ? mModelConfig.moe_config->moe_intermediate_size
+                                           : mModelConfig.IntermediateSize;
             wm.train_router = mLoRAConfig->train_router;
         }
         mLoRAWeights = std::make_unique<modules::ModularLoRAWeightsManager>(wm, *mAllocator);
@@ -1217,8 +1211,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             gm.num_experts = mModelConfig.moe_config->num_experts;
             gm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0
-                                        ? mModelConfig.moe_config->moe_intermediate_size
-                                        : mModelConfig.IntermediateSize;
+                                           ? mModelConfig.moe_config->moe_intermediate_size
+                                           : mModelConfig.IntermediateSize;
             gm.train_router = mLoRAConfig->train_router;
         }
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
@@ -1368,4 +1362,4 @@ void DslModel::validate_param_shapes(const Module& module) const {
     }
 }
 
-} // namespace dsl
+}  // namespace dsl

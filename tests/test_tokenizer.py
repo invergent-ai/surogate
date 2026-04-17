@@ -2,13 +2,16 @@
 
 Compares output against HuggingFace tokenizers to ensure correctness.
 """
+
 import os
 import sys
+
 import pytest
 
 # Try to import the native module
 try:
     from surogate import _surogate
+
     HAS_NATIVE = hasattr(_surogate, "Tokenizer")
 except ImportError:
     HAS_NATIVE = False
@@ -16,6 +19,7 @@ except ImportError:
 # Try to import HuggingFace tokenizers for comparison
 try:
     from transformers import AutoTokenizer
+
     HAS_HF = True
 except ImportError:
     HAS_HF = False
@@ -24,6 +28,7 @@ except ImportError:
 def find_qwen3_model_dir():
     """Find a Qwen3 model in the HuggingFace cache."""
     import glob
+
     patterns = [
         os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json"),
         os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-FP8/snapshots/*/tokenizer.json"),
@@ -160,7 +165,7 @@ class TestNativeVsHuggingFace:
         "<html><body>Hello</body></html>",
         "user@example.com",
         "https://example.com/path?key=value&foo=bar",
-        'She said "Hello" and he replied \'Hi\'.',
+        "She said \"Hello\" and he replied 'Hi'.",
     ]
 
     @pytest.mark.parametrize("text", TEST_STRINGS)
@@ -181,9 +186,7 @@ class TestNativeVsHuggingFace:
         native_decoded = self.native.decode(native_ids)
         hf_decoded = self.hf.decode(native_ids)
         assert native_decoded == hf_decoded, (
-            f"Decode mismatch for {text!r}:\n"
-            f"  native: {native_decoded!r}\n"
-            f"  hf:     {hf_decoded!r}"
+            f"Decode mismatch for {text!r}:\n  native: {native_decoded!r}\n  hf:     {hf_decoded!r}"
         )
 
     def test_vocab_size_matches(self):
@@ -197,41 +200,58 @@ class TestNativeVsHuggingFace:
             assert self.native.pad_token_id == self.hf.pad_token_id
 
     CHAT_TEMPLATE_TESTS = [
-        ("single turn gen", [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Hello!"},
-        ], True),
-        ("multi turn gen", [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-            {"role": "user", "content": "And 3+3?"},
-        ], True),
-        ("no system", [
-            {"role": "user", "content": "Hello!"},
-        ], True),
-        ("training", [
-            {"role": "user", "content": "Hello!"},
-            {"role": "assistant", "content": "Hi there!"},
-        ], False),
-        ("multi turn training", [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hi"},
-            {"role": "assistant", "content": "Hello!"},
-            {"role": "user", "content": "Bye"},
-            {"role": "assistant", "content": "Goodbye!"},
-        ], False),
+        (
+            "single turn gen",
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello!"},
+            ],
+            True,
+        ),
+        (
+            "multi turn gen",
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+                {"role": "user", "content": "And 3+3?"},
+            ],
+            True,
+        ),
+        (
+            "no system",
+            [
+                {"role": "user", "content": "Hello!"},
+            ],
+            True,
+        ),
+        (
+            "training",
+            [
+                {"role": "user", "content": "Hello!"},
+                {"role": "assistant", "content": "Hi there!"},
+            ],
+            False,
+        ),
+        (
+            "multi turn training",
+            [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello!"},
+                {"role": "user", "content": "Bye"},
+                {"role": "assistant", "content": "Goodbye!"},
+            ],
+            False,
+        ),
     ]
 
-    @pytest.mark.parametrize("desc,messages,gen_prompt", CHAT_TEMPLATE_TESTS,
-                             ids=[t[0] for t in CHAT_TEMPLATE_TESTS])
+    @pytest.mark.parametrize("desc,messages,gen_prompt", CHAT_TEMPLATE_TESTS, ids=[t[0] for t in CHAT_TEMPLATE_TESTS])
     def test_apply_chat_template_matches(self, desc, messages, gen_prompt):
         native_text = self.native.apply_chat_template(messages, add_generation_prompt=gen_prompt)
         hf_text = self.hf.apply_chat_template(messages, tokenize=False, add_generation_prompt=gen_prompt)
         assert native_text == hf_text, (
-            f"Chat template mismatch for {desc}:\n"
-            f"  native: {native_text!r}\n"
-            f"  hf:     {hf_text!r}"
+            f"Chat template mismatch for {desc}:\n  native: {native_text!r}\n  hf:     {hf_text!r}"
         )
 
     def test_apply_chat_template_and_encode(self):
@@ -275,12 +295,12 @@ class TestEncodeForTraining:
         prev_text = ""
 
         for round_idx, (user_idx, asst_idx) in enumerate(pairs):
-            is_last = (round_idx == total_rounds - 1)
+            is_last = round_idx == total_rounds - 1
 
             # Render up to user with gen_prompt=true
-            msgs_to_user = messages[:user_idx + 1]
+            msgs_to_user = messages[: user_idx + 1]
             text_user = hf.apply_chat_template(msgs_to_user, tokenize=False, add_generation_prompt=True)
-            chrome = text_user[len(prev_text):]
+            chrome = text_user[len(prev_text) :]
             if chrome:
                 chrome_ids = hf.encode(chrome, add_special_tokens=False)
                 input_ids.extend(chrome_ids)
@@ -290,9 +310,9 @@ class TestEncodeForTraining:
                     labels.extend([-100] * len(chrome_ids))
 
             # Render up to assistant with gen_prompt=false
-            msgs_to_asst = messages[:asst_idx + 1]
+            msgs_to_asst = messages[: asst_idx + 1]
             text_asst = hf.apply_chat_template(msgs_to_asst, tokenize=False, add_generation_prompt=False)
-            response = text_asst[len(text_user):]
+            response = text_asst[len(text_user) :]
             if response:
                 resp_ids = hf.encode(response, add_special_tokens=False)
                 input_ids.extend(resp_ids)
@@ -315,46 +335,66 @@ class TestEncodeForTraining:
         return input_ids, labels
 
     TRAINING_TESTS = [
-        ("single turn", [
-            {"role": "user", "content": "Hello!"},
-            {"role": "assistant", "content": "Hi there!"},
-        ]),
-        ("single turn with system", [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Hello!"},
-            {"role": "assistant", "content": "Hi there!"},
-        ]),
-        ("multi turn", [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-            {"role": "user", "content": "And 3+3?"},
-            {"role": "assistant", "content": "6"},
-        ]),
-        ("long response", [
-            {"role": "user", "content": "Write a poem."},
-            {"role": "assistant", "content": "Roses are red,\nViolets are blue,\nSugar is sweet,\nAnd so are you."},
-        ]),
-        ("unicode", [
-            {"role": "user", "content": "Hello 你好"},
-            {"role": "assistant", "content": "你好世界! 🌍"},
-        ]),
-        ("code", [
-            {"role": "user", "content": "Write hello world in Python"},
-            {"role": "assistant", "content": 'def hello():\n    print("Hello, world!")\n'},
-        ]),
-        ("three turns", [
-            {"role": "user", "content": "Hi"},
-            {"role": "assistant", "content": "Hello!"},
-            {"role": "user", "content": "How are you?"},
-            {"role": "assistant", "content": "I'm doing well."},
-            {"role": "user", "content": "Bye"},
-            {"role": "assistant", "content": "Goodbye!"},
-        ]),
+        (
+            "single turn",
+            [
+                {"role": "user", "content": "Hello!"},
+                {"role": "assistant", "content": "Hi there!"},
+            ],
+        ),
+        (
+            "single turn with system",
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello!"},
+                {"role": "assistant", "content": "Hi there!"},
+            ],
+        ),
+        (
+            "multi turn",
+            [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+                {"role": "user", "content": "And 3+3?"},
+                {"role": "assistant", "content": "6"},
+            ],
+        ),
+        (
+            "long response",
+            [
+                {"role": "user", "content": "Write a poem."},
+                {"role": "assistant", "content": "Roses are red,\nViolets are blue,\nSugar is sweet,\nAnd so are you."},
+            ],
+        ),
+        (
+            "unicode",
+            [
+                {"role": "user", "content": "Hello 你好"},
+                {"role": "assistant", "content": "你好世界! 🌍"},
+            ],
+        ),
+        (
+            "code",
+            [
+                {"role": "user", "content": "Write hello world in Python"},
+                {"role": "assistant", "content": 'def hello():\n    print("Hello, world!")\n'},
+            ],
+        ),
+        (
+            "three turns",
+            [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello!"},
+                {"role": "user", "content": "How are you?"},
+                {"role": "assistant", "content": "I'm doing well."},
+                {"role": "user", "content": "Bye"},
+                {"role": "assistant", "content": "Goodbye!"},
+            ],
+        ),
     ]
 
-    @pytest.mark.parametrize("desc,messages", TRAINING_TESTS,
-                             ids=[t[0] for t in TRAINING_TESTS])
+    @pytest.mark.parametrize("desc,messages", TRAINING_TESTS, ids=[t[0] for t in TRAINING_TESTS])
     def test_default_strategy(self, desc, messages):
         result = self.native.encode_for_training(messages, strategy="default")
         expected_ids, expected_labels = self._hf_encode_for_training(messages, "default")
@@ -369,16 +409,14 @@ class TestEncodeForTraining:
             f"  hf     ({len(expected_labels)}): {expected_labels[:20]}"
         )
 
-    @pytest.mark.parametrize("desc,messages", TRAINING_TESTS,
-                             ids=[t[0] for t in TRAINING_TESTS])
+    @pytest.mark.parametrize("desc,messages", TRAINING_TESTS, ids=[t[0] for t in TRAINING_TESTS])
     def test_last_round_strategy(self, desc, messages):
         result = self.native.encode_for_training(messages, strategy="last_round")
         expected_ids, expected_labels = self._hf_encode_for_training(messages, "last_round")
         assert result["input_ids"] == expected_ids
         assert result["labels"] == expected_labels
 
-    @pytest.mark.parametrize("desc,messages", TRAINING_TESTS,
-                             ids=[t[0] for t in TRAINING_TESTS])
+    @pytest.mark.parametrize("desc,messages", TRAINING_TESTS, ids=[t[0] for t in TRAINING_TESTS])
     def test_all_strategy(self, desc, messages):
         result = self.native.encode_for_training(messages, strategy="all")
         expected_ids, expected_labels = self._hf_encode_for_training(messages, "all")

@@ -13,8 +13,9 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Dict, List
+from typing import Dict, List
 
 import numpy as np
 
@@ -28,7 +29,7 @@ except Exception:
 class GoldenCase:
     op: str
     case: str
-    payload: Dict
+    payload: dict
 
 
 def _dtype_name(arr: np.ndarray) -> str:
@@ -44,7 +45,7 @@ def _dtype_name(arr: np.ndarray) -> str:
     return str(dt)
 
 
-def _tensor_payload(arr: np.ndarray, dtype: str | None = None) -> Dict:
+def _tensor_payload(arr: np.ndarray, dtype: str | None = None) -> dict:
     arr = np.asarray(arr)
     return {
         "shape": list(arr.shape),
@@ -117,8 +118,15 @@ def _precompute_freqs_cis_complex(dim: int, end: int, theta: float) -> np.ndarra
     return freqs
 
 
-def _rope_forward_cpu(qkv: np.ndarray, freqs: np.ndarray, position_ids: np.ndarray | None,
-                      Hq: int, Hkv: int, head_dim: int, rotary_dim: int) -> np.ndarray:
+def _rope_forward_cpu(
+    qkv: np.ndarray,
+    freqs: np.ndarray,
+    position_ids: np.ndarray | None,
+    Hq: int,
+    Hkv: int,
+    head_dim: int,
+    rotary_dim: int,
+) -> np.ndarray:
     B, T, _ = qkv.shape
     N = Hq + 2 * Hkv
     HD = head_dim
@@ -151,8 +159,15 @@ def _rope_forward_cpu(qkv: np.ndarray, freqs: np.ndarray, position_ids: np.ndarr
     return out
 
 
-def _rope_backward_cpu(dout: np.ndarray, freqs: np.ndarray, position_ids: np.ndarray | None,
-                       Hq: int, Hkv: int, head_dim: int, rotary_dim: int) -> np.ndarray:
+def _rope_backward_cpu(
+    dout: np.ndarray,
+    freqs: np.ndarray,
+    position_ids: np.ndarray | None,
+    Hq: int,
+    Hkv: int,
+    head_dim: int,
+    rotary_dim: int,
+) -> np.ndarray:
     B, T, _ = dout.shape
     N = Hq + 2 * Hkv
     HD = head_dim
@@ -185,8 +200,9 @@ def _rope_backward_cpu(dout: np.ndarray, freqs: np.ndarray, position_ids: np.nda
     return dinp
 
 
-def _qkv_head_rmsnorm_forward(qkv: np.ndarray, weight: np.ndarray, eps: float,
-                              B: int, T: int, H: int, HS: int, channel_offset: int) -> tuple[np.ndarray, np.ndarray]:
+def _qkv_head_rmsnorm_forward(
+    qkv: np.ndarray, weight: np.ndarray, eps: float, B: int, T: int, H: int, HS: int, channel_offset: int
+) -> tuple[np.ndarray, np.ndarray]:
     """Apply head-wise RMSNorm to a slice of qkv and return updated qkv + rstd."""
     qkv_out = qkv.copy()
     BT = B * T
@@ -204,8 +220,17 @@ def _qkv_head_rmsnorm_forward(qkv: np.ndarray, weight: np.ndarray, eps: float,
     return qkv_out, rstd.reshape(B, T, H)
 
 
-def _qkv_head_rmsnorm_backward_dx(d_qkv: np.ndarray, qkv_out: np.ndarray, weight: np.ndarray, rstd: np.ndarray,
-                                  B: int, T: int, H: int, HS: int, channel_offset: int) -> np.ndarray:
+def _qkv_head_rmsnorm_backward_dx(
+    d_qkv: np.ndarray,
+    qkv_out: np.ndarray,
+    weight: np.ndarray,
+    rstd: np.ndarray,
+    B: int,
+    T: int,
+    H: int,
+    HS: int,
+    channel_offset: int,
+) -> np.ndarray:
     """In-place RMSNorm backward on a qkv slice (matches qkv_head_rmsnorm_backward_dx)."""
     qkv_view = qkv_out.reshape(B * T, -1)
     d_view = d_qkv.reshape(B * T, -1)
@@ -264,12 +289,14 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     return e / np.sum(e)
 
 
-def _flash_attention_ref(qkv: np.ndarray, B: int, T: int, Hq: int, Hkv: int, HS: int, causal: bool) -> tuple[np.ndarray, np.ndarray]:
+def _flash_attention_ref(
+    qkv: np.ndarray, B: int, T: int, Hq: int, Hkv: int, HS: int, causal: bool
+) -> tuple[np.ndarray, np.ndarray]:
     N = Hq + 2 * Hkv
     qkv4 = qkv.reshape(B, T, N, HS)
     q = qkv4[:, :, :Hq, :]
-    k = qkv4[:, :, Hq:Hq + Hkv, :]
-    v = qkv4[:, :, Hq + Hkv:, :]
+    k = qkv4[:, :, Hq : Hq + Hkv, :]
+    v = qkv4[:, :, Hq + Hkv :, :]
 
     group = Hq // Hkv
     scale = 1.0 / np.sqrt(HS)
@@ -292,13 +319,14 @@ def _flash_attention_ref(qkv: np.ndarray, B: int, T: int, Hq: int, Hkv: int, HS:
     return out, lse
 
 
-def _flash_attention_backward_ref(qkv: np.ndarray, d_out: np.ndarray, B: int, T: int, Hq: int, Hkv: int,
-                                  HS: int, causal: bool) -> np.ndarray:
+def _flash_attention_backward_ref(
+    qkv: np.ndarray, d_out: np.ndarray, B: int, T: int, Hq: int, Hkv: int, HS: int, causal: bool
+) -> np.ndarray:
     N = Hq + 2 * Hkv
     qkv4 = qkv.reshape(B, T, N, HS)
     q = qkv4[:, :, :Hq, :]
-    k = qkv4[:, :, Hq:Hq + Hkv, :]
-    v = qkv4[:, :, Hq + Hkv:, :]
+    k = qkv4[:, :, Hq : Hq + Hkv, :]
+    v = qkv4[:, :, Hq + Hkv :, :]
 
     dq = np.zeros_like(q)
     dk = np.zeros_like(k)
@@ -330,8 +358,8 @@ def _flash_attention_backward_ref(qkv: np.ndarray, d_out: np.ndarray, B: int, T:
 
     d_qkv = np.zeros_like(qkv4)
     d_qkv[:, :, :Hq, :] = dq
-    d_qkv[:, :, Hq:Hq + Hkv, :] = dk
-    d_qkv[:, :, Hq + Hkv:, :] = dv
+    d_qkv[:, :, Hq : Hq + Hkv, :] = dk
+    d_qkv[:, :, Hq + Hkv :, :] = dv
     return d_qkv.reshape(B, T, N * HS)
 
 
@@ -339,7 +367,8 @@ def _flash_attention_backward_ref(qkv: np.ndarray, d_out: np.ndarray, B: int, T:
 # Generators
 # -----------------------------------------------------------------------------
 
-def gen_matmul_swiglu() -> List[GoldenCase]:
+
+def gen_matmul_swiglu() -> list[GoldenCase]:
     # swiglu_forward kernel requires (B*T*D) to be a multiple of 1024 for FP32.
     B, T, K, D = 2, 2, 3, 256
     M, N = B * T, 2 * D
@@ -398,16 +427,13 @@ def gen_matmul_swiglu() -> List[GoldenCase]:
     return [GoldenCase(op="matmul_swiglu", case="small_case_1", payload=payload)]
 
 
-def gen_embedding() -> List[GoldenCase]:
+def gen_embedding() -> list[GoldenCase]:
     # Small deterministic embedding lookup
     token_ids = np.array([[0, 1, 3], [2, 1, 0]], dtype=np.int32)
     vocab_size = 4
     hidden = 4
     weight = np.array(
-        [[0.1, -0.2, 0.3, 0.4],
-         [0.0, 0.5, -0.5, -0.25],
-         [1.0, -1.0, 2.0, 0.75],
-         [-0.75, 0.25, 0.5, -1.25]],
+        [[0.1, -0.2, 0.3, 0.4], [0.0, 0.5, -0.5, -0.25], [1.0, -1.0, 2.0, 0.75], [-0.75, 0.25, 0.5, -1.25]],
         dtype=np.float64,
     )
     out = weight[token_ids]
@@ -432,16 +458,14 @@ def gen_embedding() -> List[GoldenCase]:
     return [GoldenCase(op="embedding", case="small_case_1", payload=payload)]
 
 
-def gen_fused_residual_rmsnorm() -> List[GoldenCase]:
+def gen_fused_residual_rmsnorm() -> list[GoldenCase]:
     B, T, C = 1, 2, 4
     residual_in = np.array(
-        [[[-0.5, 1.0, 0.25, -1.5],
-          [0.75, -0.25, 2.0, 0.5]]],
+        [[[-0.5, 1.0, 0.25, -1.5], [0.75, -0.25, 2.0, 0.5]]],
         dtype=np.float64,
     )
     inp = np.array(
-        [[[1.5, -0.5, 0.75, 0.25],
-          [-1.0, 0.5, -0.25, 1.0]]],
+        [[[1.5, -0.5, 0.75, 0.25], [-1.0, 0.5, -0.25, 1.0]]],
         dtype=np.float64,
     )
     weight = np.array([1.0, 0.5, 1.5, -0.25], dtype=np.float64)
@@ -477,7 +501,7 @@ def gen_fused_residual_rmsnorm() -> List[GoldenCase]:
     return [GoldenCase(op="fused_residual_rmsnorm", case="small_case_1", payload=payload)]
 
 
-def gen_rope() -> List[GoldenCase]:
+def gen_rope() -> list[GoldenCase]:
     B, T = 1, 2
     Hq, Hkv = 2, 1
     HD = 4
@@ -522,7 +546,7 @@ def gen_rope() -> List[GoldenCase]:
     return [GoldenCase(op="rope", case="small_case_1", payload=payload)]
 
 
-def gen_qkv_qk_norm_rope() -> List[GoldenCase]:
+def gen_qkv_qk_norm_rope() -> list[GoldenCase]:
     B, T = 1, 2
     Hq, Hkv = 2, 1
     HS = 64
@@ -570,7 +594,7 @@ def gen_qkv_qk_norm_rope() -> List[GoldenCase]:
     return [GoldenCase(op="qkv_qk_norm_rope", case="small_case_1", payload=payload)]
 
 
-def gen_flash_attention() -> List[GoldenCase]:
+def gen_flash_attention() -> list[GoldenCase]:
     B, T = 1, 3
     Hq, Hkv = 2, 1
     HS = 64
@@ -605,11 +629,13 @@ def gen_flash_attention() -> List[GoldenCase]:
     return [GoldenCase(op="flash_attention", case="small_case_1", payload=payload)]
 
 
-def gen_cross_entropy_loss() -> List[GoldenCase]:
+def gen_cross_entropy_loss() -> list[GoldenCase]:
     logits = np.array(
-        [[1.0, -0.5, 0.25, 2.0, -1.0, 0.5, -0.75, 1.25],
-         [0.5, 1.5, -0.25, -1.0, 0.75, -0.5, 1.0, -1.25],
-         [-0.5, 0.25, 1.0, -0.75, 1.5, -1.0, 0.5, 0.25]],
+        [
+            [1.0, -0.5, 0.25, 2.0, -1.0, 0.5, -0.75, 1.25],
+            [0.5, 1.5, -0.25, -1.0, 0.75, -0.5, 1.0, -1.25],
+            [-0.5, 0.25, 1.0, -0.75, 1.5, -1.0, 0.5, 0.25],
+        ],
         dtype=np.float64,
     )
     targets = np.array([3, 1, 6], dtype=np.int32)
@@ -638,18 +664,13 @@ def gen_cross_entropy_loss() -> List[GoldenCase]:
     return [GoldenCase(op="cross_entropy_loss", case="small_case_1", payload=payload)]
 
 
-def gen_fused_lm_head_loss() -> List[GoldenCase]:
+def gen_fused_lm_head_loss() -> list[GoldenCase]:
     xF = np.array(
-        [[1.0, -0.5, 0.25],
-         [0.5, 1.5, -1.0],
-         [-0.75, 0.25, 1.25]],
+        [[1.0, -0.5, 0.25], [0.5, 1.5, -1.0], [-0.75, 0.25, 1.25]],
         dtype=np.float64,
     )
     weight = np.array(
-        [[0.5, -1.0, 0.25],
-         [-0.5, 1.5, 0.75],
-         [1.0, 0.0, -0.5],
-         [-1.25, 0.5, 1.0]],
+        [[0.5, -1.0, 0.25], [-0.5, 1.5, 0.75], [1.0, 0.0, -0.5], [-1.25, 0.5, 1.0]],
         dtype=np.float64,
     )
     targets = np.array([2, 1, 3], dtype=np.int32)
@@ -680,7 +701,7 @@ def gen_fused_lm_head_loss() -> List[GoldenCase]:
     return [GoldenCase(op="fused_lm_head_loss", case="small_case_1", payload=payload)]
 
 
-def gen_flash_attention_backward() -> List[GoldenCase]:
+def gen_flash_attention_backward() -> list[GoldenCase]:
     B, T = 1, 3
     Hq, Hkv = 2, 1
     HS = 64
@@ -720,11 +741,13 @@ def gen_flash_attention_backward() -> List[GoldenCase]:
     return [GoldenCase(op="flash_attention_backward", case="small_case_1", payload=payload)]
 
 
-def gen_cross_entropy_backward() -> List[GoldenCase]:
+def gen_cross_entropy_backward() -> list[GoldenCase]:
     logits = np.array(
-        [[1.0, -0.5, 0.25, 2.0, -1.0, 0.5, -0.75, 1.25],
-         [0.5, 1.5, -0.25, -1.0, 0.75, -0.5, 1.0, -1.25],
-         [-0.5, 0.25, 1.0, -0.75, 1.5, -1.0, 0.5, 0.25]],
+        [
+            [1.0, -0.5, 0.25, 2.0, -1.0, 0.5, -0.75, 1.25],
+            [0.5, 1.5, -0.25, -1.0, 0.75, -0.5, 1.0, -1.25],
+            [-0.5, 0.25, 1.0, -0.75, 1.5, -1.0, 0.5, 0.25],
+        ],
         dtype=np.float64,
     )
     targets = np.array([3, 1, 6], dtype=np.int32)
@@ -756,18 +779,13 @@ def gen_cross_entropy_backward() -> List[GoldenCase]:
     return [GoldenCase(op="cross_entropy_backward", case="small_case_1", payload=payload)]
 
 
-def gen_fused_lm_head_loss_backward() -> List[GoldenCase]:
+def gen_fused_lm_head_loss_backward() -> list[GoldenCase]:
     xF = np.array(
-        [[1.0, -0.5, 0.25],
-         [0.5, 1.5, -1.0],
-         [-0.75, 0.25, 1.25]],
+        [[1.0, -0.5, 0.25], [0.5, 1.5, -1.0], [-0.75, 0.25, 1.25]],
         dtype=np.float64,
     )
     weight = np.array(
-        [[0.5, -1.0, 0.25],
-         [-0.5, 1.5, 0.75],
-         [1.0, 0.0, -0.5],
-         [-1.25, 0.5, 1.0]],
+        [[0.5, -1.0, 0.25], [-0.5, 1.5, 0.75], [1.0, 0.0, -0.5], [-1.25, 0.5, 1.0]],
         dtype=np.float64,
     )
     targets = np.array([2, 1, 3], dtype=np.int32)
@@ -805,7 +823,7 @@ def gen_fused_lm_head_loss_backward() -> List[GoldenCase]:
     return [GoldenCase(op="fused_lm_head_loss_backward", case="small_case_1", payload=payload)]
 
 
-def gen_rope_backward() -> List[GoldenCase]:
+def gen_rope_backward() -> list[GoldenCase]:
     B, T = 1, 2
     Hq, Hkv = 2, 1
     HD = 4
@@ -843,7 +861,7 @@ def gen_rope_backward() -> List[GoldenCase]:
     return [GoldenCase(op="rope_backward", case="small_case_1", payload=payload)]
 
 
-def gen_qkv_qk_norm_rope_backward() -> List[GoldenCase]:
+def gen_qkv_qk_norm_rope_backward() -> list[GoldenCase]:
     B, T = 1, 2
     Hq, Hkv = 2, 1
     HS = 64
@@ -900,16 +918,14 @@ def gen_qkv_qk_norm_rope_backward() -> List[GoldenCase]:
     return [GoldenCase(op="qkv_qk_norm_rope_backward", case="small_case_1", payload=payload)]
 
 
-def gen_fused_residual_rmsnorm_backward() -> List[GoldenCase]:
+def gen_fused_residual_rmsnorm_backward() -> list[GoldenCase]:
     B, T, C = 1, 2, 4
     residual_in = np.array(
-        [[[-0.5, 1.0, 0.25, -1.5],
-          [0.75, -0.25, 2.0, 0.5]]],
+        [[[-0.5, 1.0, 0.25, -1.5], [0.75, -0.25, 2.0, 0.5]]],
         dtype=np.float64,
     )
     inp = np.array(
-        [[[1.5, -0.5, 0.75, 0.25],
-          [-1.0, 0.5, -0.25, 1.0]]],
+        [[[1.5, -0.5, 0.75, 0.25], [-1.0, 0.5, -0.25, 1.0]]],
         dtype=np.float64,
     )
     weight = np.array([1.0, 0.5, 1.5, -0.25], dtype=np.float64)
@@ -921,13 +937,11 @@ def gen_fused_residual_rmsnorm_backward() -> List[GoldenCase]:
     rstd = (1.0 / np.sqrt(mean_sq + eps)).reshape(B, T)
 
     d_y = np.array(
-        [[[0.25, -0.5, 1.0, -1.5],
-          [0.75, 0.5, -0.25, 1.25]]],
+        [[[0.25, -0.5, 1.0, -1.5], [0.75, 0.5, -0.25, 1.25]]],
         dtype=np.float64,
     )
     d_residual_next = np.array(
-        [[[0.1, -0.2, 0.3, -0.4],
-          [-0.5, 0.6, -0.7, 0.8]]],
+        [[[0.1, -0.2, 0.3, -0.4], [-0.5, 0.6, -0.7, 0.8]]],
         dtype=np.float64,
     )
 
@@ -962,9 +976,8 @@ def gen_fused_residual_rmsnorm_backward() -> List[GoldenCase]:
     return [GoldenCase(op="fused_residual_rmsnorm_backward", case="small_case_1", payload=payload)]
 
 
-def gen_add_backward() -> List[GoldenCase]:
-    d_out = np.array([[1.0, -0.5, 2.0],
-                      [0.25, 3.0, -1.5]], dtype=np.float64)
+def gen_add_backward() -> list[GoldenCase]:
+    d_out = np.array([[1.0, -0.5, 2.0], [0.25, 3.0, -1.5]], dtype=np.float64)
     d_a = d_out.copy()
     d_b = d_out.copy()
 
@@ -986,11 +999,9 @@ def gen_add_backward() -> List[GoldenCase]:
     return [GoldenCase(op="add_backward", case="small_case_1", payload=payload)]
 
 
-def gen_view_backward() -> List[GoldenCase]:
+def gen_view_backward() -> list[GoldenCase]:
     d_out = np.array(
-        [[1.0, -1.0, 2.0, -2.0],
-         [0.5, 0.25, -0.5, 1.5],
-         [3.0, -3.0, 4.0, -4.0]],
+        [[1.0, -1.0, 2.0, -2.0], [0.5, 0.25, -0.5, 1.5], [3.0, -3.0, 4.0, -4.0]],
         dtype=np.float64,
     )
     d_inp = d_out.reshape(2, 3, 2)
@@ -1012,10 +1023,9 @@ def gen_view_backward() -> List[GoldenCase]:
     return [GoldenCase(op="view_backward", case="small_case_1", payload=payload)]
 
 
-def gen_bias_add_backward() -> List[GoldenCase]:
+def gen_bias_add_backward() -> list[GoldenCase]:
     d_out = np.array(
-        [[[1.0, -0.5, 2.0, 0.75],
-          [0.25, 3.0, -1.5, -2.0]]],
+        [[[1.0, -0.5, 2.0, 0.75], [0.25, 3.0, -1.5, -2.0]]],
         dtype=np.float64,
     )
     d_x = d_out.copy()
@@ -1039,14 +1049,10 @@ def gen_bias_add_backward() -> List[GoldenCase]:
     return [GoldenCase(op="bias_add_backward", case="small_case_1", payload=payload)]
 
 
-def gen_matmul_backward() -> List[GoldenCase]:
-    A = np.array([[1.0, 2.0, -1.0],
-                  [0.5, -1.0, 3.0]], dtype=np.float64)
-    B = np.array([[1.0, 0.0, 2.0, -1.0],
-                  [0.0, 1.0, -1.0, 0.5],
-                  [1.0, 1.0, 0.0, 2.0]], dtype=np.float64)
-    d_out = np.array([[1.0, -0.5, 2.0, -1.0],
-                      [0.25, 3.0, -1.5, 0.5]], dtype=np.float64)
+def gen_matmul_backward() -> list[GoldenCase]:
+    A = np.array([[1.0, 2.0, -1.0], [0.5, -1.0, 3.0]], dtype=np.float64)
+    B = np.array([[1.0, 0.0, 2.0, -1.0], [0.0, 1.0, -1.0, 0.5], [1.0, 1.0, 0.0, 2.0]], dtype=np.float64)
+    d_out = np.array([[1.0, -0.5, 2.0, -1.0], [0.25, 3.0, -1.5, 0.5]], dtype=np.float64)
     dA = d_out @ B.T
     dB = A.T @ d_out
 
@@ -1070,7 +1076,7 @@ def gen_matmul_backward() -> List[GoldenCase]:
     return [GoldenCase(op="matmul_backward", case="small_case_1", payload=payload)]
 
 
-def gen_swiglu_backward() -> List[GoldenCase]:
+def gen_swiglu_backward() -> list[GoldenCase]:
     # swiglu_backward kernel requires (B*T*C) to be a multiple of 1024 for FP32.
     B, T, C = 2, 2, 256
     inp = (np.arange(B * T * 2 * C, dtype=np.float64).reshape(B, T, 2 * C) * 0.01) - 0.5
@@ -1101,7 +1107,7 @@ def gen_swiglu_backward() -> List[GoldenCase]:
     return [GoldenCase(op="swiglu_backward", case="small_case_1", payload=payload)]
 
 
-def gen_matmul_swiglu_backward() -> List[GoldenCase]:
+def gen_matmul_swiglu_backward() -> list[GoldenCase]:
     # swiglu_backward kernel requires (B*T*D) to be a multiple of 1024 for FP32.
     B, T, K, D = 2, 2, 3, 256
     M, N = B * T, 2 * D
@@ -1147,15 +1153,13 @@ def gen_matmul_swiglu_backward() -> List[GoldenCase]:
     return [GoldenCase(op="matmul_swiglu_backward", case="small_case_1", payload=payload)]
 
 
-def gen_embedding_backward() -> List[GoldenCase]:
+def gen_embedding_backward() -> list[GoldenCase]:
     token_ids = np.array([[0, 1, 3], [2, 1, 0]], dtype=np.int32)
     d_out = np.array(
-        [[[0.1, -0.2, 0.3, 0.4],
-          [0.0, 0.5, -0.5, 0.25],
-          [1.0, -1.0, 2.0, -0.75]],
-         [[-0.75, 0.25, 0.5, -1.25],
-          [0.2, -0.1, 0.4, 0.6],
-          [0.05, 0.15, -0.25, -0.35]]],
+        [
+            [[0.1, -0.2, 0.3, 0.4], [0.0, 0.5, -0.5, 0.25], [1.0, -1.0, 2.0, -0.75]],
+            [[-0.75, 0.25, 0.5, -1.25], [0.2, -0.1, 0.4, 0.6], [0.05, 0.15, -0.25, -0.35]],
+        ],
         dtype=np.float64,
     )
     vocab_size = 4
@@ -1186,7 +1190,7 @@ def gen_embedding_backward() -> List[GoldenCase]:
     return [GoldenCase(op="embedding_backward", case="small_case_1", payload=payload)]
 
 
-def gen_zeros_backward() -> List[GoldenCase]:
+def gen_zeros_backward() -> list[GoldenCase]:
     payload = {
         "op": "zeros_backward",
         "case": "small_case_1",
@@ -1200,15 +1204,12 @@ def gen_zeros_backward() -> List[GoldenCase]:
     return [GoldenCase(op="zeros_backward", case="small_case_1", payload=payload)]
 
 
-def gen_add() -> List[GoldenCase]:
-    A = np.array([[1.5, -2.0, 0.25],
-                  [3.0, 0.0, -4.5]], dtype=np.float64)
-    B = np.array([[-1.0, 2.0, 1.75],
-                  [0.5, -3.0, 2.25]], dtype=np.float64)
+def gen_add() -> list[GoldenCase]:
+    A = np.array([[1.5, -2.0, 0.25], [3.0, 0.0, -4.5]], dtype=np.float64)
+    B = np.array([[-1.0, 2.0, 1.75], [0.5, -3.0, 2.25]], dtype=np.float64)
     out = A + B
 
-    d_out = np.array([[1.0, -0.5, 2.0],
-                      [0.25, 3.0, -1.5]], dtype=np.float64)
+    d_out = np.array([[1.0, -0.5, 2.0], [0.25, 3.0, -1.5]], dtype=np.float64)
     d_a = d_out.copy()
     d_b = d_out.copy()
 
@@ -1245,13 +1246,11 @@ def gen_add() -> List[GoldenCase]:
     return [GoldenCase(op="add", case="small_case_1", payload=payload)]
 
 
-def gen_view() -> List[GoldenCase]:
+def gen_view() -> list[GoldenCase]:
     x = np.arange(12, dtype=np.float64).reshape(2, 3, 2)
     out = x.reshape(3, 4)
     d_out = np.array(
-        [[1.0, -1.0, 2.0, -2.0],
-         [0.5, 0.25, -0.5, 1.5],
-         [3.0, -3.0, 4.0, -4.0]],
+        [[1.0, -1.0, 2.0, -2.0], [0.5, 0.25, -0.5, 1.5], [3.0, -3.0, 4.0, -4.0]],
         dtype=np.float64,
     )
     d_inp = d_out.reshape(x.shape)
@@ -1277,7 +1276,7 @@ def gen_view() -> List[GoldenCase]:
     return [GoldenCase(op="view", case="small_case_1", payload=payload)]
 
 
-def gen_zeros() -> List[GoldenCase]:
+def gen_zeros() -> list[GoldenCase]:
     out = np.zeros((2, 3), dtype=np.float64)
     payload = {
         "op": "zeros",
@@ -1294,19 +1293,17 @@ def gen_zeros() -> List[GoldenCase]:
     return [GoldenCase(op="zeros", case="small_case_1", payload=payload)]
 
 
-def gen_bias_add() -> List[GoldenCase]:
+def gen_bias_add() -> list[GoldenCase]:
     # x shape (B,T,C), bias shape (C)
     x = np.array(
-        [[[1.0, -2.0, 0.5, 1.25],
-          [0.25, 3.0, -1.5, -0.75]]],
+        [[[1.0, -2.0, 0.5, 1.25], [0.25, 3.0, -1.5, -0.75]]],
         dtype=np.float64,
     )
     bias = np.array([0.5, -1.0, 2.0, -0.25], dtype=np.float64)
     out = x + bias
 
     d_out = np.array(
-        [[[1.0, -0.5, 2.0, 0.75],
-          [0.25, 3.0, -1.5, -2.0]]],
+        [[[1.0, -0.5, 2.0, 0.75], [0.25, 3.0, -1.5, -2.0]]],
         dtype=np.float64,
     )
     d_x = d_out.copy()
@@ -1345,16 +1342,12 @@ def gen_bias_add() -> List[GoldenCase]:
     return [GoldenCase(op="bias_add", case="small_case_1", payload=payload)]
 
 
-def gen_matmul() -> List[GoldenCase]:
-    A = np.array([[1.0, 2.0, -1.0],
-                  [0.5, -1.0, 3.0]], dtype=np.float64)  # (M,K)
-    B = np.array([[1.0, 0.0, 2.0, -1.0],
-                  [0.0, 1.0, -1.0, 0.5],
-                  [1.0, 1.0, 0.0, 2.0]], dtype=np.float64)  # (K,N)
+def gen_matmul() -> list[GoldenCase]:
+    A = np.array([[1.0, 2.0, -1.0], [0.5, -1.0, 3.0]], dtype=np.float64)  # (M,K)
+    B = np.array([[1.0, 0.0, 2.0, -1.0], [0.0, 1.0, -1.0, 0.5], [1.0, 1.0, 0.0, 2.0]], dtype=np.float64)  # (K,N)
     out = A @ B
 
-    d_out = np.array([[1.0, -0.5, 2.0, -1.0],
-                      [0.25, 3.0, -1.5, 0.5]], dtype=np.float64)
+    d_out = np.array([[1.0, -0.5, 2.0, -1.0], [0.25, 3.0, -1.5, 0.5]], dtype=np.float64)
     dA = d_out @ B.T
     dB = A.T @ d_out
 
@@ -1391,17 +1384,13 @@ def gen_matmul() -> List[GoldenCase]:
     return [GoldenCase(op="matmul", case="small_case_1", payload=payload)]
 
 
-def gen_matmul_bias() -> List[GoldenCase]:
-    A = np.array([[1.0, 2.0, -1.0],
-                  [0.5, -1.0, 3.0]], dtype=np.float64)
-    B = np.array([[1.0, 0.0, 2.0, -1.0],
-                  [0.0, 1.0, -1.0, 0.5],
-                  [1.0, 1.0, 0.0, 2.0]], dtype=np.float64)
+def gen_matmul_bias() -> list[GoldenCase]:
+    A = np.array([[1.0, 2.0, -1.0], [0.5, -1.0, 3.0]], dtype=np.float64)
+    B = np.array([[1.0, 0.0, 2.0, -1.0], [0.0, 1.0, -1.0, 0.5], [1.0, 1.0, 0.0, 2.0]], dtype=np.float64)
     bias = np.array([0.5, -1.0, 2.0, -0.25], dtype=np.float64)
     out = A @ B + bias
 
-    d_out = np.array([[1.0, -0.5, 2.0, -1.0],
-                      [0.25, 3.0, -1.5, 0.5]], dtype=np.float64)
+    d_out = np.array([[1.0, -0.5, 2.0, -1.0], [0.25, 3.0, -1.5, 0.5]], dtype=np.float64)
     dA = d_out @ B.T
     dB = A.T @ d_out
     d_bias = d_out.sum(axis=0)
@@ -1443,7 +1432,7 @@ def gen_matmul_bias() -> List[GoldenCase]:
     return [GoldenCase(op="matmul_bias", case="small_case_1", payload=payload)]
 
 
-def gen_swiglu() -> List[GoldenCase]:
+def gen_swiglu() -> list[GoldenCase]:
     # swiglu_forward kernel requires (B*T*C) to be a multiple of 1024 for FP32.
     B, T, C = 2, 2, 256
     inp = (np.arange(B * T * 2 * C, dtype=np.float64).reshape(B, T, 2 * C) * 0.01) - 0.5
@@ -1488,7 +1477,7 @@ def gen_swiglu() -> List[GoldenCase]:
     return [GoldenCase(op="swiglu", case="small_case_1", payload=payload)]
 
 
-def gen_swiglu_mlp() -> List[GoldenCase]:
+def gen_swiglu_mlp() -> list[GoldenCase]:
     """Generate SwiGLU MLP golden test (composed: matmul -> swiglu -> matmul)."""
     if torch is None:
         raise RuntimeError("PyTorch required for module golden generation")
@@ -1524,10 +1513,7 @@ def gen_swiglu_mlp() -> List[GoldenCase]:
     # Backward pass
     d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
     d_out_t = torch.tensor(d_out, dtype=torch.float64)
-    d_x, d_up_w, d_down_w = torch.autograd.grad(
-        out, (x_t, up_w_t, down_w_t),
-        grad_outputs=d_out_t
-    )
+    d_x, d_up_w, d_down_w = torch.autograd.grad(out, (x_t, up_w_t, down_w_t), grad_outputs=d_out_t)
 
     # Save intermediate activations for verification
     up_3d_np = up_3d.detach().numpy()
@@ -1564,7 +1550,7 @@ def gen_swiglu_mlp() -> List[GoldenCase]:
     return [GoldenCase(op="swiglu_mlp", case="small_case_1", payload=payload)]
 
 
-def gen_gqa_attention() -> List[GoldenCase]:
+def gen_gqa_attention() -> list[GoldenCase]:
     """Generate GQA Attention golden test (composed: qkv_proj -> rope -> flash_attn -> out_proj)."""
     if torch is None:
         raise RuntimeError("PyTorch required for module golden generation")
@@ -1608,10 +1594,7 @@ def gen_gqa_attention() -> List[GoldenCase]:
     # Backward pass
     d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
     d_out_t = torch.tensor(d_out, dtype=torch.float64)
-    d_x, d_qkv_w, d_out_w = torch.autograd.grad(
-        out, (x_t, qkv_w_t, out_w_t),
-        grad_outputs=d_out_t
-    )
+    d_x, d_qkv_w, d_out_w = torch.autograd.grad(out, (x_t, qkv_w_t, out_w_t), grad_outputs=d_out_t)
 
     # Save intermediates
     qkv_packed_np = qkv_packed.detach().numpy()
@@ -1661,8 +1644,8 @@ def _torch_flash_attention_ref(qkv: torch.Tensor, B: int, T: int, Hq: int, Hkv: 
     N = Hq + 2 * Hkv
     qkv4 = qkv.reshape(B, T, N, HS)
     q = qkv4[:, :, :Hq, :]
-    k = qkv4[:, :, Hq:Hq + Hkv, :]
-    v = qkv4[:, :, Hq + Hkv:, :]
+    k = qkv4[:, :, Hq : Hq + Hkv, :]
+    v = qkv4[:, :, Hq + Hkv :, :]
 
     group = Hq // Hkv
     scale = 1.0 / np.sqrt(HS)
@@ -1682,7 +1665,7 @@ def _torch_flash_attention_ref(qkv: torch.Tensor, B: int, T: int, Hq: int, Hkv: 
     # Apply causal mask
     if causal:
         mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=scores.device), diagonal=1)
-        scores = scores.masked_fill(mask, float('-inf'))
+        scores = scores.masked_fill(mask, float("-inf"))
 
     # Compute LSE (logsumexp) for each query position
     lse = torch.logsumexp(scores, dim=-1)  # (B, Hq, T)
@@ -1699,8 +1682,9 @@ def _torch_flash_attention_ref(qkv: torch.Tensor, B: int, T: int, Hq: int, Hkv: 
     return out, lse
 
 
-def _torch_rope(qkv: torch.Tensor, freqs: torch.Tensor, position_ids: np.ndarray,
-                Hq: int, Hkv: int, head_dim: int) -> torch.Tensor:
+def _torch_rope(
+    qkv: torch.Tensor, freqs: torch.Tensor, position_ids: np.ndarray, Hq: int, Hkv: int, head_dim: int
+) -> torch.Tensor:
     """Apply RoPE using PyTorch (for golden generation).
 
     Args:
@@ -1731,15 +1715,15 @@ def _torch_rope(qkv: torch.Tensor, freqs: torch.Tensor, position_ids: np.ndarray
                 # Clone to avoid in-place modification issue - real/imag are views,
                 # so writing to out[..., :rotary_half] modifies what real points to
                 real = out[b, t, h, :rotary_half].clone()
-                imag = out[b, t, h, rotary_half:2*rotary_half].clone()
+                imag = out[b, t, h, rotary_half : 2 * rotary_half].clone()
 
                 out[b, t, h, :rotary_half] = real * cos_vals - imag * sin_vals
-                out[b, t, h, rotary_half:2*rotary_half] = real * sin_vals + imag * cos_vals
+                out[b, t, h, rotary_half : 2 * rotary_half] = real * sin_vals + imag * cos_vals
 
     return out
 
 
-def gen_embedding_module() -> List[GoldenCase]:
+def gen_embedding_module() -> list[GoldenCase]:
     """Generate Embedding module golden test (token lookup)."""
     if torch is None:
         raise RuntimeError("PyTorch required for module golden generation")
@@ -1763,7 +1747,7 @@ def gen_embedding_module() -> List[GoldenCase]:
     # Backward pass
     d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
     d_out_t = torch.tensor(d_out, dtype=torch.float64)
-    d_embed_w, = torch.autograd.grad(out, (embed_w_t,), grad_outputs=d_out_t)
+    (d_embed_w,) = torch.autograd.grad(out, (embed_w_t,), grad_outputs=d_out_t)
 
     payload = {
         "op": "embedding_module",
@@ -1791,7 +1775,7 @@ def gen_embedding_module() -> List[GoldenCase]:
     return [GoldenCase(op="embedding_module", case="small_case_1", payload=payload)]
 
 
-def gen_rmsnorm_module() -> List[GoldenCase]:
+def gen_rmsnorm_module() -> list[GoldenCase]:
     """Generate RMSNorm module golden test (fused residual + RMS normalization)."""
     if torch is None:
         raise RuntimeError("PyTorch required for module golden generation")
@@ -1813,16 +1797,14 @@ def gen_rmsnorm_module() -> List[GoldenCase]:
 
     # Fused residual + RMSNorm
     residual_out = residual_t + x_t
-    rms = torch.sqrt(torch.mean(residual_out ** 2, dim=-1, keepdim=True) + eps)
+    rms = torch.sqrt(torch.mean(residual_out**2, dim=-1, keepdim=True) + eps)
     rstd = 1.0 / rms
     y = residual_out * rstd * weight_t
 
     # Backward pass
     d_y = np.random.randn(B, T, C).astype(np.float64) * 0.1
     d_y_t = torch.tensor(d_y, dtype=torch.float64)
-    d_residual, d_x, d_weight = torch.autograd.grad(
-        y, (residual_t, x_t, weight_t), grad_outputs=d_y_t
-    )
+    d_residual, d_x, d_weight = torch.autograd.grad(y, (residual_t, x_t, weight_t), grad_outputs=d_y_t)
 
     payload = {
         "op": "rmsnorm_module",
@@ -1855,7 +1837,7 @@ def gen_rmsnorm_module() -> List[GoldenCase]:
     return [GoldenCase(op="rmsnorm_module", case="small_case_1", payload=payload)]
 
 
-def gen_transformer_block() -> List[GoldenCase]:
+def gen_transformer_block() -> list[GoldenCase]:
     """Generate TransformerBlock golden test (attention + MLP with residuals)."""
     if torch is None:
         raise RuntimeError("PyTorch required for module golden generation")
@@ -1893,7 +1875,7 @@ def gen_transformer_block() -> List[GoldenCase]:
     freqs_t = torch.tensor(freqs, dtype=torch.float64)
 
     # Pre-attention RMSNorm
-    rms1 = torch.sqrt(torch.mean(x_t ** 2, dim=-1, keepdim=True) + eps)
+    rms1 = torch.sqrt(torch.mean(x_t**2, dim=-1, keepdim=True) + eps)
     ln1_out = x_t / rms1 * ln1_w_t
 
     # QKV projection
@@ -1913,14 +1895,14 @@ def gen_transformer_block() -> List[GoldenCase]:
     attn_residual = x_t + proj_out.reshape(B, T, C)
 
     # Pre-MLP RMSNorm
-    rms2 = torch.sqrt(torch.mean(attn_residual ** 2, dim=-1, keepdim=True) + eps)
+    rms2 = torch.sqrt(torch.mean(attn_residual**2, dim=-1, keepdim=True) + eps)
     ln2_out = attn_residual / rms2 * ln2_w_t
 
     # MLP with SwiGLU
     ln2_flat = ln2_out.reshape(B * T, C)
     up_out = ln2_flat @ up_w_t.T  # [B*T, M]
-    gate = up_out[:, :M // 2]
-    up = up_out[:, M // 2:]
+    gate = up_out[:, : M // 2]
+    up = up_out[:, M // 2 :]
     swiglu_out = torch.nn.functional.silu(gate) * up  # [B*T, M//2]
     down_out = swiglu_out @ down_w_t.T  # [B*T, C]
 
@@ -1931,10 +1913,7 @@ def gen_transformer_block() -> List[GoldenCase]:
     d_out = np.random.randn(B, T, C).astype(np.float64) * 0.1
     d_out_t = torch.tensor(d_out, dtype=torch.float64)
 
-    grads = torch.autograd.grad(
-        out, (x_t, ln1_w_t, qkv_w_t, out_w_t, ln2_w_t, up_w_t, down_w_t),
-        grad_outputs=d_out_t
-    )
+    grads = torch.autograd.grad(out, (x_t, ln1_w_t, qkv_w_t, out_w_t, ln2_w_t, up_w_t, down_w_t), grad_outputs=d_out_t)
     d_x, d_ln1_w, d_qkv_w, d_out_w, d_ln2_w, d_up_w, d_down_w = grads
 
     payload = {
@@ -1984,7 +1963,7 @@ def gen_transformer_block() -> List[GoldenCase]:
     return [GoldenCase(op="transformer_block", case="small_case_1", payload=payload)]
 
 
-def gen_lm_head_module() -> List[GoldenCase]:
+def gen_lm_head_module() -> list[GoldenCase]:
     """Generate LMHead module golden test (final norm + projection + loss)."""
     if torch is None:
         raise RuntimeError("PyTorch required for module golden generation")
@@ -2008,7 +1987,7 @@ def gen_lm_head_module() -> List[GoldenCase]:
     targets_t = torch.tensor(targets, dtype=torch.long)
 
     # Final RMSNorm
-    rms = torch.sqrt(torch.mean(x_t ** 2, dim=-1, keepdim=True) + eps)
+    rms = torch.sqrt(torch.mean(x_t**2, dim=-1, keepdim=True) + eps)
     ln_out = x_t / rms * ln_w_t
 
     # LM Head projection
@@ -2017,15 +1996,11 @@ def gen_lm_head_module() -> List[GoldenCase]:
     logits_3d = logits.reshape(B, T, V)
 
     # Cross-entropy loss
-    loss = torch.nn.functional.cross_entropy(
-        logits_3d.reshape(-1, V), targets_t.reshape(-1), reduction='mean'
-    )
+    loss = torch.nn.functional.cross_entropy(logits_3d.reshape(-1, V), targets_t.reshape(-1), reduction="mean")
 
     # Backward pass
     d_loss = torch.ones_like(loss)
-    d_x, d_ln_w, d_lm_w = torch.autograd.grad(
-        loss, (x_t, ln_w_t, lm_w_t), grad_outputs=d_loss
-    )
+    d_x, d_ln_w, d_lm_w = torch.autograd.grad(loss, (x_t, ln_w_t, lm_w_t), grad_outputs=d_loss)
 
     payload = {
         "op": "lm_head_module",
@@ -2059,7 +2034,7 @@ def gen_lm_head_module() -> List[GoldenCase]:
     return [GoldenCase(op="lm_head_module", case="small_case_1", payload=payload)]
 
 
-def gen_llama_block() -> List[GoldenCase]:
+def gen_llama_block() -> list[GoldenCase]:
     """Generate LlamaBlock golden test.
 
     Matches the structure from surogate/dsl/blocks/llama.py:
@@ -2115,7 +2090,7 @@ def gen_llama_block() -> List[GoldenCase]:
     # === Pre-attention fused_residual_rmsnorm ===
     # res_ffn = residual + x; ln1 = rmsnorm(res_ffn)
     res_ffn = residual_t + x_t
-    rms1 = torch.sqrt(torch.mean(res_ffn ** 2, dim=-1, keepdim=True) + eps)
+    rms1 = torch.sqrt(torch.mean(res_ffn**2, dim=-1, keepdim=True) + eps)
     ln1_out = res_ffn / rms1 * ln1_w_t
 
     # === QKV projection (no bias) ===
@@ -2137,7 +2112,7 @@ def gen_llama_block() -> List[GoldenCase]:
     # === Pre-MLP fused_residual_rmsnorm ===
     # res_att = res_ffn + att_out; ln2 = rmsnorm(res_att)
     res_att = res_ffn + att_out
-    rms2 = torch.sqrt(torch.mean(res_att ** 2, dim=-1, keepdim=True) + eps)
+    rms2 = torch.sqrt(torch.mean(res_att**2, dim=-1, keepdim=True) + eps)
     ln2_out = res_att / rms2 * ln2_w_t
 
     # === MLP with SwiGLU ===
@@ -2223,7 +2198,7 @@ def gen_llama_block() -> List[GoldenCase]:
     return [GoldenCase(op="llama_block", case="small_case_1", payload=payload)]
 
 
-def gen_qwen3_block() -> List[GoldenCase]:
+def gen_qwen3_block() -> list[GoldenCase]:
     """Generate Qwen3Block golden test.
 
     Matches the structure from surogate/dsl/blocks/qwen3.py:
@@ -2284,7 +2259,7 @@ def gen_qwen3_block() -> List[GoldenCase]:
 
     # === Pre-attention fused_residual_rmsnorm ===
     res_ffn = residual_t + x_t
-    rms1 = torch.sqrt(torch.mean(res_ffn ** 2, dim=-1, keepdim=True) + eps)
+    rms1 = torch.sqrt(torch.mean(res_ffn**2, dim=-1, keepdim=True) + eps)
     ln1_out = res_ffn / rms1 * ln1_w_t
 
     # === QKV projection (no bias) ===
@@ -2295,13 +2270,13 @@ def gen_qwen3_block() -> List[GoldenCase]:
     # === QK-Norm + RoPE (fused) ===
     # Split QKV
     q = qkv[:, :, :Hq, :]  # [B, T, Hq, HD]
-    k = qkv[:, :, Hq:Hq+Hkv, :]  # [B, T, Hkv, HD]
-    v = qkv[:, :, Hq+Hkv:, :]  # [B, T, Hkv, HD]
+    k = qkv[:, :, Hq : Hq + Hkv, :]  # [B, T, Hkv, HD]
+    v = qkv[:, :, Hq + Hkv :, :]  # [B, T, Hkv, HD]
 
     # Apply RMSNorm to Q and K per-head
-    q_rms = torch.sqrt(torch.mean(q ** 2, dim=-1, keepdim=True) + eps)
+    q_rms = torch.sqrt(torch.mean(q**2, dim=-1, keepdim=True) + eps)
     q_normed = q / q_rms * q_norm_w_t
-    k_rms = torch.sqrt(torch.mean(k ** 2, dim=-1, keepdim=True) + eps)
+    k_rms = torch.sqrt(torch.mean(k**2, dim=-1, keepdim=True) + eps)
     k_normed = k / k_rms * k_norm_w_t
 
     # Reassemble QKV for RoPE
@@ -2320,7 +2295,7 @@ def gen_qwen3_block() -> List[GoldenCase]:
 
     # === Pre-MLP fused_residual_rmsnorm ===
     res_att = res_ffn + att_out
-    rms2 = torch.sqrt(torch.mean(res_att ** 2, dim=-1, keepdim=True) + eps)
+    rms2 = torch.sqrt(torch.mean(res_att**2, dim=-1, keepdim=True) + eps)
     ln2_out = res_att / rms2 * ln2_w_t
 
     # === MLP with SwiGLU ===
@@ -2407,7 +2382,7 @@ def gen_qwen3_block() -> List[GoldenCase]:
     return [GoldenCase(op="qwen3_block", case="small_case_1", payload=payload)]
 
 
-def gen_qwen3_model() -> List[GoldenCase]:
+def gen_qwen3_model() -> list[GoldenCase]:
     """Generate Qwen3Model golden test (1-layer model).
 
     Matches the structure from surogate/dsl/models/qwen3.py:
@@ -2488,7 +2463,7 @@ def gen_qwen3_model() -> List[GoldenCase]:
     # === 3. Qwen3Block forward (single layer) ===
     # Pre-attention norm
     res_ffn = residual0 + x0
-    rms1 = torch.sqrt(torch.mean(res_ffn ** 2, dim=-1, keepdim=True) + eps)
+    rms1 = torch.sqrt(torch.mean(res_ffn**2, dim=-1, keepdim=True) + eps)
     ln1_out = res_ffn / rms1 * ln1_w_t
 
     # QKV projection
@@ -2498,12 +2473,12 @@ def gen_qwen3_model() -> List[GoldenCase]:
 
     # QK-Norm + RoPE
     q = qkv[:, :, :Hq, :]
-    k = qkv[:, :, Hq:Hq+Hkv, :]
-    v = qkv[:, :, Hq+Hkv:, :]
+    k = qkv[:, :, Hq : Hq + Hkv, :]
+    v = qkv[:, :, Hq + Hkv :, :]
 
-    q_rms = torch.sqrt(torch.mean(q ** 2, dim=-1, keepdim=True) + eps)
+    q_rms = torch.sqrt(torch.mean(q**2, dim=-1, keepdim=True) + eps)
     q_normed = q / q_rms * q_norm_w_t
-    k_rms = torch.sqrt(torch.mean(k ** 2, dim=-1, keepdim=True) + eps)
+    k_rms = torch.sqrt(torch.mean(k**2, dim=-1, keepdim=True) + eps)
     k_normed = k / k_rms * k_norm_w_t
 
     qkv_normed = torch.cat([q_normed, k_normed, v], dim=2)
@@ -2519,7 +2494,7 @@ def gen_qwen3_model() -> List[GoldenCase]:
 
     # Pre-MLP norm
     res_att = res_ffn + att_out
-    rms2 = torch.sqrt(torch.mean(res_att ** 2, dim=-1, keepdim=True) + eps)
+    rms2 = torch.sqrt(torch.mean(res_att**2, dim=-1, keepdim=True) + eps)
     ln2_out = res_att / rms2 * ln2_w_t
 
     # MLP with SwiGLU
@@ -2540,7 +2515,7 @@ def gen_qwen3_model() -> List[GoldenCase]:
 
     # === 4. Final fused_residual_rmsnorm ===
     residual_final = residual1 + x1
-    rms_final = torch.sqrt(torch.mean(residual_final ** 2, dim=-1, keepdim=True) + eps)
+    rms_final = torch.sqrt(torch.mean(residual_final**2, dim=-1, keepdim=True) + eps)
     xF = residual_final / rms_final * final_norm_w_t
 
     # === 5. LM head + cross-entropy loss ===
@@ -2627,7 +2602,7 @@ def gen_qwen3_model() -> List[GoldenCase]:
 
 
 # Registry of all ops. Add generators as they are implemented.
-OP_GENERATORS: Dict[str, Callable[[], List[GoldenCase]]] = {
+OP_GENERATORS: dict[str, Callable[[], list[GoldenCase]]] = {
     # Forward ops (primitives)
     "embedding": gen_embedding,
     "zeros": gen_zeros,
@@ -2681,7 +2656,7 @@ def _list_ops() -> None:
         print(f"  {name:30s} {status}")
 
 
-def _resolve_ops(args_ops: List[str], run_all: bool) -> List[str]:
+def _resolve_ops(args_ops: list[str], run_all: bool) -> list[str]:
     if run_all:
         return sorted(OP_GENERATORS.keys())
     if not args_ops:

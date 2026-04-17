@@ -1,17 +1,15 @@
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Union, List
 
 
 class HubOperation:
-
     @classmethod
     @contextmanager
     def patch_hub(cls):
         yield
 
     @classmethod
-    def try_login(cls, key: Optional[str] = None, secret: Optional[str] = None) -> bool:
+    def try_login(cls, key: str | None = None, secret: str | None = None) -> bool:
         """Try to login to the hub
 
         Args:
@@ -24,9 +22,11 @@ class HubOperation:
 
     @classmethod
     def create_model_repo(
-        cls, repo_id: str, 
+        cls,
+        repo_id: str,
         private: bool = False,
-        key: Optional[str] = None, secret: Optional[str] = None, 
+        key: str | None = None,
+        secret: str | None = None,
     ):
         """Create a model repo on the hub
 
@@ -41,15 +41,16 @@ class HubOperation:
     def push_to_hub(
         cls,
         repo_id: str,
-        folder_path: Union[str, Path],
-        path_in_repo: Optional[str] = None,
-        commit_message: Optional[str] = None,
-        commit_description: Optional[str] = None,
+        folder_path: str | Path,
+        path_in_repo: str | None = None,
+        commit_message: str | None = None,
+        commit_description: str | None = None,
         private: bool = False,
-        revision: Optional[str] = 'master',
-        ignore_patterns: Optional[Union[List[str], str]] = None,
-        key: Optional[str] = None, secret: Optional[str] = None,
-        **kwargs
+        revision: str | None = "master",
+        ignore_patterns: list[str] | str | None = None,
+        key: str | None = None,
+        secret: str | None = None,
+        **kwargs,
     ):
         """Push a model-like folder to the hub
 
@@ -73,8 +74,9 @@ class HubOperation:
         subset_name: str,
         split: str,
         streaming: bool = False,
-        revision: Optional[str] = None,
-        key: Optional[str] = None, secret: Optional[str] = None,
+        revision: str | None = None,
+        key: str | None = None,
+        secret: str | None = None,
     ):
         """Load a dataset from the repo
 
@@ -93,11 +95,12 @@ class HubOperation:
     @classmethod
     def download_model(
         cls,
-        model_id_or_path: Optional[str] = None,
-        revision: Optional[str] = None,
-        ignore_patterns: Optional[List[str]] = None,
-        key: Optional[str] = None, secret: Optional[str] = None,
-        **kwargs
+        model_id_or_path: str | None = None,
+        revision: str | None = None,
+        ignore_patterns: list[str] | None = None,
+        key: str | None = None,
+        secret: str | None = None,
+        **kwargs,
     ):
         """Download model from the hub
 

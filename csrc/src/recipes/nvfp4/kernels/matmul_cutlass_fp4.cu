@@ -61,14 +61,17 @@ std::size_t cutlass_fp4_workspace_size(int M, int N, int K) {
     return 16 * 1024 * 1024;  // 16 MB
 }
 
-void matmul_cutlass_fp4(
-    nv_bfloat16* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+void matmul_cutlass_fp4(nv_bfloat16* d,
+                        const uint8_t* a,
+                        const uint8_t* b,
+                        const uint8_t* scale_a,
+                        const uint8_t* scale_b,
+                        std::byte* workspace,
+                        std::size_t workspace_size,
+                        int M,
+                        int N,
+                        int K,
+                        cudaStream_t stream) {
     const int sm_version = get_sm_version();
 
     if (sm_version < 100) {
@@ -107,14 +110,17 @@ void matmul_cutlass_fp4(
                              "Ensure CUDA_ARCHITECTURES includes 100a, 103a, 120a, or 121a.");
 }
 
-void matmul_cutlass_fp4_f32(
-    float* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+void matmul_cutlass_fp4_f32(float* d,
+                            const uint8_t* a,
+                            const uint8_t* b,
+                            const uint8_t* scale_a,
+                            const uint8_t* scale_b,
+                            std::byte* workspace,
+                            std::size_t workspace_size,
+                            int M,
+                            int N,
+                            int K,
+                            cudaStream_t stream) {
     const int sm_version = get_sm_version();
 
     if (sm_version < 100) {
@@ -149,15 +155,18 @@ void matmul_cutlass_fp4_f32(
                              "Ensure CUDA_ARCHITECTURES includes 100a, 103a, 120a, or 121a.");
 }
 
-void matmul_cutlass_fp4_alpha(
-    nv_bfloat16* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    const float* alpha_ptr,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+void matmul_cutlass_fp4_alpha(nv_bfloat16* d,
+                              const uint8_t* a,
+                              const uint8_t* b,
+                              const uint8_t* scale_a,
+                              const uint8_t* scale_b,
+                              const float* alpha_ptr,
+                              std::byte* workspace,
+                              std::size_t workspace_size,
+                              int M,
+                              int N,
+                              int K,
+                              cudaStream_t stream) {
     const int sm_version = get_sm_version();
 
     if (sm_version < 100) {
@@ -168,21 +177,54 @@ void matmul_cutlass_fp4_alpha(
     // Dispatch to the appropriate kernel based on SM version
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     if (sm_version == 100) {
-        matmul_cutlass_fp4_sm100_alpha(d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
+        matmul_cutlass_fp4_sm100_alpha(d,
+                                       a,
+                                       b,
+                                       scale_a,
+                                       scale_b,
+                                       alpha_ptr,
+                                       workspace,
+                                       workspace_size,
+                                       M,
+                                       N,
+                                       K,
+                                       stream);
         return;
     }
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
     if (sm_version == 103) {
-        matmul_cutlass_fp4_sm103_alpha(d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
+        matmul_cutlass_fp4_sm103_alpha(d,
+                                       a,
+                                       b,
+                                       scale_a,
+                                       scale_b,
+                                       alpha_ptr,
+                                       workspace,
+                                       workspace_size,
+                                       M,
+                                       N,
+                                       K,
+                                       stream);
         return;
     }
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
     if (sm_version >= 120) {
-        matmul_cutlass_fp4_sm120_alpha(d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
+        matmul_cutlass_fp4_sm120_alpha(d,
+                                       a,
+                                       b,
+                                       scale_a,
+                                       scale_b,
+                                       alpha_ptr,
+                                       workspace,
+                                       workspace_size,
+                                       M,
+                                       N,
+                                       K,
+                                       stream);
         return;
     }
 #endif

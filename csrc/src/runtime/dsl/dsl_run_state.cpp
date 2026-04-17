@@ -95,7 +95,8 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
     if (rope_type == "linear") {
         compute_default(base);
         if (factor != 0.0) {
-            for (auto& v : out.inv_freq) v = static_cast<float>(v / factor);
+            for (auto& v : out.inv_freq)
+                v = static_cast<float>(v / factor);
         }
         return out;
     }
@@ -117,8 +118,8 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
     }
 
     if (rope_type == "yarn") {
-        const double max_pos = static_cast<double>(
-            rope.original_max_position_embeddings.value_or(cfg.MaxPositionEmbeddings));
+        const double max_pos =
+            static_cast<double>(rope.original_max_position_embeddings.value_or(cfg.MaxPositionEmbeddings));
         const double beta_fast = static_cast<double>(rope.beta_fast.value_or(32.0f));
         const double beta_slow = static_cast<double>(rope.beta_slow.value_or(1.0f));
         const bool truncate = rope.truncate.value_or(true);
@@ -148,8 +149,12 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
         auto find_correction_dim = [&](double num_rot, double dim_val, double base_val, double max_pos_val) {
             return (dim_val * std::log(max_pos_val / (num_rot * 2.0 * kPi))) / (2.0 * std::log(base_val));
         };
-        auto find_correction_range = [&](double low_rot, double high_rot, double dim_val,
-                                         double base_val, double max_pos_val, bool truncate_val) {
+        auto find_correction_range = [&](double low_rot,
+                                         double high_rot,
+                                         double dim_val,
+                                         double base_val,
+                                         double max_pos_val,
+                                         bool truncate_val) {
             double low = find_correction_dim(low_rot, dim_val, base_val, max_pos_val);
             double high = find_correction_dim(high_rot, dim_val, base_val, max_pos_val);
             if (truncate_val) {
@@ -161,7 +166,8 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
             return std::pair<double, double>(low, high);
         };
 
-        auto [low, high] = find_correction_range(beta_fast, beta_slow, static_cast<double>(dim), base, max_pos, truncate);
+        auto [low, high] =
+            find_correction_range(beta_fast, beta_slow, static_cast<double>(dim), base, max_pos, truncate);
         if (low == high) {
             high += 0.001;
         }
@@ -188,7 +194,8 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
             if (factor_for_attn <= 1.0) {
                 attention_factor = 1.0;
             } else if (original_max > 0) {
-                attention_factor = std::sqrt(1.0 + std::log(factor_for_attn) / std::log(static_cast<double>(original_max)));
+                attention_factor =
+                    std::sqrt(1.0 + std::log(factor_for_attn) / std::log(static_cast<double>(original_max)));
             } else {
                 attention_factor = 1.0;
             }
@@ -235,8 +242,8 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
             const double inv = static_cast<double>(out.inv_freq[static_cast<std::size_t>(i)]);
             const double wavelen = 2.0 * kPi / inv;
             double inv_llama = (wavelen > low_freq_wavelen) ? (inv / factor_llama) : inv;
-            const double smooth_factor = (static_cast<double>(old_ctx) / wavelen - low_freq_factor) /
-                                         (high_freq_factor - low_freq_factor);
+            const double smooth_factor =
+                (static_cast<double>(old_ctx) / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
             const double smoothed = (1.0 - smooth_factor) * inv_llama / factor_llama + smooth_factor * inv_llama;
             const bool is_medium = !(wavelen < high_freq_wavelen) && !(wavelen > low_freq_wavelen);
             const double final_inv = is_medium ? smoothed : inv_llama;
@@ -250,17 +257,17 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
     return out;
 }
 
-template<typename T>
+template <typename T>
 inline T rope_cast(float v) {
     return static_cast<T>(v);
 }
 
-template<>
+template <>
 inline nv_bfloat16 rope_cast<nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
 
-template<typename T>
+template <typename T>
 void fill_rope_freqs(std::vector<T>& out, const RopeInvFreq& params, int head_size, int max_seq_len) {
     if (params.dim <= 0 || params.inv_freq.empty()) return;
     const int dim = params.dim;
@@ -283,7 +290,8 @@ void fill_rope_freqs(std::vector<T>& out, const RopeInvFreq& params, int head_si
 DslRunState::DslRunState(const PretrainedConfig& config,
                          const DslRuntimeConfig& runtime_config,
                          const RuntimeOptions& options,
-                         int B, int T,
+                         int B,
+                         int T,
                          const std::shared_ptr<TensorAllocator>& allocator,
                          bool lora_only_mode,
                          bool prequantized,
@@ -331,9 +339,10 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     const std::size_t stack_capacity = (stack_bytes > 0) ? stack_bytes : kDefaultStackBytes;
     if (allocate_stack) {
         // Allocate stack memory (heuristic size).
-        mStackBuffer = mAllocator->allocate(
-            ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE,
-            {static_cast<long>(stack_capacity)});
+        mStackBuffer = mAllocator->allocate(ETensorDType::BYTE,
+                                            "dsl_stack",
+                                            EAllocationType::ON_DEVICE,
+                                            {static_cast<long>(stack_capacity)});
         Stack = DeviceMemoryStack(mStackBuffer.Data, stack_capacity, DeviceId);
     } else {
         // Dummy stack for sizing pass (no device allocation).
@@ -401,7 +410,8 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
 
     mNonBlockActivations.encoded = mAllocator->allocate(dtype, "encoded", EAllocationType::ON_DEVICE, {B, T, C});
     mNonBlockActivations.ln_final = mAllocator->allocate(dtype, "ln_final", EAllocationType::ON_DEVICE, {B, T, C});
-    mNonBlockActivations.ln_final_rstd = mAllocator->allocate(ETensorDType::FP32, "ln_final_rstd", EAllocationType::ON_DEVICE, {B, T});
+    mNonBlockActivations.ln_final_rstd =
+        mAllocator->allocate(ETensorDType::FP32, "ln_final_rstd", EAllocationType::ON_DEVICE, {B, T});
 
     // Output buffer (persistent; avoids large stack pressure for full fine-tuning).
     const long lmhead_chunks = static_cast<long>(mLMHeadChunks);
@@ -428,35 +438,41 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
         const int head_size = cfg.head_size();
         const RopeInvFreq rope_params = compute_rope_inv_freq(cfg, head_size, max_seq_len);
         if (dtype == ETensorDType::BF16) {
-            mNonBlockActivations.freq_cis = mAllocator->allocate(
-                dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
+            mNonBlockActivations.freq_cis =
+                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
             std::vector<nv_bfloat16> freq_cpu(static_cast<std::size_t>(max_seq_len) * 2 * head_size);
             fill_rope_freqs(freq_cpu, rope_params, head_size, max_seq_len);
-            CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data, freq_cpu.data(),
-                                  freq_cpu.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data,
+                                  freq_cpu.data(),
+                                  freq_cpu.size() * sizeof(nv_bfloat16),
+                                  cudaMemcpyHostToDevice));
         } else if (dtype == ETensorDType::FP32) {
-            mNonBlockActivations.freq_cis = mAllocator->allocate(
-                dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
+            mNonBlockActivations.freq_cis =
+                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
             std::vector<float> freq_cpu(static_cast<std::size_t>(max_seq_len) * 2 * head_size);
             fill_rope_freqs(freq_cpu, rope_params, head_size, max_seq_len);
-            CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data, freq_cpu.data(),
-                                  freq_cpu.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data,
+                                  freq_cpu.data(),
+                                  freq_cpu.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice));
         } else {
             // Default: allocate in model dtype and leave zeroed.
-            mNonBlockActivations.freq_cis = mAllocator->allocate(
-                dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
+            mNonBlockActivations.freq_cis =
+                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
             fill_zero(mNonBlockActivations.freq_cis, MainStream);
         }
     }
 
-    mNonBlockGradients.d_ln_final = mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
+    mNonBlockGradients.d_ln_final =
+        mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
     // Always allocate d_embeddings even in LoRA-only mode. While embedding backward
     // is skipped in LoRA mode, the autodiff graph still produces d_embed_1 as an
     // intermediate. Without a persistent buffer, ensure_output_tensor allocates it on
     // the stack where it blocks can_restore_stack for the entire backward pass (its
     // last_use is the final embedding_backward op), preventing per-layer stack restores
     // and causing stack OOM on MoE models with many layers.
-    mNonBlockGradients.d_embeddings = mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+    mNonBlockGradients.d_embeddings =
+        mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
 }
 
 void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
@@ -485,9 +501,8 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     }
     const long NumExperts = mRuntimeConfig.num_experts;
     const long TopK = (mRuntimeConfig.num_experts_per_tok > 0) ? mRuntimeConfig.num_experts_per_tok : 1;
-    const long MoeM = (mRuntimeConfig.moe_intermediate_size > 0)
-        ? mRuntimeConfig.moe_intermediate_size
-        : cfg.IntermediateSize;
+    const long MoeM =
+        (mRuntimeConfig.moe_intermediate_size > 0) ? mRuntimeConfig.moe_intermediate_size : cfg.IntermediateSize;
     const long MoeMUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * MoeM;
     const bool use_qk_norm = mRuntimeConfig.use_qk_norm;
 
@@ -538,8 +553,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // onboarded blocks), forcing stack-backed FFN temps causes large persistent
     // save-buffer copies and severe memory pressure.
     const bool can_recompute_ffn_temps =
-        mSlotRegistry.will_recompute("mlp_up", lora_only) &&
-        mSlotRegistry.will_recompute("swiglu", lora_only);
+        mSlotRegistry.will_recompute("mlp_up", lora_only) && mSlotRegistry.will_recompute("swiglu", lora_only);
     const bool ffn_temps_on_stack = recompute_enabled && lora_only && can_recompute_ffn_temps;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
@@ -585,8 +599,10 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // att_out sharing is handled by share_att when recompute is enabled.
     const bool has_mlp_up_slot_global = has_layout && mSlotRegistry.lookup("mlp_up").has_value();
     const bool has_swiglu_slot_global = has_layout && mSlotRegistry.lookup("swiglu").has_value();
-    if (share_mlp_up && !ffn_temps_on_stack && has_mlp_up_slot_global) shared_mlp_up = mAllocator->allocate(dtype, "mlp_up_shared", kind, {B, T, MUp});
-    if (share_swiglu && !ffn_temps_on_stack && has_swiglu_slot_global) shared_swiglu = mAllocator->allocate(dtype, "swiglu_shared", kind, {B, T, M});
+    if (share_mlp_up && !ffn_temps_on_stack && has_mlp_up_slot_global)
+        shared_mlp_up = mAllocator->allocate(dtype, "mlp_up_shared", kind, {B, T, MUp});
+    if (share_swiglu && !ffn_temps_on_stack && has_swiglu_slot_global)
+        shared_swiglu = mAllocator->allocate(dtype, "swiglu_shared", kind, {B, T, M});
     if (share_residual_intermediates) {
         shared_residual_att = mAllocator->allocate(dtype, "residual_att_shared", kind, {B, T, C});
     }
@@ -600,13 +616,17 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
 
         // Per-layer dimensions for hybrid models
         const long lQKV = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].qkv_channels : QKV;
+                              ? mRuntimeConfig.per_layer_dims[i].qkv_channels
+                              : QKV;
         const long lAttnDim = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].attn_dim : AttnDim;
+                                  ? mRuntimeConfig.per_layer_dims[i].attn_dim
+                                  : AttnDim;
         const long lMUp = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].mlp_up : MUp;
+                              ? mRuntimeConfig.per_layer_dims[i].mlp_up
+                              : MUp;
         const long lM = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].intermediate : M;
+                            ? mRuntimeConfig.per_layer_dims[i].intermediate
+                            : M;
 
         acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, "ln1_rstd", kind, {B, T});
         acts.ln1 = share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, "ln1", kind, {B, T, C});
@@ -615,10 +635,10 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         acts.ln2 = share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, "ln2", kind, {B, T, C});
 
         if (use_qk_norm) {
-            acts.q_rstd = share_qk_rstd ? shared_q_rstd
-                                        : mAllocator->allocate(ETensorDType::FP32, "q_rstd", kind, {B, T, Hq});
-            acts.k_rstd = share_qk_rstd ? shared_k_rstd
-                                        : mAllocator->allocate(ETensorDType::FP32, "k_rstd", kind, {B, T, Hkv});
+            acts.q_rstd =
+                share_qk_rstd ? shared_q_rstd : mAllocator->allocate(ETensorDType::FP32, "q_rstd", kind, {B, T, Hq});
+            acts.k_rstd =
+                share_qk_rstd ? shared_k_rstd : mAllocator->allocate(ETensorDType::FP32, "k_rstd", kind, {B, T, Hkv});
         } else {
             acts.q_rstd = {};
             acts.k_rstd = {};
@@ -632,19 +652,18 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         const bool need_separate_qkv_rope = recompute_enabled && use_qk_norm;
         if (need_separate_qkv_rope) {
             acts.qkv_rope = (shared_qkv_rope.Data && !is_kv_src)
-                ? shared_qkv_rope
-                : mAllocator->allocate(dtype, "qkv_rope", kind, {B, T, lQKV});
+                                ? shared_qkv_rope
+                                : mAllocator->allocate(dtype, "qkv_rope", kind, {B, T, lQKV});
         } else {
             acts.qkv_rope = {};
         }
 
-        acts.lse = share_att ? shared_lse
-                             : mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
+        acts.lse = share_att ? shared_lse : mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
         acts.att = share_att ? shared_att : mAllocator->allocate(dtype, "att", kind, {B, T, lAttnDim});
         acts.att_out = share_att_out ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
 
         acts.residual_att = share_residual_intermediates ? shared_residual_att
-                                                          : mAllocator->allocate(dtype, "residual_att", kind, {B, T, C});
+                                                         : mAllocator->allocate(dtype, "residual_att", kind, {B, T, C});
 
         // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
         // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
@@ -661,8 +680,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.swiglu = share_swiglu ? shared_swiglu : mAllocator->allocate(dtype, "swiglu", kind, {B, T, lM});
         }
 
-        acts.mlp_down = share_mlp_down ? shared_mlp_down
-                                       : mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
+        acts.mlp_down = share_mlp_down ? shared_mlp_down : mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
 
         if (NumExperts > 0) {
             const long num_tokens = B * T;
@@ -670,7 +688,8 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.router_logits = mAllocator->allocate(dtype, "router_logits", kind, {num_tokens, NumExperts});
             acts.router_probs = mAllocator->allocate(dtype, "router_probs", kind, {num_tokens, NumExperts});
             acts.routing_weights = mAllocator->allocate(dtype, "routing_weights", kind, {num_tokens, TopK});
-            acts.routing_indices = mAllocator->allocate(ETensorDType::INT32, "routing_indices", kind, {num_tokens, TopK});
+            acts.routing_indices =
+                mAllocator->allocate(ETensorDType::INT32, "routing_indices", kind, {num_tokens, TopK});
             acts.permuted_input = mAllocator->allocate(dtype, "permuted_input", kind, {total_tokens, C});
             acts.scatter_indices = mAllocator->allocate(ETensorDType::INT32, "scatter_indices", kind, {total_tokens});
             acts.expert_gate_up = mAllocator->allocate(dtype, "expert_gate_up", kind, {total_tokens, MoeMUp});
@@ -758,11 +777,13 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         const long d_up_bytes = has_mlp_up_slot_global ? B * T * MUp * get_dtype_size(dtype) : 0;
         auto* sim_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
         auto* sim_d_mlp_up = d_mlp_up_bytes > 0
-            ? Stack.allocate(static_cast<std::size_t>(d_mlp_up_bytes), "d_mlp_up_simulate") : nullptr;
+                                 ? Stack.allocate(static_cast<std::size_t>(d_mlp_up_bytes), "d_mlp_up_simulate")
+                                 : nullptr;
         auto* sim_d_swiglu = d_swiglu_bytes > 0
-            ? Stack.allocate(static_cast<std::size_t>(d_swiglu_bytes), "d_swiglu_simulate") : nullptr;
-        auto* sim_d_up = d_up_bytes > 0
-            ? Stack.allocate(static_cast<std::size_t>(d_up_bytes), "d_up_simulate") : nullptr;
+                                 ? Stack.allocate(static_cast<std::size_t>(d_swiglu_bytes), "d_swiglu_simulate")
+                                 : nullptr;
+        auto* sim_d_up =
+            d_up_bytes > 0 ? Stack.allocate(static_cast<std::size_t>(d_up_bytes), "d_up_simulate") : nullptr;
         if (sim_d_up) Stack.free(sim_d_up);
         if (sim_d_swiglu) Stack.free(sim_d_swiglu);
         if (sim_d_mlp_up) Stack.free(sim_d_mlp_up);
@@ -798,19 +819,24 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
 
         // Per-layer dimensions for hybrid models
         const long lQKV = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].qkv_channels : QKV;
+                              ? mRuntimeConfig.per_layer_dims[i].qkv_channels
+                              : QKV;
         const long lAttnDim = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].attn_dim : AttnDim;
+                                  ? mRuntimeConfig.per_layer_dims[i].attn_dim
+                                  : AttnDim;
         const long lMUp = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].mlp_up : MUp;
+                              ? mRuntimeConfig.per_layer_dims[i].mlp_up
+                              : MUp;
         const long lM = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-            ? mRuntimeConfig.per_layer_dims[i].intermediate : M;
+                            ? mRuntimeConfig.per_layer_dims[i].intermediate
+                            : M;
 
         g.d_res_ffn = share_res_ffn ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
                                     : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
         g.d_res_att = share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        g.d_att_out = hybrid ? (share_grads ? mSharedDAttOut : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}))
-                             : g.d_res_att;
+        g.d_att_out = hybrid
+                          ? (share_grads ? mSharedDAttOut : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}))
+                          : g.d_res_att;
         g.d_ln2 = share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
 
         if (large_bwd_temps_on_stack || !has_mlp_up_slot_global) {
@@ -940,15 +966,14 @@ void DslRunState::build_activation_grad_zero_segments() {
     }
 
     const long bytes = static_cast<long>(static_cast<std::size_t>(mActGradZeroCount) * sizeof(std::uint64_t));
-    mActGradZeroPtrs = mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_ptrs",
-                                            EAllocationType::ON_DEVICE, {bytes});
-    mActGradZeroSizes = mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_sizes",
-                                             EAllocationType::ON_DEVICE, {bytes});
+    mActGradZeroPtrs =
+        mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_ptrs", EAllocationType::ON_DEVICE, {bytes});
+    mActGradZeroSizes =
+        mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_sizes", EAllocationType::ON_DEVICE, {bytes});
 
-    CUDA_CHECK(cudaMemcpy(mActGradZeroPtrs.Data, ptrs.data(),
-                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(mActGradZeroSizes.Data, sizes.data(),
-                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mActGradZeroPtrs.Data, ptrs.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(mActGradZeroSizes.Data, sizes.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
 }
 
 void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options) {
@@ -964,17 +989,22 @@ void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg,
     const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
 
     if (mEnableFp8Forward) {
-        modules::allocate_fp8_forward_buffers(
-            mFP8ForwardQuants, mFP8ForwardStats, *mAllocator,
-            B, T, C, M, AttnDim, options.forward_matmul_dtype());
+        modules::allocate_fp8_forward_buffers(mFP8ForwardQuants,
+                                              mFP8ForwardStats,
+                                              *mAllocator,
+                                              B,
+                                              T,
+                                              C,
+                                              M,
+                                              AttnDim,
+                                              options.forward_matmul_dtype());
     }
 
     if (options.fp8_hybrid_enabled()) {
         modules::FP8ScalingConfig fp8_cfg{};
         fp8_cfg.amax_history_len = options.RecipeOptions.fp8_amax_history_len;
         fp8_cfg.margin = static_cast<float>(options.RecipeOptions.fp8_margin);
-        mFP8ScalingState = std::make_unique<modules::FP8ScalingState>(
-            fp8_cfg, mAllocator, DeviceId, cfg.NumLayers);
+        mFP8ScalingState = std::make_unique<modules::FP8ScalingState>(fp8_cfg, mAllocator, DeviceId, cfg.NumLayers);
     }
 
     if (mGradQuantDtype == mGradDtype) {
@@ -988,8 +1018,8 @@ void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg,
         return;
     }
 
-    mGradQuantStats = mAllocator->allocate(ETensorDType::FP32, "dsl_grad_quant_stats",
-                                           EAllocationType::ON_DEVICE, {8L});
+    mGradQuantStats =
+        mAllocator->allocate(ETensorDType::FP32, "dsl_grad_quant_stats", EAllocationType::ON_DEVICE, {8L});
     float* stats = mGradQuantStats.get<float>();
 
     auto alloc = [&](ETensorDType dtype, const std::string& name, const std::vector<long>& shape) -> Tensor {
@@ -1016,9 +1046,12 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long QKV = D * (Hq + 2 * Hkv);
     const long C_attn = static_cast<long>(cfg.attn_out_channels());
 
-    const long rmsnorm_scratch_bytes = static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(C), DeviceProp));
-    mScratch.rmsnorm_scratch = mAllocator->allocate(
-        ETensorDType::BYTE, "rmsnorm_scratch", EAllocationType::ON_DEVICE, {rmsnorm_scratch_bytes});
+    const long rmsnorm_scratch_bytes =
+        static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(C), DeviceProp));
+    mScratch.rmsnorm_scratch = mAllocator->allocate(ETensorDType::BYTE,
+                                                    "rmsnorm_scratch",
+                                                    EAllocationType::ON_DEVICE,
+                                                    {rmsnorm_scratch_bytes});
 
     const long M = cfg.IntermediateSize;
     const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
@@ -1026,47 +1059,54 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long max_bias_channels = std::max<long>(QKV, std::max<long>(C, std::max<long>(MUp, V)));
     const long bias_scratch_bytes =
         static_cast<long>(get_bias_backward_scratch_size(mGradDtype, static_cast<int>(max_bias_channels), DeviceProp));
-    mScratch.matmul_bias_scratch = mAllocator->allocate(
-        ETensorDType::FP32, "bias_scratch", EAllocationType::ON_DEVICE, {bias_scratch_bytes / static_cast<long>(sizeof(float))});
+    mScratch.matmul_bias_scratch = mAllocator->allocate(ETensorDType::FP32,
+                                                        "bias_scratch",
+                                                        EAllocationType::ON_DEVICE,
+                                                        {bias_scratch_bytes / static_cast<long>(sizeof(float))});
 
     const long num_block_sums = std::max<long>(2, static_cast<long>(get_max_num_block_sums(DeviceProp)));
-    mScratch.norm_buffer = mAllocator->allocate(
-        ETensorDType::FP32, "norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums});
+    mScratch.norm_buffer =
+        mAllocator->allocate(ETensorDType::FP32, "norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums});
 
-    mScratch.matmul_scales = mAllocator->allocate(
-        ETensorDType::FP32, "matmul_scales", EAllocationType::ON_DEVICE, {2L});
+    mScratch.matmul_scales =
+        mAllocator->allocate(ETensorDType::FP32, "matmul_scales", EAllocationType::ON_DEVICE, {2L});
 
     const long BT = B * T;
-    mScratch.cross_entropy_dloss = mAllocator->allocate(
-        ETensorDType::FP32, "cross_entropy_dloss", EAllocationType::ON_DEVICE, {BT});
-    mScratch.cross_entropy_logsumexp = mAllocator->allocate(
-        ETensorDType::FP32, "cross_entropy_logsumexp", EAllocationType::ON_DEVICE, {BT});
-    const int n_chunks = static_cast<int>(
-        (V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE);
+    mScratch.cross_entropy_dloss =
+        mAllocator->allocate(ETensorDType::FP32, "cross_entropy_dloss", EAllocationType::ON_DEVICE, {BT});
+    mScratch.cross_entropy_logsumexp =
+        mAllocator->allocate(ETensorDType::FP32, "cross_entropy_logsumexp", EAllocationType::ON_DEVICE, {BT});
+    const int n_chunks = static_cast<int>((V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE);
     if (n_chunks > 1) {
-        mScratch.cross_entropy_chunk_logsumexp = mAllocator->allocate(
-            ETensorDType::FP32, "cross_entropy_chunk_logsumexp", EAllocationType::ON_DEVICE,
-            {BT, n_chunks});
+        mScratch.cross_entropy_chunk_logsumexp = mAllocator->allocate(ETensorDType::FP32,
+                                                                      "cross_entropy_chunk_logsumexp",
+                                                                      EAllocationType::ON_DEVICE,
+                                                                      {BT, n_chunks});
     }
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
     if (!mLoraOnlyMode) {
         const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);
         const long num_c_groups = (C + group_width - 1) / group_width;
-        mScratch.encoder_bwd_scratch = mAllocator->allocate(
-            ETensorDType::INT32, "encoder_bwd_scratch", EAllocationType::ON_DEVICE, {B, T, num_c_groups * 5});
-        mScratch.encoder_bwd_indices = mAllocator->allocate(
-            ETensorDType::INT32, "encoder_bwd_indices", EAllocationType::PINNED, {B, T, num_c_groups});
-        mScratch.encoder_bwd_info = mAllocator->allocate(
-            ETensorDType::INT32, "encoder_bwd_info", EAllocationType::PINNED, {B, T, 4 * num_c_groups});
+        mScratch.encoder_bwd_scratch = mAllocator->allocate(ETensorDType::INT32,
+                                                            "encoder_bwd_scratch",
+                                                            EAllocationType::ON_DEVICE,
+                                                            {B, T, num_c_groups * 5});
+        mScratch.encoder_bwd_indices = mAllocator->allocate(ETensorDType::INT32,
+                                                            "encoder_bwd_indices",
+                                                            EAllocationType::PINNED,
+                                                            {B, T, num_c_groups});
+        mScratch.encoder_bwd_info = mAllocator->allocate(ETensorDType::INT32,
+                                                         "encoder_bwd_info",
+                                                         EAllocationType::PINNED,
+                                                         {B, T, 4 * num_c_groups});
     }
 
     const int attn_chunks = mAttnBwdChunks;
     if (attn_chunks < 1) {
         throw std::runtime_error("attn_bwd_chunks must be >= 1");
     }
-    const long attn_ws_batch_size =
-        (attn_chunks == 1) ? B : div_exact(B, static_cast<long>(attn_chunks));
+    const long attn_ws_batch_size = (attn_chunks == 1) ? B : div_exact(B, static_cast<long>(attn_chunks));
     // For hybrid models, use max head_size for cuDNN workspace sizing.
     long max_D = D;
     if (mRuntimeConfig.has_per_layer_dims()) {
@@ -1076,16 +1116,18 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     }
     const bool cudnn_ok = (max_D > 0 && Hq > 0 && Hkv > 0 && (max_D % 8 == 0) && max_D <= 256);
     if (cudnn_ok) {
-        const long cudnn_ws_size = static_cast<long>(
-            cudnn_get_workspace_size(static_cast<int>(attn_ws_batch_size), static_cast<int>(T),
-                                     static_cast<int>(Hq), static_cast<int>(Hkv),
-                                     static_cast<int>(max_D), CudnnHandle));
+        const long cudnn_ws_size = static_cast<long>(cudnn_get_workspace_size(static_cast<int>(attn_ws_batch_size),
+                                                                              static_cast<int>(T),
+                                                                              static_cast<int>(Hq),
+                                                                              static_cast<int>(Hkv),
+                                                                              static_cast<int>(max_D),
+                                                                              CudnnHandle));
         // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
         // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
         // from the temp stack, checkpoint restores during backward can cause it to be reallocated
         // in a region that overlaps with gradient buffers.
-        mScratch.cudnn_workspace = mAllocator->allocate(
-            ETensorDType::BYTE, "cudnn_workspace", EAllocationType::ON_DEVICE, {cudnn_ws_size});
+        mScratch.cudnn_workspace =
+            mAllocator->allocate(ETensorDType::BYTE, "cudnn_workspace", EAllocationType::ON_DEVICE, {cudnn_ws_size});
     } else {
         // Leave an empty descriptor; attention ops will fail later if invoked with invalid head size.
         mScratch.cudnn_workspace = Tensor::empty(ETensorDType::BYTE, {0});
@@ -1105,16 +1147,11 @@ Tensor* DslRunState::get_fp8_forward_buffer(int op) {
     if (!has_fp8_forward()) return nullptr;
     auto matmul_op = static_cast<modules::MatmulOp>(op);
     switch (matmul_op) {
-        case modules::MatmulOp::QKV:
-            return &mFP8ForwardQuants.ln1;
-        case modules::MatmulOp::MLPUp:
-            return &mFP8ForwardQuants.ln2;
-        case modules::MatmulOp::AttnOut:
-            return &mFP8ForwardQuants.att;
-        case modules::MatmulOp::MLPDown:
-            return &mFP8ForwardQuants.swiglu;
-        default:
-            return nullptr;
+        case modules::MatmulOp::QKV: return &mFP8ForwardQuants.ln1;
+        case modules::MatmulOp::MLPUp: return &mFP8ForwardQuants.ln2;
+        case modules::MatmulOp::AttnOut: return &mFP8ForwardQuants.att;
+        case modules::MatmulOp::MLPDown: return &mFP8ForwardQuants.swiglu;
+        default: return nullptr;
     }
 }
 
@@ -1122,31 +1159,25 @@ Tensor* DslRunState::get_gradient_quant_buffer(int op) {
     if (!has_grad_quants()) return nullptr;
     auto matmul_op = static_cast<modules::MatmulOp>(op);
     switch (matmul_op) {
-        case modules::MatmulOp::QKV:
-            return &mSimplifiedQuantGrads.d_qkv;
-        case modules::MatmulOp::MLPUp:
-            return &mSimplifiedQuantGrads.d_mlp_up;
-        case modules::MatmulOp::AttnOut:
-            return &mSimplifiedQuantGrads.d_res_att;
-        case modules::MatmulOp::MLPDown:
-            return &mSimplifiedQuantGrads.d_res_ffn;
-        default:
-            return nullptr;
+        case modules::MatmulOp::QKV: return &mSimplifiedQuantGrads.d_qkv;
+        case modules::MatmulOp::MLPUp: return &mSimplifiedQuantGrads.d_mlp_up;
+        case modules::MatmulOp::AttnOut: return &mSimplifiedQuantGrads.d_res_att;
+        case modules::MatmulOp::MLPDown: return &mSimplifiedQuantGrads.d_res_ffn;
+        default: return nullptr;
     }
 }
 
 void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg, bool offload_residuals) {
     mOffloadResiduals = offload_residuals;
-    mResidualManager = std::make_unique<modules::ResidualManager>(
-        mAllocator,
-        cfg.NumLayers,
-        static_cast<int>(B),
-        static_cast<int>(T),
-        cfg.HiddenSize,
-        cfg.DType,
-        offload_residuals,
-        /*num_residual_buffers=*/2,
-        MainStream);
+    mResidualManager = std::make_unique<modules::ResidualManager>(mAllocator,
+                                                                  cfg.NumLayers,
+                                                                  static_cast<int>(B),
+                                                                  static_cast<int>(T),
+                                                                  cfg.HiddenSize,
+                                                                  cfg.DType,
+                                                                  offload_residuals,
+                                                                  /*num_residual_buffers=*/2,
+                                                                  MainStream);
 }
 
 void DslRunState::fetch_residual(int layer_idx, cudaStream_t stream) {
@@ -1289,16 +1320,15 @@ IRunState::MoEStats DslRunState::get_moe_stats() const {
         return stats;
     }
     // Copy accumulated stats from device to host (sync — called after forward is complete)
-    CUDA_CHECK(cudaMemcpy(mMoEStatsHost, mMoEStatsDevice,
-                          kMoEStatsSize * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(mMoEStatsHost, mMoEStatsDevice, kMoEStatsSize * sizeof(float), cudaMemcpyDeviceToHost));
     const int num_layers = static_cast<int>(mMoEStatsHost[4]);
     if (num_layers <= 0) {
         return stats;
     }
-    stats.aux_loss = mMoEStatsHost[0];                       // summed across layers
-    stats.z_loss = mMoEStatsHost[1];                          // summed across layers
-    stats.expert_utilization = mMoEStatsHost[2] / num_layers; // average
-    stats.load_imbalance = mMoEStatsHost[3] / num_layers;    // average
+    stats.aux_loss = mMoEStatsHost[0];                         // summed across layers
+    stats.z_loss = mMoEStatsHost[1];                           // summed across layers
+    stats.expert_utilization = mMoEStatsHost[2] / num_layers;  // average
+    stats.load_imbalance = mMoEStatsHost[3] / num_layers;      // average
     stats.num_layers = num_layers;
     stats.valid = true;
     return stats;
@@ -1306,9 +1336,8 @@ IRunState::MoEStats DslRunState::get_moe_stats() const {
 
 void DslRunState::reset_moe_stats() {
     if (mMoEStatsDevice) {
-        CUDA_CHECK(cudaMemsetAsync(mMoEStatsDevice, 0,
-                                   kMoEStatsSize * sizeof(float), MainStream));
+        CUDA_CHECK(cudaMemsetAsync(mMoEStatsDevice, 0, kMoEStatsSize * sizeof(float), MainStream));
     }
 }
 
-} // namespace dsl
+}  // namespace dsl

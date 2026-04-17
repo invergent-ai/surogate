@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "utilities/dtype.h"
 
@@ -40,8 +43,7 @@ bool shape_equal(const Tensor& t, const std::vector<long>& shape) {
 }
 
 bool ends_with_local(std::string_view value, std::string_view suffix) {
-    return value.size() >= suffix.size() &&
-           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 std::string shape_to_string(const Tensor& t) {
@@ -157,15 +159,17 @@ void CompiledExecutor::dispatch_concat(const CompiledOp& op) {
                 out_ptr + static_cast<std::size_t>(out_offset_dim) * static_cast<std::size_t>(inner) * elem_bytes;
             const std::byte* src_base = static_cast<const std::byte*>(in_t->Data);
             if (outer == 1) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    dst_base, src_base, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(dst_base, src_base, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             } else {
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    dst_base, dst_pitch,
-                    src_base, row_bytes,
-                    row_bytes, static_cast<std::size_t>(outer),
-                    cudaMemcpyDeviceToDevice,
-                    mRunState.MainStream));
+                CUDA_CHECK(cudaMemcpy2DAsync(dst_base,
+                                             dst_pitch,
+                                             src_base,
+                                             row_bytes,
+                                             row_bytes,
+                                             static_cast<std::size_t>(outer),
+                                             cudaMemcpyDeviceToDevice,
+                                             mRunState.MainStream));
             }
             out_offset_dim += in_dim;
         }
@@ -208,12 +212,9 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
     if (split_sizes.empty()) {
         // Qwen3.5 full-attention backward: infer [Q,K,V] partitions from head ratio
         // when autodiff produced split without explicit sizes.
-        const bool grad_concat_input = !op.inputs.empty() &&
-                                       op.inputs[0].name.size() > 2 &&
-                                       op.inputs[0].name[0] == 'd' &&
-                                       op.inputs[0].name[1] == '_';
-        const bool qkv_grad_outputs = op.outputs.size() == 3 &&
-                                      ends_with_local(op.outputs[0].name, ".full_q") &&
+        const bool grad_concat_input = !op.inputs.empty() && op.inputs[0].name.size() > 2 &&
+                                       op.inputs[0].name[0] == 'd' && op.inputs[0].name[1] == '_';
+        const bool qkv_grad_outputs = op.outputs.size() == 3 && ends_with_local(op.outputs[0].name, ".full_q") &&
                                       ends_with_local(op.outputs[1].name, ".full_k") &&
                                       ends_with_local(op.outputs[2].name, ".full_v");
         if (grad_concat_input && qkv_grad_outputs) {
@@ -262,14 +263,10 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
     if (split_sizes.size() != op.outputs.size()) {
         throw std::runtime_error("dispatch_split: split size count must match number of outputs");
     }
-    if (const char* dbg = std::getenv("SUROGATE_DEBUG_QWEN35_BWD");
-        dbg && std::string(dbg) == "1") {
-        const bool grad_concat_input = !op.inputs.empty() &&
-                                       op.inputs[0].name.size() > 2 &&
-                                       op.inputs[0].name[0] == 'd' &&
-                                       op.inputs[0].name[1] == '_';
-        const bool qkv_grad_outputs = op.outputs.size() == 3 &&
-                                      ends_with_local(op.outputs[0].name, ".full_q") &&
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_QWEN35_BWD"); dbg && std::string(dbg) == "1") {
+        const bool grad_concat_input = !op.inputs.empty() && op.inputs[0].name.size() > 2 &&
+                                       op.inputs[0].name[0] == 'd' && op.inputs[0].name[1] == '_';
+        const bool qkv_grad_outputs = op.outputs.size() == 3 && ends_with_local(op.outputs[0].name, ".full_q") &&
                                       ends_with_local(op.outputs[1].name, ".full_k") &&
                                       ends_with_local(op.outputs[2].name, ".full_v");
         if (grad_concat_input && qkv_grad_outputs) {
@@ -286,14 +283,9 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
     const long sum = std::accumulate(split_sizes.begin(), split_sizes.end(), 0L);
     if (sum != in_dim) {
         std::ostringstream oss;
-        oss << "dispatch_split: split sizes must sum to input size along dim"
-            << " (input=" << op.inputs[0].name
-            << ", in_shape=" << shape_to_string(in)
-            << ", dim=" << dim
-            << ", in_dim=" << in_dim
-            << ", split_sizes=" << join_sizes(split_sizes)
-            << ", outputs=" << join_output_names(op.outputs)
-            << ")";
+        oss << "dispatch_split: split sizes must sum to input size along dim" << " (input=" << op.inputs[0].name
+            << ", in_shape=" << shape_to_string(in) << ", dim=" << dim << ", in_dim=" << in_dim
+            << ", split_sizes=" << join_sizes(split_sizes) << ", outputs=" << join_output_names(op.outputs) << ")";
         throw std::runtime_error(oss.str());
     }
 
@@ -324,8 +316,7 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
         // to prevent overlapping writes.
         bool shared_slot = false;
         for (std::size_t j = 0; j < op.outputs.size(); ++j) {
-            if (j != i && op.outputs[j].tensor_id == op.outputs[i].tensor_id &&
-                op.outputs[j].tensor_id >= 0) {
+            if (j != i && op.outputs[j].tensor_id == op.outputs[i].tensor_id && op.outputs[j].tensor_id >= 0) {
                 shared_slot = true;
                 break;
             }
@@ -344,15 +335,17 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
             const std::byte* src_base =
                 in_ptr + static_cast<std::size_t>(dim_offset) * static_cast<std::size_t>(inner) * elem_bytes;
             if (outer == 1) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    out_ptr, src_base, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(out_ptr, src_base, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             } else {
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    out_ptr, row_bytes,
-                    src_base, src_pitch,
-                    row_bytes, static_cast<std::size_t>(outer),
-                    cudaMemcpyDeviceToDevice,
-                    mRunState.MainStream));
+                CUDA_CHECK(cudaMemcpy2DAsync(out_ptr,
+                                             row_bytes,
+                                             src_base,
+                                             src_pitch,
+                                             row_bytes,
+                                             static_cast<std::size_t>(outer),
+                                             cudaMemcpyDeviceToDevice,
+                                             mRunState.MainStream));
             }
         }
 
@@ -361,4 +354,257 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Concat backward rule
+// Forward: y = concat(x1, x2, ..., dim)
+// Backward: dx1, dx2, ... = split(dy, dim)
+// -----------------------------------------------------------------------------
+std::vector<Operation> concat_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+
+    bool any_needed = false;
+    for (std::size_t i = 0; i < fwd.inputs.size(); ++i) {
+        if (ctx.needs_grad(i)) {
+            any_needed = true;
+            break;
+        }
+    }
+    if (!any_needed) {
+        return ops;
+    }
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"dim", "split_size"}, "concat");
+
+    std::vector<std::string> inputs = {ctx.d_output};
+    std::vector<std::string> outputs;
+    outputs.reserve(fwd.inputs.size());
+    for (std::size_t i = 0; i < fwd.inputs.size(); ++i) {
+        outputs.push_back(ctx.needs_grad(i) ? ctx.d_inputs[i] : "");
+    }
+
+    ops.push_back(make_operation("concat_backward_" + std::to_string(ctx.op_counter++),
+                                 "split",
+                                 "split",
+                                 inputs,
+                                 outputs,
+                                 attrs));
+
+    return ops;
+}
+
+}  // namespace
+
+namespace {
+
+// -----------------------------------------------------------------------------
+// Split backward rule
+// Forward: y1, y2, ... = split(x, split_size, dim)
+// Backward: dx = concat(dy1, dy2, ..., dim)
+// -----------------------------------------------------------------------------
+std::vector<Operation> split_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+
+    if (!ctx.needs_grad(0)) {
+        return ops;
+    }
+
+    AttrMap concat_attrs = copy_attrs(fwd.attrs, {"dim"}, "split");
+    std::vector<std::string> concat_inputs;
+    concat_inputs.reserve(fwd.outputs.size());
+
+    for (std::size_t i = 0; i < fwd.outputs.size(); ++i) {
+        const bool has_grad = (i < ctx.d_outputs.size() && !ctx.d_outputs[i].empty());
+        if (has_grad) {
+            concat_inputs.push_back(ctx.d_outputs[i]);
+            continue;
+        }
+
+        // Missing branch gradient => explicit zero tensor, shaped like the
+        // corresponding forward split output, so concat gets a full partition.
+        const std::string zero_name = "split_zero_grad_" + std::to_string(ctx.op_counter++);
+        AttrMap zattrs;
+        zattrs["shape_like"] = AttrValue(saved_ref(fwd.outputs[i]));
+        ops.push_back(make_operation("split_zero_" + std::to_string(ctx.op_counter++),
+                                     "zeros",
+                                     "zeros",
+                                     {},
+                                     {zero_name},
+                                     zattrs));
+        concat_inputs.push_back(zero_name);
+    }
+
+    if (concat_inputs.empty()) {
+        return ops;
+    }
+
+    ops.push_back(make_operation("split_backward_" + std::to_string(ctx.op_counter++),
+                                 "concat",
+                                 "concat",
+                                 concat_inputs,
+                                 {ctx.d_inputs[0]},
+                                 concat_attrs));
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("split", ::dsl::split_backward);
+
+REGISTER_AUTODIFF("concat", ::dsl::concat_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// Concat
+// ------------------------------------------------------------------------
+const int _concat_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "concat";
+    sig.min_inputs = 1;
+    sig.max_inputs = -1;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap& attrs, const ShapeEnv&) {
+        if (inputs.empty() || outputs.empty()) {
+            ShapeValidationError err;
+            err.message = "concat requires at least 1 input and 1 output";
+            return std::make_optional(err);
+        }
+        if (inputs[0].empty() || outputs[0].empty()) {
+            return std::optional<ShapeValidationError>();
+        }
+
+        const int rank = static_cast<int>(inputs[0].size());
+        long dim = 0;
+        if (const AttrValue* dim_attr = find_attr(attrs, "dim")) {
+            if (auto v = attr_int(*dim_attr)) {
+                dim = *v;
+            }
+        }
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) {
+            ShapeValidationError err;
+            err.message = "concat: dim out of range for input rank";
+            return std::make_optional(err);
+        }
+
+        auto expected = inputs[0];
+        long cat = 0;
+        for (const auto& in_shape : inputs) {
+            if (in_shape.size() != static_cast<std::size_t>(rank)) {
+                ShapeValidationError err;
+                err.message = "concat: all inputs must have the same rank";
+                return std::make_optional(err);
+            }
+            for (int d = 0; d < rank; ++d) {
+                if (d == dim) continue;
+                if (in_shape[d] != expected[d]) {
+                    ShapeValidationError err;
+                    err.message = "concat: non-concat dimensions must match";
+                    return std::make_optional(err);
+                }
+            }
+            cat += in_shape[dim];
+        }
+        expected[dim] = cat;
+
+        if (outputs[0].size() != expected.size()) {
+            ShapeValidationError err;
+            err.message = "concat: output rank mismatch";
+            return std::make_optional(err);
+        }
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            if (outputs[0][i] != expected[i]) {
+                ShapeValidationError err;
+                err.message = "concat: output shape mismatch";
+                return std::make_optional(err);
+            }
+        }
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// Split
+// ------------------------------------------------------------------------
+const int _split_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "split";
+    sig.min_inputs = 1;
+    sig.max_inputs = 1;
+    sig.min_outputs = 1;
+    sig.max_outputs = -1;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap& attrs, const ShapeEnv&) {
+        if (inputs.empty() || outputs.empty()) {
+            ShapeValidationError err;
+            err.message = "split requires 1 input and at least 1 output";
+            return std::make_optional(err);
+        }
+        if (inputs[0].empty()) {
+            return std::optional<ShapeValidationError>();
+        }
+
+        const auto& in_shape = inputs[0];
+        const int rank = static_cast<int>(in_shape.size());
+        long dim = 0;
+        if (const AttrValue* dim_attr = find_attr(attrs, "dim")) {
+            if (auto v = attr_int(*dim_attr)) {
+                dim = *v;
+            }
+        }
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) {
+            ShapeValidationError err;
+            err.message = "split: dim out of range for input rank";
+            return std::make_optional(err);
+        }
+
+        long total = 0;
+        for (const auto& out_shape : outputs) {
+            if (out_shape.empty()) {
+                return std::optional<ShapeValidationError>();
+            }
+            if (out_shape.size() != static_cast<std::size_t>(rank)) {
+                ShapeValidationError err;
+                err.message = "split: all outputs must have same rank as input";
+                return std::make_optional(err);
+            }
+            for (int d = 0; d < rank; ++d) {
+                if (d == dim) continue;
+                if (out_shape[d] != in_shape[d]) {
+                    ShapeValidationError err;
+                    err.message = "split: non-split dimensions must match input";
+                    return std::make_optional(err);
+                }
+            }
+            total += out_shape[dim];
+        }
+
+        if (total != in_shape[dim]) {
+            ShapeValidationError err;
+            err.message = "split: output split sizes do not sum to input size along dim";
+            return std::make_optional(err);
+        }
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

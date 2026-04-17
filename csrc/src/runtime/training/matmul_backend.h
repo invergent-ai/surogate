@@ -17,9 +17,9 @@
  * - AUTO: Automatically selects based on GPU architecture and data type
  */
 enum class EMatmulBackend {
-    CUBLASLT,    ///< Use cuBLAS Lt (default, universal support)
-    CUTLASS,     ///< Use CUTLASS kernels (SM90 per-tensor or SM120 block-scaled)
-    AUTO         ///< Auto-select based on GPU and dtype
+    CUBLASLT,  ///< Use cuBLAS Lt (default, universal support)
+    CUTLASS,   ///< Use CUTLASS kernels (SM90 per-tensor or SM120 block-scaled)
+    AUTO       ///< Auto-select based on GPU and dtype
 };
 
 inline std::string to_string(EMatmulBackend backend) {

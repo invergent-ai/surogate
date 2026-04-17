@@ -30,7 +30,7 @@
  *
  * @note TODO: This kernel could be optimized with vectorized stores.
  */
-template<typename floatX>
+template <typename floatX>
 __global__ void fill_kernel(floatX* dst, floatX value, std::size_t count) {
     long id = threadIdx.x + blockIdx.x * blockDim.x;
     if (id >= count) return;
@@ -49,9 +49,9 @@ __global__ void fill_kernel(floatX* dst, floatX value, std::size_t count) {
  * @param count Number of elements to fill.
  * @param stream CUDA stream for asynchronous execution.
  */
-template<typename floatX>
+template <typename floatX>
 void fill_imp(floatX* dst, floatX value, std::size_t count, cudaStream_t stream) {
-    fill_kernel<<<div_ceil(count, static_cast<std::size_t>(256)), 256, 0, stream>>> (dst, value, count);
+    fill_kernel<<<div_ceil(count, static_cast<std::size_t>(256)), 256, 0, stream>>>(dst, value, count);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -94,7 +94,8 @@ void fill_dense_cu_seqlens(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen
         throw std::invalid_argument("fill_dense_cu_seqlens: invalid arguments");
     }
     constexpr int kBlockSize = 256;
-    const int grid = static_cast<int>(div_ceil(static_cast<std::size_t>(num_docs + 1), static_cast<std::size_t>(kBlockSize)));
+    const int grid =
+        static_cast<int>(div_ceil(static_cast<std::size_t>(num_docs + 1), static_cast<std::size_t>(kBlockSize)));
     dense_cu_seqlens_kernel<<<grid, kBlockSize, 0, stream>>>(cu_seqlens, num_docs, max_doc_seqlen);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -105,9 +106,7 @@ void fill_dense_cu_seqlens(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen
 
 namespace {
 
-__global__ void zero_segments_kernel(const std::uint64_t* ptrs,
-                                     const std::uint64_t* sizes,
-                                     int n) {
+__global__ void zero_segments_kernel(const std::uint64_t* ptrs, const std::uint64_t* sizes, int n) {
     const int seg = static_cast<int>(blockIdx.x);
     if (seg >= n) return;
 
@@ -125,22 +124,19 @@ __global__ void zero_segments_kernel(const std::uint64_t* ptrs,
     if ((p_u & 0xF) == 0) {
         auto* v = reinterpret_cast<uint4*>(p);
         const std::size_t n_vec = vec_bytes / 16;
-        for (std::size_t i = static_cast<std::size_t>(threadIdx.x);
-             i < n_vec;
+        for (std::size_t i = static_cast<std::size_t>(threadIdx.x); i < n_vec;
              i += static_cast<std::size_t>(blockDim.x)) {
             v[i] = make_uint4(0, 0, 0, 0);
         }
     } else {
-        for (std::size_t i = static_cast<std::size_t>(threadIdx.x);
-             i < vec_bytes;
+        for (std::size_t i = static_cast<std::size_t>(threadIdx.x); i < vec_bytes;
              i += static_cast<std::size_t>(blockDim.x)) {
             p[i] = std::byte{0};
         }
     }
 
     // Tail.
-    for (std::size_t i = vec_bytes + static_cast<std::size_t>(threadIdx.x);
-         i < bytes;
+    for (std::size_t i = vec_bytes + static_cast<std::size_t>(threadIdx.x); i < bytes;
          i += static_cast<std::size_t>(blockDim.x)) {
         p[i] = std::byte{0};
     }
@@ -148,10 +144,7 @@ __global__ void zero_segments_kernel(const std::uint64_t* ptrs,
 
 }  // namespace
 
-void zero_device_segments(const std::uint64_t* ptrs,
-                          const std::uint64_t* sizes,
-                          int n,
-                          cudaStream_t stream) {
+void zero_device_segments(const std::uint64_t* ptrs, const std::uint64_t* sizes, int n, cudaStream_t stream) {
     if (n <= 0 || ptrs == nullptr || sizes == nullptr) return;
     // One block per segment; segments are large enough that per-block looping is fine.
     zero_segments_kernel<<<n, 256, 0, stream>>>(ptrs, sizes, n);

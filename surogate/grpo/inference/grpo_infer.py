@@ -13,9 +13,11 @@ def setup_vllm_env(config: GRPOInferenceConfig):
     if config.enable_lora:
         os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
 
+
 def grpo_infer(config: GRPOInferenceConfig):
     setup_vllm_env(config)
-    
+
     # We import here to be able to set environment variables before importing vLLM
     from surogate.grpo.inference.vllm.server import server  # pyright: ignore
+
     server(config)

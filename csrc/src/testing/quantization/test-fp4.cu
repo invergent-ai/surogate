@@ -106,11 +106,11 @@ float random_sign_cpu(long idx, unsigned int seed) {
 }
 
 // CPU reference for Hadamard transform forward
-void hadamard_transform_forward_cpu(
-    std::vector<float>& out,
-    const std::vector<float>& in,
-    int M, int K, unsigned int seed)
-{
+void hadamard_transform_forward_cpu(std::vector<float>& out,
+                                    const std::vector<float>& in,
+                                    int M,
+                                    int K,
+                                    unsigned int seed) {
     constexpr float HADAMARD_SCALE = 0.25f;
     out.resize(M * K);
 
@@ -161,13 +161,12 @@ float compute_mae(const std::vector<float>& a, const std::vector<float>& b) {
     return total_err / static_cast<float>(a.size());
 }
 
-} // anonymous namespace
-
+}  // anonymous namespace
 
 TEST_CASE("FP4 E2M1 quantization levels", "[quantization][fp4]") {
     // Verify FP4 E2M1 quantization produces correct discrete levels
-    std::vector<float> test_values = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f,
-                                       2.0f, 2.5f, 3.0f, 3.5f, 4.0f, 5.0f, 6.0f, 7.0f};
+    std::vector<float> test_values =
+        {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 3.5f, 4.0f, 5.0f, 6.0f, 7.0f};
 
     for (float v : test_values) {
         float q = quantize_fp4_e2m1_cpu(v);
@@ -190,7 +189,6 @@ TEST_CASE("FP4 E2M1 quantization levels", "[quantization][fp4]") {
         REQUIRE(q <= 0.0f);
     }
 }
-
 
 TEST_CASE("FP4 block quantization roundtrip", "[quantization][fp4]") {
     // Test parameters - must be multiples of 16 for FP4
@@ -225,33 +223,36 @@ TEST_CASE("FP4 block quantization roundtrip", "[quantization][fp4]") {
 
     // Run GPU quantization using the same two-stage scaling scheme as training:
     // global_encode_scale = FP8_MAX * FP4_MAX / global_amax, global_decode_scale = 1 / global_encode_scale.
-    quantize_fp4_block_auto_scale(
-        thrust::raw_pointer_cast(d_fp4.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        thrust::raw_pointer_cast(d_global_amax.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        M, K,
-        props, 0);
+    quantize_fp4_block_auto_scale(thrust::raw_pointer_cast(d_fp4.data()),
+                                  thrust::raw_pointer_cast(d_scales.data()),
+                                  thrust::raw_pointer_cast(d_global_amax.data()),
+                                  thrust::raw_pointer_cast(d_input.data()),
+                                  M,
+                                  K,
+                                  props,
+                                  0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Get global amax from device
     float h_global_amax;
-    CUDA_CHECK(cudaMemcpy(&h_global_amax, thrust::raw_pointer_cast(d_global_amax.data()),
-                          sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_global_amax,
+                          thrust::raw_pointer_cast(d_global_amax.data()),
+                          sizeof(float),
+                          cudaMemcpyDeviceToHost));
 
     // Compute global decode scale consistent with quantize_fp4_block_auto_scale.
     constexpr float FP8_E4M3_MAX = fp8_max_v<__nv_fp8_e4m3>;
-    float global_decode_scale =
-        (h_global_amax > 0.0f) ? (h_global_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)) : 1.0f;
+    float global_decode_scale = (h_global_amax > 0.0f) ? (h_global_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)) : 1.0f;
 
     // Run GPU dequantization
-    dequantize_fp4_block(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_fp4.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        global_decode_scale,
-        M, K,
-        props, 0);
+    dequantize_fp4_block(thrust::raw_pointer_cast(d_output.data()),
+                         thrust::raw_pointer_cast(d_fp4.data()),
+                         thrust::raw_pointer_cast(d_scales.data()),
+                         global_decode_scale,
+                         M,
+                         K,
+                         props,
+                         0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy output back to host
@@ -282,7 +283,6 @@ TEST_CASE("FP4 block quantization roundtrip", "[quantization][fp4]") {
     REQUIRE(mae < 0.5f);
 }
 
-
 TEST_CASE("Hadamard transform basic properties", "[quantization][fp4]") {
     // Test that Hadamard transform preserves energy (orthogonality)
     const int M = 64;
@@ -300,11 +300,13 @@ TEST_CASE("Hadamard transform basic properties", "[quantization][fp4]") {
     unsigned int seed = 42;
 
     // Run GPU Hadamard forward
-    hadamard_transform_forward(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        nullptr,  // amax_out
-        M, K, seed, 0);
+    hadamard_transform_forward(thrust::raw_pointer_cast(d_output.data()),
+                               thrust::raw_pointer_cast(d_input.data()),
+                               nullptr,  // amax_out
+                               M,
+                               K,
+                               seed,
+                               0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy output back
@@ -328,7 +330,6 @@ TEST_CASE("Hadamard transform basic properties", "[quantization][fp4]") {
     REQUIRE(energy_ratio < 1.1f);
 }
 
-
 TEST_CASE("Hadamard transform forward-inverse roundtrip", "[quantization][fp4]") {
     const int M = 32;
     const int K = 32;
@@ -346,17 +347,22 @@ TEST_CASE("Hadamard transform forward-inverse roundtrip", "[quantization][fp4]")
     unsigned int seed = 789;
 
     // Forward transform
-    hadamard_transform_forward(
-        thrust::raw_pointer_cast(d_transformed.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        nullptr, M, K, seed, 0);
+    hadamard_transform_forward(thrust::raw_pointer_cast(d_transformed.data()),
+                               thrust::raw_pointer_cast(d_input.data()),
+                               nullptr,
+                               M,
+                               K,
+                               seed,
+                               0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Inverse transform
-    hadamard_transform_inverse(
-        thrust::raw_pointer_cast(d_reconstructed.data()),
-        thrust::raw_pointer_cast(d_transformed.data()),
-        M, K, seed, 0);
+    hadamard_transform_inverse(thrust::raw_pointer_cast(d_reconstructed.data()),
+                               thrust::raw_pointer_cast(d_transformed.data()),
+                               M,
+                               K,
+                               seed,
+                               0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy reconstructed back
@@ -375,7 +381,6 @@ TEST_CASE("Hadamard transform forward-inverse roundtrip", "[quantization][fp4]")
     INFO("Hadamard roundtrip relative error: " << rel_error);
     REQUIRE(rel_error < 0.01f);  // Should be very close with BF16 precision
 }
-
 
 TEST_CASE("Hadamard transform CPU-GPU consistency", "[quantization][fp4]") {
     const int M = 16;
@@ -403,10 +408,13 @@ TEST_CASE("Hadamard transform CPU-GPU consistency", "[quantization][fp4]") {
     thrust::device_vector<nv_bfloat16> d_input(input_bf16.begin(), input_bf16.end());
     thrust::device_vector<nv_bfloat16> d_output(M * K);
 
-    hadamard_transform_forward(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        nullptr, M, K, seed, 0);
+    hadamard_transform_forward(thrust::raw_pointer_cast(d_output.data()),
+                               thrust::raw_pointer_cast(d_input.data()),
+                               nullptr,
+                               M,
+                               K,
+                               seed,
+                               0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<nv_bfloat16> h_output(M * K);
@@ -423,25 +431,24 @@ TEST_CASE("Hadamard transform CPU-GPU consistency", "[quantization][fp4]") {
     REQUIRE(rel_error < 0.02f);  // Allow for BF16 precision differences
 }
 
-
 TEST_CASE("FP4 scale shape computation", "[quantization][fp4][utils]") {
     // Test that fp4_scale_shape returns correct dimensions
     {
         auto [rows, cols] = fp4_scale_shape(128, 128);
-        REQUIRE(rows == 128); // rows rounded up to 128
-        REQUIRE(cols == 8);   // ceil(128/16) = 8, aligned to 4 = 8
+        REQUIRE(rows == 128);  // rows rounded up to 128
+        REQUIRE(cols == 8);    // ceil(128/16) = 8, aligned to 4 = 8
     }
 
     {
         auto [rows, cols] = fp4_scale_shape(256, 256);
-        REQUIRE(rows == 256); // rows rounded up to 128
-        REQUIRE(cols == 16);  // ceil(256/16) = 16
+        REQUIRE(rows == 256);  // rows rounded up to 128
+        REQUIRE(cols == 16);   // ceil(256/16) = 16
     }
 
     {
         auto [rows, cols] = fp4_scale_shape(512, 1024);
-        REQUIRE(rows == 512); // rows rounded up to 128
-        REQUIRE(cols == 64);  // ceil(1024/16) = 64
+        REQUIRE(rows == 512);  // rows rounded up to 128
+        REQUIRE(cols == 64);   // ceil(1024/16) = 64
     }
 }
 
@@ -495,20 +502,24 @@ TEST_CASE("FP4 cuDNN matmul matches BF16 reference (within tolerance)", "[quanti
     thrust::device_vector<float> d_amax_b(1);
 
     // Quantize A and W to FP4 (two-level scaling, auto scale).
-    quantize_fp4_block_auto_scale(
-        thrust::raw_pointer_cast(d_a_fp4.data()),
-        thrust::raw_pointer_cast(d_scale_a.data()),
-        thrust::raw_pointer_cast(d_amax_a.data()),
-        thrust::raw_pointer_cast(d_a.data()),
-        M, K, dp, stream);
+    quantize_fp4_block_auto_scale(thrust::raw_pointer_cast(d_a_fp4.data()),
+                                  thrust::raw_pointer_cast(d_scale_a.data()),
+                                  thrust::raw_pointer_cast(d_amax_a.data()),
+                                  thrust::raw_pointer_cast(d_a.data()),
+                                  M,
+                                  K,
+                                  dp,
+                                  stream);
 
     // Weights use the NVFP4 16x16 block scaling variant (TransformerEngine recipe).
-    quantize_fp4_weight_2d_auto_scale(
-        thrust::raw_pointer_cast(d_w_fp4.data()),
-        thrust::raw_pointer_cast(d_scale_b.data()),
-        thrust::raw_pointer_cast(d_amax_b.data()),
-        thrust::raw_pointer_cast(d_w.data()),
-        N, K, dp, stream);
+    quantize_fp4_weight_2d_auto_scale(thrust::raw_pointer_cast(d_w_fp4.data()),
+                                      thrust::raw_pointer_cast(d_scale_b.data()),
+                                      thrust::raw_pointer_cast(d_amax_b.data()),
+                                      thrust::raw_pointer_cast(d_w.data()),
+                                      N,
+                                      K,
+                                      dp,
+                                      stream);
 
     // FP4 matmul via cuDNN (FP32 output) + alpha correction.
     thrust::device_vector<float> d_out((std::size_t)M * (std::size_t)N);
@@ -519,23 +530,28 @@ TEST_CASE("FP4 cuDNN matmul matches BF16 reference (within tolerance)", "[quanti
     void* ws_ptr = nullptr;
     CUDA_CHECK(cudaMalloc(&ws_ptr, ws_bytes));
 
-    fp4_matmul_f32(
-        thrust::raw_pointer_cast(d_out.data()),
-        thrust::raw_pointer_cast(d_a_fp4.data()),
-        thrust::raw_pointer_cast(d_w_fp4.data()),
-        thrust::raw_pointer_cast(d_scale_a.data()),
-        thrust::raw_pointer_cast(d_scale_b.data()),
-        1.0f, 1.0f,
-        reinterpret_cast<std::byte*>(ws_ptr), ws_bytes,
-        M, N, K, BLOCK_SIZE,
-        cudnn_handle, stream);
+    fp4_matmul_f32(thrust::raw_pointer_cast(d_out.data()),
+                   thrust::raw_pointer_cast(d_a_fp4.data()),
+                   thrust::raw_pointer_cast(d_w_fp4.data()),
+                   thrust::raw_pointer_cast(d_scale_a.data()),
+                   thrust::raw_pointer_cast(d_scale_b.data()),
+                   1.0f,
+                   1.0f,
+                   reinterpret_cast<std::byte*>(ws_ptr),
+                   ws_bytes,
+                   M,
+                   N,
+                   K,
+                   BLOCK_SIZE,
+                   cudnn_handle,
+                   stream);
 
-    fp4_alpha_scale(
-        thrust::raw_pointer_cast(d_out.data()),
-        thrust::raw_pointer_cast(d_amax_a.data()),
-        thrust::raw_pointer_cast(d_amax_b.data()),
-        (long)M * N,
-        dp, stream);
+    fp4_alpha_scale(thrust::raw_pointer_cast(d_out.data()),
+                    thrust::raw_pointer_cast(d_amax_a.data()),
+                    thrust::raw_pointer_cast(d_amax_b.data()),
+                    (long)M * N,
+                    dp,
+                    stream);
 
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(ws_ptr));
@@ -634,28 +650,30 @@ TEST_CASE("FP4 dW matmul path (dout^T @ inp) is numerically reasonable", "[quant
     const auto [a_scale_rows, a_scale_cols] = fp4_scale_shape(OC, BT);
     thrust::device_vector<__nv_fp8_e4m3> d_a_scales((std::size_t)a_scale_rows * (std::size_t)a_scale_cols);
     thrust::device_vector<float> d_a_amax(1);
-    quantize_fp4_block_stochastic_auto_scale(
-        thrust::raw_pointer_cast(d_a_fp4.data()),
-        thrust::raw_pointer_cast(d_a_scales.data()),
-        thrust::raw_pointer_cast(d_a_amax.data()),
-        thrust::raw_pointer_cast(d_dout_tp.data()),
-        OC, BT,
-        /*seed=*/777,
-        dp, stream);
+    quantize_fp4_block_stochastic_auto_scale(thrust::raw_pointer_cast(d_a_fp4.data()),
+                                             thrust::raw_pointer_cast(d_a_scales.data()),
+                                             thrust::raw_pointer_cast(d_a_amax.data()),
+                                             thrust::raw_pointer_cast(d_dout_tp.data()),
+                                             OC,
+                                             BT,
+                                             /*seed=*/777,
+                                             dp,
+                                             stream);
 
     // Quantize B with B-operand scale layout.
     thrust::device_vector<uint8_t> d_b_fp4((std::size_t)C * (std::size_t)(BT / 2));
-    const long b_scale_rows = ((BT + 15) / 16 + 3) / 4 * 4;   // K/16 aligned to 4
-    const long b_scale_cols = (C + 127) / 128 * 128;          // N aligned to 128
+    const long b_scale_rows = ((BT + 15) / 16 + 3) / 4 * 4;  // K/16 aligned to 4
+    const long b_scale_cols = (C + 127) / 128 * 128;         // N aligned to 128
     thrust::device_vector<__nv_fp8_e4m3> d_b_scales((std::size_t)b_scale_rows * (std::size_t)b_scale_cols);
     thrust::device_vector<float> d_b_amax(1);
-    quantize_fp4_weight_auto_scale(
-        thrust::raw_pointer_cast(d_b_fp4.data()),
-        thrust::raw_pointer_cast(d_b_scales.data()),
-        thrust::raw_pointer_cast(d_b_amax.data()),
-        thrust::raw_pointer_cast(d_inp_tp.data()),
-        C, BT,
-        dp, stream);
+    quantize_fp4_weight_auto_scale(thrust::raw_pointer_cast(d_b_fp4.data()),
+                                   thrust::raw_pointer_cast(d_b_scales.data()),
+                                   thrust::raw_pointer_cast(d_b_amax.data()),
+                                   thrust::raw_pointer_cast(d_inp_tp.data()),
+                                   C,
+                                   BT,
+                                   dp,
+                                   stream);
 
     // FP4 matmul: (OC, BT) @ (BT, C) -> (OC, C)
     thrust::device_vector<float> d_dw((std::size_t)OC * (std::size_t)C);
@@ -664,23 +682,28 @@ TEST_CASE("FP4 dW matmul path (dout^T @ inp) is numerically reasonable", "[quant
     void* ws_ptr = nullptr;
     CUDA_CHECK(cudaMalloc(&ws_ptr, ws_bytes));
 
-    fp4_matmul_f32(
-        thrust::raw_pointer_cast(d_dw.data()),
-        thrust::raw_pointer_cast(d_a_fp4.data()),
-        thrust::raw_pointer_cast(d_b_fp4.data()),
-        thrust::raw_pointer_cast(d_a_scales.data()),
-        thrust::raw_pointer_cast(d_b_scales.data()),
-        1.0f, 1.0f,
-        reinterpret_cast<std::byte*>(ws_ptr), ws_bytes,
-        OC, C, BT, BLOCK_SIZE,
-        cudnn_handle, stream);
+    fp4_matmul_f32(thrust::raw_pointer_cast(d_dw.data()),
+                   thrust::raw_pointer_cast(d_a_fp4.data()),
+                   thrust::raw_pointer_cast(d_b_fp4.data()),
+                   thrust::raw_pointer_cast(d_a_scales.data()),
+                   thrust::raw_pointer_cast(d_b_scales.data()),
+                   1.0f,
+                   1.0f,
+                   reinterpret_cast<std::byte*>(ws_ptr),
+                   ws_bytes,
+                   OC,
+                   C,
+                   BT,
+                   BLOCK_SIZE,
+                   cudnn_handle,
+                   stream);
 
-    fp4_alpha_scale(
-        thrust::raw_pointer_cast(d_dw.data()),
-        thrust::raw_pointer_cast(d_a_amax.data()),
-        thrust::raw_pointer_cast(d_b_amax.data()),
-        (long)OC * C,
-        dp, stream);
+    fp4_alpha_scale(thrust::raw_pointer_cast(d_dw.data()),
+                    thrust::raw_pointer_cast(d_a_amax.data()),
+                    thrust::raw_pointer_cast(d_b_amax.data()),
+                    (long)OC * C,
+                    dp,
+                    stream);
 
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(ws_ptr));

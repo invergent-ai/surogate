@@ -23,28 +23,27 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
-        std::transform(h.begin(), h.end(), h.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        std::transform(n.begin(), n.end(), n.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         return h.find(n) != std::string::npos;
     };
     const bool is_qwen3_5 =
-        contains_ci(model_config.ModelTypeName, "qwen3_5") ||
-        contains_ci(model_config.ModelTypeName, "qwen3.5") ||
-        contains_ci(model_config.ArchitectureName, "qwen3_5") ||
-        contains_ci(model_config.ArchitectureName, "qwen3.5");
+        contains_ci(model_config.ModelTypeName, "qwen3_5") || contains_ci(model_config.ModelTypeName, "qwen3.5") ||
+        contains_ci(model_config.ArchitectureName, "qwen3_5") || contains_ci(model_config.ArchitectureName, "qwen3.5");
 
     const std::size_t q_out = Hq * Hs;
     const std::size_t q_lora_out = is_qwen3_5 ? (2 * q_out) : q_out;
     const std::size_t kv_out = Hkv * Hs;
-    const bool use_shared_expert = model_config.moe_config.has_value() &&
-                                   model_config.moe_config->use_shared_expert;
-    const std::size_t shared_D = use_shared_expert && model_config.moe_config->shared_expert_size > 0
-                                     ? static_cast<std::size_t>(model_config.moe_config->shared_expert_size)
-                                     : static_cast<std::size_t>(model_config.MoeIntermediateSize > 0
-                                                                    ? model_config.MoeIntermediateSize
-                                                                    : model_config.IntermediateSize);
+    const bool use_shared_expert = model_config.moe_config.has_value() && model_config.moe_config->use_shared_expert;
+    const std::size_t shared_D =
+        use_shared_expert && model_config.moe_config->shared_expert_size > 0
+            ? static_cast<std::size_t>(model_config.moe_config->shared_expert_size)
+            : static_cast<std::size_t>(model_config.MoeIntermediateSize > 0 ? model_config.MoeIntermediateSize
+                                                                            : model_config.IntermediateSize);
 
     std::size_t per_layer = 0;
     if (lora_config.applies_to_q()) per_layer += r * C + q_lora_out * r;
@@ -68,4 +67,4 @@ std::size_t lora_bytes(const ModelConfig& model_config, const ModularLoRAConfig&
     return lora_num_parameters(model_config, lora_config) * get_dtype_size(lora_config.dtype);
 }
 
-} // namespace modules
+}  // namespace modules

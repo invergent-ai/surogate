@@ -48,27 +48,36 @@ __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float v) {
 }
 
 template <typename floatX>
-__device__ __forceinline__ const floatX* head_ptr(const floatX* qkv, int token_idx, int head_idx,
-                                                   int qkv_channels, int head_size, int num_heads,
-                                                   int channel_offset) {
+__device__ __forceinline__ const floatX* head_ptr(const floatX* qkv,
+                                                  int token_idx,
+                                                  int head_idx,
+                                                  int qkv_channels,
+                                                  int head_size,
+                                                  int num_heads,
+                                                  int channel_offset) {
     (void)num_heads;
     const int base = token_idx * qkv_channels + channel_offset + head_idx * head_size;
     return qkv + base;
 }
 
 template <typename floatX>
-__device__ __forceinline__ floatX* head_ptr(floatX* qkv, int token_idx, int head_idx,
-                                            int qkv_channels, int head_size, int num_heads,
-                                            int channel_offset) {
+__device__ __forceinline__ floatX*
+head_ptr(floatX* qkv, int token_idx, int head_idx, int qkv_channels, int head_size, int num_heads, int channel_offset) {
     (void)num_heads;
     const int base = token_idx * qkv_channels + channel_offset + head_idx * head_size;
     return qkv + base;
 }
 
-template<typename floatX>
-__global__ void qkv_head_rmsnorm_forward_kernel(floatX* qkv, float* rstd, const floatX* weight,
-                                                float epsilon, int tokens, int qkv_channels,
-                                                int num_heads, int head_size, int channel_offset) {
+template <typename floatX>
+__global__ void qkv_head_rmsnorm_forward_kernel(floatX* qkv,
+                                                float* rstd,
+                                                const floatX* weight,
+                                                float epsilon,
+                                                int tokens,
+                                                int qkv_channels,
+                                                int num_heads,
+                                                int head_size,
+                                                int channel_offset) {
     using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     static_assert(x128::size > 0);
 
@@ -98,7 +107,7 @@ __global__ void qkv_head_rmsnorm_forward_kernel(floatX* qkv, float* rstd, const 
     for (int c = threadIdx.x; c < vecs; c += WARP_SIZE) {
         const x128 in = x128::load_cs(x + c * x128::size);
         s_in[c] = in;
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < x128::size; ++k) {
             float v = to_float(in[k]);
             acc += v * v;
@@ -112,7 +121,7 @@ __global__ void qkv_head_rmsnorm_forward_kernel(floatX* qkv, float* rstd, const 
         const x128 in = s_in[c];
         const x128 w = s_weight[c];
         x128 out;
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < x128::size; ++k) {
             const float n = s * to_float(in[k]);
             out[k] = from_float<floatX>(n * to_float(w[k]));
@@ -125,10 +134,16 @@ __global__ void qkv_head_rmsnorm_forward_kernel(floatX* qkv, float* rstd, const 
     }
 }
 
-template<typename floatX>
-__global__ void qkv_head_rmsnorm_backward_dx_kernel(floatX* d_qkv, const floatX* qkv_out, const floatX* weight, const float* rstd,
-                                                    int tokens, int qkv_channels,
-                                                    int num_heads, int head_size, int channel_offset) {
+template <typename floatX>
+__global__ void qkv_head_rmsnorm_backward_dx_kernel(floatX* d_qkv,
+                                                    const floatX* qkv_out,
+                                                    const floatX* weight,
+                                                    const float* rstd,
+                                                    int tokens,
+                                                    int qkv_channels,
+                                                    int num_heads,
+                                                    int head_size,
+                                                    int channel_offset) {
     using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     static_assert(x128::size > 0);
 
@@ -151,7 +166,7 @@ __global__ void qkv_head_rmsnorm_backward_dx_kernel(floatX* d_qkv, const floatX*
     for (int c = threadIdx.x; c < vecs; c += WARP_SIZE) {
         const x128 out = x128::load_cs(out_ptr + c * x128::size);
         const x128 dy = x128::load_cs(dy_ptr + c * x128::size);
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < x128::size; ++k) {
             dot += to_float(dy[k]) * to_float(out[k]);
         }
@@ -166,7 +181,7 @@ __global__ void qkv_head_rmsnorm_backward_dx_kernel(floatX* d_qkv, const floatX*
         const x128 dy = x128::load_cs(dy_ptr + c * x128::size);
         const x128 w = x128::load_cs(weight + c * x128::size);
         x128 dx;
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < x128::size; ++k) {
             const float wf = to_float(w[k]);
             const float dyf = to_float(dy[k]);
@@ -180,10 +195,16 @@ __global__ void qkv_head_rmsnorm_backward_dx_kernel(floatX* d_qkv, const floatX*
     }
 }
 
-template<typename floatX>
-__global__ void qkv_head_rmsnorm_backward_dweight_kernel(floatX* d_weight, const floatX* d_qkv, const floatX* qkv_out, const floatX* weight,
-                                                         int tokens, int qkv_channels,
-                                                         int num_heads, int head_size, int channel_offset,
+template <typename floatX>
+__global__ void qkv_head_rmsnorm_backward_dweight_kernel(floatX* d_weight,
+                                                         const floatX* d_qkv,
+                                                         const floatX* qkv_out,
+                                                         const floatX* weight,
+                                                         int tokens,
+                                                         int qkv_channels,
+                                                         int num_heads,
+                                                         int head_size,
+                                                         int channel_offset,
                                                          bool accumulate) {
     const int c = static_cast<int>(blockIdx.x);
     if (c >= head_size) return;
@@ -218,10 +239,16 @@ __global__ void qkv_head_rmsnorm_backward_dweight_kernel(floatX* d_weight, const
     }
 }
 
-template<typename floatX>
-__global__ void qkv_head_rmsnorm_backward_dweight_fp32_kernel(float* d_weight, const floatX* d_qkv, const floatX* qkv_out, const floatX* weight,
-                                                              int tokens, int qkv_channels,
-                                                              int num_heads, int head_size, int channel_offset,
+template <typename floatX>
+__global__ void qkv_head_rmsnorm_backward_dweight_fp32_kernel(float* d_weight,
+                                                              const floatX* d_qkv,
+                                                              const floatX* qkv_out,
+                                                              const floatX* weight,
+                                                              int tokens,
+                                                              int qkv_channels,
+                                                              int num_heads,
+                                                              int head_size,
+                                                              int channel_offset,
                                                               bool accumulate) {
     const int c = static_cast<int>(blockIdx.x);
     if (c >= head_size) return;
@@ -255,10 +282,16 @@ __global__ void qkv_head_rmsnorm_backward_dweight_fp32_kernel(float* d_weight, c
     }
 }
 
-template<typename floatX>
-void launch_forward(floatX* qkv, float* rstd, const floatX* weight,
-                    float epsilon, int tokens, int qkv_channels,
-                    int num_heads, int head_size, int channel_offset,
+template <typename floatX>
+void launch_forward(floatX* qkv,
+                    float* rstd,
+                    const floatX* weight,
+                    float epsilon,
+                    int tokens,
+                    int qkv_channels,
+                    int num_heads,
+                    int head_size,
+                    int channel_offset,
                     cudaStream_t stream) {
     const int vecs = tokens * num_heads;
     constexpr int block_y = 4;
@@ -269,17 +302,33 @@ void launch_forward(floatX* qkv, float* rstd, const floatX* weight,
     if (head_size % x128::size != 0) {
         throw std::runtime_error("qkv_head_rmsnorm_forward: head_size must be a multiple of 16B vector width");
     }
-    const std::size_t shmem = sizeof(floatX) * static_cast<std::size_t>(head_size) * static_cast<std::size_t>(1 + block_y);
-    CUDA_CHECK(cudaFuncSetAttribute(qkv_head_rmsnorm_forward_kernel<floatX>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
-    qkv_head_rmsnorm_forward_kernel<floatX><<<grid, block, shmem, stream>>>(
-        qkv, rstd, weight, epsilon, tokens, qkv_channels, num_heads, head_size, channel_offset);
+    const std::size_t shmem =
+        sizeof(floatX) * static_cast<std::size_t>(head_size) * static_cast<std::size_t>(1 + block_y);
+    CUDA_CHECK(cudaFuncSetAttribute(qkv_head_rmsnorm_forward_kernel<floatX>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)shmem));
+    qkv_head_rmsnorm_forward_kernel<floatX><<<grid, block, shmem, stream>>>(qkv,
+                                                                            rstd,
+                                                                            weight,
+                                                                            epsilon,
+                                                                            tokens,
+                                                                            qkv_channels,
+                                                                            num_heads,
+                                                                            head_size,
+                                                                            channel_offset);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename floatX>
-void launch_backward_dx(floatX* d_qkv, const floatX* qkv_out, const floatX* weight, const float* rstd,
-                        int tokens, int qkv_channels,
-                        int num_heads, int head_size, int channel_offset,
+template <typename floatX>
+void launch_backward_dx(floatX* d_qkv,
+                        const floatX* qkv_out,
+                        const floatX* weight,
+                        const float* rstd,
+                        int tokens,
+                        int qkv_channels,
+                        int num_heads,
+                        int head_size,
+                        int channel_offset,
                         cudaStream_t stream) {
     const int vecs = tokens * num_heads;
     constexpr int block_y = 4;
@@ -291,39 +340,75 @@ void launch_backward_dx(floatX* d_qkv, const floatX* qkv_out, const floatX* weig
         throw std::runtime_error("qkv_head_rmsnorm_backward_dx: head_size must be a multiple of 16B vector width");
     }
 
-    qkv_head_rmsnorm_backward_dx_kernel<floatX><<<grid, block, 0, stream>>>(
-        d_qkv, qkv_out, weight, rstd, tokens, qkv_channels, num_heads, head_size, channel_offset);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template<typename floatX>
-void launch_backward_dweight(floatX* d_weight, const floatX* d_qkv, const floatX* qkv_out, const floatX* weight,
-                             int tokens, int qkv_channels,
-                             int num_heads, int head_size, int channel_offset,
-                             bool accumulate,
-                             cudaStream_t stream) {
-    dim3 block(256);
-    dim3 grid(head_size);
-    qkv_head_rmsnorm_backward_dweight_kernel<floatX><<<grid, block, 0, stream>>>(
-        d_weight, d_qkv, qkv_out, weight, tokens, qkv_channels, num_heads, head_size, channel_offset, accumulate);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template<typename floatX>
-void launch_backward_dweight_fp32(float* d_weight, const floatX* d_qkv, const floatX* qkv_out, const floatX* weight,
-                                  int tokens, int qkv_channels,
-                                  int num_heads, int head_size, int channel_offset,
-                                  bool accumulate,
-                                  cudaStream_t stream) {
-    dim3 block(256);
-    dim3 grid(head_size);
-    qkv_head_rmsnorm_backward_dweight_fp32_kernel<floatX><<<grid, block, 0, stream>>>(
-        d_weight, d_qkv, qkv_out, weight, tokens, qkv_channels, num_heads, head_size, channel_offset, accumulate);
+    qkv_head_rmsnorm_backward_dx_kernel<floatX><<<grid, block, 0, stream>>>(d_qkv,
+                                                                            qkv_out,
+                                                                            weight,
+                                                                            rstd,
+                                                                            tokens,
+                                                                            qkv_channels,
+                                                                            num_heads,
+                                                                            head_size,
+                                                                            channel_offset);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <typename floatX>
-__device__ __forceinline__ void load_cos_sin(const floatX* freqs_cis, int pos, int head_size, int pair_idx, float& c, float& s) {
+void launch_backward_dweight(floatX* d_weight,
+                             const floatX* d_qkv,
+                             const floatX* qkv_out,
+                             const floatX* weight,
+                             int tokens,
+                             int qkv_channels,
+                             int num_heads,
+                             int head_size,
+                             int channel_offset,
+                             bool accumulate,
+                             cudaStream_t stream) {
+    dim3 block(256);
+    dim3 grid(head_size);
+    qkv_head_rmsnorm_backward_dweight_kernel<floatX><<<grid, block, 0, stream>>>(d_weight,
+                                                                                 d_qkv,
+                                                                                 qkv_out,
+                                                                                 weight,
+                                                                                 tokens,
+                                                                                 qkv_channels,
+                                                                                 num_heads,
+                                                                                 head_size,
+                                                                                 channel_offset,
+                                                                                 accumulate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename floatX>
+void launch_backward_dweight_fp32(float* d_weight,
+                                  const floatX* d_qkv,
+                                  const floatX* qkv_out,
+                                  const floatX* weight,
+                                  int tokens,
+                                  int qkv_channels,
+                                  int num_heads,
+                                  int head_size,
+                                  int channel_offset,
+                                  bool accumulate,
+                                  cudaStream_t stream) {
+    dim3 block(256);
+    dim3 grid(head_size);
+    qkv_head_rmsnorm_backward_dweight_fp32_kernel<floatX><<<grid, block, 0, stream>>>(d_weight,
+                                                                                      d_qkv,
+                                                                                      qkv_out,
+                                                                                      weight,
+                                                                                      tokens,
+                                                                                      qkv_channels,
+                                                                                      num_heads,
+                                                                                      head_size,
+                                                                                      channel_offset,
+                                                                                      accumulate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename floatX>
+__device__ __forceinline__ void
+load_cos_sin(const floatX* freqs_cis, int pos, int head_size, int pair_idx, float& c, float& s) {
     // freqs_cis stores interleaved cos/sin pairs: [cos0, sin0, cos1, sin1, ...]
     // indexed by pair_idx in [0, head_size/2).
     const int base = pos * head_size + 2 * pair_idx;
@@ -331,17 +416,21 @@ __device__ __forceinline__ void load_cos_sin(const floatX* freqs_cis, int pos, i
     s = to_float(freqs_cis[base + 1]);
 }
 
-template<typename floatX>
-__global__ void qkv_qk_norm_rope_forward_kernel(
-    floatX* qkv,
-    float* q_rstd, float* k_rstd,
-    const floatX* q_weight, const floatX* k_weight,
-    const floatX* freqs_cis, const int* position_ids,
-    float epsilon,
-    int tokens, int T,
-    int Hq, int Hkv,
-    int head_size, int qkv_channels
-) {
+template <typename floatX>
+__global__ void qkv_qk_norm_rope_forward_kernel(floatX* qkv,
+                                                float* q_rstd,
+                                                float* k_rstd,
+                                                const floatX* q_weight,
+                                                const floatX* k_weight,
+                                                const floatX* freqs_cis,
+                                                const int* position_ids,
+                                                float epsilon,
+                                                int tokens,
+                                                int T,
+                                                int Hq,
+                                                int Hkv,
+                                                int head_size,
+                                                int qkv_channels) {
     // One warp per (token, head) vector. Supports head_size/2 multiple of 32.
     constexpr int WARP = 32;
     static_assert(WARP_SIZE == WARP);
@@ -364,7 +453,7 @@ __global__ void qkv_qk_norm_rope_forward_kernel(
     const int pos = position_ids ? position_ids[token_idx] : t;
 
     const int half = head_size / 2;
-    if ((half % WARP) != 0) return; // unsupported shape
+    if ((half % WARP) != 0) return;  // unsupported shape
 
     // Compute mean square over head_size.
     float acc = 0.0f;
@@ -404,18 +493,20 @@ __global__ void qkv_qk_norm_rope_forward_kernel(
     }
 }
 
-template<typename floatX>
-__global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(
-    floatX* d_qkv,
-    const floatX* qkv_rope,
-    const floatX* weight,
-    const float* rstd,
-    const floatX* freqs_cis,
-    const int* position_ids,
-    int tokens, int T, int qkv_channels,
-    int num_heads, int head_size, int channel_offset,
-    float* abs_max_ptr
-) {
+template <typename floatX>
+__global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(floatX* d_qkv,
+                                                         const floatX* qkv_rope,
+                                                         const floatX* weight,
+                                                         const float* rstd,
+                                                         const floatX* freqs_cis,
+                                                         const int* position_ids,
+                                                         int tokens,
+                                                         int T,
+                                                         int qkv_channels,
+                                                         int num_heads,
+                                                         int head_size,
+                                                         int channel_offset,
+                                                         float* abs_max_ptr) {
     constexpr int WARP = 32;
     static_assert(WARP_SIZE == WARP);
     const int vecs_per_block = static_cast<int>(blockDim.y);
@@ -433,12 +524,9 @@ __global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(
     const int t = active ? (token_idx - b * T) : 0;
     const int pos = active ? (position_ids ? position_ids[token_idx] : t) : 0;
 
-    const floatX* outp = (!active)
-        ? nullptr
-        : qkv_rope + token_idx * qkv_channels + channel_offset + head_idx * head_size;
-    floatX* dptr = (!active)
-        ? nullptr
-        : d_qkv + token_idx * qkv_channels + channel_offset + head_idx * head_size;
+    const floatX* outp =
+        (!active) ? nullptr : qkv_rope + token_idx * qkv_channels + channel_offset + head_idx * head_size;
+    floatX* dptr = (!active) ? nullptr : d_qkv + token_idx * qkv_channels + channel_offset + head_idx * head_size;
 
     const int half = head_size / 2;
     if ((half % WARP) != 0) return;
@@ -527,18 +615,20 @@ __global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(
     }
 }
 
-template<typename floatX>
-__global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(
-    floatX* d_weight,
-    const floatX* d_qkv,
-    const floatX* qkv_rope,
-    const floatX* weight,
-    const floatX* freqs_cis,
-    const int* position_ids,
-    int tokens, int T, int qkv_channels,
-    int num_heads, int head_size, int channel_offset,
-    bool accumulate
-) {
+template <typename floatX>
+__global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(floatX* d_weight,
+                                                              const floatX* d_qkv,
+                                                              const floatX* qkv_rope,
+                                                              const floatX* weight,
+                                                              const floatX* freqs_cis,
+                                                              const int* position_ids,
+                                                              int tokens,
+                                                              int T,
+                                                              int qkv_channels,
+                                                              int num_heads,
+                                                              int head_size,
+                                                              int channel_offset,
+                                                              bool accumulate) {
     const int c = static_cast<int>(blockIdx.x);
     if (c >= head_size) return;
 
@@ -601,18 +691,20 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(
     }
 }
 
-template<typename floatX>
-__global__ void qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel(
-    float* d_weight,
-    const floatX* d_qkv,
-    const floatX* qkv_rope,
-    const floatX* weight,
-    const floatX* freqs_cis,
-    const int* position_ids,
-    int tokens, int T, int qkv_channels,
-    int num_heads, int head_size, int channel_offset,
-    bool accumulate
-) {
+template <typename floatX>
+__global__ void qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel(float* d_weight,
+                                                                   const floatX* d_qkv,
+                                                                   const floatX* qkv_rope,
+                                                                   const floatX* weight,
+                                                                   const floatX* freqs_cis,
+                                                                   const int* position_ids,
+                                                                   int tokens,
+                                                                   int T,
+                                                                   int qkv_channels,
+                                                                   int num_heads,
+                                                                   int head_size,
+                                                                   int channel_offset,
+                                                                   bool accumulate) {
     const int c = static_cast<int>(blockIdx.x);
     if (c >= head_size) return;
 
@@ -675,13 +767,13 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel(
     }
 }
 
-template<typename floatX>
-__global__ void qkv_abs_max_slice_kernel(
-    const floatX* qkv,
-    int tokens, int qkv_channels,
-    int channel_offset, int channel_count,
-    float* abs_max_ptr
-) {
+template <typename floatX>
+__global__ void qkv_abs_max_slice_kernel(const floatX* qkv,
+                                         int tokens,
+                                         int qkv_channels,
+                                         int channel_offset,
+                                         int channel_count,
+                                         float* abs_max_ptr) {
     float thread_max = 0.f;
     const int total = tokens * channel_count;
     for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
@@ -702,125 +794,252 @@ __global__ void qkv_abs_max_slice_kernel(
     handle_absmax_reduction(abs_max_ptr, &block_abs_max, thread_max);
 }
 
-template<typename floatX>
-void launch_qk_norm_rope_forward(floatX* qkv, float* q_rstd, float* k_rstd,
-                                 const floatX* q_weight, const floatX* k_weight,
-                                 const floatX* freqs_cis, const int* position_ids,
-                                 float epsilon, int tokens, int T, int Hq, int Hkv, int head_size, int qkv_channels,
+template <typename floatX>
+void launch_qk_norm_rope_forward(floatX* qkv,
+                                 float* q_rstd,
+                                 float* k_rstd,
+                                 const floatX* q_weight,
+                                 const floatX* k_weight,
+                                 const floatX* freqs_cis,
+                                 const int* position_ids,
+                                 float epsilon,
+                                 int tokens,
+                                 int T,
+                                 int Hq,
+                                 int Hkv,
+                                 int head_size,
+                                 int qkv_channels,
                                  cudaStream_t stream) {
     constexpr int block_y = 4;
     dim3 block(WARP_SIZE, block_y);
     dim3 grid(div_ceil(tokens * (Hq + Hkv), block_y));
-    qkv_qk_norm_rope_forward_kernel<floatX><<<grid, block, 0, stream>>>(
-        qkv, q_rstd, k_rstd, q_weight, k_weight, freqs_cis, position_ids, epsilon,
-        tokens, T, Hq, Hkv, head_size, qkv_channels);
+    qkv_qk_norm_rope_forward_kernel<floatX><<<grid, block, 0, stream>>>(qkv,
+                                                                        q_rstd,
+                                                                        k_rstd,
+                                                                        q_weight,
+                                                                        k_weight,
+                                                                        freqs_cis,
+                                                                        position_ids,
+                                                                        epsilon,
+                                                                        tokens,
+                                                                        T,
+                                                                        Hq,
+                                                                        Hkv,
+                                                                        head_size,
+                                                                        qkv_channels);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename floatX>
-void launch_rmsnorm_rope_backward_dx(floatX* d_qkv, const floatX* qkv_rope, const floatX* weight, const float* rstd,
-                                    const floatX* freqs_cis, const int* position_ids,
-                                    int tokens, int T, int qkv_channels,
-                                    int num_heads, int head_size, int channel_offset,
-                                    cudaStream_t stream, float* abs_max_ptr) {
+template <typename floatX>
+void launch_rmsnorm_rope_backward_dx(floatX* d_qkv,
+                                     const floatX* qkv_rope,
+                                     const floatX* weight,
+                                     const float* rstd,
+                                     const floatX* freqs_cis,
+                                     const int* position_ids,
+                                     int tokens,
+                                     int T,
+                                     int qkv_channels,
+                                     int num_heads,
+                                     int head_size,
+                                     int channel_offset,
+                                     cudaStream_t stream,
+                                     float* abs_max_ptr) {
     constexpr int block_y = 4;
     dim3 block(WARP_SIZE, block_y);
     dim3 grid(div_ceil(tokens * num_heads, block_y));
-    qkv_head_rmsnorm_rope_backward_dx_kernel<floatX><<<grid, block, 0, stream>>>(
-        d_qkv, qkv_rope, weight, rstd, freqs_cis, position_ids,
-        tokens, T, qkv_channels, num_heads, head_size, channel_offset, abs_max_ptr);
+    qkv_head_rmsnorm_rope_backward_dx_kernel<floatX><<<grid, block, 0, stream>>>(d_qkv,
+                                                                                 qkv_rope,
+                                                                                 weight,
+                                                                                 rstd,
+                                                                                 freqs_cis,
+                                                                                 position_ids,
+                                                                                 tokens,
+                                                                                 T,
+                                                                                 qkv_channels,
+                                                                                 num_heads,
+                                                                                 head_size,
+                                                                                 channel_offset,
+                                                                                 abs_max_ptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename floatX>
-void launch_rmsnorm_rope_backward_dweight(floatX* d_weight, const floatX* d_qkv, const floatX* qkv_rope, const floatX* weight,
-                                         const floatX* freqs_cis, const int* position_ids,
-                                         int tokens, int T, int qkv_channels,
-                                         int num_heads, int head_size, int channel_offset,
-                                         bool accumulate,
-                                         cudaStream_t stream) {
+template <typename floatX>
+void launch_rmsnorm_rope_backward_dweight(floatX* d_weight,
+                                          const floatX* d_qkv,
+                                          const floatX* qkv_rope,
+                                          const floatX* weight,
+                                          const floatX* freqs_cis,
+                                          const int* position_ids,
+                                          int tokens,
+                                          int T,
+                                          int qkv_channels,
+                                          int num_heads,
+                                          int head_size,
+                                          int channel_offset,
+                                          bool accumulate,
+                                          cudaStream_t stream) {
     dim3 block(256);
     dim3 grid(head_size);
-    qkv_head_rmsnorm_rope_backward_dweight_kernel<floatX><<<grid, block, 0, stream>>>(
-        d_weight, d_qkv, qkv_rope, weight, freqs_cis, position_ids,
-        tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate);
+    qkv_head_rmsnorm_rope_backward_dweight_kernel<floatX><<<grid, block, 0, stream>>>(d_weight,
+                                                                                      d_qkv,
+                                                                                      qkv_rope,
+                                                                                      weight,
+                                                                                      freqs_cis,
+                                                                                      position_ids,
+                                                                                      tokens,
+                                                                                      T,
+                                                                                      qkv_channels,
+                                                                                      num_heads,
+                                                                                      head_size,
+                                                                                      channel_offset,
+                                                                                      accumulate);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename floatX>
-void launch_rmsnorm_rope_backward_dweight_fp32(float* d_weight, const floatX* d_qkv, const floatX* qkv_rope, const floatX* weight,
-                                               const floatX* freqs_cis, const int* position_ids,
-                                               int tokens, int T, int qkv_channels,
-                                               int num_heads, int head_size, int channel_offset,
+template <typename floatX>
+void launch_rmsnorm_rope_backward_dweight_fp32(float* d_weight,
+                                               const floatX* d_qkv,
+                                               const floatX* qkv_rope,
+                                               const floatX* weight,
+                                               const floatX* freqs_cis,
+                                               const int* position_ids,
+                                               int tokens,
+                                               int T,
+                                               int qkv_channels,
+                                               int num_heads,
+                                               int head_size,
+                                               int channel_offset,
                                                bool accumulate,
                                                cudaStream_t stream) {
     dim3 block(256);
     dim3 grid(head_size);
-    qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel<floatX><<<grid, block, 0, stream>>>(
-        d_weight, d_qkv, qkv_rope, weight, freqs_cis, position_ids,
-        tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate);
+    qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel<floatX><<<grid, block, 0, stream>>>(d_weight,
+                                                                                           d_qkv,
+                                                                                           qkv_rope,
+                                                                                           weight,
+                                                                                           freqs_cis,
+                                                                                           position_ids,
+                                                                                           tokens,
+                                                                                           T,
+                                                                                           qkv_channels,
+                                                                                           num_heads,
+                                                                                           head_size,
+                                                                                           channel_offset,
+                                                                                           accumulate);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename floatX>
-void launch_qkv_abs_max_slice(const floatX* qkv, int tokens, int qkv_channels,
-                              int channel_offset, int channel_count,
-                              float* abs_max_ptr, cudaStream_t stream) {
+template <typename floatX>
+void launch_qkv_abs_max_slice(const floatX* qkv,
+                              int tokens,
+                              int qkv_channels,
+                              int channel_offset,
+                              int channel_count,
+                              float* abs_max_ptr,
+                              cudaStream_t stream) {
     if (!abs_max_ptr) return;
     constexpr int block = 256;
     const int total = tokens * channel_count;
     if (total <= 0) return;
     const int grid = std::min(1024, div_ceil(total, block));
-    qkv_abs_max_slice_kernel<floatX><<<grid, block, 0, stream>>>(
-        qkv, tokens, qkv_channels, channel_offset, channel_count, abs_max_ptr);
+    qkv_abs_max_slice_kernel<floatX>
+        <<<grid, block, 0, stream>>>(qkv, tokens, qkv_channels, channel_offset, channel_count, abs_max_ptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace
+}  // namespace
 
-void qkv_head_rmsnorm_forward(Tensor& qkv, Tensor& rstd, const Tensor& weight,
-                              float epsilon, int B, int T, int qkv_channels,
-                              int num_heads, int head_size, int channel_offset,
+void qkv_head_rmsnorm_forward(Tensor& qkv,
+                              Tensor& rstd,
+                              const Tensor& weight,
+                              float epsilon,
+                              int B,
+                              int T,
+                              int qkv_channels,
+                              int num_heads,
+                              int head_size,
+                              int channel_offset,
                               cudaStream_t stream) {
     if (rstd.DType != ETensorDType::FP32) {
         throw std::logic_error("qkv_head_rmsnorm_forward: rstd must be FP32");
     }
     if (qkv.DType != weight.DType) {
-        fprintf(stderr, "[qk_norm] qkv/weight dtype mismatch: received=%d, wanted=%d\n",
-                (int)qkv.DType, (int)weight.DType);
+        fprintf(stderr,
+                "[qk_norm] qkv/weight dtype mismatch: received=%d, wanted=%d\n",
+                (int)qkv.DType,
+                (int)weight.DType);
         throw std::logic_error("qkv_head_rmsnorm_forward: qkv/weight dtype mismatch");
     }
     const int tokens = B * T;
     if (qkv.Rank != 3 || qkv.Sizes[0] != B || qkv.Sizes[1] != T || qkv.Sizes[2] != qkv_channels) {
-        fprintf(stderr, "[qk_norm] qkv shape mismatch: qkv.Sizes=[%ld,%ld,%ld], expected=[%d,%d,%d]\n",
-                qkv.Sizes[0], qkv.Sizes[1], qkv.Sizes[2], B, T, qkv_channels);
+        fprintf(stderr,
+                "[qk_norm] qkv shape mismatch: qkv.Sizes=[%ld,%ld,%ld], expected=[%d,%d,%d]\n",
+                qkv.Sizes[0],
+                qkv.Sizes[1],
+                qkv.Sizes[2],
+                B,
+                T,
+                qkv_channels);
         throw std::logic_error("qkv_head_rmsnorm_forward: unexpected qkv shape");
     }
     if (weight.Rank != 1 || weight.Sizes[0] != head_size) {
-        fprintf(stderr, "[qk_norm] weight shape mismatch: weight.Rank=%d (expected 1), weight.Sizes[0]=%ld (expected %d)\n",
-                weight.Rank, weight.Sizes[0], head_size);
+        fprintf(stderr,
+                "[qk_norm] weight shape mismatch: weight.Rank=%d (expected 1), weight.Sizes[0]=%ld (expected %d)\n",
+                weight.Rank,
+                weight.Sizes[0],
+                head_size);
         throw std::logic_error("qkv_head_rmsnorm_forward: unexpected weight shape");
     }
     if (rstd.Rank != 3 || rstd.Sizes[0] != B || rstd.Sizes[1] != T || rstd.Sizes[2] != num_heads) {
-        fprintf(stderr, "[qk_norm] rstd shape mismatch: rstd.Sizes=[%ld,%ld,%ld], expected=[%d,%d,%d]\n",
-                rstd.Sizes[0], rstd.Sizes[1], rstd.Sizes[2], B, T, num_heads);
+        fprintf(stderr,
+                "[qk_norm] rstd shape mismatch: rstd.Sizes=[%ld,%ld,%ld], expected=[%d,%d,%d]\n",
+                rstd.Sizes[0],
+                rstd.Sizes[1],
+                rstd.Sizes[2],
+                B,
+                T,
+                num_heads);
         throw std::logic_error("qkv_head_rmsnorm_forward: unexpected rstd shape");
     }
 
     if (qkv.DType == ETensorDType::BF16) {
-        launch_forward(qkv.get<nv_bfloat16>(), rstd.get<float>(), weight.get<nv_bfloat16>(),
-                       epsilon, tokens, qkv_channels, num_heads, head_size, channel_offset, stream);
+        launch_forward(qkv.get<nv_bfloat16>(),
+                       rstd.get<float>(),
+                       weight.get<nv_bfloat16>(),
+                       epsilon,
+                       tokens,
+                       qkv_channels,
+                       num_heads,
+                       head_size,
+                       channel_offset,
+                       stream);
     } else if (qkv.DType == ETensorDType::FP32) {
-        launch_forward(qkv.get<float>(), rstd.get<float>(), weight.get<float>(),
-                       epsilon, tokens, qkv_channels, num_heads, head_size, channel_offset, stream);
+        launch_forward(qkv.get<float>(),
+                       rstd.get<float>(),
+                       weight.get<float>(),
+                       epsilon,
+                       tokens,
+                       qkv_channels,
+                       num_heads,
+                       head_size,
+                       channel_offset,
+                       stream);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_forward: unsupported dtype");
     }
 }
 
-void qkv_head_rmsnorm_backward_dx(Tensor& d_qkv, const Tensor& qkv_out, const Tensor& weight, const Tensor& rstd,
-                                  int B, int T, int qkv_channels,
-                                  int num_heads, int head_size, int channel_offset,
+void qkv_head_rmsnorm_backward_dx(Tensor& d_qkv,
+                                  const Tensor& qkv_out,
+                                  const Tensor& weight,
+                                  const Tensor& rstd,
+                                  int B,
+                                  int T,
+                                  int qkv_channels,
+                                  int num_heads,
+                                  int head_size,
+                                  int channel_offset,
                                   cudaStream_t stream) {
     if (rstd.DType != ETensorDType::FP32) {
         throw std::logic_error("qkv_head_rmsnorm_backward_dx: rstd must be FP32");
@@ -831,20 +1050,44 @@ void qkv_head_rmsnorm_backward_dx(Tensor& d_qkv, const Tensor& qkv_out, const Te
     const int tokens = B * T;
 
     if (d_qkv.DType == ETensorDType::BF16) {
-        launch_backward_dx(d_qkv.get<nv_bfloat16>(), qkv_out.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(),
-                           tokens, qkv_channels, num_heads, head_size, channel_offset, stream);
+        launch_backward_dx(d_qkv.get<nv_bfloat16>(),
+                           qkv_out.get<nv_bfloat16>(),
+                           weight.get<nv_bfloat16>(),
+                           rstd.get<float>(),
+                           tokens,
+                           qkv_channels,
+                           num_heads,
+                           head_size,
+                           channel_offset,
+                           stream);
     } else if (d_qkv.DType == ETensorDType::FP32) {
-        launch_backward_dx(d_qkv.get<float>(), qkv_out.get<float>(), weight.get<float>(), rstd.get<float>(),
-                           tokens, qkv_channels, num_heads, head_size, channel_offset, stream);
+        launch_backward_dx(d_qkv.get<float>(),
+                           qkv_out.get<float>(),
+                           weight.get<float>(),
+                           rstd.get<float>(),
+                           tokens,
+                           qkv_channels,
+                           num_heads,
+                           head_size,
+                           channel_offset,
+                           stream);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_backward_dx: unsupported dtype");
     }
 }
 
-void qkv_head_rmsnorm_backward_dweight(Tensor& d_weight, const Tensor& d_qkv, const Tensor& qkv_out, const Tensor& weight,
-                                       int B, int T, int qkv_channels,
-                                       int num_heads, int head_size, int channel_offset,
-                                       bool accumulate, cudaStream_t stream) {
+void qkv_head_rmsnorm_backward_dweight(Tensor& d_weight,
+                                       const Tensor& d_qkv,
+                                       const Tensor& qkv_out,
+                                       const Tensor& weight,
+                                       int B,
+                                       int T,
+                                       int qkv_channels,
+                                       int num_heads,
+                                       int head_size,
+                                       int channel_offset,
+                                       bool accumulate,
+                                       cudaStream_t stream) {
     if (d_weight.DType != d_qkv.DType || d_weight.DType != qkv_out.DType || d_weight.DType != weight.DType) {
         throw std::logic_error("qkv_head_rmsnorm_backward_dweight: dtype mismatch");
     }
@@ -854,20 +1097,46 @@ void qkv_head_rmsnorm_backward_dweight(Tensor& d_weight, const Tensor& d_qkv, co
     const int tokens = B * T;
 
     if (d_weight.DType == ETensorDType::BF16) {
-        launch_backward_dweight(d_weight.get<nv_bfloat16>(), d_qkv.get<nv_bfloat16>(), qkv_out.get<nv_bfloat16>(), weight.get<nv_bfloat16>(),
-                                tokens, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_backward_dweight(d_weight.get<nv_bfloat16>(),
+                                d_qkv.get<nv_bfloat16>(),
+                                qkv_out.get<nv_bfloat16>(),
+                                weight.get<nv_bfloat16>(),
+                                tokens,
+                                qkv_channels,
+                                num_heads,
+                                head_size,
+                                channel_offset,
+                                accumulate,
+                                stream);
     } else if (d_weight.DType == ETensorDType::FP32) {
-        launch_backward_dweight(d_weight.get<float>(), d_qkv.get<float>(), qkv_out.get<float>(), weight.get<float>(),
-                                tokens, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_backward_dweight(d_weight.get<float>(),
+                                d_qkv.get<float>(),
+                                qkv_out.get<float>(),
+                                weight.get<float>(),
+                                tokens,
+                                qkv_channels,
+                                num_heads,
+                                head_size,
+                                channel_offset,
+                                accumulate,
+                                stream);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_backward_dweight: unsupported dtype");
     }
 }
 
-void qkv_head_rmsnorm_backward_dweight_fp32(Tensor& d_weight_fp32, const Tensor& d_qkv, const Tensor& qkv_out, const Tensor& weight,
-                                            int B, int T, int qkv_channels,
-                                            int num_heads, int head_size, int channel_offset,
-                                            bool accumulate, cudaStream_t stream) {
+void qkv_head_rmsnorm_backward_dweight_fp32(Tensor& d_weight_fp32,
+                                            const Tensor& d_qkv,
+                                            const Tensor& qkv_out,
+                                            const Tensor& weight,
+                                            int B,
+                                            int T,
+                                            int qkv_channels,
+                                            int num_heads,
+                                            int head_size,
+                                            int channel_offset,
+                                            bool accumulate,
+                                            cudaStream_t stream) {
     if (d_weight_fp32.DType != ETensorDType::FP32) {
         throw std::logic_error("qkv_head_rmsnorm_backward_dweight_fp32: d_weight must be FP32");
     }
@@ -880,25 +1149,60 @@ void qkv_head_rmsnorm_backward_dweight_fp32(Tensor& d_weight_fp32, const Tensor&
     const int tokens = B * T;
 
     if (d_qkv.DType == ETensorDType::BF16) {
-        launch_backward_dweight_fp32(d_weight_fp32.get<float>(), d_qkv.get<nv_bfloat16>(), qkv_out.get<nv_bfloat16>(), weight.get<nv_bfloat16>(),
-                                     tokens, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_backward_dweight_fp32(d_weight_fp32.get<float>(),
+                                     d_qkv.get<nv_bfloat16>(),
+                                     qkv_out.get<nv_bfloat16>(),
+                                     weight.get<nv_bfloat16>(),
+                                     tokens,
+                                     qkv_channels,
+                                     num_heads,
+                                     head_size,
+                                     channel_offset,
+                                     accumulate,
+                                     stream);
     } else if (d_qkv.DType == ETensorDType::FP16) {
-        launch_backward_dweight_fp32(d_weight_fp32.get<float>(), d_qkv.get<__half>(), qkv_out.get<__half>(), weight.get<__half>(),
-                                     tokens, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_backward_dweight_fp32(d_weight_fp32.get<float>(),
+                                     d_qkv.get<__half>(),
+                                     qkv_out.get<__half>(),
+                                     weight.get<__half>(),
+                                     tokens,
+                                     qkv_channels,
+                                     num_heads,
+                                     head_size,
+                                     channel_offset,
+                                     accumulate,
+                                     stream);
     } else if (d_qkv.DType == ETensorDType::FP32) {
         // If inputs are already FP32, use existing path to avoid extra kernel.
-        launch_backward_dweight(d_weight_fp32.get<float>(), d_qkv.get<float>(), qkv_out.get<float>(), weight.get<float>(),
-                                tokens, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_backward_dweight(d_weight_fp32.get<float>(),
+                                d_qkv.get<float>(),
+                                qkv_out.get<float>(),
+                                weight.get<float>(),
+                                tokens,
+                                qkv_channels,
+                                num_heads,
+                                head_size,
+                                channel_offset,
+                                accumulate,
+                                stream);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_backward_dweight_fp32: unsupported dtype");
     }
 }
 
 void qkv_qk_norm_rope_forward(Tensor& qkv,
-                              Tensor& q_rstd, Tensor& k_rstd,
-                              const Tensor& q_weight, const Tensor& k_weight,
-                              const Tensor& freqs_cis, const int* position_ids,
-                              float epsilon, int B, int T, int Hq, int Hkv, int head_size,
+                              Tensor& q_rstd,
+                              Tensor& k_rstd,
+                              const Tensor& q_weight,
+                              const Tensor& k_weight,
+                              const Tensor& freqs_cis,
+                              const int* position_ids,
+                              float epsilon,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hkv,
+                              int head_size,
                               cudaStream_t stream) {
     if (qkv.DType != q_weight.DType || qkv.DType != k_weight.DType || qkv.DType != freqs_cis.DType) {
         throw std::logic_error("qkv_qk_norm_rope_forward: dtype mismatch");
@@ -932,25 +1236,56 @@ void qkv_qk_norm_rope_forward(Tensor& qkv,
     }
 
     if (qkv.DType == ETensorDType::BF16) {
-        launch_qk_norm_rope_forward(qkv.get<nv_bfloat16>(), q_rstd.get<float>(), k_rstd.get<float>(),
-                                    q_weight.get<nv_bfloat16>(), k_weight.get<nv_bfloat16>(),
-                                    freqs_cis.get<nv_bfloat16>(), position_ids,
-                                    epsilon, tokens, T, Hq, Hkv, head_size, qkv_channels, stream);
+        launch_qk_norm_rope_forward(qkv.get<nv_bfloat16>(),
+                                    q_rstd.get<float>(),
+                                    k_rstd.get<float>(),
+                                    q_weight.get<nv_bfloat16>(),
+                                    k_weight.get<nv_bfloat16>(),
+                                    freqs_cis.get<nv_bfloat16>(),
+                                    position_ids,
+                                    epsilon,
+                                    tokens,
+                                    T,
+                                    Hq,
+                                    Hkv,
+                                    head_size,
+                                    qkv_channels,
+                                    stream);
     } else if (qkv.DType == ETensorDType::FP32) {
-        launch_qk_norm_rope_forward(qkv.get<float>(), q_rstd.get<float>(), k_rstd.get<float>(),
-                                    q_weight.get<float>(), k_weight.get<float>(),
-                                    freqs_cis.get<float>(), position_ids,
-                                    epsilon, tokens, T, Hq, Hkv, head_size, qkv_channels, stream);
+        launch_qk_norm_rope_forward(qkv.get<float>(),
+                                    q_rstd.get<float>(),
+                                    k_rstd.get<float>(),
+                                    q_weight.get<float>(),
+                                    k_weight.get<float>(),
+                                    freqs_cis.get<float>(),
+                                    position_ids,
+                                    epsilon,
+                                    tokens,
+                                    T,
+                                    Hq,
+                                    Hkv,
+                                    head_size,
+                                    qkv_channels,
+                                    stream);
     } else {
         throw std::logic_error("qkv_qk_norm_rope_forward: unsupported dtype");
     }
 }
 
-void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv, const Tensor& qkv_rope, const Tensor& weight, const Tensor& rstd,
-                                       const Tensor& freqs_cis, const int* position_ids,
-                                       int B, int T, int qkv_channels,
-                                       int num_heads, int head_size, int channel_offset,
-                                       cudaStream_t stream, float* abs_max_ptr) {
+void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv,
+                                       const Tensor& qkv_rope,
+                                       const Tensor& weight,
+                                       const Tensor& rstd,
+                                       const Tensor& freqs_cis,
+                                       const int* position_ids,
+                                       int B,
+                                       int T,
+                                       int qkv_channels,
+                                       int num_heads,
+                                       int head_size,
+                                       int channel_offset,
+                                       cudaStream_t stream,
+                                       float* abs_max_ptr) {
     if (rstd.DType != ETensorDType::FP32) {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dx: rstd must be FP32");
     }
@@ -966,24 +1301,56 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv, const Tensor& qkv_rope, co
     }
 
     if (d_qkv.DType == ETensorDType::BF16) {
-        launch_rmsnorm_rope_backward_dx(d_qkv.get<nv_bfloat16>(), qkv_rope.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(),
-                                        freqs_cis.get<nv_bfloat16>(), position_ids,
-                                        tokens, T, qkv_channels, num_heads, head_size, channel_offset, stream, abs_max_ptr);
+        launch_rmsnorm_rope_backward_dx(d_qkv.get<nv_bfloat16>(),
+                                        qkv_rope.get<nv_bfloat16>(),
+                                        weight.get<nv_bfloat16>(),
+                                        rstd.get<float>(),
+                                        freqs_cis.get<nv_bfloat16>(),
+                                        position_ids,
+                                        tokens,
+                                        T,
+                                        qkv_channels,
+                                        num_heads,
+                                        head_size,
+                                        channel_offset,
+                                        stream,
+                                        abs_max_ptr);
     } else if (d_qkv.DType == ETensorDType::FP32) {
-        launch_rmsnorm_rope_backward_dx(d_qkv.get<float>(), qkv_rope.get<float>(), weight.get<float>(), rstd.get<float>(),
-                                        freqs_cis.get<float>(), position_ids,
-                                        tokens, T, qkv_channels, num_heads, head_size, channel_offset, stream, abs_max_ptr);
+        launch_rmsnorm_rope_backward_dx(d_qkv.get<float>(),
+                                        qkv_rope.get<float>(),
+                                        weight.get<float>(),
+                                        rstd.get<float>(),
+                                        freqs_cis.get<float>(),
+                                        position_ids,
+                                        tokens,
+                                        T,
+                                        qkv_channels,
+                                        num_heads,
+                                        head_size,
+                                        channel_offset,
+                                        stream,
+                                        abs_max_ptr);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dx: unsupported dtype");
     }
 }
 
-void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight, const Tensor& d_qkv, const Tensor& qkv_rope, const Tensor& weight,
-                                            const Tensor& freqs_cis, const int* position_ids,
-                                            int B, int T, int qkv_channels,
-                                            int num_heads, int head_size, int channel_offset,
-                                            bool accumulate, cudaStream_t stream) {
-    if (d_weight.DType != d_qkv.DType || d_weight.DType != qkv_rope.DType || d_weight.DType != weight.DType || d_weight.DType != freqs_cis.DType) {
+void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight,
+                                            const Tensor& d_qkv,
+                                            const Tensor& qkv_rope,
+                                            const Tensor& weight,
+                                            const Tensor& freqs_cis,
+                                            const int* position_ids,
+                                            int B,
+                                            int T,
+                                            int qkv_channels,
+                                            int num_heads,
+                                            int head_size,
+                                            int channel_offset,
+                                            bool accumulate,
+                                            cudaStream_t stream) {
+    if (d_weight.DType != d_qkv.DType || d_weight.DType != qkv_rope.DType || d_weight.DType != weight.DType ||
+        d_weight.DType != freqs_cis.DType) {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight: dtype mismatch");
     }
     if (d_weight.Rank != 1 || d_weight.Sizes[0] != head_size) {
@@ -998,23 +1365,54 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight, const Tensor& d_qk
     }
 
     if (d_weight.DType == ETensorDType::BF16) {
-        launch_rmsnorm_rope_backward_dweight(d_weight.get<nv_bfloat16>(), d_qkv.get<nv_bfloat16>(), qkv_rope.get<nv_bfloat16>(), weight.get<nv_bfloat16>(),
-                                             freqs_cis.get<nv_bfloat16>(), position_ids,
-                                             tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_rmsnorm_rope_backward_dweight(d_weight.get<nv_bfloat16>(),
+                                             d_qkv.get<nv_bfloat16>(),
+                                             qkv_rope.get<nv_bfloat16>(),
+                                             weight.get<nv_bfloat16>(),
+                                             freqs_cis.get<nv_bfloat16>(),
+                                             position_ids,
+                                             tokens,
+                                             T,
+                                             qkv_channels,
+                                             num_heads,
+                                             head_size,
+                                             channel_offset,
+                                             accumulate,
+                                             stream);
     } else if (d_weight.DType == ETensorDType::FP32) {
-        launch_rmsnorm_rope_backward_dweight(d_weight.get<float>(), d_qkv.get<float>(), qkv_rope.get<float>(), weight.get<float>(),
-                                             freqs_cis.get<float>(), position_ids,
-                                             tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_rmsnorm_rope_backward_dweight(d_weight.get<float>(),
+                                             d_qkv.get<float>(),
+                                             qkv_rope.get<float>(),
+                                             weight.get<float>(),
+                                             freqs_cis.get<float>(),
+                                             position_ids,
+                                             tokens,
+                                             T,
+                                             qkv_channels,
+                                             num_heads,
+                                             head_size,
+                                             channel_offset,
+                                             accumulate,
+                                             stream);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight: unsupported dtype");
     }
 }
 
-void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32, const Tensor& d_qkv, const Tensor& qkv_rope, const Tensor& weight,
-                                                 const Tensor& freqs_cis, const int* position_ids,
-                                                 int B, int T, int qkv_channels,
-                                                 int num_heads, int head_size, int channel_offset,
-                                                 bool accumulate, cudaStream_t stream) {
+void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32,
+                                                 const Tensor& d_qkv,
+                                                 const Tensor& qkv_rope,
+                                                 const Tensor& weight,
+                                                 const Tensor& freqs_cis,
+                                                 const int* position_ids,
+                                                 int B,
+                                                 int T,
+                                                 int qkv_channels,
+                                                 int num_heads,
+                                                 int head_size,
+                                                 int channel_offset,
+                                                 bool accumulate,
+                                                 cudaStream_t stream) {
     if (d_weight_fp32.DType != ETensorDType::FP32) {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight_fp32: d_weight must be FP32");
     }
@@ -1033,25 +1431,63 @@ void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32, const Te
     }
 
     if (d_qkv.DType == ETensorDType::BF16) {
-        launch_rmsnorm_rope_backward_dweight_fp32(d_weight_fp32.get<float>(), d_qkv.get<nv_bfloat16>(), qkv_rope.get<nv_bfloat16>(), weight.get<nv_bfloat16>(),
-                                                  freqs_cis.get<nv_bfloat16>(), position_ids,
-                                                  tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_rmsnorm_rope_backward_dweight_fp32(d_weight_fp32.get<float>(),
+                                                  d_qkv.get<nv_bfloat16>(),
+                                                  qkv_rope.get<nv_bfloat16>(),
+                                                  weight.get<nv_bfloat16>(),
+                                                  freqs_cis.get<nv_bfloat16>(),
+                                                  position_ids,
+                                                  tokens,
+                                                  T,
+                                                  qkv_channels,
+                                                  num_heads,
+                                                  head_size,
+                                                  channel_offset,
+                                                  accumulate,
+                                                  stream);
     } else if (d_qkv.DType == ETensorDType::FP16) {
-        launch_rmsnorm_rope_backward_dweight_fp32(d_weight_fp32.get<float>(), d_qkv.get<__half>(), qkv_rope.get<__half>(), weight.get<__half>(),
-                                                  freqs_cis.get<__half>(), position_ids,
-                                                  tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_rmsnorm_rope_backward_dweight_fp32(d_weight_fp32.get<float>(),
+                                                  d_qkv.get<__half>(),
+                                                  qkv_rope.get<__half>(),
+                                                  weight.get<__half>(),
+                                                  freqs_cis.get<__half>(),
+                                                  position_ids,
+                                                  tokens,
+                                                  T,
+                                                  qkv_channels,
+                                                  num_heads,
+                                                  head_size,
+                                                  channel_offset,
+                                                  accumulate,
+                                                  stream);
     } else if (d_qkv.DType == ETensorDType::FP32) {
-        launch_rmsnorm_rope_backward_dweight(d_weight_fp32.get<float>(), d_qkv.get<float>(), qkv_rope.get<float>(), weight.get<float>(),
-                                             freqs_cis.get<float>(), position_ids,
-                                             tokens, T, qkv_channels, num_heads, head_size, channel_offset, accumulate, stream);
+        launch_rmsnorm_rope_backward_dweight(d_weight_fp32.get<float>(),
+                                             d_qkv.get<float>(),
+                                             qkv_rope.get<float>(),
+                                             weight.get<float>(),
+                                             freqs_cis.get<float>(),
+                                             position_ids,
+                                             tokens,
+                                             T,
+                                             qkv_channels,
+                                             num_heads,
+                                             head_size,
+                                             channel_offset,
+                                             accumulate,
+                                             stream);
     } else {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight_fp32: unsupported dtype");
     }
 }
 
-void qkv_abs_max_slice(const Tensor& qkv, int B, int T, int qkv_channels,
-                       int channel_offset, int channel_count,
-                       float* abs_max_ptr, cudaStream_t stream) {
+void qkv_abs_max_slice(const Tensor& qkv,
+                       int B,
+                       int T,
+                       int qkv_channels,
+                       int channel_offset,
+                       int channel_count,
+                       float* abs_max_ptr,
+                       cudaStream_t stream) {
     if (!abs_max_ptr) return;
     if (qkv.DType != ETensorDType::BF16 && qkv.DType != ETensorDType::FP32) {
         throw std::logic_error("qkv_abs_max_slice: unsupported dtype");
@@ -1065,10 +1501,20 @@ void qkv_abs_max_slice(const Tensor& qkv, int B, int T, int qkv_channels,
     }
 
     if (qkv.DType == ETensorDType::BF16) {
-        launch_qkv_abs_max_slice(qkv.get<nv_bfloat16>(), tokens, qkv_channels,
-                                 channel_offset, channel_count, abs_max_ptr, stream);
+        launch_qkv_abs_max_slice(qkv.get<nv_bfloat16>(),
+                                 tokens,
+                                 qkv_channels,
+                                 channel_offset,
+                                 channel_count,
+                                 abs_max_ptr,
+                                 stream);
     } else {
-        launch_qkv_abs_max_slice(qkv.get<float>(), tokens, qkv_channels,
-                                 channel_offset, channel_count, abs_max_ptr, stream);
+        launch_qkv_abs_max_slice(qkv.get<float>(),
+                                 tokens,
+                                 qkv_channels,
+                                 channel_offset,
+                                 channel_count,
+                                 abs_max_ptr,
+                                 stream);
     }
 }

@@ -59,7 +59,7 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
             completion_logprobs=list(tokens["completion_logprobs"]),
             completion_temperatures=[temperature] * len(completion_ids),
             teacher_logprobs=None,
-            advantage=None
+            advantage=None,
         )
 
     def extend_sample(sample: TrainingSample, step: vf.TrajectoryStep, prefix_len: int, step_idx: int) -> None:

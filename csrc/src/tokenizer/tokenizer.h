@@ -29,7 +29,7 @@ struct TrainingEncoded {
 
 // A single message in a conversation.
 struct ChatMessage {
-    std::string role;    // "system", "user", "assistant", "tool"
+    std::string role;  // "system", "user", "assistant", "tool"
     std::string content;
 };
 
@@ -53,7 +53,8 @@ public:
     std::vector<int32_t> encode_ordinary(const std::string& text) const;
 
     // Batch encode for throughput.
-    std::vector<std::vector<int32_t>> encode_batch(const std::vector<std::string>& texts, bool add_special_tokens = false) const;
+    std::vector<std::vector<int32_t>> encode_batch(const std::vector<std::string>& texts,
+                                                   bool add_special_tokens = false) const;
 
     // Decode token IDs back to text.
     std::string decode(const std::vector<int32_t>& ids) const;
@@ -78,14 +79,11 @@ public:
     // Returns the formatted string ready for encode().
     // If add_generation_prompt is true, appends the assistant header so the
     // model can continue generating.
-    std::string apply_chat_template(
-        const std::vector<ChatMessage>& messages,
-        bool add_generation_prompt = false) const;
+    std::string apply_chat_template(const std::vector<ChatMessage>& messages, bool add_generation_prompt = false) const;
 
     // Convenience: apply_chat_template + encode_with_special_tokens in one call.
-    std::vector<int32_t> apply_chat_template_and_encode(
-        const std::vector<ChatMessage>& messages,
-        bool add_generation_prompt = false) const;
+    std::vector<int32_t> apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,
+                                                        bool add_generation_prompt = false) const;
 
     // Encode a conversation for training with loss masking.
     //
@@ -100,14 +98,12 @@ public:
     //   ALL        — all tokens (system, user, assistant, template)
     //
     // labels[0] is always -100.
-    TrainingEncoded encode_for_training(
-        const std::vector<ChatMessage>& messages,
-        LossStrategy strategy = LossStrategy::DEFAULT) const;
+    TrainingEncoded encode_for_training(const std::vector<ChatMessage>& messages,
+                                        LossStrategy strategy = LossStrategy::DEFAULT) const;
 
     // Batch version of encode_for_training (multi-threaded).
-    std::vector<TrainingEncoded> encode_for_training_batch(
-        const std::vector<std::vector<ChatMessage>>& batch,
-        LossStrategy strategy = LossStrategy::DEFAULT) const;
+    std::vector<TrainingEncoded> encode_for_training_batch(const std::vector<std::vector<ChatMessage>>& batch,
+                                                           LossStrategy strategy = LossStrategy::DEFAULT) const;
 
 private:
     Tokenizer();
@@ -115,4 +111,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace tokenizer
+}  // namespace tokenizer

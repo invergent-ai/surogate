@@ -5,10 +5,9 @@ Password hashing utilities using PBKDF2.
 import hashlib
 import hmac
 import secrets
-from typing import Tuple
 
 
-def hash_password(password: str, salt: str | None = None) -> Tuple[str, str]:
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
     """
     Hash a password using PBKDF2-HMAC-SHA256.
 

@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
 from ..decorators import primitive, save
+from ..tensor_type import Tensor
 
 
 @primitive(impl="kernels.mamba_conv1d")
 def mamba_conv1d(
-    x: Tensor["B", "D_conv", "T"],
-    weight: Tensor["D_conv", "K"],
-    bias: Tensor["D_conv"] | None = None,
+    x: Tensor[B, D_conv, T],
+    weight: Tensor[D_conv, K],
+    bias: Tensor[D_conv] | None = None,
     *,
     activation: str = "silu",
-) -> Tensor["B", "D_conv", "T"]:
+) -> Tensor[B, D_conv, T]:
     """Causal 1D convolution for Mamba.
 
     Args:
@@ -31,29 +31,29 @@ def mamba_conv1d(
 @mamba_conv1d.backward
 @save("x")
 def mamba_conv1d_backward(
-    d_out: Tensor["B", "D_conv", "T"],
-    x: Tensor["B", "D_conv", "T"],
-    weight: Tensor["D_conv", "K"],
-) -> tuple[Tensor["B", "D_conv", "T"], Tensor["D_conv", "K"], Tensor["D_conv"] | None]:
+    d_out: Tensor[B, D_conv, T],
+    x: Tensor[B, D_conv, T],
+    weight: Tensor[D_conv, K],
+) -> tuple[Tensor[B, D_conv, T], Tensor[D_conv, K], Tensor[D_conv] | None]:
     """Backward pass for causal 1D convolution."""
     ...
 
 
 @primitive(impl="kernels.mamba_ssm_scan")
 def mamba_ssm_scan(
-    hidden_states: Tensor["B", "I", "T"],
-    dt: Tensor["B", "I", "T"],
-    A: Tensor["H"],
-    B: Tensor["B", "G", "N", "T"],
-    C: Tensor["B", "G", "N", "T"],
-    D: Tensor["H"],
+    hidden_states: Tensor[B, I, T],
+    dt: Tensor[B, I, T],
+    A: Tensor[H],
+    B: Tensor[B, G, N, T],
+    C: Tensor[B, G, N, T],
+    D: Tensor[H],
     *,
-    dt_bias: Tensor["H"] | None = None,
+    dt_bias: Tensor[H] | None = None,
     dt_softplus: bool = True,
     dt_min: float = 0.0,
     dt_max: float = 1e9,
     chunk_size: int = 256,
-) -> tuple[Tensor["B", "T", "I"], Tensor["B", "H", "D", "N"]]:
+) -> tuple[Tensor[B, T, I], Tensor[B, H, D, N]]:
     """Mamba2 State Space Model scan (SSD algorithm).
 
     Implements the selective state space model:
@@ -84,22 +84,22 @@ def mamba_ssm_scan(
 @mamba_ssm_scan.backward
 @save("hidden_states", "dt", "B", "C", "final_state")
 def mamba_ssm_scan_backward(
-    d_out: Tensor["B", "T", "I"],
-    d_final_state: Tensor["B", "H", "D", "N"] | None,
-    hidden_states: Tensor["B", "I", "T"],
-    dt: Tensor["B", "I", "T"],
-    A: Tensor["H"],
-    B: Tensor["B", "G", "N", "T"],
-    C: Tensor["B", "G", "N", "T"],
-    D: Tensor["H"],
-    final_state: Tensor["B", "H", "D", "N"],
+    d_out: Tensor[B, T, I],
+    d_final_state: Tensor[B, H, D, N] | None,
+    hidden_states: Tensor[B, I, T],
+    dt: Tensor[B, I, T],
+    A: Tensor[H],
+    B: Tensor[B, G, N, T],
+    C: Tensor[B, G, N, T],
+    D: Tensor[H],
+    final_state: Tensor[B, H, D, N],
 ) -> tuple[
-    Tensor["B", "I", "T"],       # d_hidden_states
-    Tensor["B", "I", "T"],       # d_dt
-    Tensor["H"],                  # d_A
-    Tensor["B", "G", "N", "T"],  # d_B
-    Tensor["B", "G", "N", "T"],  # d_C
-    Tensor["H"],                  # d_D
+    Tensor[B, I, T],  # d_hidden_states
+    Tensor[B, I, T],  # d_dt
+    Tensor[H],  # d_A
+    Tensor[B, G, N, T],  # d_B
+    Tensor[B, G, N, T],  # d_C
+    Tensor[H],  # d_D
 ]:
     """Backward pass for SSM scan."""
     ...
@@ -107,14 +107,14 @@ def mamba_ssm_scan_backward(
 
 @primitive(impl="kernels.mamba_gated_rmsnorm")
 def mamba_gated_rmsnorm(
-    x: Tensor["*", "C"],
-    gate: Tensor["*", "C"],
-    weight: Tensor["C"],
+    x: Tensor["*", C],
+    gate: Tensor["*", C],
+    weight: Tensor[C],
     *,
     eps: float = 1e-5,
     group_size: int = 0,
     norm_before_gate: bool = False,
-) -> Tensor["*", "C"]:
+) -> Tensor["*", C]:
     """Gated RMSNorm for Mamba2.
 
     Applies RMSNorm with a multiplicative gate:
@@ -140,27 +140,27 @@ def mamba_gated_rmsnorm(
 @mamba_gated_rmsnorm.backward
 @save("x", "gate")
 def mamba_gated_rmsnorm_backward(
-    d_out: Tensor["*", "C"],
-    x: Tensor["*", "C"],
-    gate: Tensor["*", "C"],
-    weight: Tensor["C"],
-) -> tuple[Tensor["*", "C"], Tensor["*", "C"], Tensor["C"]]:
+    d_out: Tensor["*", C],
+    x: Tensor["*", C],
+    gate: Tensor["*", C],
+    weight: Tensor[C],
+) -> tuple[Tensor["*", C], Tensor["*", C], Tensor[C]]:
     """Backward pass for gated RMSNorm. Returns (d_x, d_gate, d_weight)."""
     ...
 
 
 @primitive(impl="kernels.mamba_split_proj")
 def mamba_split_proj(
-    projected: Tensor["B", "T", "P"],
+    projected: Tensor[B, T, P],
     *,
     intermediate_size: int,
     conv_dim: int,
     num_heads: int,
     head_dim: int,
 ) -> tuple[
-    Tensor["B", "T", "I"],      # gate
-    Tensor["B", "D_conv", "T"], # hidden_states_B_C (for conv)
-    Tensor["B", "I", "T"],      # dt (expanded)
+    Tensor[B, T, I],  # gate
+    Tensor[B, D_conv, T],  # hidden_states_B_C (for conv)
+    Tensor[B, I, T],  # dt (expanded)
 ]:
     """Split Mamba2 input projection into components.
 
@@ -185,14 +185,14 @@ def mamba_split_proj(
 
 @primitive(impl="kernels.mamba_split_conv_out")
 def mamba_split_conv_out(
-    conv_out: Tensor["B", "D_conv", "T"],
+    conv_out: Tensor[B, D_conv, T],
     *,
     intermediate_size: int,
     groups_state_size: int,
 ) -> tuple[
-    Tensor["B", "I", "T"],  # hidden_states
-    Tensor["B", "G", "N", "T"], # B (input-to-state)
-    Tensor["B", "G", "N", "T"], # C (state-to-output)
+    Tensor[B, I, T],  # hidden_states
+    Tensor[B, G, N, T],  # B (input-to-state)
+    Tensor[B, G, N, T],  # C (state-to-output)
 ]:
     """Split convolution output into hidden states, B, and C.
 
@@ -209,15 +209,15 @@ def mamba_split_conv_out(
 
 @primitive(impl="kernels.mamba_combine_scan")
 def mamba_combine_scan(
-    projected_states: Tensor["B", "T", "P"],
-    conv_weight: Tensor["D_conv", "K"],
-    conv_bias: Tensor["D_conv"] | None,
-    dt_bias: Tensor["H"],
-    A_log: Tensor["H"],
-    D: Tensor["H"],
-    norm_weight: Tensor["I"],
-    out_proj_weight: Tensor["C", "I"],
-    out_proj_bias: Tensor["C"] | None,
+    projected_states: Tensor[B, T, P],
+    conv_weight: Tensor[D_conv, K],
+    conv_bias: Tensor[D_conv] | None,
+    dt_bias: Tensor[H],
+    A_log: Tensor[H],
+    D: Tensor[H],
+    norm_weight: Tensor[I],
+    out_proj_weight: Tensor[C, I],
+    out_proj_bias: Tensor[C] | None,
     *,
     chunk_size: int = 256,
     num_heads: int,
@@ -229,7 +229,7 @@ def mamba_combine_scan(
     activation: str = "silu",
     dt_min: float = 0.0,
     dt_max: float = 1e9,
-) -> Tensor["B", "T", "C"]:
+) -> Tensor[B, T, C]:
     """Fused Mamba2 operation: conv1d + SSM scan + gated norm + output proj.
 
     This is the fused forward path that combines all Mamba2 operations

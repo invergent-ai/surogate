@@ -110,14 +110,8 @@ class LossGuard:
             grads = np.array([h[1] for h in self.history])
             mean_grad = float(np.mean(grads))
 
-            is_loss_spike = (
-                loss > mean_loss + self.loss_std_mult * std_loss
-                and loss - mean_loss > self.loss_abs_min
-            )
-            is_grad_explosion = (
-                grad_norm > self.grad_relative * mean_grad
-                or grad_norm > self.grad_absolute
-            )
+            is_loss_spike = loss > mean_loss + self.loss_std_mult * std_loss and loss - mean_loss > self.loss_abs_min
+            is_grad_explosion = grad_norm > self.grad_relative * mean_grad or grad_norm > self.grad_absolute
 
             if is_loss_spike or is_grad_explosion:
                 reason = "loss spike" if is_loss_spike else "gradient explosion"

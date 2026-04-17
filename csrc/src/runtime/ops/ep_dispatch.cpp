@@ -18,6 +18,9 @@
 #include <sstream>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/dsl/dsl_param_store.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/ep/lpt_planner.h"
@@ -36,8 +39,7 @@ namespace dsl {
 namespace {
 
 // Helper to persist a GPU buffer (realloc if needed)
-void persist_gpu_buffer(void*& buf, size_t& buf_bytes, const void* src,
-                        size_t need, cudaStream_t stream) {
+void persist_gpu_buffer(void*& buf, size_t& buf_bytes, const void* src, size_t need, cudaStream_t stream) {
     if (buf_bytes < need) {
         if (buf) CUDA_CHECK(cudaFree(buf));
         CUDA_CHECK(cudaMalloc(&buf, need));
@@ -47,32 +49,31 @@ void persist_gpu_buffer(void*& buf, size_t& buf_bytes, const void* src,
 }
 
 // Helper to persist a tensor to mMoeSavedBuffers
-void save_persistent_buffer(
-    std::unordered_map<std::string, void*>& buffers,
-    std::unordered_map<std::string, size_t>& sizes,
-    const std::string& key, const Tensor& src, cudaStream_t stream) {
+void save_persistent_buffer(std::unordered_map<std::string, void*>& buffers,
+                            std::unordered_map<std::string, size_t>& sizes,
+                            const std::string& key,
+                            const Tensor& src,
+                            cudaStream_t stream) {
     if (!src.Data) return;
     const size_t bytes = src.bytes();
     if (bytes == 0) return;
     auto buf_it = buffers.find(key);
     if (buf_it == buffers.end() || sizes[key] < bytes) {
-        if (buf_it != buffers.end() && buf_it->second)
-            CUDA_CHECK(cudaFree(buf_it->second));
+        if (buf_it != buffers.end() && buf_it->second) CUDA_CHECK(cudaFree(buf_it->second));
         void* new_buf = nullptr;
         CUDA_CHECK(cudaMalloc(&new_buf, bytes));
         buffers[key] = new_buf;
         sizes[key] = bytes;
     }
-    CUDA_CHECK(cudaMemcpyAsync(buffers[key], src.Data, bytes,
-                                cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(buffers[key], src.Data, bytes, cudaMemcpyDeviceToDevice, stream));
 }
 
 }  // namespace
 
 void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
-    Tensor& permuted_input = resolve_tensor(op.inputs[0]);   // [total_send, C]
-    Tensor& routing_indices = resolve_tensor(op.inputs[1]);   // [BT, K]
-    Tensor& scatter_indices_in = resolve_tensor(op.inputs[2]); // [total_send]
+    Tensor& permuted_input = resolve_tensor(op.inputs[0]);      // [total_send, C]
+    Tensor& routing_indices = resolve_tensor(op.inputs[1]);     // [BT, K]
+    Tensor& scatter_indices_in = resolve_tensor(op.inputs[2]);  // [total_send]
     (void)routing_indices;
 
     const int ep_size = op.attrs.ep_size;
@@ -104,21 +105,21 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     const std::string layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
     // Detect up-projection weight name: fused "experts_gate_up" (Qwen3-MoE, GPT-OSS)
     // or separate "experts_up" (Nemotron-H).
-    const std::string up_weight_name = mWeights.has(layer_prefix + "experts_gate_up")
-        ? "experts_gate_up" : "experts_up";
+    const std::string up_weight_name =
+        mWeights.has(layer_prefix + "experts_gate_up") ? "experts_gate_up" : "experts_up";
     const bool separate_up_projection = (up_weight_name == "experts_up");
     const bool force_llep = (std::getenv("SUROGATE_FORCE_LLEP") != nullptr);
-    const bool force_llep_for_separate_up =
-        (std::getenv("SUROGATE_FORCE_LLEP_EXPERTS_UP") != nullptr);
-    const bool llep_supported_for_layer =
-        force_llep && (!separate_up_projection || force_llep_for_separate_up);
+    const bool force_llep_for_separate_up = (std::getenv("SUROGATE_FORCE_LLEP_EXPERTS_UP") != nullptr);
+    const bool llep_supported_for_layer = force_llep && (!separate_up_projection || force_llep_for_separate_up);
     const float threshold = mOptions.EPLoadBalanceThreshold;
     {
         static bool printed_ep_dispatch_marker = false;
         if (!printed_ep_dispatch_marker && mComm && mComm->rank() == 0) {
             fprintf(stderr,
                     "[EP] ep_dispatch active: layer=%d up_weight=%s ep_size=%d\n",
-                    layer_idx, up_weight_name.c_str(), ep_size);
+                    layer_idx,
+                    up_weight_name.c_str(),
+                    ep_size);
             printed_ep_dispatch_marker = true;
         }
     }
@@ -149,8 +150,7 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         offsets_it = mMoEHostOffsetsCache.find(layer_idx);
     }
     if (offsets_it == mMoEHostOffsetsCache.end()) {
-        throw std::runtime_error(
-            "ep_dispatch: host expert offsets not found for layer " + std::to_string(layer_idx));
+        throw std::runtime_error("ep_dispatch: host expert offsets not found for layer " + std::to_string(layer_idx));
     }
     const std::vector<int>& expert_offsets = offsets_it->second;
 
@@ -165,22 +165,26 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
 
     if (llep_supported_for_layer && threshold < 100.0f) {
         // All-reduce expert counts across EP group
-        Tensor counts_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts)}, "ep_expert_counts");
-        CUDA_CHECK(cudaMemcpyAsync(counts_gpu.Data, local_expert_counts.data(),
-                                    num_experts * sizeof(int), cudaMemcpyHostToDevice,
-                                    mRunState.MainStream));
+        Tensor counts_gpu =
+            mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_experts)}, "ep_expert_counts");
+        CUDA_CHECK(cudaMemcpyAsync(counts_gpu.Data,
+                                   local_expert_counts.data(),
+                                   num_experts * sizeof(int),
+                                   cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
         mComm->all_reduce_sum_int_ep(counts_gpu.get<int>(), num_experts, mRunState.MainStream);
 
         global_expert_counts.resize(num_experts);
-        CUDA_CHECK(cudaMemcpyAsync(global_expert_counts.data(), counts_gpu.Data,
-                                    num_experts * sizeof(int), cudaMemcpyDeviceToHost,
-                                    mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(global_expert_counts.data(),
+                                   counts_gpu.Data,
+                                   num_experts * sizeof(int),
+                                   cudaMemcpyDeviceToHost,
+                                   mRunState.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         mTemps.push_back(counts_gpu);
 
-        const float imbalance = ep::compute_imbalance_ratio(
-            global_expert_counts.data(), num_experts, ep_size, num_local);
+        const float imbalance =
+            ep::compute_imbalance_ratio(global_expert_counts.data(), num_experts, ep_size, num_local);
         use_llep = (imbalance >= threshold);
     }
 
@@ -209,8 +213,7 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     ep::LPTPlan plan;
 
     if (use_llep) {
-        plan = ep::compute_lpt_plan(
-            global_expert_counts.data(), num_experts, ep_size, ep_rank, num_local);
+        plan = ep::compute_lpt_plan(global_expert_counts.data(), num_experts, ep_size, ep_rank, num_local);
         expert_to_gpu = plan.expert_to_gpu;
     } else {
         for (int e = 0; e < num_experts; ++e) {
@@ -255,52 +258,68 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
 
     if (use_llep) {
         // Upload expert_offsets and expert_to_gpu to GPU (small H2D copies)
-        Tensor offsets_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts + 1)}, "ep_offsets_gpu");
-        CUDA_CHECK(cudaMemcpyAsync(offsets_gpu.Data, expert_offsets.data(),
-                                    (num_experts + 1) * sizeof(int), cudaMemcpyHostToDevice,
-                                    mRunState.MainStream));
+        Tensor offsets_gpu =
+            mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_experts + 1)}, "ep_offsets_gpu");
+        CUDA_CHECK(cudaMemcpyAsync(offsets_gpu.Data,
+                                   expert_offsets.data(),
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
 
-        Tensor e2g_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts)}, "ep_e2g_gpu");
-        CUDA_CHECK(cudaMemcpyAsync(e2g_gpu.Data, expert_to_gpu.data(),
-                                    num_experts * sizeof(int), cudaMemcpyHostToDevice,
-                                    mRunState.MainStream));
+        Tensor e2g_gpu = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_experts)}, "ep_e2g_gpu");
+        CUDA_CHECK(cudaMemcpyAsync(e2g_gpu.Data,
+                                   expert_to_gpu.data(),
+                                   num_experts * sizeof(int),
+                                   cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
 
         // Allocate output send buffer
         send_buf = mRunState.temp_alloc(permuted_input.DType,
-            {static_cast<long>(total_send), static_cast<long>(hidden_size)}, "ep_send_buf");
+                                        {static_cast<long>(total_send), static_cast<long>(hidden_size)},
+                                        "ep_send_buf");
         mTemps.push_back(send_buf);
 
         // Temporary buffer for per-expert write offsets
-        Tensor pwo_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts)}, "ep_pwo_gpu");
+        Tensor pwo_gpu = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_experts)}, "ep_pwo_gpu");
 
         // Output buffer for send_order mapping (needed for backward)
-        Tensor send_order_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(total_send)}, "ep_send_order_gpu");
+        Tensor send_order_gpu =
+            mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(total_send)}, "ep_send_order_gpu");
 
         // Fused GPU kernel: compute write offsets + scatter tokens + record send_order
         if (permuted_input.DType == ETensorDType::BF16) {
-            ep_fused_prepare_send_buffer_bf16(
-                send_buf.get<nv_bfloat16>(), permuted_input.get<nv_bfloat16>(),
-                offsets_gpu.get<int>(), e2g_gpu.get<int>(),
-                pwo_gpu.get<int>(), send_order_gpu.get<int>(),
-                num_experts, ep_size, hidden_size, total_send,
-                mRunState.MainStream);
+            ep_fused_prepare_send_buffer_bf16(send_buf.get<nv_bfloat16>(),
+                                              permuted_input.get<nv_bfloat16>(),
+                                              offsets_gpu.get<int>(),
+                                              e2g_gpu.get<int>(),
+                                              pwo_gpu.get<int>(),
+                                              send_order_gpu.get<int>(),
+                                              num_experts,
+                                              ep_size,
+                                              hidden_size,
+                                              total_send,
+                                              mRunState.MainStream);
         } else {
-            ep_fused_prepare_send_buffer_fp32(
-                send_buf.get<float>(), permuted_input.get<float>(),
-                offsets_gpu.get<int>(), e2g_gpu.get<int>(),
-                pwo_gpu.get<int>(), send_order_gpu.get<int>(),
-                num_experts, ep_size, hidden_size, total_send,
-                mRunState.MainStream);
+            ep_fused_prepare_send_buffer_fp32(send_buf.get<float>(),
+                                              permuted_input.get<float>(),
+                                              offsets_gpu.get<int>(),
+                                              e2g_gpu.get<int>(),
+                                              pwo_gpu.get<int>(),
+                                              send_order_gpu.get<int>(),
+                                              num_experts,
+                                              ep_size,
+                                              hidden_size,
+                                              total_send,
+                                              mRunState.MainStream);
         }
         send_ptr = &send_buf;
 
         // Persist LLEP send order for backward (to invert the reorder)
-        persist_gpu_buffer(ep_state.llep_send_reorder_gpu, ep_state.llep_send_reorder_bytes,
-                           send_order_gpu.Data, send_order_gpu.bytes(), mRunState.MainStream);
+        persist_gpu_buffer(ep_state.llep_send_reorder_gpu,
+                           ep_state.llep_send_reorder_bytes,
+                           send_order_gpu.Data,
+                           send_order_gpu.bytes(),
+                           mRunState.MainStream);
 
         mTemps.push_back(offsets_gpu);
         mTemps.push_back(e2g_gpu);
@@ -311,51 +330,61 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     // ---- Exchange splits + per-expert counts (batched: 2 A2As, single sync) ----
     // Issue both A2As back-to-back on the stream, then batch D2H copies before one sync.
     // A2A 1: exchange per-GPU token splits
-    Tensor send_splits_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(ep_size)}, "ep_send_splits_gpu");
-    Tensor recv_splits_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(ep_size)}, "ep_recv_splits_gpu");
-    CUDA_CHECK(cudaMemcpyAsync(send_splits_gpu.Data, send_splits.data(),
-                                ep_size * sizeof(int), cudaMemcpyHostToDevice,
-                                mRunState.MainStream));
+    Tensor send_splits_gpu =
+        mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(ep_size)}, "ep_send_splits_gpu");
+    Tensor recv_splits_gpu =
+        mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(ep_size)}, "ep_recv_splits_gpu");
+    CUDA_CHECK(cudaMemcpyAsync(send_splits_gpu.Data,
+                               send_splits.data(),
+                               ep_size * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               mRunState.MainStream));
 
     std::vector<int> ones(ep_size, 1);
-    mComm->all_to_all_single(
-        reinterpret_cast<const std::byte*>(send_splits_gpu.Data),
-        reinterpret_cast<std::byte*>(recv_splits_gpu.Data),
-        ones.data(), ones.data(), sizeof(int), mRunState.MainStream);
+    mComm->all_to_all_single(reinterpret_cast<const std::byte*>(send_splits_gpu.Data),
+                             reinterpret_cast<std::byte*>(recv_splits_gpu.Data),
+                             ones.data(),
+                             ones.data(),
+                             sizeof(int),
+                             mRunState.MainStream);
 
     // A2A 2: exchange per-expert counts (fixed-size, independent of A2A 1 results)
-    Tensor send_ec_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(num_experts * ep_size)}, "ep_send_ec_gpu");
-    Tensor recv_ec_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(num_experts * ep_size)}, "ep_recv_ec_gpu");
+    Tensor send_ec_gpu =
+        mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_experts * ep_size)}, "ep_send_ec_gpu");
+    Tensor recv_ec_gpu =
+        mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_experts * ep_size)}, "ep_recv_ec_gpu");
     for (int p = 0; p < ep_size; ++p) {
-        CUDA_CHECK(cudaMemcpyAsync(
-            static_cast<std::byte*>(send_ec_gpu.Data) + static_cast<size_t>(p) * num_experts * sizeof(int),
-            local_expert_counts.data(),
-            num_experts * sizeof(int), cudaMemcpyHostToDevice,
-            mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(send_ec_gpu.Data) +
+                                       static_cast<size_t>(p) * num_experts * sizeof(int),
+                                   local_expert_counts.data(),
+                                   num_experts * sizeof(int),
+                                   cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
     }
 
     std::vector<int> ec_send_splits(ep_size, num_experts);
     std::vector<int> ec_recv_splits(ep_size, num_experts);
-    mComm->all_to_all_single(
-        reinterpret_cast<const std::byte*>(send_ec_gpu.Data),
-        reinterpret_cast<std::byte*>(recv_ec_gpu.Data),
-        ec_send_splits.data(), ec_recv_splits.data(),
-        sizeof(int), mRunState.MainStream);
+    mComm->all_to_all_single(reinterpret_cast<const std::byte*>(send_ec_gpu.Data),
+                             reinterpret_cast<std::byte*>(recv_ec_gpu.Data),
+                             ec_send_splits.data(),
+                             ec_recv_splits.data(),
+                             sizeof(int),
+                             mRunState.MainStream);
 
     // Batch D2H copies: both A2A results in one sync
     std::vector<int> recv_splits(ep_size);
-    CUDA_CHECK(cudaMemcpyAsync(recv_splits.data(), recv_splits_gpu.Data,
-                                ep_size * sizeof(int), cudaMemcpyDeviceToHost,
-                                mRunState.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(recv_splits.data(),
+                               recv_splits_gpu.Data,
+                               ep_size * sizeof(int),
+                               cudaMemcpyDeviceToHost,
+                               mRunState.MainStream));
 
     std::vector<int> recv_all_counts(num_experts * ep_size);
-    CUDA_CHECK(cudaMemcpyAsync(recv_all_counts.data(), recv_ec_gpu.Data,
-                                num_experts * ep_size * sizeof(int), cudaMemcpyDeviceToHost,
-                                mRunState.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(recv_all_counts.data(),
+                               recv_ec_gpu.Data,
+                               num_experts * ep_size * sizeof(int),
+                               cudaMemcpyDeviceToHost,
+                               mRunState.MainStream));
     CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
     mTemps.push_back(send_splits_gpu);
     mTemps.push_back(recv_splits_gpu);
@@ -386,24 +415,35 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
 
         // Prefer quantized transfer (2-8x less P2P bandwidth) when available
         auto* provider = mWeights.qlora_provider();
-        const qlora::QuantizedTensor* qt_gu = provider
-            ? provider->try_get_quantized(layer_prefix + up_weight_name) : nullptr;
-        const qlora::QuantizedTensor* qt_dn = provider
-            ? provider->try_get_quantized(layer_prefix + "experts_down") : nullptr;
+        const qlora::QuantizedTensor* qt_gu =
+            provider ? provider->try_get_quantized(layer_prefix + up_weight_name) : nullptr;
+        const qlora::QuantizedTensor* qt_dn =
+            provider ? provider->try_get_quantized(layer_prefix + "experts_down") : nullptr;
         qlora::IQuantizer* quantizer = provider ? provider->get_quantizer() : nullptr;
 
-        if (qt_gu && qt_dn && qt_gu->is_quantized() && qt_dn->is_quantized()
-            && quantizer && !qt_gu->is_on_host()) {
-            ep::transfer_expert_weights_quantized(
-                plan, *mComm, mRunState, mWeightTransferStream,
-                foreign_weights, *qt_gu, *qt_dn,
-                *native_gate_up_ptr, *native_down_ptr,
-                quantizer, num_local, ep_rank);
+        if (qt_gu && qt_dn && qt_gu->is_quantized() && qt_dn->is_quantized() && quantizer && !qt_gu->is_on_host()) {
+            ep::transfer_expert_weights_quantized(plan,
+                                                  *mComm,
+                                                  mRunState,
+                                                  mWeightTransferStream,
+                                                  foreign_weights,
+                                                  *qt_gu,
+                                                  *qt_dn,
+                                                  *native_gate_up_ptr,
+                                                  *native_down_ptr,
+                                                  quantizer,
+                                                  num_local,
+                                                  ep_rank);
         } else {
-            ep::transfer_expert_weights(
-                plan, *mComm, mRunState, mWeightTransferStream,
-                foreign_weights, *native_gate_up_ptr, *native_down_ptr,
-                num_local, ep_rank);
+            ep::transfer_expert_weights(plan,
+                                        *mComm,
+                                        mRunState,
+                                        mWeightTransferStream,
+                                        foreign_weights,
+                                        *native_gate_up_ptr,
+                                        *native_down_ptr,
+                                        num_local,
+                                        ep_rank);
         }
         // Transfer per-expert LoRA adapters alongside base weights (on same stream).
         // LoRA is low-rank so overhead is small (<1% of base weight transfer).
@@ -412,18 +452,21 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
             if (lora_block.moe.use_grouped) {
                 const auto& g = lora_block.moe.grouped;
                 Tensor null_tensor;
-                ep::transfer_expert_lora(
-                    plan, *mComm, mRunState, mWeightTransferStream,
-                    foreign_weights,
-                    g.gate_up.has_value() ? g.gate_up->A : null_tensor,
-                    g.gate_up.has_value() ? g.gate_up->B : null_tensor,
-                    g.gate.has_value() ? g.gate->A : null_tensor,
-                    g.gate.has_value() ? g.gate->B : null_tensor,
-                    g.up.has_value() ? g.up->A : null_tensor,
-                    g.up.has_value() ? g.up->B : null_tensor,
-                    g.down.has_value() ? g.down->A : null_tensor,
-                    g.down.has_value() ? g.down->B : null_tensor,
-                    num_local, ep_rank);
+                ep::transfer_expert_lora(plan,
+                                         *mComm,
+                                         mRunState,
+                                         mWeightTransferStream,
+                                         foreign_weights,
+                                         g.gate_up.has_value() ? g.gate_up->A : null_tensor,
+                                         g.gate_up.has_value() ? g.gate_up->B : null_tensor,
+                                         g.gate.has_value() ? g.gate->A : null_tensor,
+                                         g.gate.has_value() ? g.gate->B : null_tensor,
+                                         g.up.has_value() ? g.up->A : null_tensor,
+                                         g.up.has_value() ? g.up->B : null_tensor,
+                                         g.down.has_value() ? g.down->A : null_tensor,
+                                         g.down.has_value() ? g.down->B : null_tensor,
+                                         num_local,
+                                         ep_rank);
             }
         }
 
@@ -434,8 +477,10 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     const size_t recv_hidden_bytes = static_cast<size_t>(total_recv) * hidden_size * elem_sz;
     void* recv_hidden_ptr = ep_buf_acquire(recv_hidden_bytes);
 
-    Tensor recv_hidden = make_raw_tensor(recv_hidden_ptr, permuted_input.DType,
-        {static_cast<long>(total_recv), static_cast<long>(hidden_size)}, device);
+    Tensor recv_hidden = make_raw_tensor(recv_hidden_ptr,
+                                         permuted_input.DType,
+                                         {static_cast<long>(total_recv), static_cast<long>(hidden_size)},
+                                         device);
 
     std::vector<int> send_elem_splits(ep_size), recv_elem_splits(ep_size);
     for (int p = 0; p < ep_size; ++p) {
@@ -443,11 +488,12 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         recv_elem_splits[p] = recv_splits[p] * hidden_size;
     }
 
-    mComm->all_to_all_single(
-        reinterpret_cast<const std::byte*>(send_ptr->Data),
-        reinterpret_cast<std::byte*>(recv_hidden.Data),
-        send_elem_splits.data(), recv_elem_splits.data(),
-        elem_sz, mRunState.MainStream);
+    mComm->all_to_all_single(reinterpret_cast<const std::byte*>(send_ptr->Data),
+                             reinterpret_cast<std::byte*>(recv_hidden.Data),
+                             send_elem_splits.data(),
+                             recv_elem_splits.data(),
+                             elem_sz,
+                             mRunState.MainStream);
 
     // ---- Build recv-side merged expert IDs for re-sort ----
     // After A2A, tokens from peer 0 first, then peer 1, etc.
@@ -466,11 +512,9 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
                 int count = recv_all_counts[p * num_experts + e];
                 int merged_idx = global_to_merged[e];
                 if (merged_idx < 0 || merged_idx >= num_merged) {
-                    throw std::runtime_error(
-                        "ep_dispatch: invalid merged expert index at layer "
-                        + std::to_string(layer_idx) + " e=" + std::to_string(e)
-                        + " merged_idx=" + std::to_string(merged_idx)
-                        + " num_merged=" + std::to_string(num_merged));
+                    throw std::runtime_error("ep_dispatch: invalid merged expert index at layer " +
+                                             std::to_string(layer_idx) + " e=" + std::to_string(e) + " merged_idx=" +
+                                             std::to_string(merged_idx) + " num_merged=" + std::to_string(num_merged));
                 }
                 for (int t = 0; t < count; ++t) {
                     if (pos < total_recv) {
@@ -480,10 +524,9 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
             }
         }
         if (pos != total_recv) {
-            throw std::runtime_error(
-                "ep_dispatch: recv_merged_ids fill mismatch at layer "
-                + std::to_string(layer_idx) + " pos=" + std::to_string(pos)
-                + " total_recv=" + std::to_string(total_recv));
+            throw std::runtime_error("ep_dispatch: recv_merged_ids fill mismatch at layer " +
+                                     std::to_string(layer_idx) + " pos=" + std::to_string(pos) +
+                                     " total_recv=" + std::to_string(total_recv));
         }
     }
 
@@ -493,12 +536,14 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     // Small temporary: recv_routing [total_recv, 1] INT32
     const size_t recv_routing_bytes = static_cast<size_t>(total_recv) * sizeof(int);
     void* recv_routing_ptr = ep_buf_acquire(recv_routing_bytes);
-    CUDA_CHECK(cudaMemcpyAsync(recv_routing_ptr, recv_merged_ids.data(),
-                                total_recv * sizeof(int), cudaMemcpyHostToDevice,
-                                mRunState.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(recv_routing_ptr,
+                               recv_merged_ids.data(),
+                               total_recv * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               mRunState.MainStream));
 
-    Tensor recv_routing = make_raw_tensor(recv_routing_ptr, ETensorDType::INT32,
-        {static_cast<long>(total_recv), 1L}, device);
+    Tensor recv_routing =
+        make_raw_tensor(recv_routing_ptr, ETensorDType::INT32, {static_cast<long>(total_recv), 1L}, device);
 
     // ---- Re-permute received tokens by merged expert index ----
     // Per-layer persistent output: sorted_recv [total_recv, hidden].
@@ -510,8 +555,10 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         CUDA_CHECK(cudaMalloc(&ep_state_out.sorted_recv_gpu, sorted_recv_need));
         ep_state_out.sorted_recv_bytes = sorted_recv_need;
     }
-    Tensor sorted_recv = make_raw_tensor(ep_state_out.sorted_recv_gpu, permuted_input.DType,
-        {static_cast<long>(total_recv), static_cast<long>(hidden_size)}, device);
+    Tensor sorted_recv = make_raw_tensor(ep_state_out.sorted_recv_gpu,
+                                         permuted_input.DType,
+                                         {static_cast<long>(total_recv), static_cast<long>(hidden_size)},
+                                         device);
 
     // Per-layer persistent output: local_scatter [total_recv] INT32
     const size_t local_scatter_need = static_cast<size_t>(total_recv) * sizeof(int);
@@ -520,12 +567,11 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         CUDA_CHECK(cudaMalloc(&ep_state_out.local_scatter_gpu, local_scatter_need));
         ep_state_out.local_scatter_bytes = local_scatter_need;
     }
-    Tensor local_scatter = make_raw_tensor(ep_state_out.local_scatter_gpu, ETensorDType::INT32,
-        {static_cast<long>(total_recv)}, device);
+    Tensor local_scatter =
+        make_raw_tensor(ep_state_out.local_scatter_gpu, ETensorDType::INT32, {static_cast<long>(total_recv)}, device);
 
     // Small temporaries for MoE index computation
-    const size_t helper_bytes =
-        (num_merged + (num_merged + 1) + num_merged + total_recv) * sizeof(int);
+    const size_t helper_bytes = (num_merged + (num_merged + 1) + num_merged + total_recv) * sizeof(int);
     void* helper_buf = ep_buf_acquire(helper_bytes);
 
     int* merged_counts_ptr = static_cast<int*>(helper_buf);
@@ -533,47 +579,59 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     int* merged_positions_ptr = merged_offsets_ptr + (num_merged + 1);
     int* local_gather_ptr = merged_positions_ptr + num_merged;
 
-    Tensor merged_counts_t = make_raw_tensor(merged_counts_ptr, ETensorDType::INT32,
-        {static_cast<long>(num_merged)}, device);
-    Tensor merged_offsets_t = make_raw_tensor(merged_offsets_ptr, ETensorDType::INT32,
-        {static_cast<long>(num_merged + 1)}, device);
-    Tensor merged_positions_t = make_raw_tensor(merged_positions_ptr, ETensorDType::INT32,
-        {static_cast<long>(num_merged)}, device);
-    Tensor local_gather = make_raw_tensor(local_gather_ptr, ETensorDType::INT32,
-        {static_cast<long>(total_recv)}, device);
+    Tensor merged_counts_t =
+        make_raw_tensor(merged_counts_ptr, ETensorDType::INT32, {static_cast<long>(num_merged)}, device);
+    Tensor merged_offsets_t =
+        make_raw_tensor(merged_offsets_ptr, ETensorDType::INT32, {static_cast<long>(num_merged + 1)}, device);
+    Tensor merged_positions_t =
+        make_raw_tensor(merged_positions_ptr, ETensorDType::INT32, {static_cast<long>(num_merged)}, device);
+    Tensor local_gather =
+        make_raw_tensor(local_gather_ptr, ETensorDType::INT32, {static_cast<long>(total_recv)}, device);
 
     fill_zero(merged_counts_t, mRunState.MainStream);
     fill_zero(merged_positions_t, mRunState.MainStream);
     CUDA_CHECK(cudaMemsetAsync(local_gather.Data, 0, local_gather.bytes(), mRunState.MainStream));
-    CUDA_CHECK(cudaMemsetAsync(local_scatter.Data, 0xFF,
-                                local_scatter.bytes(), mRunState.MainStream));
+    CUDA_CHECK(cudaMemsetAsync(local_scatter.Data, 0xFF, local_scatter.bytes(), mRunState.MainStream));
 
     moe_compute_expert_counts(merged_counts_t.get<int>(),
                               recv_routing.get<int>(),
-                              total_recv, 1, num_merged, mRunState.MainStream);
+                              total_recv,
+                              1,
+                              num_merged,
+                              mRunState.MainStream);
 
     moe_compute_expert_offsets(merged_offsets_t.get<int>(),
                                merged_counts_t.get<int>(),
-                               num_merged, mRunState.MainStream);
+                               num_merged,
+                               mRunState.MainStream);
 
     moe_build_indices(local_gather.get<int>(),
                       local_scatter.get<int>(),
                       recv_routing.get<int>(),
                       merged_offsets_t.get<int>(),
                       merged_positions_t.get<int>(),
-                      total_recv, 1, num_merged, mRunState.MainStream);
+                      total_recv,
+                      1,
+                      num_merged,
+                      mRunState.MainStream);
 
     if (recv_hidden.DType == ETensorDType::BF16) {
         moe_permute_tokens(sorted_recv.get<nv_bfloat16>(),
                            recv_hidden.get<nv_bfloat16>(),
                            local_gather.get<int>(),
-                           total_recv, total_recv, hidden_size, 1,
+                           total_recv,
+                           total_recv,
+                           hidden_size,
+                           1,
                            mRunState.MainStream);
     } else {
         moe_permute_tokens(sorted_recv.get<float>(),
                            recv_hidden.get<float>(),
                            local_gather.get<int>(),
-                           total_recv, total_recv, hidden_size, 1,
+                           total_recv,
+                           total_recv,
+                           hidden_size,
+                           1,
                            mRunState.MainStream);
     }
 
@@ -585,29 +643,33 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     {
         std::vector<int> merged_offsets_host(num_merged + 1);
         CUDA_CHECK(cudaMemcpyAsync(merged_offsets_host.data(),
-                                    merged_offsets_t.get<int>(),
-                                    (num_merged + 1) * sizeof(int),
-                                    cudaMemcpyDeviceToHost, mRunState.MainStream));
+                                   merged_offsets_t.get<int>(),
+                                   (num_merged + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost,
+                                   mRunState.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         mMoEHostOffsetsCache[ep_key] = merged_offsets_host;
-
     }
 
     // ---- Persist expert offsets and EP state ----
     // IMPORTANT: Must persist all data from helper_buf BEFORE releasing to pool.
     // local_gather.Data points into helper_buf — pool may recycle it for next layer.
     const std::string saved_offsets_key = moe_saved_key(layer_idx, "moe_expert_offsets");
-    save_persistent_buffer(mMoeSavedBuffers, mMoeSavedSizes,
-                           saved_offsets_key,
-                           merged_offsets_t, mRunState.MainStream);
+    save_persistent_buffer(mMoeSavedBuffers, mMoeSavedSizes, saved_offsets_key, merged_offsets_t, mRunState.MainStream);
 
     // Persist EP backward state (send_order = local_gather, recv_reorder = local_scatter)
     // Must happen BEFORE pool release of helper_buf since local_gather.Data is inside it.
     auto& ep_state_persist = mEpStates[ep_key];
-    persist_gpu_buffer(ep_state_persist.send_order_gpu, ep_state_persist.send_order_bytes,
-                       local_gather.Data, local_gather.bytes(), mRunState.MainStream);
-    persist_gpu_buffer(ep_state_persist.recv_reorder_gpu, ep_state_persist.recv_reorder_bytes,
-                       local_scatter.Data, local_scatter.bytes(), mRunState.MainStream);
+    persist_gpu_buffer(ep_state_persist.send_order_gpu,
+                       ep_state_persist.send_order_bytes,
+                       local_gather.Data,
+                       local_gather.bytes(),
+                       mRunState.MainStream);
+    persist_gpu_buffer(ep_state_persist.recv_reorder_gpu,
+                       ep_state_persist.recv_reorder_bytes,
+                       local_scatter.Data,
+                       local_scatter.bytes(),
+                       mRunState.MainStream);
 
     // Return helper buf to pool — bind from persistent copies instead
     ep_buf_release(helper_buf, helper_bytes);
@@ -615,8 +677,7 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     // Bind from persistent copies (helper_buf returned to pool, may be overwritten)
     {
         Tensor offsets_persisted = merged_offsets_t;
-        offsets_persisted.Data = static_cast<std::byte*>(
-            mMoeSavedBuffers[saved_offsets_key]);
+        offsets_persisted.Data = static_cast<std::byte*>(mMoeSavedBuffers[saved_offsets_key]);
         bind_tensor("moe_expert_offsets", offsets_persisted);
     }
 
@@ -633,9 +694,8 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         {
             auto wt_err = cudaGetLastError();
             if (wt_err != cudaSuccess) {
-                throw std::runtime_error(
-                    std::string("ep_dispatch: weight transfer stream error at layer ")
-                    + std::to_string(layer_idx) + ": " + cudaGetErrorString(wt_err));
+                throw std::runtime_error(std::string("ep_dispatch: weight transfer stream error at layer ") +
+                                         std::to_string(layer_idx) + ": " + cudaGetErrorString(wt_err));
             }
         }
 
@@ -671,10 +731,10 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
 
             if (local_native >= 0 && local_native < num_local) {
                 // Native expert — point directly into dequant buffer (no copy)
-                llep.gate_up_weight_ptrs[m] = static_cast<const std::byte*>(native_gate_up.Data)
-                    + static_cast<size_t>(local_native) * gu_expert_bytes;
-                llep.down_weight_ptrs[m] = static_cast<const std::byte*>(native_down.Data)
-                    + static_cast<size_t>(local_native) * dn_expert_bytes;
+                llep.gate_up_weight_ptrs[m] = static_cast<const std::byte*>(native_gate_up.Data) +
+                                              static_cast<size_t>(local_native) * gu_expert_bytes;
+                llep.down_weight_ptrs[m] = static_cast<const std::byte*>(native_down.Data) +
+                                           static_cast<size_t>(local_native) * dn_expert_bytes;
             } else {
                 // Foreign expert — point into P2P receive buffer (kept alive below)
                 auto wit = foreign_weights.weights.find(global_e);
@@ -703,10 +763,10 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
                 // Unlike base weights, LoRA tensors are small (~9 MB/layer) so per-layer
                 // storage is feasible and avoids the shared-buffer aliasing bug where a later
                 // layer's reallocation would free memory still referenced by earlier layers.
-                auto build_merged_pair = [&](
-                    const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& local_opt,
-                    std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& merged_opt,
-                    auto get_foreign_A, auto get_foreign_B) {
+                auto build_merged_pair = [&](const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& local_opt,
+                                             std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& merged_opt,
+                                             auto get_foreign_A,
+                                             auto get_foreign_B) {
                     if (!local_opt.has_value() || !local_opt->has_value()) return;
                     const auto& local = *local_opt;
                     const long a_rows = local.A.Sizes[1];
@@ -726,10 +786,10 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
                     llep.owned_lora_ptrs.push_back(ptr_B);
 
                     modules::LoRAGroupedLayerWeights<Tensor> merged;
-                    merged.A = make_raw_tensor(ptr_A, local.A.DType,
-                        {static_cast<long>(num_merged), a_rows, a_cols}, device);
-                    merged.B = make_raw_tensor(ptr_B, local.B.DType,
-                        {static_cast<long>(num_merged), b_rows, b_cols}, device);
+                    merged.A =
+                        make_raw_tensor(ptr_A, local.A.DType, {static_cast<long>(num_merged), a_rows, a_cols}, device);
+                    merged.B =
+                        make_raw_tensor(ptr_B, local.B.DType, {static_cast<long>(num_merged), b_rows, b_cols}, device);
 
                     for (int m = 0; m < num_merged; ++m) {
                         const int global_e = merged_experts[m];
@@ -738,18 +798,30 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
                         auto* b_dst = static_cast<std::byte*>(merged.B.Data) + static_cast<size_t>(m) * b_slice;
 
                         if (local_native >= 0 && local_native < num_local) {
-                            const auto* a_src = static_cast<const std::byte*>(local.A.Data) + static_cast<size_t>(local_native) * a_slice;
-                            const auto* b_src = static_cast<const std::byte*>(local.B.Data) + static_cast<size_t>(local_native) * b_slice;
-                            CUDA_CHECK(cudaMemcpyAsync(a_dst, a_src, a_slice, cudaMemcpyDeviceToDevice, mRunState.MainStream));
-                            CUDA_CHECK(cudaMemcpyAsync(b_dst, b_src, b_slice, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                            const auto* a_src = static_cast<const std::byte*>(local.A.Data) +
+                                                static_cast<size_t>(local_native) * a_slice;
+                            const auto* b_src = static_cast<const std::byte*>(local.B.Data) +
+                                                static_cast<size_t>(local_native) * b_slice;
+                            CUDA_CHECK(
+                                cudaMemcpyAsync(a_dst, a_src, a_slice, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                            CUDA_CHECK(
+                                cudaMemcpyAsync(b_dst, b_src, b_slice, cudaMemcpyDeviceToDevice, mRunState.MainStream));
                         } else {
                             auto wit = foreign_weights.weights.find(global_e);
                             if (wit != foreign_weights.weights.end()) {
                                 const Tensor& fa = get_foreign_A(wit->second.lora);
                                 const Tensor& fb = get_foreign_B(wit->second.lora);
                                 if (!fa.is_null()) {
-                                    CUDA_CHECK(cudaMemcpyAsync(a_dst, fa.Data, a_slice, cudaMemcpyDeviceToDevice, mRunState.MainStream));
-                                    CUDA_CHECK(cudaMemcpyAsync(b_dst, fb.Data, b_slice, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                                    CUDA_CHECK(cudaMemcpyAsync(a_dst,
+                                                               fa.Data,
+                                                               a_slice,
+                                                               cudaMemcpyDeviceToDevice,
+                                                               mRunState.MainStream));
+                                    CUDA_CHECK(cudaMemcpyAsync(b_dst,
+                                                               fb.Data,
+                                                               b_slice,
+                                                               cudaMemcpyDeviceToDevice,
+                                                               mRunState.MainStream));
                                 }
                             }
                         }
@@ -757,16 +829,24 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
                     merged_opt = std::move(merged);
                 };
 
-                build_merged_pair(g.gate_up, ml.gate_up,
+                build_merged_pair(
+                    g.gate_up,
+                    ml.gate_up,
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.gate_up_A; },
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.gate_up_B; });
-                build_merged_pair(g.gate, ml.gate,
+                build_merged_pair(
+                    g.gate,
+                    ml.gate,
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.gate_A; },
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.gate_B; });
-                build_merged_pair(g.up, ml.up,
+                build_merged_pair(
+                    g.up,
+                    ml.up,
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.up_A; },
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.up_B; });
-                build_merged_pair(g.down, ml.down,
+                build_merged_pair(
+                    g.down,
+                    ml.down,
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.down_A; },
                     [](const ep::ExpertLoRA& l) -> const Tensor& { return l.down_B; });
             }
@@ -831,10 +911,10 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
             for (int m = 0; m < num_merged; ++m) {
                 const int global_e = merged_experts[m];
                 const int local_native = global_e - native_start;
-                llep.gate_up_weight_ptrs[m] = static_cast<const std::byte*>(native_gate_up.Data)
-                    + static_cast<size_t>(local_native) * gu_expert_bytes;
-                llep.down_weight_ptrs[m] = static_cast<const std::byte*>(native_down.Data)
-                    + static_cast<size_t>(local_native) * dn_expert_bytes;
+                llep.gate_up_weight_ptrs[m] = static_cast<const std::byte*>(native_gate_up.Data) +
+                                              static_cast<size_t>(local_native) * gu_expert_bytes;
+                llep.down_weight_ptrs[m] = static_cast<const std::byte*>(native_down.Data) +
+                                           static_cast<size_t>(local_native) * dn_expert_bytes;
             }
 
             llep.merged_offsets_host = mMoEHostOffsetsCache[ep_key];
@@ -853,7 +933,6 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     // ---- Store outputs ----
     store_tensor(op.outputs[0], sorted_recv);
     store_tensor(op.outputs[1], local_scatter);
-
 }
 
 void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
@@ -913,16 +992,14 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
         }
     }
     if (it == mEpStates.end()) {
-        throw std::runtime_error(
-            "ep_dispatch_backward: no EP state for layer " + std::to_string(layer_idx));
+        throw std::runtime_error("ep_dispatch_backward: no EP state for layer " + std::to_string(layer_idx));
     }
     const auto& ep_state = it->second;
     auto& ep_state_mut = mEpStates[ep_key_selected];
     if (ep_state.total_recv != input_total_recv) {
         std::ostringstream oss;
         oss << "ep_dispatch_backward: EP state/input mismatch at layer " << layer_idx
-            << " (selected_key=" << ep_key_selected
-            << ", state.total_recv=" << ep_state.total_recv
+            << " (selected_key=" << ep_key_selected << ", state.total_recv=" << ep_state.total_recv
             << ", input.rows=" << input_total_recv << ")";
         throw std::runtime_error(oss.str());
     }
@@ -931,22 +1008,29 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
     // ---- 1. Un-sort gradient (reverse local re-permutation) ----
     const size_t unsorted_bytes = static_cast<size_t>(ep_state.total_recv) * hidden_size * elem_sz;
     void* d_recv_unsorted_ptr = ep_buf_acquire(unsorted_bytes);
-    Tensor d_recv_unsorted = make_raw_tensor(d_recv_unsorted_ptr, d_recv_sorted.DType,
-        {static_cast<long>(ep_state.total_recv), static_cast<long>(hidden_size)},
-        d_recv_sorted.Device);
+    Tensor d_recv_unsorted = make_raw_tensor(d_recv_unsorted_ptr,
+                                             d_recv_sorted.DType,
+                                             {static_cast<long>(ep_state.total_recv), static_cast<long>(hidden_size)},
+                                             d_recv_sorted.Device);
 
     if (d_recv_sorted.DType == ETensorDType::BF16) {
         moe_permute_tokens(d_recv_unsorted.get<nv_bfloat16>(),
                            d_recv_sorted.get<nv_bfloat16>(),
                            static_cast<int*>(ep_state.recv_reorder_gpu),
-                           ep_state.total_recv, ep_state.total_recv,
-                           hidden_size, 1, mRunState.MainStream);
+                           ep_state.total_recv,
+                           ep_state.total_recv,
+                           hidden_size,
+                           1,
+                           mRunState.MainStream);
     } else {
         moe_permute_tokens(d_recv_unsorted.get<float>(),
                            d_recv_sorted.get<float>(),
                            static_cast<int*>(ep_state.recv_reorder_gpu),
-                           ep_state.total_recv, ep_state.total_recv,
-                           hidden_size, 1, mRunState.MainStream);
+                           ep_state.total_recv,
+                           ep_state.total_recv,
+                           hidden_size,
+                           1,
+                           mRunState.MainStream);
     }
 
     // ---- 2. Reverse A2A (swap send/recv splits) ----
@@ -958,9 +1042,10 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
         CUDA_CHECK(cudaMalloc(&ep_state_mut.dispatch_bwd_send_gpu, send_need));
         ep_state_mut.dispatch_bwd_send_bytes = send_need;
     }
-    Tensor d_send_buf = make_raw_tensor(ep_state_mut.dispatch_bwd_send_gpu, d_recv_sorted.DType,
-        {static_cast<long>(ep_state.total_send), static_cast<long>(hidden_size)},
-        d_recv_sorted.Device);
+    Tensor d_send_buf = make_raw_tensor(ep_state_mut.dispatch_bwd_send_gpu,
+                                        d_recv_sorted.DType,
+                                        {static_cast<long>(ep_state.total_send), static_cast<long>(hidden_size)},
+                                        d_recv_sorted.Device);
 
     std::vector<int> reverse_send_elem(ep_size), reverse_recv_elem(ep_size);
     for (int p = 0; p < ep_size; ++p) {
@@ -968,11 +1053,12 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
         reverse_recv_elem[p] = ep_state.send_splits[p] * hidden_size;
     }
 
-    mComm->all_to_all_single(
-        reinterpret_cast<const std::byte*>(d_recv_unsorted.Data),
-        reinterpret_cast<std::byte*>(d_send_buf.Data),
-        reverse_send_elem.data(), reverse_recv_elem.data(),
-        elem_sz, mRunState.MainStream);
+    mComm->all_to_all_single(reinterpret_cast<const std::byte*>(d_recv_unsorted.Data),
+                             reinterpret_cast<std::byte*>(d_send_buf.Data),
+                             reverse_send_elem.data(),
+                             reverse_recv_elem.data(),
+                             elem_sz,
+                             mRunState.MainStream);
 
     // Return buffer to pool (stream ordering ensures A2A completes before reuse)
     ep_buf_release(d_recv_unsorted_ptr, unsorted_bytes);
@@ -984,8 +1070,11 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
         // Since send_order is a bijection, compute inverse and use gather.
         const int N = ep_state.total_send;
         std::vector<int> send_order_host(N);
-        CUDA_CHECK(cudaMemcpyAsync(send_order_host.data(), ep_state.llep_send_reorder_gpu,
-                                    N * sizeof(int), cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(send_order_host.data(),
+                                   ep_state.llep_send_reorder_gpu,
+                                   N * sizeof(int),
+                                   cudaMemcpyDeviceToHost,
+                                   mRunState.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
 
         std::vector<int> inverse_order(N);
@@ -995,8 +1084,11 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
 
         const size_t inv_gpu_bytes = static_cast<size_t>(N) * sizeof(int);
         void* inv_gpu_ptr = ep_buf_acquire(inv_gpu_bytes);
-        CUDA_CHECK(cudaMemcpyAsync(inv_gpu_ptr, inverse_order.data(),
-                                    N * sizeof(int), cudaMemcpyHostToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(inv_gpu_ptr,
+                                   inverse_order.data(),
+                                   N * sizeof(int),
+                                   cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
 
         // Per-layer persistent output for LLEP reorder.
         if (ep_state_mut.dispatch_bwd_out_bytes < send_need) {
@@ -1004,19 +1096,29 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
             CUDA_CHECK(cudaMalloc(&ep_state_mut.dispatch_bwd_out_gpu, send_need));
             ep_state_mut.dispatch_bwd_out_bytes = send_need;
         }
-        Tensor d_permuted = make_raw_tensor(ep_state_mut.dispatch_bwd_out_gpu, d_recv_sorted.DType,
-            {static_cast<long>(N), static_cast<long>(hidden_size)}, d_recv_sorted.Device);
+        Tensor d_permuted = make_raw_tensor(ep_state_mut.dispatch_bwd_out_gpu,
+                                            d_recv_sorted.DType,
+                                            {static_cast<long>(N), static_cast<long>(hidden_size)},
+                                            d_recv_sorted.Device);
 
         if (d_recv_sorted.DType == ETensorDType::BF16) {
             moe_permute_tokens(d_permuted.get<nv_bfloat16>(),
                                d_send_buf.get<nv_bfloat16>(),
                                static_cast<int*>(inv_gpu_ptr),
-                               N, N, hidden_size, 1, mRunState.MainStream);
+                               N,
+                               N,
+                               hidden_size,
+                               1,
+                               mRunState.MainStream);
         } else {
             moe_permute_tokens(d_permuted.get<float>(),
                                d_send_buf.get<float>(),
                                static_cast<int*>(inv_gpu_ptr),
-                               N, N, hidden_size, 1, mRunState.MainStream);
+                               N,
+                               N,
+                               hidden_size,
+                               1,
+                               mRunState.MainStream);
         }
 
         ep_buf_release(inv_gpu_ptr, inv_gpu_bytes);
@@ -1026,4 +1128,81 @@ void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// EP Dispatch backward rule
+// Forward: recv_sorted, recv_scatter = ep_dispatch(permuted, routing, scatter, ...)
+// Backward: d_permuted = ep_dispatch_backward(d_recv_sorted)
+// Only the first input (permuted tokens) is differentiable
+// -----------------------------------------------------------------------------
+std::vector<Operation> ep_dispatch_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        AttrMap attrs = copy_attrs(fwd.attrs, {"ep_size", "num_experts", "top_k"}, "ep_dispatch_backward");
+
+        ops.push_back(make_operation("ep_dispatch_backward_" + std::to_string(ctx.op_counter++),
+                                     "ep_dispatch_backward",
+                                     "ep_dispatch_backward",
+                                     {ctx.d_outputs[0]},
+                                     {ctx.d_inputs[0]},
+                                     attrs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("ep_dispatch", ::dsl::ep_dispatch_backward_rule);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// EP Dispatch: (recv_sorted, recv_scatter) = ep_dispatch(permuted, routing, scatter)
+// Dynamic output shapes depend on EP routing
+// ------------------------------------------------------------------------
+const int _ep_dispatch_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "ep_dispatch";
+    sig.min_inputs = 3;
+    sig.max_inputs = 3;
+    sig.min_outputs = 2;
+    sig.max_outputs = 2;
+    sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+        // Shapes are dynamic (depend on runtime routing); skip validation
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// EP Dispatch Backward
+// ------------------------------------------------------------------------
+const int _ep_dispatch_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "ep_dispatch_backward";
+    sig.min_inputs = 1;
+    sig.max_inputs = 1;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

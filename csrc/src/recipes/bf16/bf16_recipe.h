@@ -22,14 +22,26 @@ namespace recipes {
  */
 class BF16Recipe final : public Recipe {
 public:
-    [[nodiscard]] bool is_bf16() const override { return true; }
+    [[nodiscard]] bool is_bf16() const override {
+        return true;
+    }
 
-    [[nodiscard]] Format forward_format() const override { return Format::BF16; }
-    [[nodiscard]] Format backward_format() const override { return Format::BF16; }
+    [[nodiscard]] Format forward_format() const override {
+        return Format::BF16;
+    }
+    [[nodiscard]] Format backward_format() const override {
+        return Format::BF16;
+    }
 
-    [[nodiscard]] QuantParams quant_fwd_input() const override { return {}; }
-    [[nodiscard]] QuantParams quant_fwd_weight() const override { return {}; }
-    [[nodiscard]] QuantParams quant_bwd_grad() const override { return {}; }
+    [[nodiscard]] QuantParams quant_fwd_input() const override {
+        return {};
+    }
+    [[nodiscard]] QuantParams quant_fwd_weight() const override {
+        return {};
+    }
+    [[nodiscard]] QuantParams quant_bwd_grad() const override {
+        return {};
+    }
 
     [[nodiscard]] MatmulParams gemm_fprop() const override {
         return {.use_split_accumulator = false};
@@ -41,7 +53,9 @@ public:
         return {.use_split_accumulator = false};
     }
 
-    [[nodiscard]] std::string_view name() const override { return "bf16"; }
+    [[nodiscard]] std::string_view name() const override {
+        return "bf16";
+    }
 };
 
 }  // namespace recipes

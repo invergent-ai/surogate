@@ -2,9 +2,11 @@ import asyncio
 from time import perf_counter
 
 import numpy as np
+
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
+
 
 class EventLoopLagMonitor:
     """A class to monitor how busy the main event loop is."""

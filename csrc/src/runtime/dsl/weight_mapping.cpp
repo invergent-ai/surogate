@@ -18,7 +18,15 @@ namespace dsl {
 namespace {
 
 struct WeightSpec {
-    enum class Kind { Direct, Fuse, Transform, TiedTo, Split, StackExperts, Unknown };
+    enum class Kind {
+        Direct,
+        Fuse,
+        Transform,
+        TiedTo,
+        Split,
+        StackExperts,
+        Unknown
+    };
     Kind kind = Kind::Unknown;
     std::string source;
     std::vector<std::string> sources;
@@ -346,14 +354,14 @@ std::optional<modules::TensorTarget> resolve_tensor_target(const std::string& in
 }
 
 modules::RangeComputeFn resolve_fuse_range(modules::TensorTarget target, const std::string& source_name) {
+    using modules::ranges::mlp_gate_weight;
+    using modules::ranges::mlp_up_weight;
     using modules::ranges::qkv_k_bias;
     using modules::ranges::qkv_k_weight;
     using modules::ranges::qkv_q_bias;
     using modules::ranges::qkv_q_weight;
     using modules::ranges::qkv_v_bias;
     using modules::ranges::qkv_v_weight;
-    using modules::ranges::mlp_gate_weight;
-    using modules::ranges::mlp_up_weight;
 
     if (target == modules::TensorTarget::QKVWeight) {
         if (contains_ci(source_name, "q_proj")) return qkv_q_weight;
@@ -375,7 +383,8 @@ modules::RangeComputeFn resolve_fuse_range(modules::TensorTarget target, const s
 class DslWeightMapping final : public modules::BaseWeightMapping {
 public:
     explicit DslWeightMapping(std::vector<WeightEntry> entries)
-        : mEntries(std::move(entries)) {}
+        : mEntries(std::move(entries)) {
+    }
 
     void register_patterns() override {
         for (const auto& entry : mEntries) {
@@ -413,7 +422,8 @@ public:
                     break;
                 case WeightSpec::Kind::Transform:
                     if (spec.source.empty()) {
-                        throw std::runtime_error("DSL weight mapping: missing source for transform " + entry.internal_name);
+                        throw std::runtime_error("DSL weight mapping: missing source for transform " +
+                                                 entry.internal_name);
                     }
                     add_pattern_for_source(spec.source, *target, nullptr, spec.optional);
                     break;
@@ -424,7 +434,8 @@ public:
                     // stack_experts: loads per-expert HF tensors and stacks them into batched format.
                     // The pattern has {expert} placeholder which add_expert_pattern handles.
                     if (spec.source.empty()) {
-                        throw std::runtime_error("DSL weight mapping: missing pattern for stack_experts " + entry.internal_name);
+                        throw std::runtime_error("DSL weight mapping: missing pattern for stack_experts " +
+                                                 entry.internal_name);
                     }
                     if (spec.fuse_gate_up) {
                         // For gate_up: register both gate_proj and up_proj patterns
@@ -467,7 +478,7 @@ private:
     std::vector<WeightEntry> mEntries;
 };
 
-} // namespace
+}  // namespace
 
 std::unique_ptr<modules::BaseWeightMapping> build_weight_mapping(const Module& module) {
     if (module.hf_mapping.empty()) {
@@ -486,4 +497,4 @@ std::unique_ptr<modules::BaseWeightMapping> build_weight_mapping(const Module& m
     return mapping;
 }
 
-} // namespace dsl
+}  // namespace dsl

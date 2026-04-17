@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from .. import nn
+from ..dim import B, Dim, T
 from ..nn import GPT_OSS_BLOCK_NAME_REMAP
-from ..dim import B, T, Dim
 
 
 class GptOssBlock(nn.Block):
@@ -32,12 +32,19 @@ class GptOssBlock(nn.Block):
 
         self.attn_norm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.GptOssAttention(
-            d_model, num_query_heads, num_kv_heads, head_size,
-            max_seq, use_qkv_bias=use_qkv_bias,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            use_qkv_bias=use_qkv_bias,
         )
         self.mlp_norm = nn.RMSNorm(d_model, eps=eps)
         self.moe = nn.GptOssMoEExperts(
-            d_model, d_ff, num_experts, num_experts_per_tok,
+            d_model,
+            d_ff,
+            num_experts,
+            num_experts_per_tok,
             ep_size=ep_size,
         )
 
@@ -54,7 +61,8 @@ class GptOssBlock(nn.Block):
         moe_out = self.moe(h_flat)
         # Register output slot and reshape back
         self._register_activation(
-            "mlp_down", ("B", "T", "C"),
+            "mlp_down",
+            ("B", "T", "C"),
             aliases=["mlp_down_flat"],
             share_policy="per_layer",
             description="MoE output (block output)",

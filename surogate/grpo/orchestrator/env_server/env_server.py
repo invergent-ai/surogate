@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+
 from verifiers.workers import ZMQEnvServer
 
 from surogate.grpo.orchestrator.env_server.config import EnvServerConfig
@@ -32,4 +33,3 @@ def run_server(config: EnvServerConfig):
         **{"address": config.env.address} if config.env.address is not None else {},
     )
     asyncio.run(server.run())
-

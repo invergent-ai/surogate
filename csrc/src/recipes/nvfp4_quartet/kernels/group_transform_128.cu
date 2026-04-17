@@ -23,7 +23,7 @@ __global__ void group_transform_128_kernel(nv_bfloat16* y, const nv_bfloat16* h,
 
     __shared__ alignas(16) nv_bfloat16 h_smem[G * G];
     extern __shared__ uint4 dynamic_smem[];
-    nv_bfloat16* a_smem = reinterpret_cast<nv_bfloat16*>(dynamic_smem) + T*G*warp_id;
+    nv_bfloat16* a_smem = reinterpret_cast<nv_bfloat16*>(dynamic_smem) + T * G * warp_id;
 
     // Load Hadamard matrix into shared memory
     for (int k = warp_id; k < T_PER_G * T_PER_G; k += W) {
@@ -48,7 +48,6 @@ __global__ void group_transform_128_kernel(nv_bfloat16* y, const nv_bfloat16* h,
 
     m16_n16_a_fragment<nv_bfloat16> a_frags[T_PER_G];
     for (int i = start_i; i < groups; i += W * gridDim.x) {
-
         __pipeline_wait_prior(0);
         for (int k = 0; k < T_PER_G; ++k) {
             a_frags[k] = load_fragment_a_swizzle(lane_id, a_smem + k * T * T);
@@ -76,7 +75,8 @@ __global__ void group_transform_128_kernel(nv_bfloat16* y, const nv_bfloat16* h,
 }
 
 //! Calculates X^T H^T efficiently (transposed input)
-__global__ void group_transform_128_tp_kernel(nv_bfloat16* y, const nv_bfloat16* h, const nv_bfloat16* x, int rows, int cols) {
+__global__ void
+group_transform_128_tp_kernel(nv_bfloat16* y, const nv_bfloat16* h, const nv_bfloat16* x, int rows, int cols) {
     constexpr int G = 128;
     constexpr int T = 16;
     constexpr int W = 8;
@@ -90,7 +90,7 @@ __global__ void group_transform_128_tp_kernel(nv_bfloat16* y, const nv_bfloat16*
 
     __shared__ alignas(16) nv_bfloat16 h_smem[G * G];
     extern __shared__ uint4 dynamic_smem[];
-    nv_bfloat16* a_smem = reinterpret_cast<nv_bfloat16*>(dynamic_smem) + T*G*warp_id;
+    nv_bfloat16* a_smem = reinterpret_cast<nv_bfloat16*>(dynamic_smem) + T * G * warp_id;
 
     for (int k = warp_id; k < T_PER_G * T_PER_G; k += W) {
         int i = k % T_PER_G;
@@ -150,34 +150,54 @@ __global__ void group_transform_128_tp_kernel(nv_bfloat16* y, const nv_bfloat16*
     }
 }
 
-void group_transform_128_launcher(nv_bfloat16* y, const nv_bfloat16* H, const nv_bfloat16* x, int M, int N, cudaStream_t stream) {
+void group_transform_128_launcher(nv_bfloat16* y,
+                                  const nv_bfloat16* H,
+                                  const nv_bfloat16* x,
+                                  int M,
+                                  int N,
+                                  cudaStream_t stream) {
     assert(M * N % 128 == 0);
     int groups = M * N / 128;
     int blocks, device;
     int smem = 8 * 16 * 128 * 2;
     QUARTET_CUDA_CHECK(cudaGetDevice(&device));
-    QUARTET_CUDA_CHECK(cudaFuncSetAttribute(group_transform_128_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    QUARTET_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, group_transform_128_kernel, 32*4, smem));
+    QUARTET_CUDA_CHECK(
+        cudaFuncSetAttribute(group_transform_128_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    QUARTET_CUDA_CHECK(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, group_transform_128_kernel, 32 * 4, smem));
     int sms;
     QUARTET_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
     group_transform_128_kernel<<<sms * blocks, dim3(32, 8), smem, stream>>>(y, H, x, groups / 16);
     QUARTET_CUDA_CHECK(cudaGetLastError());
 }
 
-void group_transform_128_tp_launcher(nv_bfloat16* y, const nv_bfloat16* H, const nv_bfloat16* x, int M, int N, cudaStream_t stream) {
+void group_transform_128_tp_launcher(nv_bfloat16* y,
+                                     const nv_bfloat16* H,
+                                     const nv_bfloat16* x,
+                                     int M,
+                                     int N,
+                                     cudaStream_t stream) {
     assert(M * N % 128 == 0);
     int blocks, device;
     int smem = 8 * 16 * 128 * 2;
     QUARTET_CUDA_CHECK(cudaGetDevice(&device));
-    QUARTET_CUDA_CHECK(cudaFuncSetAttribute(group_transform_128_tp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    QUARTET_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, group_transform_128_tp_kernel, 32*4, smem));
+    QUARTET_CUDA_CHECK(
+        cudaFuncSetAttribute(group_transform_128_tp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    QUARTET_CUDA_CHECK(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, group_transform_128_tp_kernel, 32 * 4, smem));
     int sms;
     QUARTET_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
     group_transform_128_tp_kernel<<<sms * blocks, dim3(32, 8), smem, stream>>>(y, H, x, M, N);
     QUARTET_CUDA_CHECK(cudaGetLastError());
 }
 
-void group_transform_128(nv_bfloat16* y, const nv_bfloat16* H, const nv_bfloat16* x, int M, int N, bool transpose, cudaStream_t stream) {
+void group_transform_128(nv_bfloat16* y,
+                         const nv_bfloat16* H,
+                         const nv_bfloat16* x,
+                         int M,
+                         int N,
+                         bool transpose,
+                         cudaStream_t stream) {
     if (transpose) {
         group_transform_128_tp_launcher(y, H, x, M, N, stream);
     } else {

@@ -90,9 +90,15 @@ struct PretrainedConfig {
     }
 
     // Type checking methods
-    [[nodiscard]] virtual bool is_moe() const { return false; }
-    [[nodiscard]] virtual bool has_sliding_window() const { return SlidingWindow > 0; }
-    [[nodiscard]] virtual bool has_qk_norm() const { return UseQKNorm; }
+    [[nodiscard]] virtual bool is_moe() const {
+        return false;
+    }
+    [[nodiscard]] virtual bool has_sliding_window() const {
+        return SlidingWindow > 0;
+    }
+    [[nodiscard]] virtual bool has_qk_norm() const {
+        return UseQKNorm;
+    }
 
     [[nodiscard]] bool is_sliding_layer(int layer_idx) const {
         if (layer_idx < 0) {
@@ -107,12 +113,20 @@ struct PretrainedConfig {
     }
 
     // MoE layer query (overridden by MoE configs)
-    [[nodiscard]] virtual bool is_moe_layer(int /*layer_idx*/) const { return false; }
+    [[nodiscard]] virtual bool is_moe_layer(int /*layer_idx*/) const {
+        return false;
+    }
 
     // Computed properties
-    [[nodiscard]] int head_size() const { return HeadDim > 0 ? HeadDim : (HiddenSize / NumQueryHeads); }
-    [[nodiscard]] int attn_out_channels() const { return head_size() * NumQueryHeads; }
-    [[nodiscard]] int qkv_channels() const { return head_size() * (NumQueryHeads + 2 * NumKeyValHeads); }
+    [[nodiscard]] int head_size() const {
+        return HeadDim > 0 ? HeadDim : (HiddenSize / NumQueryHeads);
+    }
+    [[nodiscard]] int attn_out_channels() const {
+        return head_size() * NumQueryHeads;
+    }
+    [[nodiscard]] int qkv_channels() const {
+        return head_size() * (NumQueryHeads + 2 * NumKeyValHeads);
+    }
     [[nodiscard]] std::string_view model_name() const;
 
     // Default constructors - public for compatibility with existing code
@@ -128,4 +142,4 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
 void save_pretrained_config(const PretrainedConfig& config, const char* file_name);
 std::unique_ptr<PretrainedConfig> create_pretrained_config_from_name(std::string_view name, ETensorDType dtype);
 
-#endif // SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H
+#endif  // SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H

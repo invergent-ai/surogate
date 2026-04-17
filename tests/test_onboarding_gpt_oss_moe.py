@@ -59,9 +59,9 @@ BATCH = 1
 SEQ_LEN = 16
 # bf16 forward through MoE layers accumulates more error than dense models.
 # Full-precision (BF16) tolerances:
-RMS_TOL = 5e-2           # per-layer mid-state tolerance
-FINAL_NORM_TOL = 2e-1    # post-norm tolerance
-LAYER_OUT_TOL = 5e-2     # per-layer output tolerance (after MoE residual)
+RMS_TOL = 5e-2  # per-layer mid-state tolerance
+FINAL_NORM_TOL = 2e-1  # post-norm tolerance
+LAYER_OUT_TOL = 5e-2  # per-layer output tolerance (after MoE residual)
 # Pre-quantized (MXFP4) tolerances — dequantization adds quantization noise:
 MXFP4_RMS_TOL = 5e-1
 MXFP4_FINAL_NORM_TOL = 2.0
@@ -73,10 +73,10 @@ MXFP4_LAYER_OUT_TOL = 5e-1
 # as a compromise between realism and test speed/memory.
 TRAIN_SEQ_LEN = 512
 TRAIN_GRAD_ACCUM = 4
-NUM_TRAIN_STEPS = 10       # optimizer steps (each = grad_accum micro-steps)
+NUM_TRAIN_STEPS = 10  # optimizer steps (each = grad_accum micro-steps)
 TRAIN_LR = 2e-4
-LOSS_MATCH_TOL = 0.5           # HF vs Surogate step-0 loss tolerance (BF16)
-MXFP4_LOSS_MATCH_TOL = 1.0    # Larger for MXFP4 quantization noise
+LOSS_MATCH_TOL = 0.5  # HF vs Surogate step-0 loss tolerance (BF16)
+MXFP4_LOSS_MATCH_TOL = 1.0  # Larger for MXFP4 quantization noise
 # Short HF-vs-Surogate stability comparison (kept small for VRAM/time).
 # Grad accumulation defaults to TRAIN_GRAD_ACCUM to mirror real training.
 HF_COMPARE_STEPS = int(os.environ.get("GPT_OSS_HF_COMPARE_STEPS", "10"))
@@ -91,6 +91,7 @@ DUMP_DIR = Path(f"tmp/onboarding_gpt_oss_moe_dumps_{NUM_LAYERS}l")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_model_path() -> Path | None:
     """Resolve the path to GPT-OSS weights."""
@@ -155,9 +156,7 @@ def prepare_mini_model(snapshot_dir: Path) -> Path:
     config.setdefault("attention_bias", True)
     if isinstance(config.get("layer_types"), list):
         config["layer_types"] = ["full_attention"] * NUM_LAYERS
-    (MINI_MODEL_DIR / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n"
-    )
+    (MINI_MODEL_DIR / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     for tok_file in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
         src = snapshot_dir / tok_file
@@ -215,14 +214,14 @@ def load_dump(name: str) -> np.ndarray:
     return data.reshape(shape)
 
 
-def diff_stats(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+def diff_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     diff = a.astype(np.float32) - b.astype(np.float32)
     rms = float(np.sqrt(np.mean(diff * diff)))
     max_abs = float(np.max(np.abs(diff)))
     return rms, max_abs
 
 
-def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
+def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     inputs = rng.integers(0, vocab_size, size=(BATCH, SEQ_LEN), dtype=np.int32)
     targets = inputs.copy()
@@ -245,6 +244,7 @@ def compute_ce_loss(logits_np: np.ndarray, targets_np: np.ndarray) -> float:
     (target[i] = input[i+1], last position = -100).
     """
     import torch.nn.functional as F
+
     logits = torch.tensor(logits_np, dtype=torch.float32)
     targets = torch.tensor(targets_np.astype(np.int64))
     return F.cross_entropy(
@@ -254,7 +254,7 @@ def compute_ce_loss(logits_np: np.ndarray, targets_np: np.ndarray) -> float:
     ).item()
 
 
-def make_train_inputs(vocab_size: int, seq_len: int = TRAIN_SEQ_LEN) -> Dict[str, np.ndarray]:
+def make_train_inputs(vocab_size: int, seq_len: int = TRAIN_SEQ_LEN) -> dict[str, np.ndarray]:
     """Create training inputs with seq_len (longer than forward test inputs)."""
     rng = np.random.default_rng(SEED + 1)  # Different seed from forward test
     inputs = rng.integers(0, vocab_size, size=(BATCH, seq_len), dtype=np.int32)
@@ -278,6 +278,7 @@ def _grad_breakdown_from_named_tensors(named_tensors, proj_names: list[str], sca
     Optional `scale` applies a scalar normalization (e.g. token averaging) to each tensor.
     """
     import math
+
     stats = {p: {"sq": 0.0, "max_abs": 0.0, "tensors": 0} for p in proj_names}
     total_sq = 0.0
     total_max = 0.0
@@ -334,13 +335,17 @@ def lora_grad_breakdown_from_trainer(trainer, proj_names: list[str], grad_accum:
     return _grad_breakdown_from_named_tensors(named, proj_names, scale=token_scale)
 
 
-def run_surogate_training(model_dir: Path, inputs: np.ndarray, targets: np.ndarray,
-                          num_steps: int = NUM_TRAIN_STEPS,
-                          seq_len: int | None = None,
-                          grad_accum: int = TRAIN_GRAD_ACCUM,
-                          learning_rate: float = TRAIN_LR,
-                          norm_source: str = "trainer",
-                          capture_breakdown: bool = False) -> Dict[str, list]:
+def run_surogate_training(
+    model_dir: Path,
+    inputs: np.ndarray,
+    targets: np.ndarray,
+    num_steps: int = NUM_TRAIN_STEPS,
+    seq_len: int | None = None,
+    grad_accum: int = TRAIN_GRAD_ACCUM,
+    learning_rate: float = TRAIN_LR,
+    norm_source: str = "trainer",
+    capture_breakdown: bool = False,
+) -> dict[str, list]:
     """Run Surogate forward+backward+optimizer for num_steps.
 
     Uses grad_accum gradient accumulation steps per optimizer step to
@@ -351,8 +356,12 @@ def run_surogate_training(model_dir: Path, inputs: np.ndarray, targets: np.ndarr
     import gc
 
     # Clear debug env vars that interfere with training
-    for key in ["SUROGATE_DEBUG_DUMP_TENSORS", "SUROGATE_DEBUG_DUMP_DIR",
-                "SUROGATE_DEBUG_DUMP_LAYER", "SUROGATE_DEBUG_FORWARD_ONLY"]:
+    for key in [
+        "SUROGATE_DEBUG_DUMP_TENSORS",
+        "SUROGATE_DEBUG_DUMP_DIR",
+        "SUROGATE_DEBUG_DUMP_LAYER",
+        "SUROGATE_DEBUG_FORWARD_ONLY",
+    ]:
         os.environ.pop(key, None)
 
     mxfp4 = is_mxfp4_model(model_dir)
@@ -373,9 +382,11 @@ def run_surogate_training(model_dir: Path, inputs: np.ndarray, targets: np.ndarr
     opts.dsl_ir_json = build_dsl_ir_for_model(str(model_dir))
 
     lora_config = _surogate.LoRAAdapterConfig(
-        rank=16, alpha=32, dropout=0.0, dtype="bf16",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_up_proj", "down_proj"],
+        rank=16,
+        alpha=32,
+        dropout=0.0,
+        dtype="bf16",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"],
         use_rslora=False,
     )
 
@@ -384,8 +395,7 @@ def run_surogate_training(model_dir: Path, inputs: np.ndarray, targets: np.ndarr
         qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
         model_config = json.loads((model_dir / "config.json").read_text())
         qcfg = model_config.get("quantization_config", {})
-        modules_to_not_convert = qcfg.get(
-            "modules_to_not_convert", qcfg.get("ignore", []))
+        modules_to_not_convert = qcfg.get("modules_to_not_convert", qcfg.get("ignore", []))
         if modules_to_not_convert:
             qlora_config.modules_to_not_convert = modules_to_not_convert
 
@@ -459,6 +469,7 @@ def check_supported_weights(model_dir: Path) -> None:
     if model_path.exists():
         try:
             from safetensors import safe_open
+
             with safe_open(str(model_path), framework="pt", device="cpu") as f:
                 keys = f.keys()
                 if any(k.startswith("model.layers.") for k in keys):
@@ -488,7 +499,8 @@ def check_supported_weights(model_dir: Path) -> None:
 # HuggingFace forward — uses hooks for reliable per-layer capture
 # ---------------------------------------------------------------------------
 
-def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]:
+
+def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]:
     """Run HF forward and capture per-layer outputs via hooks.
 
     Captures mid-layer states (after attention, before MoE) via pre-hook on
@@ -507,6 +519,7 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     if qcfg:
         try:
             from transformers import Mxfp4Config
+
             model_kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
         except Exception:
             pass
@@ -518,29 +531,30 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
         pass
     model.eval()
 
-    result: Dict[str, np.ndarray] = {}
-    layer_outs: Dict[int, torch.Tensor] = {}
-    mid_states: Dict[int, torch.Tensor] = {}
+    result: dict[str, np.ndarray] = {}
+    layer_outs: dict[int, torch.Tensor] = {}
+    mid_states: dict[int, torch.Tensor] = {}
     hooks = []
 
     for i in range(NUM_LAYERS):
+
         def make_layer_hook(idx):
             def hook_fn(module, args, output):
                 hs = output[0] if isinstance(output, tuple) else output
                 layer_outs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(model.model.layers[i].register_forward_hook(make_layer_hook(i)))
 
         def make_mid_hook(idx):
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
                 mid_states[idx] = hs.detach().clone()
+
             return hook_fn
-        hooks.append(
-            model.model.layers[i].post_attention_layernorm.register_forward_pre_hook(
-                make_mid_hook(i)
-            )
-        )
+
+        hooks.append(model.model.layers[i].post_attention_layernorm.register_forward_pre_hook(make_mid_hook(i)))
 
     with torch.no_grad():
         input_ids = torch.tensor(inputs, device="cuda", dtype=torch.long)
@@ -548,10 +562,7 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
         position_ids = torch.arange(seq_len, device="cuda", dtype=torch.long).unsqueeze(0)
         position_ids = position_ids.expand(input_ids.shape[0], -1)
         attention_mask = torch.ones_like(input_ids)
-        _ = model(input_ids=input_ids,
-                  position_ids=position_ids,
-                  attention_mask=attention_mask,
-                  use_cache=False)
+        _ = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask, use_cache=False)
 
         for i in range(NUM_LAYERS):
             result[f"layer_output_{i}"] = layer_outs[i].float().cpu().numpy()
@@ -577,8 +588,8 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
 # Surogate forward
 # ---------------------------------------------------------------------------
 
-def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
-                         targets: np.ndarray) -> None:
+
+def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarray) -> None:
     """Run Surogate forward pass and dump tensors to DUMP_DIR.
 
     For MXFP4 pre-quantized models, uses prequant MXFP4 loading + LoRA
@@ -624,15 +635,13 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
             alpha=32,
             dropout=0.0,
             dtype="bf16",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_up_proj", "down_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"],
             use_rslora=False,
         )
         qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
         model_config = json.loads((model_dir / "config.json").read_text())
         qcfg = model_config.get("quantization_config", {})
-        modules_to_not_convert = qcfg.get(
-            "modules_to_not_convert", qcfg.get("ignore", []))
+        modules_to_not_convert = qcfg.get("modules_to_not_convert", qcfg.get("ignore", []))
         if modules_to_not_convert:
             qlora_config.modules_to_not_convert = modules_to_not_convert
 
@@ -652,10 +661,15 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
     trainer.step(inputs, targets)
 
 
-def run_hf_training(model_dir: Path, inputs: np.ndarray, targets: np.ndarray,
-                    num_steps: int, grad_accum: int = 1,
-                    learning_rate: float = TRAIN_LR,
-                    capture_breakdown: bool = False) -> Dict[str, list]:
+def run_hf_training(
+    model_dir: Path,
+    inputs: np.ndarray,
+    targets: np.ndarray,
+    num_steps: int,
+    grad_accum: int = 1,
+    learning_rate: float = TRAIN_LR,
+    capture_breakdown: bool = False,
+) -> dict[str, list]:
     """Run HF training for a few steps and report loss + grad norm (LoRA params).
 
     Uses PEFT LoRA adapters and AdamW. Keeps this lightweight for stability checks.
@@ -689,8 +703,7 @@ def run_hf_training(model_dir: Path, inputs: np.ndarray, targets: np.ndarray,
         r=16,
         lora_alpha=32,
         lora_dropout=0.0,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_up_proj", "down_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"],
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -735,6 +748,7 @@ def run_hf_training(model_dir: Path, inputs: np.ndarray, targets: np.ndarray,
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def model_dir():
@@ -783,6 +797,7 @@ def training_results(model_dir):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestGptOssMoEOnboarding:
     """Per-layer forward comparison: Surogate vs HuggingFace."""
 
@@ -806,9 +821,7 @@ class TestGptOssMoEOnboarding:
             hf_mid = hf[f"mid_state_{i}"]
             rms, max_abs = diff_stats(rt_res_att, hf_mid)
             if rms > tol:
-                failures.append(
-                    f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})"
-                )
+                failures.append(f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})")
 
         if failures:
             pytest.fail("Per-layer mid-state mismatches:\n" + "\n".join(failures))
@@ -819,9 +832,7 @@ class TestGptOssMoEOnboarding:
         tol = MXFP4_FINAL_NORM_TOL if quantized else FINAL_NORM_TOL
         rt_xf = load_dump("xF")
         rms, max_abs = diff_stats(rt_xf, hf["post_norm"])
-        assert rms < tol, (
-            f"xF (final norm output) rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})"
-        )
+        assert rms < tol, f"xF (final norm output) rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})"
 
     def test_per_layer_output(self, forward_results, quantized):
         """Check that per-layer outputs (after MoE residual) match HF."""
@@ -844,9 +855,7 @@ class TestGptOssMoEOnboarding:
 
             rms, max_abs = diff_stats(rt_out, hf_out)
             if rms > tol:
-                failures.append(
-                    f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})"
-                )
+                failures.append(f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})")
 
         if failures:
             pytest.fail("Per-layer output mismatches:\n" + "\n".join(failures))
@@ -862,14 +871,12 @@ class TestGptOssMoEOnboarding:
             pytest.skip("residual_final dump not available")
 
         rms, max_abs = diff_stats(rt_residual_final, hf["pre_norm"])
-        assert rms < tol, (
-            f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})"
-        )
+        assert rms < tol, f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={tol:.0e})"
 
     def test_summary(self, forward_results, quantized):
         """Print a summary table of all comparisons (informational)."""
         hf = forward_results
-        rows: List[Tuple[str, float, float]] = []
+        rows: list[tuple[str, float, float]] = []
 
         for i in range(NUM_LAYERS - 1):
             rt_res_att = None
@@ -936,10 +943,7 @@ class TestGptOssMoETraining:
         diff = abs(hf_loss - rt_loss)
 
         print(f"\n[Loss Compare] HF={hf_loss:.4f}  Surogate={rt_loss:.4f}  diff={diff:.4f}")
-        assert diff < tol, (
-            f"Step-0 loss mismatch: HF={hf_loss:.4f} Surogate={rt_loss:.4f} "
-            f"diff={diff:.4f} (tol={tol})"
-        )
+        assert diff < tol, f"Step-0 loss mismatch: HF={hf_loss:.4f} Surogate={rt_loss:.4f} diff={diff:.4f} (tol={tol})"
 
     def test_all_losses_finite(self, training_results):
         """All training losses must be finite (no NaN/Inf)."""
@@ -961,17 +965,13 @@ class TestGptOssMoETraining:
         max_norm = max(norms)
         # After gradient clipping to 1.0, norms should not grow unbounded.
         # Allow some headroom — the reported norm may be pre-clip.
-        assert max_norm < 1e6, (
-            f"Gradient norms exploded: max={max_norm:.2f}, "
-            f"all norms={[f'{n:.2f}' for n in norms]}"
-        )
+        assert max_norm < 1e6, f"Gradient norms exploded: max={max_norm:.2f}, all norms={[f'{n:.2f}' for n in norms]}"
 
     def test_loss_decreases(self, training_results):
         """Loss should decrease (or at least not diverge) over training steps."""
         losses = training_results["losses"]
         assert losses[-1] < losses[0] * 1.5, (
-            f"Loss didn't decrease: {losses[0]:.4f} -> {losses[-1]:.4f} "
-            f"(all: {[f'{l:.4f}' for l in losses]})"
+            f"Loss didn't decrease: {losses[0]:.4f} -> {losses[-1]:.4f} (all: {[f'{l:.4f}' for l in losses]})"
         )
 
     def test_training_summary(self, training_results, quantized):
@@ -1001,15 +1001,24 @@ class TestGptOssMoETraining:
         config = json.loads((model_dir / "config.json").read_text())
         data = make_train_inputs(config["vocab_size"], seq_len=HF_COMPARE_SEQ_LEN)
 
-        hf = run_hf_training(model_dir, data["inputs"], data["targets"],
-                             num_steps=HF_COMPARE_STEPS, grad_accum=HF_COMPARE_GRAD_ACCUM,
-                             capture_breakdown=True)
-        rt = run_surogate_training(model_dir, data["inputs"], data["targets"],
-                                   num_steps=HF_COMPARE_STEPS,
-                                   seq_len=HF_COMPARE_SEQ_LEN,
-                                   grad_accum=HF_COMPARE_GRAD_ACCUM,
-                                   norm_source="lora",
-                                   capture_breakdown=True)
+        hf = run_hf_training(
+            model_dir,
+            data["inputs"],
+            data["targets"],
+            num_steps=HF_COMPARE_STEPS,
+            grad_accum=HF_COMPARE_GRAD_ACCUM,
+            capture_breakdown=True,
+        )
+        rt = run_surogate_training(
+            model_dir,
+            data["inputs"],
+            data["targets"],
+            num_steps=HF_COMPARE_STEPS,
+            seq_len=HF_COMPARE_SEQ_LEN,
+            grad_accum=HF_COMPARE_GRAD_ACCUM,
+            norm_source="lora",
+            capture_breakdown=True,
+        )
 
         hf_losses = hf["losses"]
         rt_losses = rt["losses"]
@@ -1040,8 +1049,7 @@ class TestGptOssMoETraining:
         print("\n--- GPT-OSS HF vs Surogate Training (short) ---")
         print(" step |   loss_hf   loss_rt   ratio |  norm_hf   norm_rt   ratio")
         for i, l_hf, l_rt, lr, n_hf, n_rt, nr in rows:
-            print(f" {i:>4d} | {l_hf:8.4f} {l_rt:8.4f} {lr:6.2f} |"
-                  f" {n_hf:8.2f} {n_rt:8.2f} {nr:6.2f}")
+            print(f" {i:>4d} | {l_hf:8.4f} {l_rt:8.4f} {lr:6.2f} | {n_hf:8.2f} {n_rt:8.2f} {nr:6.2f}")
         if hf_breakdowns and rt_breakdowns:
             print("\n--- GPT-OSS LoRA Grad Breakdown (per projection) ---")
             header = " proj            |  hf_norm    rt_norm    ratio |  hf_max    rt_max | tensors_hf/rt"
@@ -1080,16 +1088,26 @@ class TestGptOssMoETraining:
         config = json.loads((model_dir / "config.json").read_text())
         data = make_train_inputs(config["vocab_size"], seq_len=HF_COMPARE_SEQ_LEN)
 
-        hf = run_hf_training(model_dir, data["inputs"], data["targets"],
-                             num_steps=HF_COMPARE_STEPS, grad_accum=HF_COMPARE_GRAD_ACCUM,
-                             learning_rate=0.0, capture_breakdown=False)
-        rt = run_surogate_training(model_dir, data["inputs"], data["targets"],
-                                   num_steps=HF_COMPARE_STEPS,
-                                   seq_len=HF_COMPARE_SEQ_LEN,
-                                   grad_accum=HF_COMPARE_GRAD_ACCUM,
-                                   learning_rate=0.0,
-                                   norm_source="lora",
-                                   capture_breakdown=False)
+        hf = run_hf_training(
+            model_dir,
+            data["inputs"],
+            data["targets"],
+            num_steps=HF_COMPARE_STEPS,
+            grad_accum=HF_COMPARE_GRAD_ACCUM,
+            learning_rate=0.0,
+            capture_breakdown=False,
+        )
+        rt = run_surogate_training(
+            model_dir,
+            data["inputs"],
+            data["targets"],
+            num_steps=HF_COMPARE_STEPS,
+            seq_len=HF_COMPARE_SEQ_LEN,
+            grad_accum=HF_COMPARE_GRAD_ACCUM,
+            learning_rate=0.0,
+            norm_source="lora",
+            capture_breakdown=False,
+        )
 
         hf_losses = hf["losses"]
         rt_losses = rt["losses"]
@@ -1118,8 +1136,7 @@ class TestGptOssMoETraining:
         print("\n--- GPT-OSS HF vs Surogate Training (LR=0 no-update) ---")
         print(" step |   loss_hf   loss_rt   ratio |  norm_hf   norm_rt   ratio")
         for i, l_hf, l_rt, lr, n_hf, n_rt, nr in rows:
-            print(f" {i:>4d} | {l_hf:8.4f} {l_rt:8.4f} {lr:6.2f} |"
-                  f" {n_hf:8.2f} {n_rt:8.2f} {nr:6.2f}")
+            print(f" {i:>4d} | {l_hf:8.4f} {l_rt:8.4f} {lr:6.2f} | {n_hf:8.2f} {n_rt:8.2f} {nr:6.2f}")
 
         for i, l_hf, l_rt, loss_ratio, n_hf, n_rt, norm_ratio in rows:
             assert loss_ratio < loss_ratio_tol, (

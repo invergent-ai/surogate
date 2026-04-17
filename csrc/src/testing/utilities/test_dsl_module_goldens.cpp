@@ -407,7 +407,8 @@ void expect_allclose(const std::string& label,
 
     INFO(label << ": max_abs=" << max_abs << " max_rel=" << max_rel);
     if (first_bad != actual_vals.size()) {
-        const double exp_val = expected.is_int() ? static_cast<double>(expected.i64[first_bad]) : expected.f64[first_bad];
+        const double exp_val =
+            expected.is_int() ? static_cast<double>(expected.i64[first_bad]) : expected.f64[first_bad];
         const double act_val = actual_vals[first_bad];
         INFO(label << ": first_bad idx=" << first_bad << " expected=" << exp_val << " actual=" << act_val);
     }
@@ -510,10 +511,9 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
         op1.kernel_type = "view";
         op1.inputs = {"x"};
         op1.outputs = {"x_flat"};
-        op1.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-            dsl::AttrValue(static_cast<std::int64_t>(C))
-        }));
+        op1.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(C))}));
         graph.operations.push_back(op1);
 
         dsl::Operation op2;
@@ -531,11 +531,10 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
         op3.kernel_type = "view";
         op3.inputs = {"up_flat"};
         op3.outputs = {"up"};
-        op3.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B)),
-            dsl::AttrValue(static_cast<std::int64_t>(T)),
-            dsl::AttrValue(static_cast<std::int64_t>(2 * M))
-        }));
+        op3.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(2 * M))}));
         graph.operations.push_back(op3);
 
         dsl::Operation op4;
@@ -552,10 +551,9 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
         op5.kernel_type = "view";
         op5.inputs = {"swiglu"};
         op5.outputs = {"swiglu_flat"};
-        op5.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-            dsl::AttrValue(static_cast<std::int64_t>(M))
-        }));
+        op5.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(M))}));
         graph.operations.push_back(op5);
 
         dsl::Operation op6;
@@ -573,11 +571,10 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
         op7.kernel_type = "view";
         op7.inputs = {"out_flat"};
         op7.outputs = {"out"};
-        op7.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B)),
-            dsl::AttrValue(static_cast<std::int64_t>(T)),
-            dsl::AttrValue(static_cast<std::int64_t>(C))
-        }));
+        op7.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(C))}));
         graph.operations.push_back(op7);
 
         module.forward = graph;
@@ -586,8 +583,15 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                    false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Copy golden inputs to device
         Tensor& x_tensor = params.get("x");
@@ -802,10 +806,9 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
         op1.kernel_type = "view";
         op1.inputs = {"x"};
         op1.outputs = {"x_flat"};
-        op1.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-            dsl::AttrValue(static_cast<std::int64_t>(C))
-        }));
+        op1.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(C))}));
         graph.operations.push_back(op1);
 
         // QKV projection
@@ -825,11 +828,10 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
         op3.kernel_type = "view";
         op3.inputs = {"qkv_flat"};
         op3.outputs = {"qkv"};
-        op3.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B)),
-            dsl::AttrValue(static_cast<std::int64_t>(T)),
-            dsl::AttrValue(static_cast<std::int64_t>(QKV))
-        }));
+        op3.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(QKV))}));
         graph.operations.push_back(op3);
 
         // RoPE: takes 3D [B, T, QKV] and treats it logically as [B, T, H, D]
@@ -859,10 +861,9 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
         op6.kernel_type = "view";
         op6.inputs = {"attn_out"};
         op6.outputs = {"attn_out_flat"};
-        op6.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-            dsl::AttrValue(static_cast<std::int64_t>(Hq * HD))
-        }));
+        op6.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(Hq * HD))}));
         graph.operations.push_back(op6);
 
         // Output projection
@@ -882,11 +883,10 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
         op8.kernel_type = "view";
         op8.inputs = {"out_flat"};
         op8.outputs = {"out"};
-        op8.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-            dsl::AttrValue(static_cast<std::int64_t>(B)),
-            dsl::AttrValue(static_cast<std::int64_t>(T)),
-            dsl::AttrValue(static_cast<std::int64_t>(C))
-        }));
+        op8.attrs["shape"] = dsl::AttrValue(
+            std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                          dsl::AttrValue(static_cast<std::int64_t>(C))}));
         graph.operations.push_back(op8);
 
         module.forward = graph;
@@ -895,8 +895,15 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                    false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("x"), gc.inputs.at("x"));
@@ -927,14 +934,15 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
         std::vector<std::int32_t> pos_ids_2d(total_pos_ids);
         for (std::size_t b = 0; b < B_len; ++b) {
             for (std::size_t t = 0; t < T_len; ++t) {
-                std::int32_t val = pos_ids_golden.is_int()
-                    ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
-                    : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
+                std::int32_t val = pos_ids_golden.is_int() ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
+                                                           : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
                 pos_ids_2d[b * T_len + t] = val;
             }
         }
-        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data, pos_ids_2d.data(),
-                             total_pos_ids * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data,
+                              pos_ids_2d.data(),
+                              total_pos_ids * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Compile graph
         dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
@@ -1156,8 +1164,15 @@ TEST_CASE("dsl module goldens: embedding_module", "[dsl][modules][goldens]") {
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                    false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Copy inputs
         copy_tensor_to_device(params.get("embedding_weight"), gc.inputs.at("embedding_weight"));
@@ -1168,8 +1183,10 @@ TEST_CASE("dsl module goldens: embedding_module", "[dsl][modules][goldens]") {
         for (std::size_t i = 0; i < token_ids_golden.numel(); ++i) {
             token_ids_host[i] = static_cast<std::int32_t>(token_ids_golden.i64[i]);
         }
-        CUDA_CHECK(cudaMemcpy(run_state.Inputs.Data, token_ids_host.data(),
-                             token_ids_host.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.Inputs.Data,
+                              token_ids_host.data(),
+                              token_ids_host.size() * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Compile and execute
         dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
@@ -1292,8 +1309,15 @@ TEST_CASE("dsl module goldens: rmsnorm_module", "[dsl][modules][goldens]") {
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                    false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Copy inputs
         copy_tensor_to_device(params.get("residual"), gc.inputs.at("residual"));
@@ -1664,10 +1688,9 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"ln1"};
             op.outputs = {"ln1_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -1691,12 +1714,11 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"qkv_flat"};
             op.outputs = {"qkv"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(Hq + 2 * Hkv)),
-                dsl::AttrValue(static_cast<std::int64_t>(HD))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(Hq + 2 * Hkv)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(HD))}));
             graph.operations.push_back(op);
         }
 
@@ -1732,10 +1754,9 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"att"};
             op.outputs = {"att_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(AttnDim))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(AttnDim))}));
             graph.operations.push_back(op);
         }
 
@@ -1759,11 +1780,10 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"att_out_flat"};
             op.outputs = {"att_out"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -1787,10 +1807,9 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"ln2"};
             op.outputs = {"ln2_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -1814,11 +1833,10 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"mlp_up_flat"};
             op.outputs = {"mlp_up"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(MUp))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(MUp))}));
             graph.operations.push_back(op);
         }
 
@@ -1841,10 +1859,9 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"swiglu"};
             op.outputs = {"swiglu_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(M))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(M))}));
             graph.operations.push_back(op);
         }
 
@@ -1868,11 +1885,10 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"out_flat"};
             op.outputs = {"out"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -1883,8 +1899,15 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                    false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("x"), gc.inputs.at("x"));
@@ -1917,14 +1940,15 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
         std::vector<std::int32_t> pos_ids_2d(total_pos_ids);
         for (std::size_t b = 0; b < B_len; ++b) {
             for (std::size_t t = 0; t < T_len; ++t) {
-                std::int32_t val = pos_ids_golden.is_int()
-                    ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
-                    : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
+                std::int32_t val = pos_ids_golden.is_int() ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
+                                                           : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
                 pos_ids_2d[b * T_len + t] = val;
             }
         }
-        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data, pos_ids_2d.data(),
-                             total_pos_ids * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data,
+                              pos_ids_2d.data(),
+                              total_pos_ids * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Compile graph
         dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
@@ -2012,7 +2036,8 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
                 for (const auto& op : compiled_backward.ops) {
                     if (op.type == dsl::CompiledOpType::MatmulBackward) has_matmul_backward = true;
                     if (op.type == dsl::CompiledOpType::SwiGLUBackward) has_swiglu_backward = true;
-                    if (op.type == dsl::CompiledOpType::FusedResidualRMSNormBackward) has_fused_residual_rmsnorm_backward = true;
+                    if (op.type == dsl::CompiledOpType::FusedResidualRMSNormBackward)
+                        has_fused_residual_rmsnorm_backward = true;
                     if (op.type == dsl::CompiledOpType::RoPEBackward) has_rope_backward = true;
                     if (op.type == dsl::CompiledOpType::FlashAttentionBackward) has_flash_attention_backward = true;
                 }
@@ -2240,10 +2265,9 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"ln1"};
             op.outputs = {"ln1_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -2267,12 +2291,11 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"qkv_flat"};
             op.outputs = {"qkv"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(Hq + 2 * Hkv)),
-                dsl::AttrValue(static_cast<std::int64_t>(HD))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(Hq + 2 * Hkv)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(HD))}));
             graph.operations.push_back(op);
         }
 
@@ -2308,10 +2331,9 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"att"};
             op.outputs = {"att_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(AttnDim))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(AttnDim))}));
             graph.operations.push_back(op);
         }
 
@@ -2335,11 +2357,10 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"att_out_flat"};
             op.outputs = {"att_out"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -2363,10 +2384,9 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"ln2"};
             op.outputs = {"ln2_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -2388,11 +2408,10 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"mlp_up_flat"};
             op.outputs = {"mlp_up"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(MUp))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(MUp))}));
             graph.operations.push_back(op);
         }
 
@@ -2413,10 +2432,9 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"swiglu"};
             op.outputs = {"swiglu_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(M))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(M))}));
             graph.operations.push_back(op);
         }
 
@@ -2438,11 +2456,10 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
             op.kernel_type = "view";
             op.inputs = {"out_flat"};
             op.outputs = {"out"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -2453,8 +2470,15 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                    false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("x"), gc.inputs.at("x"));
@@ -2489,14 +2513,15 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
         std::vector<std::int32_t> pos_ids_2d(total_pos_ids);
         for (std::size_t b = 0; b < B_len; ++b) {
             for (std::size_t t = 0; t < T_len; ++t) {
-                std::int32_t val = pos_ids_golden.is_int()
-                    ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
-                    : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
+                std::int32_t val = pos_ids_golden.is_int() ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
+                                                           : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
                 pos_ids_2d[b * T_len + t] = val;
             }
         }
-        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data, pos_ids_2d.data(),
-                             total_pos_ids * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data,
+                              pos_ids_2d.data(),
+                              total_pos_ids * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Compile graph
         dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
@@ -2585,7 +2610,8 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
                 for (const auto& op : compiled_backward.ops) {
                     if (op.type == dsl::CompiledOpType::MatmulBackward) has_matmul_backward = true;
                     if (op.type == dsl::CompiledOpType::SwiGLUBackward) has_swiglu_backward = true;
-                    if (op.type == dsl::CompiledOpType::FusedResidualRMSNormBackward) has_fused_residual_rmsnorm_backward = true;
+                    if (op.type == dsl::CompiledOpType::FusedResidualRMSNormBackward)
+                        has_fused_residual_rmsnorm_backward = true;
                     if (op.type == dsl::CompiledOpType::QKVQKNormRoPEBackward) has_qkv_qk_norm_rope_backward = true;
                     if (op.type == dsl::CompiledOpType::FlashAttentionBackward) has_flash_attention_backward = true;
                 }
@@ -2817,11 +2843,10 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.name = "zeros";
             op.kernel_type = "zeros";
             op.outputs = {"residual0"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             op.attrs["dtype"] = dsl::AttrValue("fp32");
             graph.operations.push_back(op);
         }
@@ -2847,10 +2872,9 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_ln1"};
             op.outputs = {"block0_ln1_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -2874,12 +2898,11 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_qkv_flat"};
             op.outputs = {"block0_qkv"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(Hq + 2 * Hkv)),
-                dsl::AttrValue(static_cast<std::int64_t>(HD))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(Hq + 2 * Hkv)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(HD))}));
             graph.operations.push_back(op);
         }
 
@@ -2915,10 +2938,9 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_att"};
             op.outputs = {"block0_att_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(AttnDim))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(AttnDim))}));
             graph.operations.push_back(op);
         }
 
@@ -2942,11 +2964,10 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_att_out_flat"};
             op.outputs = {"block0_att_out"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -2970,10 +2991,9 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_ln2"};
             op.outputs = {"block0_ln2_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -2995,11 +3015,10 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_mlp_up_flat"};
             op.outputs = {"block0_mlp_up"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(MUp))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(MUp))}));
             graph.operations.push_back(op);
         }
 
@@ -3020,10 +3039,9 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_swiglu"};
             op.outputs = {"block0_swiglu_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(M))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(M))}));
             graph.operations.push_back(op);
         }
 
@@ -3045,11 +3063,10 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"block0_out_flat"};
             op.outputs = {"block0_out"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B)),
-                dsl::AttrValue(static_cast<std::int64_t>(T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -3074,10 +3091,9 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             op.kernel_type = "view";
             op.inputs = {"xF"};
             op.outputs = {"xF_flat"};
-            op.attrs["shape"] = dsl::AttrValue(std::make_shared<dsl::AttrList>(dsl::AttrList{
-                dsl::AttrValue(static_cast<std::int64_t>(B * T)),
-                dsl::AttrValue(static_cast<std::int64_t>(C))
-            }));
+            op.attrs["shape"] = dsl::AttrValue(
+                std::make_shared<dsl::AttrList>(dsl::AttrList{dsl::AttrValue(static_cast<std::int64_t>(B * T)),
+                                                              dsl::AttrValue(static_cast<std::int64_t>(C))}));
             graph.operations.push_back(op);
         }
 
@@ -3100,8 +3116,15 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                    false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("embedding"), gc.inputs.at("embedding"));
@@ -3137,36 +3160,39 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
         std::vector<std::int32_t> pos_ids_2d(total_pos_ids);
         for (std::size_t b = 0; b < B_len; ++b) {
             for (std::size_t t = 0; t < T_len; ++t) {
-                std::int32_t val = pos_ids_golden.is_int()
-                    ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
-                    : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
+                std::int32_t val = pos_ids_golden.is_int() ? static_cast<std::int32_t>(pos_ids_golden.i64[t])
+                                                           : static_cast<std::int32_t>(pos_ids_golden.f64[t]);
                 pos_ids_2d[b * T_len + t] = val;
             }
         }
-        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data, pos_ids_2d.data(),
-                             total_pos_ids * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data,
+                              pos_ids_2d.data(),
+                              total_pos_ids * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Token IDs - copy to run_state.Inputs (the executor resolves token_ids to this slot)
         const auto& token_ids_golden = gc.inputs.at("token_ids");
         std::vector<std::int32_t> token_ids_host(B * T);
         for (std::size_t i = 0; i < token_ids_golden.numel(); ++i) {
-            token_ids_host[i] = token_ids_golden.is_int()
-                ? static_cast<std::int32_t>(token_ids_golden.i64[i])
-                : static_cast<std::int32_t>(token_ids_golden.f64[i]);
+            token_ids_host[i] = token_ids_golden.is_int() ? static_cast<std::int32_t>(token_ids_golden.i64[i])
+                                                          : static_cast<std::int32_t>(token_ids_golden.f64[i]);
         }
-        CUDA_CHECK(cudaMemcpy(run_state.Inputs.Data, token_ids_host.data(),
-                             B * T * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.Inputs.Data,
+                              token_ids_host.data(),
+                              B * T * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Targets - copy to run_state.Targets (the executor resolves targets to this slot)
         const auto& targets_golden = gc.inputs.at("targets");
         std::vector<std::int32_t> targets_host(B * T);
         for (std::size_t i = 0; i < targets_golden.numel(); ++i) {
-            targets_host[i] = targets_golden.is_int()
-                ? static_cast<std::int32_t>(targets_golden.i64[i])
-                : static_cast<std::int32_t>(targets_golden.f64[i]);
+            targets_host[i] = targets_golden.is_int() ? static_cast<std::int32_t>(targets_golden.i64[i])
+                                                      : static_cast<std::int32_t>(targets_golden.f64[i]);
         }
-        CUDA_CHECK(cudaMemcpy(run_state.Targets.Data, targets_host.data(),
-                             B * T * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.Targets.Data,
+                              targets_host.data(),
+                              B * T * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Compile graph
         dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
@@ -3220,15 +3246,13 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
             const double expected_loss = golden_loss.f64[0];
             const double diff = std::abs(mean_loss - expected_loss);
             const double rel = diff / (std::abs(expected_loss) + 1e-12);
-            INFO("loss: expected=" << expected_loss << " actual=" << mean_loss
-                 << " diff=" << diff << " rel=" << rel);
+            INFO("loss: expected=" << expected_loss << " actual=" << mean_loss << " diff=" << diff << " rel=" << rel);
             REQUIRE(diff < atol + rtol * std::abs(expected_loss));
         }
 
         INFO("✓ Qwen3Model forward pass verified against PyTorch reference");
     });
 }
-
 
 // ============================================================================
 // Qwen3Model Recompute Comparison Test
@@ -3272,12 +3296,14 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
         if (!t || t->nelem() == 0) return 0.0;
         std::vector<double> data = read_tensor_as_double(*t);
         double sum_sq = 0.0;
-        for (double v : data) sum_sq += v * v;
+        for (double v : data)
+            sum_sq += v * v;
         return std::sqrt(sum_sq);
     };
 
     // Helper to run a single forward pass and return the result
-    auto run_single_forward = [&gc, &compute_norm](NCCLCommunicator& comm, bool recompute_block) -> RecomputeTestResult {
+    auto run_single_forward = [&gc, &compute_norm](NCCLCommunicator& comm,
+                                                   bool recompute_block) -> RecomputeTestResult {
         const long B = *meta_long(gc.meta, "B");
         const long T = *meta_long(gc.meta, "T");
         const long V = *meta_long(gc.meta, "V");
@@ -3378,9 +3404,12 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
         graph.outputs.emplace("loss", loss_info);
 
         // Add operations
-        auto add_op = [&](const std::string& id, const std::string& name, const std::string& kernel,
-                         const std::vector<std::string>& ins, const std::vector<std::string>& outs,
-                         const std::unordered_map<std::string, dsl::AttrValue>& attrs = {}) {
+        auto add_op = [&](const std::string& id,
+                          const std::string& name,
+                          const std::string& kernel,
+                          const std::vector<std::string>& ins,
+                          const std::vector<std::string>& outs,
+                          const std::unordered_map<std::string, dsl::AttrValue>& attrs = {}) {
             dsl::Operation op;
             op.id = id;
             op.name = name;
@@ -3393,58 +3422,127 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
 
         auto shape_attr = [](const std::vector<std::int64_t>& dims) {
             dsl::AttrList list;
-            for (auto d : dims) list.push_back(dsl::AttrValue(d));
+            for (auto d : dims)
+                list.push_back(dsl::AttrValue(d));
             return dsl::AttrValue(std::make_shared<dsl::AttrList>(list));
         };
 
         add_op("embed_lookup", "embedding", "embedding", {"token_ids", "embedding"}, {"x0"});
-        add_op("zero_residual", "zeros", "zeros", {}, {"residual0"},
+        add_op("zero_residual",
+               "zeros",
+               "zeros",
+               {},
+               {"residual0"},
                {{"shape", shape_attr({B, T, C})}, {"dtype", dsl::AttrValue("fp32")}});
-        add_op("block0_fused_residual_rmsnorm_1", "fused_residual_rmsnorm", "fused_residual_rmsnorm",
-               {"residual0", "x0", "block0_ln1_weight"}, {"block0_res_ffn", "block0_ln1", "block0_ln1_rstd"},
+        add_op("block0_fused_residual_rmsnorm_1",
+               "fused_residual_rmsnorm",
+               "fused_residual_rmsnorm",
+               {"residual0", "x0", "block0_ln1_weight"},
+               {"block0_res_ffn", "block0_ln1", "block0_ln1_rstd"},
                {{"eps", dsl::AttrValue(static_cast<double>(eps))}});
-        add_op("block0_ln1_flat_view", "view", "view", {"block0_ln1"}, {"block0_ln1_flat"},
+        add_op("block0_ln1_flat_view",
+               "view",
+               "view",
+               {"block0_ln1"},
+               {"block0_ln1_flat"},
                {{"shape", shape_attr({B * T, C})}});
-        add_op("block0_qkv_proj", "matmul", "matmul", {"block0_ln1_flat", "block0_qkv_weight"}, {"block0_qkv_flat"},
+        add_op("block0_qkv_proj",
+               "matmul",
+               "matmul",
+               {"block0_ln1_flat", "block0_qkv_weight"},
+               {"block0_qkv_flat"},
                {{"transpose", dsl::AttrValue("NT")}});
-        add_op("block0_qkv_view", "view", "view", {"block0_qkv_flat"}, {"block0_qkv"},
+        add_op("block0_qkv_view",
+               "view",
+               "view",
+               {"block0_qkv_flat"},
+               {"block0_qkv"},
                {{"shape", shape_attr({B, T, Hq + 2 * Hkv, HD})}});
-        add_op("block0_qkv_qk_norm_rope", "qkv_qk_norm_rope", "qkv_qk_norm_rope",
+        add_op("block0_qkv_qk_norm_rope",
+               "qkv_qk_norm_rope",
+               "qkv_qk_norm_rope",
                {"block0_qkv", "block0_q_norm_weight", "block0_k_norm_weight", "rope_freqs", "position_ids"},
                {"block0_qkv_rope", "block0_q_rstd", "block0_k_rstd"},
                {{"eps", dsl::AttrValue(static_cast<double>(eps))}});
-        add_op("block0_flash_attention", "flash_attention", "flash_attention",
-               {"block0_qkv_rope"}, {"block0_att", "block0_lse"},
+        add_op("block0_flash_attention",
+               "flash_attention",
+               "flash_attention",
+               {"block0_qkv_rope"},
+               {"block0_att", "block0_lse"},
                {{"causal", dsl::AttrValue(true)}});
-        add_op("block0_att_flat_view", "view", "view", {"block0_att"}, {"block0_att_flat"},
+        add_op("block0_att_flat_view",
+               "view",
+               "view",
+               {"block0_att"},
+               {"block0_att_flat"},
                {{"shape", shape_attr({B * T, AttnDim})}});
-        add_op("block0_out_proj", "matmul", "matmul", {"block0_att_flat", "block0_out_weight"}, {"block0_att_out_flat"},
+        add_op("block0_out_proj",
+               "matmul",
+               "matmul",
+               {"block0_att_flat", "block0_out_weight"},
+               {"block0_att_out_flat"},
                {{"transpose", dsl::AttrValue("NT")}});
-        add_op("block0_att_out_view", "view", "view", {"block0_att_out_flat"}, {"block0_att_out"},
+        add_op("block0_att_out_view",
+               "view",
+               "view",
+               {"block0_att_out_flat"},
+               {"block0_att_out"},
                {{"shape", shape_attr({B, T, C})}});
-        add_op("block0_fused_residual_rmsnorm_2", "fused_residual_rmsnorm", "fused_residual_rmsnorm",
-               {"block0_res_ffn", "block0_att_out", "block0_ln2_weight"}, {"block0_residual_out", "block0_ln2", "block0_ln2_rstd"},
+        add_op("block0_fused_residual_rmsnorm_2",
+               "fused_residual_rmsnorm",
+               "fused_residual_rmsnorm",
+               {"block0_res_ffn", "block0_att_out", "block0_ln2_weight"},
+               {"block0_residual_out", "block0_ln2", "block0_ln2_rstd"},
                {{"eps", dsl::AttrValue(static_cast<double>(eps))}});
-        add_op("block0_ln2_flat_view", "view", "view", {"block0_ln2"}, {"block0_ln2_flat"},
+        add_op("block0_ln2_flat_view",
+               "view",
+               "view",
+               {"block0_ln2"},
+               {"block0_ln2_flat"},
                {{"shape", shape_attr({B * T, C})}});
-        add_op("block0_mlp_up_proj", "matmul", "matmul", {"block0_ln2_flat", "block0_mlp_up_weight"}, {"block0_mlp_up_flat"},
+        add_op("block0_mlp_up_proj",
+               "matmul",
+               "matmul",
+               {"block0_ln2_flat", "block0_mlp_up_weight"},
+               {"block0_mlp_up_flat"},
                {{"transpose", dsl::AttrValue("NT")}});
-        add_op("block0_mlp_up_view", "view", "view", {"block0_mlp_up_flat"}, {"block0_mlp_up"},
+        add_op("block0_mlp_up_view",
+               "view",
+               "view",
+               {"block0_mlp_up_flat"},
+               {"block0_mlp_up"},
                {{"shape", shape_attr({B, T, MUp})}});
         add_op("block0_swiglu", "swiglu", "swiglu", {"block0_mlp_up"}, {"block0_swiglu_out"});
-        add_op("block0_swiglu_flat_view", "view", "view", {"block0_swiglu_out"}, {"block0_swiglu_flat"},
+        add_op("block0_swiglu_flat_view",
+               "view",
+               "view",
+               {"block0_swiglu_out"},
+               {"block0_swiglu_flat"},
                {{"shape", shape_attr({B * T, M})}});
-        add_op("block0_mlp_down_proj", "matmul", "matmul", {"block0_swiglu_flat", "block0_mlp_down_weight"}, {"block0_out_flat"},
+        add_op("block0_mlp_down_proj",
+               "matmul",
+               "matmul",
+               {"block0_swiglu_flat", "block0_mlp_down_weight"},
+               {"block0_out_flat"},
                {{"transpose", dsl::AttrValue("NT")}});
-        add_op("block0_out_view", "view", "view", {"block0_out_flat"}, {"block0_out"},
+        add_op("block0_out_view",
+               "view",
+               "view",
+               {"block0_out_flat"},
+               {"block0_out"},
                {{"shape", shape_attr({B, T, C})}});
-        add_op("final_fused_residual_rmsnorm", "fused_residual_rmsnorm", "fused_residual_rmsnorm",
-               {"block0_residual_out", "block0_out", "final_norm"}, {"residual_final", "xF", "final_rstd"},
+        add_op("final_fused_residual_rmsnorm",
+               "fused_residual_rmsnorm",
+               "fused_residual_rmsnorm",
+               {"block0_residual_out", "block0_out", "final_norm"},
+               {"residual_final", "xF", "final_rstd"},
                {{"eps", dsl::AttrValue(static_cast<double>(eps))}});
-        add_op("xF_flat_view", "view", "view", {"xF"}, {"xF_flat"},
-               {{"shape", shape_attr({B * T, C})}});
-        add_op("lm_head_loss", "fused_lm_head_loss", "fused_lm_head_loss",
-               {"xF_flat", "lm_head", "targets"}, {"loss"},
+        add_op("xF_flat_view", "view", "view", {"xF"}, {"xF_flat"}, {{"shape", shape_attr({B * T, C})}});
+        add_op("lm_head_loss",
+               "fused_lm_head_loss",
+               "fused_lm_head_loss",
+               {"xF_flat", "lm_head", "targets"},
+               {"loss"},
                {{"compute_accuracy", dsl::AttrValue(true)}});
 
         module.forward = graph;
@@ -3454,8 +3552,15 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
         constexpr std::size_t kStackBytes = 256 * 1024 * 1024;
         const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta);
-        dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                   false, kStackBytes, true);
+        dsl::DslRunState run_state(cfg,
+                                   runtime_cfg,
+                                   options,
+                                   static_cast<int>(B),
+                                   static_cast<int>(T),
+                                   allocator,
+                                   false,
+                                   kStackBytes,
+                                   true);
 
         // Reset loss/accuracy buffers since cross-entropy forward accumulates into them.
         fill_zero(run_state.Losses, run_state.MainStream);
@@ -3492,26 +3597,34 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
         std::vector<std::int32_t> pos_ids(B_len * T_len);
         for (std::size_t b = 0; b < B_len; ++b) {
             for (std::size_t t = 0; t < T_len; ++t) {
-                pos_ids[b * T_len + t] = pos_golden.is_int() ? static_cast<std::int32_t>(pos_golden.i64[t]) : static_cast<std::int32_t>(pos_golden.f64[t]);
+                pos_ids[b * T_len + t] = pos_golden.is_int() ? static_cast<std::int32_t>(pos_golden.i64[t])
+                                                             : static_cast<std::int32_t>(pos_golden.f64[t]);
             }
         }
-        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data, pos_ids.data(), B_len * T_len * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(run_state.PositionIDs.Data,
+                              pos_ids.data(),
+                              B_len * T_len * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
 
         // Token IDs
         const auto& tok_golden = gc.inputs.at("token_ids");
         std::vector<std::int32_t> tok_host(B * T);
         for (std::size_t i = 0; i < tok_golden.numel(); ++i) {
-            tok_host[i] = tok_golden.is_int() ? static_cast<std::int32_t>(tok_golden.i64[i]) : static_cast<std::int32_t>(tok_golden.f64[i]);
+            tok_host[i] = tok_golden.is_int() ? static_cast<std::int32_t>(tok_golden.i64[i])
+                                              : static_cast<std::int32_t>(tok_golden.f64[i]);
         }
-        CUDA_CHECK(cudaMemcpy(run_state.Inputs.Data, tok_host.data(), B * T * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(run_state.Inputs.Data, tok_host.data(), B * T * sizeof(std::int32_t), cudaMemcpyHostToDevice));
 
         // Targets
         const auto& tgt_golden = gc.inputs.at("targets");
         std::vector<std::int32_t> tgt_host(B * T);
         for (std::size_t i = 0; i < tgt_golden.numel(); ++i) {
-            tgt_host[i] = tgt_golden.is_int() ? static_cast<std::int32_t>(tgt_golden.i64[i]) : static_cast<std::int32_t>(tgt_golden.f64[i]);
+            tgt_host[i] = tgt_golden.is_int() ? static_cast<std::int32_t>(tgt_golden.i64[i])
+                                              : static_cast<std::int32_t>(tgt_golden.f64[i]);
         }
-        CUDA_CHECK(cudaMemcpy(run_state.Targets.Data, tgt_host.data(), B * T * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(run_state.Targets.Data, tgt_host.data(), B * T * sizeof(std::int32_t), cudaMemcpyHostToDevice));
 
         // Compile and execute
         dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
@@ -3526,17 +3639,17 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
 
         // Capture norms of intermediate tensors for debugging
         const std::vector<std::string> tensor_names = {
-            "x0",                    // Embedding output
-            "block0_ln1",            // Pre-attention layer norm
-            "block0_qkv",            // QKV projection
-            "block0_qkv_rope",       // After RoPE
-            "block0_att",            // Attention output
-            "block0_att_out",        // After out projection
-            "block0_ln2",            // Pre-MLP layer norm
-            "block0_mlp_up",         // MLP up projection
-            "block0_swiglu_out",     // After SwiGLU
-            "block0_out",            // MLP output
-            "xF",                    // Final layer norm output
+            "x0",                 // Embedding output
+            "block0_ln1",         // Pre-attention layer norm
+            "block0_qkv",         // QKV projection
+            "block0_qkv_rope",    // After RoPE
+            "block0_att",         // Attention output
+            "block0_att_out",     // After out projection
+            "block0_ln2",         // Pre-MLP layer norm
+            "block0_mlp_up",      // MLP up projection
+            "block0_swiglu_out",  // After SwiGLU
+            "block0_out",         // MLP output
+            "xF",                 // Final layer norm output
         };
 
         for (const auto& name : tensor_names) {
@@ -3550,7 +3663,8 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
 
         std::vector<double> per_token = read_tensor_as_double(*loss_tensor);
         double mean_loss = 0.0;
-        for (double v : per_token) mean_loss += v;
+        for (double v : per_token)
+            mean_loss += v;
         mean_loss /= static_cast<double>(per_token.size());
         result.loss = mean_loss;
         result.norms["loss"] = compute_norm(loss_tensor);
@@ -3592,29 +3706,38 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
     // Compare tensor norms to identify where divergence starts
     INFO("=== Tensor Norm Comparison ===");
 
-    const std::vector<std::string> tensor_order = {
-        "x0", "block0_ln1", "block0_qkv", "block0_qkv_rope", "block0_att",
-        "block0_att_out", "block0_ln2", "block0_mlp_up", "block0_swiglu_out",
-        "block0_out", "xF", "loss"
-    };
+    const std::vector<std::string> tensor_order = {"x0",
+                                                   "block0_ln1",
+                                                   "block0_qkv",
+                                                   "block0_qkv_rope",
+                                                   "block0_att",
+                                                   "block0_att_out",
+                                                   "block0_ln2",
+                                                   "block0_mlp_up",
+                                                   "block0_swiglu_out",
+                                                   "block0_out",
+                                                   "xF",
+                                                   "loss"};
 
     bool found_divergence = false;
     std::string first_divergent_tensor;
     double max_rel_diff = 0.0;
 
     for (const auto& name : tensor_order) {
-        const double norm_no_recompute = result_no_recompute.norms.count(name) ? result_no_recompute.norms.at(name) : 0.0;
-        const double norm_with_recompute = result_with_recompute.norms.count(name) ? result_with_recompute.norms.at(name) : 0.0;
+        const double norm_no_recompute =
+            result_no_recompute.norms.count(name) ? result_no_recompute.norms.at(name) : 0.0;
+        const double norm_with_recompute =
+            result_with_recompute.norms.count(name) ? result_with_recompute.norms.at(name) : 0.0;
         const double abs_diff = std::abs(norm_with_recompute - norm_no_recompute);
         const double rel_diff = abs_diff / (norm_no_recompute + 1e-12);
 
         // Only WARN on divergence, INFO otherwise (INFO shows on failure)
         if (rel_diff > 1e-3) {
             WARN("  " << name << ": norm_base=" << norm_no_recompute << " norm_recompute=" << norm_with_recompute
-                 << " rel_diff=" << rel_diff << " <-- DIVERGED");
+                      << " rel_diff=" << rel_diff << " <-- DIVERGED");
         } else {
             INFO("  " << name << ": norm_base=" << norm_no_recompute << " norm_recompute=" << norm_with_recompute
-                 << " rel_diff=" << rel_diff);
+                      << " rel_diff=" << rel_diff);
         }
 
         if (rel_diff > 1e-3 && !found_divergence) {

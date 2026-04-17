@@ -22,7 +22,6 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
-
 from surogate.grpo.inference.patches import (
     monkey_patch_hermes_tool_parser_thread_safety,
     monkey_patch_load_lora_adapter,
@@ -170,7 +169,7 @@ async def custom_init_app_state(
         request_logger = None
 
     resolved_chat_template = load_chat_template(args.chat_template)
-    
+
     chat_kwargs = dict(
         openai_serving_render=state.openai_serving_render,
         request_logger=request_logger,
@@ -193,7 +192,7 @@ async def custom_init_app_state(
         args.response_role,
         **chat_kwargs,
     )
-    
+
     state.openai_serving_chat = serving_chat if "generate" in supported_tasks else None
     state.openai_serving_chat_with_tokens = serving_chat if "generate" in supported_tasks else None
 
@@ -238,7 +237,7 @@ vllm.entrypoints.cli.serve.run_api_server_worker_proc = custom_run_api_server_wo
 def server(config: GRPOInferenceConfig):
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
-        
+
     if config.tool_call_parser is not None:
         logger.info(f"Using tool_call_parser='{config.tool_call_parser}' for model '{config.model}'")
 

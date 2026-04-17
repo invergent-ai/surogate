@@ -1,7 +1,7 @@
 """CLI entry point for GRPO RL training: `surogate grpo-train config.yaml`"""
 
-import sys
 import argparse
+import sys
 
 from surogate.utils.logger import get_logger
 

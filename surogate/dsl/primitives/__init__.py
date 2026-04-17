@@ -1,42 +1,42 @@
 """Primitive Operations for Python DSL"""
 
+from .activations import relu2, sigmoid, silu, silu_mul, swiglu
+from .attention import flash_attention, mrope, qkv_qk_norm, qkv_qk_norm_rope, rope
 from .common import TransposeMode
-from .matmul import matmul, batched_matmul
-from .normalization import rmsnorm, fused_residual_rmsnorm
-from .activations import swiglu, silu, sigmoid, relu2, silu_mul
-from .attention import flash_attention, rope, mrope, qkv_qk_norm, qkv_qk_norm_rope
+from .elementwise import add, bias_add, deepstack_inject, mask_scatter, mul, scale
 from .embedding import embedding
-from .tensor_ops import view, transpose, concat, split, repeat_interleave_heads
-from .elementwise import add, mul, scale, bias_add, mask_scatter, deepstack_inject
-from .initialization import zeros, ones, fill_normal
-from .losses import fused_lm_head_loss
-from .moe import (
-    moe_softmax,
-    moe_sigmoid,
-    moe_topk,
-    moe_permute,
-    moe_unpermute,
-    moe_grouped_gemm_gate_up,
-    moe_grouped_gemm_down,
-)
-from .mamba import (
-    mamba_conv1d,
-    mamba_ssm_scan,
-    mamba_gated_rmsnorm,
-    mamba_split_proj,
-    mamba_split_conv_out,
-    mamba_combine_scan,
+from .ep import (
+    ep_combine,
+    ep_dispatch,
 )
 from .gated_delta_rule import (
     chunk_gated_delta_rule,
 )
+from .initialization import fill_normal, ones, zeros
+from .losses import fused_lm_head_loss
+from .mamba import (
+    mamba_combine_scan,
+    mamba_conv1d,
+    mamba_gated_rmsnorm,
+    mamba_split_conv_out,
+    mamba_split_proj,
+    mamba_ssm_scan,
+)
+from .matmul import batched_matmul, matmul
+from .moe import (
+    moe_grouped_gemm_down,
+    moe_grouped_gemm_gate_up,
+    moe_permute,
+    moe_sigmoid,
+    moe_softmax,
+    moe_topk,
+    moe_unpermute,
+)
+from .normalization import fused_residual_rmsnorm, rmsnorm
 from .qwen3_5 import (
     qwen3_5_decay,
 )
-from .ep import (
-    ep_dispatch,
-    ep_combine,
-)
+from .tensor_ops import concat, repeat_interleave_heads, split, transpose, view
 
 __all__ = [
     # Common

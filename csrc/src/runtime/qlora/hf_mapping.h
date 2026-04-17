@@ -16,7 +16,15 @@
 namespace modules {
 
 struct HfMappingSpec {
-    enum class Kind { Direct, Fuse, Split, Transform, TiedTo, StackExperts, Unknown };
+    enum class Kind {
+        Direct,
+        Fuse,
+        Split,
+        Transform,
+        TiedTo,
+        StackExperts,
+        Unknown
+    };
     Kind kind = Kind::Unknown;
     std::string source;
     std::vector<std::string> sources;
@@ -123,6 +131,6 @@ struct HfMapping {
     }
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_QLORA_HF_MAPPING_H
+#endif  // SUROGATE_SRC_MODULES_QLORA_HF_MAPPING_H

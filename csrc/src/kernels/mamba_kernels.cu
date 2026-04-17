@@ -19,35 +19,35 @@
 
 namespace {
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ float to_float(T v) {
     return static_cast<float>(v);
 }
 
-template<>
+template <>
 __device__ __forceinline__ float to_float<nv_bfloat16>(nv_bfloat16 v) {
     return __bfloat162float(v);
 }
 
-template<>
+template <>
 __device__ __forceinline__ float to_float<half>(half v) {
     return __half2float(v);
 }
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ T from_float(float v);
 
-template<>
+template <>
 __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
 
-template<>
+template <>
 __device__ __forceinline__ half from_float<half>(float v) {
     return __float2half(v);
 }
 
-template<>
+template <>
 __device__ __forceinline__ float from_float<float>(float v) {
     return v;
 }
@@ -56,7 +56,7 @@ inline int div_up(long n, int d) {
     return static_cast<int>((n + d - 1) / d);
 }
 
-template<typename T>
+template <typename T>
 __global__ void mamba_copy_gate_kernel(T* gate, const T* proj, long total, int D, int proj_size) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -65,8 +65,9 @@ __global__ void mamba_copy_gate_kernel(T* gate, const T* proj, long total, int D
     gate[idx] = proj[bt * proj_size + d];
 }
 
-template<typename T>
-__global__ void mamba_copy_conv_in_kernel(T* conv_in, const T* proj, long total, int Tlen, int D, int conv_dim, int proj_size) {
+template <typename T>
+__global__ void
+mamba_copy_conv_in_kernel(T* conv_in, const T* proj, long total, int Tlen, int D, int conv_dim, int proj_size) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long t = idx % Tlen;
@@ -76,8 +77,16 @@ __global__ void mamba_copy_conv_in_kernel(T* conv_in, const T* proj, long total,
     conv_in[idx] = proj[proj_base + D + c];
 }
 
-template<typename T>
-__global__ void mamba_expand_delta_kernel(T* delta, const T* proj, long total, int Tlen, int D, int conv_dim, int num_heads, int head_dim, int proj_size) {
+template <typename T>
+__global__ void mamba_expand_delta_kernel(T* delta,
+                                          const T* proj,
+                                          long total,
+                                          int Tlen,
+                                          int D,
+                                          int conv_dim,
+                                          int num_heads,
+                                          int head_dim,
+                                          int proj_size) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long t = idx % Tlen;
@@ -89,9 +98,9 @@ __global__ void mamba_expand_delta_kernel(T* delta, const T* proj, long total, i
     delta[idx] = proj[proj_base + D + conv_dim + h];
 }
 
-template<typename T>
-__global__ void mamba_split_conv_out_kernel(const T* conv_out, T* u, T* B, T* C,
-                                            long total, int Tlen, int D, int groups, int dstate) {
+template <typename T>
+__global__ void
+mamba_split_conv_out_kernel(const T* conv_out, T* u, T* B, T* C, long total, int Tlen, int D, int groups, int dstate) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long t = idx % Tlen;
@@ -113,9 +122,16 @@ __global__ void mamba_split_conv_out_kernel(const T* conv_out, T* u, T* B, T* C,
     }
 }
 
-template<typename T>
-__global__ void mamba_pack_conv_out_kernel(T* d_conv_out, const T* d_u, const float* d_B, const float* d_C,
-                                           long total, int Tlen, int D, int groups, int dstate) {
+template <typename T>
+__global__ void mamba_pack_conv_out_kernel(T* d_conv_out,
+                                           const T* d_u,
+                                           const float* d_B,
+                                           const float* d_C,
+                                           long total,
+                                           int Tlen,
+                                           int D,
+                                           int groups,
+                                           int dstate) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long t = idx % Tlen;
@@ -139,7 +155,7 @@ __global__ void mamba_pack_conv_out_kernel(T* d_conv_out, const T* d_u, const fl
     }
 }
 
-template<typename T>
+template <typename T>
 __global__ void mamba_transpose_btd_to_bdt_kernel(T* out, const T* in, long total, int Tlen, int D) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -150,7 +166,7 @@ __global__ void mamba_transpose_btd_to_bdt_kernel(T* out, const T* in, long tota
     out[(b * D + d) * Tlen + t] = in[idx];
 }
 
-template<typename T>
+template <typename T>
 __global__ void mamba_transpose_bdt_to_btd_kernel(T* out, const T* in, long total, int Tlen, int D) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -176,7 +192,8 @@ __global__ void mamba_expand_head_param_kernel(float* out, const float* param, l
     out[idx] = param[h];
 }
 
-__global__ void mamba_reduce_dA_log_kernel(float* dA_log, const float* dA, const float* A, long total, int dstate, int head_dim) {
+__global__ void
+mamba_reduce_dA_log_kernel(float* dA_log, const float* dA, const float* A, long total, int dstate, int head_dim) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long d = idx / dstate;
@@ -191,8 +208,9 @@ __global__ void mamba_reduce_head_param_kernel(float* d_param, const float* d_pa
     atomicAdd(&d_param[h], d_param_exp[idx]);
 }
 
-template<typename T>
-__global__ void mamba_reduce_delta_kernel(T* d_dt, const T* d_delta, long total, int Tlen, int D, int num_heads, int head_dim) {
+template <typename T>
+__global__ void
+mamba_reduce_delta_kernel(T* d_dt, const T* d_delta, long total, int Tlen, int D, int num_heads, int head_dim) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long t = idx % Tlen;
@@ -206,9 +224,17 @@ __global__ void mamba_reduce_delta_kernel(T* d_dt, const T* d_delta, long total,
     d_dt[idx] = from_float<T>(sum);
 }
 
-template<typename T>
-__global__ void mamba_pack_dproj_kernel(T* d_proj, const T* d_gate, const T* d_conv_in, const T* d_delta,
-                                        long total, int Tlen, int D, int conv_dim, int num_heads, int head_dim) {
+template <typename T>
+__global__ void mamba_pack_dproj_kernel(T* d_proj,
+                                        const T* d_gate,
+                                        const T* d_conv_in,
+                                        const T* d_delta,
+                                        long total,
+                                        int Tlen,
+                                        int D,
+                                        int conv_dim,
+                                        int num_heads,
+                                        int head_dim) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long k = idx % (D + conv_dim + num_heads);
@@ -234,9 +260,16 @@ __global__ void mamba_pack_dproj_kernel(T* d_proj, const T* d_gate, const T* d_c
     }
 }
 
-template<typename T>
-__global__ void mamba_group_rmsnorm_forward_kernel(const T* inp, const T* weight, T* out, float* rstd,
-                                                   int tokens, int D, int groups, int group_size, float eps) {
+template <typename T>
+__global__ void mamba_group_rmsnorm_forward_kernel(const T* inp,
+                                                   const T* weight,
+                                                   T* out,
+                                                   float* rstd,
+                                                   int tokens,
+                                                   int D,
+                                                   int groups,
+                                                   int group_size,
+                                                   float eps) {
     int token = blockIdx.x;
     int group = blockIdx.y;
     if (token >= tokens || group >= groups) return;
@@ -268,10 +301,16 @@ __global__ void mamba_group_rmsnorm_forward_kernel(const T* inp, const T* weight
     }
 }
 
-template<typename T>
-__global__ void mamba_group_rmsnorm_backward_dx_kernel(const T* dout, const T* inp, const T* weight,
-                                                       const float* rstd, T* dinp,
-                                                       int tokens, int D, int groups, int group_size) {
+template <typename T>
+__global__ void mamba_group_rmsnorm_backward_dx_kernel(const T* dout,
+                                                       const T* inp,
+                                                       const T* weight,
+                                                       const float* rstd,
+                                                       T* dinp,
+                                                       int tokens,
+                                                       int D,
+                                                       int groups,
+                                                       int group_size) {
     int token = blockIdx.x;
     int group = blockIdx.y;
     if (token >= tokens || group >= groups) return;
@@ -306,9 +345,15 @@ __global__ void mamba_group_rmsnorm_backward_dx_kernel(const T* dout, const T* i
     }
 }
 
-template<typename T>
-__global__ void mamba_group_rmsnorm_backward_dweight_kernel(float* dweight, const T* dout, const T* inp,
-                                                            const float* rstd, long total, int D, int groups, int group_size) {
+template <typename T>
+__global__ void mamba_group_rmsnorm_backward_dweight_kernel(float* dweight,
+                                                            const T* dout,
+                                                            const T* inp,
+                                                            const float* rstd,
+                                                            long total,
+                                                            int D,
+                                                            int groups,
+                                                            int group_size) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     long token = idx / D;
@@ -319,14 +364,22 @@ __global__ void mamba_group_rmsnorm_backward_dweight_kernel(float* dweight, cons
     atomicAdd(&dweight[d], grad);
 }
 
-} // namespace
+}  // namespace
 
 // =============================================================================
 // Public wrappers
 // =============================================================================
 
-void mamba_split_proj(Tensor& gate, Tensor& conv_in, Tensor& delta, const Tensor& proj,
-                      int B, int Tlen, int D, int conv_dim, int num_heads, int head_dim,
+void mamba_split_proj(Tensor& gate,
+                      Tensor& conv_in,
+                      Tensor& delta,
+                      const Tensor& proj,
+                      int B,
+                      int Tlen,
+                      int D,
+                      int conv_dim,
+                      int num_heads,
+                      int head_dim,
                       cudaStream_t stream) {
     const long gate_total = static_cast<long>(B) * Tlen * D;
     const long conv_total = static_cast<long>(B) * conv_dim * Tlen;
@@ -335,55 +388,123 @@ void mamba_split_proj(Tensor& gate, Tensor& conv_in, Tensor& delta, const Tensor
 
     const int threads = 256;
     if (proj.DType == ETensorDType::BF16) {
-        mamba_copy_gate_kernel<<<div_up(gate_total, threads), threads, 0, stream>>>(
-            gate.get<nv_bfloat16>(), proj.get<nv_bfloat16>(), gate_total, D, proj_size);
-        mamba_copy_conv_in_kernel<<<div_up(conv_total, threads), threads, 0, stream>>>(
-            conv_in.get<nv_bfloat16>(), proj.get<nv_bfloat16>(), conv_total, Tlen, D, conv_dim, proj_size);
-        mamba_expand_delta_kernel<<<div_up(delta_total, threads), threads, 0, stream>>>(
-            delta.get<nv_bfloat16>(), proj.get<nv_bfloat16>(), delta_total, Tlen, D, conv_dim, num_heads, head_dim, proj_size);
+        mamba_copy_gate_kernel<<<div_up(gate_total, threads), threads, 0, stream>>>(gate.get<nv_bfloat16>(),
+                                                                                    proj.get<nv_bfloat16>(),
+                                                                                    gate_total,
+                                                                                    D,
+                                                                                    proj_size);
+        mamba_copy_conv_in_kernel<<<div_up(conv_total, threads), threads, 0, stream>>>(conv_in.get<nv_bfloat16>(),
+                                                                                       proj.get<nv_bfloat16>(),
+                                                                                       conv_total,
+                                                                                       Tlen,
+                                                                                       D,
+                                                                                       conv_dim,
+                                                                                       proj_size);
+        mamba_expand_delta_kernel<<<div_up(delta_total, threads), threads, 0, stream>>>(delta.get<nv_bfloat16>(),
+                                                                                        proj.get<nv_bfloat16>(),
+                                                                                        delta_total,
+                                                                                        Tlen,
+                                                                                        D,
+                                                                                        conv_dim,
+                                                                                        num_heads,
+                                                                                        head_dim,
+                                                                                        proj_size);
     } else if (proj.DType == ETensorDType::FP16) {
-        mamba_copy_gate_kernel<<<div_up(gate_total, threads), threads, 0, stream>>>(
-            gate.get<half>(), proj.get<half>(), gate_total, D, proj_size);
-        mamba_copy_conv_in_kernel<<<div_up(conv_total, threads), threads, 0, stream>>>(
-            conv_in.get<half>(), proj.get<half>(), conv_total, Tlen, D, conv_dim, proj_size);
-        mamba_expand_delta_kernel<<<div_up(delta_total, threads), threads, 0, stream>>>(
-            delta.get<half>(), proj.get<half>(), delta_total, Tlen, D, conv_dim, num_heads, head_dim, proj_size);
+        mamba_copy_gate_kernel<<<div_up(gate_total, threads), threads, 0, stream>>>(gate.get<half>(),
+                                                                                    proj.get<half>(),
+                                                                                    gate_total,
+                                                                                    D,
+                                                                                    proj_size);
+        mamba_copy_conv_in_kernel<<<div_up(conv_total, threads), threads, 0, stream>>>(conv_in.get<half>(),
+                                                                                       proj.get<half>(),
+                                                                                       conv_total,
+                                                                                       Tlen,
+                                                                                       D,
+                                                                                       conv_dim,
+                                                                                       proj_size);
+        mamba_expand_delta_kernel<<<div_up(delta_total, threads), threads, 0, stream>>>(delta.get<half>(),
+                                                                                        proj.get<half>(),
+                                                                                        delta_total,
+                                                                                        Tlen,
+                                                                                        D,
+                                                                                        conv_dim,
+                                                                                        num_heads,
+                                                                                        head_dim,
+                                                                                        proj_size);
     } else {
         throw std::logic_error("mamba_split_proj: unsupported dtype");
     }
 }
 
-void mamba_split_conv_out(Tensor& u, Tensor& B, Tensor& C, const Tensor& conv_out,
-                          int Bsz, int Tlen, int D, int groups, int dstate,
+void mamba_split_conv_out(Tensor& u,
+                          Tensor& B,
+                          Tensor& C,
+                          const Tensor& conv_out,
+                          int Bsz,
+                          int Tlen,
+                          int D,
+                          int groups,
+                          int dstate,
                           cudaStream_t stream) {
     const long total = static_cast<long>(Bsz) * (D + 2 * groups * dstate) * Tlen;
     const int threads = 256;
     if (conv_out.DType == ETensorDType::BF16) {
-        mamba_split_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            conv_out.get<nv_bfloat16>(), u.get<nv_bfloat16>(), B.get<nv_bfloat16>(), C.get<nv_bfloat16>(),
-            total, Tlen, D, groups, dstate);
+        mamba_split_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(conv_out.get<nv_bfloat16>(),
+                                                                                    u.get<nv_bfloat16>(),
+                                                                                    B.get<nv_bfloat16>(),
+                                                                                    C.get<nv_bfloat16>(),
+                                                                                    total,
+                                                                                    Tlen,
+                                                                                    D,
+                                                                                    groups,
+                                                                                    dstate);
     } else if (conv_out.DType == ETensorDType::FP16) {
-        mamba_split_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            conv_out.get<half>(), u.get<half>(), B.get<half>(), C.get<half>(),
-            total, Tlen, D, groups, dstate);
+        mamba_split_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(conv_out.get<half>(),
+                                                                                    u.get<half>(),
+                                                                                    B.get<half>(),
+                                                                                    C.get<half>(),
+                                                                                    total,
+                                                                                    Tlen,
+                                                                                    D,
+                                                                                    groups,
+                                                                                    dstate);
     } else {
         throw std::logic_error("mamba_split_conv_out: unsupported dtype");
     }
 }
 
-void mamba_pack_conv_out(Tensor& d_conv_out, const Tensor& d_u, const Tensor& d_B, const Tensor& d_C,
-                         int Bsz, int Tlen, int D, int groups, int dstate,
+void mamba_pack_conv_out(Tensor& d_conv_out,
+                         const Tensor& d_u,
+                         const Tensor& d_B,
+                         const Tensor& d_C,
+                         int Bsz,
+                         int Tlen,
+                         int D,
+                         int groups,
+                         int dstate,
                          cudaStream_t stream) {
     const long total = static_cast<long>(Bsz) * (D + 2 * groups * dstate) * Tlen;
     const int threads = 256;
     if (d_conv_out.DType == ETensorDType::BF16) {
-        mamba_pack_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            d_conv_out.get<nv_bfloat16>(), d_u.get<nv_bfloat16>(),
-            d_B.get<float>(), d_C.get<float>(), total, Tlen, D, groups, dstate);
+        mamba_pack_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_conv_out.get<nv_bfloat16>(),
+                                                                                   d_u.get<nv_bfloat16>(),
+                                                                                   d_B.get<float>(),
+                                                                                   d_C.get<float>(),
+                                                                                   total,
+                                                                                   Tlen,
+                                                                                   D,
+                                                                                   groups,
+                                                                                   dstate);
     } else if (d_conv_out.DType == ETensorDType::FP16) {
-        mamba_pack_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            d_conv_out.get<half>(), d_u.get<half>(),
-            d_B.get<float>(), d_C.get<float>(), total, Tlen, D, groups, dstate);
+        mamba_pack_conv_out_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_conv_out.get<half>(),
+                                                                                   d_u.get<half>(),
+                                                                                   d_B.get<float>(),
+                                                                                   d_C.get<float>(),
+                                                                                   total,
+                                                                                   Tlen,
+                                                                                   D,
+                                                                                   groups,
+                                                                                   dstate);
     } else {
         throw std::logic_error("mamba_pack_conv_out: unsupported dtype");
     }
@@ -393,11 +514,17 @@ void mamba_transpose_btd_to_bdt(Tensor& out, const Tensor& inp, int B, int Tlen,
     const long total = static_cast<long>(B) * Tlen * D;
     const int threads = 256;
     if (inp.DType == ETensorDType::BF16) {
-        mamba_transpose_btd_to_bdt_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), total, Tlen, D);
+        mamba_transpose_btd_to_bdt_kernel<<<div_up(total, threads), threads, 0, stream>>>(out.get<nv_bfloat16>(),
+                                                                                          inp.get<nv_bfloat16>(),
+                                                                                          total,
+                                                                                          Tlen,
+                                                                                          D);
     } else if (inp.DType == ETensorDType::FP16) {
-        mamba_transpose_btd_to_bdt_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            out.get<half>(), inp.get<half>(), total, Tlen, D);
+        mamba_transpose_btd_to_bdt_kernel<<<div_up(total, threads), threads, 0, stream>>>(out.get<half>(),
+                                                                                          inp.get<half>(),
+                                                                                          total,
+                                                                                          Tlen,
+                                                                                          D);
     } else {
         throw std::logic_error("mamba_transpose_btd_to_bdt: unsupported dtype");
     }
@@ -407,11 +534,17 @@ void mamba_transpose_bdt_to_btd(Tensor& out, const Tensor& inp, int B, int Tlen,
     const long total = static_cast<long>(B) * Tlen * D;
     const int threads = 256;
     if (inp.DType == ETensorDType::BF16) {
-        mamba_transpose_bdt_to_btd_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), total, Tlen, D);
+        mamba_transpose_bdt_to_btd_kernel<<<div_up(total, threads), threads, 0, stream>>>(out.get<nv_bfloat16>(),
+                                                                                          inp.get<nv_bfloat16>(),
+                                                                                          total,
+                                                                                          Tlen,
+                                                                                          D);
     } else if (inp.DType == ETensorDType::FP16) {
-        mamba_transpose_bdt_to_btd_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            out.get<half>(), inp.get<half>(), total, Tlen, D);
+        mamba_transpose_bdt_to_btd_kernel<<<div_up(total, threads), threads, 0, stream>>>(out.get<half>(),
+                                                                                          inp.get<half>(),
+                                                                                          total,
+                                                                                          Tlen,
+                                                                                          D);
     } else {
         throw std::logic_error("mamba_transpose_bdt_to_btd: unsupported dtype");
     }
@@ -421,124 +554,219 @@ void mamba_expand_A(Tensor& A, const Tensor& A_log, int num_heads, int head_dim,
     (void)num_heads;
     const long total = static_cast<long>(head_dim) * num_heads * dstate;
     const int threads = 256;
-    mamba_expand_A_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        A.get<float>(), A_log.get<float>(), total, dstate, head_dim);
+    mamba_expand_A_kernel<<<div_up(total, threads), threads, 0, stream>>>(A.get<float>(),
+                                                                          A_log.get<float>(),
+                                                                          total,
+                                                                          dstate,
+                                                                          head_dim);
 }
 
 void mamba_expand_head_param(Tensor& out, const Tensor& param, int num_heads, int head_dim, cudaStream_t stream) {
     (void)num_heads;
     const long total = static_cast<long>(head_dim) * num_heads;
     const int threads = 256;
-    mamba_expand_head_param_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        out.get<float>(), param.get<float>(), total, head_dim);
+    mamba_expand_head_param_kernel<<<div_up(total, threads), threads, 0, stream>>>(out.get<float>(),
+                                                                                   param.get<float>(),
+                                                                                   total,
+                                                                                   head_dim);
 }
 
-void mamba_reduce_dA_log(Tensor& dA_log, const Tensor& dA, const Tensor& A,
-                         int num_heads, int head_dim, int dstate, bool accumulate, cudaStream_t stream) {
+void mamba_reduce_dA_log(Tensor& dA_log,
+                         const Tensor& dA,
+                         const Tensor& A,
+                         int num_heads,
+                         int head_dim,
+                         int dstate,
+                         bool accumulate,
+                         cudaStream_t stream) {
     if (!accumulate) {
         CUDA_CHECK(cudaMemsetAsync(dA_log.Data, 0, dA_log.bytes(), stream));
     }
     const long total = static_cast<long>(head_dim) * num_heads * dstate;
     const int threads = 256;
-    mamba_reduce_dA_log_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        dA_log.get<float>(), dA.get<float>(), A.get<float>(), total, dstate, head_dim);
+    mamba_reduce_dA_log_kernel<<<div_up(total, threads), threads, 0, stream>>>(dA_log.get<float>(),
+                                                                               dA.get<float>(),
+                                                                               A.get<float>(),
+                                                                               total,
+                                                                               dstate,
+                                                                               head_dim);
 }
 
-void mamba_reduce_head_param(Tensor& d_param, const Tensor& d_param_exp,
-                             int num_heads, int head_dim, bool accumulate, cudaStream_t stream) {
+void mamba_reduce_head_param(Tensor& d_param,
+                             const Tensor& d_param_exp,
+                             int num_heads,
+                             int head_dim,
+                             bool accumulate,
+                             cudaStream_t stream) {
     if (!accumulate) {
         CUDA_CHECK(cudaMemsetAsync(d_param.Data, 0, d_param.bytes(), stream));
     }
     const long total = static_cast<long>(head_dim) * num_heads;
     const int threads = 256;
-    mamba_reduce_head_param_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        d_param.get<float>(), d_param_exp.get<float>(), total, head_dim);
+    mamba_reduce_head_param_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_param.get<float>(),
+                                                                                   d_param_exp.get<float>(),
+                                                                                   total,
+                                                                                   head_dim);
 }
 
-void mamba_reduce_delta_to_dt(Tensor& d_dt, const Tensor& d_delta,
-                              int B, int Tlen, int num_heads, int head_dim, cudaStream_t stream) {
+void mamba_reduce_delta_to_dt(Tensor& d_dt,
+                              const Tensor& d_delta,
+                              int B,
+                              int Tlen,
+                              int num_heads,
+                              int head_dim,
+                              cudaStream_t stream) {
     const long total = static_cast<long>(B) * Tlen * num_heads;
     const int threads = 256;
     if (d_delta.DType == ETensorDType::BF16) {
-        mamba_reduce_delta_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            d_dt.get<nv_bfloat16>(), d_delta.get<nv_bfloat16>(), total, Tlen,
-            num_heads * head_dim, num_heads, head_dim);
+        mamba_reduce_delta_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_dt.get<nv_bfloat16>(),
+                                                                                  d_delta.get<nv_bfloat16>(),
+                                                                                  total,
+                                                                                  Tlen,
+                                                                                  num_heads * head_dim,
+                                                                                  num_heads,
+                                                                                  head_dim);
     } else if (d_delta.DType == ETensorDType::FP16) {
-        mamba_reduce_delta_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            d_dt.get<half>(), d_delta.get<half>(), total, Tlen,
-            num_heads * head_dim, num_heads, head_dim);
+        mamba_reduce_delta_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_dt.get<half>(),
+                                                                                  d_delta.get<half>(),
+                                                                                  total,
+                                                                                  Tlen,
+                                                                                  num_heads * head_dim,
+                                                                                  num_heads,
+                                                                                  head_dim);
     } else {
         throw std::logic_error("mamba_reduce_delta_to_dt: unsupported dtype");
     }
 }
 
-void mamba_pack_dproj(Tensor& d_proj, const Tensor& d_gate, const Tensor& d_conv_in, const Tensor& d_delta,
-                      int B, int Tlen, int D, int conv_dim, int num_heads, int head_dim, cudaStream_t stream) {
+void mamba_pack_dproj(Tensor& d_proj,
+                      const Tensor& d_gate,
+                      const Tensor& d_conv_in,
+                      const Tensor& d_delta,
+                      int B,
+                      int Tlen,
+                      int D,
+                      int conv_dim,
+                      int num_heads,
+                      int head_dim,
+                      cudaStream_t stream) {
     const long total = static_cast<long>(B) * Tlen * (D + conv_dim + num_heads);
     const int threads = 256;
     if (d_proj.DType == ETensorDType::BF16) {
-        mamba_pack_dproj_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            d_proj.get<nv_bfloat16>(),
-            d_gate.get<nv_bfloat16>(),
-            d_conv_in.get<nv_bfloat16>(),
-            d_delta.get<nv_bfloat16>(),
-            total, Tlen, D, conv_dim, num_heads, head_dim);
+        mamba_pack_dproj_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_proj.get<nv_bfloat16>(),
+                                                                                d_gate.get<nv_bfloat16>(),
+                                                                                d_conv_in.get<nv_bfloat16>(),
+                                                                                d_delta.get<nv_bfloat16>(),
+                                                                                total,
+                                                                                Tlen,
+                                                                                D,
+                                                                                conv_dim,
+                                                                                num_heads,
+                                                                                head_dim);
     } else if (d_proj.DType == ETensorDType::FP16) {
-        mamba_pack_dproj_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            d_proj.get<half>(),
-            d_gate.get<half>(),
-            d_conv_in.get<half>(),
-            d_delta.get<half>(),
-            total, Tlen, D, conv_dim, num_heads, head_dim);
+        mamba_pack_dproj_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_proj.get<half>(),
+                                                                                d_gate.get<half>(),
+                                                                                d_conv_in.get<half>(),
+                                                                                d_delta.get<half>(),
+                                                                                total,
+                                                                                Tlen,
+                                                                                D,
+                                                                                conv_dim,
+                                                                                num_heads,
+                                                                                head_dim);
     } else {
         throw std::logic_error("mamba_pack_dproj: unsupported dtype");
     }
 }
 
-void mamba_group_rmsnorm_forward(Tensor& out, Tensor& rstd, const Tensor& inp, const Tensor& weight,
-                                 float epsilon, int B, int Tlen, int D, int groups, cudaStream_t stream) {
+void mamba_group_rmsnorm_forward(Tensor& out,
+                                 Tensor& rstd,
+                                 const Tensor& inp,
+                                 const Tensor& weight,
+                                 float epsilon,
+                                 int B,
+                                 int Tlen,
+                                 int D,
+                                 int groups,
+                                 cudaStream_t stream) {
     const int tokens = B * Tlen;
     const int group_size = D / groups;
     dim3 grid(tokens, groups, 1);
     const int threads = 256;
     const size_t smem = threads * sizeof(float);
     if (inp.DType == ETensorDType::BF16) {
-        mamba_group_rmsnorm_forward_kernel<<<grid, threads, smem, stream>>>(
-            inp.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), out.get<nv_bfloat16>(),
-            rstd.get<float>(), tokens, D, groups, group_size, epsilon);
+        mamba_group_rmsnorm_forward_kernel<<<grid, threads, smem, stream>>>(inp.get<nv_bfloat16>(),
+                                                                            weight.get<nv_bfloat16>(),
+                                                                            out.get<nv_bfloat16>(),
+                                                                            rstd.get<float>(),
+                                                                            tokens,
+                                                                            D,
+                                                                            groups,
+                                                                            group_size,
+                                                                            epsilon);
     } else if (inp.DType == ETensorDType::FP16) {
-        mamba_group_rmsnorm_forward_kernel<<<grid, threads, smem, stream>>>(
-            inp.get<half>(), weight.get<half>(), out.get<half>(),
-            rstd.get<float>(), tokens, D, groups, group_size, epsilon);
+        mamba_group_rmsnorm_forward_kernel<<<grid, threads, smem, stream>>>(inp.get<half>(),
+                                                                            weight.get<half>(),
+                                                                            out.get<half>(),
+                                                                            rstd.get<float>(),
+                                                                            tokens,
+                                                                            D,
+                                                                            groups,
+                                                                            group_size,
+                                                                            epsilon);
     } else {
         throw std::logic_error("mamba_group_rmsnorm_forward: unsupported dtype");
     }
 }
 
-void mamba_group_rmsnorm_backward_dx(Tensor& dinp, const Tensor& dout, const Tensor& inp, const Tensor& weight,
-                                     const Tensor& rstd, int B, int Tlen, int D, int groups, cudaStream_t stream) {
+void mamba_group_rmsnorm_backward_dx(Tensor& dinp,
+                                     const Tensor& dout,
+                                     const Tensor& inp,
+                                     const Tensor& weight,
+                                     const Tensor& rstd,
+                                     int B,
+                                     int Tlen,
+                                     int D,
+                                     int groups,
+                                     cudaStream_t stream) {
     const int tokens = B * Tlen;
     const int group_size = D / groups;
     dim3 grid(tokens, groups, 1);
     const int threads = 256;
     const size_t smem = threads * sizeof(float);
     if (inp.DType == ETensorDType::BF16) {
-        mamba_group_rmsnorm_backward_dx_kernel<<<grid, threads, smem, stream>>>(
-            dout.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), weight.get<nv_bfloat16>(),
-            rstd.get<float>(), dinp.get<nv_bfloat16>(),
-            tokens, D, groups, group_size);
+        mamba_group_rmsnorm_backward_dx_kernel<<<grid, threads, smem, stream>>>(dout.get<nv_bfloat16>(),
+                                                                                inp.get<nv_bfloat16>(),
+                                                                                weight.get<nv_bfloat16>(),
+                                                                                rstd.get<float>(),
+                                                                                dinp.get<nv_bfloat16>(),
+                                                                                tokens,
+                                                                                D,
+                                                                                groups,
+                                                                                group_size);
     } else if (inp.DType == ETensorDType::FP16) {
-        mamba_group_rmsnorm_backward_dx_kernel<<<grid, threads, smem, stream>>>(
-            dout.get<half>(), inp.get<half>(), weight.get<half>(),
-            rstd.get<float>(), dinp.get<half>(),
-            tokens, D, groups, group_size);
+        mamba_group_rmsnorm_backward_dx_kernel<<<grid, threads, smem, stream>>>(dout.get<half>(),
+                                                                                inp.get<half>(),
+                                                                                weight.get<half>(),
+                                                                                rstd.get<float>(),
+                                                                                dinp.get<half>(),
+                                                                                tokens,
+                                                                                D,
+                                                                                groups,
+                                                                                group_size);
     } else {
         throw std::logic_error("mamba_group_rmsnorm_backward_dx: unsupported dtype");
     }
 }
 
-void mamba_group_rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tensor& dout, const Tensor& inp,
-                                               const Tensor& rstd, int B, int Tlen, int D, int groups,
+void mamba_group_rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32,
+                                               const Tensor& dout,
+                                               const Tensor& inp,
+                                               const Tensor& rstd,
+                                               int B,
+                                               int Tlen,
+                                               int D,
+                                               int groups,
                                                cudaStream_t stream) {
     const long total = static_cast<long>(B) * Tlen * D;
     const int group_size = D / groups;
@@ -546,12 +774,24 @@ void mamba_group_rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tenso
     CUDA_CHECK(cudaMemsetAsync(dweight_fp32.Data, 0, dweight_fp32.bytes(), stream));
     if (inp.DType == ETensorDType::BF16) {
         mamba_group_rmsnorm_backward_dweight_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            dweight_fp32.get<float>(), dout.get<nv_bfloat16>(), inp.get<nv_bfloat16>(),
-            rstd.get<float>(), total, D, groups, group_size);
+            dweight_fp32.get<float>(),
+            dout.get<nv_bfloat16>(),
+            inp.get<nv_bfloat16>(),
+            rstd.get<float>(),
+            total,
+            D,
+            groups,
+            group_size);
     } else if (inp.DType == ETensorDType::FP16) {
         mamba_group_rmsnorm_backward_dweight_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-            dweight_fp32.get<float>(), dout.get<half>(), inp.get<half>(),
-            rstd.get<float>(), total, D, groups, group_size);
+            dweight_fp32.get<float>(),
+            dout.get<half>(),
+            inp.get<half>(),
+            rstd.get<float>(),
+            total,
+            D,
+            groups,
+            group_size);
     } else {
         throw std::logic_error("mamba_group_rmsnorm_backward_dweight_fp32: unsupported dtype");
     }
@@ -561,13 +801,21 @@ void mamba_group_rmsnorm_backward_dweight_fp32(Tensor& dweight_fp32, const Tenso
 // Causal Conv1D wrappers
 // -----------------------------------------------------------------------------
 
-template<typename input_t, typename weight_t>
-void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream);
-template<typename input_t, typename weight_t>
-void causal_conv1d_bwd_cuda(ConvParamsBwd &params, cudaStream_t stream);
+template <typename input_t, typename weight_t>
+void causal_conv1d_fwd_cuda(ConvParamsBase& params, cudaStream_t stream);
+template <typename input_t, typename weight_t>
+void causal_conv1d_bwd_cuda(ConvParamsBwd& params, cudaStream_t stream);
 
-void mamba_causal_conv1d_forward(Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
-                                int B, int Tlen, int conv_dim, int kernel, bool silu, cudaStream_t stream) {
+void mamba_causal_conv1d_forward(Tensor& out,
+                                 const Tensor& x,
+                                 const Tensor& weight,
+                                 const Tensor* bias,
+                                 int B,
+                                 int Tlen,
+                                 int conv_dim,
+                                 int kernel,
+                                 bool silu,
+                                 cudaStream_t stream) {
     ConvParamsBase params{};
     params.batch = B;
     params.dim = conv_dim;
@@ -608,9 +856,18 @@ void mamba_causal_conv1d_forward(Tensor& out, const Tensor& x, const Tensor& wei
     }
 }
 
-void mamba_causal_conv1d_backward(Tensor& dx, Tensor& dweight_fp32, Tensor* dbias_fp32,
-                                 const Tensor& x, const Tensor& weight, const Tensor& dout,
-                                 int B, int Tlen, int conv_dim, int kernel, bool silu, cudaStream_t stream) {
+void mamba_causal_conv1d_backward(Tensor& dx,
+                                  Tensor& dweight_fp32,
+                                  Tensor* dbias_fp32,
+                                  const Tensor& x,
+                                  const Tensor& weight,
+                                  const Tensor& dout,
+                                  int B,
+                                  int Tlen,
+                                  int conv_dim,
+                                  int kernel,
+                                  bool silu,
+                                  cudaStream_t stream) {
     ConvParamsBwd params{};
     params.batch = B;
     params.dim = conv_dim;
@@ -678,17 +935,29 @@ void mamba_causal_conv1d_backward(Tensor& dx, Tensor& dweight_fp32, Tensor* dbia
 // Selective scan wrappers
 // -----------------------------------------------------------------------------
 
-template<typename input_t, typename weight_t>
-void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream);
-template<typename input_t, typename weight_t>
-void selective_scan_bwd_cuda(SSMParamsBwd &params, cudaStream_t stream);
+template <typename input_t, typename weight_t>
+void selective_scan_fwd_cuda(SSMParamsBase& params, cudaStream_t stream);
+template <typename input_t, typename weight_t>
+void selective_scan_bwd_cuda(SSMParamsBwd& params, cudaStream_t stream);
 
-void mamba_selective_scan_forward(Tensor& out, const Tensor& u, const Tensor& delta,
-                                  const Tensor& A, const Tensor& B, const Tensor& C,
-                                  const Tensor& D, const Tensor& delta_bias,
-                                  float delta_min, float delta_max,
-                                  Tensor& x, int Bsz, int Tlen, int Ddim, int dstate,
-                                  int groups, int n_chunks, cudaStream_t stream) {
+void mamba_selective_scan_forward(Tensor& out,
+                                  const Tensor& u,
+                                  const Tensor& delta,
+                                  const Tensor& A,
+                                  const Tensor& B,
+                                  const Tensor& C,
+                                  const Tensor& D,
+                                  const Tensor& delta_bias,
+                                  float delta_min,
+                                  float delta_max,
+                                  Tensor& x,
+                                  int Bsz,
+                                  int Tlen,
+                                  int Ddim,
+                                  int dstate,
+                                  int groups,
+                                  int n_chunks,
+                                  cudaStream_t stream) {
     SSMParamsBase params{};
     params.batch = Bsz;
     params.dim = Ddim;
@@ -741,15 +1010,31 @@ void mamba_selective_scan_forward(Tensor& out, const Tensor& u, const Tensor& de
     }
 }
 
-void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tensor& dB, Tensor& dC,
-                                   Tensor* dD, Tensor* ddelta_bias,
-                                   const Tensor& u, const Tensor& delta,
-                                   const Tensor& A, const Tensor& B, const Tensor& C,
-                                   const Tensor& D, const Tensor& delta_bias,
-                                   float delta_min, float delta_max,
-                                   const Tensor& dout, Tensor& x,
-                                   int Bsz, int Tlen, int Ddim, int dstate,
-                                   int groups, int n_chunks, cudaStream_t stream) {
+void mamba_selective_scan_backward(Tensor& du,
+                                   Tensor& ddelta,
+                                   Tensor& dA,
+                                   Tensor& dB,
+                                   Tensor& dC,
+                                   Tensor* dD,
+                                   Tensor* ddelta_bias,
+                                   const Tensor& u,
+                                   const Tensor& delta,
+                                   const Tensor& A,
+                                   const Tensor& B,
+                                   const Tensor& C,
+                                   const Tensor& D,
+                                   const Tensor& delta_bias,
+                                   float delta_min,
+                                   float delta_max,
+                                   const Tensor& dout,
+                                   Tensor& x,
+                                   int Bsz,
+                                   int Tlen,
+                                   int Ddim,
+                                   int dstate,
+                                   int groups,
+                                   int n_chunks,
+                                   cudaStream_t stream) {
     SSMParamsBwd params{};
     params.batch = Bsz;
     params.dim = Ddim;
@@ -771,7 +1056,7 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
     params.u_ptr = u.Data;
     params.delta_ptr = delta.Data;
     params.delta_bias_ptr = delta_bias.Data;
-    params.out_ptr = dout.Data; // not used
+    params.out_ptr = dout.Data;  // not used
     params.x_ptr = x.Data;
     params.z_ptr = nullptr;
     params.out_z_ptr = nullptr;
@@ -835,7 +1120,7 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
 
 namespace {
 
-template<typename T>
+template <typename T>
 __global__ void elementwise_mul_kernel(T* out, const T* a, const T* b, long total) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -845,7 +1130,7 @@ __global__ void elementwise_mul_kernel(T* out, const T* a, const T* b, long tota
 }
 
 // FP32 specialization
-template<>
+template <>
 __global__ void elementwise_mul_kernel<float>(float* out, const float* a, const float* b, long total) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -878,11 +1163,9 @@ void elementwise_mul(float* out, const float* a, const float* b, long total, cud
 // The per-row scale is loaded once into shared memory (broadcast across all threads in row).
 // -----------------------------------------------------------------------------
 
-template<typename T, int VEC>
-__global__ void scale_rows_kernel(T* __restrict__ out,
-                                  const T* __restrict__ data,
-                                  const T* __restrict__ scale,
-                                  long M) {
+template <typename T, int VEC>
+__global__ void
+scale_rows_kernel(T* __restrict__ out, const T* __restrict__ data, const T* __restrict__ scale, long M) {
     const long row = blockIdx.y;
     const float s = to_float(scale[row]);
     const long base = row * M;
@@ -890,12 +1173,11 @@ __global__ void scale_rows_kernel(T* __restrict__ out,
     long col = (static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x) * VEC;
     if (col + VEC <= M) {
         // Vectorized path: load VEC elements at once
-        using Vec = typename std::conditional<sizeof(T) == 2,
-            typename std::conditional<VEC == 8, uint4, uint2>::type,
-            float4>::type;
+        using Vec = typename std::
+            conditional<sizeof(T) == 2, typename std::conditional<VEC == 8, uint4, uint2>::type, float4>::type;
         Vec v = *reinterpret_cast<const Vec*>(&data[base + col]);
         T* elems = reinterpret_cast<T*>(&v);
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < VEC; ++i) {
             elems[i] = from_float<T>(to_float(elems[i]) * s);
         }
@@ -909,7 +1191,7 @@ __global__ void scale_rows_kernel(T* __restrict__ out,
 }
 
 // FP32 specialization (no to_float/from_float overhead)
-template<>
+template <>
 __global__ void scale_rows_kernel<float, 4>(float* __restrict__ out,
                                             const float* __restrict__ data,
                                             const float* __restrict__ scale,
@@ -920,7 +1202,10 @@ __global__ void scale_rows_kernel<float, 4>(float* __restrict__ out,
     long col = (static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
     if (col + 4 <= M) {
         float4 v = *reinterpret_cast<const float4*>(&data[base + col]);
-        v.x *= s; v.y *= s; v.z *= s; v.w *= s;
+        v.x *= s;
+        v.y *= s;
+        v.z *= s;
+        v.w *= s;
         *reinterpret_cast<float4*>(&out[base + col]) = v;
     } else {
         for (long i = col; i < M; ++i) {
@@ -929,7 +1214,12 @@ __global__ void scale_rows_kernel<float, 4>(float* __restrict__ out,
     }
 }
 
-void scale_rows(nv_bfloat16* out, const nv_bfloat16* data, const nv_bfloat16* scale, long N, long M, cudaStream_t stream) {
+void scale_rows(nv_bfloat16* out,
+                const nv_bfloat16* data,
+                const nv_bfloat16* scale,
+                long N,
+                long M,
+                cudaStream_t stream) {
     constexpr int VEC = 8;  // 8 x bf16 = 128 bits
     const int threads = 256;
     dim3 grid(div_up(M, threads * VEC), static_cast<unsigned>(N));
@@ -956,11 +1246,8 @@ void scale_rows(float* out, const float* data, const float* scale, long N, long 
 // One block per row, block-level reduction via shared memory.
 // -----------------------------------------------------------------------------
 
-template<typename T>
-__global__ void reduce_row_mul_kernel(T* __restrict__ out,
-                                      const T* __restrict__ a,
-                                      const T* __restrict__ b,
-                                      long M) {
+template <typename T>
+__global__ void reduce_row_mul_kernel(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b, long M) {
     extern __shared__ float smem[];
     const long row = blockIdx.x;
     const long base = row * M;
@@ -1003,15 +1290,9 @@ __device__ __forceinline__ float softplus_stable(float x) {
     return log1pf(expf(x));
 }
 
-template<typename TOut, typename TIn, typename TParam>
-__global__ void qwen3_5_decay_forward_kernel(
-    TOut* out,
-    const TIn* a,
-    const TParam* a_log,
-    const TParam* dt_bias,
-    long total,
-    int H
-) {
+template <typename TOut, typename TIn, typename TParam>
+__global__ void
+qwen3_5_decay_forward_kernel(TOut* out, const TIn* a, const TParam* a_log, const TParam* dt_bias, long total, int H) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     const int h = static_cast<int>(idx % H);
@@ -1024,18 +1305,16 @@ __global__ void qwen3_5_decay_forward_kernel(
     out[idx] = from_float<TOut>(g);
 }
 
-template<typename TIn, typename TGrad, typename TParam>
-__global__ void qwen3_5_decay_backward_kernel(
-    TIn* d_a,
-    float* d_a_log,
-    float* d_dt_bias,
-    const TGrad* d_out,
-    const TIn* a,
-    const TParam* a_log,
-    const TParam* dt_bias,
-    long total,
-    int H
-) {
+template <typename TIn, typename TGrad, typename TParam>
+__global__ void qwen3_5_decay_backward_kernel(TIn* d_a,
+                                              float* d_a_log,
+                                              float* d_dt_bias,
+                                              const TGrad* d_out,
+                                              const TIn* a,
+                                              const TParam* a_log,
+                                              const TParam* dt_bias,
+                                              long total,
+                                              int H) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     const int h = static_cast<int>(idx % H);
@@ -1055,16 +1334,9 @@ __global__ void qwen3_5_decay_backward_kernel(
     atomicAdd(&d_dt_bias[h], dout * dga);
 }
 
-template<typename T>
-__global__ void repeat_interleave_heads_forward_kernel(
-    T* out,
-    const T* inp,
-    int B,
-    int Tlen,
-    int H_in,
-    int D,
-    int repeats
-) {
+template <typename T>
+__global__ void
+repeat_interleave_heads_forward_kernel(T* out, const T* inp, int B, int Tlen, int H_in, int D, int repeats) {
     const int H_out = H_in * repeats;
     const long total = static_cast<long>(B) * Tlen * H_out * D;
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1082,16 +1354,9 @@ __global__ void repeat_interleave_heads_forward_kernel(
     out[idx] = inp[in_idx];
 }
 
-template<typename T>
-__global__ void repeat_interleave_heads_backward_kernel(
-    T* d_inp,
-    const T* d_out,
-    int B,
-    int Tlen,
-    int H_in,
-    int D,
-    int repeats
-) {
+template <typename T>
+__global__ void
+repeat_interleave_heads_backward_kernel(T* d_inp, const T* d_out, int B, int Tlen, int H_in, int D, int repeats) {
     const long total = static_cast<long>(B) * Tlen * H_in * D;
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -1114,67 +1379,89 @@ __global__ void repeat_interleave_heads_backward_kernel(
     d_inp[idx] = from_float<T>(acc);
 }
 
-template<typename TOut, typename TIn, typename TParam>
-void launch_qwen3_5_decay_forward(
-    TOut* out,
-    const TIn* a,
-    const TParam* a_log,
-    const TParam* dt_bias,
-    long total,
-    int H,
-    cudaStream_t stream
-) {
+template <typename TOut, typename TIn, typename TParam>
+void launch_qwen3_5_decay_forward(TOut* out,
+                                  const TIn* a,
+                                  const TParam* a_log,
+                                  const TParam* dt_bias,
+                                  long total,
+                                  int H,
+                                  cudaStream_t stream) {
     const int threads = 256;
-    qwen3_5_decay_forward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        out, a, a_log, dt_bias, total, H);
+    qwen3_5_decay_forward_kernel<<<div_up(total, threads), threads, 0, stream>>>(out, a, a_log, dt_bias, total, H);
 }
 
-template<typename TIn, typename TGrad, typename TParam>
-void launch_qwen3_5_decay_backward(
-    TIn* d_a,
-    float* d_a_log,
-    float* d_dt_bias,
-    const TGrad* d_out,
-    const TIn* a,
-    const TParam* a_log,
-    const TParam* dt_bias,
-    long total,
-    int H,
-    cudaStream_t stream
-) {
+template <typename TIn, typename TGrad, typename TParam>
+void launch_qwen3_5_decay_backward(TIn* d_a,
+                                   float* d_a_log,
+                                   float* d_dt_bias,
+                                   const TGrad* d_out,
+                                   const TIn* a,
+                                   const TParam* a_log,
+                                   const TParam* dt_bias,
+                                   long total,
+                                   int H,
+                                   cudaStream_t stream) {
     const int threads = 256;
-    qwen3_5_decay_backward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        d_a, d_a_log, d_dt_bias, d_out, a, a_log, dt_bias, total, H);
+    qwen3_5_decay_backward_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_a,
+                                                                                  d_a_log,
+                                                                                  d_dt_bias,
+                                                                                  d_out,
+                                                                                  a,
+                                                                                  a_log,
+                                                                                  dt_bias,
+                                                                                  total,
+                                                                                  H);
 }
 
-template<typename T>
-void launch_repeat_interleave_heads_forward(
-    T* out, const T* inp, int B, int Tlen, int H_in, int D, int repeats, cudaStream_t stream) {
+template <typename T>
+void launch_repeat_interleave_heads_forward(T* out,
+                                            const T* inp,
+                                            int B,
+                                            int Tlen,
+                                            int H_in,
+                                            int D,
+                                            int repeats,
+                                            cudaStream_t stream) {
     const int H_out = H_in * repeats;
     const long total = static_cast<long>(B) * Tlen * H_out * D;
     const int threads = 256;
-    repeat_interleave_heads_forward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        out, inp, B, Tlen, H_in, D, repeats);
+    repeat_interleave_heads_forward_kernel<<<div_up(total, threads), threads, 0, stream>>>(out,
+                                                                                           inp,
+                                                                                           B,
+                                                                                           Tlen,
+                                                                                           H_in,
+                                                                                           D,
+                                                                                           repeats);
 }
 
-template<typename T>
-void launch_repeat_interleave_heads_backward(
-    T* d_inp, const T* d_out, int B, int Tlen, int H_in, int D, int repeats, cudaStream_t stream) {
+template <typename T>
+void launch_repeat_interleave_heads_backward(T* d_inp,
+                                             const T* d_out,
+                                             int B,
+                                             int Tlen,
+                                             int H_in,
+                                             int D,
+                                             int repeats,
+                                             cudaStream_t stream) {
     const long total = static_cast<long>(B) * Tlen * H_in * D;
     const int threads = 256;
-    repeat_interleave_heads_backward_kernel<<<div_up(total, threads), threads, 0, stream>>>(
-        d_inp, d_out, B, Tlen, H_in, D, repeats);
+    repeat_interleave_heads_backward_kernel<<<div_up(total, threads), threads, 0, stream>>>(d_inp,
+                                                                                            d_out,
+                                                                                            B,
+                                                                                            Tlen,
+                                                                                            H_in,
+                                                                                            D,
+                                                                                            repeats);
 }
 
 }  // namespace
 
-void qwen3_5_decay_forward(
-    Tensor& out,
-    const Tensor& a,
-    const Tensor& A_log,
-    const Tensor& dt_bias,
-    cudaStream_t stream
-) {
+void qwen3_5_decay_forward(Tensor& out,
+                           const Tensor& a,
+                           const Tensor& A_log,
+                           const Tensor& dt_bias,
+                           cudaStream_t stream) {
     if (a.Rank != 3 || A_log.Rank != 1 || dt_bias.Rank != 1) {
         throw std::logic_error("qwen3_5_decay_forward: invalid ranks");
     }
@@ -1187,29 +1474,41 @@ void qwen3_5_decay_forward(
     if (a.DType == ETensorDType::BF16) {
         if (out.DType == ETensorDType::FP32) {
             if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-                launch_qwen3_5_decay_forward(
-                    out.get<float>(), a.get<nv_bfloat16>(),
-                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<float>(),
+                                             a.get<nv_bfloat16>(),
+                                             A_log.get<nv_bfloat16>(),
+                                             dt_bias.get<nv_bfloat16>(),
+                                             total,
+                                             H,
+                                             stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_forward(
-                    out.get<float>(), a.get<nv_bfloat16>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<float>(),
+                                             a.get<nv_bfloat16>(),
+                                             A_log.get<float>(),
+                                             dt_bias.get<float>(),
+                                             total,
+                                             H,
+                                             stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
             }
         } else if (out.DType == ETensorDType::BF16) {
             if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-                launch_qwen3_5_decay_forward(
-                    out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<nv_bfloat16>(),
+                                             a.get<nv_bfloat16>(),
+                                             A_log.get<nv_bfloat16>(),
+                                             dt_bias.get<nv_bfloat16>(),
+                                             total,
+                                             H,
+                                             stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_forward(
-                    out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<nv_bfloat16>(),
+                                             a.get<nv_bfloat16>(),
+                                             A_log.get<float>(),
+                                             dt_bias.get<float>(),
+                                             total,
+                                             H,
+                                             stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
             }
@@ -1219,29 +1518,41 @@ void qwen3_5_decay_forward(
     } else if (a.DType == ETensorDType::FP16) {
         if (out.DType == ETensorDType::FP32) {
             if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-                launch_qwen3_5_decay_forward(
-                    out.get<float>(), a.get<half>(),
-                    A_log.get<half>(), dt_bias.get<half>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<float>(),
+                                             a.get<half>(),
+                                             A_log.get<half>(),
+                                             dt_bias.get<half>(),
+                                             total,
+                                             H,
+                                             stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_forward(
-                    out.get<float>(), a.get<half>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<float>(),
+                                             a.get<half>(),
+                                             A_log.get<float>(),
+                                             dt_bias.get<float>(),
+                                             total,
+                                             H,
+                                             stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
             }
         } else if (out.DType == ETensorDType::FP16) {
             if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-                launch_qwen3_5_decay_forward(
-                    out.get<half>(), a.get<half>(),
-                    A_log.get<half>(), dt_bias.get<half>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<half>(),
+                                             a.get<half>(),
+                                             A_log.get<half>(),
+                                             dt_bias.get<half>(),
+                                             total,
+                                             H,
+                                             stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_forward(
-                    out.get<half>(), a.get<half>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_forward(out.get<half>(),
+                                             a.get<half>(),
+                                             A_log.get<float>(),
+                                             dt_bias.get<float>(),
+                                             total,
+                                             H,
+                                             stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
             }
@@ -1253,20 +1564,29 @@ void qwen3_5_decay_forward(
             throw std::logic_error("qwen3_5_decay_forward: FP32 input requires FP32 output");
         }
         if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-            launch_qwen3_5_decay_forward(
-                out.get<float>(), a.get<float>(),
-                A_log.get<float>(), dt_bias.get<float>(),
-                total, H, stream);
+            launch_qwen3_5_decay_forward(out.get<float>(),
+                                         a.get<float>(),
+                                         A_log.get<float>(),
+                                         dt_bias.get<float>(),
+                                         total,
+                                         H,
+                                         stream);
         } else if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-            launch_qwen3_5_decay_forward(
-                out.get<float>(), a.get<float>(),
-                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                total, H, stream);
+            launch_qwen3_5_decay_forward(out.get<float>(),
+                                         a.get<float>(),
+                                         A_log.get<nv_bfloat16>(),
+                                         dt_bias.get<nv_bfloat16>(),
+                                         total,
+                                         H,
+                                         stream);
         } else if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-            launch_qwen3_5_decay_forward(
-                out.get<float>(), a.get<float>(),
-                A_log.get<half>(), dt_bias.get<half>(),
-                total, H, stream);
+            launch_qwen3_5_decay_forward(out.get<float>(),
+                                         a.get<float>(),
+                                         A_log.get<half>(),
+                                         dt_bias.get<half>(),
+                                         total,
+                                         H,
+                                         stream);
         } else {
             throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
         }
@@ -1275,16 +1595,14 @@ void qwen3_5_decay_forward(
     }
 }
 
-void qwen3_5_decay_backward(
-    Tensor& d_a,
-    Tensor& d_A_log,
-    Tensor& d_dt_bias,
-    const Tensor& d_out,
-    const Tensor& a,
-    const Tensor& A_log,
-    const Tensor& dt_bias,
-    cudaStream_t stream
-) {
+void qwen3_5_decay_backward(Tensor& d_a,
+                            Tensor& d_A_log,
+                            Tensor& d_dt_bias,
+                            const Tensor& d_out,
+                            const Tensor& a,
+                            const Tensor& A_log,
+                            const Tensor& dt_bias,
+                            cudaStream_t stream) {
     if (d_out.Rank != 3 || a.Rank != 3 || A_log.Rank != 1 || dt_bias.Rank != 1) {
         throw std::logic_error("qwen3_5_decay_backward: invalid ranks");
     }
@@ -1303,33 +1621,53 @@ void qwen3_5_decay_backward(
     if (a.DType == ETensorDType::BF16) {
         if (d_out.DType == ETensorDType::BF16) {
             if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<nv_bfloat16>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<nv_bfloat16>(),
+                                              a.get<nv_bfloat16>(),
+                                              A_log.get<nv_bfloat16>(),
+                                              dt_bias.get<nv_bfloat16>(),
+                                              total,
+                                              H,
+                                              stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<nv_bfloat16>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<nv_bfloat16>(),
+                                              a.get<nv_bfloat16>(),
+                                              A_log.get<float>(),
+                                              dt_bias.get<float>(),
+                                              total,
+                                              H,
+                                              stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
             }
         } else if (d_out.DType == ETensorDType::FP32) {
             if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<float>(), a.get<nv_bfloat16>(),
-                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<nv_bfloat16>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<float>(),
+                                              a.get<nv_bfloat16>(),
+                                              A_log.get<nv_bfloat16>(),
+                                              dt_bias.get<nv_bfloat16>(),
+                                              total,
+                                              H,
+                                              stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<float>(), a.get<nv_bfloat16>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<nv_bfloat16>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<float>(),
+                                              a.get<nv_bfloat16>(),
+                                              A_log.get<float>(),
+                                              dt_bias.get<float>(),
+                                              total,
+                                              H,
+                                              stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
             }
@@ -1339,33 +1677,53 @@ void qwen3_5_decay_backward(
     } else if (a.DType == ETensorDType::FP16) {
         if (d_out.DType == ETensorDType::FP16) {
             if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<half>(), a.get<half>(),
-                    A_log.get<half>(), dt_bias.get<half>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<half>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<half>(),
+                                              a.get<half>(),
+                                              A_log.get<half>(),
+                                              dt_bias.get<half>(),
+                                              total,
+                                              H,
+                                              stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<half>(), a.get<half>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<half>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<half>(),
+                                              a.get<half>(),
+                                              A_log.get<float>(),
+                                              dt_bias.get<float>(),
+                                              total,
+                                              H,
+                                              stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
             }
         } else if (d_out.DType == ETensorDType::FP32) {
             if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<float>(), a.get<half>(),
-                    A_log.get<half>(), dt_bias.get<half>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<half>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<float>(),
+                                              a.get<half>(),
+                                              A_log.get<half>(),
+                                              dt_bias.get<half>(),
+                                              total,
+                                              H,
+                                              stream);
             } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-                launch_qwen3_5_decay_backward(
-                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                    d_out.get<float>(), a.get<half>(),
-                    A_log.get<float>(), dt_bias.get<float>(),
-                    total, H, stream);
+                launch_qwen3_5_decay_backward(d_a.get<half>(),
+                                              d_A_log.get<float>(),
+                                              d_dt_bias.get<float>(),
+                                              d_out.get<float>(),
+                                              a.get<half>(),
+                                              A_log.get<float>(),
+                                              dt_bias.get<float>(),
+                                              total,
+                                              H,
+                                              stream);
             } else {
                 throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
             }
@@ -1374,23 +1732,38 @@ void qwen3_5_decay_backward(
         }
     } else if (a.DType == ETensorDType::FP32 && d_out.DType == ETensorDType::FP32) {
         if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-            launch_qwen3_5_decay_backward(
-                d_a.get<float>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                d_out.get<float>(), a.get<float>(),
-                A_log.get<float>(), dt_bias.get<float>(),
-                total, H, stream);
+            launch_qwen3_5_decay_backward(d_a.get<float>(),
+                                          d_A_log.get<float>(),
+                                          d_dt_bias.get<float>(),
+                                          d_out.get<float>(),
+                                          a.get<float>(),
+                                          A_log.get<float>(),
+                                          dt_bias.get<float>(),
+                                          total,
+                                          H,
+                                          stream);
         } else if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-            launch_qwen3_5_decay_backward(
-                d_a.get<float>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                d_out.get<float>(), a.get<float>(),
-                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                total, H, stream);
+            launch_qwen3_5_decay_backward(d_a.get<float>(),
+                                          d_A_log.get<float>(),
+                                          d_dt_bias.get<float>(),
+                                          d_out.get<float>(),
+                                          a.get<float>(),
+                                          A_log.get<nv_bfloat16>(),
+                                          dt_bias.get<nv_bfloat16>(),
+                                          total,
+                                          H,
+                                          stream);
         } else if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-            launch_qwen3_5_decay_backward(
-                d_a.get<float>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                d_out.get<float>(), a.get<float>(),
-                A_log.get<half>(), dt_bias.get<half>(),
-                total, H, stream);
+            launch_qwen3_5_decay_backward(d_a.get<float>(),
+                                          d_A_log.get<float>(),
+                                          d_dt_bias.get<float>(),
+                                          d_out.get<float>(),
+                                          a.get<float>(),
+                                          A_log.get<half>(),
+                                          dt_bias.get<half>(),
+                                          total,
+                                          H,
+                                          stream);
         } else {
             throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
         }
@@ -1399,12 +1772,7 @@ void qwen3_5_decay_backward(
     }
 }
 
-void repeat_interleave_heads_forward(
-    Tensor& out,
-    const Tensor& inp,
-    int repeats,
-    cudaStream_t stream
-) {
+void repeat_interleave_heads_forward(Tensor& out, const Tensor& inp, int repeats, cudaStream_t stream) {
     if (repeats <= 0) {
         throw std::logic_error("repeat_interleave_heads_forward: repeats must be > 0");
     }
@@ -1415,8 +1783,8 @@ void repeat_interleave_heads_forward(
     const int Tlen = static_cast<int>(inp.Sizes[1]);
     const int H_in = static_cast<int>(inp.Sizes[2]);
     const int D = static_cast<int>(inp.Sizes[3]);
-    if (out.Sizes[0] != B || out.Sizes[1] != Tlen ||
-        out.Sizes[2] != static_cast<long>(H_in * repeats) || out.Sizes[3] != D) {
+    if (out.Sizes[0] != B || out.Sizes[1] != Tlen || out.Sizes[2] != static_cast<long>(H_in * repeats) ||
+        out.Sizes[3] != D) {
         throw std::logic_error("repeat_interleave_heads_forward: output shape mismatch");
     }
     if (inp.DType != out.DType) {
@@ -1424,25 +1792,24 @@ void repeat_interleave_heads_forward(
     }
 
     if (inp.DType == ETensorDType::BF16) {
-        launch_repeat_interleave_heads_forward(
-            out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), B, Tlen, H_in, D, repeats, stream);
+        launch_repeat_interleave_heads_forward(out.get<nv_bfloat16>(),
+                                               inp.get<nv_bfloat16>(),
+                                               B,
+                                               Tlen,
+                                               H_in,
+                                               D,
+                                               repeats,
+                                               stream);
     } else if (inp.DType == ETensorDType::FP16) {
-        launch_repeat_interleave_heads_forward(
-            out.get<half>(), inp.get<half>(), B, Tlen, H_in, D, repeats, stream);
+        launch_repeat_interleave_heads_forward(out.get<half>(), inp.get<half>(), B, Tlen, H_in, D, repeats, stream);
     } else if (inp.DType == ETensorDType::FP32) {
-        launch_repeat_interleave_heads_forward(
-            out.get<float>(), inp.get<float>(), B, Tlen, H_in, D, repeats, stream);
+        launch_repeat_interleave_heads_forward(out.get<float>(), inp.get<float>(), B, Tlen, H_in, D, repeats, stream);
     } else {
         throw std::logic_error("repeat_interleave_heads_forward: unsupported dtype");
     }
 }
 
-void repeat_interleave_heads_backward(
-    Tensor& d_inp,
-    const Tensor& d_out,
-    int repeats,
-    cudaStream_t stream
-) {
+void repeat_interleave_heads_backward(Tensor& d_inp, const Tensor& d_out, int repeats, cudaStream_t stream) {
     if (repeats <= 0) {
         throw std::logic_error("repeat_interleave_heads_backward: repeats must be > 0");
     }
@@ -1453,8 +1820,8 @@ void repeat_interleave_heads_backward(
     const int Tlen = static_cast<int>(d_inp.Sizes[1]);
     const int H_in = static_cast<int>(d_inp.Sizes[2]);
     const int D = static_cast<int>(d_inp.Sizes[3]);
-    if (d_out.Sizes[0] != B || d_out.Sizes[1] != Tlen ||
-        d_out.Sizes[2] != static_cast<long>(H_in * repeats) || d_out.Sizes[3] != D) {
+    if (d_out.Sizes[0] != B || d_out.Sizes[1] != Tlen || d_out.Sizes[2] != static_cast<long>(H_in * repeats) ||
+        d_out.Sizes[3] != D) {
         throw std::logic_error("repeat_interleave_heads_backward: output shape mismatch");
     }
     if (d_inp.DType != d_out.DType) {
@@ -1462,14 +1829,32 @@ void repeat_interleave_heads_backward(
     }
 
     if (d_inp.DType == ETensorDType::BF16) {
-        launch_repeat_interleave_heads_backward(
-            d_inp.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), B, Tlen, H_in, D, repeats, stream);
+        launch_repeat_interleave_heads_backward(d_inp.get<nv_bfloat16>(),
+                                                d_out.get<nv_bfloat16>(),
+                                                B,
+                                                Tlen,
+                                                H_in,
+                                                D,
+                                                repeats,
+                                                stream);
     } else if (d_inp.DType == ETensorDType::FP16) {
-        launch_repeat_interleave_heads_backward(
-            d_inp.get<half>(), d_out.get<half>(), B, Tlen, H_in, D, repeats, stream);
+        launch_repeat_interleave_heads_backward(d_inp.get<half>(),
+                                                d_out.get<half>(),
+                                                B,
+                                                Tlen,
+                                                H_in,
+                                                D,
+                                                repeats,
+                                                stream);
     } else if (d_inp.DType == ETensorDType::FP32) {
-        launch_repeat_interleave_heads_backward(
-            d_inp.get<float>(), d_out.get<float>(), B, Tlen, H_in, D, repeats, stream);
+        launch_repeat_interleave_heads_backward(d_inp.get<float>(),
+                                                d_out.get<float>(),
+                                                B,
+                                                Tlen,
+                                                H_in,
+                                                D,
+                                                repeats,
+                                                stream);
     } else {
         throw std::logic_error("repeat_interleave_heads_backward: unsupported dtype");
     }

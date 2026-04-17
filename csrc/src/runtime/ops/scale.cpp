@@ -1,13 +1,35 @@
 #include "runtime/executor/compiled_ops.h"
 
 #include <stdexcept>
+#include <string>
 #include <vector>
 
+#include "runtime/dsl/autodiff.h"
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/op_registry.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 
 namespace dsl {
+
+namespace {
+
+// Autodiff rule. Forward: y = factor * x. Backward: d_x = factor * d_y.
+std::vector<Operation> scale_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    if (ctx.needs_grad(0)) {
+        AttrMap attrs = copy_attrs(ctx.fwd_op.attrs, {"factor"});
+        ops.push_back(make_operation("scale_backward_" + std::to_string(ctx.op_counter++),
+                                     "scale_backward",
+                                     "scale_backward",
+                                     {ctx.d_output},
+                                     {ctx.d_inputs[0]},
+                                     attrs));
+    }
+    return ops;
+}
+
+}  // namespace
 
 // Forward: out = factor * x
 void CompiledExecutor::dispatch_scale(const CompiledOp& op) {
@@ -60,3 +82,5 @@ void CompiledExecutor::dispatch_scale_backward(const CompiledOp& op) {
 }
 
 }  // namespace dsl
+
+REGISTER_AUTODIFF("scale", ::dsl::scale_backward_rule);

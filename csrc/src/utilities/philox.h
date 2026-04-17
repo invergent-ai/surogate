@@ -59,7 +59,8 @@ public:
      * @param seed_a First 32-bit seed word (stored as key[0]).
      * @param seed_b Second 32-bit seed word (stored as key[1]).
      */
-    Philox4x32(uint32_t seed_a, std::uint32_t seed_b) : key{seed_a, seed_b} {
+    Philox4x32(uint32_t seed_a, std::uint32_t seed_b)
+        : key{seed_a, seed_b} {
     }
 
     /**
@@ -102,4 +103,4 @@ public:
     }
 };
 
-#endif //SUROGATE_SRC_UTILS_PHILOX_H
+#endif  //SUROGATE_SRC_UTILS_PHILOX_H

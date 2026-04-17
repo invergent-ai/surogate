@@ -52,17 +52,15 @@ constexpr int BLOCK_SIZE = 256;
  * @param scaled_max_e5m2 = fp8_max * 2^(-margin) for E5M2 (57344 * 2^(-margin))
  * @param amax_epsilon Optional floor for amax values (0.0 = no floor, not used by TE)
  */
-__global__ void delayed_scaling_update_kernel(
-    float* __restrict__ amax_history,
-    float* __restrict__ scales,
-    const float* __restrict__ recorded_amaxes,
-    int history_len,
-    int num_quantizers,
-    int amax_compute_algo,  // 0 = MAX, 1 = MOST_RECENT
-    float scaled_max_e4m3,
-    float scaled_max_e5m2,
-    float amax_epsilon
-) {
+__global__ void delayed_scaling_update_kernel(float* __restrict__ amax_history,
+                                              float* __restrict__ scales,
+                                              const float* __restrict__ recorded_amaxes,
+                                              int history_len,
+                                              int num_quantizers,
+                                              int amax_compute_algo,  // 0 = MAX, 1 = MOST_RECENT
+                                              float scaled_max_e4m3,
+                                              float scaled_max_e5m2,
+                                              float amax_epsilon) {
     const int qid = blockIdx.x;  // Quantizer index
     if (qid >= num_quantizers) return;
 
@@ -154,13 +152,11 @@ __global__ void delayed_scaling_update_kernel(
 /**
  * @brief Kernel to initialize scales to 1.0 and zero history/recorded amaxes
  */
-__global__ void reset_fp8_scaling_state_kernel(
-    float* __restrict__ amax_history,
-    float* __restrict__ scales,
-    float* __restrict__ recorded_amaxes,
-    int history_len,
-    int num_quantizers
-) {
+__global__ void reset_fp8_scaling_state_kernel(float* __restrict__ amax_history,
+                                               float* __restrict__ scales,
+                                               float* __restrict__ recorded_amaxes,
+                                               int history_len,
+                                               int num_quantizers) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Zero amax history
@@ -176,37 +172,33 @@ __global__ void reset_fp8_scaling_state_kernel(
     }
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 namespace modules {
 
 // FP8ScalingState implementation
 
-FP8ScalingState::FP8ScalingState(
-    const FP8ScalingConfig& config,
-    const std::shared_ptr<TensorAllocator>& allocator,
-    int device_id,
-    int num_layers
-) : mConfig(config), mDeviceId(device_id), mNumLayers(num_layers),
-    mNumQuantizers(get_total_quantizers(num_layers)) {
+FP8ScalingState::FP8ScalingState(const FP8ScalingConfig& config,
+                                 const std::shared_ptr<TensorAllocator>& allocator,
+                                 int device_id,
+                                 int num_layers)
+    : mConfig(config),
+      mDeviceId(device_id),
+      mNumLayers(num_layers),
+      mNumQuantizers(get_total_quantizers(num_layers)) {
     const long history_len = config.amax_history_len;
     const long num_quantizers = mNumQuantizers;
 
     // Allocate tensors
-    mAmaxHistory = allocator->allocate(
-        ETensorDType::FP32, "fp8_amax_history",
-        EAllocationType::ON_DEVICE,
-        {history_len, num_quantizers});
+    mAmaxHistory = allocator->allocate(ETensorDType::FP32,
+                                       "fp8_amax_history",
+                                       EAllocationType::ON_DEVICE,
+                                       {history_len, num_quantizers});
 
-    mScales = allocator->allocate(
-        ETensorDType::FP32, "fp8_scales",
-        EAllocationType::ON_DEVICE,
-        {num_quantizers});
+    mScales = allocator->allocate(ETensorDType::FP32, "fp8_scales", EAllocationType::ON_DEVICE, {num_quantizers});
 
-    mRecordedAmaxes = allocator->allocate(
-        ETensorDType::FP32, "fp8_recorded_amaxes",
-        EAllocationType::ON_DEVICE,
-        {num_quantizers});
+    mRecordedAmaxes =
+        allocator->allocate(ETensorDType::FP32, "fp8_recorded_amaxes", EAllocationType::ON_DEVICE, {num_quantizers});
 
     // Initialize to default values (will be done on first use)
 }
@@ -219,22 +211,16 @@ void FP8ScalingState::reset(cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = (total_elems + block_size - 1) / block_size;
 
-    reset_fp8_scaling_state_kernel<<<grid_size, block_size, 0, stream>>>(
-        mAmaxHistory.get<float>(),
-        mScales.get<float>(),
-        mRecordedAmaxes.get<float>(),
-        history_len,
-        num_quantizers
-    );
+    reset_fp8_scaling_state_kernel<<<grid_size, block_size, 0, stream>>>(mAmaxHistory.get<float>(),
+                                                                         mScales.get<float>(),
+                                                                         mRecordedAmaxes.get<float>(),
+                                                                         history_len,
+                                                                         num_quantizers);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void FP8ScalingState::zero_recorded_amaxes(cudaStream_t stream) {
-    CUDA_CHECK(cudaMemsetAsync(
-        mRecordedAmaxes.Data,
-        0,
-        mNumQuantizers * sizeof(float),
-        stream));
+    CUDA_CHECK(cudaMemsetAsync(mRecordedAmaxes.Data, 0, mNumQuantizers * sizeof(float), stream));
 }
 
 void delayed_scaling_update(FP8ScalingState& state, cudaStream_t stream) {
@@ -253,18 +239,16 @@ void delayed_scaling_update(FP8ScalingState& state, cudaStream_t stream) {
     const int grid_size = num_quantizers;
     const int block_size = BLOCK_SIZE;
 
-    delayed_scaling_update_kernel<<<grid_size, block_size, 0, stream>>>(
-        state.amax_history().get<float>(),
-        state.scales().get<float>(),
-        state.recorded_amaxes().get<float>(),
-        history_len,
-        num_quantizers,
-        algo,
-        scaled_max_e4m3,
-        scaled_max_e5m2,
-        config.amax_epsilon
-    );
+    delayed_scaling_update_kernel<<<grid_size, block_size, 0, stream>>>(state.amax_history().get<float>(),
+                                                                        state.scales().get<float>(),
+                                                                        state.recorded_amaxes().get<float>(),
+                                                                        history_len,
+                                                                        num_quantizers,
+                                                                        algo,
+                                                                        scaled_max_e4m3,
+                                                                        scaled_max_e5m2,
+                                                                        config.amax_epsilon);
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace modules
+}  // namespace modules

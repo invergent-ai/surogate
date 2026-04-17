@@ -2,7 +2,12 @@ from pathlib import Path
 from time import time
 
 from surogate.grpo.runs import get_multi_run_manager
-from surogate.grpo.transport.base import MicroBatchReceiver, MicroBatchSender, TrainingBatchReceiver, TrainingBatchSender
+from surogate.grpo.transport.base import (
+    MicroBatchReceiver,
+    MicroBatchSender,
+    TrainingBatchReceiver,
+    TrainingBatchSender,
+)
 from surogate.grpo.transport.types import MicroBatch, TrainingBatch
 from surogate.grpo.utils.pathing import get_rollout_dir, get_step_path, sync_wait_for_path
 

@@ -10,4 +10,4 @@
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_run_state.h"
 
-#endif // SUROGATE_SRC_DSL_DSL_RUNTIME_H
+#endif  // SUROGATE_SRC_DSL_DSL_RUNTIME_H

@@ -68,8 +68,8 @@ __device__ __forceinline__ float random_sign(long idx, unsigned int seed) {
  * @param[in,out] x Array of 16 float values to transform
  */
 __device__ __forceinline__ void hadamard16_inplace(float x[16]) {
-    // Stage 1: pairs (0,1), (2,3), ... (14,15)
-    #pragma unroll
+// Stage 1: pairs (0,1), (2,3), ... (14,15)
+#pragma unroll
     for (int i = 0; i < 16; i += 2) {
         float a = x[i];
         float b = x[i + 1];
@@ -77,8 +77,8 @@ __device__ __forceinline__ void hadamard16_inplace(float x[16]) {
         x[i + 1] = a - b;
     }
 
-    // Stage 2: pairs with stride 2
-    #pragma unroll
+// Stage 2: pairs with stride 2
+#pragma unroll
     for (int i = 0; i < 16; i += 4) {
         float a0 = x[i];
         float a1 = x[i + 1];
@@ -90,8 +90,8 @@ __device__ __forceinline__ void hadamard16_inplace(float x[16]) {
         x[i + 3] = a1 - b1;
     }
 
-    // Stage 3: pairs with stride 4
-    #pragma unroll
+// Stage 3: pairs with stride 4
+#pragma unroll
     for (int i = 0; i < 16; i += 8) {
         float a0 = x[i];
         float a1 = x[i + 1];
@@ -113,12 +113,12 @@ __device__ __forceinline__ void hadamard16_inplace(float x[16]) {
 
     // Stage 4: pairs with stride 8
     float a[8], b[8];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 8; ++i) {
         a[i] = x[i];
         b[i] = x[i + 8];
     }
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 8; ++i) {
         x[i] = a[i] + b[i];
         x[i + 8] = a[i] - b[i];
@@ -137,14 +137,12 @@ __device__ __forceinline__ void hadamard16_inplace(float x[16]) {
  * @param total_elements Total number of elements (must be multiple of 16)
  * @param seed Random seed for sign matrix generation
  */
-__global__ void hadamard_transform_forward_kernel(
-    nv_bfloat16* __restrict__ out,
-    const nv_bfloat16* __restrict__ in,
-    float* __restrict__ amax_out,
-    long total_elements,
-    int K,
-    unsigned int seed)
-{
+__global__ void hadamard_transform_forward_kernel(nv_bfloat16* __restrict__ out,
+                                                  const nv_bfloat16* __restrict__ in,
+                                                  float* __restrict__ amax_out,
+                                                  long total_elements,
+                                                  int K,
+                                                  unsigned int seed) {
     // Shared memory for block-level amax reduction
     __shared__ float s_block_amax;
     if (threadIdx.x == 0) {
@@ -156,16 +154,14 @@ __global__ void hadamard_transform_forward_kernel(
     float thread_amax = 0.0f;
 
     // Grid-stride loop over 16-element blocks
-    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-         block_idx < num_blocks;
+    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x; block_idx < num_blocks;
          block_idx += gridDim.x * blockDim.x) {
-
         const long base_idx = block_idx * HADAMARD_SIZE;
         const long col0 = base_idx % K;
         float values[HADAMARD_SIZE];
 
-        // Load and apply random diagonal sign matrix
-        #pragma unroll
+// Load and apply random diagonal sign matrix
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float val = (float)in[base_idx + i];
             float sign = random_sign(col0 + i, seed);
@@ -175,8 +171,8 @@ __global__ void hadamard_transform_forward_kernel(
         // Apply Hadamard transform
         hadamard16_inplace(values);
 
-        // Scale and store, track amax
-        #pragma unroll
+// Scale and store, track amax
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float scaled = values[i] * HADAMARD_SCALE;
             thread_amax = fmaxf(thread_amax, fabsf(scaled));
@@ -213,26 +209,22 @@ __global__ void hadamard_transform_forward_kernel(
  * @param total_elements Total number of elements (must be multiple of 16)
  * @param seed Random seed (must match forward transform)
  */
-__global__ void hadamard_transform_inverse_kernel(
-    nv_bfloat16* __restrict__ out,
-    const nv_bfloat16* __restrict__ in,
-    long total_elements,
-    int K,
-    unsigned int seed)
-{
+__global__ void hadamard_transform_inverse_kernel(nv_bfloat16* __restrict__ out,
+                                                  const nv_bfloat16* __restrict__ in,
+                                                  long total_elements,
+                                                  int K,
+                                                  unsigned int seed) {
     const long num_blocks = total_elements / HADAMARD_SIZE;
 
     // Grid-stride loop over 16-element blocks
-    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-         block_idx < num_blocks;
+    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x; block_idx < num_blocks;
          block_idx += gridDim.x * blockDim.x) {
-
         const long base_idx = block_idx * HADAMARD_SIZE;
         const long col0 = base_idx % K;
         float values[HADAMARD_SIZE];
 
-        // Load values
-        #pragma unroll
+// Load values
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             values[i] = (float)in[base_idx + i];
         }
@@ -240,11 +232,11 @@ __global__ void hadamard_transform_inverse_kernel(
         // Apply Hadamard transform (same as forward since H16 is symmetric)
         hadamard16_inplace(values);
 
-        // Apply inverse scaling (multiply by 4) and random sign matrix
-        // Note: inverse scale is 1/HADAMARD_SCALE = 4, but we need to account
-        // for the forward scale that was already applied, so total inverse scale
-        // is HADAMARD_SCALE (the Hadamard transform is self-inverse when properly scaled)
-        #pragma unroll
+// Apply inverse scaling (multiply by 4) and random sign matrix
+// Note: inverse scale is 1/HADAMARD_SCALE = 4, but we need to account
+// for the forward scale that was already applied, so total inverse scale
+// is HADAMARD_SCALE (the Hadamard transform is self-inverse when properly scaled)
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float sign = random_sign(col0 + i, seed);
             float scaled = values[i] * HADAMARD_SCALE * sign;
@@ -259,13 +251,12 @@ __global__ void hadamard_transform_inverse_kernel(
  * Applies a 16-point RHT down the M dimension for each column.
  * (M must be multiple of 16; K can be any positive value.)
  */
-__global__ void hadamard_transform_forward_rows_kernel(
-    nv_bfloat16* __restrict__ out,
-    const nv_bfloat16* __restrict__ in,
-    float* __restrict__ amax_out,
-    int M, int K,
-    unsigned int seed)
-{
+__global__ void hadamard_transform_forward_rows_kernel(nv_bfloat16* __restrict__ out,
+                                                       const nv_bfloat16* __restrict__ in,
+                                                       float* __restrict__ amax_out,
+                                                       int M,
+                                                       int K,
+                                                       unsigned int seed) {
     __shared__ float s_block_amax;
     if (threadIdx.x == 0) {
         s_block_amax = 0.0f;
@@ -277,16 +268,14 @@ __global__ void hadamard_transform_forward_rows_kernel(
 
     float thread_amax = 0.0f;
 
-    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-         block_idx < num_blocks;
+    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x; block_idx < num_blocks;
          block_idx += gridDim.x * blockDim.x) {
-
         const int col = (int)(block_idx % K);
         const int rb = (int)(block_idx / K);
         const int row0 = rb * HADAMARD_SIZE;
 
         float values[HADAMARD_SIZE];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float val = (float)in[(row0 + i) * (long)K + col];
             float sign = random_sign((long)row0 + i, seed);
@@ -295,7 +284,7 @@ __global__ void hadamard_transform_forward_rows_kernel(
 
         hadamard16_inplace(values);
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float scaled = values[i] * HADAMARD_SCALE;
             thread_amax = fmaxf(thread_amax, fabsf(scaled));
@@ -324,32 +313,29 @@ __global__ void hadamard_transform_forward_rows_kernel(
  *
  * Inverse of forward_rows: apply H16 then random sign matrix D, with scaling.
  */
-__global__ void hadamard_transform_inverse_rows_kernel(
-    nv_bfloat16* __restrict__ out,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K,
-    unsigned int seed)
-{
+__global__ void hadamard_transform_inverse_rows_kernel(nv_bfloat16* __restrict__ out,
+                                                       const nv_bfloat16* __restrict__ in,
+                                                       int M,
+                                                       int K,
+                                                       unsigned int seed) {
     const int row_blocks = M / HADAMARD_SIZE;
     const long num_blocks = (long)row_blocks * (long)K;
 
-    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-         block_idx < num_blocks;
+    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x; block_idx < num_blocks;
          block_idx += gridDim.x * blockDim.x) {
-
         const int col = (int)(block_idx % K);
         const int rb = (int)(block_idx / K);
         const int row0 = rb * HADAMARD_SIZE;
 
         float values[HADAMARD_SIZE];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             values[i] = (float)in[(row0 + i) * (long)K + col];
         }
 
         hadamard16_inplace(values);
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float sign = random_sign((long)row0 + i, seed);
             float scaled = values[i] * HADAMARD_SCALE * sign;
@@ -361,14 +347,12 @@ __global__ void hadamard_transform_inverse_rows_kernel(
 /**
  * @brief FP32 version of Hadamard transform forward kernel.
  */
-__global__ void hadamard_transform_forward_f32_kernel(
-    float* __restrict__ out,
-    const float* __restrict__ in,
-    float* __restrict__ amax_out,
-    long total_elements,
-    int K,
-    unsigned int seed)
-{
+__global__ void hadamard_transform_forward_f32_kernel(float* __restrict__ out,
+                                                      const float* __restrict__ in,
+                                                      float* __restrict__ amax_out,
+                                                      long total_elements,
+                                                      int K,
+                                                      unsigned int seed) {
     __shared__ float s_block_amax;
     if (threadIdx.x == 0) {
         s_block_amax = 0.0f;
@@ -378,15 +362,13 @@ __global__ void hadamard_transform_forward_f32_kernel(
     const long num_blocks = total_elements / HADAMARD_SIZE;
     float thread_amax = 0.0f;
 
-    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-         block_idx < num_blocks;
+    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x; block_idx < num_blocks;
          block_idx += gridDim.x * blockDim.x) {
-
         const long base_idx = block_idx * HADAMARD_SIZE;
         const long col0 = base_idx % K;
         float values[HADAMARD_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float val = in[base_idx + i];
             float sign = random_sign(col0 + i, seed);
@@ -395,7 +377,7 @@ __global__ void hadamard_transform_forward_f32_kernel(
 
         hadamard16_inplace(values);
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float scaled = values[i] * HADAMARD_SCALE;
             thread_amax = fmaxf(thread_amax, fabsf(scaled));
@@ -422,31 +404,27 @@ __global__ void hadamard_transform_forward_f32_kernel(
 /**
  * @brief FP32 version of Hadamard transform inverse kernel.
  */
-__global__ void hadamard_transform_inverse_f32_kernel(
-    float* __restrict__ out,
-    const float* __restrict__ in,
-    long total_elements,
-    int K,
-    unsigned int seed)
-{
+__global__ void hadamard_transform_inverse_f32_kernel(float* __restrict__ out,
+                                                      const float* __restrict__ in,
+                                                      long total_elements,
+                                                      int K,
+                                                      unsigned int seed) {
     const long num_blocks = total_elements / HADAMARD_SIZE;
 
-    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-         block_idx < num_blocks;
+    for (long block_idx = blockIdx.x * blockDim.x + threadIdx.x; block_idx < num_blocks;
          block_idx += gridDim.x * blockDim.x) {
-
         const long base_idx = block_idx * HADAMARD_SIZE;
         const long col0 = base_idx % K;
         float values[HADAMARD_SIZE];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             values[i] = in[base_idx + i];
         }
 
         hadamard16_inplace(values);
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < HADAMARD_SIZE; ++i) {
             float sign = random_sign(col0 + i, seed);
             float scaled = values[i] * HADAMARD_SCALE * sign;
@@ -455,7 +433,7 @@ __global__ void hadamard_transform_inverse_f32_kernel(
     }
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // Host Launcher Functions
@@ -474,14 +452,13 @@ __global__ void hadamard_transform_inverse_f32_kernel(
  * @param seed Random seed for sign matrix generation
  * @param stream CUDA stream
  */
-void hadamard_transform_forward(
-    nv_bfloat16* out,
-    const nv_bfloat16* in,
-    float* amax_out,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_forward(nv_bfloat16* out,
+                                const nv_bfloat16* in,
+                                float* amax_out,
+                                int M,
+                                int K,
+                                unsigned int seed,
+                                cudaStream_t stream) {
     if (K % HADAMARD_SIZE != 0) {
         throw std::runtime_error("hadamard_transform_forward: K must be multiple of 16");
     }
@@ -490,17 +467,20 @@ void hadamard_transform_forward(
     const long num_blocks_to_process = total_elements / HADAMARD_SIZE;
 
     const int threads_per_block = 256;
-    const int num_cuda_blocks = std::min(
-        (int)div_ceil(num_blocks_to_process, (long)threads_per_block),
-        2048  // Cap grid size
+    const int num_cuda_blocks = std::min((int)div_ceil(num_blocks_to_process, (long)threads_per_block),
+                                         2048  // Cap grid size
     );
 
     if (amax_out != nullptr) {
         CUDA_CHECK(cudaMemsetAsync(amax_out, 0, sizeof(float), stream));
     }
 
-    hadamard_transform_forward_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(
-        out, in, amax_out, total_elements, K, seed);
+    hadamard_transform_forward_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(out,
+                                                                                         in,
+                                                                                         amax_out,
+                                                                                         total_elements,
+                                                                                         K,
+                                                                                         seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -516,13 +496,12 @@ void hadamard_transform_forward(
  * @param seed Random seed (must match forward transform)
  * @param stream CUDA stream
  */
-void hadamard_transform_inverse(
-    nv_bfloat16* out,
-    const nv_bfloat16* in,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_inverse(nv_bfloat16* out,
+                                const nv_bfloat16* in,
+                                int M,
+                                int K,
+                                unsigned int seed,
+                                cudaStream_t stream) {
     if (K % HADAMARD_SIZE != 0) {
         throw std::runtime_error("hadamard_transform_inverse: K must be multiple of 16");
     }
@@ -531,24 +510,23 @@ void hadamard_transform_inverse(
     const long num_blocks_to_process = total_elements / HADAMARD_SIZE;
 
     const int threads_per_block = 256;
-    const int num_cuda_blocks = std::min(
-        (int)div_ceil(num_blocks_to_process, (long)threads_per_block),
-        2048
-    );
+    const int num_cuda_blocks = std::min((int)div_ceil(num_blocks_to_process, (long)threads_per_block), 2048);
 
-    hadamard_transform_inverse_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(
-        out, in, total_elements, K, seed);
+    hadamard_transform_inverse_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(out,
+                                                                                         in,
+                                                                                         total_elements,
+                                                                                         K,
+                                                                                         seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void hadamard_transform_forward_rows(
-    nv_bfloat16* out,
-    const nv_bfloat16* in,
-    float* amax_out,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_forward_rows(nv_bfloat16* out,
+                                     const nv_bfloat16* in,
+                                     float* amax_out,
+                                     int M,
+                                     int K,
+                                     unsigned int seed,
+                                     cudaStream_t stream) {
     if (M % HADAMARD_SIZE != 0) {
         throw std::runtime_error("hadamard_transform_forward_rows: M must be multiple of 16");
     }
@@ -556,27 +534,27 @@ void hadamard_transform_forward_rows(
     const long num_blocks_to_process = (long)(M / HADAMARD_SIZE) * (long)K;
 
     const int threads_per_block = 256;
-    const int num_cuda_blocks = std::min(
-        (int)div_ceil(num_blocks_to_process, (long)threads_per_block),
-        2048
-    );
+    const int num_cuda_blocks = std::min((int)div_ceil(num_blocks_to_process, (long)threads_per_block), 2048);
 
     if (amax_out != nullptr) {
         CUDA_CHECK(cudaMemsetAsync(amax_out, 0, sizeof(float), stream));
     }
 
-    hadamard_transform_forward_rows_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(
-        out, in, amax_out, M, K, seed);
+    hadamard_transform_forward_rows_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(out,
+                                                                                              in,
+                                                                                              amax_out,
+                                                                                              M,
+                                                                                              K,
+                                                                                              seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void hadamard_transform_inverse_rows(
-    nv_bfloat16* out,
-    const nv_bfloat16* in,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_inverse_rows(nv_bfloat16* out,
+                                     const nv_bfloat16* in,
+                                     int M,
+                                     int K,
+                                     unsigned int seed,
+                                     cudaStream_t stream) {
     if (M % HADAMARD_SIZE != 0) {
         throw std::runtime_error("hadamard_transform_inverse_rows: M must be multiple of 16");
     }
@@ -584,27 +562,22 @@ void hadamard_transform_inverse_rows(
     const long num_blocks_to_process = (long)(M / HADAMARD_SIZE) * (long)K;
 
     const int threads_per_block = 256;
-    const int num_cuda_blocks = std::min(
-        (int)div_ceil(num_blocks_to_process, (long)threads_per_block),
-        2048
-    );
+    const int num_cuda_blocks = std::min((int)div_ceil(num_blocks_to_process, (long)threads_per_block), 2048);
 
-    hadamard_transform_inverse_rows_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(
-        out, in, M, K, seed);
+    hadamard_transform_inverse_rows_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(out, in, M, K, seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Apply Random Hadamard Transform (forward) to FP32 tensor.
  */
-void hadamard_transform_forward(
-    float* out,
-    const float* in,
-    float* amax_out,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_forward(float* out,
+                                const float* in,
+                                float* amax_out,
+                                int M,
+                                int K,
+                                unsigned int seed,
+                                cudaStream_t stream) {
     if (K % HADAMARD_SIZE != 0) {
         throw std::runtime_error("hadamard_transform_forward: K must be multiple of 16");
     }
@@ -613,30 +586,25 @@ void hadamard_transform_forward(
     const long num_blocks_to_process = total_elements / HADAMARD_SIZE;
 
     const int threads_per_block = 256;
-    const int num_cuda_blocks = std::min(
-        (int)div_ceil(num_blocks_to_process, (long)threads_per_block),
-        2048
-    );
+    const int num_cuda_blocks = std::min((int)div_ceil(num_blocks_to_process, (long)threads_per_block), 2048);
 
     if (amax_out != nullptr) {
         CUDA_CHECK(cudaMemsetAsync(amax_out, 0, sizeof(float), stream));
     }
 
-    hadamard_transform_forward_f32_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(
-        out, in, amax_out, total_elements, K, seed);
+    hadamard_transform_forward_f32_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(out,
+                                                                                             in,
+                                                                                             amax_out,
+                                                                                             total_elements,
+                                                                                             K,
+                                                                                             seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Apply Random Hadamard Transform (inverse) to FP32 tensor.
  */
-void hadamard_transform_inverse(
-    float* out,
-    const float* in,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_inverse(float* out, const float* in, int M, int K, unsigned int seed, cudaStream_t stream) {
     if (K % HADAMARD_SIZE != 0) {
         throw std::runtime_error("hadamard_transform_inverse: K must be multiple of 16");
     }
@@ -645,13 +613,13 @@ void hadamard_transform_inverse(
     const long num_blocks_to_process = total_elements / HADAMARD_SIZE;
 
     const int threads_per_block = 256;
-    const int num_cuda_blocks = std::min(
-        (int)div_ceil(num_blocks_to_process, (long)threads_per_block),
-        2048
-    );
+    const int num_cuda_blocks = std::min((int)div_ceil(num_blocks_to_process, (long)threads_per_block), 2048);
 
-    hadamard_transform_inverse_f32_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(
-        out, in, total_elements, K, seed);
+    hadamard_transform_inverse_f32_kernel<<<num_cuda_blocks, threads_per_block, 0, stream>>>(out,
+                                                                                             in,
+                                                                                             total_elements,
+                                                                                             K,
+                                                                                             seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -662,24 +630,17 @@ void hadamard_transform_inverse(
 /**
  * @brief Tensor-based wrapper for Hadamard transform forward.
  */
-void hadamard_transform_forward(
-    Tensor& out,
-    const Tensor& in,
-    float* amax_out,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_forward(Tensor& out,
+                                const Tensor& in,
+                                float* amax_out,
+                                int M,
+                                int K,
+                                unsigned int seed,
+                                cudaStream_t stream) {
     if (in.DType == ETensorDType::BF16) {
-        hadamard_transform_forward(
-            out.get<nv_bfloat16>(),
-            in.get<nv_bfloat16>(),
-            amax_out, M, K, seed, stream);
+        hadamard_transform_forward(out.get<nv_bfloat16>(), in.get<nv_bfloat16>(), amax_out, M, K, seed, stream);
     } else if (in.DType == ETensorDType::FP32) {
-        hadamard_transform_forward(
-            out.get<float>(),
-            in.get<float>(),
-            amax_out, M, K, seed, stream);
+        hadamard_transform_forward(out.get<float>(), in.get<float>(), amax_out, M, K, seed, stream);
     } else {
         throw std::runtime_error("hadamard_transform_forward: unsupported dtype (must be BF16 or FP32)");
     }
@@ -688,23 +649,11 @@ void hadamard_transform_forward(
 /**
  * @brief Tensor-based wrapper for Hadamard transform inverse.
  */
-void hadamard_transform_inverse(
-    Tensor& out,
-    const Tensor& in,
-    int M, int K,
-    unsigned int seed,
-    cudaStream_t stream)
-{
+void hadamard_transform_inverse(Tensor& out, const Tensor& in, int M, int K, unsigned int seed, cudaStream_t stream) {
     if (in.DType == ETensorDType::BF16) {
-        hadamard_transform_inverse(
-            out.get<nv_bfloat16>(),
-            in.get<nv_bfloat16>(),
-            M, K, seed, stream);
+        hadamard_transform_inverse(out.get<nv_bfloat16>(), in.get<nv_bfloat16>(), M, K, seed, stream);
     } else if (in.DType == ETensorDType::FP32) {
-        hadamard_transform_inverse(
-            out.get<float>(),
-            in.get<float>(),
-            M, K, seed, stream);
+        hadamard_transform_inverse(out.get<float>(), in.get<float>(), M, K, seed, stream);
     } else {
         throw std::runtime_error("hadamard_transform_inverse: unsupported dtype (must be BF16 or FP32)");
     }

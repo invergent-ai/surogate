@@ -38,15 +38,21 @@ public:
      * @param alloc Optional tensor allocator
      * @return Unique pointer to model (as IModel)
      */
-    static std::unique_ptr<IModel> create_from_pretrained_config(
-        const PretrainedConfig& config,
-        const RuntimeOptions& options,
-        int rank,
-        int world,
-        const std::shared_ptr<TensorAllocator>& alloc = nullptr) {
+    static std::unique_ptr<IModel>
+    create_from_pretrained_config(const PretrainedConfig& config,
+                                  const RuntimeOptions& options,
+                                  int rank,
+                                  int world,
+                                  const std::shared_ptr<TensorAllocator>& alloc = nullptr) {
         require_dsl_ir(options);
-        return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc,
-                                               std::nullopt, modules::QLoRAConfig{}, rank, world);
+        return std::make_unique<dsl::DslModel>(config,
+                                               options,
+                                               options.DslIrJson,
+                                               alloc,
+                                               std::nullopt,
+                                               modules::QLoRAConfig{},
+                                               rank,
+                                               world);
     }
 
     /**
@@ -60,17 +66,21 @@ public:
      * @param qlora_config Optional QLoRA configuration for quantized base weights
      * @return Unique pointer to LoRA-wrapped model (as IModel)
      */
-    static std::unique_ptr<IModel> create_lora_from_pretrained_config(
-        const PretrainedConfig& config,
-        const ModularLoRAConfig& lora_config,
-        const RuntimeOptions& options,
-        NCCLCommunicator& comm,
-        const std::shared_ptr<TensorAllocator>& alloc,
-        const QLoRAConfig& qlora_config = QLoRAConfig{}) {
+    static std::unique_ptr<IModel> create_lora_from_pretrained_config(const PretrainedConfig& config,
+                                                                      const ModularLoRAConfig& lora_config,
+                                                                      const RuntimeOptions& options,
+                                                                      NCCLCommunicator& comm,
+                                                                      const std::shared_ptr<TensorAllocator>& alloc,
+                                                                      const QLoRAConfig& qlora_config = QLoRAConfig{}) {
         require_dsl_ir(options);
-        return std::make_unique<dsl::DslModel>(config, options, options.DslIrJson, alloc,
+        return std::make_unique<dsl::DslModel>(config,
+                                               options,
+                                               options.DslIrJson,
+                                               alloc,
                                                std::optional<ModularLoRAConfig>{lora_config},
-                                               qlora_config, comm.rank(), comm.world_size());
+                                               qlora_config,
+                                               comm.rank(),
+                                               comm.world_size());
     }
 
 private:

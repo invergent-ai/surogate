@@ -18,7 +18,8 @@ namespace modules {
 namespace detail {
 
 struct EmptyTensorContainer final : public ITensorContainer {
-    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>&) override {}
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>&) override {
+    }
 };
 
 inline ITensorContainer& empty_tensor_container() {
@@ -42,7 +43,7 @@ inline std::vector<std::string> targets_to_peft_names(const ModularLoRAConfig& c
     return out;
 }
 
-} // namespace detail
+}  // namespace detail
 
 /**
  * @brief Calculate number of LoRA parameters
@@ -54,6 +55,6 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
  */
 std::size_t lora_bytes(const ModelConfig& model_config, const ModularLoRAConfig& lora_config);
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_UTILS_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_UTILS_H

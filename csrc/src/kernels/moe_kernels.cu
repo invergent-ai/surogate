@@ -36,13 +36,11 @@
 // Each row corresponds to one token, each column to one expert.
 // Optimized for small num_experts (typical: 8-256 experts).
 
-template<typename T, int BLOCK_SIZE = 256>
-__global__ void moe_softmax_forward_kernel(
-    T* __restrict__ out,              // (num_tokens, num_experts)
-    const T* __restrict__ inp,         // (num_tokens, num_experts)
-    int num_tokens,
-    int num_experts
-) {
+template <typename T, int BLOCK_SIZE = 256>
+__global__ void moe_softmax_forward_kernel(T* __restrict__ out,        // (num_tokens, num_experts)
+                                           const T* __restrict__ inp,  // (num_tokens, num_experts)
+                                           int num_tokens,
+                                           int num_experts) {
     // One block per token (row)
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -112,12 +110,8 @@ __global__ void moe_softmax_forward_kernel(
 }
 
 // Sigmoid activation for DeepSeek-style routing
-template<typename T>
-__global__ void moe_sigmoid_forward_kernel(
-    T* __restrict__ out,
-    const T* __restrict__ inp,
-    int num_elements
-) {
+template <typename T>
+__global__ void moe_sigmoid_forward_kernel(T* __restrict__ out, const T* __restrict__ inp, int num_elements) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_elements) return;
 
@@ -126,13 +120,11 @@ __global__ void moe_sigmoid_forward_kernel(
     out[idx] = static_cast<T>(sigmoid_val);
 }
 
-template<typename T>
-__global__ void moe_sigmoid_backward_kernel(
-    T* __restrict__ d_inp,
-    const T* __restrict__ grad,
-    const T* __restrict__ out,
-    int num_elements
-) {
+template <typename T>
+__global__ void moe_sigmoid_backward_kernel(T* __restrict__ d_inp,
+                                            const T* __restrict__ grad,
+                                            const T* __restrict__ out,
+                                            int num_elements) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_elements) return;
 
@@ -142,13 +134,9 @@ __global__ void moe_sigmoid_backward_kernel(
     d_inp[idx] = static_cast<T>(dy);
 }
 
-template<typename T>
-__global__ void moe_scale_forward_kernel(
-    T* __restrict__ out,
-    const T* __restrict__ inp,
-    float scale,
-    int num_elements
-) {
+template <typename T>
+__global__ void
+moe_scale_forward_kernel(T* __restrict__ out, const T* __restrict__ inp, float scale, int num_elements) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_elements) return;
     float val = static_cast<float>(inp[idx]);
@@ -171,16 +159,19 @@ constexpr int MOE_WARP_SIZE = 32;
 
 // Insert a (val, idx) pair into a descending-sorted register array of size K.
 // Replaces the last element and bubbles it up to the correct position.
-template<int K>
+template <int K>
 __device__ __forceinline__ void topk_insert(float* vals, int* idxs, float val, int idx) {
     vals[K - 1] = val;
     idxs[K - 1] = idx;
-    #pragma unroll
+#pragma unroll
     for (int j = K - 2; j >= 0; j--) {
-        if ((vals[j + 1] > vals[j]) ||
-            (vals[j + 1] == vals[j] && idxs[j + 1] < idxs[j])) {
-            float tv = vals[j]; vals[j] = vals[j + 1]; vals[j + 1] = tv;
-            int ti = idxs[j]; idxs[j] = idxs[j + 1]; idxs[j + 1] = ti;
+        if ((vals[j + 1] > vals[j]) || (vals[j + 1] == vals[j] && idxs[j + 1] < idxs[j])) {
+            float tv = vals[j];
+            vals[j] = vals[j + 1];
+            vals[j + 1] = tv;
+            int ti = idxs[j];
+            idxs[j] = idxs[j + 1];
+            idxs[j + 1] = ti;
         }
     }
 }
@@ -191,22 +182,20 @@ __device__ __forceinline__ void topk_insert(float* vals, int* idxs, float val, i
 // When correction_bias is non-null, selection is based on (score + bias) but
 // the values stored in out_vals are the biased scores (caller must re-read
 // original scores after if needed).
-template<int K, typename T>
-__device__ __forceinline__ void warp_topk(
-    const T* __restrict__ token_scores,
-    int num_experts,
-    float* out_vals,
-    int* out_idxs,
-    const float* __restrict__ correction_bias = nullptr,
-    float rounding_scale = 0.0f
-) {
+template <int K, typename T>
+__device__ __forceinline__ void warp_topk(const T* __restrict__ token_scores,
+                                          int num_experts,
+                                          float* out_vals,
+                                          int* out_idxs,
+                                          const float* __restrict__ correction_bias = nullptr,
+                                          float rounding_scale = 0.0f) {
     const int lane = threadIdx.x & (MOE_WARP_SIZE - 1);
 
     // Per-lane local top-K
     float my_vals[MOE_TOPK_MAX_K];
     int my_idxs[MOE_TOPK_MAX_K];
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < K; i++) {
         my_vals[i] = -FLT_MAX;
         my_idxs[i] = -1;
@@ -226,16 +215,16 @@ __device__ __forceinline__ void warp_topk(
         }
     }
 
-    // Warp-level merge: 5 rounds (log2(32)) of shuffle-based tournament.
-    // Each round, exchange top-K lists with a partner lane and merge the two
-    // sorted K-lists into a single K-list (keep top K from 2K candidates).
-    #pragma unroll
+// Warp-level merge: 5 rounds (log2(32)) of shuffle-based tournament.
+// Each round, exchange top-K lists with a partner lane and merge the two
+// sorted K-lists into a single K-list (keep top K from 2K candidates).
+#pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         // Get partner's top-K via warp shuffle
         float partner_vals[MOE_TOPK_MAX_K];
         int partner_idxs[MOE_TOPK_MAX_K];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < K; i++) {
             partner_vals[i] = __shfl_xor_sync(0xFFFFFFFFu, my_vals[i], offset);
             partner_idxs[i] = __shfl_xor_sync(0xFFFFFFFFu, my_idxs[i], offset);
@@ -246,7 +235,7 @@ __device__ __forceinline__ void warp_topk(
         int merged_idxs[MOE_TOPK_MAX_K];
         int a = 0, b = 0;
 
-        #pragma unroll
+#pragma unroll
         for (int m = 0; m < K; m++) {
             // Pick the larger head element
             bool take_partner = (a >= K) || (b < K && partner_vals[b] > my_vals[a]);
@@ -261,16 +250,16 @@ __device__ __forceinline__ void warp_topk(
             }
         }
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < K; i++) {
             my_vals[i] = merged_vals[i];
             my_idxs[i] = merged_idxs[i];
         }
     }
 
-    // After merging, all lanes hold the same global top-K (from lane 0).
-    // Broadcast from lane 0 to ensure consistency.
-    #pragma unroll
+// After merging, all lanes hold the same global top-K (from lane 0).
+// Broadcast from lane 0 to ensure consistency.
+#pragma unroll
     for (int i = 0; i < K; i++) {
         out_vals[i] = __shfl_sync(0xFFFFFFFFu, my_vals[i], 0);
         out_idxs[i] = __shfl_sync(0xFFFFFFFFu, my_idxs[i], 0);
@@ -280,20 +269,18 @@ __device__ __forceinline__ void warp_topk(
 // Warp-per-token top-K kernel. Packs multiple warps per block.
 // When correction_bias is non-null, expert selection uses (score + bias) but
 // routing weights are computed from the original unbiased scores.
-template<typename T, int K>
-__global__ void moe_topk_forward_kernel(
-    int* __restrict__ expert_indices,      // (num_tokens, top_k)
-    T* __restrict__ routing_weights,       // (num_tokens, top_k)
-    const T* __restrict__ scores,          // (num_tokens, num_experts)
-    const float* __restrict__ correction_bias,  // (num_experts) or nullptr
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    bool normalize_weights,
-    bool softmax_weights,
-    bool sort_by_index,
-    float rounding_scale
-) {
+template <typename T, int K>
+__global__ void moe_topk_forward_kernel(int* __restrict__ expert_indices,           // (num_tokens, top_k)
+                                        T* __restrict__ routing_weights,            // (num_tokens, top_k)
+                                        const T* __restrict__ scores,               // (num_tokens, num_experts)
+                                        const float* __restrict__ correction_bias,  // (num_experts) or nullptr
+                                        int num_tokens,
+                                        int num_experts,
+                                        int top_k,
+                                        bool normalize_weights,
+                                        bool softmax_weights,
+                                        bool sort_by_index,
+                                        float rounding_scale) {
     const int warps_per_block = blockDim.x / MOE_WARP_SIZE;
     const int warp_id = threadIdx.x / MOE_WARP_SIZE;
     const int lane = threadIdx.x & (MOE_WARP_SIZE - 1);
@@ -402,17 +389,15 @@ __global__ void moe_topk_forward_kernel(
 // Non-selected experts receive zero gradient.
 //
 // For normalize_weights=false, w_k = p_k and d_p_k = d_w_k.
-__global__ void moe_topk_backward_kernel(
-    float* __restrict__ d_probs,              // (num_tokens, num_experts)
-    const float* __restrict__ d_routing_w,    // (num_tokens, top_k)
-    const float* __restrict__ probs,          // (num_tokens, num_experts)
-    const int* __restrict__ expert_indices,   // (num_tokens, top_k)
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    bool normalize_weights,
-    bool softmax_weights
-) {
+__global__ void moe_topk_backward_kernel(float* __restrict__ d_probs,             // (num_tokens, num_experts)
+                                         const float* __restrict__ d_routing_w,   // (num_tokens, top_k)
+                                         const float* __restrict__ probs,         // (num_tokens, num_experts)
+                                         const int* __restrict__ expert_indices,  // (num_tokens, top_k)
+                                         int num_tokens,
+                                         int num_experts,
+                                         int top_k,
+                                         bool normalize_weights,
+                                         bool softmax_weights) {
     constexpr int MAX_K = 8;
     int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (token_idx >= num_tokens) return;
@@ -426,7 +411,7 @@ __global__ void moe_topk_backward_kernel(
     if (softmax_weights) {
         float maxv = -INFINITY;
         float z_vals[MAX_K];
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < MAX_K; ++k) {
             if (k >= top_k) break;
             int e = idx_row[k];
@@ -437,7 +422,7 @@ __global__ void moe_topk_backward_kernel(
 
         float sum = 0.0f;
         float w_vals[MAX_K];
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < MAX_K; ++k) {
             if (k >= top_k) break;
             float w = expf(z_vals[k] - maxv);
@@ -446,14 +431,14 @@ __global__ void moe_topk_backward_kernel(
         }
         sum = fmaxf(sum, 1e-20f);
         float dot = 0.0f;
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < MAX_K; ++k) {
             if (k >= top_k) break;
             w_vals[k] /= sum;
             dot += d_w_row[k] * w_vals[k];
         }
 
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < MAX_K; ++k) {
             if (k >= top_k) break;
             int e = idx_row[k];
@@ -466,7 +451,7 @@ __global__ void moe_topk_backward_kernel(
     }
 
     if (!normalize_weights) {
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < MAX_K; ++k) {
             if (k >= top_k) break;
             int e = idx_row[k];
@@ -480,7 +465,7 @@ __global__ void moe_topk_backward_kernel(
     float sum_p = 0.0f;
     float dot = 0.0f;
 
-    #pragma unroll
+#pragma unroll
     for (int k = 0; k < MAX_K; ++k) {
         if (k >= top_k) break;
         int e = idx_row[k];
@@ -493,7 +478,7 @@ __global__ void moe_topk_backward_kernel(
     sum_p = fmaxf(sum_p, 1e-20f);
     float inv_s2 = 1.0f / (sum_p * sum_p);
 
-    #pragma unroll
+#pragma unroll
     for (int k = 0; k < MAX_K; ++k) {
         if (k >= top_k) break;
         int e = idx_row[k];
@@ -507,15 +492,13 @@ __global__ void moe_topk_backward_kernel(
 // ============================================================================
 // GPT-OSS MoE Activation (interleaved gate/up)
 // ============================================================================
-template<typename T>
-__global__ void gpt_oss_moe_act_forward_kernel(
-    T* __restrict__ out,           // (N, D)
-    const T* __restrict__ inp,     // (N, 2*D) interleaved [gate, up]
-    int total_elements,            // N * D
-    int D,
-    float alpha,
-    float limit
-) {
+template <typename T>
+__global__ void gpt_oss_moe_act_forward_kernel(T* __restrict__ out,        // (N, D)
+                                               const T* __restrict__ inp,  // (N, 2*D) interleaved [gate, up]
+                                               int total_elements,         // N * D
+                                               int D,
+                                               float alpha,
+                                               float limit) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
     int d = idx % D;
@@ -532,16 +515,14 @@ __global__ void gpt_oss_moe_act_forward_kernel(
     out[idx] = static_cast<T>(out_val);
 }
 
-template<typename T>
-__global__ void gpt_oss_moe_act_backward_kernel(
-    T* __restrict__ d_inp,          // (N, 2*D) interleaved [gate, up]
-    const T* __restrict__ d_out,    // (N, D)
-    const T* __restrict__ inp,      // (N, 2*D) interleaved [gate, up]
-    int total_elements,             // N * D
-    int D,
-    float alpha,
-    float limit
-) {
+template <typename T>
+__global__ void gpt_oss_moe_act_backward_kernel(T* __restrict__ d_inp,        // (N, 2*D) interleaved [gate, up]
+                                                const T* __restrict__ d_out,  // (N, D)
+                                                const T* __restrict__ inp,    // (N, 2*D) interleaved [gate, up]
+                                                int total_elements,           // N * D
+                                                int D,
+                                                float alpha,
+                                                float limit) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
     int d = idx % D;
@@ -577,88 +558,72 @@ __global__ void gpt_oss_moe_act_backward_kernel(
     d_inp[base + 1] = static_cast<T>(d_up);
 }
 
-void gpt_oss_moe_act_forward(
-    nv_bfloat16* out,
-    const nv_bfloat16* inp,
-    int N,
-    int D,
-    float alpha,
-    float limit,
-    cudaStream_t stream
-) {
+void gpt_oss_moe_act_forward(nv_bfloat16* out,
+                             const nv_bfloat16* inp,
+                             int N,
+                             int D,
+                             float alpha,
+                             float limit,
+                             cudaStream_t stream) {
     const int total = N * D;
     if (total == 0) return;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    gpt_oss_moe_act_forward_kernel<<<grid_size, block_size, 0, stream>>>(
-        out, inp, total, D, alpha, limit
-    );
+    gpt_oss_moe_act_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, total, D, alpha, limit);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void gpt_oss_moe_act_forward(
-    float* out,
-    const float* inp,
-    int N,
-    int D,
-    float alpha,
-    float limit,
-    cudaStream_t stream
-) {
+void gpt_oss_moe_act_forward(float* out,
+                             const float* inp,
+                             int N,
+                             int D,
+                             float alpha,
+                             float limit,
+                             cudaStream_t stream) {
     const int total = N * D;
     if (total == 0) return;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    gpt_oss_moe_act_forward_kernel<<<grid_size, block_size, 0, stream>>>(
-        out, inp, total, D, alpha, limit
-    );
+    gpt_oss_moe_act_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, total, D, alpha, limit);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void gpt_oss_moe_act_backward(
-    nv_bfloat16* d_inp,
-    const nv_bfloat16* d_out,
-    const nv_bfloat16* inp,
-    int N,
-    int D,
-    float alpha,
-    float limit,
-    cudaStream_t stream
-) {
+void gpt_oss_moe_act_backward(nv_bfloat16* d_inp,
+                              const nv_bfloat16* d_out,
+                              const nv_bfloat16* inp,
+                              int N,
+                              int D,
+                              float alpha,
+                              float limit,
+                              cudaStream_t stream) {
     const int total = N * D;
     if (total == 0) return;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    gpt_oss_moe_act_backward_kernel<<<grid_size, block_size, 0, stream>>>(
-        d_inp, d_out, inp, total, D, alpha, limit
-    );
+    gpt_oss_moe_act_backward_kernel<<<grid_size, block_size, 0, stream>>>(d_inp, d_out, inp, total, D, alpha, limit);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void gpt_oss_moe_act_backward(
-    float* d_inp,
-    const float* d_out,
-    const float* inp,
-    int N,
-    int D,
-    float alpha,
-    float limit,
-    cudaStream_t stream
-) {
+void gpt_oss_moe_act_backward(float* d_inp,
+                              const float* d_out,
+                              const float* inp,
+                              int N,
+                              int D,
+                              float alpha,
+                              float limit,
+                              cudaStream_t stream) {
     const int total = N * D;
     if (total == 0) return;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    gpt_oss_moe_act_backward_kernel<<<grid_size, block_size, 0, stream>>>(
-        d_inp, d_out, inp, total, D, alpha, limit
-    );
+    gpt_oss_moe_act_backward_kernel<<<grid_size, block_size, 0, stream>>>(d_inp, d_out, inp, total, D, alpha, limit);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================
 // Utility: sanitize non-finite values (NaN/Inf) in-place
 // ============================================================================
-template<typename T>
+template <typename T>
 __global__ void sanitize_non_finite_kernel(T* data, int n) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -668,7 +633,7 @@ __global__ void sanitize_non_finite_kernel(T* data, int n) {
     }
 }
 
-template<typename T>
+template <typename T>
 static void sanitize_non_finite_impl(T* data, int n, cudaStream_t stream) {
     if (n <= 0) return;
     const int block = 256;
@@ -688,17 +653,19 @@ void sanitize_non_finite(float* data, int n, cudaStream_t stream) {
 // ============================================================================
 // Utility: clamp absolute values in-place
 // ============================================================================
-template<typename T>
+template <typename T>
 __global__ void clamp_abs_kernel(T* data, int n, float max_abs) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float v = static_cast<float>(data[idx]);
-    if (v > max_abs) v = max_abs;
-    else if (v < -max_abs) v = -max_abs;
+    if (v > max_abs)
+        v = max_abs;
+    else if (v < -max_abs)
+        v = -max_abs;
     data[idx] = static_cast<T>(v);
 }
 
-template<typename T>
+template <typename T>
 static void clamp_abs_impl(T* data, int n, float max_abs, cudaStream_t stream) {
     if (n <= 0 || max_abs <= 0.0f) return;
     const int block = 256;
@@ -718,7 +685,7 @@ void clamp_abs(float* data, int n, float max_abs, cudaStream_t stream) {
 // ============================================================================
 // Utility: count non-finite values (NaN/Inf)
 // ============================================================================
-template<typename T>
+template <typename T>
 __global__ void count_non_finite_kernel(int* out_count, const T* data, int n) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -728,7 +695,7 @@ __global__ void count_non_finite_kernel(int* out_count, const T* data, int n) {
     }
 }
 
-template<typename T>
+template <typename T>
 static void count_non_finite_impl(int* out_count, const T* data, int n, cudaStream_t stream) {
     if (n <= 0) return;
     const int block = 256;
@@ -748,7 +715,7 @@ void count_non_finite(int* out_count, const float* data, int n, cudaStream_t str
 // ============================================================================
 // Utility: count values with |x| > threshold (for diagnosing extreme grads).
 // ============================================================================
-template<typename T>
+template <typename T>
 __global__ void count_above_threshold_kernel(int* out_count, const T* data, int n, float threshold) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -758,9 +725,8 @@ __global__ void count_above_threshold_kernel(int* out_count, const T* data, int 
     }
 }
 
-template<typename T>
-static void count_above_threshold_impl(int* out_count, const T* data, int n,
-                                       float threshold, cudaStream_t stream) {
+template <typename T>
+static void count_above_threshold_impl(int* out_count, const T* data, int n, float threshold, cudaStream_t stream) {
     if (n <= 0) return;
     const int block = 256;
     const int grid = (n + block - 1) / block;
@@ -768,13 +734,11 @@ static void count_above_threshold_impl(int* out_count, const T* data, int n,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void count_above_threshold(int* out_count, const nv_bfloat16* data, int n,
-                           float threshold, cudaStream_t stream) {
+void count_above_threshold(int* out_count, const nv_bfloat16* data, int n, float threshold, cudaStream_t stream) {
     count_above_threshold_impl(out_count, data, n, threshold, stream);
 }
 
-void count_above_threshold(int* out_count, const float* data, int n,
-                           float threshold, cudaStream_t stream) {
+void count_above_threshold(int* out_count, const float* data, int n, float threshold, cudaStream_t stream) {
     count_above_threshold_impl(out_count, data, n, threshold, stream);
 }
 
@@ -801,15 +765,13 @@ void count_invalid_indices(int* out_count, const int* indices, int n, int num_ex
 // ============================================================================
 // MoE per-expert bias add
 // ============================================================================
-template<typename T>
-__global__ void moe_expert_bias_add_forward_kernel(
-    T* __restrict__ out,
-    const T* __restrict__ inp,
-    const T* __restrict__ bias,
-    const int* __restrict__ expert_offsets,
-    int num_experts,
-    int hidden_size
-) {
+template <typename T>
+__global__ void moe_expert_bias_add_forward_kernel(T* __restrict__ out,
+                                                   const T* __restrict__ inp,
+                                                   const T* __restrict__ bias,
+                                                   const int* __restrict__ expert_offsets,
+                                                   int num_experts,
+                                                   int hidden_size) {
     int e = blockIdx.y;
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_experts || d >= hidden_size) return;
@@ -823,15 +785,13 @@ __global__ void moe_expert_bias_add_forward_kernel(
     }
 }
 
-template<typename T>
-__global__ void moe_expert_bias_add_backward_kernel(
-    T* __restrict__ d_inp,
-    float* __restrict__ d_bias,
-    const T* __restrict__ d_out,
-    const int* __restrict__ expert_offsets,
-    int num_experts,
-    int hidden_size
-) {
+template <typename T>
+__global__ void moe_expert_bias_add_backward_kernel(T* __restrict__ d_inp,
+                                                    float* __restrict__ d_bias,
+                                                    const T* __restrict__ d_out,
+                                                    const int* __restrict__ expert_offsets,
+                                                    int num_experts,
+                                                    int hidden_size) {
     int e = blockIdx.y;
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_experts || d >= hidden_size) return;
@@ -849,80 +809,84 @@ __global__ void moe_expert_bias_add_backward_kernel(
     d_bias[e * hidden_size + d] = sum;
 }
 
-void moe_expert_bias_add_forward(
-    float* out,
-    const float* inp,
-    const float* bias,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int total_tokens,
-    cudaStream_t stream
-) {
+void moe_expert_bias_add_forward(float* out,
+                                 const float* inp,
+                                 const float* bias,
+                                 const int* expert_offsets,
+                                 int num_experts,
+                                 int hidden_size,
+                                 int total_tokens,
+                                 cudaStream_t stream) {
     (void)total_tokens;
     if (num_experts <= 0 || hidden_size <= 0) return;
     dim3 block(256, 1, 1);
     dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
-    moe_expert_bias_add_forward_kernel<<<grid, block, 0, stream>>>(
-        out, inp, bias, expert_offsets, num_experts, hidden_size
-    );
+    moe_expert_bias_add_forward_kernel<<<grid, block, 0, stream>>>(out,
+                                                                   inp,
+                                                                   bias,
+                                                                   expert_offsets,
+                                                                   num_experts,
+                                                                   hidden_size);
 }
 
-void moe_expert_bias_add_forward(
-    nv_bfloat16* out,
-    const nv_bfloat16* inp,
-    const nv_bfloat16* bias,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int total_tokens,
-    cudaStream_t stream
-) {
+void moe_expert_bias_add_forward(nv_bfloat16* out,
+                                 const nv_bfloat16* inp,
+                                 const nv_bfloat16* bias,
+                                 const int* expert_offsets,
+                                 int num_experts,
+                                 int hidden_size,
+                                 int total_tokens,
+                                 cudaStream_t stream) {
     (void)total_tokens;
     if (num_experts <= 0 || hidden_size <= 0) return;
     dim3 block(256, 1, 1);
     dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
-    moe_expert_bias_add_forward_kernel<<<grid, block, 0, stream>>>(
-        out, inp, bias, expert_offsets, num_experts, hidden_size
-    );
+    moe_expert_bias_add_forward_kernel<<<grid, block, 0, stream>>>(out,
+                                                                   inp,
+                                                                   bias,
+                                                                   expert_offsets,
+                                                                   num_experts,
+                                                                   hidden_size);
 }
 
-void moe_expert_bias_add_backward(
-    float* d_inp,
-    float* d_bias,
-    const float* d_out,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int total_tokens,
-    cudaStream_t stream
-) {
+void moe_expert_bias_add_backward(float* d_inp,
+                                  float* d_bias,
+                                  const float* d_out,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int hidden_size,
+                                  int total_tokens,
+                                  cudaStream_t stream) {
     (void)total_tokens;
     if (num_experts <= 0 || hidden_size <= 0) return;
     dim3 block(256, 1, 1);
     dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
-    moe_expert_bias_add_backward_kernel<<<grid, block, 0, stream>>>(
-        d_inp, d_bias, d_out, expert_offsets, num_experts, hidden_size
-    );
+    moe_expert_bias_add_backward_kernel<<<grid, block, 0, stream>>>(d_inp,
+                                                                    d_bias,
+                                                                    d_out,
+                                                                    expert_offsets,
+                                                                    num_experts,
+                                                                    hidden_size);
 }
 
-void moe_expert_bias_add_backward(
-    nv_bfloat16* d_inp,
-    float* d_bias,
-    const nv_bfloat16* d_out,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int total_tokens,
-    cudaStream_t stream
-) {
+void moe_expert_bias_add_backward(nv_bfloat16* d_inp,
+                                  float* d_bias,
+                                  const nv_bfloat16* d_out,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int hidden_size,
+                                  int total_tokens,
+                                  cudaStream_t stream) {
     (void)total_tokens;
     if (num_experts <= 0 || hidden_size <= 0) return;
     dim3 block(256, 1, 1);
     dim3 grid((hidden_size + block.x - 1) / block.x, num_experts, 1);
-    moe_expert_bias_add_backward_kernel<<<grid, block, 0, stream>>>(
-        d_inp, d_bias, d_out, expert_offsets, num_experts, hidden_size
-    );
+    moe_expert_bias_add_backward_kernel<<<grid, block, 0, stream>>>(d_inp,
+                                                                    d_bias,
+                                                                    d_out,
+                                                                    expert_offsets,
+                                                                    num_experts,
+                                                                    hidden_size);
 }
 
 // ============================================================================
@@ -936,13 +900,11 @@ void moe_expert_bias_add_backward(
 // each block accumulates into a private shared histogram, then a single pass
 // flushes the per-block counts to global memory with one atomicAdd per expert.
 // This reduces global atomics from O(num_tokens * top_k) to O(num_experts * num_blocks).
-__global__ void moe_compute_expert_counts_kernel(
-    int* __restrict__ expert_counts,       // (num_experts,) output
-    const int* __restrict__ expert_indices, // (num_tokens, top_k)
-    int num_tokens,
-    int top_k,
-    int num_experts
-) {
+__global__ void moe_compute_expert_counts_kernel(int* __restrict__ expert_counts,         // (num_experts,) output
+                                                 const int* __restrict__ expert_indices,  // (num_tokens, top_k)
+                                                 int num_tokens,
+                                                 int top_k,
+                                                 int num_experts) {
     extern __shared__ int shared_hist[];
 
     // Zero shared histogram cooperatively
@@ -978,15 +940,14 @@ __global__ void moe_compute_expert_counts_kernel(
 // into a single warp-aggregated add, then each thread computes its slot
 // from the warp-local prefix count.
 __global__ void moe_compute_gather_indices_kernel(
-    int* __restrict__ gather_indices,      // (total_tokens,) output: index of token in original order
-    int* __restrict__ scatter_indices,     // (total_tokens,) output: inverse mapping
-    const int* __restrict__ expert_indices, // (num_tokens, top_k)
-    const int* __restrict__ expert_offsets, // (num_experts + 1,) cumsum of expert_counts
-    int* __restrict__ expert_positions,    // (num_experts,) current write position per expert
+    int* __restrict__ gather_indices,        // (total_tokens,) output: index of token in original order
+    int* __restrict__ scatter_indices,       // (total_tokens,) output: inverse mapping
+    const int* __restrict__ expert_indices,  // (num_tokens, top_k)
+    const int* __restrict__ expert_offsets,  // (num_experts + 1,) cumsum of expert_counts
+    int* __restrict__ expert_positions,      // (num_experts,) current write position per expert
     int num_tokens,
     int top_k,
-    int num_experts
-) {
+    int num_experts) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_assignments = num_tokens * top_k;
 
@@ -1000,7 +961,7 @@ __global__ void moe_compute_gather_indices_kernel(
     // Warp-aggregated atomic: find all lanes in this warp targeting the same expert
     // and batch them into a single atomicAdd.
     // We iterate over the set of unique expert_ids in this warp using a peer mask.
-    int remaining_mask = __ballot_sync(0xFFFFFFFFu, true); // mask of all active lanes
+    int remaining_mask = __ballot_sync(0xFFFFFFFFu, true);  // mask of all active lanes
     int slot = -1;
 
     while (remaining_mask) {
@@ -1035,23 +996,22 @@ __global__ void moe_compute_gather_indices_kernel(
     }
 
     int dest_idx = expert_offsets[expert_id] + slot;
-    gather_indices[dest_idx] = idx;  // Token assignment idx -> goes to position dest_idx
-    scatter_indices[idx] = dest_idx; // Inverse mapping
+    gather_indices[dest_idx] = idx;   // Token assignment idx -> goes to position dest_idx
+    scatter_indices[idx] = dest_idx;  // Inverse mapping
 }
 
 // Deterministic gather/scatter index construction.
 // Assignments are processed in strictly increasing `idx` order, so each expert's
 // local ordering is stable and identical across replicas/devices.
 // This avoids EP rank divergence caused by nondeterministic atomic scheduling.
-__global__ void moe_compute_gather_indices_deterministic_kernel(
-    int* __restrict__ gather_indices,       // (total_tokens,) output
-    int* __restrict__ scatter_indices,      // (total_tokens,) output
-    const int* __restrict__ expert_indices, // (num_tokens, top_k)
-    const int* __restrict__ expert_offsets, // (num_experts + 1)
-    int* __restrict__ expert_positions,     // (num_experts,) running positions
-    int total_assignments,
-    int num_experts
-) {
+__global__ void
+moe_compute_gather_indices_deterministic_kernel(int* __restrict__ gather_indices,        // (total_tokens,) output
+                                                int* __restrict__ scatter_indices,       // (total_tokens,) output
+                                                const int* __restrict__ expert_indices,  // (num_tokens, top_k)
+                                                const int* __restrict__ expert_offsets,  // (num_experts + 1)
+                                                int* __restrict__ expert_positions,  // (num_experts,) running positions
+                                                int total_assignments,
+                                                int num_experts) {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
@@ -1069,17 +1029,15 @@ __global__ void moe_compute_gather_indices_deterministic_kernel(
 }
 
 // Permute hidden states from token order to expert-grouped order
-template<typename T>
-__global__ void moe_permute_tokens_kernel(
-    T* __restrict__ out,                   // (total_tokens, hidden_size)
-    const T* __restrict__ inp,             // (num_tokens, hidden_size)
-    const int* __restrict__ gather_indices, // (total_tokens,)
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k
-) {
-    using x128 = GenericVector<T, 16/sizeof(T)>;
+template <typename T>
+__global__ void moe_permute_tokens_kernel(T* __restrict__ out,                     // (total_tokens, hidden_size)
+                                          const T* __restrict__ inp,               // (num_tokens, hidden_size)
+                                          const int* __restrict__ gather_indices,  // (total_tokens,)
+                                          int total_tokens,
+                                          int num_tokens,
+                                          int hidden_size,
+                                          int top_k) {
+    using x128 = GenericVector<T, 16 / sizeof(T)>;
 
     int out_idx = blockIdx.x;
     if (out_idx >= total_tokens) return;
@@ -1103,18 +1061,16 @@ __global__ void moe_permute_tokens_kernel(
 }
 
 // Unpermute and weight-combine expert outputs back to token order
-template<typename T>
-__global__ void moe_unpermute_and_combine_kernel(
-    T* __restrict__ out,                    // (num_tokens, hidden_size)
-    const T* __restrict__ expert_out,       // (total_tokens, hidden_size)
-    const T* __restrict__ routing_weights,  // (num_tokens, top_k)
-    const int* __restrict__ scatter_indices, // (total_tokens,)
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k
-) {
-    using x128 = GenericVector<T, 16/sizeof(T)>;
+template <typename T>
+__global__ void moe_unpermute_and_combine_kernel(T* __restrict__ out,                    // (num_tokens, hidden_size)
+                                                 const T* __restrict__ expert_out,       // (total_tokens, hidden_size)
+                                                 const T* __restrict__ routing_weights,  // (num_tokens, top_k)
+                                                 const int* __restrict__ scatter_indices,  // (total_tokens,)
+                                                 int num_tokens,
+                                                 int total_tokens,
+                                                 int hidden_size,
+                                                 int top_k) {
+    using x128 = GenericVector<T, 16 / sizeof(T)>;
 
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -1163,18 +1119,17 @@ __global__ void moe_unpermute_and_combine_kernel(
 }
 
 // Unpermute and weight-combine expert outputs back to token order (FP32 routing weights)
-template<typename T>
-__global__ void moe_unpermute_and_combine_kernel_mixed(
-    T* __restrict__ out,                    // (num_tokens, hidden_size)
-    const T* __restrict__ expert_out,       // (total_tokens, hidden_size)
-    const float* __restrict__ routing_weights,  // (num_tokens, top_k) in FP32
-    const int* __restrict__ scatter_indices, // (total_tokens,)
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k
-) {
-    using x128 = GenericVector<T, 16/sizeof(T)>;
+template <typename T>
+__global__ void
+moe_unpermute_and_combine_kernel_mixed(T* __restrict__ out,                        // (num_tokens, hidden_size)
+                                       const T* __restrict__ expert_out,           // (total_tokens, hidden_size)
+                                       const float* __restrict__ routing_weights,  // (num_tokens, top_k) in FP32
+                                       const int* __restrict__ scatter_indices,    // (total_tokens,)
+                                       int num_tokens,
+                                       int total_tokens,
+                                       int hidden_size,
+                                       int top_k) {
+    using x128 = GenericVector<T, 16 / sizeof(T)>;
 
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -1230,24 +1185,22 @@ __global__ void moe_unpermute_and_combine_kernel_mixed(
 // where f_e = fraction of tokens routed to expert e
 //       P_e = average routing probability to expert e
 
-template<typename T>
-__global__ void moe_aux_loss_kernel(
-    float* __restrict__ aux_loss,          // scalar output
-    float* __restrict__ router_z_loss,     // scalar output (optional)
-    const T* __restrict__ routing_probs,   // (num_tokens, num_experts) - post softmax
-    const int* __restrict__ expert_indices, // (num_tokens, top_k)
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    float aux_loss_coef,
-    float z_loss_coef
-) {
+template <typename T>
+__global__ void moe_aux_loss_kernel(float* __restrict__ aux_loss,            // scalar output
+                                    float* __restrict__ router_z_loss,       // scalar output (optional)
+                                    const T* __restrict__ routing_probs,     // (num_tokens, num_experts) - post softmax
+                                    const int* __restrict__ expert_indices,  // (num_tokens, top_k)
+                                    int num_tokens,
+                                    int num_experts,
+                                    int top_k,
+                                    float aux_loss_coef,
+                                    float z_loss_coef) {
     // This kernel computes both load-balancing loss and router z-loss
     // For simplicity, use atomics; production should use proper reductions
 
     extern __shared__ float smem[];
-    float* expert_fractions = smem;                    // num_experts
-    float* expert_probs = smem + num_experts;          // num_experts
+    float* expert_fractions = smem;            // num_experts
+    float* expert_probs = smem + num_experts;  // num_experts
 
     // Initialize shared memory
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
@@ -1299,14 +1252,13 @@ __global__ void moe_aux_loss_kernel(
 // The logsumexp is computed as: max + log(sum(exp(x - max)))
 // This is numerically stable and avoids overflow.
 
-template<typename T, int BLOCK_SIZE = 256>
-__global__ void moe_router_z_loss_kernel(
-    float* __restrict__ z_loss,           // scalar output (accumulated via atomicAdd)
-    const T* __restrict__ router_logits,  // (num_tokens, num_experts) - pre-softmax
-    int num_tokens,
-    int num_experts,
-    float z_loss_coef
-) {
+template <typename T, int BLOCK_SIZE = 256>
+__global__ void
+moe_router_z_loss_kernel(float* __restrict__ z_loss,           // scalar output (accumulated via atomicAdd)
+                         const T* __restrict__ router_logits,  // (num_tokens, num_experts) - pre-softmax
+                         int num_tokens,
+                         int num_experts,
+                         float z_loss_coef) {
     // Each block processes one token (row)
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -1376,14 +1328,13 @@ __global__ void moe_router_z_loss_kernel(
 
 // Z-loss backward kernel
 // d_logits = coef * (2 * logsumexp / num_tokens) * softmax(logits)
-template<typename T, int BLOCK_SIZE = 256>
-__global__ void moe_router_z_loss_backward_kernel(
-    T* __restrict__ d_logits,             // (num_tokens, num_experts) - gradient output
-    const T* __restrict__ router_logits,  // (num_tokens, num_experts) - pre-softmax
-    int num_tokens,
-    int num_experts,
-    float z_loss_coef
-) {
+template <typename T, int BLOCK_SIZE = 256>
+__global__ void
+moe_router_z_loss_backward_kernel(T* __restrict__ d_logits,             // (num_tokens, num_experts) - gradient output
+                                  const T* __restrict__ router_logits,  // (num_tokens, num_experts) - pre-softmax
+                                  int num_tokens,
+                                  int num_experts,
+                                  float z_loss_coef) {
     // Each block processes one token (row)
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -1453,132 +1404,76 @@ __global__ void moe_router_z_loss_backward_kernel(
 // Host Wrapper Functions
 // ============================================================================
 
-void moe_softmax_forward(
-    nv_bfloat16* out,
-    const nv_bfloat16* inp,
-    int num_tokens,
-    int num_experts,
-    cudaStream_t stream
-) {
+void moe_softmax_forward(nv_bfloat16* out,
+                         const nv_bfloat16* inp,
+                         int num_tokens,
+                         int num_experts,
+                         cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_softmax_forward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        out, inp, num_tokens, num_experts
-    );
+    moe_softmax_forward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(out, inp, num_tokens, num_experts);
 }
 
-void moe_softmax_forward(
-    float* out,
-    const float* inp,
-    int num_tokens,
-    int num_experts,
-    cudaStream_t stream
-) {
+void moe_softmax_forward(float* out, const float* inp, int num_tokens, int num_experts, cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_softmax_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        out, inp, num_tokens, num_experts
-    );
+    moe_softmax_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(out, inp, num_tokens, num_experts);
 }
 
-void moe_sigmoid_forward(
-    nv_bfloat16* out,
-    const nv_bfloat16* inp,
-    int num_elements,
-    cudaStream_t stream
-) {
+void moe_sigmoid_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_elements, cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_elements + block_size - 1) / block_size;
-    moe_sigmoid_forward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        out, inp, num_elements
-    );
+    moe_sigmoid_forward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(out, inp, num_elements);
 }
 
-void moe_sigmoid_forward(
-    float* out,
-    const float* inp,
-    int num_elements,
-    cudaStream_t stream
-) {
+void moe_sigmoid_forward(float* out, const float* inp, int num_elements, cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_elements + block_size - 1) / block_size;
-    moe_sigmoid_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        out, inp, num_elements
-    );
+    moe_sigmoid_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(out, inp, num_elements);
 }
 
-void moe_sigmoid_backward(
-    nv_bfloat16* d_inp,
-    const nv_bfloat16* grad,
-    const nv_bfloat16* out,
-    int num_elements,
-    cudaStream_t stream
-) {
+void moe_sigmoid_backward(nv_bfloat16* d_inp,
+                          const nv_bfloat16* grad,
+                          const nv_bfloat16* out,
+                          int num_elements,
+                          cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_elements + block_size - 1) / block_size;
-    moe_sigmoid_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        d_inp, grad, out, num_elements
-    );
+    moe_sigmoid_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(d_inp, grad, out, num_elements);
 }
 
-void moe_sigmoid_backward(
-    float* d_inp,
-    const float* grad,
-    const float* out,
-    int num_elements,
-    cudaStream_t stream
-) {
+void moe_sigmoid_backward(float* d_inp, const float* grad, const float* out, int num_elements, cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_elements + block_size - 1) / block_size;
-    moe_sigmoid_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        d_inp, grad, out, num_elements
-    );
+    moe_sigmoid_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(d_inp, grad, out, num_elements);
 }
 
-void moe_scale_forward(
-    nv_bfloat16* out,
-    const nv_bfloat16* inp,
-    float scale,
-    int num_elements,
-    cudaStream_t stream
-) {
+void moe_scale_forward(nv_bfloat16* out, const nv_bfloat16* inp, float scale, int num_elements, cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_elements + block_size - 1) / block_size;
-    moe_scale_forward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        out, inp, scale, num_elements
-    );
+    moe_scale_forward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(out, inp, scale, num_elements);
 }
 
-void moe_scale_forward(
-    float* out,
-    const float* inp,
-    float scale,
-    int num_elements,
-    cudaStream_t stream
-) {
+void moe_scale_forward(float* out, const float* inp, float scale, int num_elements, cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_elements + block_size - 1) / block_size;
-    moe_scale_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        out, inp, scale, num_elements
-    );
+    moe_scale_forward_kernel<float><<<grid_size, block_size, 0, stream>>>(out, inp, scale, num_elements);
 }
 
 // Dispatch helper: select template K and launch warp-per-token kernel
-template<typename T>
-static void moe_topk_forward_dispatch(
-    int* expert_indices,
-    T* routing_weights,
-    const T* scores,
-    const float* correction_bias,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    bool normalize_weights,
-    bool softmax_weights,
-    bool sort_by_index,
-    float rounding_scale,
-    cudaStream_t stream
-) {
+template <typename T>
+static void moe_topk_forward_dispatch(int* expert_indices,
+                                      T* routing_weights,
+                                      const T* scores,
+                                      const float* correction_bias,
+                                      int num_tokens,
+                                      int num_experts,
+                                      int top_k,
+                                      bool normalize_weights,
+                                      bool softmax_weights,
+                                      bool sort_by_index,
+                                      float rounding_scale,
+                                      cudaStream_t stream) {
     // 8 warps per block = 256 threads, each warp handles one token
     constexpr int warps_per_block = 8;
     constexpr int block_size = warps_per_block * MOE_WARP_SIZE;
@@ -1586,97 +1481,144 @@ static void moe_topk_forward_dispatch(
 
     // Template-specialize for common K values to enable full unrolling
     switch (top_k) {
-    case 1:
-        moe_topk_forward_kernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
-            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
-        break;
-    case 2:
-        moe_topk_forward_kernel<T, 2><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
-            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
-        break;
-    case 4:
-        moe_topk_forward_kernel<T, 4><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
-            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
-        break;
-    default:
-        // K=8 covers top_k 3,5,6,7,8 — the merge always produces K entries,
-        // but we only write top_k of them via the lane < top_k guard.
-        moe_topk_forward_kernel<T, 8><<<grid_size, block_size, 0, stream>>>(
-            expert_indices, routing_weights, scores, correction_bias, num_tokens, num_experts, top_k,
-            normalize_weights, softmax_weights, sort_by_index, rounding_scale);
-        break;
+        case 1:
+            moe_topk_forward_kernel<T, 1><<<grid_size, block_size, 0, stream>>>(expert_indices,
+                                                                                routing_weights,
+                                                                                scores,
+                                                                                correction_bias,
+                                                                                num_tokens,
+                                                                                num_experts,
+                                                                                top_k,
+                                                                                normalize_weights,
+                                                                                softmax_weights,
+                                                                                sort_by_index,
+                                                                                rounding_scale);
+            break;
+        case 2:
+            moe_topk_forward_kernel<T, 2><<<grid_size, block_size, 0, stream>>>(expert_indices,
+                                                                                routing_weights,
+                                                                                scores,
+                                                                                correction_bias,
+                                                                                num_tokens,
+                                                                                num_experts,
+                                                                                top_k,
+                                                                                normalize_weights,
+                                                                                softmax_weights,
+                                                                                sort_by_index,
+                                                                                rounding_scale);
+            break;
+        case 4:
+            moe_topk_forward_kernel<T, 4><<<grid_size, block_size, 0, stream>>>(expert_indices,
+                                                                                routing_weights,
+                                                                                scores,
+                                                                                correction_bias,
+                                                                                num_tokens,
+                                                                                num_experts,
+                                                                                top_k,
+                                                                                normalize_weights,
+                                                                                softmax_weights,
+                                                                                sort_by_index,
+                                                                                rounding_scale);
+            break;
+        default:
+            // K=8 covers top_k 3,5,6,7,8 — the merge always produces K entries,
+            // but we only write top_k of them via the lane < top_k guard.
+            moe_topk_forward_kernel<T, 8><<<grid_size, block_size, 0, stream>>>(expert_indices,
+                                                                                routing_weights,
+                                                                                scores,
+                                                                                correction_bias,
+                                                                                num_tokens,
+                                                                                num_experts,
+                                                                                top_k,
+                                                                                normalize_weights,
+                                                                                softmax_weights,
+                                                                                sort_by_index,
+                                                                                rounding_scale);
+            break;
     }
 }
 
-void moe_topk_forward(
-    int* expert_indices,
-    nv_bfloat16* routing_weights,
-    const nv_bfloat16* scores,
-    const float* correction_bias,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    bool normalize_weights,
-    bool softmax_weights,
-    bool sort_by_index,
-    float rounding_scale,
-    cudaStream_t stream
-) {
-    moe_topk_forward_dispatch(expert_indices, routing_weights, scores, correction_bias,
-                              num_tokens, num_experts, top_k, normalize_weights,
-                              softmax_weights, sort_by_index, rounding_scale, stream);
+void moe_topk_forward(int* expert_indices,
+                      nv_bfloat16* routing_weights,
+                      const nv_bfloat16* scores,
+                      const float* correction_bias,
+                      int num_tokens,
+                      int num_experts,
+                      int top_k,
+                      bool normalize_weights,
+                      bool softmax_weights,
+                      bool sort_by_index,
+                      float rounding_scale,
+                      cudaStream_t stream) {
+    moe_topk_forward_dispatch(expert_indices,
+                              routing_weights,
+                              scores,
+                              correction_bias,
+                              num_tokens,
+                              num_experts,
+                              top_k,
+                              normalize_weights,
+                              softmax_weights,
+                              sort_by_index,
+                              rounding_scale,
+                              stream);
 }
 
-void moe_topk_forward(
-    int* expert_indices,
-    float* routing_weights,
-    const float* scores,
-    const float* correction_bias,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    bool normalize_weights,
-    bool softmax_weights,
-    bool sort_by_index,
-    float rounding_scale,
-    cudaStream_t stream
-) {
-    moe_topk_forward_dispatch(expert_indices, routing_weights, scores, correction_bias,
-                              num_tokens, num_experts, top_k, normalize_weights,
-                              softmax_weights, sort_by_index, rounding_scale, stream);
+void moe_topk_forward(int* expert_indices,
+                      float* routing_weights,
+                      const float* scores,
+                      const float* correction_bias,
+                      int num_tokens,
+                      int num_experts,
+                      int top_k,
+                      bool normalize_weights,
+                      bool softmax_weights,
+                      bool sort_by_index,
+                      float rounding_scale,
+                      cudaStream_t stream) {
+    moe_topk_forward_dispatch(expert_indices,
+                              routing_weights,
+                              scores,
+                              correction_bias,
+                              num_tokens,
+                              num_experts,
+                              top_k,
+                              normalize_weights,
+                              softmax_weights,
+                              sort_by_index,
+                              rounding_scale,
+                              stream);
 }
 
-void moe_topk_backward(
-    float* d_probs,
-    const float* d_routing_weights,
-    const float* probs,
-    const int* expert_indices,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    bool normalize_weights,
-    bool softmax_weights,
-    cudaStream_t stream
-) {
+void moe_topk_backward(float* d_probs,
+                       const float* d_routing_weights,
+                       const float* probs,
+                       const int* expert_indices,
+                       int num_tokens,
+                       int num_experts,
+                       int top_k,
+                       bool normalize_weights,
+                       bool softmax_weights,
+                       cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_tokens + block_size - 1) / block_size;
-    moe_topk_backward_kernel<<<grid_size, block_size, 0, stream>>>(
-        d_probs, d_routing_weights, probs, expert_indices,
-        num_tokens, num_experts, top_k, normalize_weights, softmax_weights
-    );
+    moe_topk_backward_kernel<<<grid_size, block_size, 0, stream>>>(d_probs,
+                                                                   d_routing_weights,
+                                                                   probs,
+                                                                   expert_indices,
+                                                                   num_tokens,
+                                                                   num_experts,
+                                                                   top_k,
+                                                                   normalize_weights,
+                                                                   softmax_weights);
 }
 
-void moe_compute_expert_counts(
-    int* expert_counts,
-    const int* expert_indices,
-    int num_tokens,
-    int top_k,
-    int num_experts,
-    cudaStream_t stream
-) {
+void moe_compute_expert_counts(int* expert_counts,
+                               const int* expert_indices,
+                               int num_tokens,
+                               int top_k,
+                               int num_experts,
+                               cudaStream_t stream) {
     // Zero the output first
     cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
 
@@ -1686,19 +1628,19 @@ void moe_compute_expert_counts(
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
     size_t smem = num_experts * sizeof(int);
-    moe_compute_expert_counts_kernel<<<grid_size, block_size, smem, stream>>>(
-        expert_counts, expert_indices, num_tokens, top_k, num_experts
-    );
+    moe_compute_expert_counts_kernel<<<grid_size, block_size, smem, stream>>>(expert_counts,
+                                                                              expert_indices,
+                                                                              num_tokens,
+                                                                              top_k,
+                                                                              num_experts);
 }
 
 // Compute exclusive prefix sum of expert_counts into expert_offsets (length num_experts + 1).
 // num_experts is small (typically <= 128), so a single-thread kernel is sufficient and avoids
 // alignment/temporary-storage pitfalls of generic scan implementations.
-__global__ void moe_compute_expert_offsets_kernel(
-    int* __restrict__ expert_offsets,
-    const int* __restrict__ expert_counts,
-    int num_experts
-) {
+__global__ void moe_compute_expert_offsets_kernel(int* __restrict__ expert_offsets,
+                                                  const int* __restrict__ expert_counts,
+                                                  int num_experts) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     int sum = 0;
     expert_offsets[0] = 0;
@@ -1708,12 +1650,7 @@ __global__ void moe_compute_expert_offsets_kernel(
     }
 }
 
-void moe_compute_expert_offsets(
-    int* expert_offsets,
-    const int* expert_counts,
-    int num_experts,
-    cudaStream_t stream
-) {
+void moe_compute_expert_offsets(int* expert_offsets, const int* expert_counts, int num_experts, cudaStream_t stream) {
     // Compute exclusive prefix sum of expert_counts.
     // We intentionally use a tiny single-thread kernel here:
     // - num_experts is small (typically <= 128)
@@ -1723,26 +1660,27 @@ void moe_compute_expert_offsets(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void moe_build_indices(
-    int* gather_indices,
-    int* scatter_indices,
-    const int* expert_indices,
-    const int* expert_offsets,
-    int* expert_positions,
-    int num_tokens,
-    int top_k,
-    int num_experts,
-    cudaStream_t stream
-) {
+void moe_build_indices(int* gather_indices,
+                       int* scatter_indices,
+                       const int* expert_indices,
+                       const int* expert_offsets,
+                       int* expert_positions,
+                       int num_tokens,
+                       int top_k,
+                       int num_experts,
+                       cudaStream_t stream) {
     int total = num_tokens * top_k;
     if (total == 0) return;  // No tokens to index
 
     // Use deterministic index construction so EP replicas observe identical
     // per-expert token ordering across devices/ranks.
-    moe_compute_gather_indices_deterministic_kernel<<<1, 1, 0, stream>>>(
-        gather_indices, scatter_indices, expert_indices, expert_offsets,
-        expert_positions, total, num_experts
-    );
+    moe_compute_gather_indices_deterministic_kernel<<<1, 1, 0, stream>>>(gather_indices,
+                                                                         scatter_indices,
+                                                                         expert_indices,
+                                                                         expert_offsets,
+                                                                         expert_positions,
+                                                                         total,
+                                                                         num_experts);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1750,12 +1688,10 @@ void moe_build_indices(
 // Expert Index Remapping Kernel for Selective Dequantization
 // ============================================================================
 
-__global__ void moe_remap_expert_indices_kernel(
-    int* __restrict__ remapped_indices,
-    const int* __restrict__ expert_indices,
-    const int* __restrict__ expert_to_compact,
-    int total_elements
-) {
+__global__ void moe_remap_expert_indices_kernel(int* __restrict__ remapped_indices,
+                                                const int* __restrict__ expert_indices,
+                                                const int* __restrict__ expert_to_compact,
+                                                int total_elements) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
 
@@ -1764,155 +1700,160 @@ __global__ void moe_remap_expert_indices_kernel(
     remapped_indices[idx] = compact_expert;
 }
 
-void moe_remap_expert_indices(
-    int* remapped_indices,
-    const int* expert_indices,
-    const int* expert_to_compact,
-    int num_tokens,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_remap_expert_indices(int* remapped_indices,
+                              const int* expert_indices,
+                              const int* expert_to_compact,
+                              int num_tokens,
+                              int top_k,
+                              cudaStream_t stream) {
     int total = num_tokens * top_k;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
 
-    moe_remap_expert_indices_kernel<<<grid_size, block_size, 0, stream>>>(
-        remapped_indices, expert_indices, expert_to_compact, total
-    );
+    moe_remap_expert_indices_kernel<<<grid_size, block_size, 0, stream>>>(remapped_indices,
+                                                                          expert_indices,
+                                                                          expert_to_compact,
+                                                                          total);
 }
 
-void moe_permute_tokens(
-    nv_bfloat16* out,
-    const nv_bfloat16* inp,
-    const int* gather_indices,
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_permute_tokens(nv_bfloat16* out,
+                        const nv_bfloat16* inp,
+                        const int* gather_indices,
+                        int total_tokens,
+                        int num_tokens,
+                        int hidden_size,
+                        int top_k,
+                        cudaStream_t stream) {
     if (total_tokens == 0) return;
     int block_size = 256;
     int grid_size = total_tokens;
-    moe_permute_tokens_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        out, inp, gather_indices, total_tokens, num_tokens, hidden_size, top_k
-    );
+    moe_permute_tokens_kernel<nv_bfloat16>
+        <<<grid_size, block_size, 0, stream>>>(out, inp, gather_indices, total_tokens, num_tokens, hidden_size, top_k);
 }
 
-void moe_permute_tokens(
-    float* out,
-    const float* inp,
-    const int* gather_indices,
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_permute_tokens(float* out,
+                        const float* inp,
+                        const int* gather_indices,
+                        int total_tokens,
+                        int num_tokens,
+                        int hidden_size,
+                        int top_k,
+                        cudaStream_t stream) {
     if (total_tokens == 0) return;
     int block_size = 256;
     int grid_size = total_tokens;
-    moe_permute_tokens_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        out, inp, gather_indices, total_tokens, num_tokens, hidden_size, top_k
-    );
+    moe_permute_tokens_kernel<float>
+        <<<grid_size, block_size, 0, stream>>>(out, inp, gather_indices, total_tokens, num_tokens, hidden_size, top_k);
 }
 
-void moe_unpermute_and_combine(
-    nv_bfloat16* out,
-    const nv_bfloat16* expert_out,
-    const nv_bfloat16* routing_weights,
-    const int* scatter_indices,
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_unpermute_and_combine(nv_bfloat16* out,
+                               const nv_bfloat16* expert_out,
+                               const nv_bfloat16* routing_weights,
+                               const int* scatter_indices,
+                               int num_tokens,
+                               int total_tokens,
+                               int hidden_size,
+                               int top_k,
+                               cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_unpermute_and_combine_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        out, expert_out, routing_weights, scatter_indices,
-        num_tokens, total_tokens, hidden_size, top_k
-    );
+    moe_unpermute_and_combine_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(out,
+                                                                                        expert_out,
+                                                                                        routing_weights,
+                                                                                        scatter_indices,
+                                                                                        num_tokens,
+                                                                                        total_tokens,
+                                                                                        hidden_size,
+                                                                                        top_k);
 }
 
-void moe_unpermute_and_combine(
-    nv_bfloat16* out,
-    const nv_bfloat16* expert_out,
-    const float* routing_weights,
-    const int* scatter_indices,
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_unpermute_and_combine(nv_bfloat16* out,
+                               const nv_bfloat16* expert_out,
+                               const float* routing_weights,
+                               const int* scatter_indices,
+                               int num_tokens,
+                               int total_tokens,
+                               int hidden_size,
+                               int top_k,
+                               cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_unpermute_and_combine_kernel_mixed<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        out, expert_out, routing_weights, scatter_indices,
-        num_tokens, total_tokens, hidden_size, top_k
-    );
+    moe_unpermute_and_combine_kernel_mixed<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(out,
+                                                                                              expert_out,
+                                                                                              routing_weights,
+                                                                                              scatter_indices,
+                                                                                              num_tokens,
+                                                                                              total_tokens,
+                                                                                              hidden_size,
+                                                                                              top_k);
 }
 
-void moe_unpermute_and_combine(
-    float* out,
-    const float* expert_out,
-    const float* routing_weights,
-    const int* scatter_indices,
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_unpermute_and_combine(float* out,
+                               const float* expert_out,
+                               const float* routing_weights,
+                               const int* scatter_indices,
+                               int num_tokens,
+                               int total_tokens,
+                               int hidden_size,
+                               int top_k,
+                               cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_unpermute_and_combine_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        out, expert_out, routing_weights, scatter_indices,
-        num_tokens, total_tokens, hidden_size, top_k
-    );
+    moe_unpermute_and_combine_kernel<float><<<grid_size, block_size, 0, stream>>>(out,
+                                                                                  expert_out,
+                                                                                  routing_weights,
+                                                                                  scatter_indices,
+                                                                                  num_tokens,
+                                                                                  total_tokens,
+                                                                                  hidden_size,
+                                                                                  top_k);
 }
 
-void moe_compute_aux_loss(
-    float* aux_loss,
-    const nv_bfloat16* routing_probs,
-    const int* expert_indices,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    float aux_loss_coef,
-    cudaStream_t stream
-) {
+void moe_compute_aux_loss(float* aux_loss,
+                          const nv_bfloat16* routing_probs,
+                          const int* expert_indices,
+                          int num_tokens,
+                          int num_experts,
+                          int top_k,
+                          float aux_loss_coef,
+                          cudaStream_t stream) {
     // Initialize output
     cudaMemsetAsync(aux_loss, 0, sizeof(float), stream);
 
     int block_size = 256;
     int shared_mem = 2 * num_experts * sizeof(float);
-    moe_aux_loss_kernel<nv_bfloat16><<<1, block_size, shared_mem, stream>>>(
-        aux_loss, nullptr, routing_probs, expert_indices,
-        num_tokens, num_experts, top_k, aux_loss_coef, 0.0f
-    );
+    moe_aux_loss_kernel<nv_bfloat16><<<1, block_size, shared_mem, stream>>>(aux_loss,
+                                                                            nullptr,
+                                                                            routing_probs,
+                                                                            expert_indices,
+                                                                            num_tokens,
+                                                                            num_experts,
+                                                                            top_k,
+                                                                            aux_loss_coef,
+                                                                            0.0f);
 }
 
-void moe_compute_aux_loss(
-    float* aux_loss,
-    const float* routing_probs,
-    const int* expert_indices,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    float aux_loss_coef,
-    cudaStream_t stream
-) {
+void moe_compute_aux_loss(float* aux_loss,
+                          const float* routing_probs,
+                          const int* expert_indices,
+                          int num_tokens,
+                          int num_experts,
+                          int top_k,
+                          float aux_loss_coef,
+                          cudaStream_t stream) {
     cudaMemsetAsync(aux_loss, 0, sizeof(float), stream);
 
     int block_size = 256;
     int shared_mem = 2 * num_experts * sizeof(float);
-    moe_aux_loss_kernel<float><<<1, block_size, shared_mem, stream>>>(
-        aux_loss, nullptr, routing_probs, expert_indices,
-        num_tokens, num_experts, top_k, aux_loss_coef, 0.0f
-    );
+    moe_aux_loss_kernel<float><<<1, block_size, shared_mem, stream>>>(aux_loss,
+                                                                      nullptr,
+                                                                      routing_probs,
+                                                                      expert_indices,
+                                                                      num_tokens,
+                                                                      num_experts,
+                                                                      top_k,
+                                                                      aux_loss_coef,
+                                                                      0.0f);
 }
 
 // ============================================================================
@@ -1922,19 +1863,18 @@ void moe_compute_aux_loss(
 // and accumulates into a persistent stats buffer via atomicAdd.
 // stats layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
 
-template<typename T>
-__global__ void moe_routing_stats_kernel(
-    float* __restrict__ stats,              // [5] accumulated stats
-    const T* __restrict__ routing_probs,    // (num_tokens, num_experts) post-softmax/sigmoid
-    const int* __restrict__ expert_indices, // (num_tokens, top_k)
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    float aux_loss_coef
-) {
+template <typename T>
+__global__ void
+moe_routing_stats_kernel(float* __restrict__ stats,               // [5] accumulated stats
+                         const T* __restrict__ routing_probs,     // (num_tokens, num_experts) post-softmax/sigmoid
+                         const int* __restrict__ expert_indices,  // (num_tokens, top_k)
+                         int num_tokens,
+                         int num_experts,
+                         int top_k,
+                         float aux_loss_coef) {
     extern __shared__ float smem[];
-    float* expert_counts = smem;                   // num_experts
-    float* expert_probs  = smem + num_experts;     // num_experts
+    float* expert_counts = smem;               // num_experts
+    float* expert_probs = smem + num_experts;  // num_experts
 
     // Initialize shared memory
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
@@ -1988,105 +1928,95 @@ __global__ void moe_routing_stats_kernel(
     }
 }
 
-void moe_compute_routing_stats(
-    float* stats,
-    const nv_bfloat16* routing_probs,
-    const int* expert_indices,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    float aux_loss_coef,
-    cudaStream_t stream
-) {
+void moe_compute_routing_stats(float* stats,
+                               const nv_bfloat16* routing_probs,
+                               const int* expert_indices,
+                               int num_tokens,
+                               int num_experts,
+                               int top_k,
+                               float aux_loss_coef,
+                               cudaStream_t stream) {
     int block_size = 256;
     int shared_mem = 2 * num_experts * sizeof(float);
-    moe_routing_stats_kernel<nv_bfloat16><<<1, block_size, shared_mem, stream>>>(
-        stats, routing_probs, expert_indices,
-        num_tokens, num_experts, top_k, aux_loss_coef
-    );
+    moe_routing_stats_kernel<nv_bfloat16><<<1, block_size, shared_mem, stream>>>(stats,
+                                                                                 routing_probs,
+                                                                                 expert_indices,
+                                                                                 num_tokens,
+                                                                                 num_experts,
+                                                                                 top_k,
+                                                                                 aux_loss_coef);
 }
 
-void moe_compute_routing_stats(
-    float* stats,
-    const float* routing_probs,
-    const int* expert_indices,
-    int num_tokens,
-    int num_experts,
-    int top_k,
-    float aux_loss_coef,
-    cudaStream_t stream
-) {
+void moe_compute_routing_stats(float* stats,
+                               const float* routing_probs,
+                               const int* expert_indices,
+                               int num_tokens,
+                               int num_experts,
+                               int top_k,
+                               float aux_loss_coef,
+                               cudaStream_t stream) {
     int block_size = 256;
     int shared_mem = 2 * num_experts * sizeof(float);
-    moe_routing_stats_kernel<float><<<1, block_size, shared_mem, stream>>>(
-        stats, routing_probs, expert_indices,
-        num_tokens, num_experts, top_k, aux_loss_coef
-    );
+    moe_routing_stats_kernel<float><<<1, block_size, shared_mem, stream>>>(stats,
+                                                                           routing_probs,
+                                                                           expert_indices,
+                                                                           num_tokens,
+                                                                           num_experts,
+                                                                           top_k,
+                                                                           aux_loss_coef);
 }
 
-void moe_router_z_loss_forward(
-    float* z_loss,
-    const nv_bfloat16* router_logits,
-    int num_tokens,
-    int num_experts,
-    float z_loss_coef,
-    cudaStream_t stream
-) {
+void moe_router_z_loss_forward(float* z_loss,
+                               const nv_bfloat16* router_logits,
+                               int num_tokens,
+                               int num_experts,
+                               float z_loss_coef,
+                               cudaStream_t stream) {
     // Initialize output to zero (will be accumulated via atomicAdd)
     cudaMemsetAsync(z_loss, 0, sizeof(float), stream);
 
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_router_z_loss_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        z_loss, router_logits, num_tokens, num_experts, z_loss_coef
-    );
+    moe_router_z_loss_kernel<nv_bfloat16>
+        <<<grid_size, block_size, 0, stream>>>(z_loss, router_logits, num_tokens, num_experts, z_loss_coef);
 }
 
-void moe_router_z_loss_forward(
-    float* z_loss,
-    const float* router_logits,
-    int num_tokens,
-    int num_experts,
-    float z_loss_coef,
-    cudaStream_t stream
-) {
+void moe_router_z_loss_forward(float* z_loss,
+                               const float* router_logits,
+                               int num_tokens,
+                               int num_experts,
+                               float z_loss_coef,
+                               cudaStream_t stream) {
     cudaMemsetAsync(z_loss, 0, sizeof(float), stream);
 
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_router_z_loss_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        z_loss, router_logits, num_tokens, num_experts, z_loss_coef
-    );
+    moe_router_z_loss_kernel<float>
+        <<<grid_size, block_size, 0, stream>>>(z_loss, router_logits, num_tokens, num_experts, z_loss_coef);
 }
 
-void moe_router_z_loss_backward(
-    nv_bfloat16* d_logits,
-    const nv_bfloat16* router_logits,
-    int num_tokens,
-    int num_experts,
-    float z_loss_coef,
-    cudaStream_t stream
-) {
+void moe_router_z_loss_backward(nv_bfloat16* d_logits,
+                                const nv_bfloat16* router_logits,
+                                int num_tokens,
+                                int num_experts,
+                                float z_loss_coef,
+                                cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_router_z_loss_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        d_logits, router_logits, num_tokens, num_experts, z_loss_coef
-    );
+    moe_router_z_loss_backward_kernel<nv_bfloat16>
+        <<<grid_size, block_size, 0, stream>>>(d_logits, router_logits, num_tokens, num_experts, z_loss_coef);
 }
 
-void moe_router_z_loss_backward(
-    float* d_logits,
-    const float* router_logits,
-    int num_tokens,
-    int num_experts,
-    float z_loss_coef,
-    cudaStream_t stream
-) {
+void moe_router_z_loss_backward(float* d_logits,
+                                const float* router_logits,
+                                int num_tokens,
+                                int num_experts,
+                                float z_loss_coef,
+                                cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_router_z_loss_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        d_logits, router_logits, num_tokens, num_experts, z_loss_coef
-    );
+    moe_router_z_loss_backward_kernel<float>
+        <<<grid_size, block_size, 0, stream>>>(d_logits, router_logits, num_tokens, num_experts, z_loss_coef);
 }
 
 // ============================================================================
@@ -2103,33 +2033,36 @@ void moe_router_z_loss_backward(
 // pointing to where expert e's tokens start.
 
 // Helper to get cuBLAS data type from C++ type
-template<typename T>
+template <typename T>
 constexpr cudaDataType_t cublas_dtype() {
-    if constexpr (std::is_same_v<T, float>) return CUDA_R_32F;
-    else if constexpr (std::is_same_v<T, nv_bfloat16>) return CUDA_R_16BF;
-    else if constexpr (std::is_same_v<T, half>) return CUDA_R_16F;
-    else static_assert(!sizeof(T), "Unsupported type for cuBLAS");
+    if constexpr (std::is_same_v<T, float>)
+        return CUDA_R_32F;
+    else if constexpr (std::is_same_v<T, nv_bfloat16>)
+        return CUDA_R_16BF;
+    else if constexpr (std::is_same_v<T, half>)
+        return CUDA_R_16F;
+    else
+        static_assert(!sizeof(T), "Unsupported type for cuBLAS");
 }
 
 // Kernel to build pointer arrays on device (avoids host-device sync)
-template<typename T>
-__global__ void build_gemm_pointers_gate_up_kernel(
-    const T** A_ptrs,           // output: input pointers
-    const T** B_ptrs,           // output: weight pointers
-    T** C_ptrs,                 // output: output pointers
-    int* lda_arr,
-    int* ldb_arr,
-    int* ldc_arr,
-    int* m_arr,
-    int* n_arr,
-    int* k_arr,
-    const T* input,
-    const T* weights,
-    T* output,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,            // C
-    int intermediate_size       // D
+template <typename T>
+__global__ void build_gemm_pointers_gate_up_kernel(const T** A_ptrs,  // output: input pointers
+                                                   const T** B_ptrs,  // output: weight pointers
+                                                   T** C_ptrs,        // output: output pointers
+                                                   int* lda_arr,
+                                                   int* ldb_arr,
+                                                   int* ldc_arr,
+                                                   int* m_arr,
+                                                   int* n_arr,
+                                                   int* k_arr,
+                                                   const T* input,
+                                                   const T* weights,
+                                                   T* output,
+                                                   const int* expert_offsets,
+                                                   int num_experts,
+                                                   int hidden_size,       // C
+                                                   int intermediate_size  // D
 ) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_experts) return;
@@ -2157,32 +2090,31 @@ __global__ void build_gemm_pointers_gate_up_kernel(
     // B = input with CUBLAS_OP_N: op(B) = (C, tokens)
     // M = 2*D, N = tokens, K = C
 
-    m_arr[e] = 2 * intermediate_size;  // M = 2*D
-    n_arr[e] = tokens_e;               // N = tokens
-    k_arr[e] = hidden_size;            // K = C
-    lda_arr[e] = hidden_size;          // lda = C (leading dim of weight in col-major)
-    ldb_arr[e] = hidden_size;          // ldb = C (leading dim of input in col-major)
-    ldc_arr[e] = 2 * intermediate_size; // ldc = 2*D (leading dim of output in col-major)
+    m_arr[e] = 2 * intermediate_size;    // M = 2*D
+    n_arr[e] = tokens_e;                 // N = tokens
+    k_arr[e] = hidden_size;              // K = C
+    lda_arr[e] = hidden_size;            // lda = C (leading dim of weight in col-major)
+    ldb_arr[e] = hidden_size;            // ldb = C (leading dim of input in col-major)
+    ldc_arr[e] = 2 * intermediate_size;  // ldc = 2*D (leading dim of output in col-major)
 }
 
-template<typename T>
-__global__ void build_gemm_pointers_down_kernel(
-    const T** A_ptrs,
-    const T** B_ptrs,
-    T** C_ptrs,
-    int* lda_arr,
-    int* ldb_arr,
-    int* ldc_arr,
-    int* m_arr,
-    int* n_arr,
-    int* k_arr,
-    const T* input,
-    const T* weights,
-    T* output,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,            // C
-    int intermediate_size       // D
+template <typename T>
+__global__ void build_gemm_pointers_down_kernel(const T** A_ptrs,
+                                                const T** B_ptrs,
+                                                T** C_ptrs,
+                                                int* lda_arr,
+                                                int* ldb_arr,
+                                                int* ldc_arr,
+                                                int* m_arr,
+                                                int* n_arr,
+                                                int* k_arr,
+                                                const T* input,
+                                                const T* weights,
+                                                T* output,
+                                                const int* expert_offsets,
+                                                int num_experts,
+                                                int hidden_size,       // C
+                                                int intermediate_size  // D
 ) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_experts) return;
@@ -2204,34 +2136,32 @@ __global__ void build_gemm_pointers_down_kernel(
     // B = input with CUBLAS_OP_N: op(B) = (D, tokens)
     // M = C, N = tokens, K = D
 
-    m_arr[e] = hidden_size;       // M = C
-    n_arr[e] = tokens_e;          // N = tokens
-    k_arr[e] = intermediate_size; // K = D
-    lda_arr[e] = intermediate_size; // lda = D
-    ldb_arr[e] = intermediate_size; // ldb = D
-    ldc_arr[e] = hidden_size;       // ldc = C
+    m_arr[e] = hidden_size;          // M = C
+    n_arr[e] = tokens_e;             // N = tokens
+    k_arr[e] = intermediate_size;    // K = D
+    lda_arr[e] = intermediate_size;  // lda = D
+    ldb_arr[e] = intermediate_size;  // ldb = D
+    ldc_arr[e] = hidden_size;        // ldc = C
 }
 
-template<typename T>
-void moe_grouped_gemm_impl(
-    T* output,
-    const T* input,
-    const T* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int M,
-    int K,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    float alpha,
-    float beta,
-    EMMTranspose mode,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs = nullptr
-) {
+template <typename T>
+void moe_grouped_gemm_impl(T* output,
+                           const T* input,
+                           const T* weights,
+                           const int* expert_offsets,
+                           int num_experts,
+                           int M,
+                           int K,
+                           cublasHandle_t cublas_handle,
+                           cudaStream_t stream,
+                           const int* host_offsets,
+                           float alpha,
+                           float beta,
+                           EMMTranspose mode,
+                           const int* active_expert_indices,
+                           bool weight_is_compact,
+                           int num_active_experts,
+                           const void* const* weight_ptrs = nullptr) {
     int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
     const int* h_offsets;
@@ -2240,9 +2170,11 @@ void moe_grouped_gemm_impl(
         h_offsets = host_offsets;
     } else {
         local_offsets.resize(num_experts + 1);
-        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(),
+                                   expert_offsets,
                                    (num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         h_offsets = local_offsets.data();
     }
@@ -2284,9 +2216,7 @@ void moe_grouped_gemm_impl(
         ldc_vec.push_back(M);
 
         const int weight_idx = weight_is_compact ? e : global_idx;
-        A_vec.push_back(weight_ptrs
-            ? static_cast<const T*>(weight_ptrs[weight_idx])
-            : weights + weight_idx * M * K);
+        A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx]) : weights + weight_idx * M * K);
         B_vec.push_back(input + h_offsets[global_idx] * K);
         C_vec.push_back(output + h_offsets[global_idx] * M);
     }
@@ -2314,19 +2244,26 @@ void moe_grouped_gemm_impl(
     std::vector<float> alpha_vec(gemm_count, alpha);
     std::vector<float> beta_vec(gemm_count, beta);
 
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
-        cublas_handle,
-        transa_vec.data(), transb_vec.data(),
-        m_vec.data(), n_vec.data(), k_vec.data(),
-        alpha_vec.data(),
-        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
-        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
-        beta_vec.data(),
-        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
-        gemm_count,
-        group_size_vec.data(),
-        CUBLAS_COMPUTE_32F
-    ));
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
+                                            transa_vec.data(),
+                                            transb_vec.data(),
+                                            m_vec.data(),
+                                            n_vec.data(),
+                                            k_vec.data(),
+                                            alpha_vec.data(),
+                                            reinterpret_cast<const void**>(d_A_array),
+                                            cublas_dtype<T>(),
+                                            lda_vec.data(),
+                                            reinterpret_cast<const void**>(d_B_array),
+                                            cublas_dtype<T>(),
+                                            ldb_vec.data(),
+                                            beta_vec.data(),
+                                            reinterpret_cast<void**>(d_C_array),
+                                            cublas_dtype<T>(),
+                                            ldc_vec.data(),
+                                            gemm_count,
+                                            group_size_vec.data(),
+                                            CUBLAS_COMPUTE_32F));
 
     // Free device pointer arrays
     CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
@@ -2334,50 +2271,94 @@ void moe_grouped_gemm_impl(
     CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
-void moe_grouped_gemm(float* output, const float* input, const float* weights,
-                      const int* expert_offsets, int num_experts,
-                      int M, int K,
-                      cublasHandle_t cublas_handle, cudaStream_t stream,
+void moe_grouped_gemm(float* output,
+                      const float* input,
+                      const float* weights,
+                      const int* expert_offsets,
+                      int num_experts,
+                      int M,
+                      int K,
+                      cublasHandle_t cublas_handle,
+                      cudaStream_t stream,
                       const int* host_offsets,
-                      float alpha, float beta, EMMTranspose mode,
+                      float alpha,
+                      float beta,
+                      EMMTranspose mode,
                       const int* active_expert_indices,
                       bool weight_is_compact,
                       int num_active_experts,
                       const void* const* weight_ptrs) {
-    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+    moe_grouped_gemm_impl(output,
+                          input,
+                          weights,
+                          expert_offsets,
+                          num_experts,
+                          M,
+                          K,
+                          cublas_handle,
+                          stream,
+                          host_offsets,
+                          alpha,
+                          beta,
+                          mode,
+                          active_expert_indices,
+                          weight_is_compact,
+                          num_active_experts,
+                          weight_ptrs);
 }
 
-void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
-                      const int* expert_offsets, int num_experts,
-                      int M, int K,
-                      cublasHandle_t cublas_handle, cudaStream_t stream,
+void moe_grouped_gemm(nv_bfloat16* output,
+                      const nv_bfloat16* input,
+                      const nv_bfloat16* weights,
+                      const int* expert_offsets,
+                      int num_experts,
+                      int M,
+                      int K,
+                      cublasHandle_t cublas_handle,
+                      cudaStream_t stream,
                       const int* host_offsets,
-                      float alpha, float beta, EMMTranspose mode,
+                      float alpha,
+                      float beta,
+                      EMMTranspose mode,
                       const int* active_expert_indices,
                       bool weight_is_compact,
                       int num_active_experts,
                       const void* const* weight_ptrs) {
-    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+    moe_grouped_gemm_impl(output,
+                          input,
+                          weights,
+                          expert_offsets,
+                          num_experts,
+                          M,
+                          K,
+                          cublas_handle,
+                          stream,
+                          host_offsets,
+                          alpha,
+                          beta,
+                          mode,
+                          active_expert_indices,
+                          weight_is_compact,
+                          num_active_experts,
+                          weight_ptrs);
 }
 
-template<typename T>
-void moe_grouped_gemm_weight_grad_impl(
-    T* d_weight,
-    const T* grad_output,
-    const T* input,
-    const int* expert_offsets,
-    int num_experts,
-    int M,
-    int N,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    float alpha,
-    float beta,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts
-) {
+template <typename T>
+void moe_grouped_gemm_weight_grad_impl(T* d_weight,
+                                       const T* grad_output,
+                                       const T* input,
+                                       const int* expert_offsets,
+                                       int num_experts,
+                                       int M,
+                                       int N,
+                                       cublasHandle_t cublas_handle,
+                                       cudaStream_t stream,
+                                       const int* host_offsets,
+                                       float alpha,
+                                       float beta,
+                                       const int* active_expert_indices,
+                                       bool weight_is_compact,
+                                       int num_active_experts) {
     int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
     const int* h_offsets;
@@ -2386,9 +2367,11 @@ void moe_grouped_gemm_weight_grad_impl(
         h_offsets = host_offsets;
     } else {
         local_offsets.resize(num_experts + 1);
-        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(),
+                                   expert_offsets,
                                    (num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         h_offsets = local_offsets.data();
     }
@@ -2467,19 +2450,26 @@ void moe_grouped_gemm_weight_grad_impl(
     std::vector<float> alpha_vec(gemm_count, alpha);
     std::vector<float> beta_vec(gemm_count, beta);
 
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
-        cublas_handle,
-        transa_vec.data(), transb_vec.data(),
-        m_vec.data(), n_vec.data(), k_vec.data(),
-        alpha_vec.data(),
-        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
-        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
-        beta_vec.data(),
-        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
-        gemm_count,
-        group_size_vec.data(),
-        CUBLAS_COMPUTE_32F
-    ));
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
+                                            transa_vec.data(),
+                                            transb_vec.data(),
+                                            m_vec.data(),
+                                            n_vec.data(),
+                                            k_vec.data(),
+                                            alpha_vec.data(),
+                                            reinterpret_cast<const void**>(d_A_array),
+                                            cublas_dtype<T>(),
+                                            lda_vec.data(),
+                                            reinterpret_cast<const void**>(d_B_array),
+                                            cublas_dtype<T>(),
+                                            ldb_vec.data(),
+                                            beta_vec.data(),
+                                            reinterpret_cast<void**>(d_C_array),
+                                            cublas_dtype<T>(),
+                                            ldc_vec.data(),
+                                            gemm_count,
+                                            group_size_vec.data(),
+                                            CUBLAS_COMPUTE_32F));
 
     // Free device pointer arrays
     CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
@@ -2487,46 +2477,86 @@ void moe_grouped_gemm_weight_grad_impl(
     CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
-void moe_grouped_gemm_weight_grad(float* d_weight, const float* grad_output, const float* input,
-                                  const int* expert_offsets, int num_experts,
-                                  int M, int N,
-                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+void moe_grouped_gemm_weight_grad(float* d_weight,
+                                  const float* grad_output,
+                                  const float* input,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int M,
+                                  int N,
+                                  cublasHandle_t cublas_handle,
+                                  cudaStream_t stream,
                                   const int* host_offsets,
-                                  float alpha, float beta,
+                                  float alpha,
+                                  float beta,
                                   const int* active_expert_indices,
                                   bool weight_is_compact,
                                   int num_active_experts) {
-    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta, active_expert_indices, weight_is_compact, num_active_experts);
+    moe_grouped_gemm_weight_grad_impl(d_weight,
+                                      grad_output,
+                                      input,
+                                      expert_offsets,
+                                      num_experts,
+                                      M,
+                                      N,
+                                      cublas_handle,
+                                      stream,
+                                      host_offsets,
+                                      alpha,
+                                      beta,
+                                      active_expert_indices,
+                                      weight_is_compact,
+                                      num_active_experts);
 }
 
-void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad_output, const nv_bfloat16* input,
-                                  const int* expert_offsets, int num_experts,
-                                  int M, int N,
-                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight,
+                                  const nv_bfloat16* grad_output,
+                                  const nv_bfloat16* input,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int M,
+                                  int N,
+                                  cublasHandle_t cublas_handle,
+                                  cudaStream_t stream,
                                   const int* host_offsets,
-                                  float alpha, float beta,
+                                  float alpha,
+                                  float beta,
                                   const int* active_expert_indices,
                                   bool weight_is_compact,
                                   int num_active_experts) {
-    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta, active_expert_indices, weight_is_compact, num_active_experts);
+    moe_grouped_gemm_weight_grad_impl(d_weight,
+                                      grad_output,
+                                      input,
+                                      expert_offsets,
+                                      num_experts,
+                                      M,
+                                      N,
+                                      cublas_handle,
+                                      stream,
+                                      host_offsets,
+                                      alpha,
+                                      beta,
+                                      active_expert_indices,
+                                      weight_is_compact,
+                                      num_active_experts);
 }
 
-template<typename T>
+template <typename T>
 void moe_grouped_gemm_gate_up_impl(
-    T* output,                        // (total_tokens, 2*D) - gate+up output
-    const T* input,                   // (total_tokens, C) - permuted tokens
-    const T* weights,                 // (num_experts, 2*D, C) - batched weights (ignored when weight_ptrs != null)
-    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    T* output,                  // (total_tokens, 2*D) - gate+up output
+    const T* input,             // (total_tokens, C) - permuted tokens
+    const T* weights,           // (num_experts, 2*D, C) - batched weights (ignored when weight_ptrs != null)
+    const int* expert_offsets,  // (num_experts + 1) - token offsets per expert (device)
     int num_experts,
-    int hidden_size,                  // C
-    int intermediate_size,            // D (output is 2*D for gate+up)
+    int hidden_size,        // C
+    int intermediate_size,  // D (output is 2*D for gate+up)
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,  // Optional: pre-cached host offsets to avoid D2H sync
     const int* active_expert_indices,
     bool weight_is_compact,
     int num_active_experts,
-    const void* const* weight_ptrs    // Optional: per-expert weight pointers (LLEP)
+    const void* const* weight_ptrs  // Optional: per-expert weight pointers (LLEP)
 ) {
     int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     // Get host-side offsets - either use cached or copy from device
@@ -2539,9 +2569,11 @@ void moe_grouped_gemm_gate_up_impl(
     } else {
         // Copy from device (requires sync - slower path)
         local_offsets.resize(num_experts + 1);
-        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(),
+                                   expert_offsets,
                                    (num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         h_offsets = local_offsets.data();
     }
@@ -2562,29 +2594,36 @@ void moe_grouped_gemm_gate_up_impl(
         if (force_default_algo < 0) {
             force_default_algo = (std::getenv("SUROGATE_MOE_GEMM_DEFAULT") != nullptr) ? 1 : 0;
         }
-        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT
-                                                         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
         for (int e = 0; e < n_active; ++e) {
             int global_idx = active_expert_indices ? active_expert_indices[e] : e;
             int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
             if (tokens_e == 0) continue;
             const int weight_idx = weight_is_compact ? e : global_idx;
-            const T* A_ptr = weight_ptrs
-                ? static_cast<const T*>(weight_ptrs[weight_idx])
-                : weights + weight_idx * out_dim * hidden_size;
+            const T* A_ptr = weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                         : weights + weight_idx * out_dim * hidden_size;
             const T* B_ptr = input + h_offsets[global_idx] * hidden_size;
             T* C_ptr = output + h_offsets[global_idx] * out_dim;
 
-            CUBLAS_CHECK(cublasGemmEx(
-                cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                out_dim, tokens_e, hidden_size,
-                &alpha,
-                A_ptr, cublas_dtype<T>(), hidden_size,
-                B_ptr, cublas_dtype<T>(), hidden_size,
-                &beta,
-                C_ptr, cublas_dtype<T>(), out_dim,
-                CUBLAS_COMPUTE_32F, algo));
+            CUBLAS_CHECK(cublasGemmEx(cublas_handle,
+                                      CUBLAS_OP_T,
+                                      CUBLAS_OP_N,
+                                      out_dim,
+                                      tokens_e,
+                                      hidden_size,
+                                      &alpha,
+                                      A_ptr,
+                                      cublas_dtype<T>(),
+                                      hidden_size,
+                                      B_ptr,
+                                      cublas_dtype<T>(),
+                                      hidden_size,
+                                      &beta,
+                                      C_ptr,
+                                      cublas_dtype<T>(),
+                                      out_dim,
+                                      CUBLAS_COMPUTE_32F,
+                                      algo));
         }
         return;
     }
@@ -2612,9 +2651,8 @@ void moe_grouped_gemm_gate_up_impl(
         if (tokens_e == 0) continue;
 
         const int weight_idx = weight_is_compact ? e : global_idx;
-        const T* A_ptr = weight_ptrs
-            ? static_cast<const T*>(weight_ptrs[weight_idx])
-            : weights + weight_idx * out_dim * hidden_size;
+        const T* A_ptr =
+            weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx]) : weights + weight_idx * out_dim * hidden_size;
         const T* B_ptr = input + h_offsets[global_idx] * hidden_size;
         T* C_ptr = output + h_offsets[global_idx] * out_dim;
 
@@ -2654,19 +2692,26 @@ void moe_grouped_gemm_gate_up_impl(
     std::vector<float> alpha_vec(gemm_count, alpha);
     std::vector<float> beta_vec(gemm_count, beta);
 
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
-        cublas_handle,
-        transa_vec.data(), transb_vec.data(),
-        m_vec.data(), n_vec.data(), k_vec.data(),
-        alpha_vec.data(),
-        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
-        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
-        beta_vec.data(),
-        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
-        gemm_count,
-        group_size_vec.data(),
-        CUBLAS_COMPUTE_32F
-    ));
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
+                                            transa_vec.data(),
+                                            transb_vec.data(),
+                                            m_vec.data(),
+                                            n_vec.data(),
+                                            k_vec.data(),
+                                            alpha_vec.data(),
+                                            reinterpret_cast<const void**>(d_A_array),
+                                            cublas_dtype<T>(),
+                                            lda_vec.data(),
+                                            reinterpret_cast<const void**>(d_B_array),
+                                            cublas_dtype<T>(),
+                                            ldb_vec.data(),
+                                            beta_vec.data(),
+                                            reinterpret_cast<void**>(d_C_array),
+                                            cublas_dtype<T>(),
+                                            ldc_vec.data(),
+                                            gemm_count,
+                                            group_size_vec.data(),
+                                            CUBLAS_COMPUTE_32F));
 
     // Free device pointer arrays
     CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
@@ -2674,22 +2719,22 @@ void moe_grouped_gemm_gate_up_impl(
     CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
-template<typename T>
+template <typename T>
 void moe_grouped_gemm_down_impl(
-    T* output,                        // (total_tokens, C) - down proj output
-    const T* input,                   // (total_tokens, D) - SwiGLU output
-    const T* weights,                 // (num_experts, C, D) - batched weights (ignored when weight_ptrs != null)
-    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    T* output,                  // (total_tokens, C) - down proj output
+    const T* input,             // (total_tokens, D) - SwiGLU output
+    const T* weights,           // (num_experts, C, D) - batched weights (ignored when weight_ptrs != null)
+    const int* expert_offsets,  // (num_experts + 1) - token offsets per expert (device)
     int num_experts,
-    int hidden_size,                  // C
-    int intermediate_size,            // D
+    int hidden_size,        // C
+    int intermediate_size,  // D
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,  // Optional: pre-cached host offsets to avoid D2H sync
     const int* active_expert_indices,
     bool weight_is_compact,
     int num_active_experts,
-    const void* const* weight_ptrs    // Optional: per-expert weight pointers (LLEP)
+    const void* const* weight_ptrs  // Optional: per-expert weight pointers (LLEP)
 ) {
     int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     // Get host-side offsets - either use cached or copy from device
@@ -2700,9 +2745,11 @@ void moe_grouped_gemm_down_impl(
         h_offsets = host_offsets;
     } else {
         local_offsets.resize(num_experts + 1);
-        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(),
+                                   expert_offsets,
                                    (num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         h_offsets = local_offsets.data();
     }
@@ -2722,29 +2769,36 @@ void moe_grouped_gemm_down_impl(
         if (force_default_algo < 0) {
             force_default_algo = (std::getenv("SUROGATE_MOE_GEMM_DEFAULT") != nullptr) ? 1 : 0;
         }
-        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT
-                                                         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
         for (int e = 0; e < n_active; ++e) {
             int global_idx = active_expert_indices ? active_expert_indices[e] : e;
             int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
             if (tokens_e == 0) continue;
             const int weight_idx = weight_is_compact ? e : global_idx;
-            const T* A_ptr = weight_ptrs
-                ? static_cast<const T*>(weight_ptrs[weight_idx])
-                : weights + weight_idx * hidden_size * intermediate_size;
+            const T* A_ptr = weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                         : weights + weight_idx * hidden_size * intermediate_size;
             const T* B_ptr = input + h_offsets[global_idx] * intermediate_size;
             T* C_ptr = output + h_offsets[global_idx] * hidden_size;
 
-            CUBLAS_CHECK(cublasGemmEx(
-                cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                hidden_size, tokens_e, intermediate_size,
-                &alpha,
-                A_ptr, cublas_dtype<T>(), intermediate_size,
-                B_ptr, cublas_dtype<T>(), intermediate_size,
-                &beta,
-                C_ptr, cublas_dtype<T>(), hidden_size,
-                CUBLAS_COMPUTE_32F, algo));
+            CUBLAS_CHECK(cublasGemmEx(cublas_handle,
+                                      CUBLAS_OP_T,
+                                      CUBLAS_OP_N,
+                                      hidden_size,
+                                      tokens_e,
+                                      intermediate_size,
+                                      &alpha,
+                                      A_ptr,
+                                      cublas_dtype<T>(),
+                                      intermediate_size,
+                                      B_ptr,
+                                      cublas_dtype<T>(),
+                                      intermediate_size,
+                                      &beta,
+                                      C_ptr,
+                                      cublas_dtype<T>(),
+                                      hidden_size,
+                                      CUBLAS_COMPUTE_32F,
+                                      algo));
         }
         return;
     }
@@ -2780,9 +2834,8 @@ void moe_grouped_gemm_down_impl(
         ldb_vec.push_back(intermediate_size);
         ldc_vec.push_back(hidden_size);
 
-        A_vec.push_back(weight_ptrs
-            ? static_cast<const T*>(weight_ptrs[weight_idx])
-            : weights + weight_idx * hidden_size * intermediate_size);
+        A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                    : weights + weight_idx * hidden_size * intermediate_size);
         B_vec.push_back(input + h_offsets[global_idx] * intermediate_size);
         C_vec.push_back(output + h_offsets[global_idx] * hidden_size);
     }
@@ -2810,19 +2863,26 @@ void moe_grouped_gemm_down_impl(
     std::vector<float> alpha_vec(gemm_count, alpha);
     std::vector<float> beta_vec(gemm_count, beta);
 
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
-        cublas_handle,
-        transa_vec.data(), transb_vec.data(),
-        m_vec.data(), n_vec.data(), k_vec.data(),
-        alpha_vec.data(),
-        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
-        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
-        beta_vec.data(),
-        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
-        gemm_count,
-        group_size_vec.data(),
-        CUBLAS_COMPUTE_32F
-    ));
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
+                                            transa_vec.data(),
+                                            transb_vec.data(),
+                                            m_vec.data(),
+                                            n_vec.data(),
+                                            k_vec.data(),
+                                            alpha_vec.data(),
+                                            reinterpret_cast<const void**>(d_A_array),
+                                            cublas_dtype<T>(),
+                                            lda_vec.data(),
+                                            reinterpret_cast<const void**>(d_B_array),
+                                            cublas_dtype<T>(),
+                                            ldb_vec.data(),
+                                            beta_vec.data(),
+                                            reinterpret_cast<void**>(d_C_array),
+                                            cublas_dtype<T>(),
+                                            ldc_vec.data(),
+                                            gemm_count,
+                                            group_size_vec.data(),
+                                            CUBLAS_COMPUTE_32F));
 
     // Free device pointer arrays
     CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
@@ -2830,88 +2890,124 @@ void moe_grouped_gemm_down_impl(
     CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
-void moe_grouped_gemm_gate_up(
-    nv_bfloat16* output,
-    const nv_bfloat16* input,
-    const nv_bfloat16* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
-                                   num_experts, hidden_size, intermediate_size,
-                                   cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_gate_up(nv_bfloat16* output,
+                              const nv_bfloat16* input,
+                              const nv_bfloat16* weights,
+                              const int* expert_offsets,
+                              int num_experts,
+                              int hidden_size,
+                              int intermediate_size,
+                              cublasHandle_t cublas_handle,
+                              cudaStream_t stream,
+                              const int* host_offsets,
+                              const int* active_expert_indices,
+                              bool weight_is_compact,
+                              int num_active_experts,
+                              const void* const* weight_ptrs) {
+    moe_grouped_gemm_gate_up_impl(output,
+                                  input,
+                                  weights,
+                                  expert_offsets,
+                                  num_experts,
+                                  hidden_size,
+                                  intermediate_size,
+                                  cublas_handle,
+                                  stream,
+                                  host_offsets,
+                                  active_expert_indices,
+                                  weight_is_compact,
+                                  num_active_experts,
+                                  weight_ptrs);
 }
 
-void moe_grouped_gemm_gate_up(
-    float* output,
-    const float* input,
-    const float* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
-                                   num_experts, hidden_size, intermediate_size,
-                                   cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_gate_up(float* output,
+                              const float* input,
+                              const float* weights,
+                              const int* expert_offsets,
+                              int num_experts,
+                              int hidden_size,
+                              int intermediate_size,
+                              cublasHandle_t cublas_handle,
+                              cudaStream_t stream,
+                              const int* host_offsets,
+                              const int* active_expert_indices,
+                              bool weight_is_compact,
+                              int num_active_experts,
+                              const void* const* weight_ptrs) {
+    moe_grouped_gemm_gate_up_impl(output,
+                                  input,
+                                  weights,
+                                  expert_offsets,
+                                  num_experts,
+                                  hidden_size,
+                                  intermediate_size,
+                                  cublas_handle,
+                                  stream,
+                                  host_offsets,
+                                  active_expert_indices,
+                                  weight_is_compact,
+                                  num_active_experts,
+                                  weight_ptrs);
 }
 
-void moe_grouped_gemm_down(
-    nv_bfloat16* output,
-    const nv_bfloat16* input,
-    const nv_bfloat16* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
-                                num_experts, hidden_size, intermediate_size,
-                                cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_down(nv_bfloat16* output,
+                           const nv_bfloat16* input,
+                           const nv_bfloat16* weights,
+                           const int* expert_offsets,
+                           int num_experts,
+                           int hidden_size,
+                           int intermediate_size,
+                           cublasHandle_t cublas_handle,
+                           cudaStream_t stream,
+                           const int* host_offsets,
+                           const int* active_expert_indices,
+                           bool weight_is_compact,
+                           int num_active_experts,
+                           const void* const* weight_ptrs) {
+    moe_grouped_gemm_down_impl(output,
+                               input,
+                               weights,
+                               expert_offsets,
+                               num_experts,
+                               hidden_size,
+                               intermediate_size,
+                               cublas_handle,
+                               stream,
+                               host_offsets,
+                               active_expert_indices,
+                               weight_is_compact,
+                               num_active_experts,
+                               weight_ptrs);
 }
 
-void moe_grouped_gemm_down(
-    float* output,
-    const float* input,
-    const float* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
-                                num_experts, hidden_size, intermediate_size,
-                                cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_down(float* output,
+                           const float* input,
+                           const float* weights,
+                           const int* expert_offsets,
+                           int num_experts,
+                           int hidden_size,
+                           int intermediate_size,
+                           cublasHandle_t cublas_handle,
+                           cudaStream_t stream,
+                           const int* host_offsets,
+                           const int* active_expert_indices,
+                           bool weight_is_compact,
+                           int num_active_experts,
+                           const void* const* weight_ptrs) {
+    moe_grouped_gemm_down_impl(output,
+                               input,
+                               weights,
+                               expert_offsets,
+                               num_experts,
+                               hidden_size,
+                               intermediate_size,
+                               cublas_handle,
+                               stream,
+                               host_offsets,
+                               active_expert_indices,
+                               weight_is_compact,
+                               num_active_experts,
+                               weight_ptrs);
 }
 
 // ============================================================================
@@ -2922,24 +3018,23 @@ void moe_grouped_gemm_down(
 // - gate_up_backward: d_input = d_gate_up @ gate_up_proj (no transpose on weight)
 
 // Kernel to build pointer arrays for down backward on device
-template<typename T>
-__global__ void build_gemm_pointers_down_backward_kernel(
-    const T** A_ptrs,           // output: d_output pointers
-    const T** B_ptrs,           // output: weight pointers
-    T** C_ptrs,                 // output: d_input pointers
-    int* lda_arr,
-    int* ldb_arr,
-    int* ldc_arr,
-    int* m_arr,
-    int* n_arr,
-    int* k_arr,
-    const T* d_output,
-    const T* weights,
-    T* d_input,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,            // C
-    int intermediate_size       // D
+template <typename T>
+__global__ void build_gemm_pointers_down_backward_kernel(const T** A_ptrs,  // output: d_output pointers
+                                                         const T** B_ptrs,  // output: weight pointers
+                                                         T** C_ptrs,        // output: d_input pointers
+                                                         int* lda_arr,
+                                                         int* ldb_arr,
+                                                         int* ldc_arr,
+                                                         int* m_arr,
+                                                         int* n_arr,
+                                                         int* k_arr,
+                                                         const T* d_output,
+                                                         const T* weights,
+                                                         T* d_input,
+                                                         const int* expert_offsets,
+                                                         int num_experts,
+                                                         int hidden_size,       // C
+                                                         int intermediate_size  // D
 ) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_experts) return;
@@ -2966,33 +3061,32 @@ __global__ void build_gemm_pointers_down_backward_kernel(
     // So: d_input(D, tokens) = W(D, C) @ d_output(C, tokens)
     // With CUBLAS_OP_N on both: M = D, N = tokens, K = C
 
-    m_arr[e] = intermediate_size;   // M = D
-    n_arr[e] = tokens_e;            // N = tokens
-    k_arr[e] = hidden_size;         // K = C
-    lda_arr[e] = intermediate_size; // lda = D (leading dim of W in col-major)
-    ldb_arr[e] = hidden_size;       // ldb = C (leading dim of d_output in col-major)
-    ldc_arr[e] = intermediate_size; // ldc = D (leading dim of d_input in col-major)
+    m_arr[e] = intermediate_size;    // M = D
+    n_arr[e] = tokens_e;             // N = tokens
+    k_arr[e] = hidden_size;          // K = C
+    lda_arr[e] = intermediate_size;  // lda = D (leading dim of W in col-major)
+    ldb_arr[e] = hidden_size;        // ldb = C (leading dim of d_output in col-major)
+    ldc_arr[e] = intermediate_size;  // ldc = D (leading dim of d_input in col-major)
 }
 
 // Kernel to build pointer arrays for gate_up backward on device
-template<typename T>
-__global__ void build_gemm_pointers_gate_up_backward_kernel(
-    const T** A_ptrs,           // output: d_gate_up pointers
-    const T** B_ptrs,           // output: weight pointers
-    T** C_ptrs,                 // output: d_input pointers
-    int* lda_arr,
-    int* ldb_arr,
-    int* ldc_arr,
-    int* m_arr,
-    int* n_arr,
-    int* k_arr,
-    const T* d_gate_up,
-    const T* weights,
-    T* d_input,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,            // C
-    int intermediate_size       // D
+template <typename T>
+__global__ void build_gemm_pointers_gate_up_backward_kernel(const T** A_ptrs,  // output: d_gate_up pointers
+                                                            const T** B_ptrs,  // output: weight pointers
+                                                            T** C_ptrs,        // output: d_input pointers
+                                                            int* lda_arr,
+                                                            int* ldb_arr,
+                                                            int* ldc_arr,
+                                                            int* m_arr,
+                                                            int* n_arr,
+                                                            int* k_arr,
+                                                            const T* d_gate_up,
+                                                            const T* weights,
+                                                            T* d_input,
+                                                            const int* expert_offsets,
+                                                            int num_experts,
+                                                            int hidden_size,       // C
+                                                            int intermediate_size  // D
 ) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_experts) return;
@@ -3019,30 +3113,30 @@ __global__ void build_gemm_pointers_gate_up_backward_kernel(
     // So: d_input(C, tokens) = W(C, 2*D) @ d_gate_up(2*D, tokens)
     // With CUBLAS_OP_N on both: M = C, N = tokens, K = 2*D
 
-    m_arr[e] = hidden_size;           // M = C
-    n_arr[e] = tokens_e;              // N = tokens
-    k_arr[e] = 2 * intermediate_size; // K = 2*D
-    lda_arr[e] = hidden_size;         // lda = C (leading dim of W in col-major)
-    ldb_arr[e] = 2 * intermediate_size; // ldb = 2*D (leading dim of d_gate_up in col-major)
-    ldc_arr[e] = hidden_size;         // ldc = C (leading dim of d_input in col-major)
+    m_arr[e] = hidden_size;              // M = C
+    n_arr[e] = tokens_e;                 // N = tokens
+    k_arr[e] = 2 * intermediate_size;    // K = 2*D
+    lda_arr[e] = hidden_size;            // lda = C (leading dim of W in col-major)
+    ldb_arr[e] = 2 * intermediate_size;  // ldb = 2*D (leading dim of d_gate_up in col-major)
+    ldc_arr[e] = hidden_size;            // ldc = C (leading dim of d_input in col-major)
 }
 
-template<typename T>
+template <typename T>
 void moe_grouped_gemm_down_backward_impl(
-    T* d_input,                       // (total_tokens, D) - gradient w.r.t. SwiGLU output
-    const T* d_output,                // (total_tokens, C) - gradient from downstream
-    const T* weights,                 // (num_experts, C, D) - down_proj weights (ignored when weight_ptrs != null)
-    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    T* d_input,                 // (total_tokens, D) - gradient w.r.t. SwiGLU output
+    const T* d_output,          // (total_tokens, C) - gradient from downstream
+    const T* weights,           // (num_experts, C, D) - down_proj weights (ignored when weight_ptrs != null)
+    const int* expert_offsets,  // (num_experts + 1) - token offsets per expert (device)
     int num_experts,
-    int hidden_size,                  // C
-    int intermediate_size,            // D
+    int hidden_size,        // C
+    int intermediate_size,  // D
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,  // Optional: pre-cached host offsets to avoid D2H sync
     const int* active_expert_indices,
     bool weight_is_compact,
     int num_active_experts,
-    const void* const* weight_ptrs    // Optional: per-expert weight pointers (LLEP)
+    const void* const* weight_ptrs  // Optional: per-expert weight pointers (LLEP)
 ) {
     int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
@@ -3052,9 +3146,11 @@ void moe_grouped_gemm_down_backward_impl(
         h_offsets = host_offsets;
     } else {
         local_offsets.resize(num_experts + 1);
-        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(),
+                                   expert_offsets,
                                    (num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         h_offsets = local_offsets.data();
     }
@@ -3094,9 +3190,8 @@ void moe_grouped_gemm_down_backward_impl(
         ldc_vec.push_back(intermediate_size);
 
         const int weight_idx = weight_is_compact ? e : global_idx;
-        A_vec.push_back(weight_ptrs
-            ? static_cast<const T*>(weight_ptrs[weight_idx])
-            : weights + weight_idx * hidden_size * intermediate_size);
+        A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                    : weights + weight_idx * hidden_size * intermediate_size);
         B_vec.push_back(d_output + h_offsets[global_idx] * hidden_size);
         C_vec.push_back(d_input + h_offsets[global_idx] * intermediate_size);
     }
@@ -3124,19 +3219,26 @@ void moe_grouped_gemm_down_backward_impl(
     std::vector<float> alpha_vec(gemm_count, alpha);
     std::vector<float> beta_vec(gemm_count, beta);
 
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
-        cublas_handle,
-        transa_vec.data(), transb_vec.data(),
-        m_vec.data(), n_vec.data(), k_vec.data(),
-        alpha_vec.data(),
-        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
-        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
-        beta_vec.data(),
-        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
-        gemm_count,
-        group_size_vec.data(),
-        CUBLAS_COMPUTE_32F
-    ));
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
+                                            transa_vec.data(),
+                                            transb_vec.data(),
+                                            m_vec.data(),
+                                            n_vec.data(),
+                                            k_vec.data(),
+                                            alpha_vec.data(),
+                                            reinterpret_cast<const void**>(d_A_array),
+                                            cublas_dtype<T>(),
+                                            lda_vec.data(),
+                                            reinterpret_cast<const void**>(d_B_array),
+                                            cublas_dtype<T>(),
+                                            ldb_vec.data(),
+                                            beta_vec.data(),
+                                            reinterpret_cast<void**>(d_C_array),
+                                            cublas_dtype<T>(),
+                                            ldc_vec.data(),
+                                            gemm_count,
+                                            group_size_vec.data(),
+                                            CUBLAS_COMPUTE_32F));
 
     // Free device pointer arrays
     CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
@@ -3144,22 +3246,22 @@ void moe_grouped_gemm_down_backward_impl(
     CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
-template<typename T>
+template <typename T>
 void moe_grouped_gemm_gate_up_backward_impl(
-    T* d_input,                       // (total_tokens, C) - gradient w.r.t. input
-    const T* d_gate_up,               // (total_tokens, 2*D) - gradient from SwiGLU backward
-    const T* weights,                 // (num_experts, 2*D, C) - gate_up_proj weights (ignored when weight_ptrs != null)
-    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    T* d_input,                 // (total_tokens, C) - gradient w.r.t. input
+    const T* d_gate_up,         // (total_tokens, 2*D) - gradient from SwiGLU backward
+    const T* weights,           // (num_experts, 2*D, C) - gate_up_proj weights (ignored when weight_ptrs != null)
+    const int* expert_offsets,  // (num_experts + 1) - token offsets per expert (device)
     int num_experts,
-    int hidden_size,                  // C
-    int intermediate_size,            // D (d_gate_up is 2*D)
+    int hidden_size,        // C
+    int intermediate_size,  // D (d_gate_up is 2*D)
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,  // Optional: pre-cached host offsets to avoid D2H sync
     const int* active_expert_indices,
     bool weight_is_compact,
     int num_active_experts,
-    const void* const* weight_ptrs    // Optional: per-expert weight pointers (LLEP)
+    const void* const* weight_ptrs  // Optional: per-expert weight pointers (LLEP)
 ) {
     int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
@@ -3169,9 +3271,11 @@ void moe_grouped_gemm_gate_up_backward_impl(
         h_offsets = host_offsets;
     } else {
         local_offsets.resize(num_experts + 1);
-        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(),
+                                   expert_offsets,
                                    (num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         h_offsets = local_offsets.data();
     }
@@ -3212,9 +3316,8 @@ void moe_grouped_gemm_gate_up_backward_impl(
         ldc_vec.push_back(hidden_size);
 
         const int weight_idx = weight_is_compact ? e : global_idx;
-        A_vec.push_back(weight_ptrs
-            ? static_cast<const T*>(weight_ptrs[weight_idx])
-            : weights + weight_idx * gate_up_dim * hidden_size);
+        A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                    : weights + weight_idx * gate_up_dim * hidden_size);
         B_vec.push_back(d_gate_up + h_offsets[global_idx] * gate_up_dim);
         C_vec.push_back(d_input + h_offsets[global_idx] * hidden_size);
     }
@@ -3242,19 +3345,26 @@ void moe_grouped_gemm_gate_up_backward_impl(
     std::vector<float> alpha_vec(gemm_count, alpha);
     std::vector<float> beta_vec(gemm_count, beta);
 
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
-        cublas_handle,
-        transa_vec.data(), transb_vec.data(),
-        m_vec.data(), n_vec.data(), k_vec.data(),
-        alpha_vec.data(),
-        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
-        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
-        beta_vec.data(),
-        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
-        gemm_count,
-        group_size_vec.data(),
-        CUBLAS_COMPUTE_32F
-    ));
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
+                                            transa_vec.data(),
+                                            transb_vec.data(),
+                                            m_vec.data(),
+                                            n_vec.data(),
+                                            k_vec.data(),
+                                            alpha_vec.data(),
+                                            reinterpret_cast<const void**>(d_A_array),
+                                            cublas_dtype<T>(),
+                                            lda_vec.data(),
+                                            reinterpret_cast<const void**>(d_B_array),
+                                            cublas_dtype<T>(),
+                                            ldb_vec.data(),
+                                            beta_vec.data(),
+                                            reinterpret_cast<void**>(d_C_array),
+                                            cublas_dtype<T>(),
+                                            ldc_vec.data(),
+                                            gemm_count,
+                                            group_size_vec.data(),
+                                            CUBLAS_COMPUTE_32F));
 
     // Free device pointer arrays
     CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
@@ -3262,18 +3372,18 @@ void moe_grouped_gemm_gate_up_backward_impl(
     CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
-template<typename T>
+template <typename T>
 void moe_grouped_gemm_up_backward_impl(
-    T* d_input,                       // (total_tokens, C) - gradient w.r.t. input
-    const T* d_up,                    // (total_tokens, D) - gradient from activation backward
-    const T* weights,                 // (num_experts, D, C) - up projection weights
-    const int* expert_offsets,        // (num_experts + 1) - token offsets per expert (device)
+    T* d_input,                 // (total_tokens, C) - gradient w.r.t. input
+    const T* d_up,              // (total_tokens, D) - gradient from activation backward
+    const T* weights,           // (num_experts, D, C) - up projection weights
+    const int* expert_offsets,  // (num_experts + 1) - token offsets per expert (device)
     int num_experts,
-    int hidden_size,                  // C
-    int intermediate_size,            // D
+    int hidden_size,        // C
+    int intermediate_size,  // D
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,  // Optional: pre-cached host offsets to avoid D2H sync
     const int* active_expert_indices,
     bool weight_is_compact,
     int num_active_experts,
@@ -3287,9 +3397,11 @@ void moe_grouped_gemm_up_backward_impl(
         h_offsets = host_offsets;
     } else {
         local_offsets.resize(num_experts + 1);
-        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(),
+                                   expert_offsets,
                                    (num_experts + 1) * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         h_offsets = local_offsets.data();
     }
@@ -3329,9 +3441,8 @@ void moe_grouped_gemm_up_backward_impl(
         ldc_vec.push_back(hidden_size);
 
         const int weight_idx = weight_is_compact ? e : global_idx;
-        A_vec.push_back(weight_ptrs
-            ? static_cast<const T*>(weight_ptrs[weight_idx])
-            : weights + weight_idx * up_dim * hidden_size);
+        A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                    : weights + weight_idx * up_dim * hidden_size);
         B_vec.push_back(d_up + h_offsets[global_idx] * up_dim);
         C_vec.push_back(d_input + h_offsets[global_idx] * hidden_size);
     }
@@ -3358,19 +3469,26 @@ void moe_grouped_gemm_up_backward_impl(
     std::vector<float> alpha_vec(gemm_count, alpha);
     std::vector<float> beta_vec(gemm_count, beta);
 
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
-        cublas_handle,
-        transa_vec.data(), transb_vec.data(),
-        m_vec.data(), n_vec.data(), k_vec.data(),
-        alpha_vec.data(),
-        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
-        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
-        beta_vec.data(),
-        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
-        gemm_count,
-        group_size_vec.data(),
-        CUBLAS_COMPUTE_32F
-    ));
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
+                                            transa_vec.data(),
+                                            transb_vec.data(),
+                                            m_vec.data(),
+                                            n_vec.data(),
+                                            k_vec.data(),
+                                            alpha_vec.data(),
+                                            reinterpret_cast<const void**>(d_A_array),
+                                            cublas_dtype<T>(),
+                                            lda_vec.data(),
+                                            reinterpret_cast<const void**>(d_B_array),
+                                            cublas_dtype<T>(),
+                                            ldb_vec.data(),
+                                            beta_vec.data(),
+                                            reinterpret_cast<void**>(d_C_array),
+                                            cublas_dtype<T>(),
+                                            ldc_vec.data(),
+                                            gemm_count,
+                                            group_size_vec.data(),
+                                            CUBLAS_COMPUTE_32F));
 
     CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
     CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
@@ -3378,130 +3496,184 @@ void moe_grouped_gemm_up_backward_impl(
 }
 
 // Host wrappers for grouped GEMM backward
-void moe_grouped_gemm_down_backward(
-    nv_bfloat16* d_input,
-    const nv_bfloat16* d_output,
-    const nv_bfloat16* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_down_backward_impl(d_input, d_output, weights, expert_offsets,
-                                         num_experts, hidden_size, intermediate_size,
-                                         cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_down_backward(nv_bfloat16* d_input,
+                                    const nv_bfloat16* d_output,
+                                    const nv_bfloat16* weights,
+                                    const int* expert_offsets,
+                                    int num_experts,
+                                    int hidden_size,
+                                    int intermediate_size,
+                                    cublasHandle_t cublas_handle,
+                                    cudaStream_t stream,
+                                    const int* host_offsets,
+                                    const int* active_expert_indices,
+                                    bool weight_is_compact,
+                                    int num_active_experts,
+                                    const void* const* weight_ptrs) {
+    moe_grouped_gemm_down_backward_impl(d_input,
+                                        d_output,
+                                        weights,
+                                        expert_offsets,
+                                        num_experts,
+                                        hidden_size,
+                                        intermediate_size,
+                                        cublas_handle,
+                                        stream,
+                                        host_offsets,
+                                        active_expert_indices,
+                                        weight_is_compact,
+                                        num_active_experts,
+                                        weight_ptrs);
 }
 
-void moe_grouped_gemm_down_backward(
-    float* d_input,
-    const float* d_output,
-    const float* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_down_backward_impl(d_input, d_output, weights, expert_offsets,
-                                         num_experts, hidden_size, intermediate_size,
-                                         cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_down_backward(float* d_input,
+                                    const float* d_output,
+                                    const float* weights,
+                                    const int* expert_offsets,
+                                    int num_experts,
+                                    int hidden_size,
+                                    int intermediate_size,
+                                    cublasHandle_t cublas_handle,
+                                    cudaStream_t stream,
+                                    const int* host_offsets,
+                                    const int* active_expert_indices,
+                                    bool weight_is_compact,
+                                    int num_active_experts,
+                                    const void* const* weight_ptrs) {
+    moe_grouped_gemm_down_backward_impl(d_input,
+                                        d_output,
+                                        weights,
+                                        expert_offsets,
+                                        num_experts,
+                                        hidden_size,
+                                        intermediate_size,
+                                        cublas_handle,
+                                        stream,
+                                        host_offsets,
+                                        active_expert_indices,
+                                        weight_is_compact,
+                                        num_active_experts,
+                                        weight_ptrs);
 }
 
-void moe_grouped_gemm_gate_up_backward(
-    nv_bfloat16* d_input,
-    const nv_bfloat16* d_gate_up,
-    const nv_bfloat16* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_gate_up_backward_impl(d_input, d_gate_up, weights, expert_offsets,
-                                            num_experts, hidden_size, intermediate_size,
-                                            cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input,
+                                       const nv_bfloat16* d_gate_up,
+                                       const nv_bfloat16* weights,
+                                       const int* expert_offsets,
+                                       int num_experts,
+                                       int hidden_size,
+                                       int intermediate_size,
+                                       cublasHandle_t cublas_handle,
+                                       cudaStream_t stream,
+                                       const int* host_offsets,
+                                       const int* active_expert_indices,
+                                       bool weight_is_compact,
+                                       int num_active_experts,
+                                       const void* const* weight_ptrs) {
+    moe_grouped_gemm_gate_up_backward_impl(d_input,
+                                           d_gate_up,
+                                           weights,
+                                           expert_offsets,
+                                           num_experts,
+                                           hidden_size,
+                                           intermediate_size,
+                                           cublas_handle,
+                                           stream,
+                                           host_offsets,
+                                           active_expert_indices,
+                                           weight_is_compact,
+                                           num_active_experts,
+                                           weight_ptrs);
 }
 
-void moe_grouped_gemm_gate_up_backward(
-    float* d_input,
-    const float* d_gate_up,
-    const float* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_gate_up_backward_impl(d_input, d_gate_up, weights, expert_offsets,
-                                            num_experts, hidden_size, intermediate_size,
-                                            cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_gate_up_backward(float* d_input,
+                                       const float* d_gate_up,
+                                       const float* weights,
+                                       const int* expert_offsets,
+                                       int num_experts,
+                                       int hidden_size,
+                                       int intermediate_size,
+                                       cublasHandle_t cublas_handle,
+                                       cudaStream_t stream,
+                                       const int* host_offsets,
+                                       const int* active_expert_indices,
+                                       bool weight_is_compact,
+                                       int num_active_experts,
+                                       const void* const* weight_ptrs) {
+    moe_grouped_gemm_gate_up_backward_impl(d_input,
+                                           d_gate_up,
+                                           weights,
+                                           expert_offsets,
+                                           num_experts,
+                                           hidden_size,
+                                           intermediate_size,
+                                           cublas_handle,
+                                           stream,
+                                           host_offsets,
+                                           active_expert_indices,
+                                           weight_is_compact,
+                                           num_active_experts,
+                                           weight_ptrs);
 }
 
-void moe_grouped_gemm_up_backward(
-    nv_bfloat16* d_input,
-    const nv_bfloat16* d_up,
-    const nv_bfloat16* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_up_backward_impl(d_input, d_up, weights, expert_offsets,
-                                      num_experts, hidden_size, intermediate_size,
-                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_up_backward(nv_bfloat16* d_input,
+                                  const nv_bfloat16* d_up,
+                                  const nv_bfloat16* weights,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int hidden_size,
+                                  int intermediate_size,
+                                  cublasHandle_t cublas_handle,
+                                  cudaStream_t stream,
+                                  const int* host_offsets,
+                                  const int* active_expert_indices,
+                                  bool weight_is_compact,
+                                  int num_active_experts,
+                                  const void* const* weight_ptrs) {
+    moe_grouped_gemm_up_backward_impl(d_input,
+                                      d_up,
+                                      weights,
+                                      expert_offsets,
+                                      num_experts,
+                                      hidden_size,
+                                      intermediate_size,
+                                      cublas_handle,
+                                      stream,
+                                      host_offsets,
+                                      active_expert_indices,
+                                      weight_is_compact,
+                                      num_active_experts,
+                                      weight_ptrs);
 }
 
-void moe_grouped_gemm_up_backward(
-    float* d_input,
-    const float* d_up,
-    const float* weights,
-    const int* expert_offsets,
-    int num_experts,
-    int hidden_size,
-    int intermediate_size,
-    cublasHandle_t cublas_handle,
-    cudaStream_t stream,
-    const int* host_offsets,
-    const int* active_expert_indices,
-    bool weight_is_compact,
-    int num_active_experts,
-    const void* const* weight_ptrs
-) {
-    moe_grouped_gemm_up_backward_impl(d_input, d_up, weights, expert_offsets,
-                                      num_experts, hidden_size, intermediate_size,
-                                      cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts, weight_ptrs);
+void moe_grouped_gemm_up_backward(float* d_input,
+                                  const float* d_up,
+                                  const float* weights,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int hidden_size,
+                                  int intermediate_size,
+                                  cublasHandle_t cublas_handle,
+                                  cudaStream_t stream,
+                                  const int* host_offsets,
+                                  const int* active_expert_indices,
+                                  bool weight_is_compact,
+                                  int num_active_experts,
+                                  const void* const* weight_ptrs) {
+    moe_grouped_gemm_up_backward_impl(d_input,
+                                      d_up,
+                                      weights,
+                                      expert_offsets,
+                                      num_experts,
+                                      hidden_size,
+                                      intermediate_size,
+                                      cublas_handle,
+                                      stream,
+                                      host_offsets,
+                                      active_expert_indices,
+                                      weight_is_compact,
+                                      num_active_experts,
+                                      weight_ptrs);
 }
 
 // ============================================================================
@@ -3510,14 +3682,13 @@ void moe_grouped_gemm_up_backward(
 
 // Softmax backward kernel
 // d_logits = softmax_probs * (d_output - sum_j(d_output_j * softmax_probs_j))
-template<typename T, int BLOCK_SIZE = 256>
-__global__ void moe_softmax_backward_kernel(
-    T* __restrict__ d_logits,             // (num_tokens, num_experts)
-    const T* __restrict__ d_probs,        // (num_tokens, num_experts) - upstream gradient
-    const T* __restrict__ softmax_probs,  // (num_tokens, num_experts)
-    int num_tokens,
-    int num_experts
-) {
+template <typename T, int BLOCK_SIZE = 256>
+__global__ void
+moe_softmax_backward_kernel(T* __restrict__ d_logits,             // (num_tokens, num_experts)
+                            const T* __restrict__ d_probs,        // (num_tokens, num_experts) - upstream gradient
+                            const T* __restrict__ softmax_probs,  // (num_tokens, num_experts)
+                            int num_tokens,
+                            int num_experts) {
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
 
@@ -3563,20 +3734,19 @@ __global__ void moe_softmax_backward_kernel(
 
 // Backward through unpermute+combine: scatter gradient to expert outputs
 // d_expert_outputs[permuted_idx] = routing_weights[token, k] * d_output[token]
-template<typename T>
-__global__ void moe_combine_backward_kernel(
-    T* __restrict__ d_expert_out,         // (total_tokens, hidden_size)
-    T* __restrict__ d_routing_weights,    // (num_tokens, top_k) - optional, can be NULL
-    const T* __restrict__ d_output,       // (num_tokens, hidden_size)
-    const T* __restrict__ expert_out,     // (total_tokens, hidden_size) - for weight gradient
-    const T* __restrict__ routing_weights,// (num_tokens, top_k)
-    const int* __restrict__ scatter_indices, // (total_tokens,)
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k
-) {
-    using x128 = GenericVector<T, 16/sizeof(T)>;
+template <typename T>
+__global__ void
+moe_combine_backward_kernel(T* __restrict__ d_expert_out,           // (total_tokens, hidden_size)
+                            T* __restrict__ d_routing_weights,      // (num_tokens, top_k) - optional, can be NULL
+                            const T* __restrict__ d_output,         // (num_tokens, hidden_size)
+                            const T* __restrict__ expert_out,       // (total_tokens, hidden_size) - for weight gradient
+                            const T* __restrict__ routing_weights,  // (num_tokens, top_k)
+                            const int* __restrict__ scatter_indices,  // (total_tokens,)
+                            int num_tokens,
+                            int total_tokens,
+                            int hidden_size,
+                            int top_k) {
+    using x128 = GenericVector<T, 16 / sizeof(T)>;
 
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -3652,20 +3822,19 @@ __global__ void moe_combine_backward_kernel(
 
 // Backward through unpermute+combine with FP32 routing weights and BF16 expert outputs.
 // d_expert_outputs[permuted_idx] = routing_weights[token, k] * d_output[token]
-template<typename T>
+template <typename T>
 __global__ void moe_combine_backward_kernel_mixed(
-    T* __restrict__ d_expert_out,          // (total_tokens, hidden_size)
-    float* __restrict__ d_routing_weights, // (num_tokens, top_k) - optional, can be NULL
-    const T* __restrict__ d_output,        // (num_tokens, hidden_size)
-    const T* __restrict__ expert_out,      // (total_tokens, hidden_size) - for weight gradient
-    const float* __restrict__ routing_weights, // (num_tokens, top_k) in FP32
-    const int* __restrict__ scatter_indices,  // (total_tokens,)
+    T* __restrict__ d_expert_out,               // (total_tokens, hidden_size)
+    float* __restrict__ d_routing_weights,      // (num_tokens, top_k) - optional, can be NULL
+    const T* __restrict__ d_output,             // (num_tokens, hidden_size)
+    const T* __restrict__ expert_out,           // (total_tokens, hidden_size) - for weight gradient
+    const float* __restrict__ routing_weights,  // (num_tokens, top_k) in FP32
+    const int* __restrict__ scatter_indices,    // (total_tokens,)
     int num_tokens,
     int total_tokens,
     int hidden_size,
-    int top_k
-) {
-    using x128 = GenericVector<T, 16/sizeof(T)>;
+    int top_k) {
+    using x128 = GenericVector<T, 16 / sizeof(T)>;
 
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -3743,16 +3912,14 @@ __global__ void moe_combine_backward_kernel_mixed(
 // d_input[token] += d_permuted[permuted_idx] for each assignment
 // FP32 version - uses native atomicAdd
 // Note: atomicAdd is per-element (no vectorized atomic), but we vectorize the load
-__global__ void moe_permute_backward_kernel_fp32(
-    float* __restrict__ d_input,              // (num_tokens, hidden_size)
-    const float* __restrict__ d_permuted,     // (total_tokens, hidden_size)
-    const int* __restrict__ gather_indices,   // (total_tokens,)
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k
-) {
-    using x128 = GenericVector<float, 16/sizeof(float)>;
+__global__ void moe_permute_backward_kernel_fp32(float* __restrict__ d_input,             // (num_tokens, hidden_size)
+                                                 const float* __restrict__ d_permuted,    // (total_tokens, hidden_size)
+                                                 const int* __restrict__ gather_indices,  // (total_tokens,)
+                                                 int total_tokens,
+                                                 int num_tokens,
+                                                 int hidden_size,
+                                                 int top_k) {
+    using x128 = GenericVector<float, 16 / sizeof(float)>;
 
     int out_idx = blockIdx.x;
     if (out_idx >= total_tokens) return;
@@ -3779,16 +3946,15 @@ __global__ void moe_permute_backward_kernel_fp32(
 
 // BF16 version - uses atomicAdd for __nv_bfloat16 (requires SM80+)
 // Vectorized load, scalar atomicAdd
-__global__ void moe_permute_backward_kernel_bf16(
-    nv_bfloat16* __restrict__ d_input,              // (num_tokens, hidden_size)
-    const nv_bfloat16* __restrict__ d_permuted,     // (total_tokens, hidden_size)
-    const int* __restrict__ gather_indices,         // (total_tokens,)
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k
-) {
-    using x128 = GenericVector<nv_bfloat16, 16/sizeof(nv_bfloat16)>;
+__global__ void
+moe_permute_backward_kernel_bf16(nv_bfloat16* __restrict__ d_input,           // (num_tokens, hidden_size)
+                                 const nv_bfloat16* __restrict__ d_permuted,  // (total_tokens, hidden_size)
+                                 const int* __restrict__ gather_indices,      // (total_tokens,)
+                                 int total_tokens,
+                                 int num_tokens,
+                                 int hidden_size,
+                                 int top_k) {
+    using x128 = GenericVector<nv_bfloat16, 16 / sizeof(nv_bfloat16)>;
 
     int out_idx = blockIdx.x;
     if (out_idx >= total_tokens) return;
@@ -3813,16 +3979,15 @@ __global__ void moe_permute_backward_kernel_bf16(
     }
 }
 
-template<typename T, typename AccT>
+template <typename T, typename AccT>
 __global__ void moe_permute_backward_from_scatter_kernel(
-    T* __restrict__ d_input,                // (num_tokens, hidden_size)
-    const T* __restrict__ d_permuted,       // (total_tokens, hidden_size)
-    const int* __restrict__ scatter_indices,// (total_tokens,) assignment_idx -> permuted pos
+    T* __restrict__ d_input,                  // (num_tokens, hidden_size)
+    const T* __restrict__ d_permuted,         // (total_tokens, hidden_size)
+    const int* __restrict__ scatter_indices,  // (total_tokens,) assignment_idx -> permuted pos
     int total_tokens,
     int num_tokens,
     int hidden_size,
-    int top_k
-) {
+    int top_k) {
     using x128 = GenericVector<T, 16 / sizeof(T)>;
 
     int token_idx = blockIdx.x;
@@ -3856,9 +4021,7 @@ __global__ void moe_permute_backward_from_scatter_kernel(
         out.store(d_in + d);
     }
 
-    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x;
-         r < hidden_size;
-         r += blockDim.x) {
+    for (int r = (hidden_size / x128::size) * x128::size + threadIdx.x; r < hidden_size; r += blockDim.x) {
         AccT acc = AccT(0);
         for (int k = 0; k < top_k; ++k) {
             const int assignment_idx = assignment_base + k;
@@ -3874,170 +4037,184 @@ __global__ void moe_permute_backward_from_scatter_kernel(
 // Backward Host Wrapper Functions
 // ============================================================================
 
-void moe_softmax_backward(
-    nv_bfloat16* d_logits,
-    const nv_bfloat16* d_probs,
-    const nv_bfloat16* softmax_probs,
-    int num_tokens,
-    int num_experts,
-    cudaStream_t stream
-) {
+void moe_softmax_backward(nv_bfloat16* d_logits,
+                          const nv_bfloat16* d_probs,
+                          const nv_bfloat16* softmax_probs,
+                          int num_tokens,
+                          int num_experts,
+                          cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_softmax_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        d_logits, d_probs, softmax_probs, num_tokens, num_experts
-    );
+    moe_softmax_backward_kernel<nv_bfloat16>
+        <<<grid_size, block_size, 0, stream>>>(d_logits, d_probs, softmax_probs, num_tokens, num_experts);
 }
 
-void moe_softmax_backward(
-    float* d_logits,
-    const float* d_probs,
-    const float* softmax_probs,
-    int num_tokens,
-    int num_experts,
-    cudaStream_t stream
-) {
+void moe_softmax_backward(float* d_logits,
+                          const float* d_probs,
+                          const float* softmax_probs,
+                          int num_tokens,
+                          int num_experts,
+                          cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_softmax_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        d_logits, d_probs, softmax_probs, num_tokens, num_experts
-    );
+    moe_softmax_backward_kernel<float>
+        <<<grid_size, block_size, 0, stream>>>(d_logits, d_probs, softmax_probs, num_tokens, num_experts);
 }
 
-void moe_combine_backward(
-    nv_bfloat16* d_expert_out,
-    nv_bfloat16* d_routing_weights,
-    const nv_bfloat16* d_output,
-    const nv_bfloat16* expert_out,
-    const nv_bfloat16* routing_weights,
-    const int* scatter_indices,
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_combine_backward(nv_bfloat16* d_expert_out,
+                          nv_bfloat16* d_routing_weights,
+                          const nv_bfloat16* d_output,
+                          const nv_bfloat16* expert_out,
+                          const nv_bfloat16* routing_weights,
+                          const int* scatter_indices,
+                          int num_tokens,
+                          int total_tokens,
+                          int hidden_size,
+                          int top_k,
+                          cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_combine_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        d_expert_out, d_routing_weights, d_output, expert_out,
-        routing_weights, scatter_indices, num_tokens, total_tokens, hidden_size, top_k
-    );
+    moe_combine_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(d_expert_out,
+                                                                                   d_routing_weights,
+                                                                                   d_output,
+                                                                                   expert_out,
+                                                                                   routing_weights,
+                                                                                   scatter_indices,
+                                                                                   num_tokens,
+                                                                                   total_tokens,
+                                                                                   hidden_size,
+                                                                                   top_k);
 }
 
-void moe_combine_backward(
-    nv_bfloat16* d_expert_out,
-    float* d_routing_weights,
-    const nv_bfloat16* d_output,
-    const nv_bfloat16* expert_out,
-    const float* routing_weights,
-    const int* scatter_indices,
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_combine_backward(nv_bfloat16* d_expert_out,
+                          float* d_routing_weights,
+                          const nv_bfloat16* d_output,
+                          const nv_bfloat16* expert_out,
+                          const float* routing_weights,
+                          const int* scatter_indices,
+                          int num_tokens,
+                          int total_tokens,
+                          int hidden_size,
+                          int top_k,
+                          cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_combine_backward_kernel_mixed<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-        d_expert_out, d_routing_weights, d_output, expert_out,
-        routing_weights, scatter_indices, num_tokens, total_tokens, hidden_size, top_k
-    );
+    moe_combine_backward_kernel_mixed<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(d_expert_out,
+                                                                                         d_routing_weights,
+                                                                                         d_output,
+                                                                                         expert_out,
+                                                                                         routing_weights,
+                                                                                         scatter_indices,
+                                                                                         num_tokens,
+                                                                                         total_tokens,
+                                                                                         hidden_size,
+                                                                                         top_k);
 }
 
-void moe_combine_backward(
-    float* d_expert_out,
-    float* d_routing_weights,
-    const float* d_output,
-    const float* expert_out,
-    const float* routing_weights,
-    const int* scatter_indices,
-    int num_tokens,
-    int total_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_combine_backward(float* d_expert_out,
+                          float* d_routing_weights,
+                          const float* d_output,
+                          const float* expert_out,
+                          const float* routing_weights,
+                          const int* scatter_indices,
+                          int num_tokens,
+                          int total_tokens,
+                          int hidden_size,
+                          int top_k,
+                          cudaStream_t stream) {
     int block_size = 256;
     int grid_size = num_tokens;
-    moe_combine_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(
-        d_expert_out, d_routing_weights, d_output, expert_out,
-        routing_weights, scatter_indices, num_tokens, total_tokens, hidden_size, top_k
-    );
+    moe_combine_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(d_expert_out,
+                                                                             d_routing_weights,
+                                                                             d_output,
+                                                                             expert_out,
+                                                                             routing_weights,
+                                                                             scatter_indices,
+                                                                             num_tokens,
+                                                                             total_tokens,
+                                                                             hidden_size,
+                                                                             top_k);
 }
 
-void moe_permute_backward(
-    nv_bfloat16* d_input,
-    const nv_bfloat16* d_permuted,
-    const int* gather_indices,
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_permute_backward(nv_bfloat16* d_input,
+                          const nv_bfloat16* d_permuted,
+                          const int* gather_indices,
+                          int total_tokens,
+                          int num_tokens,
+                          int hidden_size,
+                          int top_k,
+                          cudaStream_t stream) {
     // Zero the output first (since we're accumulating)
     cudaMemsetAsync(d_input, 0, num_tokens * hidden_size * sizeof(nv_bfloat16), stream);
 
     int block_size = 256;
     int grid_size = total_tokens;
-    moe_permute_backward_kernel_bf16<<<grid_size, block_size, 0, stream>>>(
-        d_input, d_permuted, gather_indices, total_tokens, num_tokens, hidden_size, top_k
-    );
+    moe_permute_backward_kernel_bf16<<<grid_size, block_size, 0, stream>>>(d_input,
+                                                                           d_permuted,
+                                                                           gather_indices,
+                                                                           total_tokens,
+                                                                           num_tokens,
+                                                                           hidden_size,
+                                                                           top_k);
 }
 
-void moe_permute_backward(
-    float* d_input,
-    const float* d_permuted,
-    const int* gather_indices,
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_permute_backward(float* d_input,
+                          const float* d_permuted,
+                          const int* gather_indices,
+                          int total_tokens,
+                          int num_tokens,
+                          int hidden_size,
+                          int top_k,
+                          cudaStream_t stream) {
     cudaMemsetAsync(d_input, 0, num_tokens * hidden_size * sizeof(float), stream);
 
     int block_size = 256;
     int grid_size = total_tokens;
-    moe_permute_backward_kernel_fp32<<<grid_size, block_size, 0, stream>>>(
-        d_input, d_permuted, gather_indices, total_tokens, num_tokens, hidden_size, top_k
-    );
+    moe_permute_backward_kernel_fp32<<<grid_size, block_size, 0, stream>>>(d_input,
+                                                                           d_permuted,
+                                                                           gather_indices,
+                                                                           total_tokens,
+                                                                           num_tokens,
+                                                                           hidden_size,
+                                                                           top_k);
 }
 
-void moe_permute_backward_from_scatter(
-    nv_bfloat16* d_input,
-    const nv_bfloat16* d_permuted,
-    const int* scatter_indices,
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_permute_backward_from_scatter(nv_bfloat16* d_input,
+                                       const nv_bfloat16* d_permuted,
+                                       const int* scatter_indices,
+                                       int total_tokens,
+                                       int num_tokens,
+                                       int hidden_size,
+                                       int top_k,
+                                       cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = num_tokens;
-    moe_permute_backward_from_scatter_kernel<nv_bfloat16, float><<<grid_size, block_size, 0, stream>>>(
-        d_input, d_permuted, scatter_indices, total_tokens, num_tokens, hidden_size, top_k
-    );
+    moe_permute_backward_from_scatter_kernel<nv_bfloat16, float><<<grid_size, block_size, 0, stream>>>(d_input,
+                                                                                                       d_permuted,
+                                                                                                       scatter_indices,
+                                                                                                       total_tokens,
+                                                                                                       num_tokens,
+                                                                                                       hidden_size,
+                                                                                                       top_k);
 }
 
-void moe_permute_backward_from_scatter(
-    float* d_input,
-    const float* d_permuted,
-    const int* scatter_indices,
-    int total_tokens,
-    int num_tokens,
-    int hidden_size,
-    int top_k,
-    cudaStream_t stream
-) {
+void moe_permute_backward_from_scatter(float* d_input,
+                                       const float* d_permuted,
+                                       const int* scatter_indices,
+                                       int total_tokens,
+                                       int num_tokens,
+                                       int hidden_size,
+                                       int top_k,
+                                       cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = num_tokens;
-    moe_permute_backward_from_scatter_kernel<float, float><<<grid_size, block_size, 0, stream>>>(
-        d_input, d_permuted, scatter_indices, total_tokens, num_tokens, hidden_size, top_k
-    );
+    moe_permute_backward_from_scatter_kernel<float, float><<<grid_size, block_size, 0, stream>>>(d_input,
+                                                                                                 d_permuted,
+                                                                                                 scatter_indices,
+                                                                                                 total_tokens,
+                                                                                                 num_tokens,
+                                                                                                 hidden_size,
+                                                                                                 top_k);
 }
 
 // ============================================================================
@@ -4059,11 +4236,15 @@ void moe_grouped_gemm(nv_bfloat16* output,
                       const __nv_fp8_e4m3* weights,
                       const float* scale_input,
                       const float* scale_weights,
-                      const int* expert_offsets, int num_experts,
-                      int M, int K,
-                      cublasLtHandle_t cublas_handle, cudaStream_t stream,
+                      const int* expert_offsets,
+                      int num_experts,
+                      int M,
+                      int K,
+                      cublasLtHandle_t cublas_handle,
+                      cudaStream_t stream,
                       const int* host_offsets,
-                      float alpha, float beta,
+                      float alpha,
+                      float beta,
                       EMMTranspose mode,
                       const int* active_expert_indices,
                       bool weight_is_compact,
@@ -4092,11 +4273,18 @@ void moe_grouped_gemm(nv_bfloat16* output,
         // input: (num_tokens, K) E4M3
         // weight: (M, K) E4M3
         // output: (num_tokens, M) BF16
-        matmul(output_slice, weight_slice, input_slice,
+        matmul(output_slice,
+               weight_slice,
+               input_slice,
                static_cast<nv_bfloat16*>(nullptr),  // no bias
-               weight_scale_slice, scale_input,
-               cublas_handle, nullptr, 0,  // no workspace needed
-               M, num_tokens, K,
+               weight_scale_slice,
+               scale_input,
+               cublas_handle,
+               nullptr,
+               0,  // no workspace needed
+               M,
+               num_tokens,
+               K,
                mode,  // typically TN
                /*accumulate=*/false,
                stream);
@@ -4109,9 +4297,12 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input,
                                   const __nv_fp8_e4m3* weights,
                                   const float* scale_dout,
                                   const float* scale_weights,
-                                  const int* expert_offsets, int num_experts,
-                                  int hidden_size, int intermediate_size,
-                                  cublasLtHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int hidden_size,
+                                  int intermediate_size,
+                                  cublasLtHandle_t cublas_handle,
+                                  cudaStream_t stream,
                                   const int* host_offsets,
                                   const int* active_expert_indices,
                                   bool weight_is_compact,
@@ -4142,11 +4333,18 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input,
 
         // dinp = W^T @ dout => (K, M) @ (num_tokens, M)^T = (K, num_tokens)^T = (num_tokens, K)
         // Using NN mode: dinp = weight @ dout where weight is (M, K) -> need (K, M)
-        matmul(dinp_slice, weight_slice, dout_slice,
+        matmul(dinp_slice,
+               weight_slice,
+               dout_slice,
                static_cast<nv_bfloat16*>(nullptr),  // no bias
-               weight_scale_slice, scale_dout,
-               cublas_handle, nullptr, 0,
-               K, num_tokens, M,
+               weight_scale_slice,
+               scale_dout,
+               cublas_handle,
+               nullptr,
+               0,
+               K,
+               num_tokens,
+               M,
                EMMTranspose::NN,  // weight needs to be transposed
                /*accumulate=*/false,
                stream);

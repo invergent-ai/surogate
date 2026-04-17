@@ -46,9 +46,9 @@ public:
         bool is_moe = false;  ///< True for MoE models
 
         // MoE-specific configuration (only used when is_moe = true)
-        int num_experts = 0;              ///< Number of experts per layer
-        int moe_intermediate_size = 0;    ///< Per-expert intermediate size (0 = use intermediate_size)
-        bool train_router = false;         ///< Train MoE router gate during LoRA fine-tuning
+        int num_experts = 0;            ///< Number of experts per layer
+        int moe_intermediate_size = 0;  ///< Per-expert intermediate size (0 = use intermediate_size)
+        bool train_router = false;      ///< Train MoE router gate during LoRA fine-tuning
 
         const ModelConfig* model_config = nullptr;  ///< Per-layer block type (hybrid models)
 
@@ -97,27 +97,37 @@ public:
      * Call once per training step (after the optimizer updates master weights)
      * so that the next get_block() call per layer will re-sync.
      */
-    void advance_sync_generation() { ++mSyncGeneration; }
+    void advance_sync_generation() {
+        ++mSyncGeneration;
+    }
 
     /**
      * @brief Get LoRA scaling factor
      */
-    [[nodiscard]] float scaling() const { return mConfig.lora_config.scaling(); }
+    [[nodiscard]] float scaling() const {
+        return mConfig.lora_config.scaling();
+    }
 
     /**
      * @brief Check if LoRA is enabled
      */
-    [[nodiscard]] bool enabled() const { return mConfig.lora_config.enabled(); }
+    [[nodiscard]] bool enabled() const {
+        return mConfig.lora_config.enabled();
+    }
 
     /**
      * @brief Get the LoRA configuration
      */
-    [[nodiscard]] const ModularLoRAConfig& lora_config() const { return mConfig.lora_config; }
+    [[nodiscard]] const ModularLoRAConfig& lora_config() const {
+        return mConfig.lora_config;
+    }
 
     /**
      * @brief Check if router training is enabled
      */
-    [[nodiscard]] bool train_router() const { return mConfig.train_router; }
+    [[nodiscard]] bool train_router() const {
+        return mConfig.train_router;
+    }
 
     /**
      * @brief Get number of trainable parameters
@@ -144,18 +154,20 @@ private:
     std::vector<std::uint64_t> mBlockSyncGen;  // Per-block last-synced generation
 
     void allocate_layer_weights(LoRALayerWeights<TensorShard>& shard,
-                                 LoRALayerWeights<Tensor>& work,
-                                 int in_features, int out_features,
-                                 const std::string& name);
+                                LoRALayerWeights<Tensor>& work,
+                                int in_features,
+                                int out_features,
+                                const std::string& name);
     void allocate_block_weights(int layer_idx);
     void allocate_grouped_moe_weights(LoRAGroupedExpertWeights<TensorShard>& master_moe,
                                       LoRAGroupedExpertWeights<Tensor>& work_moe,
                                       int layer_idx);
     void allocate_expert_weights(LoRAExpertWeights<TensorShard>& master_expert,
-                                  LoRAExpertWeights<Tensor>& work_expert,
-                                  int layer_idx, int expert_idx);
+                                 LoRAExpertWeights<Tensor>& work_expert,
+                                 int layer_idx,
+                                 int expert_idx);
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H

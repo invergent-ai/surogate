@@ -23,22 +23,18 @@ namespace qlora {
 // Construction / Destruction
 // ---------------------------------------------------------------------------
 
-AdapterMerger::AdapterMerger(
-    const std::string& adapter_dir,
-    const dsl::MappingTable& hf_mapping,
-    SafeTensorsReader& base_reader,
-    dsl::ShardConfig shard)
-    : mAdapterReader(
-          (fs::path(adapter_dir) / "adapter_model.safetensors").string())
-    , mMapping(hf_mapping)
-    , mBaseReader(base_reader)
-    , mShard(shard) {
-
+AdapterMerger::AdapterMerger(const std::string& adapter_dir,
+                             const dsl::MappingTable& hf_mapping,
+                             SafeTensorsReader& base_reader,
+                             dsl::ShardConfig shard)
+    : mAdapterReader((fs::path(adapter_dir) / "adapter_model.safetensors").string()),
+      mMapping(hf_mapping),
+      mBaseReader(base_reader),
+      mShard(shard) {
     // ---- Parse adapter_config.json ----
     const auto config_path = fs::path(adapter_dir) / "adapter_config.json";
     if (!fs::exists(config_path)) {
-        throw std::runtime_error(
-            "AdapterMerger: adapter_config.json not found in " + adapter_dir);
+        throw std::runtime_error("AdapterMerger: adapter_config.json not found in " + adapter_dir);
     }
 
     nlohmann::json cfg;
@@ -68,8 +64,7 @@ AdapterMerger::AdapterMerger(
         // Look for ".lora_A.weight" suffix
         const std::string lora_a_suffix = ".lora_A.weight";
         if (name.size() <= lora_a_suffix.size()) continue;
-        if (name.compare(name.size() - lora_a_suffix.size(),
-                         lora_a_suffix.size(), lora_a_suffix) != 0) {
+        if (name.compare(name.size() - lora_a_suffix.size(), lora_a_suffix.size(), lora_a_suffix) != 0) {
             continue;
         }
 
@@ -78,12 +73,9 @@ AdapterMerger::AdapterMerger(
         std::string base_name;
         const std::string peft_prefix = "base_model.model.";
         if (name.compare(0, peft_prefix.size(), peft_prefix) == 0) {
-            base_name = name.substr(
-                peft_prefix.size(),
-                name.size() - peft_prefix.size() - lora_a_suffix.size());
+            base_name = name.substr(peft_prefix.size(), name.size() - peft_prefix.size() - lora_a_suffix.size());
         } else {
-            base_name = name.substr(
-                0, name.size() - lora_a_suffix.size());
+            base_name = name.substr(0, name.size() - lora_a_suffix.size());
         }
 
         // Construct lora_B key
@@ -98,8 +90,7 @@ AdapterMerger::AdapterMerger(
     }
 
     if (mAdapterTargets.empty()) {
-        throw std::runtime_error(
-            "AdapterMerger: no LoRA adapter weights found in " + adapter_dir);
+        throw std::runtime_error("AdapterMerger: no LoRA adapter weights found in " + adapter_dir);
     }
 
     // ---- Create cuBLAS handle ----
@@ -111,7 +102,10 @@ AdapterMerger::AdapterMerger(
     fmt::print(stderr,
                "[AdapterMerger] Loaded adapter from {}: rank={}, alpha={}, "
                "scaling={:.4f}, {} target weights\n",
-               adapter_dir, mRank, alpha, mScaling,
+               adapter_dir,
+               mRank,
+               alpha,
+               mScaling,
                mAdapterTargets.size());
 }
 
@@ -133,8 +127,7 @@ void AdapterMerger::ensure_buf(void*& buf, size_t& current_size, size_t needed) 
         buf = nullptr;
         current_size = 0;
         throw std::runtime_error(
-            fmt::format("AdapterMerger: cudaMalloc({}) failed: {}",
-                        needed, cudaGetErrorString(err)));
+            fmt::format("AdapterMerger: cudaMalloc({}) failed: {}", needed, cudaGetErrorString(err)));
     }
     current_size = needed;
 }
@@ -143,8 +136,7 @@ void AdapterMerger::ensure_buf(void*& buf, size_t& current_size, size_t needed) 
 // Mapping resolution helpers
 // ---------------------------------------------------------------------------
 
-const dsl::MappingSpec* AdapterMerger::find_spec(
-    const std::string& dsl_name, int& layer_idx) const {
+const dsl::MappingSpec* AdapterMerger::find_spec(const std::string& dsl_name, int& layer_idx) const {
     // Try exact match first.
     auto it = mMapping.find(dsl_name);
     if (it != mMapping.end()) {
@@ -156,10 +148,10 @@ const dsl::MappingSpec* AdapterMerger::find_spec(
     if (dsl::DslWeightLoader::parse_block_param(dsl_name, layer_idx, param_name)) {
         // Try several common block-type prefix patterns
         for (const char* prefix : {"blocks[{layer}].",
-                                    "attn_blocks[{layer}].",
-                                    "mamba_blocks[{layer}].",
-                                    "mlp_blocks[{layer}].",
-                                    "moe_blocks[{layer}]."}) {
+                                   "attn_blocks[{layer}].",
+                                   "mamba_blocks[{layer}].",
+                                   "mlp_blocks[{layer}].",
+                                   "moe_blocks[{layer}]."}) {
             std::string pattern = std::string(prefix) + param_name;
             it = mMapping.find(pattern);
             if (it != mMapping.end()) {
@@ -173,9 +165,7 @@ const dsl::MappingSpec* AdapterMerger::find_spec(
 
 std::string AdapterMerger::strip_weight_suffix(const std::string& hf_name) {
     const std::string suffix = ".weight";
-    if (hf_name.size() > suffix.size() &&
-        hf_name.compare(hf_name.size() - suffix.size(),
-                        suffix.size(), suffix) == 0) {
+    if (hf_name.size() > suffix.size() && hf_name.compare(hf_name.size() - suffix.size(), suffix.size(), suffix) == 0) {
         return hf_name.substr(0, hf_name.size() - suffix.size());
     }
     return hf_name;
@@ -185,13 +175,11 @@ std::string AdapterMerger::strip_weight_suffix(const std::string& hf_name) {
 // Core merge: apply adapter delta for one HF component
 // ---------------------------------------------------------------------------
 
-void AdapterMerger::merge_component(
-    const std::string& hf_base_name,
-    Tensor& bf16_weight,
-    long row_offset,
-    long component_rows,
-    cudaStream_t stream) {
-
+void AdapterMerger::merge_component(const std::string& hf_base_name,
+                                    Tensor& bf16_weight,
+                                    long row_offset,
+                                    long component_rows,
+                                    cudaStream_t stream) {
     auto target_it = mAdapterTargets.find(hf_base_name);
     if (target_it == mAdapterTargets.end()) return;
 
@@ -224,12 +212,10 @@ void AdapterMerger::merge_component(
     ensure_buf(mLoraBBuf, mLoraBBufBytes, b_bytes);
 
     // Create Tensor views for the scratch buffers
-    Tensor lora_a = Tensor::from_pointer(
-        static_cast<std::byte*>(mLoraABuf), 0, ETensorDType::BF16,
-        std::vector<long>{R, K});
-    Tensor lora_b = Tensor::from_pointer(
-        static_cast<std::byte*>(mLoraBBuf), 0, ETensorDType::BF16,
-        std::vector<long>{local_M, R});
+    Tensor lora_a =
+        Tensor::from_pointer(static_cast<std::byte*>(mLoraABuf), 0, ETensorDType::BF16, std::vector<long>{R, K});
+    Tensor lora_b =
+        Tensor::from_pointer(static_cast<std::byte*>(mLoraBBuf), 0, ETensorDType::BF16, std::vector<long>{local_M, R});
 
     // Load from adapter safetensors to GPU.
     if (shard_row_start == 0 && shard_row_end == M) {
@@ -261,29 +247,34 @@ void AdapterMerger::merge_component(
     const float beta_val = 1.0f;
 
     const long lda_W = bf16_weight.Rank >= 2 ? bf16_weight.Sizes[bf16_weight.Rank - 1] : 1;
-    auto* W_ptr = reinterpret_cast<nv_bfloat16*>(bf16_weight.Data)
-                  + row_offset * lda_W;
+    auto* W_ptr = reinterpret_cast<nv_bfloat16*>(bf16_weight.Data) + row_offset * lda_W;
     auto* A_ptr = reinterpret_cast<nv_bfloat16*>(mLoraABuf);
     auto* B_ptr = reinterpret_cast<nv_bfloat16*>(mLoraBBuf);
 
-    auto gemm_status = cublasGemmEx(
-        mCublasHandle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        static_cast<int>(K),       // m (columns of C in col-major)
-        static_cast<int>(local_M), // n (rows of C in col-major)
-        static_cast<int>(R),       // k (inner dimension)
-        &alpha_val,
-        A_ptr, CUDA_R_16BF, static_cast<int>(K),       // A^T [K, R]
-        B_ptr, CUDA_R_16BF, static_cast<int>(R),       // B^T [R, M]
-        &beta_val,
-        W_ptr, CUDA_R_16BF, static_cast<int>(lda_W),   // W^T [K, M]
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT);
+    auto gemm_status = cublasGemmEx(mCublasHandle,
+                                    CUBLAS_OP_N,
+                                    CUBLAS_OP_N,
+                                    static_cast<int>(K),        // m (columns of C in col-major)
+                                    static_cast<int>(local_M),  // n (rows of C in col-major)
+                                    static_cast<int>(R),        // k (inner dimension)
+                                    &alpha_val,
+                                    A_ptr,
+                                    CUDA_R_16BF,
+                                    static_cast<int>(K),  // A^T [K, R]
+                                    B_ptr,
+                                    CUDA_R_16BF,
+                                    static_cast<int>(R),  // B^T [R, M]
+                                    &beta_val,
+                                    W_ptr,
+                                    CUDA_R_16BF,
+                                    static_cast<int>(lda_W),  // W^T [K, M]
+                                    CUBLAS_COMPUTE_32F,
+                                    CUBLAS_GEMM_DEFAULT);
 
     if (gemm_status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(fmt::format(
-            "AdapterMerger: cuBLAS GEMM failed for '{}' (status={})",
-            hf_base_name, static_cast<int>(gemm_status)));
+        throw std::runtime_error(fmt::format("AdapterMerger: cuBLAS GEMM failed for '{}' (status={})",
+                                             hf_base_name,
+                                             static_cast<int>(gemm_status)));
     }
 }
 
@@ -291,11 +282,7 @@ void AdapterMerger::merge_component(
 // Public: apply adapter to a DSL parameter
 // ---------------------------------------------------------------------------
 
-void AdapterMerger::apply(
-    const std::string& dsl_param_name,
-    Tensor& bf16_weight,
-    cudaStream_t stream) {
-
+void AdapterMerger::apply(const std::string& dsl_param_name, Tensor& bf16_weight, cudaStream_t stream) {
     int layer_idx = -1;
     const auto* spec = find_spec(dsl_param_name, layer_idx);
     if (!spec) return;  // No mapping → nothing to merge
@@ -303,8 +290,7 @@ void AdapterMerger::apply(
     switch (spec->kind) {
         case dsl::MappingSpec::Kind::Direct: {
             // Single HF tensor → single merge
-            std::string hf_name = dsl::DslWeightLoader::format_hf_name(
-                spec->source, layer_idx);
+            std::string hf_name = dsl::DslWeightLoader::format_hf_name(spec->source, layer_idx);
             std::string base_name = strip_weight_suffix(hf_name);
             const long M = bf16_weight.Sizes[0];
             merge_component(base_name, bf16_weight, 0, M, stream);
@@ -316,8 +302,7 @@ void AdapterMerger::apply(
             // Apply each component's delta at the correct row offset.
             long offset = 0;
             for (const auto& src : spec->sources) {
-                std::string hf_name = dsl::DslWeightLoader::format_hf_name(
-                    src, layer_idx);
+                std::string hf_name = dsl::DslWeightLoader::format_hf_name(src, layer_idx);
                 std::string base_name = strip_weight_suffix(hf_name);
 
                 // Determine this component's row count from the base model.
@@ -334,8 +319,7 @@ void AdapterMerger::apply(
                     continue;
                 }
 
-                merge_component(base_name, bf16_weight, offset,
-                                component_rows, stream);
+                merge_component(base_name, bf16_weight, offset, component_rows, stream);
                 offset += component_rows;
             }
             break;
@@ -347,8 +331,7 @@ void AdapterMerger::apply(
             // delta to the transformed tensor. For transpose transforms,
             // this means the delta needs to match the transformed shape.
             // For now, treat like Direct (most transforms are simple transpose).
-            std::string hf_name = dsl::DslWeightLoader::format_hf_name(
-                spec->source, layer_idx);
+            std::string hf_name = dsl::DslWeightLoader::format_hf_name(spec->source, layer_idx);
             std::string base_name = strip_weight_suffix(hf_name);
             const long M = bf16_weight.Sizes[0];
             merge_component(base_name, bf16_weight, 0, M, stream);
@@ -359,8 +342,7 @@ void AdapterMerger::apply(
             // Split mapping: one HF tensor sliced into multiple DSL params.
             // The adapter targets the full HF weight; we need to apply only
             // the slice that corresponds to this param.
-            std::string hf_name = dsl::DslWeightLoader::format_hf_name(
-                spec->source, layer_idx);
+            std::string hf_name = dsl::DslWeightLoader::format_hf_name(spec->source, layer_idx);
             std::string base_name = strip_weight_suffix(hf_name);
 
             auto target_it = mAdapterTargets.find(base_name);
@@ -383,8 +365,7 @@ void AdapterMerger::apply(
             // Expert weights handled by apply_expert() in the per-expert loop.
             break;
 
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -392,12 +373,10 @@ void AdapterMerger::apply(
 // Public: apply adapter to a single expert
 // ---------------------------------------------------------------------------
 
-void AdapterMerger::apply_expert(
-    const std::string& dsl_param_name,
-    int expert_idx,
-    Tensor& bf16_expert,
-    cudaStream_t stream) {
-
+void AdapterMerger::apply_expert(const std::string& dsl_param_name,
+                                 int expert_idx,
+                                 Tensor& bf16_expert,
+                                 cudaStream_t stream) {
     int layer_idx = -1;
     const auto* spec = find_spec(dsl_param_name, layer_idx);
     if (!spec) return;
@@ -412,8 +391,7 @@ void AdapterMerger::apply_expert(
         // Source has pattern like "model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"
         // and there's a corresponding gate_proj source.
         // The fuse_gate_up pattern stores the up_proj source; gate_proj is derived.
-        std::string up_hf = dsl::DslWeightLoader::format_hf_name(
-            spec->source, layer_idx, expert_idx);
+        std::string up_hf = dsl::DslWeightLoader::format_hf_name(spec->source, layer_idx, expert_idx);
         std::string up_base = strip_weight_suffix(up_hf);
 
         // Derive gate_proj name from up_proj
@@ -430,8 +408,7 @@ void AdapterMerger::apply_expert(
         merge_component(gate_base, bf16_expert, half_rows, half_rows, stream);
     } else {
         // Simple: one HF tensor per expert.
-        std::string hf_name = dsl::DslWeightLoader::format_hf_name(
-            spec->source, layer_idx, expert_idx);
+        std::string hf_name = dsl::DslWeightLoader::format_hf_name(spec->source, layer_idx, expert_idx);
         std::string base_name = strip_weight_suffix(hf_name);
         const long M = bf16_expert.Sizes[0];
         merge_component(base_name, bf16_expert, 0, M, stream);

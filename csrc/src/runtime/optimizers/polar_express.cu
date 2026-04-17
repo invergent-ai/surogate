@@ -24,12 +24,12 @@ namespace optimizers {
 constexpr int THREADS_PER_BLOCK = 256;
 
 // cuBLAS error checking
-#define CUBLAS_CHECK(call)                                                    \
-    do {                                                                       \
-        cublasStatus_t status = (call);                                        \
-        if (status != CUBLAS_STATUS_SUCCESS) {                                 \
+#define CUBLAS_CHECK(call)                                                       \
+    do {                                                                         \
+        cublasStatus_t status = (call);                                          \
+        if (status != CUBLAS_STATUS_SUCCESS) {                                   \
             throw std::runtime_error("cuBLAS error: " + std::to_string(status)); \
-        }                                                                      \
+        }                                                                        \
     } while (0)
 
 // ----------------------------------------------------------------------------
@@ -41,12 +41,7 @@ constexpr int THREADS_PER_BLOCK = 256;
  * Each thread block processes one batch element, reducing across all elements.
  */
 template <int BLOCK_THREADS>
-__global__ void kFrobeniusNormSquared(
-    const nv_bfloat16* __restrict__ X,
-    float* __restrict__ norm_sq,
-    int M,
-    int K
-) {
+__global__ void kFrobeniusNormSquared(const nv_bfloat16* __restrict__ X, float* __restrict__ norm_sq, int M, int K) {
     const int batch_idx = blockIdx.x;
     const int tid = threadIdx.x;
     const int num_elems = M * K;
@@ -90,11 +85,7 @@ __global__ void kFrobeniusNormSquared(
 /**
  * @brief Convert norm squared to spectral scale: 1 / (sqrt(norm_sq) * 1.02 + 1e-6)
  */
-__global__ void kNormToScale(
-    const float* __restrict__ norm_sq,
-    float* __restrict__ scale,
-    int batch
-) {
+__global__ void kNormToScale(const float* __restrict__ norm_sq, float* __restrict__ scale, int batch) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch) {
         float norm = sqrtf(norm_sq[idx]);
@@ -102,18 +93,9 @@ __global__ void kNormToScale(
     }
 }
 
-void compute_spectral_scale(
-    const nv_bfloat16* X,
-    float* scale,
-    int batch,
-    int M,
-    int K,
-    cudaStream_t stream
-) {
+void compute_spectral_scale(const nv_bfloat16* X, float* scale, int batch, int M, int K, cudaStream_t stream) {
     // Launch one block per batch element
-    kFrobeniusNormSquared<THREADS_PER_BLOCK><<<batch, THREADS_PER_BLOCK, 0, stream>>>(
-        X, scale, M, K
-    );
+    kFrobeniusNormSquared<THREADS_PER_BLOCK><<<batch, THREADS_PER_BLOCK, 0, stream>>>(X, scale, M, K);
 
     // Convert norm to scale
     int blocks = (batch + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
@@ -123,12 +105,7 @@ void compute_spectral_scale(
 // ----------------------------------------------------------------------------
 // Scale Application Kernel
 
-__global__ void kApplyScale(
-    nv_bfloat16* __restrict__ X,
-    const float* __restrict__ scale,
-    int M,
-    int K
-) {
+__global__ void kApplyScale(nv_bfloat16* __restrict__ X, const float* __restrict__ scale, int M, int K) {
     const int batch_idx = blockIdx.y;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int num_elems = M * K;
@@ -141,14 +118,7 @@ __global__ void kApplyScale(
     }
 }
 
-void apply_scale(
-    nv_bfloat16* X,
-    const float* scale,
-    int batch,
-    int M,
-    int K,
-    cudaStream_t stream
-) {
+void apply_scale(nv_bfloat16* X, const float* scale, int batch, int M, int K, cudaStream_t stream) {
     int num_elems = M * K;
     int blocks_x = (num_elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     dim3 grid(blocks_x, batch);
@@ -165,14 +135,7 @@ void apply_scale(
 //   ldb=K (leading dim of X row-major)
 //   ldc=M (leading dim of C row-major)
 
-void XXT(
-    const nv_bfloat16* X,
-    nv_bfloat16* C,
-    int batch,
-    int M,
-    int K,
-    cudaStream_t stream
-) {
+void XXT(const nv_bfloat16* X, nv_bfloat16* C, int batch, int M, int K, cudaStream_t stream) {
     // Create temporary cuBLAS handle for this call
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
@@ -186,22 +149,29 @@ void XXT(
 
     // For row-major X @ X^T:
     // cuBLAS: CUBLAS_OP_T, CUBLAS_OP_N with lda=ldb=K, ldc=M
-    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-        handle,
-        CUBLAS_OP_T,     // transA
-        CUBLAS_OP_N,     // transB
-        M,               // m: rows of output C
-        M,               // n: cols of output C
-        K,               // k: inner dimension
-        &one,
-        X, CUDA_R_16BF, K, stride_X,   // lda=K
-        X, CUDA_R_16BF, K, stride_X,   // ldb=K
-        &zero,
-        C, CUDA_R_16BF, M, stride_C,   // ldc=M
-        batch,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT
-    ));
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle,
+                                            CUBLAS_OP_T,  // transA
+                                            CUBLAS_OP_N,  // transB
+                                            M,            // m: rows of output C
+                                            M,            // n: cols of output C
+                                            K,            // k: inner dimension
+                                            &one,
+                                            X,
+                                            CUDA_R_16BF,
+                                            K,
+                                            stride_X,  // lda=K
+                                            X,
+                                            CUDA_R_16BF,
+                                            K,
+                                            stride_X,  // ldb=K
+                                            &zero,
+                                            C,
+                                            CUDA_R_16BF,
+                                            M,
+                                            stride_C,  // ldc=M
+                                            batch,
+                                            CUBLAS_COMPUTE_32F,
+                                            CUBLAS_GEMM_DEFAULT));
 
     // Synchronize before destroying handle
     cudaStreamSynchronize(stream);
@@ -211,15 +181,7 @@ void XXT(
 // ----------------------------------------------------------------------------
 // ba_plus_cAA: Compute C = beta*A + alpha*(A @ A)
 
-void ba_plus_cAA(
-    const nv_bfloat16* A,
-    nv_bfloat16* C,
-    int batch,
-    int M,
-    float alpha,
-    float beta,
-    cudaStream_t stream
-) {
+void ba_plus_cAA(const nv_bfloat16* A, nv_bfloat16* C, int batch, int M, float alpha, float beta, cudaStream_t stream) {
     // Legacy function kept for API compatibility
     // The actual implementation is done inline in polar_express with cuBLAS
 }
@@ -227,12 +189,8 @@ void ba_plus_cAA(
 // ----------------------------------------------------------------------------
 // AXPY: C = alpha * A + C
 
-__global__ void kAxpyMatrix(
-    const nv_bfloat16* __restrict__ A,
-    nv_bfloat16* __restrict__ C,
-    float alpha,
-    int num_elems
-) {
+__global__ void
+kAxpyMatrix(const nv_bfloat16* __restrict__ A, nv_bfloat16* __restrict__ C, float alpha, int num_elems) {
     const int batch_idx = blockIdx.y;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -244,15 +202,7 @@ __global__ void kAxpyMatrix(
     }
 }
 
-void axpy_matrix(
-    const nv_bfloat16* A,
-    nv_bfloat16* C,
-    float alpha,
-    int batch,
-    int M,
-    int N,
-    cudaStream_t stream
-) {
+void axpy_matrix(const nv_bfloat16* A, nv_bfloat16* C, float alpha, int batch, int M, int N, cudaStream_t stream) {
     int num_elems = M * N;
     int blocks_x = (num_elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     dim3 grid(blocks_x, batch);
@@ -262,12 +212,7 @@ void axpy_matrix(
 // ----------------------------------------------------------------------------
 // Matrix Transpose
 
-__global__ void kTranspose(
-    const nv_bfloat16* __restrict__ A,
-    nv_bfloat16* __restrict__ B,
-    int M,
-    int N
-) {
+__global__ void kTranspose(const nv_bfloat16* __restrict__ A, nv_bfloat16* __restrict__ B, int M, int N) {
     const int batch_idx = blockIdx.z;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -279,14 +224,7 @@ __global__ void kTranspose(
     }
 }
 
-void transpose(
-    const nv_bfloat16* A,
-    nv_bfloat16* B,
-    int batch,
-    int M,
-    int N,
-    cudaStream_t stream
-) {
+void transpose(const nv_bfloat16* A, nv_bfloat16* B, int batch, int M, int N, cudaStream_t stream) {
     dim3 block(16, 16);
     dim3 grid((N + 15) / 16, (M + 15) / 16, batch);
     kTranspose<<<grid, block, 0, stream>>>(A, B, M, N);
@@ -295,13 +233,11 @@ void transpose(
 // ----------------------------------------------------------------------------
 // Fused kernel: C = beta*A + alpha*(matmul result already in C)
 
-__global__ void kFusedBetaAPlusAlphaC(
-    const nv_bfloat16* __restrict__ A,
-    nv_bfloat16* __restrict__ C,
-    float alpha,
-    float beta,
-    int num_elems
-) {
+__global__ void kFusedBetaAPlusAlphaC(const nv_bfloat16* __restrict__ A,
+                                      nv_bfloat16* __restrict__ C,
+                                      float alpha,
+                                      float beta,
+                                      int num_elems) {
     const int batch_idx = blockIdx.y;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -324,15 +260,13 @@ size_t polar_express_workspace_size(int batch, int M, int N) {
     return 4 * matrix_size + batch * sizeof(float);
 }
 
-void polar_express(
-    cublasHandle_t handle,
-    nv_bfloat16* G,
-    nv_bfloat16* workspace,
-    int batch,
-    int M,
-    int N,
-    cudaStream_t stream
-) {
+void polar_express(cublasHandle_t handle,
+                   nv_bfloat16* G,
+                   nv_bfloat16* workspace,
+                   int batch,
+                   int M,
+                   int N,
+                   cudaStream_t stream) {
     // Set cuBLAS stream
     CUBLAS_CHECK(cublasSetStream(handle, stream));
 
@@ -394,52 +328,64 @@ void polar_express(
         // A_out = X @ X^T (row-major: A[M,M] = X[M,N] @ X^T[N,M])
         // This is the same as the working XXT function:
         //   CUBLAS_OP_T, CUBLAS_OP_N, m=M, n=M, k=N, lda=N, ldb=N, ldc=M
-        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-            handle,
-            CUBLAS_OP_T,     // transA
-            CUBLAS_OP_N,     // transB
-            work_M,          // m: rows of output A
-            work_M,          // n: cols of output A
-            work_N,          // k: inner dimension (cols of X)
-            &one,
-            X, CUDA_R_16BF, work_N, stride_X,     // lda=N (X row-major M x N)
-            X, CUDA_R_16BF, work_N, stride_X,     // ldb=N (X row-major M x N)
-            &zero,
-            A_buf, CUDA_R_16BF, work_M, stride_A, // ldc=M (output row-major M x M)
-            batch,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT
-        ));
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle,
+                                                CUBLAS_OP_T,  // transA
+                                                CUBLAS_OP_N,  // transB
+                                                work_M,       // m: rows of output A
+                                                work_M,       // n: cols of output A
+                                                work_N,       // k: inner dimension (cols of X)
+                                                &one,
+                                                X,
+                                                CUDA_R_16BF,
+                                                work_N,
+                                                stride_X,  // lda=N (X row-major M x N)
+                                                X,
+                                                CUDA_R_16BF,
+                                                work_N,
+                                                stride_X,  // ldb=N (X row-major M x N)
+                                                &zero,
+                                                A_buf,
+                                                CUDA_R_16BF,
+                                                work_M,
+                                                stride_A,  // ldc=M (output row-major M x M)
+                                                batch,
+                                                CUBLAS_COMPUTE_32F,
+                                                CUBLAS_GEMM_DEFAULT));
 
         // B = A @ A (row-major: B[M,M] = A[M,M] @ A[M,M])
         // For square matrix multiplication A @ A:
         // Row-major A @ A: call CUBLAS_OP_N, CUBLAS_OP_N, m=M, n=M, k=M
         // A_cublas=A with lda=M, B_cublas=A with ldb=M, C=B with ldc=M
-        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-            handle,
-            CUBLAS_OP_N,     // transA
-            CUBLAS_OP_N,     // transB
-            work_M,          // m
-            work_M,          // n
-            work_M,          // k
-            &one,
-            A_buf, CUDA_R_16BF, work_M, stride_A,  // lda=M
-            A_buf, CUDA_R_16BF, work_M, stride_A,  // ldb=M
-            &zero,
-            B_buf, CUDA_R_16BF, work_M, stride_A,  // ldc=M
-            batch,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT
-        ));
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle,
+                                                CUBLAS_OP_N,  // transA
+                                                CUBLAS_OP_N,  // transB
+                                                work_M,       // m
+                                                work_M,       // n
+                                                work_M,       // k
+                                                &one,
+                                                A_buf,
+                                                CUDA_R_16BF,
+                                                work_M,
+                                                stride_A,  // lda=M
+                                                A_buf,
+                                                CUDA_R_16BF,
+                                                work_M,
+                                                stride_A,  // ldb=M
+                                                &zero,
+                                                B_buf,
+                                                CUDA_R_16BF,
+                                                work_M,
+                                                stride_A,  // ldc=M
+                                                batch,
+                                                CUBLAS_COMPUTE_32F,
+                                                CUBLAS_GEMM_DEFAULT));
 
         // B = b*A + c*B (where B now contains A @ A)
         {
             int num_elems = work_M * work_M;
             int blocks_x = (num_elems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
             dim3 grid(blocks_x, batch);
-            kFusedBetaAPlusAlphaC<<<grid, THREADS_PER_BLOCK, 0, stream>>>(
-                A_buf, B_buf, c, b, num_elems
-            );
+            kFusedBetaAPlusAlphaC<<<grid, THREADS_PER_BLOCK, 0, stream>>>(A_buf, B_buf, c, b, num_elems);
         }
 
         // C = B @ X (row-major: C[M,N] = B[M,M] @ X[M,N])
@@ -449,22 +395,29 @@ void polar_express(
         // Here: B[M,M] @ X[M,N] = C[M,N]
         //   m=N, n=M, k=M
         //   A_cublas=X with lda=N, B_cublas=B with ldb=M
-        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-            handle,
-            CUBLAS_OP_N,     // transA
-            CUBLAS_OP_N,     // transB
-            work_N,          // m: cols of output (N)
-            work_M,          // n: rows of output (M)
-            work_M,          // k: inner dimension (M)
-            &one,
-            X, CUDA_R_16BF, work_N, stride_X,      // A=X, lda=N (X row-major M x N)
-            B_buf, CUDA_R_16BF, work_M, stride_A,  // B=B, ldb=M (B row-major M x M)
-            &zero,
-            C_buf, CUDA_R_16BF, work_N, stride_X,  // C, ldc=N (C row-major M x N)
-            batch,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT
-        ));
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle,
+                                                CUBLAS_OP_N,  // transA
+                                                CUBLAS_OP_N,  // transB
+                                                work_N,       // m: cols of output (N)
+                                                work_M,       // n: rows of output (M)
+                                                work_M,       // k: inner dimension (M)
+                                                &one,
+                                                X,
+                                                CUDA_R_16BF,
+                                                work_N,
+                                                stride_X,  // A=X, lda=N (X row-major M x N)
+                                                B_buf,
+                                                CUDA_R_16BF,
+                                                work_M,
+                                                stride_A,  // B=B, ldb=M (B row-major M x M)
+                                                &zero,
+                                                C_buf,
+                                                CUDA_R_16BF,
+                                                work_N,
+                                                stride_X,  // C, ldc=N (C row-major M x N)
+                                                batch,
+                                                CUBLAS_COMPUTE_32F,
+                                                CUBLAS_GEMM_DEFAULT));
 
         // C = a*X + C
         axpy_matrix(X, C_buf, a, batch, work_M, work_N, stream);
@@ -480,9 +433,8 @@ void polar_express(
         transpose(X, G, batch, work_M, work_N, stream);
     } else if (X != G) {
         // Copy result back to G if it ended up in workspace
-        cudaMemcpyAsync(G, X, batch * M * N * sizeof(nv_bfloat16),
-                        cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(G, X, batch * M * N * sizeof(nv_bfloat16), cudaMemcpyDeviceToDevice, stream);
     }
 }
 
-} // namespace optimizers
+}  // namespace optimizers

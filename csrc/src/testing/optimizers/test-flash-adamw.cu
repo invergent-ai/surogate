@@ -35,13 +35,15 @@ struct AdamWState {
     int step = 0;
 };
 
-void adamw_cpu(
-    std::vector<float>& params,
-    const std::vector<float>& grads,
-    AdamWState& state,
-    float lr, float beta1, float beta2, float eps, float weight_decay,
-    float grad_scale = 1.0f
-) {
+void adamw_cpu(std::vector<float>& params,
+               const std::vector<float>& grads,
+               AdamWState& state,
+               float lr,
+               float beta1,
+               float beta2,
+               float eps,
+               float weight_decay,
+               float grad_scale = 1.0f) {
     const size_t n = params.size();
     if (state.m.empty()) {
         state.m.resize(n, 0.0f);
@@ -63,7 +65,8 @@ void adamw_cpu(
 
 float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
     float d = 0.0f;
-    for (size_t i = 0; i < a.size(); ++i) d = std::max(d, std::fabs(a[i] - b[i]));
+    for (size_t i = 0; i < a.size(); ++i)
+        d = std::max(d, std::fabs(a[i] - b[i]));
     return d;
 }
 
@@ -79,24 +82,37 @@ float relative_error(const std::vector<float>& actual, const std::vector<float>&
 
 std::vector<float> bf16_to_float(const std::vector<nv_bfloat16>& v) {
     std::vector<float> r(v.size());
-    for (size_t i = 0; i < v.size(); ++i) r[i] = __bfloat162float(v[i]);
+    for (size_t i = 0; i < v.size(); ++i)
+        r[i] = __bfloat162float(v[i]);
     return r;
 }
 
 class CudaTimer {
 public:
-    CudaTimer() { cudaEventCreate(&s_); cudaEventCreate(&e_); }
-    ~CudaTimer() { cudaEventDestroy(s_); cudaEventDestroy(e_); }
-    void start(cudaStream_t st = 0) { cudaEventRecord(s_, st); }
-    float stop(cudaStream_t st = 0) {
-        cudaEventRecord(e_, st); cudaEventSynchronize(e_);
-        float ms; cudaEventElapsedTime(&ms, s_, e_); return ms;
+    CudaTimer() {
+        cudaEventCreate(&s_);
+        cudaEventCreate(&e_);
     }
+    ~CudaTimer() {
+        cudaEventDestroy(s_);
+        cudaEventDestroy(e_);
+    }
+    void start(cudaStream_t st = 0) {
+        cudaEventRecord(s_, st);
+    }
+    float stop(cudaStream_t st = 0) {
+        cudaEventRecord(e_, st);
+        cudaEventSynchronize(e_);
+        float ms;
+        cudaEventElapsedTime(&ms, s_, e_);
+        return ms;
+    }
+
 private:
     cudaEvent_t s_, e_;
 };
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // FLASH ADAMW 8-BIT CORRECTNESS TESTS
@@ -111,13 +127,12 @@ TEST_CASE("Flash AdamW 8-bit initialization", "[optimizers][flash_adamw8bit]") {
     thrust::device_vector<half> d_scales1(num_groups);
     thrust::device_vector<half> d_scales2(num_groups);
 
-    init_flash_adamw8bit_state(
-        thrust::raw_pointer_cast(d_state1.data()),
-        thrust::raw_pointer_cast(d_state2.data()),
-        thrust::raw_pointer_cast(d_scales1.data()),
-        thrust::raw_pointer_cast(d_scales2.data()),
-        n, 0
-    );
+    init_flash_adamw8bit_state(thrust::raw_pointer_cast(d_state1.data()),
+                               thrust::raw_pointer_cast(d_state2.data()),
+                               thrust::raw_pointer_cast(d_scales1.data()),
+                               thrust::raw_pointer_cast(d_scales2.data()),
+                               n,
+                               0);
     cudaDeviceSynchronize();
 
     std::vector<signed char> h_state1 = from_device(d_state1);
@@ -148,13 +163,12 @@ TEST_CASE("Flash AdamW 8-bit FP32 correctness", "[optimizers][flash_adamw8bit]")
     thrust::device_vector<half> d_scales1(num_groups);
     thrust::device_vector<half> d_scales2(num_groups);
 
-    init_flash_adamw8bit_state(
-        thrust::raw_pointer_cast(d_state1.data()),
-        thrust::raw_pointer_cast(d_state2.data()),
-        thrust::raw_pointer_cast(d_scales1.data()),
-        thrust::raw_pointer_cast(d_scales2.data()),
-        n, 0
-    );
+    init_flash_adamw8bit_state(thrust::raw_pointer_cast(d_state1.data()),
+                               thrust::raw_pointer_cast(d_state2.data()),
+                               thrust::raw_pointer_cast(d_scales1.data()),
+                               thrust::raw_pointer_cast(d_scales2.data()),
+                               n,
+                               0);
 
     AdamWState cpu_state;
 
@@ -162,16 +176,23 @@ TEST_CASE("Flash AdamW 8-bit FP32 correctness", "[optimizers][flash_adamw8bit]")
         std::vector<float> h_grads = uniform_host(n, -0.1f, 0.1f, 42 + step);
         thrust::device_vector<float> d_grads = to_device(h_grads);
 
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_state1.data()),
-            thrust::raw_pointer_cast(d_state2.data()),
-            thrust::raw_pointer_cast(d_scales1.data()),
-            thrust::raw_pointer_cast(d_scales2.data()),
-            n, lr, beta1, beta2, step, eps, weight_decay,
-            nullptr, nullptr, nullptr, 0
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_state1.data()),
+                                thrust::raw_pointer_cast(d_state2.data()),
+                                thrust::raw_pointer_cast(d_scales1.data()),
+                                thrust::raw_pointer_cast(d_scales2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                step,
+                                eps,
+                                weight_decay,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                0);
 
         adamw_cpu(h_params_cpu, h_grads, cpu_state, lr, beta1, beta2, eps, weight_decay);
         cudaDeviceSynchronize();
@@ -207,13 +228,12 @@ TEST_CASE("Flash AdamW 8-bit BF16 correctness", "[optimizers][flash_adamw8bit]")
     thrust::device_vector<half> d_scales1(num_groups);
     thrust::device_vector<half> d_scales2(num_groups);
 
-    init_flash_adamw8bit_state(
-        thrust::raw_pointer_cast(d_state1.data()),
-        thrust::raw_pointer_cast(d_state2.data()),
-        thrust::raw_pointer_cast(d_scales1.data()),
-        thrust::raw_pointer_cast(d_scales2.data()),
-        n, 0
-    );
+    init_flash_adamw8bit_state(thrust::raw_pointer_cast(d_state1.data()),
+                               thrust::raw_pointer_cast(d_state2.data()),
+                               thrust::raw_pointer_cast(d_scales1.data()),
+                               thrust::raw_pointer_cast(d_scales2.data()),
+                               n,
+                               0);
 
     AdamWState cpu_state;
 
@@ -222,16 +242,23 @@ TEST_CASE("Flash AdamW 8-bit BF16 correctness", "[optimizers][flash_adamw8bit]")
         std::vector<nv_bfloat16> h_grads_bf16 = to_bf16(h_grads_f);
         thrust::device_vector<nv_bfloat16> d_grads = to_device(h_grads_bf16);
 
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_state1.data()),
-            thrust::raw_pointer_cast(d_state2.data()),
-            thrust::raw_pointer_cast(d_scales1.data()),
-            thrust::raw_pointer_cast(d_scales2.data()),
-            n, lr, beta1, beta2, step, eps, weight_decay,
-            nullptr, nullptr, nullptr, 0
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_state1.data()),
+                                thrust::raw_pointer_cast(d_state2.data()),
+                                thrust::raw_pointer_cast(d_scales1.data()),
+                                thrust::raw_pointer_cast(d_scales2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                step,
+                                eps,
+                                weight_decay,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                0);
 
         std::vector<float> h_grads_rounded = round_bf16(h_grads_f);
         adamw_cpu(h_params_cpu, h_grads_rounded, cpu_state, lr, beta1, beta2, eps, weight_decay);
@@ -281,13 +308,12 @@ TEST_CASE("Flash vs BnB AdamW 8-bit accuracy comparison - FP32", "[optimizers][f
     thrust::device_vector<float> d_bnb_a1(bnb_num_blocks), d_bnb_a2(bnb_num_blocks);
     thrust::device_vector<float> d_q1 = to_device(h_q1), d_q2 = to_device(h_q2);
 
-    init_adamw8bit_state(
-        thrust::raw_pointer_cast(d_bnb_s1.data()),
-        thrust::raw_pointer_cast(d_bnb_s2.data()),
-        thrust::raw_pointer_cast(d_bnb_a1.data()),
-        thrust::raw_pointer_cast(d_bnb_a2.data()),
-        n, 0
-    );
+    init_adamw8bit_state(thrust::raw_pointer_cast(d_bnb_s1.data()),
+                         thrust::raw_pointer_cast(d_bnb_s2.data()),
+                         thrust::raw_pointer_cast(d_bnb_a1.data()),
+                         thrust::raw_pointer_cast(d_bnb_a2.data()),
+                         n,
+                         0);
 
     // --- Flash setup ---
     thrust::device_vector<float> d_params_flash = to_device(h_params_flash);
@@ -295,13 +321,12 @@ TEST_CASE("Flash vs BnB AdamW 8-bit accuracy comparison - FP32", "[optimizers][f
     thrust::device_vector<unsigned char> d_flash_s2(n);
     thrust::device_vector<half> d_flash_sc1(flash_num_groups), d_flash_sc2(flash_num_groups);
 
-    init_flash_adamw8bit_state(
-        thrust::raw_pointer_cast(d_flash_s1.data()),
-        thrust::raw_pointer_cast(d_flash_s2.data()),
-        thrust::raw_pointer_cast(d_flash_sc1.data()),
-        thrust::raw_pointer_cast(d_flash_sc2.data()),
-        n, 0
-    );
+    init_flash_adamw8bit_state(thrust::raw_pointer_cast(d_flash_s1.data()),
+                               thrust::raw_pointer_cast(d_flash_s2.data()),
+                               thrust::raw_pointer_cast(d_flash_sc1.data()),
+                               thrust::raw_pointer_cast(d_flash_sc2.data()),
+                               n,
+                               0);
 
     AdamWState cpu_state;
 
@@ -313,30 +338,44 @@ TEST_CASE("Flash vs BnB AdamW 8-bit accuracy comparison - FP32", "[optimizers][f
         thrust::device_vector<float> d_grads = to_device(h_grads);
 
         // BnB 8-bit update
-        adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_bnb.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_bnb_s1.data()),
-            thrust::raw_pointer_cast(d_bnb_s2.data()),
-            n, lr, beta1, beta2, step, eps, weight_decay, nullptr,
-            thrust::raw_pointer_cast(d_q1.data()),
-            thrust::raw_pointer_cast(d_q2.data()),
-            thrust::raw_pointer_cast(d_bnb_a1.data()),
-            thrust::raw_pointer_cast(d_bnb_a2.data()),
-            nullptr, nullptr, 0
-        );
+        adamw_update_8bit(thrust::raw_pointer_cast(d_params_bnb.data()),
+                          thrust::raw_pointer_cast(d_grads.data()),
+                          thrust::raw_pointer_cast(d_bnb_s1.data()),
+                          thrust::raw_pointer_cast(d_bnb_s2.data()),
+                          n,
+                          lr,
+                          beta1,
+                          beta2,
+                          step,
+                          eps,
+                          weight_decay,
+                          nullptr,
+                          thrust::raw_pointer_cast(d_q1.data()),
+                          thrust::raw_pointer_cast(d_q2.data()),
+                          thrust::raw_pointer_cast(d_bnb_a1.data()),
+                          thrust::raw_pointer_cast(d_bnb_a2.data()),
+                          nullptr,
+                          nullptr,
+                          0);
 
         // Flash 8-bit update
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_flash.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_flash_s1.data()),
-            thrust::raw_pointer_cast(d_flash_s2.data()),
-            thrust::raw_pointer_cast(d_flash_sc1.data()),
-            thrust::raw_pointer_cast(d_flash_sc2.data()),
-            n, lr, beta1, beta2, step, eps, weight_decay,
-            nullptr, nullptr, nullptr, 0
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params_flash.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_flash_s1.data()),
+                                thrust::raw_pointer_cast(d_flash_s2.data()),
+                                thrust::raw_pointer_cast(d_flash_sc1.data()),
+                                thrust::raw_pointer_cast(d_flash_sc2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                step,
+                                eps,
+                                weight_decay,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                0);
 
         // CPU reference
         adamw_cpu(h_params_cpu, h_grads, cpu_state, lr, beta1, beta2, eps, weight_decay);
@@ -357,7 +396,8 @@ TEST_CASE("Flash vs BnB AdamW 8-bit accuracy comparison - FP32", "[optimizers][f
             printf("Step %3d | BnB rel_err: %.6f | Flash rel_err: %.6f | "
                    "BnB max_diff: %.6f | Flash max_diff: %.6f\n",
                    step,
-                   bnb_rel, flash_rel,
+                   bnb_rel,
+                   flash_rel,
                    max_abs_diff(bnb_gpu, h_params_cpu),
                    max_abs_diff(flash_gpu, h_params_cpu));
         }
@@ -377,11 +417,10 @@ TEST_CASE("Flash vs BnB AdamW 8-bit accuracy comparison - FP32", "[optimizers][f
 
     // Memory comparison
     size_t bnb_state_bytes = 2 * n * sizeof(unsigned char) + 2 * bnb_num_blocks * sizeof(float);
-    size_t flash_state_bytes = n * sizeof(signed char) + n * sizeof(unsigned char) + 2 * flash_num_groups * sizeof(half);
-    printf("BnB   state memory: %zu bytes (%.2f bytes/param)\n",
-           bnb_state_bytes, (double)bnb_state_bytes / n);
-    printf("Flash state memory: %zu bytes (%.2f bytes/param)\n",
-           flash_state_bytes, (double)flash_state_bytes / n);
+    size_t flash_state_bytes =
+        n * sizeof(signed char) + n * sizeof(unsigned char) + 2 * flash_num_groups * sizeof(half);
+    printf("BnB   state memory: %zu bytes (%.2f bytes/param)\n", bnb_state_bytes, (double)bnb_state_bytes / n);
+    printf("Flash state memory: %zu bytes (%.2f bytes/param)\n", flash_state_bytes, (double)flash_state_bytes / n);
 
     // Both should be within tolerance
     REQUIRE(bnb_final_rel < 0.1f);
@@ -413,26 +452,24 @@ TEST_CASE("Flash vs BnB AdamW 8-bit accuracy comparison - BF16", "[optimizers][f
     thrust::device_vector<unsigned char> d_bnb_s1(n), d_bnb_s2(n);
     thrust::device_vector<float> d_bnb_a1(bnb_num_blocks), d_bnb_a2(bnb_num_blocks);
     thrust::device_vector<float> d_q1 = to_device(h_q1), d_q2 = to_device(h_q2);
-    init_adamw8bit_state(
-        thrust::raw_pointer_cast(d_bnb_s1.data()),
-        thrust::raw_pointer_cast(d_bnb_s2.data()),
-        thrust::raw_pointer_cast(d_bnb_a1.data()),
-        thrust::raw_pointer_cast(d_bnb_a2.data()),
-        n, 0
-    );
+    init_adamw8bit_state(thrust::raw_pointer_cast(d_bnb_s1.data()),
+                         thrust::raw_pointer_cast(d_bnb_s2.data()),
+                         thrust::raw_pointer_cast(d_bnb_a1.data()),
+                         thrust::raw_pointer_cast(d_bnb_a2.data()),
+                         n,
+                         0);
 
     // Flash state
     thrust::device_vector<nv_bfloat16> d_params_flash = to_device(h_bf16);
     thrust::device_vector<signed char> d_flash_s1(n);
     thrust::device_vector<unsigned char> d_flash_s2(n);
     thrust::device_vector<half> d_flash_sc1(flash_num_groups), d_flash_sc2(flash_num_groups);
-    init_flash_adamw8bit_state(
-        thrust::raw_pointer_cast(d_flash_s1.data()),
-        thrust::raw_pointer_cast(d_flash_s2.data()),
-        thrust::raw_pointer_cast(d_flash_sc1.data()),
-        thrust::raw_pointer_cast(d_flash_sc2.data()),
-        n, 0
-    );
+    init_flash_adamw8bit_state(thrust::raw_pointer_cast(d_flash_s1.data()),
+                               thrust::raw_pointer_cast(d_flash_s2.data()),
+                               thrust::raw_pointer_cast(d_flash_sc1.data()),
+                               thrust::raw_pointer_cast(d_flash_sc2.data()),
+                               n,
+                               0);
 
     AdamWState cpu_state;
 
@@ -441,29 +478,43 @@ TEST_CASE("Flash vs BnB AdamW 8-bit accuracy comparison - BF16", "[optimizers][f
         std::vector<nv_bfloat16> h_grads_bf16 = to_bf16(h_grads_f);
         thrust::device_vector<nv_bfloat16> d_grads = to_device(h_grads_bf16);
 
-        adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_bnb.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_bnb_s1.data()),
-            thrust::raw_pointer_cast(d_bnb_s2.data()),
-            n, lr, beta1, beta2, step, eps, weight_decay, nullptr,
-            thrust::raw_pointer_cast(d_q1.data()),
-            thrust::raw_pointer_cast(d_q2.data()),
-            thrust::raw_pointer_cast(d_bnb_a1.data()),
-            thrust::raw_pointer_cast(d_bnb_a2.data()),
-            nullptr, nullptr, 0
-        );
+        adamw_update_8bit(thrust::raw_pointer_cast(d_params_bnb.data()),
+                          thrust::raw_pointer_cast(d_grads.data()),
+                          thrust::raw_pointer_cast(d_bnb_s1.data()),
+                          thrust::raw_pointer_cast(d_bnb_s2.data()),
+                          n,
+                          lr,
+                          beta1,
+                          beta2,
+                          step,
+                          eps,
+                          weight_decay,
+                          nullptr,
+                          thrust::raw_pointer_cast(d_q1.data()),
+                          thrust::raw_pointer_cast(d_q2.data()),
+                          thrust::raw_pointer_cast(d_bnb_a1.data()),
+                          thrust::raw_pointer_cast(d_bnb_a2.data()),
+                          nullptr,
+                          nullptr,
+                          0);
 
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_flash.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_flash_s1.data()),
-            thrust::raw_pointer_cast(d_flash_s2.data()),
-            thrust::raw_pointer_cast(d_flash_sc1.data()),
-            thrust::raw_pointer_cast(d_flash_sc2.data()),
-            n, lr, beta1, beta2, step, eps, weight_decay,
-            nullptr, nullptr, nullptr, 0
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params_flash.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_flash_s1.data()),
+                                thrust::raw_pointer_cast(d_flash_s2.data()),
+                                thrust::raw_pointer_cast(d_flash_sc1.data()),
+                                thrust::raw_pointer_cast(d_flash_sc2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                step,
+                                eps,
+                                weight_decay,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                0);
 
         std::vector<float> h_grads_rounded = round_bf16(h_grads_f);
         adamw_cpu(h_params_cpu, h_grads_rounded, cpu_state, lr, beta1, beta2, eps, weight_decay);
@@ -503,50 +554,63 @@ TEST_CASE("Flash AdamW 8-bit benchmark - FP32 params", "[optimizers][flash_adamw
     thrust::device_vector<unsigned char> d_s2(n);
     thrust::device_vector<half> d_sc1(num_groups), d_sc2(num_groups);
 
-    init_flash_adamw8bit_state(
-        thrust::raw_pointer_cast(d_s1.data()),
-        thrust::raw_pointer_cast(d_s2.data()),
-        thrust::raw_pointer_cast(d_sc1.data()),
-        thrust::raw_pointer_cast(d_sc2.data()),
-        n, 0
-    );
+    init_flash_adamw8bit_state(thrust::raw_pointer_cast(d_s1.data()),
+                               thrust::raw_pointer_cast(d_s2.data()),
+                               thrust::raw_pointer_cast(d_sc1.data()),
+                               thrust::raw_pointer_cast(d_sc2.data()),
+                               n,
+                               0);
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     CudaTimer timer;
 
     for (int i = 0; i < warmup; ++i) {
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_s1.data()),
-            thrust::raw_pointer_cast(d_s2.data()),
-            thrust::raw_pointer_cast(d_sc1.data()),
-            thrust::raw_pointer_cast(d_sc2.data()),
-            n, lr, beta1, beta2, i + 1, eps, wd,
-            nullptr, nullptr, nullptr, stream
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_s1.data()),
+                                thrust::raw_pointer_cast(d_s2.data()),
+                                thrust::raw_pointer_cast(d_sc1.data()),
+                                thrust::raw_pointer_cast(d_sc2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                i + 1,
+                                eps,
+                                wd,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                stream);
     }
     cudaStreamSynchronize(stream);
 
     timer.start(stream);
     for (int i = 0; i < bench; ++i) {
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_s1.data()),
-            thrust::raw_pointer_cast(d_s2.data()),
-            thrust::raw_pointer_cast(d_sc1.data()),
-            thrust::raw_pointer_cast(d_sc2.data()),
-            n, lr, beta1, beta2, warmup + i + 1, eps, wd,
-            nullptr, nullptr, nullptr, stream
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_s1.data()),
+                                thrust::raw_pointer_cast(d_s2.data()),
+                                thrust::raw_pointer_cast(d_sc1.data()),
+                                thrust::raw_pointer_cast(d_sc2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                warmup + i + 1,
+                                eps,
+                                wd,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                stream);
     }
     float total_ms = timer.stop(stream);
     float avg_ms = total_ms / bench;
 
     // Memory: params r/w (2*4B), grads r (4B), states r/w (2*1B+2*1B), scales r/w (2*2B per group)
-    double bytes = (double)n * (2*4 + 4 + 4*1) + (double)num_groups * (4*2);
+    double bytes = (double)n * (2 * 4 + 4 + 4 * 1) + (double)num_groups * (4 * 2);
     double bw = (bytes / (avg_ms / 1000.0)) / 1e9;
 
     size_t state_bytes = n * sizeof(signed char) + n * sizeof(unsigned char) + 2 * num_groups * sizeof(half);
@@ -557,8 +621,7 @@ TEST_CASE("Flash AdamW 8-bit benchmark - FP32 params", "[optimizers][flash_adamw
     printf("Avg time: %.3f ms\n", avg_ms);
     printf("Throughput: %.2f M params/ms\n", (n / 1e6) / avg_ms);
     printf("Effective bandwidth: %.1f GB/s\n", bw);
-    printf("State memory: %.1f MB (%.2f bytes/param)\n",
-           state_bytes / 1e6, (double)state_bytes / n);
+    printf("State memory: %.1f MB (%.2f bytes/param)\n", state_bytes / 1e6, (double)state_bytes / n);
     printf("Memory savings vs FP32 states: %.1f%%\n", savings);
 
     cudaStreamDestroy(stream);
@@ -584,26 +647,24 @@ TEST_CASE("Flash vs BnB AdamW 8-bit benchmark", "[optimizers][flash_adamw8bit][b
     thrust::device_vector<float> d_grads = to_device(h_data);
     thrust::device_vector<unsigned char> d_bnb_s1(n), d_bnb_s2(n);
     thrust::device_vector<float> d_bnb_a1(bnb_num_blocks), d_bnb_a2(bnb_num_blocks);
-    init_adamw8bit_state(
-        thrust::raw_pointer_cast(d_bnb_s1.data()),
-        thrust::raw_pointer_cast(d_bnb_s2.data()),
-        thrust::raw_pointer_cast(d_bnb_a1.data()),
-        thrust::raw_pointer_cast(d_bnb_a2.data()),
-        n, 0
-    );
+    init_adamw8bit_state(thrust::raw_pointer_cast(d_bnb_s1.data()),
+                         thrust::raw_pointer_cast(d_bnb_s2.data()),
+                         thrust::raw_pointer_cast(d_bnb_a1.data()),
+                         thrust::raw_pointer_cast(d_bnb_a2.data()),
+                         n,
+                         0);
 
     // Flash setup
     thrust::device_vector<float> d_params_flash = to_device(h_data);
     thrust::device_vector<signed char> d_flash_s1(n);
     thrust::device_vector<unsigned char> d_flash_s2(n);
     thrust::device_vector<half> d_flash_sc1(flash_num_groups), d_flash_sc2(flash_num_groups);
-    init_flash_adamw8bit_state(
-        thrust::raw_pointer_cast(d_flash_s1.data()),
-        thrust::raw_pointer_cast(d_flash_s2.data()),
-        thrust::raw_pointer_cast(d_flash_sc1.data()),
-        thrust::raw_pointer_cast(d_flash_sc2.data()),
-        n, 0
-    );
+    init_flash_adamw8bit_state(thrust::raw_pointer_cast(d_flash_s1.data()),
+                               thrust::raw_pointer_cast(d_flash_s2.data()),
+                               thrust::raw_pointer_cast(d_flash_sc1.data()),
+                               thrust::raw_pointer_cast(d_flash_sc2.data()),
+                               n,
+                               0);
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
@@ -611,65 +672,93 @@ TEST_CASE("Flash vs BnB AdamW 8-bit benchmark", "[optimizers][flash_adamw8bit][b
 
     // --- Benchmark BnB ---
     for (int i = 0; i < warmup; ++i) {
-        adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_bnb.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_bnb_s1.data()),
-            thrust::raw_pointer_cast(d_bnb_s2.data()),
-            n, lr, beta1, beta2, i + 1, eps, wd, nullptr,
-            thrust::raw_pointer_cast(d_q1.data()),
-            thrust::raw_pointer_cast(d_q2.data()),
-            thrust::raw_pointer_cast(d_bnb_a1.data()),
-            thrust::raw_pointer_cast(d_bnb_a2.data()),
-            nullptr, nullptr, stream
-        );
+        adamw_update_8bit(thrust::raw_pointer_cast(d_params_bnb.data()),
+                          thrust::raw_pointer_cast(d_grads.data()),
+                          thrust::raw_pointer_cast(d_bnb_s1.data()),
+                          thrust::raw_pointer_cast(d_bnb_s2.data()),
+                          n,
+                          lr,
+                          beta1,
+                          beta2,
+                          i + 1,
+                          eps,
+                          wd,
+                          nullptr,
+                          thrust::raw_pointer_cast(d_q1.data()),
+                          thrust::raw_pointer_cast(d_q2.data()),
+                          thrust::raw_pointer_cast(d_bnb_a1.data()),
+                          thrust::raw_pointer_cast(d_bnb_a2.data()),
+                          nullptr,
+                          nullptr,
+                          stream);
     }
     cudaStreamSynchronize(stream);
 
     timer.start(stream);
     for (int i = 0; i < bench; ++i) {
-        adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_bnb.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_bnb_s1.data()),
-            thrust::raw_pointer_cast(d_bnb_s2.data()),
-            n, lr, beta1, beta2, warmup + i + 1, eps, wd, nullptr,
-            thrust::raw_pointer_cast(d_q1.data()),
-            thrust::raw_pointer_cast(d_q2.data()),
-            thrust::raw_pointer_cast(d_bnb_a1.data()),
-            thrust::raw_pointer_cast(d_bnb_a2.data()),
-            nullptr, nullptr, stream
-        );
+        adamw_update_8bit(thrust::raw_pointer_cast(d_params_bnb.data()),
+                          thrust::raw_pointer_cast(d_grads.data()),
+                          thrust::raw_pointer_cast(d_bnb_s1.data()),
+                          thrust::raw_pointer_cast(d_bnb_s2.data()),
+                          n,
+                          lr,
+                          beta1,
+                          beta2,
+                          warmup + i + 1,
+                          eps,
+                          wd,
+                          nullptr,
+                          thrust::raw_pointer_cast(d_q1.data()),
+                          thrust::raw_pointer_cast(d_q2.data()),
+                          thrust::raw_pointer_cast(d_bnb_a1.data()),
+                          thrust::raw_pointer_cast(d_bnb_a2.data()),
+                          nullptr,
+                          nullptr,
+                          stream);
     }
     float bnb_ms = timer.stop(stream) / bench;
 
     // --- Benchmark Flash ---
     for (int i = 0; i < warmup; ++i) {
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_flash.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_flash_s1.data()),
-            thrust::raw_pointer_cast(d_flash_s2.data()),
-            thrust::raw_pointer_cast(d_flash_sc1.data()),
-            thrust::raw_pointer_cast(d_flash_sc2.data()),
-            n, lr, beta1, beta2, i + 1, eps, wd,
-            nullptr, nullptr, nullptr, stream
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params_flash.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_flash_s1.data()),
+                                thrust::raw_pointer_cast(d_flash_s2.data()),
+                                thrust::raw_pointer_cast(d_flash_sc1.data()),
+                                thrust::raw_pointer_cast(d_flash_sc2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                i + 1,
+                                eps,
+                                wd,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                stream);
     }
     cudaStreamSynchronize(stream);
 
     timer.start(stream);
     for (int i = 0; i < bench; ++i) {
-        flash_adamw_update_8bit(
-            thrust::raw_pointer_cast(d_params_flash.data()),
-            thrust::raw_pointer_cast(d_grads.data()),
-            thrust::raw_pointer_cast(d_flash_s1.data()),
-            thrust::raw_pointer_cast(d_flash_s2.data()),
-            thrust::raw_pointer_cast(d_flash_sc1.data()),
-            thrust::raw_pointer_cast(d_flash_sc2.data()),
-            n, lr, beta1, beta2, warmup + i + 1, eps, wd,
-            nullptr, nullptr, nullptr, stream
-        );
+        flash_adamw_update_8bit(thrust::raw_pointer_cast(d_params_flash.data()),
+                                thrust::raw_pointer_cast(d_grads.data()),
+                                thrust::raw_pointer_cast(d_flash_s1.data()),
+                                thrust::raw_pointer_cast(d_flash_s2.data()),
+                                thrust::raw_pointer_cast(d_flash_sc1.data()),
+                                thrust::raw_pointer_cast(d_flash_sc2.data()),
+                                n,
+                                lr,
+                                beta1,
+                                beta2,
+                                warmup + i + 1,
+                                eps,
+                                wd,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                stream);
     }
     float flash_ms = timer.stop(stream) / bench;
 

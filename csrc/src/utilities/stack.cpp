@@ -20,9 +20,11 @@
  * @param amount    Total capacity of the backing region in bytes.
  * @param device_id Device identifier associated with the memory (used for Tensor views).
  */
-DeviceMemoryStack::DeviceMemoryStack(std::byte* memory, std::size_t amount, int device_id) :
-    mBackingMemory(memory), mTop(memory), mDeviceID(device_id), mCapacity(amount) {
-
+DeviceMemoryStack::DeviceMemoryStack(std::byte* memory, std::size_t amount, int device_id)
+    : mBackingMemory(memory),
+      mTop(memory),
+      mDeviceID(device_id),
+      mCapacity(amount) {
 }
 
 /**
@@ -41,26 +43,32 @@ std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
     constexpr size_t alignment = 4096;
     std::size_t aligned_amount = div_ceil(amount, alignment) * alignment;
     std::byte* new_top = mTop + aligned_amount;
-    if(new_top > mBackingMemory + mCapacity) {
+    if (new_top > mBackingMemory + mCapacity) {
         std::size_t used = mTop - mBackingMemory;
-        fprintf(stderr, "[Stack OOM] Failed to allocate '%s': requested=%zu MB, used=%zu MB, capacity=%zu MB\n",
-                name, aligned_amount / (1024*1024), used / (1024*1024), mCapacity / (1024*1024));
+        fprintf(stderr,
+                "[Stack OOM] Failed to allocate '%s': requested=%zu MB, used=%zu MB, capacity=%zu MB\n",
+                name,
+                aligned_amount / (1024 * 1024),
+                used / (1024 * 1024),
+                mCapacity / (1024 * 1024));
         // Print recent allocations
         fprintf(stderr, "[Stack OOM] Recent allocations (last 10 of %zu total):\n", mAlloc.size());
         size_t start = mAlloc.size() > 10 ? mAlloc.size() - 10 : 0;
         for (size_t i = start; i < mAlloc.size(); ++i) {
-            fprintf(stderr, "  - %s: %zu MB\n", mAlloc[i].Name, mAlloc[i].Amount / (1024*1024));
+            fprintf(stderr, "  - %s: %zu MB\n", mAlloc[i].Name, mAlloc[i].Amount / (1024 * 1024));
         }
         // Print top allocations by size for diagnosis
         if (mAlloc.size() > 10) {
             std::vector<size_t> sorted_indices(mAlloc.size());
-            for (size_t i = 0; i < mAlloc.size(); ++i) sorted_indices[i] = i;
-            std::sort(sorted_indices.begin(), sorted_indices.end(),
-                      [this](size_t a, size_t b) { return mAlloc[a].Amount > mAlloc[b].Amount; });
+            for (size_t i = 0; i < mAlloc.size(); ++i)
+                sorted_indices[i] = i;
+            std::sort(sorted_indices.begin(), sorted_indices.end(), [this](size_t a, size_t b) {
+                return mAlloc[a].Amount > mAlloc[b].Amount;
+            });
             fprintf(stderr, "[Stack OOM] Top 10 allocations by size:\n");
             for (size_t i = 0; i < std::min<size_t>(10, sorted_indices.size()); ++i) {
                 const auto& rec = mAlloc[sorted_indices[i]];
-                fprintf(stderr, "  - %s: %zu MB (idx=%zu)\n", rec.Name, rec.Amount / (1024*1024), sorted_indices[i]);
+                fprintf(stderr, "  - %s: %zu MB (idx=%zu)\n", rec.Name, rec.Amount / (1024 * 1024), sorted_indices[i]);
             }
         }
         // Print aggregate stats by name
@@ -71,11 +79,13 @@ std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
             stats.first++;
             stats.second += rec.Amount;
         }
-        std::vector<std::pair<std::string, std::pair<size_t, size_t>>> sorted_stats(name_stats.begin(), name_stats.end());
-        std::sort(sorted_stats.begin(), sorted_stats.end(),
-                  [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+        std::vector<std::pair<std::string, std::pair<size_t, size_t>>> sorted_stats(name_stats.begin(),
+                                                                                    name_stats.end());
+        std::sort(sorted_stats.begin(), sorted_stats.end(), [](const auto& a, const auto& b) {
+            return a.second.second > b.second.second;
+        });
         for (const auto& [n, s] : sorted_stats) {
-            fprintf(stderr, "  - %s: count=%zu total=%zu MB\n", n.c_str(), s.first, s.second / (1024*1024));
+            fprintf(stderr, "  - %s: count=%zu total=%zu MB\n", n.c_str(), s.first, s.second / (1024 * 1024));
         }
         throw std::bad_alloc();
     }
@@ -100,7 +110,8 @@ std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
  * @throws std::bad_alloc If the underlying byte allocation would exceed capacity.
  */
 Tensor DeviceMemoryStack::allocate(ETensorDType dtype, const std::vector<long>& shape, const char* name) {
-    std::size_t total = std::accumulate(std::begin(shape), std::end(shape), (long)get_dtype_size(dtype), std::multiplies<>());
+    std::size_t total =
+        std::accumulate(std::begin(shape), std::end(shape), (long)get_dtype_size(dtype), std::multiplies<>());
     return Tensor::from_pointer(allocate(total, name), mDeviceID, dtype, shape);
 }
 
@@ -115,10 +126,10 @@ Tensor DeviceMemoryStack::allocate(ETensorDType dtype, const std::vector<long>& 
  * @throws std::logic_error If @p ptr is not the most-recent allocation.
  */
 void DeviceMemoryStack::free(std::byte* ptr) {
-    if(mAlloc.empty()) {
+    if (mAlloc.empty()) {
         throw std::logic_error("DeviceMemoryStack::free_left called with empty allocation list");
     }
-    if(mAlloc.back().Pointer != ptr) {
+    if (mAlloc.back().Pointer != ptr) {
         throw std::logic_error("DeviceMemoryStack::free_left called with wrong pointer");
     }
     mTop = mAlloc.back().Pointer;
@@ -135,7 +146,7 @@ void DeviceMemoryStack::free(std::byte* ptr) {
  */
 std::vector<std::pair<std::string, long>> DeviceMemoryStack::get_allocation_stats() const {
     std::vector<std::pair<std::string, long>> result;
-    for (auto& [ptr, amount, name]: get_high_mark()) {
+    for (auto& [ptr, amount, name] : get_high_mark()) {
         result.emplace_back(name ? name : "<unnamed>", static_cast<long>(amount));
     }
     return result;
@@ -148,7 +159,7 @@ std::vector<std::pair<std::string, long>> DeviceMemoryStack::get_allocation_stat
  * and snapshots the current allocation list.
  */
 void DeviceMemoryStack::_track_max() {
-    if(bytes_used() > mMaxUtilization) {
+    if (bytes_used() > mMaxUtilization) {
         mMaxUtilization = bytes_used();
         mHighMark = mAlloc;
     }

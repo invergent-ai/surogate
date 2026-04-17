@@ -8,12 +8,11 @@ to vLLM's model via DLPack zero-copy views.
 from __future__ import annotations
 
 import threading
-from typing import Optional
 
 import torch
 
 _lock = threading.Lock()
-_pending_weights: Optional[dict[str, torch.Tensor]] = None
+_pending_weights: dict[str, torch.Tensor] | None = None
 
 
 def set_pending_weights(weights: dict[str, torch.Tensor]) -> None:
@@ -23,7 +22,7 @@ def set_pending_weights(weights: dict[str, torch.Tensor]) -> None:
         _pending_weights = weights
 
 
-def get_pending_weights() -> Optional[dict[str, torch.Tensor]]:
+def get_pending_weights() -> dict[str, torch.Tensor] | None:
     """Retrieve and clear pending weight tensors."""
     global _pending_weights
     with _lock:

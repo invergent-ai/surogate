@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 from surogate.train.metrics import MoEMetrics
 
@@ -26,7 +25,7 @@ class RoutingDiagnostics:
     avg_load_imbalance: float = 1.0
     avg_expert_utilization: float = 1.0
     aux_loss_trend: float = 0.0
-    recommendations: List[str] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
 
 
 class MoEMonitor:
@@ -104,9 +103,7 @@ class MoEMonitor:
             self.imbalance_warn = imbalance_warn
             self.imbalance_severe = imbalance_severe
         elif num_experts > 0:
-            self.imbalance_warn, self.imbalance_severe = self._auto_thresholds(
-                num_experts, num_experts_per_tok
-            )
+            self.imbalance_warn, self.imbalance_severe = self._auto_thresholds(num_experts, num_experts_per_tok)
         else:
             # Conservative defaults when architecture is unknown
             self.imbalance_warn = 3.0
@@ -121,7 +118,7 @@ class MoEMonitor:
         # Cooldown tracking per warning category
         self._last_warn_step: dict[str, int] = {}
 
-    def step(self, moe: Optional[MoEMetrics], step: int) -> None:
+    def step(self, moe: MoEMetrics | None, step: int) -> None:
         """Feed one step's MoE metrics.  No-op when *moe* is ``None``."""
         if moe is None:
             return
@@ -178,14 +175,10 @@ class MoEMonitor:
 
         if diag.balance_score < 0.3:
             recs.append(
-                "Severe routing imbalance detected. "
-                "Consider increasing router_aux_loss_coef (e.g. 0.01 → 0.05)."
+                "Severe routing imbalance detected. Consider increasing router_aux_loss_coef (e.g. 0.01 → 0.05)."
             )
         elif diag.balance_score < 0.7:
-            recs.append(
-                "Moderate routing imbalance. "
-                "Consider increasing router_aux_loss_coef."
-            )
+            recs.append("Moderate routing imbalance. Consider increasing router_aux_loss_coef.")
 
         if diag.utilization_score < self.utilization_critical:
             recs.append(
@@ -193,10 +186,7 @@ class MoEMonitor:
                 "Try increasing router_aux_loss_coef or lowering learning rate."
             )
         elif diag.utilization_score < self.utilization_warn:
-            recs.append(
-                f"Low expert utilization ({diag.utilization_score:.0%}). "
-                "Some experts may be underused."
-            )
+            recs.append(f"Low expert utilization ({diag.utilization_score:.0%}). Some experts may be underused.")
 
         if diag.aux_loss_trend > 0 and diag.avg_aux_loss > 0:
             relative_trend = diag.aux_loss_trend / max(diag.avg_aux_loss, 1e-8)
@@ -267,7 +257,7 @@ class MoEMonitor:
         n = len(history)
         mean = sum(history) / n
         variance = sum((x - mean) ** 2 for x in history) / n
-        std = variance ** 0.5
+        std = variance**0.5
 
         # When std=0 (constant history), fall back to a relative threshold:
         # any value > 2x the mean is a spike.

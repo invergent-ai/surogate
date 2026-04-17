@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Union, List, Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
     import torch
@@ -11,18 +11,20 @@ from surogate.utils.logger import get_logger
 logger = get_logger()
 
 Processor = Any  # Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, HfProcessorMixin]
-Prompt = List[Union[str, List[int], List[str]]]
-Word = Union[str, List[int]]
+Prompt = list[str | list[int] | list[str]]
+Word = Union[str, list[int]]
 Context = Word
 
 
 class ContextType:
-    RESPONSE = 'response'
-    SUFFIX = 'suffix'
-    OTHER = 'other'
+    RESPONSE = "response"
+    SUFFIX = "suffix"
+    OTHER = "other"
 
-def get_default_torch_dtype(torch_dtype: Optional[torch.dtype]):
+
+def get_default_torch_dtype(torch_dtype: torch.dtype | None):
     import torch
+
     # torch_dtype: torch_dtype in config.json
     if torch_dtype is not None:
         return torch_dtype
@@ -41,11 +43,12 @@ def get_default_torch_dtype(torch_dtype: Optional[torch.dtype]):
         # cpu
         return torch.float32
 
+
 def fix_do_sample_warning(generation_config: GenerationConfig) -> None:
     # Use the default values of temperature/top_p/top_k in generation_config.
     if generation_config.temperature == 0:
         generation_config.do_sample = False
     if generation_config.do_sample is False:
-        generation_config.temperature = 1.
-        generation_config.top_p = 1.
+        generation_config.temperature = 1.0
+        generation_config.top_p = 1.0
         generation_config.top_k = 50

@@ -19,7 +19,7 @@ inline TestSizeConfig& mutable_cfg() {
 }
 
 inline void set_test_config(const TestSizeConfig& cfg) {
-    if(cfg.Nq % cfg.Nkv != 0) {
+    if (cfg.Nq % cfg.Nkv != 0) {
         fprintf(stderr, "ERROR: Nq must be divisible by Nkv\n");
         exit(EXIT_FAILURE);
     }
@@ -30,4 +30,4 @@ inline const TestSizeConfig& get_test_config() {
     return mutable_cfg();
 }
 
-} // namespace testing_config
+}  // namespace testing_config

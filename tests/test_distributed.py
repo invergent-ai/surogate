@@ -1,6 +1,7 @@
-import pytest
-from unittest.mock import MagicMock, patch
 from dataclasses import asdict
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 class TestNCCLIdGeneration:
@@ -74,10 +75,12 @@ class TestSFTConfigDistributed:
         from surogate.core.config.sft_config import SFTConfig
         from surogate.utils.dict import DictDefault
 
-        cfg = DictDefault({
-            "model": {"model_dir": "test-model"},
-            "datasets": [{"path": "test.json"}],
-        })
+        cfg = DictDefault(
+            {
+                "model": {"model_dir": "test-model"},
+                "datasets": [{"path": "test.json"}],
+            }
+        )
         # This would normally fail because of model validation,
         # so we just test the distributed parsing logic
         # by checking that None distributed is handled

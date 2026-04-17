@@ -34,10 +34,10 @@
  *
  * @note TODO: This kernel could be optimized with vectorized loads/stores.
  */
-template<typename Src, typename Dst>
+template <typename Src, typename Dst>
 __global__ void convert_dtype_kernel(Dst* target, const Src* source, std::size_t size) {
     long tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if(tid >= size) {
+    if (tid >= size) {
         return;
     }
     target[tid] = static_cast<Dst>(source[tid]);
@@ -56,7 +56,7 @@ __global__ void convert_dtype_kernel(Dst* target, const Src* source, std::size_t
  * @param[in] source Source array.
  * @param size Number of elements to convert.
  */
-template<typename Src, typename Dst>
+template <typename Src, typename Dst>
 void convert_dtype_launcher(Dst* target, const Src* source, std::size_t size, cudaStream_t stream) {
     unsigned long n_blocks = div_ceil(size, 128ul);
     convert_dtype_kernel<Src, Dst><<<n_blocks, 128, 0, stream>>>(target, source, size);

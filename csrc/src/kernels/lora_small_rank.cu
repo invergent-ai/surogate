@@ -15,8 +15,8 @@
 template <int R, bool A_TRANSPOSED>
 __global__ void lora_project_small_rank_bf16_kernel(
     nv_bfloat16* out,
-    const nv_bfloat16* A,     // [R, C] row-major or [C, R] row-major when A_TRANSPOSED=true
-    const nv_bfloat16* input, // [BT, C] row-major
+    const nv_bfloat16* A,      // [R, C] row-major or [C, R] row-major when A_TRANSPOSED=true
+    const nv_bfloat16* input,  // [BT, C] row-major
     int BT,
     int C) {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -24,7 +24,8 @@ __global__ void lora_project_small_rank_bf16_kernel(
 
     float acc[R];
 #pragma unroll
-    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    for (int r = 0; r < R; ++r)
+        acc[r] = 0.0f;
 
     const int x_base = n * C;
     for (int c = 0; c < C; ++c) {
@@ -44,53 +45,65 @@ __global__ void lora_project_small_rank_bf16_kernel(
 }
 
 template <int R>
-static void launch_lora_project_small_rank_bf16(
-    Tensor& out,
-    const Tensor& A,
-    const Tensor& input,
-    int BT,
-    int C,
-    bool a_transposed,
-    cudaStream_t stream) {
+static void launch_lora_project_small_rank_bf16(Tensor& out,
+                                                const Tensor& A,
+                                                const Tensor& input,
+                                                int BT,
+                                                int C,
+                                                bool a_transposed,
+                                                cudaStream_t stream) {
     constexpr int threads = 128;
     const int blocks = (BT + threads - 1) / threads;
     if (a_transposed) {
-        lora_project_small_rank_bf16_kernel<R, true><<<blocks, threads, 0, stream>>>(
-            out.get<nv_bfloat16>(),
-            A.get<nv_bfloat16>(),
-            input.get<nv_bfloat16>(),
-            BT,
-            C);
+        lora_project_small_rank_bf16_kernel<R, true><<<blocks, threads, 0, stream>>>(out.get<nv_bfloat16>(),
+                                                                                     A.get<nv_bfloat16>(),
+                                                                                     input.get<nv_bfloat16>(),
+                                                                                     BT,
+                                                                                     C);
     } else {
-        lora_project_small_rank_bf16_kernel<R, false><<<blocks, threads, 0, stream>>>(
-            out.get<nv_bfloat16>(),
-            A.get<nv_bfloat16>(),
-            input.get<nv_bfloat16>(),
-            BT,
-            C);
+        lora_project_small_rank_bf16_kernel<R, false><<<blocks, threads, 0, stream>>>(out.get<nv_bfloat16>(),
+                                                                                      A.get<nv_bfloat16>(),
+                                                                                      input.get<nv_bfloat16>(),
+                                                                                      BT,
+                                                                                      C);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool lora_project_small_rank_bf16(
-    Tensor& out,
-    const Tensor& A,
-    const Tensor& input,
-    int BT,
-    int in_features,
-    int rank,
-    cudaStream_t stream) {
+bool lora_project_small_rank_bf16(Tensor& out,
+                                  const Tensor& A,
+                                  const Tensor& input,
+                                  int BT,
+                                  int in_features,
+                                  int rank,
+                                  cudaStream_t stream) {
     const bool debug = std::getenv("SUROGATE_DEBUG_LORA_GEMM") != nullptr;
     auto reject = [&](const char* reason) -> bool {
         if (debug) {
             std::fprintf(stderr,
-                "[LORA-SMALL] reject=%s rank=%d BT=%d in=%d out_ptr=%p A_ptr=%p inp_ptr=%p out_shape=[%ld,%ld] out_rank=%d A_shape=[%ld,%ld] A_rank=%d inp_shape=[%ld,%ld,%ld] inp_rank=%d dtypes(o,a,i)=(%d,%d,%d)\n",
-                reason, rank, BT, in_features,
-                (void*)out.Data, (void*)A.Data, (void*)input.Data,
-                out.Sizes[0], out.Sizes[1], out.Rank,
-                A.Sizes[0], A.Sizes[1], A.Rank,
-                input.Sizes[0], input.Sizes[1], input.Sizes[2], input.Rank,
-                (int)out.DType, (int)A.DType, (int)input.DType);
+                         "[LORA-SMALL] reject=%s rank=%d BT=%d in=%d out_ptr=%p A_ptr=%p inp_ptr=%p "
+                         "out_shape=[%ld,%ld] out_rank=%d A_shape=[%ld,%ld] A_rank=%d inp_shape=[%ld,%ld,%ld] "
+                         "inp_rank=%d dtypes(o,a,i)=(%d,%d,%d)\n",
+                         reason,
+                         rank,
+                         BT,
+                         in_features,
+                         (void*)out.Data,
+                         (void*)A.Data,
+                         (void*)input.Data,
+                         out.Sizes[0],
+                         out.Sizes[1],
+                         out.Rank,
+                         A.Sizes[0],
+                         A.Sizes[1],
+                         A.Rank,
+                         input.Sizes[0],
+                         input.Sizes[1],
+                         input.Sizes[2],
+                         input.Rank,
+                         (int)out.DType,
+                         (int)A.DType,
+                         (int)input.DType);
         }
         return false;
     };
@@ -138,24 +151,50 @@ bool lora_project_small_rank_bf16(
 
     if (debug) {
         std::fprintf(stderr,
-            "[LORA-SMALL] launch rank=%d BT=%d in=%d a_transposed=%d\n",
-            rank, BT, in_features, (int)(a_transposed && !a_rank_major));
+                     "[LORA-SMALL] launch rank=%d BT=%d in=%d a_transposed=%d\n",
+                     rank,
+                     BT,
+                     in_features,
+                     (int)(a_transposed && !a_rank_major));
     }
 
     switch (rank) {
         case 8:
-            launch_lora_project_small_rank_bf16<8>(out, A, input, BT, in_features, a_transposed && !a_rank_major, stream);
+            launch_lora_project_small_rank_bf16<8>(out,
+                                                   A,
+                                                   input,
+                                                   BT,
+                                                   in_features,
+                                                   a_transposed && !a_rank_major,
+                                                   stream);
             return true;
         case 16:
-            launch_lora_project_small_rank_bf16<16>(out, A, input, BT, in_features, a_transposed && !a_rank_major, stream);
+            launch_lora_project_small_rank_bf16<16>(out,
+                                                    A,
+                                                    input,
+                                                    BT,
+                                                    in_features,
+                                                    a_transposed && !a_rank_major,
+                                                    stream);
             return true;
         case 32:
-            launch_lora_project_small_rank_bf16<32>(out, A, input, BT, in_features, a_transposed && !a_rank_major, stream);
+            launch_lora_project_small_rank_bf16<32>(out,
+                                                    A,
+                                                    input,
+                                                    BT,
+                                                    in_features,
+                                                    a_transposed && !a_rank_major,
+                                                    stream);
             return true;
         case 64:
-            launch_lora_project_small_rank_bf16<64>(out, A, input, BT, in_features, a_transposed && !a_rank_major, stream);
+            launch_lora_project_small_rank_bf16<64>(out,
+                                                    A,
+                                                    input,
+                                                    BT,
+                                                    in_features,
+                                                    a_transposed && !a_rank_major,
+                                                    stream);
             return true;
-        default:
-            return reject("unsupported_rank");
+        default: return reject("unsupported_rank");
     }
 }

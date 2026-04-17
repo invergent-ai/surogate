@@ -26,9 +26,14 @@ class Qwen3Block(nn.Block):
         super().__init__()
         self.attn_norm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Qwen3Attention(
-            d_model, num_query_heads, num_kv_heads, head_size,
-            max_seq, use_qkv_bias=use_qkv_bias,
-            use_qk_norm=use_qk_norm, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            use_qkv_bias=use_qkv_bias,
+            use_qk_norm=use_qk_norm,
+            eps=eps,
         )
         self.mlp_norm = nn.RMSNorm(d_model, eps=eps)
         self.mlp = nn.SwiGLUMLP(d_model, d_ff)

@@ -19,14 +19,16 @@ Key architectural features:
 from __future__ import annotations
 
 from .. import nn
+from ..blocks.gemma4 import (
+    Gemma4FullBlock,
+    Gemma4FullMoEBlock,
+    Gemma4SharedKVBlock,
+    Gemma4SlidingBlock,
+    Gemma4SlidingMoEBlock,
+)
+from ..hf import fuse
 from ..nn import GEMMA4_MODEL_NAME_REMAP
 from ..specs import ActivationScope
-from ..hf import fuse
-from ..blocks.gemma4 import (
-    Gemma4SlidingBlock, Gemma4FullBlock,
-    Gemma4SlidingMoEBlock, Gemma4FullMoEBlock,
-    Gemma4SharedKVBlock,
-)
 
 
 def _parse_gemma4_layer_types(
@@ -37,17 +39,12 @@ def _parse_gemma4_layer_types(
     if layer_types is None:
         sliding_window_pattern = 6
         layer_types = [
-            "sliding_attention"
-            if bool((i + 1) % sliding_window_pattern)
-            else "full_attention"
-            for i in range(n_layers)
+            "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention" for i in range(n_layers)
         ]
     if layer_types and layer_types[-1] != "full_attention":
         layer_types[-1] = "full_attention"
     if len(layer_types) != n_layers:
-        raise ValueError(
-            f"layer_types length ({len(layer_types)}) != n_layers ({n_layers})"
-        )
+        raise ValueError(f"layer_types length ({len(layer_types)}) != n_layers ({n_layers})")
     out: list[str] = []
     for t in layer_types:
         if t == "sliding_attention":
@@ -103,7 +100,10 @@ def _gemma4_layer_mappings(layer_prefix: str, *, k_eq_v: bool = False) -> dict[s
 
 
 def _build_gemma4_block_mappings(
-    layer_prefix: str, model_prefix: str, *, k_eq_v: bool = False,
+    layer_prefix: str,
+    model_prefix: str,
+    *,
+    k_eq_v: bool = False,
 ) -> dict[str, object]:
     """HF weight mappings for a Gemma4 model (layer + model-level params)."""
     # Layer-level mappings. The qkv_weight fuse mapping uses non-k_eq_v
@@ -123,14 +123,30 @@ def _build_gemma4_block_mappings(
 
 def _build_gemma4_model(
     cls,
-    vocab_size, d_model, n_layers, num_query_heads, num_kv_heads,
-    d_ff, max_seq, head_size, eps, sliding_window, layer_types,
-    global_head_dim, global_num_kv_heads, full_partial_rotary_factor,
-    d_per_layer_input, vocab_size_per_layer_input,
-    k_eq_v, final_logit_softcapping,
-    enable_moe_block=False, num_experts=0, top_k_experts=0,
+    vocab_size,
+    d_model,
+    n_layers,
+    num_query_heads,
+    num_kv_heads,
+    d_ff,
+    max_seq,
+    head_size,
+    eps,
+    sliding_window,
+    layer_types,
+    global_head_dim,
+    global_num_kv_heads,
+    full_partial_rotary_factor,
+    d_per_layer_input,
+    vocab_size_per_layer_input,
+    k_eq_v,
+    final_logit_softcapping,
+    enable_moe_block=False,
+    num_experts=0,
+    top_k_experts=0,
     moe_intermediate_size=0,
-    num_kv_shared_layers=0, use_double_wide_mlp=False,
+    num_kv_shared_layers=0,
+    use_double_wide_mlp=False,
 ):
     """Shared constructor logic for Gemma4 causal and conditional models."""
     cls.vocab_size = vocab_size
@@ -192,114 +208,139 @@ def _build_gemma4_model(
     block_configs = []
     if cls.n_sliding_blocks > 0:
         if enable_moe_block:
-            block_configs.append((
-                "sliding_blocks", Gemma4SlidingMoEBlock, cls.n_sliding_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    sliding_window=sliding_window,
-                    num_experts=num_experts,
-                    num_experts_per_tok=top_k_experts,
-                    moe_intermediate_size=moe_intermediate_size,
-                    eps=eps,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "sliding_blocks",
+                    Gemma4SlidingMoEBlock,
+                    cls.n_sliding_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        sliding_window=sliding_window,
+                        num_experts=num_experts,
+                        num_experts_per_tok=top_k_experts,
+                        moe_intermediate_size=moe_intermediate_size,
+                        eps=eps,
+                    ),
+                )
+            )
         else:
-            block_configs.append((
-                "sliding_blocks", Gemma4SlidingBlock, cls.n_sliding_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    sliding_window=sliding_window,
-                    d_per_layer_input=d_per_layer_input,
-                    eps=eps,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "sliding_blocks",
+                    Gemma4SlidingBlock,
+                    cls.n_sliding_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        sliding_window=sliding_window,
+                        d_per_layer_input=d_per_layer_input,
+                        eps=eps,
+                    ),
+                )
+            )
     if cls.n_full_blocks > 0:
         if enable_moe_block:
-            block_configs.append((
-                "full_blocks", Gemma4FullMoEBlock, cls.n_full_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=global_num_kv_heads,
-                    head_size=global_head_dim,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    partial_rotary_factor=full_partial_rotary_factor,
-                    k_eq_v=k_eq_v,
-                    num_experts=num_experts,
-                    num_experts_per_tok=top_k_experts,
-                    moe_intermediate_size=moe_intermediate_size,
-                    eps=eps,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "full_blocks",
+                    Gemma4FullMoEBlock,
+                    cls.n_full_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=global_num_kv_heads,
+                        head_size=global_head_dim,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        partial_rotary_factor=full_partial_rotary_factor,
+                        k_eq_v=k_eq_v,
+                        num_experts=num_experts,
+                        num_experts_per_tok=top_k_experts,
+                        moe_intermediate_size=moe_intermediate_size,
+                        eps=eps,
+                    ),
+                )
+            )
         else:
-            block_configs.append((
-                "full_blocks", Gemma4FullBlock, cls.n_full_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=global_num_kv_heads,
-                    head_size=global_head_dim,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    partial_rotary_factor=full_partial_rotary_factor,
-                    k_eq_v=k_eq_v,
-                    d_per_layer_input=d_per_layer_input,
-                    eps=eps,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "full_blocks",
+                    Gemma4FullBlock,
+                    cls.n_full_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=global_num_kv_heads,
+                        head_size=global_head_dim,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        partial_rotary_factor=full_partial_rotary_factor,
+                        k_eq_v=k_eq_v,
+                        d_per_layer_input=d_per_layer_input,
+                        eps=eps,
+                    ),
+                )
+            )
 
     # Shared-KV sliding blocks (Q-only attention, standard head_dim, double-wide MLP)
     if cls.n_shared_kv_sliding_blocks > 0:
-        block_configs.append((
-            "shared_kv_sliding_blocks", Gemma4SharedKVBlock, cls.n_shared_kv_sliding_blocks,
-            dict(
-                d_model=d_model,
-                num_query_heads=num_query_heads,
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
-                d_ff=d_ff,
-                max_seq=max_seq,
-                partial_rotary_factor=1.0,
-                d_per_layer_input=d_per_layer_input,
-                use_double_wide_mlp=use_double_wide_mlp,
-                eps=eps,
-            ),
-        ))
+        block_configs.append(
+            (
+                "shared_kv_sliding_blocks",
+                Gemma4SharedKVBlock,
+                cls.n_shared_kv_sliding_blocks,
+                dict(
+                    d_model=d_model,
+                    num_query_heads=num_query_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    d_ff=d_ff,
+                    max_seq=max_seq,
+                    partial_rotary_factor=1.0,
+                    d_per_layer_input=d_per_layer_input,
+                    use_double_wide_mlp=use_double_wide_mlp,
+                    eps=eps,
+                ),
+            )
+        )
     # Shared-KV full blocks (Q-only attention, global_head_dim, double-wide MLP)
     if cls.n_shared_kv_full_blocks > 0:
-        block_configs.append((
-            "shared_kv_full_blocks", Gemma4SharedKVBlock, cls.n_shared_kv_full_blocks,
-            dict(
-                d_model=d_model,
-                num_query_heads=num_query_heads,
-                num_kv_heads=global_num_kv_heads,
-                head_size=global_head_dim,
-                d_ff=d_ff,
-                max_seq=max_seq,
-                partial_rotary_factor=full_partial_rotary_factor,
-                d_per_layer_input=d_per_layer_input,
-                use_double_wide_mlp=use_double_wide_mlp,
-                eps=eps,
-            ),
-        ))
+        block_configs.append(
+            (
+                "shared_kv_full_blocks",
+                Gemma4SharedKVBlock,
+                cls.n_shared_kv_full_blocks,
+                dict(
+                    d_model=d_model,
+                    num_query_heads=num_query_heads,
+                    num_kv_heads=global_num_kv_heads,
+                    head_size=global_head_dim,
+                    d_ff=d_ff,
+                    max_seq=max_seq,
+                    partial_rotary_factor=full_partial_rotary_factor,
+                    d_per_layer_input=d_per_layer_input,
+                    use_double_wide_mlp=use_double_wide_mlp,
+                    eps=eps,
+                ),
+            )
+        )
 
     cls.embedding = nn.ScaledEmbedding(vocab_size, d_model)
 
     # Per-layer input embeddings (only when d_per_layer_input > 0)
     if d_per_layer_input > 0:
         cls.pli_embedding = nn.ScaledEmbedding(
-            vocab_size_per_layer_input, n_layers * d_per_layer_input,
+            vocab_size_per_layer_input,
+            n_layers * d_per_layer_input,
             embed_scale=float(d_per_layer_input) ** 0.5,
             dim_name="PLI_total",
         )
@@ -325,10 +366,8 @@ def _gemma4_forward(model, token_ids, position_ids, targets):
     # IO slots
     model._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
     model._register_activation("position_ids", ("T",), dtype="int32", scope=G)
-    model._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                               aliases=["labels"])
-    model._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
-                               scope=G, aliases=["rope_freqs"])
+    model._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
+    model._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32", scope=G, aliases=["rope_freqs"])
 
     # Global intermediate slots
     _h = ("B", "T", "d_model")
@@ -339,10 +378,8 @@ def _gemma4_forward(model, token_ids, position_ids, targets):
     model._register_activation("residual_final", _h, scope=G)
     model._register_activation("xF", _h, aliases=["ln_final"], scope=G)
     model._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-    model._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                               save=True, scope=G)
-    model._register_activation("loss", ("B * T",), dtype="fp32",
-                               aliases=["losses"], scope=G)
+    model._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+    model._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
     # Main embedding (scaled by sqrt(hidden_size))
     x = model.embedding(token_ids)
@@ -353,32 +390,22 @@ def _gemma4_forward(model, token_ids, position_ids, targets):
         # Per-layer input computation
         pli_embeds = model.pli_embedding(token_ids)
 
-        model._register_param("pli_model_proj", ("PLI_total", "d_model"),
-                              quantizable=False)
+        model._register_param("pli_model_proj", ("PLI_total", "d_model"), quantizable=False)
         x_flat_pli = model._view(x, ["B * T", "d_model"], name="x_flat_pli")
         pli_proj_flat = model._matmul(x_flat_pli, "pli_model_proj", name="pli_proj_flat")
-        pli_proj_3d = model._view(pli_proj_flat, ["B", "T", pli_total],
-                                  name="pli_proj_3d")
-        pli_proj_scaled = model._scale_by_const(pli_proj_3d, float(d_model) ** -0.5,
-                                                name="pli_proj_scaled")
+        pli_proj_3d = model._view(pli_proj_flat, ["B", "T", pli_total], name="pli_proj_3d")
+        pli_proj_scaled = model._scale_by_const(pli_proj_3d, float(d_model) ** -0.5, name="pli_proj_scaled")
 
-        pli_embeds_4d = model._view(pli_embeds, ["B", "T", n_layers, d_pli],
-                                    name="pli_embeds_4d")
-        pli_proj_4d = model._view(pli_proj_scaled, ["B", "T", n_layers, d_pli],
-                                  name="pli_proj_4d")
+        pli_embeds_4d = model._view(pli_embeds, ["B", "T", n_layers, d_pli], name="pli_embeds_4d")
+        pli_proj_4d = model._view(pli_proj_scaled, ["B", "T", n_layers, d_pli], name="pli_proj_4d")
 
         model._register_param("pli_proj_norm", ("PLI_D",), quantizable=False)
-        pli_proj_rn_flat = model._view(
-            pli_proj_4d, ["B * T * " + str(n_layers), str(d_pli)],
-            name="pli_proj_rn_flat")
-        pli_proj_normed = model._rmsnorm(pli_proj_rn_flat, "pli_proj_norm",
-                                         eps=model.eps, name="pli_proj_normed")
-        pli_proj_normed_4d = model._view(
-            pli_proj_normed, ["B", "T", n_layers, d_pli], name="pli_proj_normed_4d")
+        pli_proj_rn_flat = model._view(pli_proj_4d, ["B * T * " + str(n_layers), str(d_pli)], name="pli_proj_rn_flat")
+        pli_proj_normed = model._rmsnorm(pli_proj_rn_flat, "pli_proj_norm", eps=model.eps, name="pli_proj_normed")
+        pli_proj_normed_4d = model._view(pli_proj_normed, ["B", "T", n_layers, d_pli], name="pli_proj_normed_4d")
 
         pli_combined = model._add(pli_proj_normed_4d, pli_embeds_4d, name="pli_combined")
-        per_layer_inputs = model._scale_by_const(pli_combined, 2.0 ** -0.5,
-                                                 name="per_layer_inputs")
+        per_layer_inputs = model._scale_by_const(pli_combined, 2.0**-0.5, name="per_layer_inputs")
 
         # Forward through blocks with per-layer inputs
         residual = model._zeros(["B", "T", "d_model"])
@@ -398,6 +425,7 @@ def _gemma4_forward(model, token_ids, position_ids, targets):
 # ============================================================================
 # Model classes
 # ============================================================================
+
 
 @nn.hf_config(
     architecture="Gemma4ForCausalLM",
@@ -432,7 +460,8 @@ class Gemma4CausalModel(nn.Model):
 
     _name_remap_ = GEMMA4_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_gemma4_block_mappings(
-        "model.layers.{layer}", "model",
+        "model.layers.{layer}",
+        "model",
     )
 
     def __init__(
@@ -465,11 +494,24 @@ class Gemma4CausalModel(nn.Model):
         super().__init__()
         _build_gemma4_model(
             self,
-            vocab_size, d_model, n_layers, num_query_heads, num_kv_heads,
-            d_ff, max_seq, head_size, eps, sliding_window, layer_types,
-            global_head_dim, global_num_kv_heads, full_partial_rotary_factor,
-            d_per_layer_input, vocab_size_per_layer_input,
-            k_eq_v, final_logit_softcapping,
+            vocab_size,
+            d_model,
+            n_layers,
+            num_query_heads,
+            num_kv_heads,
+            d_ff,
+            max_seq,
+            head_size,
+            eps,
+            sliding_window,
+            layer_types,
+            global_head_dim,
+            global_num_kv_heads,
+            full_partial_rotary_factor,
+            d_per_layer_input,
+            vocab_size_per_layer_input,
+            k_eq_v,
+            final_logit_softcapping,
             enable_moe_block=enable_moe_block,
             num_experts=num_experts or 0,
             top_k_experts=top_k_experts or 0,
@@ -515,7 +557,8 @@ class Gemma4ConditionalModel(nn.Model):
 
     _name_remap_ = GEMMA4_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_gemma4_block_mappings(
-        "model.language_model.layers.{layer}", "model.language_model",
+        "model.language_model.layers.{layer}",
+        "model.language_model",
     )
 
     def __init__(
@@ -548,11 +591,24 @@ class Gemma4ConditionalModel(nn.Model):
         super().__init__()
         _build_gemma4_model(
             self,
-            vocab_size, d_model, n_layers, num_query_heads, num_kv_heads,
-            d_ff, max_seq, head_size, eps, sliding_window, layer_types,
-            global_head_dim, global_num_kv_heads, full_partial_rotary_factor,
-            d_per_layer_input, vocab_size_per_layer_input,
-            k_eq_v, final_logit_softcapping,
+            vocab_size,
+            d_model,
+            n_layers,
+            num_query_heads,
+            num_kv_heads,
+            d_ff,
+            max_seq,
+            head_size,
+            eps,
+            sliding_window,
+            layer_types,
+            global_head_dim,
+            global_num_kv_heads,
+            full_partial_rotary_factor,
+            d_per_layer_input,
+            vocab_size_per_layer_input,
+            k_eq_v,
+            final_logit_softcapping,
             enable_moe_block=enable_moe_block,
             num_experts=num_experts or 0,
             top_k_experts=top_k_experts or 0,

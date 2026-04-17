@@ -84,32 +84,44 @@ public:
      *
      * Used for all-reduce across ranks in distributed training.
      */
-    [[nodiscard]] Tensor& recorded_amaxes() { return mRecordedAmaxes; }
+    [[nodiscard]] Tensor& recorded_amaxes() {
+        return mRecordedAmaxes;
+    }
 
     /**
      * @brief Get all scales as a single tensor
      */
-    [[nodiscard]] Tensor& scales() { return mScales; }
+    [[nodiscard]] Tensor& scales() {
+        return mScales;
+    }
 
     /**
      * @brief Get the amax history buffer
      */
-    [[nodiscard]] Tensor& amax_history() { return mAmaxHistory; }
+    [[nodiscard]] Tensor& amax_history() {
+        return mAmaxHistory;
+    }
 
     /**
      * @brief Get the configuration
      */
-    [[nodiscard]] const FP8ScalingConfig& config() const { return mConfig; }
+    [[nodiscard]] const FP8ScalingConfig& config() const {
+        return mConfig;
+    }
 
     /**
      * @brief Get the number of layers
      */
-    [[nodiscard]] int num_layers() const { return mNumLayers; }
+    [[nodiscard]] int num_layers() const {
+        return mNumLayers;
+    }
 
     /**
      * @brief Get the total number of quantizers
      */
-    [[nodiscard]] int num_quantizers() const { return mNumQuantizers; }
+    [[nodiscard]] int num_quantizers() const {
+        return mNumQuantizers;
+    }
 
     /**
      * @brief Reset all state to initial values
@@ -130,8 +142,8 @@ public:
 private:
     FP8ScalingConfig mConfig;
     int mDeviceId;
-    int mNumLayers;       ///< Number of transformer layers
-    int mNumQuantizers;   ///< Total number of quantizers (num_layers * NUM_QUANTIZERS_PER_LAYER)
+    int mNumLayers;      ///< Number of transformer layers
+    int mNumQuantizers;  ///< Total number of quantizers (num_layers * NUM_QUANTIZERS_PER_LAYER)
 
     /// Amax history buffer: [amax_history_len, num_quantizers]
     /// Row 0 = most recent, row N-1 = oldest
@@ -157,6 +169,6 @@ private:
  */
 void delayed_scaling_update(FP8ScalingState& state, cudaStream_t stream);
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_FP8_SCALING_STATE_H
+#endif  // SUROGATE_SRC_MODULES_FP8_SCALING_STATE_H

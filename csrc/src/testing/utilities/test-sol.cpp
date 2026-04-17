@@ -19,4 +19,3 @@ TEST_CASE("TrainingRunLogger::log_sol_estimate does not throw on unsupported dty
 
     REQUIRE_NOTHROW(logger.log_sol_estimate(ops, /*world_size=*/8));
 }
-

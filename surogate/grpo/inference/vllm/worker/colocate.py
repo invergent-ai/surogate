@@ -11,12 +11,12 @@ memory that vLLM's worker process allocated, achieving zero-copy sharing.
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import Module
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -63,8 +63,16 @@ def _get_ipc_info(tensor: torch.Tensor) -> dict[str, Any]:
     storage = tensor.untyped_storage()
     share_data = storage._share_cuda_()
     # Unpack all values (PyTorch 2.10+: 8 values)
-    (device_idx, storage_handle, storage_size_bytes, storage_offset_bytes,
-     ref_counter_handle, ref_counter_offset, event_handle, event_sync_required) = share_data
+    (
+        device_idx,
+        storage_handle,
+        storage_size_bytes,
+        storage_offset_bytes,
+        ref_counter_handle,
+        ref_counter_offset,
+        event_handle,
+        event_sync_required,
+    ) = share_data
 
     return {
         # Storage IPC info (for _new_shared_cuda / rebuild_cuda_tensor)
@@ -161,8 +169,7 @@ class ColocateWeightUpdateWorker(Worker):
                 entry["name"] = self._normalize_vllm_name(entry["name"])
                 results.append(entry)
 
-        logger.info("Extracted %d quantized weight IPC handles on device %d",
-                     len(results), device_idx)
+        logger.info("Extracted %d quantized weight IPC handles on device %d", len(results), device_idx)
         return results
 
     @staticmethod
@@ -170,9 +177,7 @@ class ColocateWeightUpdateWorker(Worker):
         """Check if this weight needs fuse_swap (different partition order in vLLM vs surogate)."""
         return any(f".{n}." in name for n in ColocateWeightUpdateWorker._FUSE_SWAP_NAMES)
 
-    def _extract_quant_ipc(
-        self, name: str, param: torch.Tensor, module: Any, device: int
-    ) -> dict[str, Any] | None:
+    def _extract_quant_ipc(self, name: str, param: torch.Tensor, module: Any, device: int) -> dict[str, Any] | None:
         """Try to extract IPC info for a quantized weight. Returns None if not quantized."""
         # Try BnB NF4
         entry = self._extract_bnb_nf4_ipc(name, param, module, device)
@@ -197,9 +202,7 @@ class ColocateWeightUpdateWorker(Worker):
 
         return None
 
-    def _extract_bnb_nf4_ipc(
-        self, name: str, param: torch.Tensor, module: Any, device: int
-    ) -> dict[str, Any] | None:
+    def _extract_bnb_nf4_ipc(self, name: str, param: torch.Tensor, module: Any, device: int) -> dict[str, Any] | None:
         quant_states = getattr(param, "bnb_quant_state", None)
         if quant_states is None:
             return None
@@ -216,7 +219,8 @@ class ColocateWeightUpdateWorker(Worker):
         result: dict[str, Any] = {
             "name": name,
             "format": QUANT_FORMAT_BNB_NF4,
-            "M": M, "K": K,
+            "M": M,
+            "K": K,
             "block_size": block_size,
             "double_quant": hasattr(qs, "nested") and qs.nested,
             "double_quant_group_size": getattr(qs, "nested_blocksize", 256),
@@ -238,7 +242,11 @@ class ColocateWeightUpdateWorker(Worker):
         return result
 
     def _extract_fp8_ipc(
-        self, name: str, param: torch.Tensor, module: Any, device: int,
+        self,
+        name: str,
+        param: torch.Tensor,
+        module: Any,
+        device: int,
     ) -> dict[str, Any] | None:
         if param.dtype != torch.float8_e4m3fn:
             return None
@@ -257,7 +265,8 @@ class ColocateWeightUpdateWorker(Worker):
         return {
             "name": name,
             "format": QUANT_FORMAT_FP8_PER_BLOCK,
-            "M": M, "K": K,
+            "M": M,
+            "K": K,
             "block_size": block_size,
             "double_quant": False,
             "double_quant_group_size": 256,
@@ -270,7 +279,11 @@ class ColocateWeightUpdateWorker(Worker):
         }
 
     def _extract_nvfp4_ipc(
-        self, name: str, param: torch.Tensor, module: Any, device: int,
+        self,
+        name: str,
+        param: torch.Tensor,
+        module: Any,
+        device: int,
     ) -> dict[str, Any] | None:
         """Try to extract IPC info for NVFP4 (ModelOpt) weight.
 
@@ -310,7 +323,8 @@ class ColocateWeightUpdateWorker(Worker):
         return {
             "name": name,
             "format": QUANT_FORMAT_FP4_BLOCK_2D,
-            "M": M, "K": K,
+            "M": M,
+            "K": K,
             "block_size": block_size,
             "double_quant": False,
             "double_quant_group_size": 256,

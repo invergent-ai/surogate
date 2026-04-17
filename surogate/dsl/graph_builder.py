@@ -14,15 +14,17 @@ Example:
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Sequence, TYPE_CHECKING
 from enum import Enum
+from typing import TYPE_CHECKING, Any
 
-from .dim import Dim, DimExpr, ConcreteDimValue
+from .dim import ConcreteDimValue, Dim, DimExpr
 
 if TYPE_CHECKING:
-    from .ir import GraphIR
+    pass
 
 # Type alias for shape dimensions
 ShapeDim = str | int | Dim | DimExpr | ConcreteDimValue
@@ -45,6 +47,7 @@ def _resolve_shape(shape: Sequence[ShapeDim]) -> list[str | int]:
 
 class TransposeMode(str, Enum):
     """Transpose mode for matmul operations."""
+
     NN = "NN"
     NT = "NT"
     TN = "TN"
@@ -54,6 +57,7 @@ class TransposeMode(str, Enum):
 @dataclass
 class GraphNode:
     """A node in the computation graph."""
+
     op: str
     inputs: list[str]
     outputs: list[str]
@@ -64,6 +68,7 @@ class GraphNode:
 @dataclass
 class ConditionalBranch:
     """A conditional branch in the graph."""
+
     condition: str  # Expression string
     true_nodes: list[GraphNode]
     false_nodes: list[GraphNode] | None = None
@@ -75,6 +80,7 @@ class GraphRef:
 
     This is returned by graph operations and can be used as input to other ops.
     """
+
     name: str
     builder: GraphBuilder
 
@@ -154,17 +160,19 @@ class GraphBuilder:
     ) -> GraphRef:
         """Matrix multiplication: C = alpha * op(A) @ op(B) + beta * C"""
         out = out_name if out_name else self._fresh_name("mm")
-        self._add_node(GraphNode(
-            op="matmul",
-            inputs=[self._resolve_input(a), self._resolve_input(b)],
-            outputs=[out],
-            attrs={
-                "transpose": str(transpose),
-                "accumulate": accumulate,
-                "alpha": alpha,
-                "beta": beta,
-            },
-        ))
+        self._add_node(
+            GraphNode(
+                op="matmul",
+                inputs=[self._resolve_input(a), self._resolve_input(b)],
+                outputs=[out],
+                attrs={
+                    "transpose": str(transpose),
+                    "accumulate": accumulate,
+                    "alpha": alpha,
+                    "beta": beta,
+                },
+            )
+        )
         return self._make_output(out)
 
     def matmul_bias(
@@ -181,17 +189,19 @@ class GraphBuilder:
     ) -> GraphRef:
         """Matrix multiplication with fused bias: C = alpha * op(A) @ op(B) + bias (+ beta * C)."""
         out = out_name if out_name else self._fresh_name("mm")
-        self._add_node(GraphNode(
-            op="matmul_bias",
-            inputs=[self._resolve_input(a), self._resolve_input(b), self._resolve_input(bias)],
-            outputs=[out],
-            attrs={
-                "transpose": str(transpose),
-                "accumulate": accumulate,
-                "alpha": alpha,
-                "beta": beta,
-            },
-        ))
+        self._add_node(
+            GraphNode(
+                op="matmul_bias",
+                inputs=[self._resolve_input(a), self._resolve_input(b), self._resolve_input(bias)],
+                outputs=[out],
+                attrs={
+                    "transpose": str(transpose),
+                    "accumulate": accumulate,
+                    "alpha": alpha,
+                    "beta": beta,
+                },
+            )
+        )
         return self._make_output(out)
 
     def batched_matmul(
@@ -203,12 +213,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """Batched matrix multiplication."""
         out = self._fresh_name("bmm")
-        self._add_node(GraphNode(
-            op="batched_matmul",
-            inputs=[self._resolve_input(a), self._resolve_input(b)],
-            outputs=[out],
-            attrs={"transpose": str(transpose)},
-        ))
+        self._add_node(
+            GraphNode(
+                op="batched_matmul",
+                inputs=[self._resolve_input(a), self._resolve_input(b)],
+                outputs=[out],
+                attrs={"transpose": str(transpose)},
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -227,12 +239,14 @@ class GraphBuilder:
         """RMS normalization. Returns (y, rstd)."""
         y = y_name if y_name else self._fresh_name("rms")
         rstd = rstd_name if rstd_name else self._fresh_name("rstd")
-        self._add_node(GraphNode(
-            op="rmsnorm",
-            inputs=[self._resolve_input(x), self._resolve_input(weight)],
-            outputs=[y, rstd],
-            attrs={"eps": eps},
-        ))
+        self._add_node(
+            GraphNode(
+                op="rmsnorm",
+                inputs=[self._resolve_input(x), self._resolve_input(weight)],
+                outputs=[y, rstd],
+                attrs={"eps": eps},
+            )
+        )
         return self._make_outputs([y, rstd])
 
     def fused_residual_rmsnorm(
@@ -250,16 +264,18 @@ class GraphBuilder:
         res_out = res_out_name if res_out_name else self._fresh_name("res")
         y = y_name if y_name else self._fresh_name("rms")
         rstd = rstd_name if rstd_name else self._fresh_name("rstd")
-        self._add_node(GraphNode(
-            op="fused_residual_rmsnorm",
-            inputs=[
-                self._resolve_input(residual),
-                self._resolve_input(x),
-                self._resolve_input(weight),
-            ],
-            outputs=[res_out, y, rstd],
-            attrs={"eps": eps},
-        ))
+        self._add_node(
+            GraphNode(
+                op="fused_residual_rmsnorm",
+                inputs=[
+                    self._resolve_input(residual),
+                    self._resolve_input(x),
+                    self._resolve_input(weight),
+                ],
+                outputs=[res_out, y, rstd],
+                attrs={"eps": eps},
+            )
+        )
         return self._make_outputs([res_out, y, rstd])
 
     def layernorm(
@@ -277,12 +293,14 @@ class GraphBuilder:
         inputs = [self._resolve_input(x), self._resolve_input(weight)]
         if bias is not None:
             inputs.append(self._resolve_input(bias))
-        self._add_node(GraphNode(
-            op="layernorm",
-            inputs=inputs,
-            outputs=[y, mean, rstd],
-            attrs={"eps": eps},
-        ))
+        self._add_node(
+            GraphNode(
+                op="layernorm",
+                inputs=inputs,
+                outputs=[y, mean, rstd],
+                attrs={"eps": eps},
+            )
+        )
         return self._make_outputs([y, mean, rstd])
 
     # =========================================================================
@@ -292,82 +310,98 @@ class GraphBuilder:
     def swiglu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """SwiGLU activation: silu(gate) * up"""
         out = out_name if out_name else self._fresh_name("swiglu")
-        self._add_node(GraphNode(
-            op="swiglu",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="swiglu",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def silu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """SiLU (Swish) activation."""
         out = out_name if out_name else self._fresh_name("silu")
-        self._add_node(GraphNode(
-            op="silu",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="silu",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def sigmoid(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """Sigmoid activation."""
         out = out_name if out_name else self._fresh_name("sigmoid")
-        self._add_node(GraphNode(
-            op="sigmoid",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="sigmoid",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def relu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """ReLU activation."""
         out = out_name if out_name else self._fresh_name("relu")
-        self._add_node(GraphNode(
-            op="relu",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="relu",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def relu2(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """ReLU squared activation."""
         out = out_name if out_name else self._fresh_name("relu2")
-        self._add_node(GraphNode(
-            op="relu2",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="relu2",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def gelu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """GELU activation."""
         out = out_name if out_name else self._fresh_name("gelu")
-        self._add_node(GraphNode(
-            op="gelu",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="gelu",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def softmax(self, x: str | GraphRef, *, dim: int = -1) -> GraphRef:
         """Softmax activation."""
         out = self._fresh_name("softmax")
-        self._add_node(GraphNode(
-            op="softmax",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"dim": dim},
-        ))
+        self._add_node(
+            GraphNode(
+                op="softmax",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"dim": dim},
+            )
+        )
         return self._make_output(out)
 
     def silu_mul(self, gate: str | GraphRef, up: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """SiLU(gate) * up activation."""
         out = out_name if out_name else self._fresh_name("silu_mul")
-        self._add_node(GraphNode(
-            op="silu_mul",
-            inputs=[self._resolve_input(gate), self._resolve_input(up)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="silu_mul",
+                inputs=[self._resolve_input(gate), self._resolve_input(up)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -392,12 +426,14 @@ class GraphBuilder:
         """
         out = out_name if out_name else self._fresh_name("mlp_act")
         up_out = up_out_name if up_out_name else self._fresh_name("mlp_up")
-        self._add_node(GraphNode(
-            op="matmul_swiglu",
-            inputs=[self._resolve_input(a), self._resolve_input(b)],
-            outputs=[out, up_out],
-            attrs={"transpose": str(transpose)},
-        ))
+        self._add_node(
+            GraphNode(
+                op="matmul_swiglu",
+                inputs=[self._resolve_input(a), self._resolve_input(b)],
+                outputs=[out, up_out],
+                attrs={"transpose": str(transpose)},
+            )
+        )
         return self._make_outputs([out, up_out])
 
     def fused_lm_head_loss(
@@ -415,16 +451,18 @@ class GraphBuilder:
         attrs: dict[str, Any] = {"compute_accuracy": compute_accuracy}
         if softcap is not None:
             attrs["softcap"] = softcap
-        self._add_node(GraphNode(
-            op="fused_lm_head_loss",
-            inputs=[
-                self._resolve_input(xF_flat),
-                self._resolve_input(weight),
-                self._resolve_input(targets),
-            ],
-            outputs=[out],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="fused_lm_head_loss",
+                inputs=[
+                    self._resolve_input(xF_flat),
+                    self._resolve_input(weight),
+                    self._resolve_input(targets),
+                ],
+                outputs=[out],
+                attrs=attrs,
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -453,12 +491,14 @@ class GraphBuilder:
         inputs = [self._resolve_input(qkv)]
         if sinks is not None:
             inputs.append(self._resolve_input(sinks))
-        self._add_node(GraphNode(
-            op="flash_attention",
-            inputs=inputs,
-            outputs=[out, lse],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="flash_attention",
+                inputs=inputs,
+                outputs=[out, lse],
+                attrs=attrs,
+            )
+        )
         return self._make_outputs([out, lse])
 
     def flash_attention_qkv(
@@ -478,16 +518,18 @@ class GraphBuilder:
         attrs = {"causal": causal}
         if softmax_scale is not None:
             attrs["softmax_scale"] = softmax_scale
-        self._add_node(GraphNode(
-            op="flash_attention_qkv",
-            inputs=[
-                self._resolve_input(q),
-                self._resolve_input(k),
-                self._resolve_input(v),
-            ],
-            outputs=[out, lse],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="flash_attention_qkv",
+                inputs=[
+                    self._resolve_input(q),
+                    self._resolve_input(k),
+                    self._resolve_input(v),
+                ],
+                outputs=[out, lse],
+                attrs=attrs,
+            )
+        )
         return self._make_outputs([out, lse])
 
     def rope(
@@ -504,16 +546,18 @@ class GraphBuilder:
         attrs = {}
         if rotary_dim is not None:
             attrs["rotary_dim"] = rotary_dim
-        self._add_node(GraphNode(
-            op="rope",
-            inputs=[
-                self._resolve_input(qkv),
-                self._resolve_input(freqs),
-                self._resolve_input(position_ids),
-            ],
-            outputs=[out],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="rope",
+                inputs=[
+                    self._resolve_input(qkv),
+                    self._resolve_input(freqs),
+                    self._resolve_input(position_ids),
+                ],
+                outputs=[out],
+                attrs=attrs,
+            )
+        )
         return self._make_output(out)
 
     def mrope(
@@ -533,16 +577,18 @@ class GraphBuilder:
             attrs["rotary_dim"] = rotary_dim
         if mrope_section is not None:
             attrs["mrope_section"] = list(mrope_section)
-        self._add_node(GraphNode(
-            op="mrope",
-            inputs=[
-                self._resolve_input(qkv),
-                self._resolve_input(freqs),
-                self._resolve_input(position_ids),
-            ],
-            outputs=[out],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="mrope",
+                inputs=[
+                    self._resolve_input(qkv),
+                    self._resolve_input(freqs),
+                    self._resolve_input(position_ids),
+                ],
+                outputs=[out],
+                attrs=attrs,
+            )
+        )
         return self._make_output(out)
 
     def qkv_qk_norm(
@@ -560,16 +606,18 @@ class GraphBuilder:
         qkv_out = out_name if out_name else self._fresh_name("qkv_norm")
         q_rstd = q_rstd_name if q_rstd_name else self._fresh_name("q_rstd")
         k_rstd = k_rstd_name if k_rstd_name else self._fresh_name("k_rstd")
-        self._add_node(GraphNode(
-            op="qkv_qk_norm",
-            inputs=[
-                self._resolve_input(qkv),
-                self._resolve_input(q_norm_weight),
-                self._resolve_input(k_norm_weight),
-            ],
-            outputs=[qkv_out, q_rstd, k_rstd],
-            attrs={"eps": eps},
-        ))
+        self._add_node(
+            GraphNode(
+                op="qkv_qk_norm",
+                inputs=[
+                    self._resolve_input(qkv),
+                    self._resolve_input(q_norm_weight),
+                    self._resolve_input(k_norm_weight),
+                ],
+                outputs=[qkv_out, q_rstd, k_rstd],
+                attrs={"eps": eps},
+            )
+        )
         return self._make_outputs([qkv_out, q_rstd, k_rstd])
 
     def qkv_qk_norm_rope(
@@ -589,18 +637,20 @@ class GraphBuilder:
         qkv_out = out_name if out_name else self._fresh_name("qkv_rope")
         q_rstd = q_rstd_name if q_rstd_name else self._fresh_name("q_rstd")
         k_rstd = k_rstd_name if k_rstd_name else self._fresh_name("k_rstd")
-        self._add_node(GraphNode(
-            op="qkv_qk_norm_rope",
-            inputs=[
-                self._resolve_input(qkv),
-                self._resolve_input(q_norm_weight),
-                self._resolve_input(k_norm_weight),
-                self._resolve_input(freqs),
-                self._resolve_input(position_ids),
-            ],
-            outputs=[qkv_out, q_rstd, k_rstd],
-            attrs={"eps": eps},
-        ))
+        self._add_node(
+            GraphNode(
+                op="qkv_qk_norm_rope",
+                inputs=[
+                    self._resolve_input(qkv),
+                    self._resolve_input(q_norm_weight),
+                    self._resolve_input(k_norm_weight),
+                    self._resolve_input(freqs),
+                    self._resolve_input(position_ids),
+                ],
+                outputs=[qkv_out, q_rstd, k_rstd],
+                attrs={"eps": eps},
+            )
+        )
         return self._make_outputs([qkv_out, q_rstd, k_rstd])
 
     # =========================================================================
@@ -616,12 +666,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """Reshape tensor."""
         out = out_name if out_name else self._fresh_name("view")
-        self._add_node(GraphNode(
-            op="view",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"shape": _resolve_shape(shape)},
-        ))
+        self._add_node(
+            GraphNode(
+                op="view",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"shape": _resolve_shape(shape)},
+            )
+        )
         return self._make_output(out)
 
     def transpose(
@@ -633,33 +685,39 @@ class GraphBuilder:
     ) -> GraphRef:
         """Transpose two dimensions."""
         out = self._fresh_name("transpose")
-        self._add_node(GraphNode(
-            op="transpose",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"dim0": dim0, "dim1": dim1},
-        ))
+        self._add_node(
+            GraphNode(
+                op="transpose",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"dim0": dim0, "dim1": dim1},
+            )
+        )
         return self._make_output(out)
 
     def permute(self, x: str | GraphRef, *, dims: Sequence[int]) -> GraphRef:
         """Permute dimensions."""
         out = self._fresh_name("permute")
-        self._add_node(GraphNode(
-            op="permute",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"dims": list(dims)},
-        ))
+        self._add_node(
+            GraphNode(
+                op="permute",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"dims": list(dims)},
+            )
+        )
         return self._make_output(out)
 
     def contiguous(self, x: str | GraphRef) -> GraphRef:
         """Make tensor contiguous."""
         out = self._fresh_name("contiguous")
-        self._add_node(GraphNode(
-            op="contiguous",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="contiguous",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def split(
@@ -677,12 +735,14 @@ class GraphBuilder:
             num_outputs = len(split_size)
 
         outputs = [self._fresh_name("split") for _ in range(num_outputs)]
-        self._add_node(GraphNode(
-            op="split",
-            inputs=[self._resolve_input(x)],
-            outputs=outputs,
-            attrs={"split_size": split_size, "dim": dim},
-        ))
+        self._add_node(
+            GraphNode(
+                op="split",
+                inputs=[self._resolve_input(x)],
+                outputs=outputs,
+                attrs={"split_size": split_size, "dim": dim},
+            )
+        )
         return self._make_outputs(outputs)
 
     def narrow(
@@ -701,12 +761,14 @@ class GraphBuilder:
         The output rank equals the input rank (the dimension is kept).
         """
         out = out_name if out_name else self._fresh_name("narrow")
-        self._add_node(GraphNode(
-            op="narrow",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"dim": dim, "start": start, "length": length},
-        ))
+        self._add_node(
+            GraphNode(
+                op="narrow",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"dim": dim, "start": start, "length": length},
+            )
+        )
         return self._make_output(out)
 
     def repeat_interleave_heads(
@@ -718,12 +780,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """Repeat-interleave a [B,T,H,D] tensor on the head axis (dim=2)."""
         out = out_name if out_name else self._fresh_name("repeat_heads")
-        self._add_node(GraphNode(
-            op="repeat_interleave_heads",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"repeats": repeats},
-        ))
+        self._add_node(
+            GraphNode(
+                op="repeat_interleave_heads",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"repeats": repeats},
+            )
+        )
         return self._make_output(out)
 
     def concat(
@@ -742,22 +806,26 @@ class GraphBuilder:
         attrs: dict = {"dim": dim}
         if split_size is not None:
             attrs["split_size"] = split_size
-        self._add_node(GraphNode(
-            op="concat",
-            inputs=[self._resolve_input(t) for t in tensors],
-            outputs=[out],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="concat",
+                inputs=[self._resolve_input(t) for t in tensors],
+                outputs=[out],
+                attrs=attrs,
+            )
+        )
         return self._make_output(out)
 
     def copy(self, x: str | GraphRef) -> GraphRef:
         """Copy tensor."""
         out = self._fresh_name("copy")
-        self._add_node(GraphNode(
-            op="copy",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="copy",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -767,21 +835,25 @@ class GraphBuilder:
     def add(self, a: str | GraphRef, b: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """Element-wise addition."""
         out = out_name or self._fresh_name("add")
-        self._add_node(GraphNode(
-            op="add",
-            inputs=[self._resolve_input(a), self._resolve_input(b)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="add",
+                inputs=[self._resolve_input(a), self._resolve_input(b)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def mul(self, a: str | GraphRef, b: str | GraphRef) -> GraphRef:
         """Element-wise multiplication."""
         out = self._fresh_name("mul")
-        self._add_node(GraphNode(
-            op="mul",
-            inputs=[self._resolve_input(a), self._resolve_input(b)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="mul",
+                inputs=[self._resolve_input(a), self._resolve_input(b)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def mask_scatter(
@@ -794,11 +866,13 @@ class GraphBuilder:
     ) -> GraphRef:
         """Replace rows in x at masked positions with src (visual embeddings)."""
         out = out_name if out_name else self._fresh_name("mask_scatter")
-        self._add_node(GraphNode(
-            op="mask_scatter",
-            inputs=[self._resolve_input(x), self._resolve_input(mask), self._resolve_input(src)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="mask_scatter",
+                inputs=[self._resolve_input(x), self._resolve_input(mask), self._resolve_input(src)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def deepstack_inject(
@@ -811,32 +885,38 @@ class GraphBuilder:
     ) -> GraphRef:
         """Add src to x at masked positions (deepstack visual embeddings)."""
         out = out_name if out_name else self._fresh_name("deepstack")
-        self._add_node(GraphNode(
-            op="deepstack_inject",
-            inputs=[self._resolve_input(x), self._resolve_input(mask), self._resolve_input(src)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="deepstack_inject",
+                inputs=[self._resolve_input(x), self._resolve_input(mask), self._resolve_input(src)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def scale(self, x: str | GraphRef, *, factor: float) -> GraphRef:
         """Scale tensor by constant."""
         out = self._fresh_name("scale")
-        self._add_node(GraphNode(
-            op="scale",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"factor": factor},
-        ))
+        self._add_node(
+            GraphNode(
+                op="scale",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"factor": factor},
+            )
+        )
         return self._make_output(out)
 
     def bias_add(self, x: str | GraphRef, bias: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """Add bias to tensor."""
         out = out_name if out_name else self._fresh_name("bias")
-        self._add_node(GraphNode(
-            op="bias_add",
-            inputs=[self._resolve_input(x), self._resolve_input(bias)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="bias_add",
+                inputs=[self._resolve_input(x), self._resolve_input(bias)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -852,11 +932,13 @@ class GraphBuilder:
     ) -> GraphRef:
         """Embedding lookup."""
         out = out_name if out_name else self._fresh_name("embed")
-        self._add_node(GraphNode(
-            op="embedding",
-            inputs=[self._resolve_input(indices), self._resolve_input(weight)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="embedding",
+                inputs=[self._resolve_input(indices), self._resolve_input(weight)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -872,12 +954,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """Create zero-filled tensor."""
         out = out_name if out_name else self._fresh_name("zeros")
-        self._add_node(GraphNode(
-            op="zeros",
-            inputs=[],
-            outputs=[out],
-            attrs={"shape": _resolve_shape(shape), "dtype": dtype},
-        ))
+        self._add_node(
+            GraphNode(
+                op="zeros",
+                inputs=[],
+                outputs=[out],
+                attrs={"shape": _resolve_shape(shape), "dtype": dtype},
+            )
+        )
         return self._make_output(out)
 
     def ones(
@@ -888,12 +972,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """Create one-filled tensor."""
         out = self._fresh_name("ones")
-        self._add_node(GraphNode(
-            op="ones",
-            inputs=[],
-            outputs=[out],
-            attrs={"shape": _resolve_shape(shape), "dtype": dtype},
-        ))
+        self._add_node(
+            GraphNode(
+                op="ones",
+                inputs=[],
+                outputs=[out],
+                attrs={"shape": _resolve_shape(shape), "dtype": dtype},
+            )
+        )
         return self._make_output(out)
 
     def fill(
@@ -905,12 +991,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """Create tensor filled with value."""
         out = self._fresh_name("fill")
-        self._add_node(GraphNode(
-            op="fill",
-            inputs=[],
-            outputs=[out],
-            attrs={"shape": _resolve_shape(shape), "value": value, "dtype": dtype},
-        ))
+        self._add_node(
+            GraphNode(
+                op="fill",
+                inputs=[],
+                outputs=[out],
+                attrs={"shape": _resolve_shape(shape), "value": value, "dtype": dtype},
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -920,21 +1008,25 @@ class GraphBuilder:
     def moe_softmax(self, logits: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """MoE router softmax."""
         out = out_name or self._fresh_name("moe_probs")
-        self._add_node(GraphNode(
-            op="moe_softmax",
-            inputs=[self._resolve_input(logits)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_softmax",
+                inputs=[self._resolve_input(logits)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def moe_sigmoid(self, logits: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """MoE router sigmoid."""
         out = out_name or self._fresh_name("moe_probs")
-        self._add_node(GraphNode(
-            op="moe_sigmoid",
-            inputs=[self._resolve_input(logits)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_sigmoid",
+                inputs=[self._resolve_input(logits)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def moe_topk(
@@ -972,12 +1064,14 @@ class GraphBuilder:
         inputs = [self._resolve_input(probs)]
         if correction_bias is not None:
             inputs.append(self._resolve_input(correction_bias))
-        self._add_node(GraphNode(
-            op="moe_topk",
-            inputs=inputs,
-            outputs=[weights, indices],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_topk",
+                inputs=inputs,
+                outputs=[weights, indices],
+                attrs=attrs,
+            )
+        )
         return self._make_outputs([weights, indices])
 
     def moe_permute(
@@ -992,12 +1086,14 @@ class GraphBuilder:
         """MoE input permutation. Returns (permuted_input, scatter_indices)."""
         permuted = out_name or self._fresh_name("moe_permuted")
         scatter_indices = scatter_name or self._fresh_name("moe_scatter_indices")
-        self._add_node(GraphNode(
-            op="moe_permute",
-            inputs=[self._resolve_input(x), self._resolve_input(indices)],
-            outputs=[permuted, scatter_indices],
-            attrs={"top_k": top_k},
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_permute",
+                inputs=[self._resolve_input(x), self._resolve_input(indices)],
+                outputs=[permuted, scatter_indices],
+                attrs={"top_k": top_k},
+            )
+        )
         return self._make_outputs([permuted, scatter_indices])
 
     def moe_unpermute(
@@ -1011,16 +1107,18 @@ class GraphBuilder:
     ) -> GraphRef:
         """MoE output unpermutation and combination."""
         out = out_name or self._fresh_name("moe_combined")
-        self._add_node(GraphNode(
-            op="moe_unpermute",
-            inputs=[
-                self._resolve_input(x),
-                self._resolve_input(weights),
-                self._resolve_input(indices),
-            ],
-            outputs=[out],
-            attrs={"top_k": top_k},
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_unpermute",
+                inputs=[
+                    self._resolve_input(x),
+                    self._resolve_input(weights),
+                    self._resolve_input(indices),
+                ],
+                outputs=[out],
+                attrs={"top_k": top_k},
+            )
+        )
         return self._make_output(out)
 
     def moe_grouped_gemm(
@@ -1031,15 +1129,17 @@ class GraphBuilder:
     ) -> GraphRef:
         """MoE grouped GEMM."""
         out = self._fresh_name("moe_gemm")
-        self._add_node(GraphNode(
-            op="moe_grouped_gemm",
-            inputs=[
-                self._resolve_input(x),
-                self._resolve_input(weights),
-                self._resolve_input(offsets),
-            ],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_grouped_gemm",
+                inputs=[
+                    self._resolve_input(x),
+                    self._resolve_input(weights),
+                    self._resolve_input(offsets),
+                ],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def moe_grouped_gemm_gate_up(
@@ -1065,16 +1165,18 @@ class GraphBuilder:
         if gate_up_interleaved is not None:
             attrs["gate_up_interleaved"] = gate_up_interleaved
 
-        self._add_node(GraphNode(
-            op="moe_grouped_gemm_gate_up",
-            inputs=[
-                self._resolve_input(x),
-                weights,  # Parameter name, not resolved
-                self._resolve_input(scatter_indices),
-            ],
-            outputs=[out],
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_grouped_gemm_gate_up",
+                inputs=[
+                    self._resolve_input(x),
+                    weights,  # Parameter name, not resolved
+                    self._resolve_input(scatter_indices),
+                ],
+                outputs=[out],
+                attrs=attrs,
+            )
+        )
         return self._make_output(out)
 
     def moe_grouped_gemm_down(
@@ -1095,15 +1197,17 @@ class GraphBuilder:
             Output tensor (total_tokens, hidden_size)
         """
         out = out_name or self._fresh_name("moe_down")
-        self._add_node(GraphNode(
-            op="moe_grouped_gemm_down",
-            inputs=[
-                self._resolve_input(x),
-                weights,  # Parameter name, not resolved
-                self._resolve_input(scatter_indices),
-            ],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_grouped_gemm_down",
+                inputs=[
+                    self._resolve_input(x),
+                    weights,  # Parameter name, not resolved
+                    self._resolve_input(scatter_indices),
+                ],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def gpt_oss_moe_act(
@@ -1116,12 +1220,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """GPT-OSS gated activation (interleaved gate/up)."""
         out = out_name or self._fresh_name("gpt_oss_act")
-        self._add_node(GraphNode(
-            op="gpt_oss_moe_act",
-            inputs=[self._resolve_input(x)],
-            outputs=[out],
-            attrs={"alpha": alpha, "limit": limit},
-        ))
+        self._add_node(
+            GraphNode(
+                op="gpt_oss_moe_act",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+                attrs={"alpha": alpha, "limit": limit},
+            )
+        )
         return self._make_output(out)
 
     def moe_expert_bias_add(
@@ -1133,11 +1239,13 @@ class GraphBuilder:
     ) -> GraphRef:
         """Add per-expert bias to permuted MoE activations."""
         out = out_name or self._fresh_name("moe_bias")
-        self._add_node(GraphNode(
-            op="moe_expert_bias_add",
-            inputs=[self._resolve_input(x), self._resolve_input(bias)],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="moe_expert_bias_add",
+                inputs=[self._resolve_input(x), self._resolve_input(bias)],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -1162,16 +1270,18 @@ class GraphBuilder:
         """
         recv = out_name or self._fresh_name("ep_recv")
         recv_scatter = recv_scatter_name or self._fresh_name("ep_recv_scatter")
-        self._add_node(GraphNode(
-            op="ep_dispatch",
-            inputs=[
-                self._resolve_input(permuted_input),
-                self._resolve_input(routing_indices),
-                self._resolve_input(scatter_indices),
-            ],
-            outputs=[recv, recv_scatter],
-            attrs={"num_experts": num_experts, "ep_size": ep_size, "top_k": top_k},
-        ))
+        self._add_node(
+            GraphNode(
+                op="ep_dispatch",
+                inputs=[
+                    self._resolve_input(permuted_input),
+                    self._resolve_input(routing_indices),
+                    self._resolve_input(scatter_indices),
+                ],
+                outputs=[recv, recv_scatter],
+                attrs={"num_experts": num_experts, "ep_size": ep_size, "top_k": top_k},
+            )
+        )
         return self._make_outputs([recv, recv_scatter])
 
     def ep_combine(
@@ -1185,12 +1295,14 @@ class GraphBuilder:
     ) -> GraphRef:
         """EP combine: reverse all-to-all to collect expert outputs."""
         out = out_name or self._fresh_name("ep_combined")
-        self._add_node(GraphNode(
-            op="ep_combine",
-            inputs=[self._resolve_input(expert_output)],
-            outputs=[out],
-            attrs={"num_experts": num_experts, "ep_size": ep_size, "top_k": top_k},
-        ))
+        self._add_node(
+            GraphNode(
+                op="ep_combine",
+                inputs=[self._resolve_input(expert_output)],
+                outputs=[out],
+                attrs={"num_experts": num_experts, "ep_size": ep_size, "top_k": top_k},
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -1221,12 +1333,14 @@ class GraphBuilder:
         inputs = [self._resolve_input(x), self._resolve_input(weight)]
         if bias is not None:
             inputs.append(self._resolve_input(bias))
-        self._add_node(GraphNode(
-            op="mamba_conv1d",
-            inputs=inputs,
-            outputs=[out],
-            attrs={"activation": activation},
-        ))
+        self._add_node(
+            GraphNode(
+                op="mamba_conv1d",
+                inputs=inputs,
+                outputs=[out],
+                attrs={"activation": activation},
+            )
+        )
         return self._make_output(out)
 
     def mamba_ssm_scan(
@@ -1283,22 +1397,24 @@ class GraphBuilder:
         ]
         if dt_bias is not None:
             inputs.append(self._resolve_input(dt_bias))
-        self._add_node(GraphNode(
-            op="mamba_ssm_scan",
-            inputs=inputs,
-            outputs=[out, state],
-            attrs={
-                "dt_softplus": dt_softplus,
-                "dt_min": dt_min,
-                "dt_max": dt_max,
-                "chunk_size": chunk_size,
-                "num_heads": num_heads,
-                "head_dim": head_dim,
-                "ssm_state_size": ssm_state_size,
-                "n_groups": n_groups,
-                "intermediate_size": num_heads * head_dim,
-            },
-        ))
+        self._add_node(
+            GraphNode(
+                op="mamba_ssm_scan",
+                inputs=inputs,
+                outputs=[out, state],
+                attrs={
+                    "dt_softplus": dt_softplus,
+                    "dt_min": dt_min,
+                    "dt_max": dt_max,
+                    "chunk_size": chunk_size,
+                    "num_heads": num_heads,
+                    "head_dim": head_dim,
+                    "ssm_state_size": ssm_state_size,
+                    "n_groups": n_groups,
+                    "intermediate_size": num_heads * head_dim,
+                },
+            )
+        )
         return self._make_outputs([out, state])
 
     def mamba_gated_rmsnorm(
@@ -1326,20 +1442,22 @@ class GraphBuilder:
             Gated normalized output
         """
         out = out_name or self._fresh_name("gated_norm")
-        self._add_node(GraphNode(
-            op="mamba_gated_rmsnorm",
-            inputs=[
-                self._resolve_input(x),
-                self._resolve_input(gate),
-                self._resolve_input(weight),
-            ],
-            outputs=[out],
-            attrs={
-                "eps": eps,
-                "n_groups": n_groups,
-                "norm_before_gate": norm_before_gate,
-            },
-        ))
+        self._add_node(
+            GraphNode(
+                op="mamba_gated_rmsnorm",
+                inputs=[
+                    self._resolve_input(x),
+                    self._resolve_input(gate),
+                    self._resolve_input(weight),
+                ],
+                outputs=[out],
+                attrs={
+                    "eps": eps,
+                    "n_groups": n_groups,
+                    "norm_before_gate": norm_before_gate,
+                },
+            )
+        )
         return self._make_output(out)
 
     def qwen3_5_decay(
@@ -1352,15 +1470,17 @@ class GraphBuilder:
     ) -> GraphRef:
         """Qwen3.5 decay: -exp(A_log) * softplus(a + dt_bias)."""
         out = out_name or self._fresh_name("qwen_decay")
-        self._add_node(GraphNode(
-            op="qwen3_5_decay",
-            inputs=[
-                self._resolve_input(a),
-                self._resolve_input(a_log),
-                self._resolve_input(dt_bias),
-            ],
-            outputs=[out],
-        ))
+        self._add_node(
+            GraphNode(
+                op="qwen3_5_decay",
+                inputs=[
+                    self._resolve_input(a),
+                    self._resolve_input(a_log),
+                    self._resolve_input(dt_bias),
+                ],
+                outputs=[out],
+            )
+        )
         return self._make_output(out)
 
     def mamba_split_proj(
@@ -1390,17 +1510,19 @@ class GraphBuilder:
         gate = gate_name or self._fresh_name("gate")
         conv_input = conv_input_name or self._fresh_name("conv_input")
         dt = dt_name or self._fresh_name("dt")
-        self._add_node(GraphNode(
-            op="mamba_split_proj",
-            inputs=[self._resolve_input(projected)],
-            outputs=[gate, conv_input, dt],
-            attrs={
-                "intermediate_size": intermediate_size,
-                "conv_dim": conv_dim,
-                "num_heads": num_heads,
-                "head_dim": head_dim,
-            },
-        ))
+        self._add_node(
+            GraphNode(
+                op="mamba_split_proj",
+                inputs=[self._resolve_input(projected)],
+                outputs=[gate, conv_input, dt],
+                attrs={
+                    "intermediate_size": intermediate_size,
+                    "conv_dim": conv_dim,
+                    "num_heads": num_heads,
+                    "head_dim": head_dim,
+                },
+            )
+        )
         return self._make_outputs([gate, conv_input, dt])
 
     def mamba_split_conv_out(
@@ -1430,17 +1552,19 @@ class GraphBuilder:
         hidden = hidden_name or self._fresh_name("hidden")
         B_out = B_name or self._fresh_name("ssm_B")
         C_out = C_name or self._fresh_name("ssm_C")
-        self._add_node(GraphNode(
-            op="mamba_split_conv_out",
-            inputs=[self._resolve_input(conv_out)],
-            outputs=[hidden, B_out, C_out],
-            attrs={
-                "intermediate_size": intermediate_size,
-                "groups_state_size": groups_state_size,
-                "n_groups": n_groups,
-                "ssm_state_size": ssm_state_size,
-            },
-        ))
+        self._add_node(
+            GraphNode(
+                op="mamba_split_conv_out",
+                inputs=[self._resolve_input(conv_out)],
+                outputs=[hidden, B_out, C_out],
+                attrs={
+                    "intermediate_size": intermediate_size,
+                    "groups_state_size": groups_state_size,
+                    "n_groups": n_groups,
+                    "ssm_state_size": ssm_state_size,
+                },
+            )
+        )
         return self._make_outputs([hidden, B_out, C_out])
 
     def mamba_combine_scan(
@@ -1477,33 +1601,37 @@ class GraphBuilder:
             inputs.append(self._resolve_input(conv_bias))
         else:
             inputs.append("")  # Placeholder for optional bias
-        inputs.extend([
-            self._resolve_input(dt_bias),
-            self._resolve_input(A_log),
-            self._resolve_input(D),
-            self._resolve_input(norm_weight),
-            self._resolve_input(out_proj_weight),
-        ])
+        inputs.extend(
+            [
+                self._resolve_input(dt_bias),
+                self._resolve_input(A_log),
+                self._resolve_input(D),
+                self._resolve_input(norm_weight),
+                self._resolve_input(out_proj_weight),
+            ]
+        )
         if out_proj_bias is not None:
             inputs.append(self._resolve_input(out_proj_bias))
 
-        self._add_node(GraphNode(
-            op="mamba_combine_scan",
-            inputs=inputs,
-            outputs=[out],
-            attrs={
-                "chunk_size": chunk_size,
-                "num_heads": num_heads,
-                "head_dim": head_dim,
-                "n_groups": n_groups,
-                "intermediate_size": intermediate_size,
-                "ssm_state_size": ssm_state_size,
-                "eps": eps,
-                "activation": activation,
-                "dt_min": dt_min,
-                "dt_max": dt_max,
-            },
-        ))
+        self._add_node(
+            GraphNode(
+                op="mamba_combine_scan",
+                inputs=inputs,
+                outputs=[out],
+                attrs={
+                    "chunk_size": chunk_size,
+                    "num_heads": num_heads,
+                    "head_dim": head_dim,
+                    "n_groups": n_groups,
+                    "intermediate_size": intermediate_size,
+                    "ssm_state_size": ssm_state_size,
+                    "eps": eps,
+                    "activation": activation,
+                    "dt_min": dt_min,
+                    "dt_max": dt_max,
+                },
+            )
+        )
         return self._make_output(out)
 
     # =========================================================================
@@ -1519,12 +1647,14 @@ class GraphBuilder:
     ) -> GraphRef | tuple[GraphRef, ...]:
         """Call a custom/user-defined operation."""
         outputs = [self._fresh_name(op_name) for _ in range(num_outputs)]
-        self._add_node(GraphNode(
-            op=op_name,
-            inputs=[self._resolve_input(i) for i in inputs],
-            outputs=outputs,
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op=op_name,
+                inputs=[self._resolve_input(i) for i in inputs],
+                outputs=outputs,
+                attrs=attrs,
+            )
+        )
         if num_outputs == 1:
             return self._make_output(outputs[0])
         return self._make_outputs(outputs)
@@ -1546,12 +1676,14 @@ class GraphBuilder:
         # Set _kernel_type to "custom" for module calls
         attrs = dict(kwargs)
         attrs["_kernel_type"] = "custom"
-        self._add_node(GraphNode(
-            op=module_name,  # Use module name directly, not "call:module_name"
-            inputs=[self._resolve_input(i) for i in inputs],
-            outputs=outputs,
-            attrs=attrs,
-        ))
+        self._add_node(
+            GraphNode(
+                op=module_name,  # Use module name directly, not "call:module_name"
+                inputs=[self._resolve_input(i) for i in inputs],
+                outputs=outputs,
+                attrs=attrs,
+            )
+        )
         if num_outputs == 1:
             return self._make_output(outputs[0])
         return self._make_outputs(outputs)

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-
 #ifndef SUROGATE_SRC_UTILS_TENSOR_CONTAINER_H
 #define SUROGATE_SRC_UTILS_TENSOR_CONTAINER_H
 
@@ -15,11 +14,11 @@
 class TensorShard;
 
 class ITensorContainer {
-  public:
+public:
     virtual void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) = 0;
 
-  protected:
+protected:
     ~ITensorContainer() = default;
 };
 
-#endif //SUROGATE_SRC_UTILS_TENSOR_CONTAINER_H
+#endif  //SUROGATE_SRC_UTILS_TENSOR_CONTAINER_H

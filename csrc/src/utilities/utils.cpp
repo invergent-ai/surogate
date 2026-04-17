@@ -30,7 +30,8 @@
  */
 void cuda_throw_on_error(cudaError_t status, const char* statement, const char* file, int line) {
     if (status != cudaSuccess) {
-        std::string msg = std::string("Cuda Error in ") + file + ":" + std::to_string(line) + " (" + std::string(statement) + "): " + cudaGetErrorName(status) + ": ";
+        std::string msg = std::string("Cuda Error in ") + file + ":" + std::to_string(line) + " (" +
+                          std::string(statement) + "): " + cudaGetErrorName(status) + ": ";
         msg += cudaGetErrorString(status);
         msg += "\n\nStack trace:\n" + surogate::capture_stacktrace(2);
         // make sure we have a clean cuda error state before launching the exception
@@ -43,24 +44,24 @@ void cuda_throw_on_error(cudaError_t status, const char* statement, const char* 
 
 static const char* cublas_get_error_name(cublasStatus_t status) {
     switch (status) {
-        case CUBLAS_STATUS_SUCCESS:          return "CUBLAS_STATUS_SUCCESS";
-        case CUBLAS_STATUS_NOT_INITIALIZED:  return "CUBLAS_STATUS_NOT_INITIALIZED";
-        case CUBLAS_STATUS_ALLOC_FAILED:     return "CUBLAS_STATUS_ALLOC_FAILED";
-        case CUBLAS_STATUS_INVALID_VALUE:    return "CUBLAS_STATUS_INVALID_VALUE";
-        case CUBLAS_STATUS_ARCH_MISMATCH:    return "CUBLAS_STATUS_ARCH_MISMATCH";
-        case CUBLAS_STATUS_MAPPING_ERROR:    return "CUBLAS_STATUS_MAPPING_ERROR";
+        case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
         case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
-        case CUBLAS_STATUS_INTERNAL_ERROR:   return "CUBLAS_STATUS_INTERNAL_ERROR";
-        case CUBLAS_STATUS_NOT_SUPPORTED:    return "CUBLAS_STATUS_NOT_SUPPORTED";
-        case CUBLAS_STATUS_LICENSE_ERROR:    return "CUBLAS_STATUS_LICENSE_ERROR";
-        default:                             return "CUBLAS_STATUS_UNKNOWN";
+        case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
+        case CUBLAS_STATUS_LICENSE_ERROR: return "CUBLAS_STATUS_LICENSE_ERROR";
+        default: return "CUBLAS_STATUS_UNKNOWN";
     }
 }
 
 void cublas_throw_on_error(cublasStatus_t status, const char* statement, const char* file, int line) {
     if (status != CUBLAS_STATUS_SUCCESS) {
-        std::string msg = std::string("cuBLAS Error in ") + file + ":" + std::to_string(line) +
-                          " (" + std::string(statement) + "): " + cublas_get_error_name(status);
+        std::string msg = std::string("cuBLAS Error in ") + file + ":" + std::to_string(line) + " (" +
+                          std::string(statement) + "): " + cublas_get_error_name(status);
         msg += "\n\nStack trace:\n" + surogate::capture_stacktrace(2);
         throw std::runtime_error(msg);
     }
@@ -75,7 +76,9 @@ void cublas_throw_on_error(cublasStatus_t status, const char* statement, const c
  *
  * @note This constructor is noexcept; it assumes nvtxRangePush does not throw.
  */
-NvtxRange::NvtxRange(const char* s) noexcept { nvtxRangePush(s); }
+NvtxRange::NvtxRange(const char* s) noexcept {
+    nvtxRangePush(s);
+}
 
 /**
  * @brief Begins an NVTX range labeled as "<base_str> <number>".
@@ -98,7 +101,9 @@ NvtxRange::NvtxRange(const std::string& base_str, int number) {
  *
  * @note This destructor is noexcept; it assumes nvtxRangePop does not throw.
  */
-NvtxRange::~NvtxRange() noexcept { nvtxRangePop(); }
+NvtxRange::~NvtxRange() noexcept {
+    nvtxRangePop();
+}
 
 /**
  * @brief Creates a CUDA stream and assigns it an NVTX name.
@@ -151,9 +156,8 @@ cudaEvent_t create_named_event(const char* name, bool timing) {
  *       case-insensitive comparisons on typical ASCII identifiers.
  */
 bool iequals(std::string_view lhs, std::string_view rhs) {
-    return std::ranges::equal(
-        lhs, rhs, [](unsigned char a, unsigned char b) {
-            return std::tolower(a) == std::tolower(b);
+    return std::ranges::equal(lhs, rhs, [](unsigned char a, unsigned char b) {
+        return std::tolower(a) == std::tolower(b);
     });
 }
 
@@ -176,13 +180,16 @@ void show_progress_bar(int current, int total, const std::string& label) {
 
     std::cerr << "\r" << label << ": [";
     for (int i = 0; i < bar_width; ++i) {
-        if (i < pos) std::cerr << "=";
-        else if (i == pos) std::cerr << ">";
-        else std::cerr << " ";
+        if (i < pos)
+            std::cerr << "=";
+        else if (i == pos)
+            std::cerr << ">";
+        else
+            std::cerr << " ";
     }
-    std::cerr << "] " << static_cast<int>(progress * 100.0) << "% (" 
-              << (current + 1) << "/" << total << ")" << std::flush;
-    
+    std::cerr << "] " << static_cast<int>(progress * 100.0) << "% (" << (current + 1) << "/" << total << ")"
+              << std::flush;
+
     if (current + 1 == total) {
         std::cerr << std::endl;
     }

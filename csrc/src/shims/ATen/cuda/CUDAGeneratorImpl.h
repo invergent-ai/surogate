@@ -19,7 +19,8 @@ namespace philox {
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline std::pair<uint64_t, uint64_t> unpack(const PhiloxCudaState& s) {
+    inline std::pair<uint64_t, uint64_t>
+    unpack(const PhiloxCudaState& s) {
     return {s.seed_, s.offset_};
 }
 

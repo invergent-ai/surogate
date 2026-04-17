@@ -47,9 +47,9 @@ using ForwardHook = std::function<void(int layer_idx, cudaStream_t stream, Forwa
  * where per-expert LoRA can be applied.
  */
 enum class MoEExpertHookPoint {
-    AfterExpertUpProjection,   ///< After expert gate_up matmul, before SwiGLU
-    AfterExpertDownProjection, ///< After expert down matmul
-    ManualGroup,               ///< Manual expert group execution (fused)
+    AfterExpertUpProjection,    ///< After expert gate_up matmul, before SwiGLU
+    AfterExpertDownProjection,  ///< After expert down matmul
+    ManualGroup,                ///< Manual expert group execution (fused)
 };
 
 constexpr const char* hook_point_name(MoEExpertHookPoint point) {
@@ -71,9 +71,9 @@ constexpr const char* hook_point_name(MoEExpertHookPoint point) {
  * @param stream CUDA stream
  * @param context Opaque context (MoEGroupedContext* for ManualGroup)
  */
-using MoEExpertHook = std::function<void(int layer_idx, int expert_idx, MoEExpertHookPoint point, cudaStream_t stream, void* context)>;
+using MoEExpertHook =
+    std::function<void(int layer_idx, int expert_idx, MoEExpertHookPoint point, cudaStream_t stream, void* context)>;
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_FORWARD_HOOKS_H
-
+#endif  // SUROGATE_SRC_MODULES_FORWARD_HOOKS_H

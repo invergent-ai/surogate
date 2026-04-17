@@ -30,21 +30,69 @@
  *
  * @throws std::logic_error If the output tensor data type is not supported (neither BF16 nor FP32).
  */
-void rmsnorm_forward(Tensor& out, Tensor& rms, const Tensor& inp, const Tensor& weight, float* abs_max_ptr, float epsilon, int B, int T, int C, cudaStream_t stream) {
-    if(out.DType == ETensorDType::BF16) {
-        rmsnorm_forward(out.get<nv_bfloat16>(), rms.get<float>(), inp.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), abs_max_ptr, epsilon, B, T, C, stream);
+void rmsnorm_forward(Tensor& out,
+                     Tensor& rms,
+                     const Tensor& inp,
+                     const Tensor& weight,
+                     float* abs_max_ptr,
+                     float epsilon,
+                     int B,
+                     int T,
+                     int C,
+                     cudaStream_t stream) {
+    if (out.DType == ETensorDType::BF16) {
+        rmsnorm_forward(out.get<nv_bfloat16>(),
+                        rms.get<float>(),
+                        inp.get<nv_bfloat16>(),
+                        weight.get<nv_bfloat16>(),
+                        abs_max_ptr,
+                        epsilon,
+                        B,
+                        T,
+                        C,
+                        stream);
     } else if (out.DType == ETensorDType::FP32) {
-        rmsnorm_forward(out.get<float>(), rms.get<float>(), inp.get<float>(), weight.get<float>(), abs_max_ptr, epsilon, B, T, C, stream);
+        rmsnorm_forward(out.get<float>(),
+                        rms.get<float>(),
+                        inp.get<float>(),
+                        weight.get<float>(),
+                        abs_max_ptr,
+                        epsilon,
+                        B,
+                        T,
+                        C,
+                        stream);
     } else {
         throw std::logic_error("rmsnorm_forward: unsupported dtype");
     }
 }
 
-void rmsnorm_apply_saved(Tensor& out, const Tensor& inp, const Tensor& weight, const Tensor& rstd, int B, int T, int C, cudaStream_t stream) {
-    if(out.DType == ETensorDType::BF16) {
-        rmsnorm_apply_saved(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(), B, T, C, stream);
+void rmsnorm_apply_saved(Tensor& out,
+                         const Tensor& inp,
+                         const Tensor& weight,
+                         const Tensor& rstd,
+                         int B,
+                         int T,
+                         int C,
+                         cudaStream_t stream) {
+    if (out.DType == ETensorDType::BF16) {
+        rmsnorm_apply_saved(out.get<nv_bfloat16>(),
+                            inp.get<nv_bfloat16>(),
+                            weight.get<nv_bfloat16>(),
+                            rstd.get<float>(),
+                            B,
+                            T,
+                            C,
+                            stream);
     } else if (out.DType == ETensorDType::FP32) {
-        rmsnorm_apply_saved(out.get<float>(), inp.get<float>(), weight.get<float>(), rstd.get<float>(), B, T, C, stream);
+        rmsnorm_apply_saved(out.get<float>(),
+                            inp.get<float>(),
+                            weight.get<float>(),
+                            rstd.get<float>(),
+                            B,
+                            T,
+                            C,
+                            stream);
     } else {
         throw std::logic_error("rmsnorm_apply_saved: unsupported dtype");
     }
@@ -81,14 +129,53 @@ void rmsnorm_apply_saved(Tensor& out, const Tensor& inp, const Tensor& weight, c
  *
  * @throws std::logic_error If the data type of `dinp` is not ETensorDType::BF16 or ETensorDType::FP32.
  */
-void rmsnorm_backward(Tensor& dinp, Tensor& dweight, Tensor& scratch, const Tensor& dresidual, const Tensor& dout, const Tensor& inp, const Tensor& weight, const Tensor& rstd, float* abs_max_ptr,
-                      int B, int T, int C, const cudaDeviceProp& dp, cudaStream_t stream, bool skip_weight_grad) {
-    if(dinp.DType == ETensorDType::BF16) {
-        rmsnorm_backward(dinp.get<nv_bfloat16>(), dweight.get<nv_bfloat16>(), scratch.Data, dresidual.get<nv_bfloat16>(),
-            dout.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(), abs_max_ptr, B, T, C, dp, stream, skip_weight_grad);
+void rmsnorm_backward(Tensor& dinp,
+                      Tensor& dweight,
+                      Tensor& scratch,
+                      const Tensor& dresidual,
+                      const Tensor& dout,
+                      const Tensor& inp,
+                      const Tensor& weight,
+                      const Tensor& rstd,
+                      float* abs_max_ptr,
+                      int B,
+                      int T,
+                      int C,
+                      const cudaDeviceProp& dp,
+                      cudaStream_t stream,
+                      bool skip_weight_grad) {
+    if (dinp.DType == ETensorDType::BF16) {
+        rmsnorm_backward(dinp.get<nv_bfloat16>(),
+                         dweight.get<nv_bfloat16>(),
+                         scratch.Data,
+                         dresidual.get<nv_bfloat16>(),
+                         dout.get<nv_bfloat16>(),
+                         inp.get<nv_bfloat16>(),
+                         weight.get<nv_bfloat16>(),
+                         rstd.get<float>(),
+                         abs_max_ptr,
+                         B,
+                         T,
+                         C,
+                         dp,
+                         stream,
+                         skip_weight_grad);
     } else if (dinp.DType == ETensorDType::FP32) {
-        rmsnorm_backward(dinp.get<float>(), dweight.get<float>(), scratch.Data, dresidual.get<float>(),
-            dout.get<float>(), inp.get<float>(), weight.get<float>(), rstd.get<float>(), abs_max_ptr, B, T, C, dp, stream, skip_weight_grad);
+        rmsnorm_backward(dinp.get<float>(),
+                         dweight.get<float>(),
+                         scratch.Data,
+                         dresidual.get<float>(),
+                         dout.get<float>(),
+                         inp.get<float>(),
+                         weight.get<float>(),
+                         rstd.get<float>(),
+                         abs_max_ptr,
+                         B,
+                         T,
+                         C,
+                         dp,
+                         stream,
+                         skip_weight_grad);
     } else {
         throw std::logic_error("rmsnorm_backward: unsupported dtype");
     }
@@ -121,30 +208,75 @@ void rmsnorm_backward(Tensor& dinp, Tensor& dweight, Tensor& scratch, const Tens
  *
  * @throws std::logic_error If the tensor data type is not supported (currently supports BF16 and FP32).
  */
-void fused_residual_rmsnorm_forward(Tensor& residual, Tensor& normed, Tensor& rrms, const Tensor& inp1, const Tensor& inp2, const Tensor& weight, float* abs_max_ptr,
-                                    float epsilon, int N, int C, cudaStream_t stream)
-{
-    if(residual.DType == ETensorDType::BF16) {
-        fused_residual_rmsnorm_forward(residual.get<nv_bfloat16>(), normed.get<nv_bfloat16>(), rrms.get<float>(),
-            inp1.get<nv_bfloat16>(), inp2.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), abs_max_ptr, epsilon, N, C, stream);
+void fused_residual_rmsnorm_forward(Tensor& residual,
+                                    Tensor& normed,
+                                    Tensor& rrms,
+                                    const Tensor& inp1,
+                                    const Tensor& inp2,
+                                    const Tensor& weight,
+                                    float* abs_max_ptr,
+                                    float epsilon,
+                                    int N,
+                                    int C,
+                                    cudaStream_t stream) {
+    if (residual.DType == ETensorDType::BF16) {
+        fused_residual_rmsnorm_forward(residual.get<nv_bfloat16>(),
+                                       normed.get<nv_bfloat16>(),
+                                       rrms.get<float>(),
+                                       inp1.get<nv_bfloat16>(),
+                                       inp2.get<nv_bfloat16>(),
+                                       weight.get<nv_bfloat16>(),
+                                       abs_max_ptr,
+                                       epsilon,
+                                       N,
+                                       C,
+                                       stream);
     } else if (residual.DType == ETensorDType::FP32) {
-        fused_residual_rmsnorm_forward(residual.get<float>(), normed.get<float>(), rrms.get<float>(),
-            inp1.get<float>(), inp2.get<float>(), weight.get<float>(), abs_max_ptr, epsilon, N, C, stream);
+        fused_residual_rmsnorm_forward(residual.get<float>(),
+                                       normed.get<float>(),
+                                       rrms.get<float>(),
+                                       inp1.get<float>(),
+                                       inp2.get<float>(),
+                                       weight.get<float>(),
+                                       abs_max_ptr,
+                                       epsilon,
+                                       N,
+                                       C,
+                                       stream);
     } else {
         throw std::logic_error("fused_residual_rmsnorm_forward: unsupported dtype");
     }
 }
 
-void fused_residual_rmsnorm_apply_saved(Tensor& residual, Tensor& normed,
-                                        const Tensor& inp1, const Tensor& inp2,
-                                        const Tensor& weight, const Tensor& rstd,
-                                        int N, int C, cudaStream_t stream) {
-    if(residual.DType == ETensorDType::BF16) {
-        fused_residual_rmsnorm_apply_saved(residual.get<nv_bfloat16>(), normed.get<nv_bfloat16>(),
-            inp1.get<nv_bfloat16>(), inp2.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), rstd.get<float>(), N, C, stream);
+void fused_residual_rmsnorm_apply_saved(Tensor& residual,
+                                        Tensor& normed,
+                                        const Tensor& inp1,
+                                        const Tensor& inp2,
+                                        const Tensor& weight,
+                                        const Tensor& rstd,
+                                        int N,
+                                        int C,
+                                        cudaStream_t stream) {
+    if (residual.DType == ETensorDType::BF16) {
+        fused_residual_rmsnorm_apply_saved(residual.get<nv_bfloat16>(),
+                                           normed.get<nv_bfloat16>(),
+                                           inp1.get<nv_bfloat16>(),
+                                           inp2.get<nv_bfloat16>(),
+                                           weight.get<nv_bfloat16>(),
+                                           rstd.get<float>(),
+                                           N,
+                                           C,
+                                           stream);
     } else if (residual.DType == ETensorDType::FP32) {
-        fused_residual_rmsnorm_apply_saved(residual.get<float>(), normed.get<float>(),
-            inp1.get<float>(), inp2.get<float>(), weight.get<float>(), rstd.get<float>(), N, C, stream);
+        fused_residual_rmsnorm_apply_saved(residual.get<float>(),
+                                           normed.get<float>(),
+                                           inp1.get<float>(),
+                                           inp2.get<float>(),
+                                           weight.get<float>(),
+                                           rstd.get<float>(),
+                                           N,
+                                           C,
+                                           stream);
     } else {
         throw std::logic_error("fused_residual_rmsnorm_apply_saved: unsupported dtype");
     }
@@ -174,7 +306,7 @@ void fused_residual_rmsnorm_apply_saved(Tensor& residual, Tensor& normed,
  * @throws std::logic_error If the output tensor data type is not supported (neither FP32 nor BF16).
  */
 void swiglu_forward(Tensor& out, const Tensor& inp, float* abs_max_ptr, int B, int T, int C, cudaStream_t stream) {
-    if(out.DType == ETensorDType::FP32) {
+    if (out.DType == ETensorDType::FP32) {
         swiglu_forward(out.get<float>(), inp.get<float>(), abs_max_ptr, B, T, C, stream);
     } else if (out.DType == ETensorDType::BF16) {
         swiglu_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), abs_max_ptr, B, T, C, stream);
@@ -207,8 +339,15 @@ void swiglu_forward(Tensor& out, const Tensor& inp, float* abs_max_ptr, int B, i
  *
  * @throws std::logic_error If the input/output tensor data types are not supported (currently requires out=FP8_E4M3 and inp=BF16).
  */
-void swiglu_forward_quant(Tensor& out, float* scale_ptr, const Tensor& inp, const float* abs_max_ptr, int B, int T, int C, cudaStream_t stream) {
-    if(out.DType == ETensorDType::FP8_E4M3 && inp.DType == ETensorDType::BF16) {
+void swiglu_forward_quant(Tensor& out,
+                          float* scale_ptr,
+                          const Tensor& inp,
+                          const float* abs_max_ptr,
+                          int B,
+                          int T,
+                          int C,
+                          cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP8_E4M3 && inp.DType == ETensorDType::BF16) {
         swiglu_forward_quant(out.get<__nv_fp8_e4m3>(), scale_ptr, inp.get<nv_bfloat16>(), abs_max_ptr, B, T, C, stream);
     } else {
         throw std::logic_error("swiglu_forward_quant: unsupported dtype");
@@ -237,11 +376,25 @@ void swiglu_forward_quant(Tensor& out, float* scale_ptr, const Tensor& inp, cons
  *
  * @throws std::logic_error If the tensor data type is not supported (i.e., not FP32 or BF16).
  */
-void swiglu_backward(Tensor& dinp, const Tensor& dout, const Tensor& inp, float* abs_max, int B, int T, int C, cudaStream_t stream) {
-    if(dinp.DType == ETensorDType::FP32) {
+void swiglu_backward(Tensor& dinp,
+                     const Tensor& dout,
+                     const Tensor& inp,
+                     float* abs_max,
+                     int B,
+                     int T,
+                     int C,
+                     cudaStream_t stream) {
+    if (dinp.DType == ETensorDType::FP32) {
         swiglu_backward(dinp.get<float>(), dout.get<float>(), inp.get<float>(), abs_max, B, T, C, stream);
     } else if (dinp.DType == ETensorDType::BF16) {
-        swiglu_backward(dinp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), abs_max, B, T, C, stream);
+        swiglu_backward(dinp.get<nv_bfloat16>(),
+                        dout.get<nv_bfloat16>(),
+                        inp.get<nv_bfloat16>(),
+                        abs_max,
+                        B,
+                        T,
+                        C,
+                        stream);
     } else {
         throw std::logic_error("swiglu_backward: unsupported dtype");
     }
@@ -327,11 +480,41 @@ void relu2_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n,
  *
  * @throws std::logic_error If the output tensor data type is not supported (neither FP32 nor BF16).
  */
-void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream)  {
-    if(out.DType == ETensorDType::FP32) {
-        rope_forward(out.get<float>(), in.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream);
-    } else if(out.DType == ETensorDType::BF16) {
-        rope_forward(out.get<nv_bfloat16>(), in.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream);
+void rope_forward(Tensor& out,
+                  const Tensor& in,
+                  const Tensor& freqs_cis,
+                  const int* position_ids,
+                  float* abs_max_ptr,
+                  int B,
+                  int T,
+                  int Nq,
+                  int Nkv,
+                  int head_dim,
+                  cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        rope_forward(out.get<float>(),
+                     in.get<float>(),
+                     freqs_cis.get<float>(),
+                     position_ids,
+                     abs_max_ptr,
+                     B,
+                     T,
+                     Nq,
+                     Nkv,
+                     head_dim,
+                     stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        rope_forward(out.get<nv_bfloat16>(),
+                     in.get<nv_bfloat16>(),
+                     freqs_cis.get<nv_bfloat16>(),
+                     position_ids,
+                     abs_max_ptr,
+                     B,
+                     T,
+                     Nq,
+                     Nkv,
+                     head_dim,
+                     stream);
     } else {
         throw std::logic_error("rope_forward: unsupported dtype");
     }
@@ -361,11 +544,41 @@ void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const 
  *
  * @throws std::logic_error If the data type of `dinp` is not supported (i.e., not FP32 or BF16).
  */
-void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream) {
-    if(dinp.DType == ETensorDType::FP32) {
-        rope_backward(dinp.get<float>(), dout.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream);
-    } else if(dinp.DType == ETensorDType::BF16) {
-        rope_backward(dinp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, stream);
+void rope_backward(Tensor& dinp,
+                   const Tensor& dout,
+                   const Tensor& freqs_cis,
+                   const int* position_ids,
+                   float* abs_max_ptr,
+                   int B,
+                   int T,
+                   int Nq,
+                   int Nkv,
+                   int head_dim,
+                   cudaStream_t stream) {
+    if (dinp.DType == ETensorDType::FP32) {
+        rope_backward(dinp.get<float>(),
+                      dout.get<float>(),
+                      freqs_cis.get<float>(),
+                      position_ids,
+                      abs_max_ptr,
+                      B,
+                      T,
+                      Nq,
+                      Nkv,
+                      head_dim,
+                      stream);
+    } else if (dinp.DType == ETensorDType::BF16) {
+        rope_backward(dinp.get<nv_bfloat16>(),
+                      dout.get<nv_bfloat16>(),
+                      freqs_cis.get<nv_bfloat16>(),
+                      position_ids,
+                      abs_max_ptr,
+                      B,
+                      T,
+                      Nq,
+                      Nkv,
+                      head_dim,
+                      stream);
     } else {
         throw std::logic_error("rope_backward: unsupported dtype");
     }
@@ -390,11 +603,44 @@ void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, co
  * @param rotary_dim Number of dimensions to rotate (must be <= head_dim and even).
  * @param stream The CUDA stream to execute the kernel on.
  */
-void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
-    if(out.DType == ETensorDType::FP32) {
-        rope_forward(out.get<float>(), in.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
-    } else if(out.DType == ETensorDType::BF16) {
-        rope_forward(out.get<nv_bfloat16>(), in.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+void rope_forward(Tensor& out,
+                  const Tensor& in,
+                  const Tensor& freqs_cis,
+                  const int* position_ids,
+                  float* abs_max_ptr,
+                  int B,
+                  int T,
+                  int Nq,
+                  int Nkv,
+                  int head_dim,
+                  int rotary_dim,
+                  cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        rope_forward(out.get<float>(),
+                     in.get<float>(),
+                     freqs_cis.get<float>(),
+                     position_ids,
+                     abs_max_ptr,
+                     B,
+                     T,
+                     Nq,
+                     Nkv,
+                     head_dim,
+                     rotary_dim,
+                     stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        rope_forward(out.get<nv_bfloat16>(),
+                     in.get<nv_bfloat16>(),
+                     freqs_cis.get<nv_bfloat16>(),
+                     position_ids,
+                     abs_max_ptr,
+                     B,
+                     T,
+                     Nq,
+                     Nkv,
+                     head_dim,
+                     rotary_dim,
+                     stream);
     } else {
         throw std::logic_error("rope_forward: unsupported dtype");
     }
@@ -419,11 +665,44 @@ void rope_forward(Tensor& out, const Tensor& in, const Tensor& freqs_cis, const 
  * @param rotary_dim Number of dimensions to rotate (must be <= head_dim and even).
  * @param stream The CUDA stream on which to execute the kernel.
  */
-void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, const int* position_ids, float* abs_max_ptr, int B, int T, int Nq, int Nkv, int head_dim, int rotary_dim, cudaStream_t stream) {
-    if(dinp.DType == ETensorDType::FP32) {
-        rope_backward(dinp.get<float>(), dout.get<float>(), freqs_cis.get<float>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
-    } else if(dinp.DType == ETensorDType::BF16) {
-        rope_backward(dinp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), freqs_cis.get<nv_bfloat16>(), position_ids, abs_max_ptr, B, T, Nq, Nkv, head_dim, rotary_dim, stream);
+void rope_backward(Tensor& dinp,
+                   const Tensor& dout,
+                   const Tensor& freqs_cis,
+                   const int* position_ids,
+                   float* abs_max_ptr,
+                   int B,
+                   int T,
+                   int Nq,
+                   int Nkv,
+                   int head_dim,
+                   int rotary_dim,
+                   cudaStream_t stream) {
+    if (dinp.DType == ETensorDType::FP32) {
+        rope_backward(dinp.get<float>(),
+                      dout.get<float>(),
+                      freqs_cis.get<float>(),
+                      position_ids,
+                      abs_max_ptr,
+                      B,
+                      T,
+                      Nq,
+                      Nkv,
+                      head_dim,
+                      rotary_dim,
+                      stream);
+    } else if (dinp.DType == ETensorDType::BF16) {
+        rope_backward(dinp.get<nv_bfloat16>(),
+                      dout.get<nv_bfloat16>(),
+                      freqs_cis.get<nv_bfloat16>(),
+                      position_ids,
+                      abs_max_ptr,
+                      B,
+                      T,
+                      Nq,
+                      Nkv,
+                      head_dim,
+                      rotary_dim,
+                      stream);
     } else {
         throw std::logic_error("rope_backward: unsupported dtype");
     }
@@ -447,11 +726,41 @@ void rope_backward(Tensor& dinp, const Tensor& dout, const Tensor& freqs_cis, co
  * @param head_dim Dimension of each attention head.
  * @param stream CUDA stream.
  */
-void rope_fused_forward(Tensor& out, const Tensor& inp, const int* position_ids, float* abs_max_ptr, float theta, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream) {
+void rope_fused_forward(Tensor& out,
+                        const Tensor& inp,
+                        const int* position_ids,
+                        float* abs_max_ptr,
+                        float theta,
+                        int B,
+                        int T,
+                        int Nq,
+                        int Nkv,
+                        int head_dim,
+                        cudaStream_t stream) {
     if (out.DType == ETensorDType::FP32) {
-        rope_fused_forward(out.get<float>(), inp.get<float>(), position_ids, abs_max_ptr, theta, B, T, Nq, Nkv, head_dim, stream);
+        rope_fused_forward(out.get<float>(),
+                           inp.get<float>(),
+                           position_ids,
+                           abs_max_ptr,
+                           theta,
+                           B,
+                           T,
+                           Nq,
+                           Nkv,
+                           head_dim,
+                           stream);
     } else if (out.DType == ETensorDType::BF16) {
-        rope_fused_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), position_ids, abs_max_ptr, theta, B, T, Nq, Nkv, head_dim, stream);
+        rope_fused_forward(out.get<nv_bfloat16>(),
+                           inp.get<nv_bfloat16>(),
+                           position_ids,
+                           abs_max_ptr,
+                           theta,
+                           B,
+                           T,
+                           Nq,
+                           Nkv,
+                           head_dim,
+                           stream);
     } else {
         throw std::logic_error("rope_fused_forward: unsupported dtype");
     }
@@ -475,11 +784,41 @@ void rope_fused_forward(Tensor& out, const Tensor& inp, const int* position_ids,
  * @param head_dim Dimension of each attention head.
  * @param stream CUDA stream.
  */
-void rope_fused_backward(Tensor& dinp, const Tensor& dout, const int* position_ids, float* abs_max_ptr, float theta, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream) {
+void rope_fused_backward(Tensor& dinp,
+                         const Tensor& dout,
+                         const int* position_ids,
+                         float* abs_max_ptr,
+                         float theta,
+                         int B,
+                         int T,
+                         int Nq,
+                         int Nkv,
+                         int head_dim,
+                         cudaStream_t stream) {
     if (dinp.DType == ETensorDType::FP32) {
-        rope_fused_backward(dinp.get<float>(), dout.get<float>(), position_ids, abs_max_ptr, theta, B, T, Nq, Nkv, head_dim, stream);
+        rope_fused_backward(dinp.get<float>(),
+                            dout.get<float>(),
+                            position_ids,
+                            abs_max_ptr,
+                            theta,
+                            B,
+                            T,
+                            Nq,
+                            Nkv,
+                            head_dim,
+                            stream);
     } else if (dinp.DType == ETensorDType::BF16) {
-        rope_fused_backward(dinp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), position_ids, abs_max_ptr, theta, B, T, Nq, Nkv, head_dim, stream);
+        rope_fused_backward(dinp.get<nv_bfloat16>(),
+                            dout.get<nv_bfloat16>(),
+                            position_ids,
+                            abs_max_ptr,
+                            theta,
+                            B,
+                            T,
+                            Nq,
+                            Nkv,
+                            head_dim,
+                            stream);
     } else {
         throw std::logic_error("rope_fused_backward: unsupported dtype");
     }
@@ -506,76 +845,174 @@ void rope_fused_backward(Tensor& dinp, const Tensor& dout, const int* position_i
  *
  * @throws std::runtime_error If the `logits` tensor data type is not FP32 or BF16.
  */
-void fused_classifier(Tensor& logits, Tensor& losses,
-                      float dloss, const Tensor& targets, Tensor* valid_token_count,
-                      int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
+void fused_classifier(Tensor& logits,
+                      Tensor& losses,
+                      float dloss,
+                      const Tensor& targets,
+                      Tensor* valid_token_count,
+                      int BT,
+                      int V,
+                      int P,
+                      bool write_dlogits,
+                      cudaStream_t stream) {
     int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
-    if(logits.DType == ETensorDType::FP32) {
-        fused_classifier(logits.get<float>(), losses.get<float>(), dloss, targets.get<int>(), count_ptr, BT, V, P, write_dlogits, stream);
-    } else if(logits.DType == ETensorDType::BF16) {
-        fused_classifier(logits.get<nv_bfloat16>(), losses.get<float>(), dloss, targets.get<int>(), count_ptr, BT, V, P, write_dlogits, stream);
+    if (logits.DType == ETensorDType::FP32) {
+        fused_classifier(logits.get<float>(),
+                         losses.get<float>(),
+                         dloss,
+                         targets.get<int>(),
+                         count_ptr,
+                         BT,
+                         V,
+                         P,
+                         write_dlogits,
+                         stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        fused_classifier(logits.get<nv_bfloat16>(),
+                         losses.get<float>(),
+                         dloss,
+                         targets.get<int>(),
+                         count_ptr,
+                         BT,
+                         V,
+                         P,
+                         write_dlogits,
+                         stream);
     } else {
         throw std::runtime_error("fused_classifier: unsupported dtype");
     }
 }
 
-void fused_classifier(Tensor& logits, Tensor& losses,
-                      float dloss, const Tensor& targets, Tensor* valid_token_count,
+void fused_classifier(Tensor& logits,
+                      Tensor& losses,
+                      float dloss,
+                      const Tensor& targets,
+                      Tensor* valid_token_count,
                       Tensor* correct_count,
-                      int BT, int V, int P, bool write_dlogits, cudaStream_t stream) {
+                      int BT,
+                      int V,
+                      int P,
+                      bool write_dlogits,
+                      cudaStream_t stream) {
     int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
     int* correct_ptr = correct_count ? correct_count->get<int>() : nullptr;
-    if(logits.DType == ETensorDType::FP32) {
-        fused_classifier(logits.get<float>(), losses.get<float>(), dloss, targets.get<int>(), count_ptr, correct_ptr, BT, V, P, write_dlogits, stream);
-    } else if(logits.DType == ETensorDType::BF16) {
-        fused_classifier(logits.get<nv_bfloat16>(), losses.get<float>(), dloss, targets.get<int>(), count_ptr, correct_ptr, BT, V, P, write_dlogits, stream);
+    if (logits.DType == ETensorDType::FP32) {
+        fused_classifier(logits.get<float>(),
+                         losses.get<float>(),
+                         dloss,
+                         targets.get<int>(),
+                         count_ptr,
+                         correct_ptr,
+                         BT,
+                         V,
+                         P,
+                         write_dlogits,
+                         stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        fused_classifier(logits.get<nv_bfloat16>(),
+                         losses.get<float>(),
+                         dloss,
+                         targets.get<int>(),
+                         count_ptr,
+                         correct_ptr,
+                         BT,
+                         V,
+                         P,
+                         write_dlogits,
+                         stream);
     } else {
         throw std::runtime_error("fused_classifier: unsupported dtype");
     }
 }
 
-void fused_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
-                                 const Tensor& targets, Tensor* valid_token_count,
+void fused_cross_entropy_forward(Tensor& logits,
+                                 Tensor& losses,
+                                 Tensor* logsumexp,
+                                 const Tensor& targets,
+                                 Tensor* valid_token_count,
                                  Tensor* correct_count,
-                                 int BT, int V, int P, cudaStream_t stream) {
+                                 int BT,
+                                 int V,
+                                 int P,
+                                 cudaStream_t stream) {
     float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
     int* correct_ptr = correct_count ? correct_count->get<int>() : nullptr;
     if (logits.DType == ETensorDType::FP32) {
-        fused_cross_entropy_forward(logits.get<float>(), losses.get<float>(), lse_ptr,
-                                    targets.get<int>(), count_ptr, correct_ptr,
-                                    BT, V, P, stream);
+        fused_cross_entropy_forward(logits.get<float>(),
+                                    losses.get<float>(),
+                                    lse_ptr,
+                                    targets.get<int>(),
+                                    count_ptr,
+                                    correct_ptr,
+                                    BT,
+                                    V,
+                                    P,
+                                    stream);
     } else if (logits.DType == ETensorDType::BF16) {
-        fused_cross_entropy_forward(logits.get<nv_bfloat16>(), losses.get<float>(), lse_ptr,
-                                    targets.get<int>(), count_ptr, correct_ptr,
-                                    BT, V, P, stream);
+        fused_cross_entropy_forward(logits.get<nv_bfloat16>(),
+                                    losses.get<float>(),
+                                    lse_ptr,
+                                    targets.get<int>(),
+                                    count_ptr,
+                                    correct_ptr,
+                                    BT,
+                                    V,
+                                    P,
+                                    stream);
     } else {
         throw std::runtime_error("fused_cross_entropy_forward: unsupported dtype");
     }
 }
 
-void fused_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
-                                  const Tensor& dloss, const Tensor& targets,
-                                  int BT, int V, int P, cudaStream_t stream) {
+void fused_cross_entropy_backward(Tensor& dlogits,
+                                  const Tensor& logits,
+                                  const Tensor* logsumexp,
+                                  const Tensor& dloss,
+                                  const Tensor& targets,
+                                  int BT,
+                                  int V,
+                                  int P,
+                                  cudaStream_t stream) {
     const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     const float* dloss_ptr = dloss.get<float>();
     if (dlogits.DType == ETensorDType::FP32) {
-        fused_cross_entropy_backward(dlogits.get<float>(), logits.get<float>(), lse_ptr,
-                                     dloss_ptr, targets.get<int>(),
-                                     BT, V, P, stream);
+        fused_cross_entropy_backward(dlogits.get<float>(),
+                                     logits.get<float>(),
+                                     lse_ptr,
+                                     dloss_ptr,
+                                     targets.get<int>(),
+                                     BT,
+                                     V,
+                                     P,
+                                     stream);
     } else if (dlogits.DType == ETensorDType::BF16) {
-        fused_cross_entropy_backward(dlogits.get<nv_bfloat16>(), logits.get<nv_bfloat16>(), lse_ptr,
-                                     dloss_ptr, targets.get<int>(),
-                                     BT, V, P, stream);
+        fused_cross_entropy_backward(dlogits.get<nv_bfloat16>(),
+                                     logits.get<nv_bfloat16>(),
+                                     lse_ptr,
+                                     dloss_ptr,
+                                     targets.get<int>(),
+                                     BT,
+                                     V,
+                                     P,
+                                     stream);
     } else {
         throw std::runtime_error("fused_cross_entropy_backward: unsupported dtype");
     }
 }
 
-void chunked_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsumexp,
-                                   Tensor& chunk_logsumexp, const Tensor& targets,
-                                   Tensor* valid_token_count, Tensor* correct_count,
-                                   int BT, int V, int P, int n_chunks, cudaStream_t stream) {
+void chunked_cross_entropy_forward(Tensor& logits,
+                                   Tensor& losses,
+                                   Tensor* logsumexp,
+                                   Tensor& chunk_logsumexp,
+                                   const Tensor& targets,
+                                   Tensor* valid_token_count,
+                                   Tensor* correct_count,
+                                   int BT,
+                                   int V,
+                                   int P,
+                                   int n_chunks,
+                                   cudaStream_t stream) {
     float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     if (!lse_ptr) {
         throw std::runtime_error("chunked_cross_entropy_forward: logsumexp buffer is required");
@@ -583,43 +1020,82 @@ void chunked_cross_entropy_forward(Tensor& logits, Tensor& losses, Tensor* logsu
     int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
     int* correct_ptr = correct_count ? correct_count->get<int>() : nullptr;
     if (logits.DType == ETensorDType::FP32) {
-        chunked_cross_entropy_forward(logits.get<float>(), losses.get<float>(), lse_ptr,
-                                      chunk_logsumexp.get<float>(), targets.get<int>(),
-                                      count_ptr, correct_ptr,
-                                      BT, V, P, n_chunks, stream);
+        chunked_cross_entropy_forward(logits.get<float>(),
+                                      losses.get<float>(),
+                                      lse_ptr,
+                                      chunk_logsumexp.get<float>(),
+                                      targets.get<int>(),
+                                      count_ptr,
+                                      correct_ptr,
+                                      BT,
+                                      V,
+                                      P,
+                                      n_chunks,
+                                      stream);
     } else if (logits.DType == ETensorDType::BF16) {
-        chunked_cross_entropy_forward(logits.get<nv_bfloat16>(), losses.get<float>(), lse_ptr,
-                                      chunk_logsumexp.get<float>(), targets.get<int>(),
-                                      count_ptr, correct_ptr,
-                                      BT, V, P, n_chunks, stream);
+        chunked_cross_entropy_forward(logits.get<nv_bfloat16>(),
+                                      losses.get<float>(),
+                                      lse_ptr,
+                                      chunk_logsumexp.get<float>(),
+                                      targets.get<int>(),
+                                      count_ptr,
+                                      correct_ptr,
+                                      BT,
+                                      V,
+                                      P,
+                                      n_chunks,
+                                      stream);
     } else {
         throw std::runtime_error("chunked_cross_entropy_forward: unsupported dtype");
     }
 }
 
-void chunked_cross_entropy_backward(Tensor& dlogits, const Tensor& logits, const Tensor* logsumexp,
-                                    const Tensor& dloss, const Tensor& targets,
-                                    int BT, int V, int P, cudaStream_t stream) {
+void chunked_cross_entropy_backward(Tensor& dlogits,
+                                    const Tensor& logits,
+                                    const Tensor* logsumexp,
+                                    const Tensor& dloss,
+                                    const Tensor& targets,
+                                    int BT,
+                                    int V,
+                                    int P,
+                                    cudaStream_t stream) {
     const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     if (!lse_ptr) {
         throw std::runtime_error("chunked_cross_entropy_backward: logsumexp buffer is required");
     }
     const float* dloss_ptr = dloss.get<float>();
     if (dlogits.DType == ETensorDType::FP32) {
-        chunked_cross_entropy_backward(dlogits.get<float>(), logits.get<float>(), lse_ptr,
-                                       dloss_ptr, targets.get<int>(),
-                                       BT, V, P, stream);
+        chunked_cross_entropy_backward(dlogits.get<float>(),
+                                       logits.get<float>(),
+                                       lse_ptr,
+                                       dloss_ptr,
+                                       targets.get<int>(),
+                                       BT,
+                                       V,
+                                       P,
+                                       stream);
     } else if (dlogits.DType == ETensorDType::BF16) {
-        chunked_cross_entropy_backward(dlogits.get<nv_bfloat16>(), logits.get<nv_bfloat16>(), lse_ptr,
-                                       dloss_ptr, targets.get<int>(),
-                                       BT, V, P, stream);
+        chunked_cross_entropy_backward(dlogits.get<nv_bfloat16>(),
+                                       logits.get<nv_bfloat16>(),
+                                       lse_ptr,
+                                       dloss_ptr,
+                                       targets.get<int>(),
+                                       BT,
+                                       V,
+                                       P,
+                                       stream);
     } else {
         throw std::runtime_error("chunked_cross_entropy_backward: unsupported dtype");
     }
 }
 
-void extract_logprobs(const Tensor& logits, float* logprobs, const Tensor& targets,
-                      int BT, int V, int P, cudaStream_t stream) {
+void extract_logprobs(const Tensor& logits,
+                      float* logprobs,
+                      const Tensor& targets,
+                      int BT,
+                      int V,
+                      int P,
+                      cudaStream_t stream) {
     if (logits.DType == ETensorDType::FP32) {
         extract_logprobs(logits.get<float>(), logprobs, targets.get<int>(), BT, V, P, stream);
     } else if (logits.DType == ETensorDType::BF16) {
@@ -629,8 +1105,7 @@ void extract_logprobs(const Tensor& logits, float* logprobs, const Tensor& targe
     }
 }
 
-void scale_logits_rows(Tensor& logits, const float* inv_temperature,
-                       int BT, int V, int P, cudaStream_t stream) {
+void scale_logits_rows(Tensor& logits, const float* inv_temperature, int BT, int V, int P, cudaStream_t stream) {
     if (!inv_temperature) {
         return;
     }
@@ -645,7 +1120,7 @@ void scale_logits_rows(Tensor& logits, const float* inv_temperature,
 
 void softcap_logits(Tensor& logits, float softcap, int BT, int V, cudaStream_t stream) {
     if (softcap <= 0.0f) return;
-    extern void launch_softcap_logits_bf16(nv_bfloat16* data, float softcap, long n, cudaStream_t stream);
+    extern void launch_softcap_logits_bf16(nv_bfloat16 * data, float softcap, long n, cudaStream_t stream);
     extern void launch_softcap_logits_fp32(float* data, float softcap, long n, cudaStream_t stream);
     long total = static_cast<long>(BT) * static_cast<long>(V);
     if (logits.DType == ETensorDType::BF16) {
@@ -657,13 +1132,23 @@ void softcap_logits(Tensor& logits, float softcap, int BT, int V, cudaStream_t s
     }
 }
 
-void softcap_logits_backward(Tensor& d_logits, const Tensor& capped_logits,
-                             float softcap, int BT, int V, cudaStream_t stream) {
+void softcap_logits_backward(Tensor& d_logits,
+                             const Tensor& capped_logits,
+                             float softcap,
+                             int BT,
+                             int V,
+                             cudaStream_t stream) {
     if (softcap <= 0.0f) return;
-    extern void launch_softcap_logits_backward_bf16(nv_bfloat16* d_logits, const nv_bfloat16* capped,
-                                                    float softcap, long n, cudaStream_t stream);
-    extern void launch_softcap_logits_backward_fp32(float* d_logits, const float* capped,
-                                                    float softcap, long n, cudaStream_t stream);
+    extern void launch_softcap_logits_backward_bf16(nv_bfloat16 * d_logits,
+                                                    const nv_bfloat16* capped,
+                                                    float softcap,
+                                                    long n,
+                                                    cudaStream_t stream);
+    extern void launch_softcap_logits_backward_fp32(float* d_logits,
+                                                    const float* capped,
+                                                    float softcap,
+                                                    long n,
+                                                    cudaStream_t stream);
     const long total = static_cast<long>(BT) * static_cast<long>(V);
     if (d_logits.DType != capped_logits.DType) {
         throw std::runtime_error("softcap_logits_backward: d_logits and capped_logits dtype must match");
@@ -671,11 +1156,11 @@ void softcap_logits_backward(Tensor& d_logits, const Tensor& capped_logits,
     if (d_logits.DType == ETensorDType::BF16) {
         launch_softcap_logits_backward_bf16(d_logits.get<nv_bfloat16>(),
                                             capped_logits.get<nv_bfloat16>(),
-                                            softcap, total, stream);
+                                            softcap,
+                                            total,
+                                            stream);
     } else if (d_logits.DType == ETensorDType::FP32) {
-        launch_softcap_logits_backward_fp32(d_logits.get<float>(),
-                                            capped_logits.get<float>(),
-                                            softcap, total, stream);
+        launch_softcap_logits_backward_fp32(d_logits.get<float>(), capped_logits.get<float>(), softcap, total, stream);
     } else {
         throw std::runtime_error("softcap_logits_backward: unsupported logits dtype");
     }
@@ -704,11 +1189,35 @@ void softcap_logits_backward(Tensor& d_logits, const Tensor& capped_logits,
  *
  * @throws std::runtime_error If the output tensor data type is not supported (neither FP32 nor BF16).
  */
-void encoder_forward(Tensor& out, const Tensor& inp, const Tensor& wte, std::optional<Tensor> wpe, int B, int T, int C, int V, cudaStream_t stream) {
-    if(out.DType == ETensorDType::FP32) {
-        encoder_forward(out.get<float>(), inp.get<std::int32_t>(), wte.get<float>(), wpe.has_value() ? wpe->get<float>() : nullptr, B, T, C, V, stream);
-    } else if(out.DType == ETensorDType::BF16) {
-        encoder_forward(out.get<nv_bfloat16>(), inp.get<std::int32_t>(), wte.get<nv_bfloat16>(),  wpe.has_value() ? wpe->get<nv_bfloat16>() : nullptr, B, T, C, V, stream);
+void encoder_forward(Tensor& out,
+                     const Tensor& inp,
+                     const Tensor& wte,
+                     std::optional<Tensor> wpe,
+                     int B,
+                     int T,
+                     int C,
+                     int V,
+                     cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        encoder_forward(out.get<float>(),
+                        inp.get<std::int32_t>(),
+                        wte.get<float>(),
+                        wpe.has_value() ? wpe->get<float>() : nullptr,
+                        B,
+                        T,
+                        C,
+                        V,
+                        stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        encoder_forward(out.get<nv_bfloat16>(),
+                        inp.get<std::int32_t>(),
+                        wte.get<nv_bfloat16>(),
+                        wpe.has_value() ? wpe->get<nv_bfloat16>() : nullptr,
+                        B,
+                        T,
+                        C,
+                        V,
+                        stream);
     } else {
         throw std::runtime_error("encoder_forward: unsupported dtype");
     }
@@ -741,20 +1250,52 @@ void encoder_forward(Tensor& out, const Tensor& inp, const Tensor& wte, std::opt
  *
  * @throws std::logic_error If `dwte` has an unsupported data type (not FP32 or BF16).
  */
-void encoder_backward(Tensor& dwte, Tensor& scratch,
-                      Tensor& workload_indices, Tensor& bucket_info,
-                      const Tensor& dout, const Tensor& inp, const Tensor& inputs_cpu,
-                      int B, int T, int C, unsigned int seed, cudaStream_t stream, cudaEvent_t sync_event, cudaStream_t copy_stream) {
+void encoder_backward(Tensor& dwte,
+                      Tensor& scratch,
+                      Tensor& workload_indices,
+                      Tensor& bucket_info,
+                      const Tensor& dout,
+                      const Tensor& inp,
+                      const Tensor& inputs_cpu,
+                      int B,
+                      int T,
+                      int C,
+                      unsigned int seed,
+                      cudaStream_t stream,
+                      cudaEvent_t sync_event,
+                      cudaStream_t copy_stream) {
     assert(workload_indices.Device == -1);
     assert(bucket_info.Device == -1);
-    if(dwte.DType == ETensorDType::FP32) {
-        encoder_backward(dwte.get<float>(), scratch.get<int>(), workload_indices.get<int>(),
-            (int4*)bucket_info.get<int>(), dout.get<float>(), inp.get<std::int32_t>(), inputs_cpu.get<std::int32_t>(),
-            B, T, C, seed, stream, sync_event, copy_stream);
-    } else if(dwte.DType == ETensorDType::BF16) {
-        encoder_backward(dwte.get<nv_bfloat16>(), scratch.get<int>(), workload_indices.get<int>(),
-            (int4*)bucket_info.get<int>(), dout.get<nv_bfloat16>(), inp.get<std::int32_t>(), inputs_cpu.get<std::int32_t>(),
-            B, T, C, seed, stream, sync_event, copy_stream);
+    if (dwte.DType == ETensorDType::FP32) {
+        encoder_backward(dwte.get<float>(),
+                         scratch.get<int>(),
+                         workload_indices.get<int>(),
+                         (int4*)bucket_info.get<int>(),
+                         dout.get<float>(),
+                         inp.get<std::int32_t>(),
+                         inputs_cpu.get<std::int32_t>(),
+                         B,
+                         T,
+                         C,
+                         seed,
+                         stream,
+                         sync_event,
+                         copy_stream);
+    } else if (dwte.DType == ETensorDType::BF16) {
+        encoder_backward(dwte.get<nv_bfloat16>(),
+                         scratch.get<int>(),
+                         workload_indices.get<int>(),
+                         (int4*)bucket_info.get<int>(),
+                         dout.get<nv_bfloat16>(),
+                         inp.get<std::int32_t>(),
+                         inputs_cpu.get<std::int32_t>(),
+                         B,
+                         T,
+                         C,
+                         seed,
+                         stream,
+                         sync_event,
+                         copy_stream);
     } else {
         throw std::logic_error("encoder_backward: unsupported dtype");
     }
@@ -777,10 +1318,14 @@ void encoder_backward(Tensor& dwte, Tensor& scratch,
  *
  * @throws std::logic_error If the input tensor's data type is not supported.
  */
-void global_norm_squared(Tensor& out, const Tensor& values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream) {
-    if(values.DType == ETensorDType::FP32) {
+void global_norm_squared(Tensor& out,
+                         const Tensor& values,
+                         size_t count,
+                         const cudaDeviceProp& dp,
+                         cudaStream_t stream) {
+    if (values.DType == ETensorDType::FP32) {
         global_norm_squared(out.get<float>(), values.get<float>(), count, dp, stream);
-    } else if(values.DType == ETensorDType::BF16) {
+    } else if (values.DType == ETensorDType::BF16) {
         global_norm_squared(out.get<float>(), values.get<nv_bfloat16>(), count, dp, stream);
     } else {
         throw std::logic_error("global_norm_squared: unsupported dtype");
@@ -840,12 +1385,19 @@ void count_invalid_indices(Tensor& out_count, const Tensor& indices, int num_exp
     if (indices.DType != ETensorDType::INT32) {
         throw std::logic_error("count_invalid_indices: indices must be INT32");
     }
-    count_invalid_indices(out_count.get<int>(), indices.get<int>(),
-                          static_cast<int>(indices.nelem()), num_experts, stream);
+    count_invalid_indices(out_count.get<int>(),
+                          indices.get<int>(),
+                          static_cast<int>(indices.nelem()),
+                          num_experts,
+                          stream);
 }
 
-void global_norm_squared_prescaled(float* out, const Tensor& values, size_t count, const float* prescale_device,
-                                    const cudaDeviceProp& dp, cudaStream_t stream) {
+void global_norm_squared_prescaled(float* out,
+                                   const Tensor& values,
+                                   size_t count,
+                                   const float* prescale_device,
+                                   const cudaDeviceProp& dp,
+                                   cudaStream_t stream) {
     if (values.DType == ETensorDType::FP32) {
         global_norm_squared_prescaled(out, values.get<float>(), count, prescale_device, dp, stream);
     } else if (values.DType == ETensorDType::BF16) {
@@ -854,7 +1406,6 @@ void global_norm_squared_prescaled(float* out, const Tensor& values, size_t coun
         throw std::logic_error("global_norm_squared_prescaled: unsupported dtype");
     }
 }
-
 
 /**
  * @brief Transposes a 2D tensor asynchronously on a CUDA stream.
@@ -874,13 +1425,13 @@ void global_norm_squared_prescaled(float* out, const Tensor& values, size_t coun
  *                          (i.e., not FP32, BF16, FP8_E4M3, or FP8_E5M2).
  */
 void transpose(Tensor& dst, const Tensor& src, int rows, int cols, cudaStream_t stream) {
-    if(dst.DType == ETensorDType::FP32) {
+    if (dst.DType == ETensorDType::FP32) {
         transpose(dst.get<float>(), src.get<float>(), rows, cols, stream);
-    } else if(dst.DType == ETensorDType::BF16) {
+    } else if (dst.DType == ETensorDType::BF16) {
         transpose(dst.get<nv_bfloat16>(), src.get<nv_bfloat16>(), rows, cols, stream);
-    } else if(dst.DType == ETensorDType::FP8_E4M3) {
+    } else if (dst.DType == ETensorDType::FP8_E4M3) {
         transpose(dst.get<__nv_fp8_e4m3>(), src.get<__nv_fp8_e4m3>(), rows, cols, stream);
-    }  else if(dst.DType == ETensorDType::FP8_E5M2) {
+    } else if (dst.DType == ETensorDType::FP8_E5M2) {
         transpose(dst.get<__nv_fp8_e5m2>(), src.get<__nv_fp8_e5m2>(), rows, cols, stream);
     } else {
         throw std::logic_error("transpose: unsupported dtype");
@@ -904,7 +1455,13 @@ void transpose(Tensor& dst, const Tensor& src, int rows, int cols, cudaStream_t 
  *
  * @throws std::logic_error If the destination tensor data type is not FP32 or BF16.
  */
-void vector_add_sr(Tensor& dest, const Tensor& left, const Tensor& right, float scale, long nelem, unsigned seed, cudaStream_t stream) {
+void vector_add_sr(Tensor& dest,
+                   const Tensor& left,
+                   const Tensor& right,
+                   float scale,
+                   long nelem,
+                   unsigned seed,
+                   cudaStream_t stream) {
     // Validate that nelem makes sense
     if (nelem < 0) {
         fprintf(stderr, "ERROR: negative nelem=%ld\n", nelem);
@@ -914,10 +1471,16 @@ void vector_add_sr(Tensor& dest, const Tensor& left, const Tensor& right, float 
         fprintf(stderr, "WARNING: nelem parameter (%ld) doesn't match dest.nelem() (%zu)\n", nelem, dest.nelem());
     }
 
-    if(dest.DType == ETensorDType::FP32) {
+    if (dest.DType == ETensorDType::FP32) {
         vector_add_sr(dest.get<float>(), left.get<float>(), right.get<float>(), scale, nelem, seed, stream);
-    } else if(dest.DType == ETensorDType::BF16) {
-        vector_add_sr(dest.get<nv_bfloat16>(), left.get<nv_bfloat16>(), right.get<nv_bfloat16>(), scale, nelem, seed, stream);
+    } else if (dest.DType == ETensorDType::BF16) {
+        vector_add_sr(dest.get<nv_bfloat16>(),
+                      left.get<nv_bfloat16>(),
+                      right.get<nv_bfloat16>(),
+                      scale,
+                      nelem,
+                      seed,
+                      stream);
     } else {
         throw std::logic_error("vector_add_sr: unsupported dtype");
     }
@@ -941,10 +1504,24 @@ void vector_add_sr(Tensor& dest, const Tensor& left, const Tensor& right, float 
  * @throws std::logic_error If the data types of dst and src do not match.
  * @throws std::logic_error If the data type is not supported (only FP32 and BF16 are supported).
  */
-void add_2d_slice(Tensor& dst, const Tensor& src, long rows, long dst_cols, long src_cols, long dst_col_offset, cudaStream_t stream) {
+void add_2d_slice(Tensor& dst,
+                  const Tensor& src,
+                  long rows,
+                  long dst_cols,
+                  long src_cols,
+                  long dst_col_offset,
+                  cudaStream_t stream) {
     if (dst.DType != src.DType) {
-        fprintf(stderr, "[DEBUG] add_2d_slice dtype mismatch: dst.DType=%d src.DType=%d\n", (int)dst.DType, (int)src.DType);
-        fprintf(stderr, "[DEBUG] dst shape: [%ld, %ld] src shape: [%ld, %ld]\n", dst.Sizes[0], dst.Sizes[1], src.Sizes[0], src.Sizes[1]);
+        fprintf(stderr,
+                "[DEBUG] add_2d_slice dtype mismatch: dst.DType=%d src.DType=%d\n",
+                (int)dst.DType,
+                (int)src.DType);
+        fprintf(stderr,
+                "[DEBUG] dst shape: [%ld, %ld] src shape: [%ld, %ld]\n",
+                dst.Sizes[0],
+                dst.Sizes[1],
+                src.Sizes[0],
+                src.Sizes[1]);
         throw std::logic_error("add_2d_slice: dtype mismatch");
     }
     if (dst.DType == ETensorDType::FP32) {
@@ -973,11 +1550,27 @@ void add_2d_slice(Tensor& dst, const Tensor& src, long rows, long dst_cols, long
  * @param seed The random seed used for stochastic rounding.
  * @param stream The CUDA stream on which to execute the kernel.
  */
-void vector_reduce_sr(Tensor& dest, const Tensor& src, float scale, int n_shards, int skip, long nelem, bool accumulate, unsigned seed, cudaStream_t stream) {
-    if(dest.DType == ETensorDType::FP32) {
+void vector_reduce_sr(Tensor& dest,
+                      const Tensor& src,
+                      float scale,
+                      int n_shards,
+                      int skip,
+                      long nelem,
+                      bool accumulate,
+                      unsigned seed,
+                      cudaStream_t stream) {
+    if (dest.DType == ETensorDType::FP32) {
         vector_reduce_sr(dest.get<float>(), src.get<float>(), scale, n_shards, skip, nelem, accumulate, seed, stream);
-    } else if(dest.DType == ETensorDType::BF16) {
-        vector_reduce_sr(dest.get<nv_bfloat16>(), src.get<nv_bfloat16>(), scale, n_shards, skip, nelem, accumulate, seed, stream);
+    } else if (dest.DType == ETensorDType::BF16) {
+        vector_reduce_sr(dest.get<nv_bfloat16>(),
+                         src.get<nv_bfloat16>(),
+                         scale,
+                         n_shards,
+                         skip,
+                         nelem,
+                         accumulate,
+                         seed,
+                         stream);
     }
 }
 
@@ -1004,7 +1597,7 @@ void abs_max(float* scale, const Tensor& in, long N, const cudaDeviceProp& dp, c
         // FP8 tensors should already have their absmax/scale computed during quantization
         // If we're being asked to compute absmax on FP8, something is wrong in the caller
         throw std::logic_error("absmax_scale: FP8 tensors should not need absmax recomputation. "
-                                "This likely indicates an issue with weight quantization path.");
+                               "This likely indicates an issue with weight quantization path.");
     } else {
         std::string msg = "absmax_scale: unsupported dtype: " + std::to_string(static_cast<int>(in.DType));
         throw std::logic_error(msg);
@@ -1028,7 +1621,13 @@ void abs_max(float* scale, const Tensor& in, long N, const cudaDeviceProp& dp, c
  *
  * @throws std::logic_error If the combination of input and output tensor data types is not supported.
  */
-void quantize_with_abs_max(Tensor& out, float* scale_ptr, const Tensor& in, const float* abs_max, long N, const cudaDeviceProp& dp, cudaStream_t stream) {
+void quantize_with_abs_max(Tensor& out,
+                           float* scale_ptr,
+                           const Tensor& in,
+                           const float* abs_max,
+                           long N,
+                           const cudaDeviceProp& dp,
+                           cudaStream_t stream) {
     if (in.DType == ETensorDType::FP32) {
         if (out.DType == ETensorDType::BF16) {
             quantize_with_abs_max(out.get<nv_bfloat16>(), scale_ptr, in.get<float>(), abs_max, N, dp, stream);
@@ -1081,17 +1680,59 @@ void quantize_with_abs_max(Tensor& out, float* scale_ptr, const Tensor& in, cons
  * - FP32 -> FP8_E4M3
  * - BF16 -> FP8_E4M3
  */
-void quantize_and_transpose_with_abs_max(Tensor& out, float* scale_ptr, const Tensor& in, const float* abs_max, int rows, int cols, const cudaDeviceProp& dp, cudaStream_t stream) {
-    if(out.DType == ETensorDType::BF16 && in.DType == ETensorDType::FP32) {
-        quantize_and_transpose_with_abs_max(out.get<nv_bfloat16>(), scale_ptr, in.get<float>(), abs_max, rows, cols, dp, stream);
-    } else if(out.DType == ETensorDType::INT8 && in.DType == ETensorDType::FP32) {
-        quantize_and_transpose_with_abs_max(out.get<std::int8_t>(), scale_ptr, in.get<float>(), abs_max, rows, cols, dp, stream);
-    } else if(out.DType == ETensorDType::INT8 && in.DType == ETensorDType::BF16) {
-        quantize_and_transpose_with_abs_max(out.get<std::int8_t>(), scale_ptr, in.get<nv_bfloat16>(), abs_max, rows, cols, dp, stream);
-    } else if(out.DType == ETensorDType::FP8_E4M3 && in.DType == ETensorDType::FP32) {
-        quantize_and_transpose_with_abs_max(out.get<__nv_fp8_e4m3>(), scale_ptr, in.get<float>(), abs_max, rows, cols, dp, stream);
-    } else if(out.DType == ETensorDType::FP8_E4M3 && in.DType == ETensorDType::BF16) {
-        quantize_and_transpose_with_abs_max(out.get<__nv_fp8_e4m3>(), scale_ptr, in.get<nv_bfloat16>(), abs_max, rows, cols, dp, stream);
+void quantize_and_transpose_with_abs_max(Tensor& out,
+                                         float* scale_ptr,
+                                         const Tensor& in,
+                                         const float* abs_max,
+                                         int rows,
+                                         int cols,
+                                         const cudaDeviceProp& dp,
+                                         cudaStream_t stream) {
+    if (out.DType == ETensorDType::BF16 && in.DType == ETensorDType::FP32) {
+        quantize_and_transpose_with_abs_max(out.get<nv_bfloat16>(),
+                                            scale_ptr,
+                                            in.get<float>(),
+                                            abs_max,
+                                            rows,
+                                            cols,
+                                            dp,
+                                            stream);
+    } else if (out.DType == ETensorDType::INT8 && in.DType == ETensorDType::FP32) {
+        quantize_and_transpose_with_abs_max(out.get<std::int8_t>(),
+                                            scale_ptr,
+                                            in.get<float>(),
+                                            abs_max,
+                                            rows,
+                                            cols,
+                                            dp,
+                                            stream);
+    } else if (out.DType == ETensorDType::INT8 && in.DType == ETensorDType::BF16) {
+        quantize_and_transpose_with_abs_max(out.get<std::int8_t>(),
+                                            scale_ptr,
+                                            in.get<nv_bfloat16>(),
+                                            abs_max,
+                                            rows,
+                                            cols,
+                                            dp,
+                                            stream);
+    } else if (out.DType == ETensorDType::FP8_E4M3 && in.DType == ETensorDType::FP32) {
+        quantize_and_transpose_with_abs_max(out.get<__nv_fp8_e4m3>(),
+                                            scale_ptr,
+                                            in.get<float>(),
+                                            abs_max,
+                                            rows,
+                                            cols,
+                                            dp,
+                                            stream);
+    } else if (out.DType == ETensorDType::FP8_E4M3 && in.DType == ETensorDType::BF16) {
+        quantize_and_transpose_with_abs_max(out.get<__nv_fp8_e4m3>(),
+                                            scale_ptr,
+                                            in.get<nv_bfloat16>(),
+                                            abs_max,
+                                            rows,
+                                            cols,
+                                            dp,
+                                            stream);
     } else {
         throw std::logic_error("Invalid DType combination");
     }
@@ -1113,7 +1754,13 @@ void quantize_and_transpose_with_abs_max(Tensor& out, float* scale_ptr, const Te
  *
  * @throws std::logic_error If the destination tensor's data type is not supported (i.e., not FP32 or BF16).
  */
-void fill_normal(Tensor& dest, std::size_t count, float mean, float std, unsigned long long seed, unsigned long long subsequence, cudaStream_t stream) {
+void fill_normal(Tensor& dest,
+                 std::size_t count,
+                 float mean,
+                 float std,
+                 unsigned long long seed,
+                 unsigned long long subsequence,
+                 cudaStream_t stream) {
     if (dest.DType == ETensorDType::FP32) {
         fill_normal(dest.get<float>(), count, mean, std, seed, subsequence, stream);
     } else if (dest.DType == ETensorDType::BF16) {
@@ -1178,51 +1825,178 @@ void fill_constant(Tensor& dest, float value, std::size_t count, cudaStream_t st
  *
  * @throws std::logic_error If the combination of tensor data types is not supported.
  */
-void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
-            const float* scale_a, const float* scale_b,
-            cublasLtHandle_t handle, Tensor& workspace,
-            int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream) {
+void matmul(Tensor& c,
+            const Tensor& a,
+            const Tensor& b,
+            std::optional<Tensor> bias,
+            const float* scale_a,
+            const float* scale_b,
+            cublasLtHandle_t handle,
+            Tensor& workspace,
+            int M,
+            int N,
+            int K,
+            EMMTranspose mode,
+            bool accumulate,
+            cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
 
-    if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
+    if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
-        matmul(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
-    } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::BF16) {
+        matmul(c.get<float>(),
+               a.get<float>(),
+               b.get<float>(),
+               bias_ptr,
+               scale_a,
+               scale_b,
+               handle,
+               ws,
+               ws_size,
+               M,
+               N,
+               K,
+               mode,
+               accumulate,
+               stream);
+    } else if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::BF16) {
         // Note: bias is expected to be FP32 when output is FP32
         // If bias is BF16, we skip it (TODO: add support for BF16 bias with FP32 output)
         float* bias_ptr = nullptr;
-        if(bias.has_value()) {
-            if(bias.value().DType == ETensorDType::FP32) {
+        if (bias.has_value()) {
+            if (bias.value().DType == ETensorDType::FP32) {
                 bias_ptr = bias.value().get<float>();
             } else {
                 // Skip BF16 bias for now - this shouldn't happen in practice
                 fprintf(stderr, "[WARNING] matmul: FP32 output with BF16 bias - skipping bias\n");
             }
         }
-        matmul(c.get<float>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
-    } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP8_E4M3) {
-        if(bias.has_value()) {
-            if(bias.value().DType == ETensorDType::BF16) {
-                matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias->get<nv_bfloat16>(), scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+        matmul(c.get<float>(),
+               a.get<nv_bfloat16>(),
+               b.get<nv_bfloat16>(),
+               bias_ptr,
+               scale_a,
+               scale_b,
+               handle,
+               ws,
+               ws_size,
+               M,
+               N,
+               K,
+               mode,
+               accumulate,
+               stream);
+    } else if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP8_E4M3) {
+        if (bias.has_value()) {
+            if (bias.value().DType == ETensorDType::BF16) {
+                matmul(c.get<float>(),
+                       a.get<__nv_fp8_e4m3>(),
+                       b.get<__nv_fp8_e4m3>(),
+                       bias->get<nv_bfloat16>(),
+                       scale_a,
+                       scale_b,
+                       handle,
+                       ws,
+                       ws_size,
+                       M,
+                       N,
+                       K,
+                       mode,
+                       accumulate,
+                       stream);
             } else {
-                matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias->get<float>(), scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+                matmul(c.get<float>(),
+                       a.get<__nv_fp8_e4m3>(),
+                       b.get<__nv_fp8_e4m3>(),
+                       bias->get<float>(),
+                       scale_a,
+                       scale_b,
+                       handle,
+                       ws,
+                       ws_size,
+                       M,
+                       N,
+                       K,
+                       mode,
+                       accumulate,
+                       stream);
             }
         } else {
-            matmul(c.get<float>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), (nv_bfloat16*)nullptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+            matmul(c.get<float>(),
+                   a.get<__nv_fp8_e4m3>(),
+                   b.get<__nv_fp8_e4m3>(),
+                   (nv_bfloat16*)nullptr,
+                   scale_a,
+                   scale_b,
+                   handle,
+                   ws,
+                   ws_size,
+                   M,
+                   N,
+                   K,
+                   mode,
+                   accumulate,
+                   stream);
         }
-    } else if(c.DType == ETensorDType::BF16 && a.DType == ETensorDType::FP8_E4M3 && b.DType == ETensorDType::FP8_E4M3) {
+    } else if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::FP8_E4M3 &&
+               b.DType == ETensorDType::FP8_E4M3) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul(c.get<nv_bfloat16>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e4m3>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
-    } else if(c.DType == ETensorDType::BF16 && a.DType == ETensorDType::FP8_E4M3 && b.DType == ETensorDType::FP8_E5M2) {
+        matmul(c.get<nv_bfloat16>(),
+               a.get<__nv_fp8_e4m3>(),
+               b.get<__nv_fp8_e4m3>(),
+               bias_ptr,
+               scale_a,
+               scale_b,
+               handle,
+               ws,
+               ws_size,
+               M,
+               N,
+               K,
+               mode,
+               accumulate,
+               stream);
+    } else if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::FP8_E4M3 &&
+               b.DType == ETensorDType::FP8_E5M2) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul(c.get<nv_bfloat16>(), a.get<__nv_fp8_e4m3>(), b.get<__nv_fp8_e5m2>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
-    } else if(c.DType == ETensorDType::BF16) {
+        matmul(c.get<nv_bfloat16>(),
+               a.get<__nv_fp8_e4m3>(),
+               b.get<__nv_fp8_e5m2>(),
+               bias_ptr,
+               scale_a,
+               scale_b,
+               handle,
+               ws,
+               ws_size,
+               M,
+               N,
+               K,
+               mode,
+               accumulate,
+               stream);
+    } else if (c.DType == ETensorDType::BF16) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
+        matmul(c.get<nv_bfloat16>(),
+               a.get<nv_bfloat16>(),
+               b.get<nv_bfloat16>(),
+               bias_ptr,
+               scale_a,
+               scale_b,
+               handle,
+               ws,
+               ws_size,
+               M,
+               N,
+               K,
+               mode,
+               accumulate,
+               stream);
     } else {
-        fprintf(stderr, "[DEBUG] matmul error: c.DType=%d a.DType=%d b.DType=%d\n",
-                (int)c.DType, (int)a.DType, (int)b.DType);
+        fprintf(stderr,
+                "[DEBUG] matmul error: c.DType=%d a.DType=%d b.DType=%d\n",
+                (int)c.DType,
+                (int)a.DType,
+                (int)b.DType);
         throw std::logic_error("matmul_forward: invalid DType combination");
     }
 }
@@ -1249,18 +2023,44 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
  * @param beta [in] Accumulation factor.
  * @param stream [in] CUDA stream.
  */
-void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
-            const float* scale_a, const float* scale_b,
-            cublasLtHandle_t handle, Tensor& workspace,
-            int M, int N, int K, EMMTranspose mode, float alpha, float beta, cudaStream_t stream) {
+void matmul(Tensor& c,
+            const Tensor& a,
+            const Tensor& b,
+            std::optional<Tensor> bias,
+            const float* scale_a,
+            const float* scale_b,
+            cublasLtHandle_t handle,
+            Tensor& workspace,
+            int M,
+            int N,
+            int K,
+            EMMTranspose mode,
+            float alpha,
+            float beta,
+            cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
 
     // Currently only BF16 is supported with explicit alpha/beta
     // (this is the primary use case for LoRA backward)
-    if(c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
+    if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, alpha, beta, stream);
+        matmul(c.get<nv_bfloat16>(),
+               a.get<nv_bfloat16>(),
+               b.get<nv_bfloat16>(),
+               bias_ptr,
+               scale_a,
+               scale_b,
+               handle,
+               ws,
+               ws_size,
+               M,
+               N,
+               K,
+               mode,
+               alpha,
+               beta,
+               stream);
     } else {
         // For other dtypes, fall back to the accumulate-based API
         // Note: this loses the ability to use non-1.0 alpha values
@@ -1268,7 +2068,9 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
         matmul(c, a, b, bias, scale_a, scale_b, handle, workspace, M, N, K, mode, accumulate, stream);
         // If alpha != 1.0, we'd need a separate scale kernel, but this shouldn't happen in practice
         if (alpha != 1.0f && alpha != 0.0f) {
-            fprintf(stderr, "[WARNING] matmul with alpha!=1.0 not supported for dtype %d, scaling skipped\n", (int)c.DType);
+            fprintf(stderr,
+                    "[WARNING] matmul with alpha!=1.0 not supported for dtype %d, scaling skipped\n",
+                    (int)c.DType);
         }
     }
 }
@@ -1299,10 +2101,21 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
  * @throws std::logic_error If `ldc` is less than or equal to 0.
  * @throws std::logic_error If the combination of tensor data types is not supported (currently supports all-FP32 or all-BF16).
  */
-void matmul_strided_c(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
-                      const float* scale_a, const float* scale_b,
-                      cublasLtHandle_t handle, Tensor& workspace,
-                      int M, int N, int K, EMMTranspose mode, bool accumulate, int ldc, cudaStream_t stream) {
+void matmul_strided_c(Tensor& c,
+                      const Tensor& a,
+                      const Tensor& b,
+                      std::optional<Tensor> bias,
+                      const float* scale_a,
+                      const float* scale_b,
+                      cublasLtHandle_t handle,
+                      Tensor& workspace,
+                      int M,
+                      int N,
+                      int K,
+                      EMMTranspose mode,
+                      bool accumulate,
+                      int ldc,
+                      cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
     if (ldc <= 0) {
@@ -1310,38 +2123,127 @@ void matmul_strided_c(Tensor& c, const Tensor& a, const Tensor& b, std::optional
     }
     if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
-        matmul_strided_c(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, ldc, stream);
+        matmul_strided_c(c.get<float>(),
+                         a.get<float>(),
+                         b.get<float>(),
+                         bias_ptr,
+                         scale_a,
+                         scale_b,
+                         handle,
+                         ws,
+                         ws_size,
+                         M,
+                         N,
+                         K,
+                         mode,
+                         accumulate,
+                         ldc,
+                         stream);
     } else if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul_strided_c(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, ldc, stream);
+        matmul_strided_c(c.get<nv_bfloat16>(),
+                         a.get<nv_bfloat16>(),
+                         b.get<nv_bfloat16>(),
+                         bias_ptr,
+                         scale_a,
+                         scale_b,
+                         handle,
+                         ws,
+                         ws_size,
+                         M,
+                         N,
+                         K,
+                         mode,
+                         accumulate,
+                         ldc,
+                         stream);
     } else {
         throw std::logic_error("matmul_strided_c: unsupported dtype combination");
     }
 }
 
-void matmul_strided(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> bias,
-                    const float* scale_a, const float* scale_b,
-                    cublasLtHandle_t handle, Tensor& workspace,
-                    int M, int N, int K, EMMTranspose mode, bool accumulate,
-                    int lda, int ldb, int ldc,
+void matmul_strided(Tensor& c,
+                    const Tensor& a,
+                    const Tensor& b,
+                    std::optional<Tensor> bias,
+                    const float* scale_a,
+                    const float* scale_b,
+                    cublasLtHandle_t handle,
+                    Tensor& workspace,
+                    int M,
+                    int N,
+                    int K,
+                    EMMTranspose mode,
+                    bool accumulate,
+                    int lda,
+                    int ldb,
+                    int ldc,
                     cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
     if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
-        matmul_strided(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b,
-                       handle, ws, ws_size, M, N, K, mode, accumulate, lda, ldb, ldc, stream);
+        matmul_strided(c.get<float>(),
+                       a.get<float>(),
+                       b.get<float>(),
+                       bias_ptr,
+                       scale_a,
+                       scale_b,
+                       handle,
+                       ws,
+                       ws_size,
+                       M,
+                       N,
+                       K,
+                       mode,
+                       accumulate,
+                       lda,
+                       ldb,
+                       ldc,
+                       stream);
     } else if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::BF16) {
         float* bias_ptr = nullptr;
         if (bias.has_value() && bias.value().DType == ETensorDType::FP32) {
             bias_ptr = bias.value().get<float>();
         }
-        matmul_strided(c.get<float>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b,
-                       handle, ws, ws_size, M, N, K, mode, accumulate, lda, ldb, ldc, stream);
+        matmul_strided(c.get<float>(),
+                       a.get<nv_bfloat16>(),
+                       b.get<nv_bfloat16>(),
+                       bias_ptr,
+                       scale_a,
+                       scale_b,
+                       handle,
+                       ws,
+                       ws_size,
+                       M,
+                       N,
+                       K,
+                       mode,
+                       accumulate,
+                       lda,
+                       ldb,
+                       ldc,
+                       stream);
     } else if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
-        matmul_strided(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b,
-                       handle, ws, ws_size, M, N, K, mode, accumulate, lda, ldb, ldc, stream);
+        matmul_strided(c.get<nv_bfloat16>(),
+                       a.get<nv_bfloat16>(),
+                       b.get<nv_bfloat16>(),
+                       bias_ptr,
+                       scale_a,
+                       scale_b,
+                       handle,
+                       ws,
+                       ws_size,
+                       M,
+                       N,
+                       K,
+                       mode,
+                       accumulate,
+                       lda,
+                       ldb,
+                       ldc,
+                       stream);
     } else {
         throw std::logic_error("matmul_strided: unsupported dtype combination");
     }
@@ -1375,15 +2277,60 @@ void matmul_strided(Tensor& c, const Tensor& a, const Tensor& b, std::optional<T
  *       - dbias: BF16, dout: FP8_E4M3
  *       - dbias: BF16, dout: FP8_E5M2
  */
-void backward_bias(Tensor& dbias, const Tensor& dout, const float* scale_a, const float* scale_b, Tensor& dbias_buffer, int B, int T, int OC, const cudaDeviceProp& dp, cudaStream_t stream) {
-    if(dbias.DType == ETensorDType::FP32 && dout.DType == ETensorDType::FP32) {
-        backward_bias(dbias.get<float>(), dout.get<float>(), scale_a, scale_b, dbias_buffer.get<float>(), B, T, OC, dp, stream);
-    } else if(dbias.DType == ETensorDType::BF16 && dout.DType == ETensorDType::BF16) {
-        backward_bias(dbias.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), scale_a, scale_b, dbias_buffer.get<float>(), B, T, OC, dp, stream);
-    } else if(dbias.DType == ETensorDType::BF16 && dout.DType == ETensorDType::FP8_E4M3) {
-        backward_bias(dbias.get<nv_bfloat16>(), dout.get<__nv_fp8_e4m3>(), scale_a, scale_b, dbias_buffer.get<float>(), B, T, OC, dp, stream);
-    }  else if(dbias.DType == ETensorDType::BF16 && dout.DType == ETensorDType::FP8_E5M2) {
-        backward_bias(dbias.get<nv_bfloat16>(), dout.get<__nv_fp8_e5m2>(), scale_a, scale_b, dbias_buffer.get<float>(), B, T, OC, dp, stream);
+void backward_bias(Tensor& dbias,
+                   const Tensor& dout,
+                   const float* scale_a,
+                   const float* scale_b,
+                   Tensor& dbias_buffer,
+                   int B,
+                   int T,
+                   int OC,
+                   const cudaDeviceProp& dp,
+                   cudaStream_t stream) {
+    if (dbias.DType == ETensorDType::FP32 && dout.DType == ETensorDType::FP32) {
+        backward_bias(dbias.get<float>(),
+                      dout.get<float>(),
+                      scale_a,
+                      scale_b,
+                      dbias_buffer.get<float>(),
+                      B,
+                      T,
+                      OC,
+                      dp,
+                      stream);
+    } else if (dbias.DType == ETensorDType::BF16 && dout.DType == ETensorDType::BF16) {
+        backward_bias(dbias.get<nv_bfloat16>(),
+                      dout.get<nv_bfloat16>(),
+                      scale_a,
+                      scale_b,
+                      dbias_buffer.get<float>(),
+                      B,
+                      T,
+                      OC,
+                      dp,
+                      stream);
+    } else if (dbias.DType == ETensorDType::BF16 && dout.DType == ETensorDType::FP8_E4M3) {
+        backward_bias(dbias.get<nv_bfloat16>(),
+                      dout.get<__nv_fp8_e4m3>(),
+                      scale_a,
+                      scale_b,
+                      dbias_buffer.get<float>(),
+                      B,
+                      T,
+                      OC,
+                      dp,
+                      stream);
+    } else if (dbias.DType == ETensorDType::BF16 && dout.DType == ETensorDType::FP8_E5M2) {
+        backward_bias(dbias.get<nv_bfloat16>(),
+                      dout.get<__nv_fp8_e5m2>(),
+                      scale_a,
+                      scale_b,
+                      dbias_buffer.get<float>(),
+                      B,
+                      T,
+                      OC,
+                      dp,
+                      stream);
     } else {
         throw std::logic_error("backward_bias: unsupported dtype");
     }

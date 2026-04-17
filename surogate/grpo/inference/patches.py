@@ -8,7 +8,7 @@ def transformers_v5_compat():
 
     if not hasattr(Qwen3VLMoeTextConfig, "tie_word_embeddings"):
         Qwen3VLMoeTextConfig.tie_word_embeddings = False
-        
+
     _patch_qwen35_lora()
 
 
@@ -186,7 +186,7 @@ def _apply_noisy_norms(model, adapter_path: str, logger) -> None:
 
     import torch
 
-    from surogate.grpo.noise_scheduler import NOISE_SIGMA_FILENAME, _NORM_WEIGHT_RE
+    from surogate.grpo.noise_scheduler import _NORM_WEIGHT_RE, NOISE_SIGMA_FILENAME
 
     sigma_path = os.path.join(adapter_path, NOISE_SIGMA_FILENAME)
     if not os.path.isfile(sigma_path):
@@ -264,7 +264,7 @@ def monkey_patch_tokenize_params_validation():
                     value=len(text),
                 )
         return text
-    
+
     def _patched_get_encode_kwargs(self):
         """Use max_total_tokens (max_model_len) instead of max_input_tokens for HF tokenizer truncation.
 
@@ -431,7 +431,7 @@ def _patch_qwen35_lora():
         )
 
     MergedColumnParallelLinearWithLoRA.can_replace_layer = can_replace_layer
-    
+
     def slice_lora_a(self, lora_a):
         output_shard_size = self.lora_a_stacked[0].shape[2]
         output_start_idx = self.tp_rank * output_shard_size

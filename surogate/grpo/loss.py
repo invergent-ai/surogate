@@ -1,6 +1,7 @@
 """GRPO per-token gradient computation"""
 
 import logging
+
 import numpy as np
 
 from surogate.grpo.config import GRPOLossConfig
@@ -164,9 +165,15 @@ def compute_grpo_per_token_grads(
         n_samples += 1
 
         # Accumulate metrics
-        for key in ("policy_loss", "mismatch_kl", "masked_mismatch_kl",
-                     "unmasked_mismatch_kl", "is_masked", "is_masked_low",
-                     "is_masked_high"):
+        for key in (
+            "policy_loss",
+            "mismatch_kl",
+            "masked_mismatch_kl",
+            "unmasked_mismatch_kl",
+            "is_masked",
+            "is_masked_low",
+            "is_masked_high",
+        ):
             agg_metrics[key] += s_metrics[key]
         agg_metrics["keep_tokens"] += s_metrics["keep_tokens"]
         agg_metrics["total_tokens"] += s_metrics["total_tokens"]
@@ -177,9 +184,15 @@ def compute_grpo_per_token_grads(
 
     # Average float metrics over samples
     if n_samples > 0:
-        for key in ("policy_loss", "mismatch_kl", "masked_mismatch_kl",
-                     "unmasked_mismatch_kl", "is_masked", "is_masked_low",
-                     "is_masked_high"):
+        for key in (
+            "policy_loss",
+            "mismatch_kl",
+            "masked_mismatch_kl",
+            "unmasked_mismatch_kl",
+            "is_masked",
+            "is_masked_low",
+            "is_masked_high",
+        ):
             agg_metrics[key] /= n_samples
         if "teacher_kl" in agg_metrics:
             agg_metrics["teacher_kl"] /= n_samples

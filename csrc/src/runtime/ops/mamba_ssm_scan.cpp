@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -34,9 +36,7 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
     // Use op.attrs for dimensions — tensor Sizes may be wrong after DSL view() ops
     const int num_heads = op.attrs.mamba_num_heads;
     const int head_dim = op.attrs.mamba_head_dim;
-    const int D = op.attrs.intermediate_size > 0
-        ? op.attrs.intermediate_size
-        : num_heads * head_dim;
+    const int D = op.attrs.intermediate_size > 0 ? op.attrs.intermediate_size : num_heads * head_dim;
     const int groups = op.attrs.n_groups;
     const int dstate = op.attrs.ssm_state_size;
     const int B = static_cast<int>(u.Sizes[0]);  // Batch is always first dim
@@ -78,9 +78,24 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
     mTemps.push_back(x);
 
     // Call selective scan forward
-    mamba_selective_scan_forward(out, u, delta, A, B_ssm, C_ssm, D_expanded, dt_bias_expanded,
-                                  op.attrs.dt_min, op.attrs.dt_max,
-                                  x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
+    mamba_selective_scan_forward(out,
+                                 u,
+                                 delta,
+                                 A,
+                                 B_ssm,
+                                 C_ssm,
+                                 D_expanded,
+                                 dt_bias_expanded,
+                                 op.attrs.dt_min,
+                                 op.attrs.dt_max,
+                                 x,
+                                 B,
+                                 T,
+                                 D,
+                                 dstate,
+                                 groups,
+                                 n_chunks,
+                                 mRunState.MainStream);
 
     // Transpose output from [B, D, T] to [B, T, D] for downstream ops (gated RMSNorm, out_proj)
     // which expect standard [B, T, D] layout.  Gate from split_proj is [B, T, I] physical,
@@ -135,9 +150,7 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     // Use op.attrs for dimensions — tensor Sizes may be wrong after DSL view() ops
     const int num_heads = op.attrs.mamba_num_heads;
     const int head_dim = op.attrs.mamba_head_dim;
-    const int D = op.attrs.intermediate_size > 0
-        ? op.attrs.intermediate_size
-        : num_heads * head_dim;
+    const int D = op.attrs.intermediate_size > 0 ? op.attrs.intermediate_size : num_heads * head_dim;
     const int groups = op.attrs.n_groups;
     const int dstate = op.attrs.ssm_state_size;
     const int B = static_cast<int>(u.Sizes[0]);  // Batch is always first dim
@@ -195,10 +208,31 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     fill_zero(ddelta_bias_expanded, mRunState.MainStream);
 
     // Call selective scan backward (using transposed d_out in [B, D, T] layout)
-    mamba_selective_scan_backward(du, ddelta, dA, dB, dC, &dD_expanded, &ddelta_bias_expanded,
-                                   u, delta, A, B_ssm, C_ssm, D_expanded, dt_bias_expanded,
-                                   op.attrs.dt_min, op.attrs.dt_max,
-                                   d_out_bdt, x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
+    mamba_selective_scan_backward(du,
+                                  ddelta,
+                                  dA,
+                                  dB,
+                                  dC,
+                                  &dD_expanded,
+                                  &ddelta_bias_expanded,
+                                  u,
+                                  delta,
+                                  A,
+                                  B_ssm,
+                                  C_ssm,
+                                  D_expanded,
+                                  dt_bias_expanded,
+                                  op.attrs.dt_min,
+                                  op.attrs.dt_max,
+                                  d_out_bdt,
+                                  x,
+                                  B,
+                                  T,
+                                  D,
+                                  dstate,
+                                  groups,
+                                  n_chunks,
+                                  mRunState.MainStream);
 
     // Reduce expanded gradients back to per-head
     Tensor dA_log = mRunState.temp_alloc(ETensorDType::FP32, {num_heads}, "mamba_ssm_scan_dA_log");
@@ -223,4 +257,74 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     store_tensor(op.outputs[6], ddelta_bias);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Mamba SSM scan backward rule
+// Forward: out, ssm_state = mamba_ssm_scan(u, delta, A_log, B, C, D_param, dt_bias)
+// Backward: du, ddelta, dA_log, dB, dC, dD, ddelta_bias = mamba_ssm_scan_backward(...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_ssm_scan_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    std::string u = fwd.inputs[0];
+    std::string delta = fwd.inputs[1];
+    std::string A_log = fwd.inputs[2];
+    std::string B_ssm = fwd.inputs[3];
+    std::string C_ssm = fwd.inputs[4];
+    std::string D_param = fwd.inputs[5];
+    std::string dt_bias = (fwd.inputs.size() > 6) ? fwd.inputs[6] : "";
+
+    std::string u_ref = ctx.is_param(u) ? u : saved_ref(u);
+    std::string delta_ref = ctx.is_param(delta) ? delta : saved_ref(delta);
+    std::string A_log_ref = ctx.is_param(A_log) ? A_log : saved_ref(A_log);
+    std::string B_ssm_ref = ctx.is_param(B_ssm) ? B_ssm : saved_ref(B_ssm);
+    std::string C_ssm_ref = ctx.is_param(C_ssm) ? C_ssm : saved_ref(C_ssm);
+    std::string D_param_ref = ctx.is_param(D_param) ? D_param : saved_ref(D_param);
+    std::string dt_bias_ref = dt_bias.empty() ? "" : (ctx.is_param(dt_bias) ? dt_bias : saved_ref(dt_bias));
+
+    // ssm_state is the second output from forward, referenced via saved
+    std::string ssm_state_ref = saved_ref(fwd.outputs[1]);
+
+    std::vector<std::string> inputs = {ctx.d_output,  // d_out
+                                       u_ref,
+                                       delta_ref,
+                                       A_log_ref,
+                                       B_ssm_ref,
+                                       C_ssm_ref,
+                                       D_param_ref,
+                                       dt_bias_ref,
+                                       ssm_state_ref};
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // du
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // ddelta
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // dA_log
+    outputs.push_back(ctx.needs_grad(3) ? ctx.d_inputs[3] : "");  // dB
+    outputs.push_back(ctx.needs_grad(4) ? ctx.d_inputs[4] : "");  // dC
+    outputs.push_back(ctx.needs_grad(5) ? ctx.d_inputs[5] : "");  // dD
+    if (fwd.inputs.size() > 6 && ctx.needs_grad(6)) {
+        outputs.push_back(ctx.d_inputs[6]);  // ddelta_bias
+    }
+
+    AttrMap attrs =
+        copy_attrs(fwd.attrs,
+                   {"num_heads", "head_dim", "chunk_size", "ssm_state_size", "n_groups", "intermediate_size"},
+                   "mamba_ssm_scan");
+
+    ops.push_back(make_operation("mamba_ssm_scan_backward_" + std::to_string(ctx.op_counter++),
+                                 "mamba_ssm_scan_backward",
+                                 "mamba_ssm_scan_backward",
+                                 inputs,
+                                 outputs,
+                                 attrs));
+
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("mamba_ssm_scan", ::dsl::mamba_ssm_scan_backward);

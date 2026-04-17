@@ -20,10 +20,10 @@ from surogate.dsl import (
 )
 from surogate.dsl.errors import DSLError, ErrorCode
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_first_error_code(payload: str) -> str:
     doc = json.loads(payload)
@@ -171,8 +171,7 @@ def test_config_roundtrip_qwen3():
     # Every @hf_config mapped DSL key should be in the compiled IR config
     for dsl_key in hf_mapping:
         assert dsl_key in ir_config, (
-            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "
-            f"missing from compiled IR config"
+            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') missing from compiled IR config"
         )
 
 
@@ -233,8 +232,7 @@ def test_config_roundtrip_nemotron_h():
 
     for dsl_key in hf_mapping:
         assert dsl_key in ir_config, (
-            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "
-            f"missing from compiled IR config"
+            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') missing from compiled IR config"
         )
 
 
@@ -276,8 +274,7 @@ def test_config_roundtrip_qwen3_moe():
 
     for dsl_key in hf_mapping:
         assert dsl_key in ir_config, (
-            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "
-            f"missing from compiled IR config"
+            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') missing from compiled IR config"
         )
 
 
@@ -333,8 +330,7 @@ def test_config_roundtrip_qwen3_5_conditional():
     ir_config = doc["modules"][0]["config"]
     for dsl_key in hf_mapping:
         assert dsl_key in ir_config, (
-            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "
-            f"missing from compiled IR config"
+            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') missing from compiled IR config"
         )
 
 
@@ -388,6 +384,5 @@ def test_config_roundtrip_qwen3_5_causal():
     ir_config = doc["modules"][0]["config"]
     for dsl_key in hf_mapping:
         assert dsl_key in ir_config, (
-            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "
-            f"missing from compiled IR config"
+            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') missing from compiled IR config"
         )

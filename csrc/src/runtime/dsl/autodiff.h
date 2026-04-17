@@ -101,21 +101,19 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
 std::vector<std::string> compute_required_saves(const Graph& forward, const Graph& backward);
 
 // Helper to create an operation
-Operation make_operation(
-    const std::string& id,
-    const std::string& name,
-    const std::string& kernel_type,
-    const std::vector<std::string>& inputs,
-    const std::vector<std::string>& outputs,
-    const AttrMap& attrs = {});
+Operation make_operation(const std::string& id,
+                         const std::string& name,
+                         const std::string& kernel_type,
+                         const std::vector<std::string>& inputs,
+                         const std::vector<std::string>& outputs,
+                         const AttrMap& attrs = {});
 
 // Convenience overload with auto-generated ID
-Operation make_operation(
-    const std::string& name,
-    const std::vector<std::string>& inputs,
-    const std::vector<std::string>& outputs,
-    const AttrMap& attrs = {},
-    int* counter = nullptr);
+Operation make_operation(const std::string& name,
+                         const std::vector<std::string>& inputs,
+                         const std::vector<std::string>& outputs,
+                         const AttrMap& attrs = {},
+                         int* counter = nullptr);
 
 // Helper to create a "saved.X" reference name
 inline std::string saved_ref(const std::string& name) {
@@ -127,10 +125,30 @@ inline std::string grad_name(const std::string& name, const std::string& prefix 
     return prefix + name;
 }
 
+// ---------------------------------------------------------------------------
+// Helpers used by autodiff rules. Promoted here in Phase 2b so individual
+// rule files can use them directly (previously they lived in an anonymous
+// namespace inside the monolithic autodiff_rules.cpp).
+//
+// Note: `find_attr(attrs, key)` is NOT declared here — it lives in
+// runtime/executor/graph_executor_utils.h and takes a string_view.
+// Include that header if you need it; the autodiff rule code below uses
+// its string_view overload.
+// ---------------------------------------------------------------------------
+
+// Fetch a string attribute, returning `default_val` if absent or
+// non-string-typed.
+std::string get_string_attr(const AttrMap& attrs, const std::string& key, const std::string& default_val = "");
+
+// Copy a subset of attributes from `src` into a new AttrMap, keeping
+// only the named keys. If `rule_name` is non-null, missing keys produce
+// a stderr warning to catch forward-op ↔ backward-rule name drift.
+AttrMap copy_attrs(const AttrMap& src, const std::vector<std::string>& keys, const char* rule_name = nullptr);
+
 // Initialize all built-in backward rules.
 // Called automatically on first use, but can be called explicitly.
 void register_builtin_backward_rules();
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_AUTODIFF_H
+#endif  // SUROGATE_SRC_DSL_AUTODIFF_H

@@ -40,10 +40,20 @@ void Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     // Weight is (N, K), inp is (M, K), out is (M, N)
     std::optional<Tensor> bias_opt = ctx.has_bias() ? std::make_optional(*ctx.bias) : std::nullopt;
 
-    matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt,
-           /*scale_a=*/nullptr, /*scale_b=*/nullptr,
-           rs.CublasLtHandle, rs.CuBlasWorkspace,
-           N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+    matmul(*ctx.out,
+           *ctx.weight,
+           *ctx.inp,
+           bias_opt,
+           /*scale_a=*/nullptr,
+           /*scale_b=*/nullptr,
+           rs.CublasLtHandle,
+           rs.CuBlasWorkspace,
+           N,
+           M,
+           K,
+           EMMTranspose::TN,
+           /*accumulate=*/false,
+           ctx.stream);
 }
 
 // =============================================================================
@@ -71,17 +81,37 @@ void Recipe::backward_matmul(modules::MatmulContext& ctx) const {
 
     // dinp = W^T @ dout => (K, N) @ (M, N)^T = (K, M)^T = (M, K)
     // Using NN layout: dinp = weight @ dout where weight is (N, K) -> need (K, N)
-    matmul(*ctx.dinp, *ctx.weight, *ctx.dout, std::nullopt,
-           /*scale_a=*/nullptr, /*scale_b=*/nullptr,
-           rs.CublasLtHandle, rs.CuBlasWorkspace,
-           K, M, N, EMMTranspose::NN, /*accumulate=*/false, ctx.stream);
+    matmul(*ctx.dinp,
+           *ctx.weight,
+           *ctx.dout,
+           std::nullopt,
+           /*scale_a=*/nullptr,
+           /*scale_b=*/nullptr,
+           rs.CublasLtHandle,
+           rs.CuBlasWorkspace,
+           K,
+           M,
+           N,
+           EMMTranspose::NN,
+           /*accumulate=*/false,
+           ctx.stream);
 
     // dweight = inp^T @ dout => (K, M) @ (M, N) = (K, N) => stored as (N, K)
     if (!ctx.skip_weight_grad && ctx.dweight) {
-        matmul(*ctx.dweight, *ctx.inp, *ctx.dout, std::nullopt,
-               /*scale_a=*/nullptr, /*scale_b=*/nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               K, N, M, EMMTranspose::NT, /*accumulate=*/ctx.accumulate, ctx.stream);
+        matmul(*ctx.dweight,
+               *ctx.inp,
+               *ctx.dout,
+               std::nullopt,
+               /*scale_a=*/nullptr,
+               /*scale_b=*/nullptr,
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               K,
+               N,
+               M,
+               EMMTranspose::NT,
+               /*accumulate=*/ctx.accumulate,
+               ctx.stream);
 
         // Bias gradient if requested
         if (ctx.dbias && ctx.dbias->Data) {
@@ -98,12 +128,18 @@ void Recipe::backward_matmul(modules::MatmulContext& ctx) const {
 void Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // Default implementation: BF16 MoE grouped GEMM via cuDNN Frontend.
     // Derived recipes (FP8, FP4) override to add weight dequantization.
-    moe_cudnn_grouped_gemm(
-        ctx.out, ctx.inp, ctx.weights,
-        ctx.expert_offsets, ctx.num_experts,
-        ctx.N, ctx.K, ctx.total_tokens,
-        ctx.cudnn_handle, ctx.workspace, ctx.workspace_size,
-        ctx.stream);
+    moe_cudnn_grouped_gemm(ctx.out,
+                           ctx.inp,
+                           ctx.weights,
+                           ctx.expert_offsets,
+                           ctx.num_experts,
+                           ctx.N,
+                           ctx.K,
+                           ctx.total_tokens,
+                           ctx.cudnn_handle,
+                           ctx.workspace,
+                           ctx.workspace_size,
+                           ctx.stream);
 }
 
 void Recipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const {
@@ -122,13 +158,19 @@ void Recipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const {
 
     // dinp = weights^T @ dout
     // Use the generic moe_grouped_gemm_up_backward kernel which computes d_input = d_output @ weights^T
-    moe_grouped_gemm_up_backward(
-        ctx.dinp, ctx.dout, ctx.weights,
-        ctx.expert_offsets, ctx.num_experts,
-        ctx.K, ctx.N,  // hidden_size=K, intermediate_size=N (swapped for backward)
-        reinterpret_cast<cublasHandle_t>(ctx.cublas_handle), ctx.stream,
-        ctx.host_offsets,
-        ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
+    moe_grouped_gemm_up_backward(ctx.dinp,
+                                 ctx.dout,
+                                 ctx.weights,
+                                 ctx.expert_offsets,
+                                 ctx.num_experts,
+                                 ctx.K,
+                                 ctx.N,  // hidden_size=K, intermediate_size=N (swapped for backward)
+                                 reinterpret_cast<cublasHandle_t>(ctx.cublas_handle),
+                                 ctx.stream,
+                                 ctx.host_offsets,
+                                 ctx.active_experts,
+                                 ctx.weight_is_compact,
+                                 ctx.num_active);
 }
 
 // =============================================================================
@@ -156,8 +198,7 @@ void Recipe::swiglu_backward(modules::SwiGLUContext& ctx) const {
         throw std::runtime_error("Recipe::swiglu_backward: required tensors are null");
     }
 
-    ::swiglu_backward(*ctx.dinp, *ctx.dout, *ctx.inp, ctx.abs_max_out,
-                      ctx.B, ctx.T, ctx.D, ctx.stream);
+    ::swiglu_backward(*ctx.dinp, *ctx.dout, *ctx.inp, ctx.abs_max_out, ctx.B, ctx.T, ctx.D, ctx.stream);
 }
 
 }  // namespace recipes

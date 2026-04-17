@@ -20,9 +20,9 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"ln1", TensorSlot::BlockLN1},
     {"ln1_flat", TensorSlot::BlockLN1},
     {"ln1_rstd", TensorSlot::BlockLN1RSTD},
-    {"ln", TensorSlot::BlockLN1},            // Alias for single-norm blocks (Mamba, MLP)
-    {"ln_flat", TensorSlot::BlockLN1},        // Alias for single-norm blocks
-    {"ln_rstd", TensorSlot::BlockLN1RSTD},   // Alias for single-norm blocks
+    {"ln", TensorSlot::BlockLN1},           // Alias for single-norm blocks (Mamba, MLP)
+    {"ln_flat", TensorSlot::BlockLN1},      // Alias for single-norm blocks
+    {"ln_rstd", TensorSlot::BlockLN1RSTD},  // Alias for single-norm blocks
     {"ln2", TensorSlot::BlockLN2},
     {"ln2_flat", TensorSlot::BlockLN2},
     {"ln2_rstd", TensorSlot::BlockLN2RSTD},
@@ -52,7 +52,7 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"res_in", TensorSlot::BlockResidualFFN},
     // Block gradients
     {"d_ln1", TensorSlot::BlockDLN1},
-    {"d_ln", TensorSlot::BlockDLN1},           // Alias for single-norm blocks (Mamba, MLP)
+    {"d_ln", TensorSlot::BlockDLN1},  // Alias for single-norm blocks (Mamba, MLP)
     {"d_qkv", TensorSlot::BlockDQKV},
     {"d_qkv_rope", TensorSlot::BlockDQKV},
     {"d_qkv_rope_flat", TensorSlot::BlockDQKV},
@@ -254,8 +254,7 @@ bool TensorSlotRegistry::is_global_activation(const std::string& name) const {
 
 bool TensorSlotRegistry::is_gradient(const std::string& name) const {
     auto entry = lookup(name);
-    return entry && (entry->scope == ActivationScope::Gradient ||
-                     entry->scope == ActivationScope::GlobalGradient);
+    return entry && (entry->scope == ActivationScope::Gradient || entry->scope == ActivationScope::GlobalGradient);
 }
 
 std::string TensorSlotRegistry::get_canonical_name(const std::string& name) const {
@@ -268,8 +267,7 @@ std::string TensorSlotRegistry::get_canonical_name(const std::string& name) cons
 
 bool TensorSlotRegistry::can_recompute(const std::string& name) const {
     auto entry = lookup(name);
-    return entry && (entry->recompute_in_backward ||
-                     entry->memory_hint == ActivationMemoryHint::Recompute);
+    return entry && (entry->recompute_in_backward || entry->memory_hint == ActivationMemoryHint::Recompute);
 }
 
 bool TensorSlotRegistry::will_recompute(const std::string& name, bool lora_only_mode) const {
@@ -279,8 +277,7 @@ bool TensorSlotRegistry::will_recompute(const std::string& name, bool lora_only_
     }
 
     // Must be marked as recomputable
-    if (!entry->recompute_in_backward &&
-        entry->memory_hint != ActivationMemoryHint::Recompute) {
+    if (!entry->recompute_in_backward && entry->memory_hint != ActivationMemoryHint::Recompute) {
         return false;
     }
 
@@ -353,14 +350,11 @@ bool TensorSlotRegistry::should_share(const std::string& name, bool lora_only_mo
             // The caller must ensure this is safe for their use case
             return true;
 
-        case SharePolicy::FFTShare:
-            return recompute_enabled && !lora_only_mode;
+        case SharePolicy::FFTShare: return recompute_enabled && !lora_only_mode;
 
-        case SharePolicy::LoRAShare:
-            return recompute_enabled && lora_only_mode;
+        case SharePolicy::LoRAShare: return recompute_enabled && lora_only_mode;
 
-        case SharePolicy::AlwaysRecompute:
-            return recompute_enabled;
+        case SharePolicy::AlwaysRecompute: return recompute_enabled;
     }
 
     // Fallback (should not reach here)

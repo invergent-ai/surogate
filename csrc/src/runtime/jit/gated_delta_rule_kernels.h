@@ -125,4 +125,4 @@ private:
     std::optional<JitKernel> l2norm_bwd_q_;
 };
 
-#endif // SUROGATE_SRC_RUNTIME_JIT_GATED_DELTA_RULE_KERNELS_H
+#endif  // SUROGATE_SRC_RUNTIME_JIT_GATED_DELTA_RULE_KERNELS_H

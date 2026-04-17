@@ -22,7 +22,9 @@
 struct RuntimeOptions;
 struct PretrainedConfig;
 class NCCLCommunicator;
-namespace modules { struct ModularLoRAConfig; }
+namespace modules {
+struct ModularLoRAConfig;
+}  // namespace modules
 
 namespace dsl {
 
@@ -30,12 +32,12 @@ namespace dsl {
  * @brief Status tracking for double-buffered weight prefetching.
  */
 struct WeightGatherStatus {
-    int layer_idx = -1;                ///< Which layer is stored in this buffer
-    cudaEvent_t done_event = nullptr;  ///< Event signaling gather/copy is complete (side_stream)
-    cudaEvent_t release_event = nullptr; ///< Event signaling MainStream is done reading this buffer
-    bool fetch_pending = false;        ///< Whether a gather is in progress
-    bool is_ready = true;              ///< Whether buffer is available for reuse
-    int version = -1;                  ///< Cache version for invalidation
+    int layer_idx = -1;                   ///< Which layer is stored in this buffer
+    cudaEvent_t done_event = nullptr;     ///< Event signaling gather/copy is complete (side_stream)
+    cudaEvent_t release_event = nullptr;  ///< Event signaling MainStream is done reading this buffer
+    bool fetch_pending = false;           ///< Whether a gather is in progress
+    bool is_ready = true;                 ///< Whether buffer is available for reuse
+    int version = -1;                     ///< Cache version for invalidation
 };
 
 /**
@@ -70,13 +72,13 @@ struct DslWeightManagerConfig {
  * @brief Weight entry with master and work tensors.
  */
 struct DslWeightEntry {
-    Tensor master;           ///< Master weight (may be on CPU if offloaded)
-    Tensor work;             ///< Work weight (always on GPU during computation)
-    std::vector<long> global_shape; ///< Full (unsharded) shape for this weight
-    bool master_sharded = false; ///< Whether master tensor is sharded across ranks
-    bool trainable = true;   ///< Whether this weight is trainable
-    bool is_block = false;   ///< Whether this is a per-layer block weight
-    int layer_idx = -1;      ///< Layer index for block weights (-1 for non-block)
+    Tensor master;                   ///< Master weight (may be on CPU if offloaded)
+    Tensor work;                     ///< Work weight (always on GPU during computation)
+    std::vector<long> global_shape;  ///< Full (unsharded) shape for this weight
+    bool master_sharded = false;     ///< Whether master tensor is sharded across ranks
+    bool trainable = true;           ///< Whether this weight is trainable
+    bool is_block = false;           ///< Whether this is a per-layer block weight
+    int layer_idx = -1;              ///< Layer index for block weights (-1 for non-block)
 };
 
 /**
@@ -129,21 +131,30 @@ public:
     void sync_work_from_master(cudaStream_t stream);
 
     // Metadata
-    const std::vector<std::string>& param_names() const { return mParamOrder; }
+    const std::vector<std::string>& param_names() const {
+        return mParamOrder;
+    }
     const std::vector<std::string>& block_param_names(int layer_idx) const;
-    int num_layers() const { return mConfig.num_layers; }
-    bool is_streaming_enabled() const { return mStreamWeights; }
-    bool is_offload_enabled() const { return mConfig.offload_master || mConfig.offload_quants; }
+    int num_layers() const {
+        return mConfig.num_layers;
+    }
+    bool is_streaming_enabled() const {
+        return mStreamWeights;
+    }
+    bool is_offload_enabled() const {
+        return mConfig.offload_master || mConfig.offload_quants;
+    }
     /// True when block weights need per-layer gather (sharding OR offloading).
-    bool needs_block_gather() const { return mStreamWeights || mConfig.offload_master; }
+    bool needs_block_gather() const {
+        return mStreamWeights || mConfig.offload_master;
+    }
     bool is_sharded(const std::string& name) const;
 
     // ITensorContainer interface (for checkpointing)
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 
 private:
-    void allocate_weights(const Module& module, const Graph& graph,
-                          const modules::ModularLoRAConfig* lora_config);
+    void allocate_weights(const Module& module, const Graph& graph, const modules::ModularLoRAConfig* lora_config);
     void allocate_prefetch_buffers();
     void create_cuda_resources();
     void release_cuda_resources() noexcept;
@@ -193,6 +204,6 @@ private:
     cudaEvent_t mNonBlockEvents[3] = {nullptr, nullptr, nullptr};  // emb, final_norm, lm_head
 };
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_DSL_WEIGHT_MANAGER_H
+#endif  // SUROGATE_SRC_DSL_DSL_WEIGHT_MANAGER_H

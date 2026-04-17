@@ -14,16 +14,16 @@ triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.u
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 
 from surogate.kernels.triton.gated_delta_rule import (
-    chunk_local_cumsum_kernel,
-    chunk_scaled_dot_kkt_fwd_kernel,
-    solve_tril_64x64_kernel,
-    recompute_w_u_fwd_kernel,
-    chunk_fwd_h_kernel,
-    chunk_fwd_o_kernel,
-    chunk_bwd_dv_local_kernel,
     chunk_bwd_dhu_kernel,
     chunk_bwd_dqkwg_kernel,
+    chunk_bwd_dv_local_kernel,
+    chunk_fwd_h_kernel,
+    chunk_fwd_o_kernel,
+    chunk_local_cumsum_kernel,
+    chunk_scaled_dot_kkt_fwd_kernel,
     prepare_wy_repr_bwd_kernel,
+    recompute_w_u_fwd_kernel,
+    solve_tril_64x64_kernel,
 )
 
 
@@ -63,6 +63,7 @@ def _bench_cuda_ms(fn, warmup: int, iters: int) -> float:
 # Forward / backward pipelines using our kernels
 # ---------------------------------------------------------------------------
 
+
 def _surogate_fwd(q, k, v, g_input, beta, scale, h0):
     """Run surogate forward pipeline, return (g_cum, o, Ai, w, u, h, v_new, ht)."""
     B, T, H, K = q.shape
@@ -91,13 +92,15 @@ def _surogate_fwd(q, k, v, g_input, beta, scale, h0):
     ht = torch.empty(B, H, K, V, dtype=torch.float32, device=q.device)
     v_new = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=q.device)
     chunk_fwd_h_kernel[(triton.cdiv(V, BV_h), B * H)](
-        k, u, w, v_new, g, h, h0, ht, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2)
+        k, u, w, v_new, g, h, h0, ht, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2
+    )
 
     BK_o = min(max(triton.next_power_of_2(K), 16), 64)
     BV_o = min(max(triton.next_power_of_2(V), 16), 64)
     o = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=q.device)
     chunk_fwd_o_kernel[(triton.cdiv(V, BV_o), NT, B * H)](
-        q, k, v_new, h, g, o, scale, T, H=H, K=K, V=V, BT=BT, BK=BK_o, BV=BV_o)
+        q, k, v_new, h, g, o, scale, T, H=H, K=K, V=V, BT=BT, BK=BK_o, BV=BV_o
+    )
 
     return g, o, Ai, w, u, h, v_new, ht
 
@@ -120,7 +123,8 @@ def _surogate_bwd(q, k, v, g, beta, Ai, scale, h0, do, dht):
     ht_dummy = torch.empty(B, H, K, V, dtype=torch.float32, device=q.device)
     v_new = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=q.device)
     chunk_fwd_h_kernel[(triton.cdiv(V, BV_h), B * H)](
-        k, u, w, v_new, g, h, h0, ht_dummy, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2)
+        k, u, w, v_new, g, h, h0, ht_dummy, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2
+    )
 
     # dv_local
     BK_bwd = min(max(triton.next_power_of_2(K), 16), 64)
@@ -133,7 +137,8 @@ def _surogate_bwd(q, k, v, g, beta, Ai, scale, h0, do, dht):
     dh0 = torch.empty(B, H, K, V, dtype=torch.float32, device=q.device)
     dv2 = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=q.device)
     chunk_bwd_dhu_kernel[(triton.cdiv(V, BV_h), B * H)](
-        q, k, w, g, dht, dh0, do, dh, dv, dv2, scale, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2)
+        q, k, w, g, dht, dh0, do, dh, dv, dv2, scale, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2
+    )
 
     # bwd_dqkwg
     NK = triton.cdiv(K, BK_bwd)
@@ -142,16 +147,16 @@ def _surogate_bwd(q, k, v, g, beta, Ai, scale, h0, do, dht):
     dw = torch.empty(B, T, H, K, dtype=torch.bfloat16, device=q.device)
     dg_nk = torch.empty(NK, B, T, H, dtype=torch.float32, device=q.device)
     chunk_bwd_dqkwg_kernel[(NK, NT, B * H)](
-        q, k, v_new, g, h, do, dh, dq, dk, dw, dv2, dg_nk, scale, B, T,
-        H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd)
+        q, k, v_new, g, h, do, dh, dq, dk, dw, dv2, dg_nk, scale, B, T, H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd
+    )
     dg = dg_nk.sum(0)
 
     # bwd_wy
     db = torch.empty(B, T, H, dtype=torch.bfloat16, device=q.device)
     dg_wy = torch.empty(B, T, H, dtype=torch.float32, device=q.device)
     prepare_wy_repr_bwd_kernel[(NT, B * H)](
-        k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T,
-        H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd)
+        k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T, H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd
+    )
     dg.add_(dg_wy)
 
     # reverse cumsum
@@ -164,6 +169,7 @@ def _surogate_bwd(q, k, v, g, beta, Ai, scale, h0, do, dht):
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
+
 
 def _run_case(
     B: int,
@@ -213,8 +219,7 @@ def _run_case(
         _surogate_fwd(qx, kx, v, g, beta, scale, initial_state)
 
     def run_bwd() -> None:
-        dq, dk, _dv, _db, dg, _dh0 = _surogate_bwd(
-            q_norm, k_norm, v, g_cum, beta, Ai, scale, initial_state, do_t, dht)
+        dq, dk, _dv, _db, dg, _dh0 = _surogate_bwd(q_norm, k_norm, v, g_cum, beta, Ai, scale, initial_state, do_t, dht)
         if use_qk_l2norm_in_kernel:
             _ = l2norm_bwd(q_norm, q_rstd, dq)
             _ = l2norm_bwd(k_norm, k_rstd, dk)
@@ -228,8 +233,7 @@ def _run_case(
             qx, qx_rstd = q, None
             kx, kx_rstd = k, None
         gx, _ox, Ax, _w, _u, _h, _vn, _ht = _surogate_fwd(qx, kx, v, g, beta, scale, initial_state)
-        dq, dk, _dv, _db, dg, _dh0 = _surogate_bwd(
-            qx, kx, v, gx, beta, Ax, scale, initial_state, do_t, dht)
+        dq, dk, _dv, _db, dg, _dh0 = _surogate_bwd(qx, kx, v, gx, beta, Ax, scale, initial_state, do_t, dht)
         if use_qk_l2norm_in_kernel:
             _ = l2norm_bwd(qx, qx_rstd, dq)
             _ = l2norm_bwd(kx, kx_rstd, dk)
@@ -304,17 +308,80 @@ def _jit_warmup(B: int, T: int, H: int, K: int, V: int) -> None:
     dg_wy = torch.empty(B, T, H, dtype=torch.float32, device=device)
 
     kernels = [
-        ("cumsum_fwd", lambda: chunk_local_cumsum_kernel[(NT, B*H)](g_in, g, T, H=H, BT=BT, REVERSE=0)),
-        ("cumsum_rev", lambda: chunk_local_cumsum_kernel[(NT, B*H)](g, torch.empty_like(g), T, H=H, BT=BT, REVERSE=1)),
-        ("kkt_fwd", lambda: chunk_scaled_dot_kkt_fwd_kernel[(NT, B*H)](k, g, beta, A, T, H=H, K=K, BT=BT, BK=BK_kkt)),
-        ("solve_tril", lambda: solve_tril_64x64_kernel[(NT, B*H)](A, Ai, T, H=H, BT=BT, USE_TMA=int(use_tma), DOT_PRECISION="tf32")),
-        ("wy_fwd", lambda: recompute_w_u_fwd_kernel[(NT, B*H)](k, v, beta, w, u, Ai, g, T, H=H, K=K, V=V, BT=BT, BK=64, BV=64)),
-        ("fwd_h", lambda: chunk_fwd_h_kernel[(triton.cdiv(V, BV_h), B*H)](k, u, w, v_new, g, h, h0, ht, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2)),
-        ("fwd_o", lambda: chunk_fwd_o_kernel[(triton.cdiv(V, BV_o), NT, B*H)](q, k, v_new, h, g, o, scale, T, H=H, K=K, V=V, BT=BT, BK=BK_o, BV=BV_o)),
-        ("bwd_dv_local", lambda: chunk_bwd_dv_local_kernel[(NT, B*H)](q, k, g, do_t, dv, scale, T, H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd)),
-        ("bwd_dhu", lambda: chunk_bwd_dhu_kernel[(triton.cdiv(V, BV_h), B*H)](q, k, w, g, dht, dh0, do_t, dh, dv, dv2, scale, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2)),
-        ("bwd_dqkwg", lambda: chunk_bwd_dqkwg_kernel[(NK, NT, B*H)](q, k, v_new, g, h, do_t, dh, dq, dk, dw, dv2, dg_nk, scale, B, T, H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd)),
-        ("bwd_wy", lambda: prepare_wy_repr_bwd_kernel[(NT, B*H)](k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T, H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd)),
+        ("cumsum_fwd", lambda: chunk_local_cumsum_kernel[(NT, B * H)](g_in, g, T, H=H, BT=BT, REVERSE=0)),
+        (
+            "cumsum_rev",
+            lambda: chunk_local_cumsum_kernel[(NT, B * H)](g, torch.empty_like(g), T, H=H, BT=BT, REVERSE=1),
+        ),
+        ("kkt_fwd", lambda: chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](k, g, beta, A, T, H=H, K=K, BT=BT, BK=BK_kkt)),
+        (
+            "solve_tril",
+            lambda: solve_tril_64x64_kernel[(NT, B * H)](
+                A, Ai, T, H=H, BT=BT, USE_TMA=int(use_tma), DOT_PRECISION="tf32"
+            ),
+        ),
+        (
+            "wy_fwd",
+            lambda: recompute_w_u_fwd_kernel[(NT, B * H)](
+                k, v, beta, w, u, Ai, g, T, H=H, K=K, V=V, BT=BT, BK=64, BV=64
+            ),
+        ),
+        (
+            "fwd_h",
+            lambda: chunk_fwd_h_kernel[(triton.cdiv(V, BV_h), B * H)](
+                k, u, w, v_new, g, h, h0, ht, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2
+            ),
+        ),
+        (
+            "fwd_o",
+            lambda: chunk_fwd_o_kernel[(triton.cdiv(V, BV_o), NT, B * H)](
+                q, k, v_new, h, g, o, scale, T, H=H, K=K, V=V, BT=BT, BK=BK_o, BV=BV_o
+            ),
+        ),
+        (
+            "bwd_dv_local",
+            lambda: chunk_bwd_dv_local_kernel[(NT, B * H)](
+                q, k, g, do_t, dv, scale, T, H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd
+            ),
+        ),
+        (
+            "bwd_dhu",
+            lambda: chunk_bwd_dhu_kernel[(triton.cdiv(V, BV_h), B * H)](
+                q, k, w, g, dht, dh0, do_t, dh, dv, dv2, scale, T, H=H, K=K, V=V, BT=BT, BV=BV_h, num_stages=2
+            ),
+        ),
+        (
+            "bwd_dqkwg",
+            lambda: chunk_bwd_dqkwg_kernel[(NK, NT, B * H)](
+                q,
+                k,
+                v_new,
+                g,
+                h,
+                do_t,
+                dh,
+                dq,
+                dk,
+                dw,
+                dv2,
+                dg_nk,
+                scale,
+                B,
+                T,
+                H=H,
+                K=K,
+                V=V,
+                BT=BT,
+                BK=BK_bwd,
+                BV=BV_bwd,
+            ),
+        ),
+        (
+            "bwd_wy",
+            lambda: prepare_wy_repr_bwd_kernel[(NT, B * H)](
+                k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T, H=H, K=K, V=V, BT=BT, BK=BK_bwd, BV=BV_bwd
+            ),
+        ),
     ]
 
     total = len(kernels)
@@ -345,7 +412,7 @@ def main() -> None:
         B0, T0 = 1, 128  # minimal size for compilation
         print(f"[surogate gdr] JIT warmup for H={H} K={K} V={V}...")
         _jit_warmup(B0, T0, H, K, V)
-        print(f"[surogate gdr] JIT warmup done.")
+        print("[surogate gdr] JIT warmup done.")
 
     report: dict[str, object] = {
         "meta": {

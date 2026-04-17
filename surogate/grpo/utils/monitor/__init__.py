@@ -31,7 +31,7 @@ def setup_monitor(
     wandb_config: GRPOReportingConfig | None = None,
     output_dir: Path | None = None,
     tokenizer: PreTrainedTokenizer | None = None,
-    run_config = None,
+    run_config=None,
 ) -> Monitor:
     """
     Sets up monitors to log metrics.

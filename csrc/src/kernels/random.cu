@@ -34,8 +34,13 @@
  * @param seed Random seed for reproducibility.
  * @param subsequence Subsequence offset for parallel streams.
  */
-template<typename floatX>
-__global__ void rng_normal_kernel(floatX* dst, std::size_t count, float mean, float std, unsigned long long seed, unsigned long long subsequence) {
+template <typename floatX>
+__global__ void rng_normal_kernel(floatX* dst,
+                                  std::size_t count,
+                                  float mean,
+                                  float std,
+                                  unsigned long long seed,
+                                  unsigned long long subsequence) {
     curandStatePhilox4_32_10_t state;
     long id = 4 * (threadIdx.x + blockIdx.x * blockDim.x);
     if (id >= count) return;
@@ -65,10 +70,21 @@ __global__ void rng_normal_kernel(floatX* dst, std::size_t count, float mean, fl
  * @param subsequence Subsequence offset for parallel streams.
  * @param stream CUDA stream for asynchronous execution.
  */
-template<typename floatX>
-void rng_normal_imp(floatX* dst, std::size_t count, float mean, float std, unsigned long long seed, unsigned long long subsequence, cudaStream_t stream) {
+template <typename floatX>
+void rng_normal_imp(floatX* dst,
+                    std::size_t count,
+                    float mean,
+                    float std,
+                    unsigned long long seed,
+                    unsigned long long subsequence,
+                    cudaStream_t stream) {
     assert(count % 4 == 0);
-    rng_normal_kernel<<<div_ceil(count, static_cast<std::size_t>(4*256)), 256, 0, stream>>> (dst, count, mean, std, seed, subsequence);
+    rng_normal_kernel<<<div_ceil(count, static_cast<std::size_t>(4 * 256)), 256, 0, stream>>>(dst,
+                                                                                              count,
+                                                                                              mean,
+                                                                                              std,
+                                                                                              seed,
+                                                                                              subsequence);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -83,7 +99,13 @@ void rng_normal_imp(floatX* dst, std::size_t count, float mean, float std, unsig
  * @param subsequence Subsequence offset for parallel streams.
  * @param stream CUDA stream for asynchronous execution.
  */
-void fill_normal(float* dst, std::size_t count, float mean, float std, unsigned long long seed, unsigned long long subsequence, cudaStream_t stream) {
+void fill_normal(float* dst,
+                 std::size_t count,
+                 float mean,
+                 float std,
+                 unsigned long long seed,
+                 unsigned long long subsequence,
+                 cudaStream_t stream) {
     rng_normal_imp<float>(dst, count, mean, std, seed, subsequence, stream);
 }
 
@@ -100,6 +122,12 @@ void fill_normal(float* dst, std::size_t count, float mean, float std, unsigned 
  * @param subsequence Subsequence offset for parallel streams.
  * @param stream CUDA stream for asynchronous execution.
  */
-void fill_normal(nv_bfloat16* dst, std::size_t count, float mean, float std, unsigned long long seed, unsigned long long subsequence, cudaStream_t stream) {
+void fill_normal(nv_bfloat16* dst,
+                 std::size_t count,
+                 float mean,
+                 float std,
+                 unsigned long long seed,
+                 unsigned long long subsequence,
+                 cudaStream_t stream) {
     rng_normal_imp<nv_bfloat16>(dst, count, mean, std, seed, subsequence, stream);
 }

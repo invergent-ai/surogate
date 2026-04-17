@@ -16,10 +16,9 @@
 
 #include <cuda_bf16.h>
 
-namespace std
-{
-    class jthread;
-}
+namespace std {
+class jthread;
+}  // namespace std
 
 struct Tensor;
 struct TensorShard;
@@ -36,7 +35,6 @@ public:
     virtual void join() = 0;
     virtual bool has_exception() const = 0;
 };
-
 
 class NCCLCommunicator {
 public:
@@ -62,21 +60,35 @@ public:
     void reduce_norm(float* norm_squared, cudaStream_t stream);
     void all_reduce_sum_int(int* values, int n, cudaStream_t stream);
 
-    void reduce_max(float* values, int n = 1, cudaStream_t stream=nullptr);
+    void reduce_max(float* values, int n = 1, cudaStream_t stream = nullptr);
 
     //! All-reduce tensor data in-place using average (for gradient averaging in data parallelism)
     void all_reduce_avg(Tensor& tensor, cudaStream_t stream);
 
     void wait_on_comms(cudaStream_t compute_stream);
 
-    [[nodiscard]] int rank() const { return mRank; }
-    [[nodiscard]] int world_size() const { return mWorld; }
-    [[nodiscard]] int local_rank() const { return mLocalRank; }
-    [[nodiscard]] virtual int num_nodes() const { return 1; }
-    [[nodiscard]] virtual int node_rank() const { return 0; }
-    [[nodiscard]] virtual int num_local_gpus() const { return mWorld; }
+    [[nodiscard]] int rank() const {
+        return mRank;
+    }
+    [[nodiscard]] int world_size() const {
+        return mWorld;
+    }
+    [[nodiscard]] int local_rank() const {
+        return mLocalRank;
+    }
+    [[nodiscard]] virtual int num_nodes() const {
+        return 1;
+    }
+    [[nodiscard]] virtual int node_rank() const {
+        return 0;
+    }
+    [[nodiscard]] virtual int num_local_gpus() const {
+        return mWorld;
+    }
 
-    [[nodiscard]] cudaStream_t stream() const { return mCommsStream; }
+    [[nodiscard]] cudaStream_t stream() const {
+        return mCommsStream;
+    }
 
     // ========================================================================
     // Expert Parallelism (EP) process groups
@@ -90,15 +102,33 @@ public:
     /// @param ep_size Number of EP ranks (must divide world_size; 1 = no EP)
     void init_ep_groups(int ep_size);
 
-    [[nodiscard]] int ep_rank() const { return mEPRank; }
-    [[nodiscard]] int ep_size() const { return mEPSize; }
-    [[nodiscard]] int dp_rank() const { return mDPRank; }
-    [[nodiscard]] int dp_size() const { return mDPSize; }
-    [[nodiscard]] bool ep_enabled() const { return mEPSize > 1; }
-    [[nodiscard]] ncclComm_t comm() const { return mNcclComm; }
-    [[nodiscard]] ncclComm_t ep_comm() const { return mEPComm; }
-    [[nodiscard]] ncclComm_t dp_comm() const { return mDPComm; }
-    [[nodiscard]] ncclComm_t weight_transfer_comm() const { return mWeightTransferComm; }
+    [[nodiscard]] int ep_rank() const {
+        return mEPRank;
+    }
+    [[nodiscard]] int ep_size() const {
+        return mEPSize;
+    }
+    [[nodiscard]] int dp_rank() const {
+        return mDPRank;
+    }
+    [[nodiscard]] int dp_size() const {
+        return mDPSize;
+    }
+    [[nodiscard]] bool ep_enabled() const {
+        return mEPSize > 1;
+    }
+    [[nodiscard]] ncclComm_t comm() const {
+        return mNcclComm;
+    }
+    [[nodiscard]] ncclComm_t ep_comm() const {
+        return mEPComm;
+    }
+    [[nodiscard]] ncclComm_t dp_comm() const {
+        return mDPComm;
+    }
+    [[nodiscard]] ncclComm_t weight_transfer_comm() const {
+        return mWeightTransferComm;
+    }
 
     // ========================================================================
     // Variable-split all-to-all (for EP token routing)
@@ -113,9 +143,12 @@ public:
     /// @param recv_splits Array of ep_size() ints: per-peer recv counts (in elements)
     /// @param elem_size Size of each element in bytes
     /// @param stream CUDA stream for the NCCL operations
-    void all_to_all_single(const std::byte* send, std::byte* recv,
-                           const int* send_splits, const int* recv_splits,
-                           int elem_size, cudaStream_t stream);
+    void all_to_all_single(const std::byte* send,
+                           std::byte* recv,
+                           const int* send_splits,
+                           const int* recv_splits,
+                           int elem_size,
+                           cudaStream_t stream);
 
     /// All-reduce on the EP comm (for aggregating expert counts across EP group)
     void all_reduce_sum_int_ep(int* values, int n, cudaStream_t stream);
@@ -137,23 +170,27 @@ public:
 
     //! On the root rank, returns a vector of (memcpyable) T objects that
     //! have been gathered from all ranks.
-    template<typename T>
+    template <typename T>
     std::vector<T> host_gather(const T& object) {
         static_assert(std::is_trivially_copyable_v<T>, "Cannot communicate type with non-trivial copy operator");
         std::vector<T> result;
-        if(rank() == 0) {
+        if (rank() == 0) {
             result.resize(world_size());
         }
 
-        gather_bytes_host(reinterpret_cast<std::byte*>(result.data()), reinterpret_cast<const std::byte*>(&object), sizeof(T));
+        gather_bytes_host(reinterpret_cast<std::byte*>(result.data()),
+                          reinterpret_cast<const std::byte*>(&object),
+                          sizeof(T));
         return result;
     }
 
-    template<typename T>
+    template <typename T>
     std::vector<T> host_all_gather(const T& object) {
         static_assert(std::is_trivially_copyable_v<T>, "Cannot communicate type with non-trivial copy operator");
         std::vector<T> result(world_size());
-        all_gather_bytes_host(reinterpret_cast<std::byte*>(result.data()), reinterpret_cast<const std::byte*>(&object), sizeof(T));
+        all_gather_bytes_host(reinterpret_cast<std::byte*>(result.data()),
+                              reinterpret_cast<const std::byte*>(&object),
+                              sizeof(T));
         return result;
     }
 
@@ -169,7 +206,10 @@ public:
      * @param memcpy_send_recv Enable memcpy-based send/recv emulation.
      * @param work Callable invoked once per GPU with that GPU's communicator.
      */
-    static void run_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
+    static void run_communicators(int ngpus,
+                                  bool memcpy_allgather,
+                                  bool memcpy_send_recv,
+                                  std::function<void(NCCLCommunicator& comm)> work);
 
     /**
      * @brief Launch communicator threads and return a joinable pack (non-blocking).
@@ -183,7 +223,11 @@ public:
      * @param work Callable invoked once per GPU with that GPU's communicator.
      * @return Joinable pack that can be used to wait for completion.
      */
-    static std::unique_ptr<CommunicatorThreadsPack> launch_communicators(int ngpus, bool memcpy_allgather, bool memcpy_send_recv, std::function<void(NCCLCommunicator& comm)> work);
+    static std::unique_ptr<CommunicatorThreadsPack>
+    launch_communicators(int ngpus,
+                         bool memcpy_allgather,
+                         bool memcpy_send_recv,
+                         std::function<void(NCCLCommunicator& comm)> work);
 
     /**
      * @brief Launch communicator threads with externally-provided NCCL IDs (for Ray multi-node).
@@ -203,15 +247,14 @@ public:
      * @param work Callable invoked once per GPU with that GPU's communicator.
      * @return Joinable pack that can be used to wait for completion.
      */
-    static std::unique_ptr<CommunicatorThreadsPack> launch_communicators_multinode(
-        int ngpus,
-        int node_rank,
-        int num_nodes,
-        const void* nccl_id,
-        bool memcpy_allgather,
-        bool memcpy_send_recv,
-        std::function<void(NCCLCommunicator& comm)> work
-    );
+    static std::unique_ptr<CommunicatorThreadsPack>
+    launch_communicators_multinode(int ngpus,
+                                   int node_rank,
+                                   int num_nodes,
+                                   const void* nccl_id,
+                                   bool memcpy_allgather,
+                                   bool memcpy_send_recv,
+                                   std::function<void(NCCLCommunicator& comm)> work);
 
     /**
      * @brief Generate a new NCCL unique ID.
@@ -230,7 +273,6 @@ protected:
     virtual void send(const std::byte* src, int peer, std::size_t size);
     virtual void recv(std::byte* tgt, int peer, std::size_t size);
 
-
     virtual void gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) = 0;
     virtual void all_gather_bytes_host(std::byte* recv, const std::byte* object, std::size_t size) = 0;
 
@@ -238,6 +280,7 @@ protected:
     virtual void on_execute_transaction(const CommandBuffer&) = 0;
     virtual void on_finish_transaction(cudaEvent_t signal) = 0;
     virtual void _launch_queue_throttle_sync() = 0;
+
 private:
     ncclComm_t mNcclComm;
     int mRank;
@@ -262,4 +305,4 @@ private:
     friend struct CommandVisitor;
 };
 
-#endif //SUROGATE_SRC_UTILITIES_COMM_H
+#endif  //SUROGATE_SRC_UTILITIES_COMM_H

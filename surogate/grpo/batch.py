@@ -58,7 +58,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         position_ids=position_ids,
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
-        temperatures=temperatures
+        temperatures=temperatures,
     )
 
 

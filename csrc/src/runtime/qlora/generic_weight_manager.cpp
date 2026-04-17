@@ -27,9 +27,7 @@ bool tensor_is_on_host(const Tensor& t) {
 }
 
 bool quantized_has_host_storage(const QuantizedTensor& qt) {
-    return tensor_is_on_host(qt.data) ||
-           tensor_is_on_host(qt.scales) ||
-           tensor_is_on_host(qt.meta) ||
+    return tensor_is_on_host(qt.data) || tensor_is_on_host(qt.scales) || tensor_is_on_host(qt.meta) ||
            tensor_is_on_host(qt.meta2);
 }
 
@@ -46,9 +44,7 @@ struct DeviceQuantizedScratch {
     }
 };
 
-Tensor allocate_device_like(const Tensor& src,
-                            int device_id,
-                            std::vector<void*>& allocations) {
+Tensor allocate_device_like(const Tensor& src, int device_id, std::vector<void*>& allocations) {
     if (src.is_null()) {
         return Tensor{};
     }
@@ -56,15 +52,10 @@ Tensor allocate_device_like(const Tensor& src,
     void* ptr = nullptr;
     CUDA_CHECK(cudaMalloc(&ptr, src.bytes()));
     allocations.push_back(ptr);
-    return Tensor::from_pointer(
-        static_cast<std::byte*>(ptr),
-        device_id,
-        src.DType,
-        tensor_shape(src));
+    return Tensor::from_pointer(static_cast<std::byte*>(ptr), device_id, src.DType, tensor_shape(src));
 }
 
-DeviceQuantizedScratch make_device_scratch_like(const QuantizedTensor& ref,
-                                                int device_id) {
+DeviceQuantizedScratch make_device_scratch_like(const QuantizedTensor& ref, int device_id) {
     DeviceQuantizedScratch scratch;
     scratch.tensor.M = ref.M;
     scratch.tensor.K = ref.K;
@@ -82,17 +73,16 @@ DeviceQuantizedScratch make_device_scratch_like(const QuantizedTensor& ref,
     return scratch;
 }
 
-void copy_quantized_storage(QuantizedTensor& dst,
-                            const QuantizedTensor& src,
-                            cudaStream_t stream) {
+void copy_quantized_storage(QuantizedTensor& dst, const QuantizedTensor& src, cudaStream_t stream) {
     auto copy_one = [&](Tensor& out, const Tensor& in, const char* field) {
         if (out.is_null() || in.is_null()) {
             return;
         }
         if (out.bytes() != in.bytes()) {
-            throw std::runtime_error(
-                fmt::format("GenericWeightManager: quantized {} byte mismatch (dst={}, src={})",
-                            field, out.bytes(), in.bytes()));
+            throw std::runtime_error(fmt::format("GenericWeightManager: quantized {} byte mismatch (dst={}, src={})",
+                                                 field,
+                                                 out.bytes(),
+                                                 in.bytes()));
         }
         CUDA_CHECK(cudaMemcpyAsync(out.Data, in.Data, in.bytes(), cudaMemcpyDefault, stream));
     };
@@ -113,8 +103,7 @@ void copy_quantized_storage(QuantizedTensor& dst,
 // =============================================================================
 
 DequantBufferPool::DequantBufferPool(std::shared_ptr<TensorAllocator> allocator)
-    : mAllocator(std::move(allocator))
-{
+    : mAllocator(std::move(allocator)) {
 }
 
 Tensor DequantBufferPool::acquire(int M, int K, const std::vector<long>& shape) {
@@ -139,11 +128,7 @@ Tensor DequantBufferPool::acquire(int M, int K, const std::vector<long>& shape) 
     } else {
         alloc_shape = {static_cast<long>(M)};
     }
-    return mAllocator->allocate(
-        ETensorDType::BF16,
-        "dequant_pool_buf",
-        EAllocationType::ON_DEVICE,
-        alloc_shape);
+    return mAllocator->allocate(ETensorDType::BF16, "dequant_pool_buf", EAllocationType::ON_DEVICE, alloc_shape);
 }
 
 void DequantBufferPool::release(int M, int K, Tensor buffer) {
@@ -175,19 +160,16 @@ size_t DequantBufferPool::pooled_bytes() const {
 // Construction / Destruction
 // =============================================================================
 
-GenericWeightManager::GenericWeightManager(
-    const GenericWeightManagerConfig& config,
-    std::unique_ptr<IQuantizer> quantizer,
-    std::shared_ptr<TensorAllocator> allocator)
-    : mConfig(config)
-    , mQuantizer(std::move(quantizer))
-    , mAllocator(std::move(allocator))
-{
+GenericWeightManager::GenericWeightManager(const GenericWeightManagerConfig& config,
+                                           std::unique_ptr<IQuantizer> quantizer,
+                                           std::shared_ptr<TensorAllocator> allocator)
+    : mConfig(config),
+      mQuantizer(std::move(quantizer)),
+      mAllocator(std::move(allocator)) {
     CUDA_CHECK(cudaGetDeviceProperties(&mDeviceProps, mConfig.device_id));
 
     if (mConfig.enable_offloading) {
-        mOffloadManager = create_offload_manager(
-            mConfig.offload_config, mAllocator);
+        mOffloadManager = create_offload_manager(mConfig.offload_config, mAllocator);
     }
 
     // Create buffer pool when LRU eviction is enabled
@@ -218,14 +200,13 @@ GenericWeightManager::~GenericWeightManager() {
 // Weight registration
 // =============================================================================
 
-void GenericWeightManager::register_weight(
-    const std::string& name,
-    int M, int K,
-    int offload_group,
-    const std::vector<long>& shape) {
+void GenericWeightManager::register_weight(const std::string& name,
+                                           int M,
+                                           int K,
+                                           int offload_group,
+                                           const std::vector<long>& shape) {
     if (mWeights.count(name)) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' already registered", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' already registered", name));
     }
 
     ManagedWeight entry;
@@ -237,12 +218,9 @@ void GenericWeightManager::register_weight(
 
     // Determine allocation type based on offloading
     EAllocationType alloc_type = EAllocationType::ON_DEVICE;
-    if (offload_group >= 0 && mConfig.enable_offloading &&
-        mConfig.offload_config.max_resident_groups > 0) {
+    if (offload_group >= 0 && mConfig.enable_offloading && mConfig.offload_config.max_resident_groups > 0) {
         // This weight will be offloaded: allocate quantized storage on pinned host
-        alloc_type = mConfig.offload_config.use_pinned_memory
-            ? EAllocationType::PINNED
-            : EAllocationType::ON_HOST;
+        alloc_type = mConfig.offload_config.use_pinned_memory ? EAllocationType::PINNED : EAllocationType::ON_HOST;
     }
 
     // Allocate quantized storage via IQuantizer (uses flat M*K element count)
@@ -253,31 +231,27 @@ void GenericWeightManager::register_weight(
     // groups = ceil(total_blocks / group_size), but per-expert slicing needs
     // E * ceil(blocks_per_expert / group_size). These differ when
     // blocks_per_expert is not divisible by group_size.
-    if (shape.size() == 3 && entry.quantized.double_quant &&
-        !entry.quantized.meta.is_null()) {
+    if (shape.size() == 3 && entry.quantized.double_quant && !entry.quantized.meta.is_null()) {
         const int E = static_cast<int>(shape[0]);
         const int per_expert_M_val = static_cast<int>(shape[1]);
         const long per_expert_elems = static_cast<long>(per_expert_M_val) * K;
-        const long blocks_per_expert = (per_expert_elems + entry.quantized.block_size - 1)
-                                     / entry.quantized.block_size;
-        const long groups_per_expert = (blocks_per_expert + entry.quantized.double_quant_group_size - 1)
-                                     / entry.quantized.double_quant_group_size;
+        const long blocks_per_expert = (per_expert_elems + entry.quantized.block_size - 1) / entry.quantized.block_size;
+        const long groups_per_expert =
+            (blocks_per_expert + entry.quantized.double_quant_group_size - 1) / entry.quantized.double_quant_group_size;
         const long required_groups = static_cast<long>(E) * groups_per_expert;
 
         if (required_groups > entry.quantized.meta.nelem()) {
             // Reallocate with expert-aligned group count. The original
             // (slightly too small) allocation is wasted but harmless since
             // TensorAllocator is a bump allocator with no deallocation.
-            entry.quantized.meta = mAllocator->allocate(
-                ETensorDType::FP32,
-                fmt::format("{}.absmax_scale", name).c_str(),
-                alloc_type,
-                {required_groups});
-            entry.quantized.meta2 = mAllocator->allocate(
-                ETensorDType::FP32,
-                fmt::format("{}.absmax_offset", name).c_str(),
-                alloc_type,
-                {required_groups});
+            entry.quantized.meta = mAllocator->allocate(ETensorDType::FP32,
+                                                        fmt::format("{}.absmax_scale", name).c_str(),
+                                                        alloc_type,
+                                                        {required_groups});
+            entry.quantized.meta2 = mAllocator->allocate(ETensorDType::FP32,
+                                                         fmt::format("{}.absmax_offset", name).c_str(),
+                                                         alloc_type,
+                                                         {required_groups});
         }
     }
 
@@ -290,11 +264,10 @@ void GenericWeightManager::register_weight(
         } else {
             dequant_shape = {static_cast<long>(M), static_cast<long>(K)};
         }
-        entry.dequant_buffer = mAllocator->allocate(
-            ETensorDType::BF16,
-            fmt::format("{}.dequant", name).c_str(),
-            EAllocationType::ON_DEVICE,
-            dequant_shape);
+        entry.dequant_buffer = mAllocator->allocate(ETensorDType::BF16,
+                                                    fmt::format("{}.dequant", name).c_str(),
+                                                    EAllocationType::ON_DEVICE,
+                                                    dequant_shape);
     }
     // In pooled mode, dequant_buffer starts as null and is acquired on first access
 
@@ -308,12 +281,9 @@ void GenericWeightManager::register_weight(
     }
 }
 
-void GenericWeightManager::register_full_precision(
-    const std::string& name,
-    Tensor tensor) {
+void GenericWeightManager::register_full_precision(const std::string& name, Tensor tensor) {
     if (mWeights.count(name)) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' already registered", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' already registered", name));
     }
 
     ManagedWeight entry;
@@ -323,16 +293,14 @@ void GenericWeightManager::register_full_precision(
     mWeights.emplace(name, std::move(entry));
 }
 
-void GenericWeightManager::store_prequantized(
-    const std::string& name,
-    QuantizedTensor&& qt,
-    int offload_group,
-    const std::vector<long>& shape,
-    const std::string& transform_fn,
-    int fuse_swap_at) {
+void GenericWeightManager::store_prequantized(const std::string& name,
+                                              QuantizedTensor&& qt,
+                                              int offload_group,
+                                              const std::vector<long>& shape,
+                                              const std::string& transform_fn,
+                                              int fuse_swap_at) {
     if (mWeights.count(name)) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' already registered", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' already registered", name));
     }
 
     ManagedWeight entry;
@@ -370,11 +338,10 @@ void GenericWeightManager::store_prequantized(
         } else {
             dequant_shape = {static_cast<long>(entry.M), static_cast<long>(entry.K)};
         }
-        entry.dequant_buffer = mAllocator->allocate(
-            ETensorDType::BF16,
-            fmt::format("{}.dequant", name).c_str(),
-            EAllocationType::ON_DEVICE,
-            dequant_shape);
+        entry.dequant_buffer = mAllocator->allocate(ETensorDType::BF16,
+                                                    fmt::format("{}.dequant", name).c_str(),
+                                                    EAllocationType::ON_DEVICE,
+                                                    dequant_shape);
     }
 
     // Insert into the map FIRST, then register with offload manager.
@@ -385,21 +352,17 @@ void GenericWeightManager::store_prequantized(
     }
 }
 
-void GenericWeightManager::quantize_and_store(
-    const std::string& name,
-    const Tensor& bf16,
-    cudaStream_t stream) {
+void GenericWeightManager::quantize_and_store(const std::string& name, const Tensor& bf16, cudaStream_t stream) {
     auto it = mWeights.find(name);
     if (it == mWeights.end()) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' not registered", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' not registered", name));
     }
 
     auto& entry = it->second;
     if (!entry.is_quantized_weight) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' is full-precision, "
-                       "cannot quantize", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' is full-precision, "
+                                             "cannot quantize",
+                                             name));
     }
 
     // Quantizers write their outputs from CUDA kernels and require device-backed
@@ -418,24 +381,21 @@ void GenericWeightManager::quantize_and_store(
     entry.dequant_valid = false;
 }
 
-void GenericWeightManager::quantize_expert_slice(
-    const std::string& name,
-    int expert_idx,
-    int per_expert_M,
-    const Tensor& bf16,
-    cudaStream_t stream) {
-
+void GenericWeightManager::quantize_expert_slice(const std::string& name,
+                                                 int expert_idx,
+                                                 int per_expert_M,
+                                                 const Tensor& bf16,
+                                                 cudaStream_t stream) {
     auto it = mWeights.find(name);
     if (it == mWeights.end()) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' not registered", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' not registered", name));
     }
 
     auto& entry = it->second;
     if (!entry.is_quantized_weight) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' is full-precision, "
-                       "cannot quantize", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' is full-precision, "
+                                             "cannot quantize",
+                                             name));
     }
 
     const auto& full = entry.quantized;
@@ -449,15 +409,18 @@ void GenericWeightManager::quantize_expert_slice(
     // are stored as a 2D grid (ceil(M/bs) x ceil(K/bs)).
     if (full.format == QuantFormat::FP8_PER_BLOCK) {
         if (per_expert_M % full.block_size != 0) {
-            throw std::runtime_error(
-                fmt::format("GenericWeightManager: per_expert_M ({}) not divisible by "
-                           "block_size ({}) for FP8 2D-block weight '{}'",
-                           per_expert_M, full.block_size, name));
+            throw std::runtime_error(fmt::format("GenericWeightManager: per_expert_M ({}) not divisible by "
+                                                 "block_size ({}) for FP8 2D-block weight '{}'",
+                                                 per_expert_M,
+                                                 full.block_size,
+                                                 name));
         }
     } else if (per_expert_elems % full.block_size != 0) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: expert elements ({}) not divisible by "
-                       "block_size ({}) for '{}'", per_expert_elems, full.block_size, name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: expert elements ({}) not divisible by "
+                                             "block_size ({}) for '{}'",
+                                             per_expert_elems,
+                                             full.block_size,
+                                             name));
     }
 
     // Build a QuantizedTensor view pointing to this expert's slice
@@ -473,11 +436,10 @@ void GenericWeightManager::quantize_expert_slice(
     // Data slice (byte offset computed from total data size / num_experts)
     const size_t data_bytes_per_expert = full.data.bytes() / num_experts;
     const long data_elems_per_expert = full.data.nelem() / num_experts;
-    view.data = Tensor::from_pointer(
-        static_cast<std::byte*>(full.data.Data) + expert_idx * data_bytes_per_expert,
-        full.data.Device,
-        full.data.DType,
-        std::vector<long>{data_elems_per_expert});
+    view.data = Tensor::from_pointer(static_cast<std::byte*>(full.data.Data) + expert_idx * data_bytes_per_expert,
+                                     full.data.Device,
+                                     full.data.DType,
+                                     std::vector<long>{data_elems_per_expert});
 
     // Scales slice: for BnB double-quant these are INT8 absmax (one per block),
     // for non-double-quant these are FP32 absmax. Either way, blocks divide
@@ -485,38 +447,36 @@ void GenericWeightManager::quantize_expert_slice(
     const long blocks_per_expert = (per_expert_elems + full.block_size - 1) / full.block_size;
     const long scales_per_expert = full.scales.nelem() / num_experts;
     const size_t scales_bytes_per_expert = full.scales.bytes() / num_experts;
-    view.scales = Tensor::from_pointer(
-        static_cast<std::byte*>(full.scales.Data) + expert_idx * scales_bytes_per_expert,
-        full.scales.Device,
-        full.scales.DType,
-        std::vector<long>{scales_per_expert});
+    view.scales = Tensor::from_pointer(static_cast<std::byte*>(full.scales.Data) + expert_idx * scales_bytes_per_expert,
+                                       full.scales.Device,
+                                       full.scales.DType,
+                                       std::vector<long>{scales_per_expert});
 
     // For double-quant meta/meta2 (group-level scale/offset), compute per-expert
     // group count from per-expert block count. We cannot simply divide the total
     // group count by num_experts because ceil(total_blocks / group_size) may be
     // less than num_experts * ceil(blocks_per_expert / group_size).
-    const long groups_per_expert = full.double_quant
-        ? (blocks_per_expert + full.double_quant_group_size - 1) / full.double_quant_group_size
-        : 0;
+    const long groups_per_expert =
+        full.double_quant ? (blocks_per_expert + full.double_quant_group_size - 1) / full.double_quant_group_size : 0;
 
     // Meta slice (if present, for double quantization)
     if (!full.meta.is_null()) {
         const size_t meta_elem_bytes = full.meta.bytes() / full.meta.nelem();
-        view.meta = Tensor::from_pointer(
-            static_cast<std::byte*>(full.meta.Data) + expert_idx * groups_per_expert * meta_elem_bytes,
-            full.meta.Device,
-            full.meta.DType,
-            std::vector<long>{groups_per_expert});
+        view.meta = Tensor::from_pointer(static_cast<std::byte*>(full.meta.Data) +
+                                             expert_idx * groups_per_expert * meta_elem_bytes,
+                                         full.meta.Device,
+                                         full.meta.DType,
+                                         std::vector<long>{groups_per_expert});
     }
 
     // Meta2 slice (if present, for double quantization)
     if (!full.meta2.is_null()) {
         const size_t meta2_elem_bytes = full.meta2.bytes() / full.meta2.nelem();
-        view.meta2 = Tensor::from_pointer(
-            static_cast<std::byte*>(full.meta2.Data) + expert_idx * groups_per_expert * meta2_elem_bytes,
-            full.meta2.Device,
-            full.meta2.DType,
-            std::vector<long>{groups_per_expert});
+        view.meta2 = Tensor::from_pointer(static_cast<std::byte*>(full.meta2.Data) +
+                                              expert_idx * groups_per_expert * meta2_elem_bytes,
+                                          full.meta2.Device,
+                                          full.meta2.DType,
+                                          std::vector<long>{groups_per_expert});
     }
 
     // Quantize the single expert into the sub-view.
@@ -538,8 +498,7 @@ void GenericWeightManager::quantize_expert_slice(
 Tensor& GenericWeightManager::get(const std::string& name, cudaStream_t stream) {
     auto it = mWeights.find(name);
     if (it == mWeights.end()) {
-        throw std::runtime_error(
-            fmt::format("GenericWeightManager: weight '{}' not found", name));
+        throw std::runtime_error(fmt::format("GenericWeightManager: weight '{}' not found", name));
     }
 
     auto& entry = it->second;
@@ -693,9 +652,7 @@ int GenericWeightManager::num_active_dequant_buffers() const {
 // Internal helpers
 // =============================================================================
 
-void GenericWeightManager::ensure_dequantized(ManagedWeight& entry,
-                                               const std::string& name,
-                                               cudaStream_t stream) {
+void GenericWeightManager::ensure_dequantized(ManagedWeight& entry, const std::string& name, cudaStream_t stream) {
     // In pooled mode, update LRU even if already valid (for eviction tracking)
     if (is_pooled() && entry.has_pool_buffer) {
         touch_lru(entry, name);
@@ -732,11 +689,10 @@ void GenericWeightManager::ensure_dequantized(ManagedWeight& entry,
             // TensorAllocator has no deallocation and we may need to grow.
             void* ptr = nullptr;
             CUDA_CHECK(cudaMalloc(&ptr, needed_bytes));
-            mTransposeTemp = Tensor::from_pointer(
-                static_cast<std::byte*>(ptr),
-                mConfig.device_id,
-                ETensorDType::BF16,
-                std::vector<long>{total_elems});
+            mTransposeTemp = Tensor::from_pointer(static_cast<std::byte*>(ptr),
+                                                  mConfig.device_id,
+                                                  ETensorDType::BF16,
+                                                  std::vector<long>{total_elems});
         }
 
         // Dequantize into temp buffer (data is in HF order)
@@ -744,14 +700,13 @@ void GenericWeightManager::ensure_dequantized(ManagedWeight& entry,
 
         // Batched transpose: [E, hf_rows, hf_cols] → [E, hf_cols, hf_rows]
         // where hf_rows × hf_cols is the per-expert HF shape.
-        batched_transpose_2d_bf16(
-            entry.dequant_buffer.get<nv_bfloat16>(),
-            mTransposeTemp.get<nv_bfloat16>(),
-            entry.num_experts_for_transpose,
-            entry.hf_inner_rows,
-            entry.hf_inner_cols,
-            mDeviceProps,
-            stream);
+        batched_transpose_2d_bf16(entry.dequant_buffer.get<nv_bfloat16>(),
+                                  mTransposeTemp.get<nv_bfloat16>(),
+                                  entry.num_experts_for_transpose,
+                                  entry.hf_inner_rows,
+                                  entry.hf_inner_cols,
+                                  mDeviceProps,
+                                  stream);
     } else {
         // Standard path: dequantize directly into the buffer
         mQuantizer->dequantize(entry.quantized, entry.dequant_buffer, stream);
@@ -760,17 +715,14 @@ void GenericWeightManager::ensure_dequantized(ManagedWeight& entry,
     // Swap fused partition halves if needed (e.g., vLLM [gate, up] → surogate [up, gate]).
     // Done on the BF16 dequant buffer — zero extra GPU memory, in-place via registers.
     if (entry.fuse_swap_at > 0) {
-        swap_halves_bf16(
-            entry.dequant_buffer.get<nv_bfloat16>(),
-            entry.M, entry.K, entry.fuse_swap_at, stream);
+        swap_halves_bf16(entry.dequant_buffer.get<nv_bfloat16>(), entry.M, entry.K, entry.fuse_swap_at, stream);
     }
 
     entry.dequant_valid = true;
     entry.dequant_step = mCurrentStep;
 }
 
-void GenericWeightManager::acquire_pool_buffer(ManagedWeight& entry,
-                                                const std::string& name) {
+void GenericWeightManager::acquire_pool_buffer(ManagedWeight& entry, const std::string& name) {
     // Evict LRU buffers if we're at the limit
     while (mActivePoolBuffers >= mConfig.max_dequant_cache_size) {
         evict_lru_buffer();

@@ -49,7 +49,7 @@ using BackwardHook = std::function<void(int, bool, cudaStream_t, BackwardHookPoi
 
 namespace recipes {
 class Recipe;
-}
+}  // namespace recipes
 
 class NCCLCommunicator;
 struct RuntimeOptions;
@@ -60,9 +60,6 @@ class DslRunState;
 class DslParamStore;
 class DslGradStore;
 class DslWeightManager;
-
-
-
 
 // ============================================================================
 // Compiled Executor
@@ -78,17 +75,17 @@ public:
     ~CompiledExecutor();
 
     // Execute a compiled forward graph
-    void execute_forward(const CompiledGraph& graph,
-                         NCCLCommunicator& comm,
-                         bool full,
-                         const modules::ForwardHook* hook);
+    void
+    execute_forward(const CompiledGraph& graph, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);
 
     // Replay a single layer's forward ops to regenerate activations for backward.
     // This is the torch-style gradient checkpointing: save only the layer input (residual),
     // discard intermediates during forward, replay forward during backward.
     // After this call, stack contains the replayed data. The caller must restore the stack
     // after backward ops consume the data.
-    void replay_layer_forward(int layer_idx, long B, long T,
+    void replay_layer_forward(int layer_idx,
+                              long B,
+                              long T,
                               const CompiledGraph& fwd_graph,
                               const modules::ForwardHook* hook);
 
@@ -136,8 +133,7 @@ public:
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// When set, dispatch_flash_attention routes to flash varlen instead of cuDNN.
-    void set_doc_masking_context(const std::int32_t* cu_seqlens_gpu,
-                                 int num_docs, int max_seqlen, int total_q) {
+    void set_doc_masking_context(const std::int32_t* cu_seqlens_gpu, int num_docs, int max_seqlen, int total_q) {
         mCuSeqlensGpu = cu_seqlens_gpu;
         mNumDocs = num_docs;
         mMaxDocSeqlen = max_seqlen;
@@ -152,8 +148,12 @@ public:
 
     void set_recompute_fn(std::function<void(int, long, long, bool)> fn);
     void set_recompute_enabled(bool enabled);
-    void set_recompute_use_graphs(bool enabled) { mRecomputeUseGraphs = enabled; }
-    void set_capturing(bool capturing) { mCapturing = capturing; }
+    void set_recompute_use_graphs(bool enabled) {
+        mRecomputeUseGraphs = enabled;
+    }
+    void set_capturing(bool capturing) {
+        mCapturing = capturing;
+    }
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }
@@ -168,7 +168,9 @@ public:
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
     void set_save_list(const std::vector<std::string>* save_list);
-    void set_forward_plan(std::vector<LayerForwardPlan>* plan) { mForwardPlan = plan; }
+    void set_forward_plan(std::vector<LayerForwardPlan>* plan) {
+        mForwardPlan = plan;
+    }
 
     // For embedding backward (requires CPU-side inputs for deterministic bucketing)
     void set_last_inputs_cpu(const Tensor* inputs_cpu);
@@ -177,13 +179,20 @@ public:
     void set_rng_seed_fn(std::function<unsigned int()> fn);
 
     // Set embedding output names from forward graph (for binding d_embed_N to d_embeddings)
-    void set_embedding_outputs(const std::vector<std::string>& names) { mEmbeddingOutputs = names; }
+    void set_embedding_outputs(const std::vector<std::string>& names) {
+        mEmbeddingOutputs = names;
+    }
 
     // Set slot registry for DSL-driven tensor mapping
-    void set_slot_registry(const TensorSlotRegistry* registry) { mSlotRegistry = registry; }
+    void set_slot_registry(const TensorSlotRegistry* registry) {
+        mSlotRegistry = registry;
+    }
 
     // Set batch/sequence dimensions before execution
-    void set_dimensions(long B, long T) { mB = B; mT = T; }
+    void set_dimensions(long B, long T) {
+        mB = B;
+        mT = T;
+    }
 
     // Expose mapped tensors for test/debug (returns nullptr if not found).
     const Tensor* try_get_tensor(const std::string& name) const;
@@ -194,28 +203,33 @@ public:
     void save_tensors(const std::vector<std::string>& save_list, bool force_persist = false);
     // Preallocate persistent buffers for saved tensors before CUDA graph capture.
     // This avoids cudaMalloc during capture when recompute requires persistent saves.
-    void prepare_saved_buffers_for_capture(
-        const std::vector<std::string>& save_list,
-        const CompiledGraph* capture_graph = nullptr);
+    void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list,
+                                           const CompiledGraph* capture_graph = nullptr);
+
 private:
     // Execute an MLP tile group in chunks along the sequence dimension.
     // Used when long_context mode is enabled to reduce peak MLP activation memory.
     void execute_tiled_mlp(const CompiledGraph& graph,
                            const MlpTileGroup& group,
-                           long B, long T,
+                           long B,
+                           long T,
                            const modules::ForwardHook* hook);
 
     // Execute tiled MLP backward: combined forward recompute + backward per chunk.
     // Recomputes MLP intermediates per-chunk to avoid full-size [B*T, 2M] / [B*T, M] tensors.
     void execute_tiled_mlp_backward(const CompiledGraph& bwd_graph,
                                     const MlpTileGroup& group,
-                                    long B, long T,
+                                    long B,
+                                    long T,
                                     const modules::BackwardHook* hook);
 
     // Save MoE layer tensors to persistent storage at layer boundaries
     void save_moe_layer_tensors(int layer_idx);
 
-    // Direct dispatch functions (no string comparison)
+public:
+    // Direct dispatch functions. Public so op_registry trampolines can
+    // take their address; there is no meaningful encapsulation to lose —
+    // these functions ARE the executor's per-op entry points.
     void dispatch_embedding(const CompiledOp& op);
     void dispatch_zeros(const CompiledOp& op);
     void dispatch_ones(const CompiledOp& op);
@@ -327,6 +341,7 @@ private:
     void dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& op);
     void dispatch_mamba_out_proj_backward(const CompiledOp& op, const modules::BackwardHook* hook);
 
+private:
     // Tensor resolution (pre-resolved, O(1) lookup)
     Tensor& resolve_tensor(const TensorRef& ref);
     Tensor& ensure_output_tensor(const TensorRef& ref);
@@ -334,9 +349,7 @@ private:
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 
     // Get host-side MoE expert offsets for a layer, using cache or syncing from device.
-    const int* get_or_sync_moe_host_offsets(int layer_idx,
-                                             const int* device_offsets,
-                                             int num_experts);
+    const int* get_or_sync_moe_host_offsets(int layer_idx, const int* device_offsets, int num_experts);
 
     // EP replay-aware cache key helpers.
     // For EP, replay forward can run before backward and overwrite per-layer metadata.
@@ -369,10 +382,10 @@ private:
     GatedDeltaRuleKernels mGdrKernels;
 
     // Log-prob extraction context (null in training mode)
-    float*   mLogprobsGpu          = nullptr;
+    float* mLogprobsGpu = nullptr;
 
     // Custom per-token d_loss for GRPO backward (null = standard d_loss=1 seeding)
-    float*   mCustomDLossGpu       = nullptr;
+    float* mCustomDLossGpu = nullptr;
     const float* mInvTemperatureGpu = nullptr;
 
     // Document masking context for Flash Attention varlen (null = disabled)
@@ -411,7 +424,7 @@ private:
     // For embedding backward
     const Tensor* mLastInputsCpu = nullptr;
     std::function<unsigned int()> mRngSeedFn;
-    std::vector<std::string> mEmbeddingOutputs;  // Forward graph embedding output names
+    std::vector<std::string> mEmbeddingOutputs;         // Forward graph embedding output names
     const TensorSlotRegistry* mSlotRegistry = nullptr;  // DSL slot registry for global gradient binding
 
     // Execution state
@@ -421,8 +434,8 @@ private:
     int mCurrentLayer = -1;
     int mPrefetchDirection = 1;  // +1 for forward, -1 for backward
     bool mCapturing = false;
-    bool mInReplay = false;       ///< True during replay_layer_forward
-    int mReplayLayerIdx = -1;     ///< Layer being replayed
+    bool mInReplay = false;    ///< True during replay_layer_forward
+    int mReplayLayerIdx = -1;  ///< Layer being replayed
 
     // Deferred stack checkpoint from replay_layer_forward.
     // Stack restore is deferred until backward ops consume the replay data.
@@ -440,7 +453,7 @@ private:
     std::vector<Tensor> mTensors;
     // Name-indexed tensor overrides for cases where multiple tensor names share one tensor_id/slot.
     std::unordered_map<std::string, Tensor> mNamedTensors;
-    std::vector<bool> mSaveMask;               // Per-tensor-id: true if in save list (for prune)
+    std::vector<bool> mSaveMask;  // Per-tensor-id: true if in save list (for prune)
     const CompiledGraph* mCurrentGraph = nullptr;
 
     // Bind a named tensor into the flat vector using the current graph's name-to-id map.
@@ -477,7 +490,7 @@ private:
 
     // Persistent storage for MoE expert_offsets (needs to survive from forward to backward)
     std::vector<int> mMoEExpertOffsetsData;
-    Tensor mMoEExpertOffsets;  // Views into mMoEExpertOffsetsData
+    Tensor mMoEExpertOffsets;              // Views into mMoEExpertOffsetsData
     void* mMoEExpertOffsetsGPU = nullptr;  // Persistent GPU buffer (not stack-allocated)
     size_t mMoEExpertOffsetsGPUSize = 0;   // Size in bytes
 
@@ -507,13 +520,13 @@ private:
         // Null when standard EP (no reorder needed).
         void* llep_send_reorder_gpu = nullptr;
         size_t llep_send_reorder_bytes = 0;
-        void* local_scatter_gpu = nullptr; // local_scatter [total_recv] indices output
+        void* local_scatter_gpu = nullptr;  // local_scatter [total_recv] indices output
         size_t local_scatter_bytes = 0;
         // Forward EP outputs must remain valid until backward of this layer.
         // Shared cross-layer buffers can be overwritten by subsequent layers/recompute.
-        void* sorted_recv_gpu = nullptr;    // ep_dispatch output [total_recv, hidden]
+        void* sorted_recv_gpu = nullptr;  // ep_dispatch output [total_recv, hidden]
         size_t sorted_recv_bytes = 0;
-        void* combined_gpu = nullptr;       // ep_combine output [total_send, hidden]
+        void* combined_gpu = nullptr;  // ep_combine output [total_send, hidden]
         size_t combined_bytes = 0;
         void* llep_combined_gpu = nullptr;  // ep_combine LLEP reorder output [total_send, hidden]
         size_t llep_combined_bytes = 0;
@@ -521,9 +534,9 @@ private:
         // Shared cross-layer buffers can be overwritten by later EP ops.
         void* dispatch_bwd_send_gpu = nullptr;  // ep_dispatch_backward reverse A2A [total_send, hidden]
         size_t dispatch_bwd_send_bytes = 0;
-        void* dispatch_bwd_out_gpu = nullptr;   // ep_dispatch_backward LLEP reorder output [total_send, hidden]
+        void* dispatch_bwd_out_gpu = nullptr;  // ep_dispatch_backward LLEP reorder output [total_send, hidden]
         size_t dispatch_bwd_out_bytes = 0;
-        void* combine_bwd_sorted_gpu = nullptr; // ep_combine_backward output [total_recv, hidden]
+        void* combine_bwd_sorted_gpu = nullptr;  // ep_combine_backward output [total_recv, hidden]
         size_t combine_bwd_sorted_bytes = 0;
     };
     std::unordered_map<int, EpLayerState> mEpStates;  // keyed by ep_state_key(layer_idx)
@@ -532,8 +545,8 @@ private:
     // When active, merged weight tensors contain native + foreign expert weights,
     // and the GEMM ops use these instead of the QLoRA-resolved weights.
     struct LLEPLayerState {
-        bool active = false;               // Whether LLEP rebalancing is active this step
-        int num_merged_experts = 0;        // Total experts on this GPU (native + foreign)
+        bool active = false;         // Whether LLEP rebalancing is active this step
+        int num_merged_experts = 0;  // Total experts on this GPU (native + foreign)
 
         // Per-expert weight pointers (indexed by merged expert index 0..num_merged-1).
         // Each pointer points to one expert's weight slice in either:
@@ -587,20 +600,20 @@ private:
     // Backward uses this to reconstruct native-only weight pointers when
     // the full LLEP state has been freed to save GPU memory.
     struct EPLayerMeta {
-        int num_merged = 0;                // total experts on this GPU (native + foreign)
-        int native_start = 0;              // first native expert's global ID
-        int num_local = 0;                 // number of native experts
-        std::vector<int> merged_to_global; // merged_idx → global expert ID
+        int num_merged = 0;                 // total experts on this GPU (native + foreign)
+        int native_start = 0;               // first native expert's global ID
+        int num_local = 0;                  // number of native experts
+        std::vector<int> merged_to_global;  // merged_idx → global expert ID
     };
     std::unordered_map<int, EPLayerMeta> mEPLayerMeta;  // keyed by ep_state_key(layer_idx)
 
     // Shared GPU buffers for EP combine / dispatch_backward output (off-stack).
     // Only one layer uses these at a time, so sharing saves ~1.2 GB vs per-layer.
-    void* mSharedEpCombinedGpu = nullptr;      // ep_combine reverse A2A output [total_send, hidden]
+    void* mSharedEpCombinedGpu = nullptr;  // ep_combine reverse A2A output [total_send, hidden]
     size_t mSharedEpCombinedBytes = 0;
-    void* mSharedEpSortedRecvGpu = nullptr;    // ep_dispatch_backward output [total_send, hidden]
+    void* mSharedEpSortedRecvGpu = nullptr;  // ep_dispatch_backward output [total_send, hidden]
     size_t mSharedEpSortedRecvBytes = 0;
-    void* mSharedEpLlepCombineGpu = nullptr;   // ep_combine LLEP reorder output [total_send, hidden]
+    void* mSharedEpLlepCombineGpu = nullptr;  // ep_combine LLEP reorder output [total_send, hidden]
     size_t mSharedEpLlepCombineBytes = 0;
 
     // CUDA stream for LLEP weight transfer (overlaps with token A2A on MainStream).
@@ -612,7 +625,10 @@ private:
     // guarantees safe buffer reuse without explicit synchronization.
     // Pattern: acquire() finds a recycled buffer >= requested size (or cudaMalloc's a new one);
     //          release() returns the buffer to the pool for reuse by subsequent layers.
-    struct EpPoolEntry { void* ptr; size_t bytes; };
+    struct EpPoolEntry {
+        void* ptr;
+        size_t bytes;
+    };
     std::vector<EpPoolEntry> mEpBufPool;
     void* ep_buf_acquire(size_t need);
     void ep_buf_release(void* ptr, size_t bytes);
@@ -642,15 +658,15 @@ private:
     struct SegmentGraphExec {
         cudaGraphExec_t exec = nullptr;
         DeviceMemoryStack::Checkpoint checkpoint{};
-        DeviceMemoryStack::Checkpoint post_checkpoint{}; // stack state AFTER dispatch (for replay advance)
+        DeviceMemoryStack::Checkpoint post_checkpoint{};  // stack state AFTER dispatch (for replay advance)
         // Tensor entries produced during capture. On graph replay the dispatch
         // functions don't run, so mTensors isn't populated. We snapshot the
         // entries after the initial capture and restore them on replay so that
         // cross-segment tensor lookups (e.g. attention reading QKV) still work.
         // Stack addresses are stable because the checkpoint is restored before replay.
-        std::vector<std::pair<int, Tensor>> tensor_snapshot;       // by tensor_id
-        std::vector<std::pair<std::string, Tensor>> named_snapshot; // by name
-        std::vector<std::pair<std::string, Tensor>> saved_snapshot; // mSaved entries written by dispatch
+        std::vector<std::pair<int, Tensor>> tensor_snapshot;         // by tensor_id
+        std::vector<std::pair<std::string, Tensor>> named_snapshot;  // by name
+        std::vector<std::pair<std::string, Tensor>> saved_snapshot;  // mSaved entries written by dispatch
     };
 
     // Forward segment graphs: [layer_idx][segment_idx]
@@ -665,19 +681,26 @@ private:
     void dispatch_backward_op(const CompiledOp& op, const modules::BackwardHook* hook);
 
 public:
-    void set_split_attention_graphs(bool enabled) { mSplitAttentionGraphs = enabled; }
+    void set_split_attention_graphs(bool enabled) {
+        mSplitAttentionGraphs = enabled;
+    }
     void reset_segment_graphs();
     void resize_segment_graphs(const CompiledGraph& fwd_graph, const CompiledGraph& bwd_graph);
     /// Total bytes of persistent saved buffers (untracked by TensorAllocator).
     size_t saved_buffers_total_bytes() const {
         size_t total = 0;
-        for (const auto& [name, sz] : mMoeSavedSizes) total += sz;
+        for (const auto& [name, sz] : mMoeSavedSizes)
+            total += sz;
         return total;
     }
     /// Number of persistent saved buffers.
-    int saved_buffers_count() const { return static_cast<int>(mMoeSavedSizes.size()); }
+    int saved_buffers_count() const {
+        return static_cast<int>(mMoeSavedSizes.size());
+    }
     /// Per-buffer sizes for diagnostics.
-    const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const { return mMoeSavedSizes; }
+    const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const {
+        return mMoeSavedSizes;
+    }
 };
 
 // ============================================================================

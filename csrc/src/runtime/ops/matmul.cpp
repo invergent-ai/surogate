@@ -13,6 +13,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -28,18 +31,14 @@ namespace {
 bool contains_ci(std::string_view haystack, std::string_view needle) {
     std::string h(haystack);
     std::string n(needle);
-    std::transform(h.begin(), h.end(), h.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    std::transform(n.begin(), n.end(), n.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return h.find(n) != std::string::npos;
 }
 
 bool is_qwen3_5_model(const modules::ModelConfig& cfg) {
-    return contains_ci(cfg.ModelTypeName, "qwen3_5") ||
-           contains_ci(cfg.ModelTypeName, "qwen3.5") ||
-           contains_ci(cfg.ArchitectureName, "qwen3_5") ||
-           contains_ci(cfg.ArchitectureName, "qwen3.5");
+    return contains_ci(cfg.ModelTypeName, "qwen3_5") || contains_ci(cfg.ModelTypeName, "qwen3.5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3_5") || contains_ci(cfg.ArchitectureName, "qwen3.5");
 }
 
 Tensor flatten_bt(const Tensor& t, long B, long T) {
@@ -70,9 +69,9 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
     // Router matmul: match HF by computing logits in FP32 using FP32 inputs/weights.
     // Skip the string search for dense (non-MoE) models — they have no router.
-    const bool is_router = (mConfig.NumExperts > 0) &&
-                           (weight_name.find("router_weight") != std::string::npos);
-    if (is_router && (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
+    const bool is_router = (mConfig.NumExperts > 0) && (weight_name.find("router_weight") != std::string::npos);
+    if (is_router &&
+        (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
         auto shape_vec = [](const Tensor& t) {
             return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
         };
@@ -121,9 +120,20 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         }
 
         EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
-        matmul(out_f, b_f, a_f, bias_f, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               N, M, K, mode_col, false, mRunState.MainStream);
+        matmul(out_f,
+               b_f,
+               a_f,
+               bias_f,
+               nullptr,
+               nullptr,
+               mRunState.CublasLtHandle,
+               mRunState.CuBlasWorkspace,
+               N,
+               M,
+               K,
+               mode_col,
+               false,
+               mRunState.MainStream);
         if (out.DType != ETensorDType::FP32) {
             if (out.DType == ETensorDType::BF16) {
                 convert_dtype(out.get<nv_bfloat16>(), out_f.get<float>(), out.nelem(), mRunState.MainStream);
@@ -166,13 +176,12 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                     // the input into the FP8 buffer (co-located quantization).
                     DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
                     switch (*op.attrs.matmul_op) {
-                        case modules::MatmulOp::QKV:     ready_flag = DslRunState::FP8Ready_LN1; break;
-                        case modules::MatmulOp::MLPUp:   ready_flag = DslRunState::FP8Ready_LN2; break;
+                        case modules::MatmulOp::QKV: ready_flag = DslRunState::FP8Ready_LN1; break;
+                        case modules::MatmulOp::MLPUp: ready_flag = DslRunState::FP8Ready_LN2; break;
                         case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
                         default: break;
                     }
-                    if (ready_flag != DslRunState::FP8Ready_None &&
-                        mRunState.consume_fp8_buffer_ready(ready_flag)) {
+                    if (ready_flag != DslRunState::FP8Ready_None && mRunState.consume_fp8_buffer_ready(ready_flag)) {
                         ctx.inp_quant_ready = true;
                     }
 
@@ -187,8 +196,8 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                 }
                 if (ctx.allow_fp4 && mFP4Cache) {
                     auto it = mFP4Cache->find(weight_name);
-                    if (it != mFP4Cache->end() && it->second.initialized &&
-                        it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                    if (it != mFP4Cache->end() && it->second.initialized && it->second.data.Data &&
+                        it->second.scales.Data && it->second.amax.Data) {
                         ctx.cached_fp4_data = &it->second.data;
                         ctx.cached_fp4_scales = &it->second.scales;
                         ctx.cached_fp4_amax = it->second.amax.get<float>();
@@ -203,26 +212,31 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
         if (!used_recipe) {
             EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
-            matmul(out, b, a, bias, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   N, M, K, mode_col, false, mRunState.MainStream);
+            matmul(out,
+                   b,
+                   a,
+                   bias,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   mode_col,
+                   false,
+                   mRunState.MainStream);
         }
     } catch (const std::exception& e) {
-        throw std::runtime_error(
-            "dispatch_matmul failed for op_id='" + op.op_id +
-            "' weight='" + weight_name +
-            "' transpose=" + std::to_string(static_cast<int>(op.attrs.transpose)) +
-            " used_recipe=" + std::string(used_recipe ? "1" : "0") +
-            " M=" + std::to_string(M) +
-            " N=" + std::to_string(N) +
-            " K=" + std::to_string(K) +
-            " a_rank=" + std::to_string(a.Rank) +
-            " b_rank=" + std::to_string(b.Rank) +
-            " out_rank=" + std::to_string(out.Rank) +
-            " a_dtype=" + std::to_string(static_cast<int>(a.DType)) +
-            " b_dtype=" + std::to_string(static_cast<int>(b.DType)) +
-            " out_dtype=" + std::to_string(static_cast<int>(out.DType)) +
-            ": " + e.what());
+        throw std::runtime_error("dispatch_matmul failed for op_id='" + op.op_id + "' weight='" + weight_name +
+                                 "' transpose=" + std::to_string(static_cast<int>(op.attrs.transpose)) +
+                                 " used_recipe=" + std::string(used_recipe ? "1" : "0") + " M=" + std::to_string(M) +
+                                 " N=" + std::to_string(N) + " K=" + std::to_string(K) +
+                                 " a_rank=" + std::to_string(a.Rank) + " b_rank=" + std::to_string(b.Rank) +
+                                 " out_rank=" + std::to_string(out.Rank) +
+                                 " a_dtype=" + std::to_string(static_cast<int>(a.DType)) +
+                                 " b_dtype=" + std::to_string(static_cast<int>(b.DType)) +
+                                 " out_dtype=" + std::to_string(static_cast<int>(out.DType)) + ": " + e.what());
     }
 
     // Apply shared-expert LoRA contributions (Nemotron/DeepSeek) for shared expert matmuls.
@@ -256,15 +270,14 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                         const float dropout = mLoRAConfig->dropout;
                         const bool training = mLoRARunState->is_training;
                         const int proj_type = is_shared_up ? 7 : 8;
-                        const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
-                            + static_cast<unsigned int>(shared_layer) * 1000000u
-                            + static_cast<unsigned int>(proj_type) * 100000u
-                            + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+                        const unsigned int dropout_seed = mLoRARunState->dropout_base_seed +
+                                                          static_cast<unsigned int>(shared_layer) * 1000000u +
+                                                          static_cast<unsigned int>(proj_type) * 100000u +
+                                                          static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
 
                         const auto& lora = lora_layer.value();
                         const bool lora_shape_ok =
-                            (lora.A.Rank >= 2 && lora.B.Rank >= 2 &&
-                             static_cast<int>(lora.A.Sizes[0]) == rank &&
+                            (lora.A.Rank >= 2 && lora.B.Rank >= 2 && static_cast<int>(lora.A.Sizes[0]) == rank &&
                              static_cast<int>(lora.A.Sizes[1]) == in_features &&
                              static_cast<int>(lora.B.Sizes[0]) == out_features &&
                              static_cast<int>(lora.B.Sizes[1]) == rank);
@@ -275,18 +288,34 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                                 std::fprintf(stderr,
                                              "[LORA-SHARED] skip forward due to shape mismatch: layer=%d field=%s "
                                              "runtime(in=%d,out=%d,rank=%d) A=[%ld,%ld] B=[%ld,%ld]\n",
-                                             shared_layer, field.c_str(),
-                                             in_features, out_features, rank,
-                                             lora.A.Sizes[0], lora.A.Sizes[1],
-                                             lora.B.Sizes[0], lora.B.Sizes[1]);
+                                             shared_layer,
+                                             field.c_str(),
+                                             in_features,
+                                             out_features,
+                                             rank,
+                                             lora.A.Sizes[0],
+                                             lora.A.Sizes[1],
+                                             lora.B.Sizes[0],
+                                             lora.B.Sizes[1]);
                             }
                         } else {
-                            modules::detail::apply_lora_contribution(
-                                out_flat, 0, a_flat, lora,
-                                mLoRARunState->intermediate, mLoRARunState->slice,
-                                scaling, dropout, dropout_seed, training,
-                                BT, in_features, out_features, rank,
-                                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                            modules::detail::apply_lora_contribution(out_flat,
+                                                                     0,
+                                                                     a_flat,
+                                                                     lora,
+                                                                     mLoRARunState->intermediate,
+                                                                     mLoRARunState->slice,
+                                                                     scaling,
+                                                                     dropout,
+                                                                     dropout_seed,
+                                                                     training,
+                                                                     BT,
+                                                                     in_features,
+                                                                     out_features,
+                                                                     rank,
+                                                                     mRunState.CublasLtHandle,
+                                                                     mRunState.CuBlasWorkspace,
+                                                                     mRunState.MainStream);
                         }
                     }
                 }
@@ -333,14 +362,13 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                     const float scaling = mLoRAConfig->scaling();
                     const float dropout = mLoRAConfig->dropout;
                     const bool training = mLoRARunState->is_training;
-                    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
-                        + static_cast<unsigned int>(layer_idx) * 1000000u
-                        + static_cast<unsigned int>(proj_type) * 100000u
-                        + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+                    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed +
+                                                      static_cast<unsigned int>(layer_idx) * 1000000u +
+                                                      static_cast<unsigned int>(proj_type) * 100000u +
+                                                      static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
                     const auto& lora = layer_lora->value();
                     const bool lora_shape_ok =
-                        (lora.A.Rank >= 2 && lora.B.Rank >= 2 &&
-                         static_cast<int>(lora.A.Sizes[0]) == rank &&
+                        (lora.A.Rank >= 2 && lora.B.Rank >= 2 && static_cast<int>(lora.A.Sizes[0]) == rank &&
                          static_cast<int>(lora.A.Sizes[1]) == in_features &&
                          static_cast<int>(lora.B.Sizes[0]) == out_features &&
                          static_cast<int>(lora.B.Sizes[1]) == rank);
@@ -352,20 +380,35 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                             std::fprintf(stderr,
                                          "[LORA-Q35] skip forward due to shape mismatch: layer=%d field=%s "
                                          "runtime(in=%d,out=%d,rank=%d) A=[%ld,%ld] B=[%ld,%ld]\n",
-                                         layer_idx, field.c_str(),
-                                         in_features, out_features, rank,
-                                         lora.A.Sizes[0], lora.A.Sizes[1],
-                                         lora.B.Sizes[0], lora.B.Sizes[1]);
+                                         layer_idx,
+                                         field.c_str(),
+                                         in_features,
+                                         out_features,
+                                         rank,
+                                         lora.A.Sizes[0],
+                                         lora.A.Sizes[1],
+                                         lora.B.Sizes[0],
+                                         lora.B.Sizes[1]);
                         }
                     } else {
-                        modules::detail::apply_lora_contribution(
-                            out_flat, 0, a_flat, lora,
-                            mLoRARunState->intermediate, mLoRARunState->slice,
-                            scaling, dropout, dropout_seed, training,
-                            BT, in_features, out_features, rank,
-                            mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                        modules::detail::apply_lora_contribution(out_flat,
+                                                                 0,
+                                                                 a_flat,
+                                                                 lora,
+                                                                 mLoRARunState->intermediate,
+                                                                 mLoRARunState->slice,
+                                                                 scaling,
+                                                                 dropout,
+                                                                 dropout_seed,
+                                                                 training,
+                                                                 BT,
+                                                                 in_features,
+                                                                 out_features,
+                                                                 rank,
+                                                                 mRunState.CublasLtHandle,
+                                                                 mRunState.CuBlasWorkspace,
+                                                                 mRunState.MainStream);
                     }
-
                 }
             }
         }
@@ -387,20 +430,11 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         }
         auto& layer_plan = (*mForwardPlan)[static_cast<std::size_t>(op.attrs.layer_idx)];
         switch (*op.attrs.matmul_op) {
-            case modules::MatmulOp::QKV:
-                layer_plan.qkv = plan;
-                break;
-            case modules::MatmulOp::AttnOut:
-                layer_plan.out_proj = plan;
-                break;
-            case modules::MatmulOp::MLPUp:
-                layer_plan.mlp_up = plan;
-                break;
-            case modules::MatmulOp::MLPDown:
-                layer_plan.mlp_down = plan;
-                break;
-            default:
-                break;
+            case modules::MatmulOp::QKV: layer_plan.qkv = plan; break;
+            case modules::MatmulOp::AttnOut: layer_plan.out_proj = plan; break;
+            case modules::MatmulOp::MLPUp: layer_plan.mlp_up = plan; break;
+            case modules::MatmulOp::MLPDown: layer_plan.mlp_down = plan; break;
+            default: break;
         }
     }
 
@@ -415,25 +449,15 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         if (op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
             auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
             switch (*op.attrs.forward_hook_point) {
-                case modules::ForwardHookPoint::AfterQKVProjection:
-                    acts.qkv.Data = out.Data;
-                    break;
-                case modules::ForwardHookPoint::AfterAttnOutProjection:
-                    acts.att_out.Data = out.Data;
-                    break;
-                case modules::ForwardHookPoint::AfterMLPUpProjection:
-                    acts.mlp_up.Data = out.Data;
-                    break;
-                case modules::ForwardHookPoint::AfterMLPDownProjection:
-                    acts.mlp_down.Data = out.Data;
-                    break;
-                default:
-                    break;
+                case modules::ForwardHookPoint::AfterQKVProjection: acts.qkv.Data = out.Data; break;
+                case modules::ForwardHookPoint::AfterAttnOutProjection: acts.att_out.Data = out.Data; break;
+                case modules::ForwardHookPoint::AfterMLPUpProjection: acts.mlp_up.Data = out.Data; break;
+                case modules::ForwardHookPoint::AfterMLPDownProjection: acts.mlp_down.Data = out.Data; break;
+                default: break;
             }
         }
         (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
     }
-
 }
 
 void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook) {
@@ -479,19 +503,17 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
 
-    const bool is_qkv_op = op.attrs.matmul_op.has_value() &&
-        (*op.attrs.matmul_op == modules::MatmulOp::QKV);
+    const bool is_qkv_op = op.attrs.matmul_op.has_value() && (*op.attrs.matmul_op == modules::MatmulOp::QKV);
 
     // Now allocate output tensors - skip dB if weights are frozen.
     // For backward ops, compiled shapes of saved-tensor-derived outputs may be empty
     // (backward compiler can't track saved tensor shapes). Derive from runtime inputs.
-    auto ensure_backward_output = [&](const TensorRef& ref,
-                                      const Tensor& shape_source,
-                                      bool allow_shape_fallback) -> Tensor& {
+    auto ensure_backward_output =
+        [&](const TensorRef& ref, const Tensor& shape_source, bool allow_shape_fallback) -> Tensor& {
         const auto expected_nelem = shape_source.nelem();
         const auto expected_dtype = shape_source.DType;
-        const std::vector<long> expected_shape(
-            shape_source.Sizes.begin(), shape_source.Sizes.begin() + shape_source.Rank);
+        const std::vector<long> expected_shape(shape_source.Sizes.begin(),
+                                               shape_source.Sizes.begin() + shape_source.Rank);
 
         auto alloc_temp_fallback = [&]() -> Tensor& {
             Tensor t = mRunState.temp_alloc(expected_dtype, expected_shape, "matmul_bwd_temp");
@@ -511,8 +533,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         }
 
         if (!allow_shape_fallback) {
-            throw std::runtime_error(
-                "matmul_backward: weight-grad output tensor shape/dtype mismatch for " + ref.name);
+            throw std::runtime_error("matmul_backward: weight-grad output tensor shape/dtype mismatch for " + ref.name);
         }
         return alloc_temp_fallback();
     };
@@ -542,8 +563,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     bool used_fp8 = false;
     bool has_dout_quant = false;
 
-    const bool disable_qkv_recipe_bwd =
-        is_qkv_op && skip_weight_grad && (mConfig.NumExperts > 0);
+    const bool disable_qkv_recipe_bwd = is_qkv_op && skip_weight_grad && (mConfig.NumExperts > 0);
     if (mRecipe && mode == EMMTranspose::NT && a.Sizes[0] == mB * mT && allow_quant && !disable_qkv_recipe_bwd) {
         Tensor dA_tmp{};
         Tensor dB_tmp{};
@@ -602,8 +622,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             auto* cache = is_quartet ? mFP4Cache : mFP4CacheT;
             if (cache) {
                 auto it = cache->find(weight_name);
-                if (it != cache->end() && it->second.initialized &&
-                    it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                if (it != cache->end() && it->second.initialized && it->second.data.Data && it->second.scales.Data &&
+                    it->second.amax.Data) {
                     ctx.cached_fp4_data = &it->second.data;
                     ctx.cached_fp4_scales = &it->second.scales;
                     ctx.cached_fp4_amax = it->second.amax.get<float>();
@@ -673,9 +693,20 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             int M = 0, N = 0, K = 0;
             matmul_dims(d_out_mat, b, mode_dA, M, N, K);
             EMMTranspose mode_col = swap_transpose(mode_dA);
-            matmul(*dA_ptr, b, d_out_mat, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   N, M, K, mode_col, false, mRunState.MainStream);
+            matmul(*dA_ptr,
+                   b,
+                   d_out_mat,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   mode_col,
+                   false,
+                   mRunState.MainStream);
         }
         if (dB_ptr && !skip_weight_grad) {
             const Tensor* lhs = nullptr;
@@ -711,9 +742,20 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             int M = 0, N = 0, K = 0;
             matmul_dims(*lhs, *rhs, mode_rm, M, N, K);
             EMMTranspose mode_col = swap_transpose(mode_rm);
-            matmul(*dB_ptr, *rhs, *lhs, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   N, M, K, mode_col, do_accumulate, mRunState.MainStream);
+            matmul(*dB_ptr,
+                   *rhs,
+                   *lhs,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   mode_col,
+                   do_accumulate,
+                   mRunState.MainStream);
         }
     }
 
@@ -733,85 +775,107 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     const auto& lora_layer = is_shared_up ? shared.up : shared.down;
                     if (lora_layer.has_value() && lora_layer->has_value()) {
                         bool lora_accum = false;
-                        auto& lora_grads = mLoRAGrads->get_block_full(shared_layer, mRunState.MainStream, *mComm, lora_accum);
+                        auto& lora_grads =
+                            mLoRAGrads->get_block_full(shared_layer, mRunState.MainStream, *mComm, lora_accum);
                         lora_accum = lora_accum || do_accumulate;
 
                         if (lora_grads.moe.shared.has_value()) {
                             auto* grad_layer = is_shared_up ? &lora_grads.moe.shared->up : &lora_grads.moe.shared->down;
                             if (grad_layer && grad_layer->has_value() && grad_layer->value().has_value()) {
-                            Tensor a_flat = a;
-                            Tensor d_out_flat = d_out;
-                            if (a_flat.Rank > 2 && a_flat.Sizes[0] == mB && a_flat.Sizes[1] == mT) {
-                                a_flat = view_tensor(a_flat, {mB * mT, a_flat.Sizes[a_flat.Rank - 1]});
-                            }
-                            if (d_out_flat.Rank > 2 && d_out_flat.Sizes[0] == mB && d_out_flat.Sizes[1] == mT) {
-                                d_out_flat = view_tensor(d_out_flat, {mB * mT, d_out_flat.Sizes[d_out_flat.Rank - 1]});
-                            }
-
-                            Tensor dA_tmp{};
-                            Tensor* dA_use = dA_ptr;
-                            if (!dA_use) {
-                                dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]}, "matmul_dA_tmp");
-                                fill_zero(dA_tmp, mRunState.MainStream);
-                                mTemps.push_back(dA_tmp);
-                                dA_use = &dA_tmp;
-                            }
-
-                            const int BT = static_cast<int>(a_flat.Sizes[0]);
-                            const int in_features = static_cast<int>(a_flat.Sizes[1]);
-                            const int out_features = static_cast<int>(d_out_flat.Sizes[1]);
-                            const int rank = mLoRAConfig->rank;
-                            const float scaling = mLoRAConfig->scaling();
-                            const float dropout = mLoRAConfig->dropout;
-                            const bool training = mLoRARunState->is_training;
-                            const int proj_type = is_shared_up ? 7 : 8;
-                            const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
-                                + static_cast<unsigned int>(shared_layer) * 1000000u
-                                + static_cast<unsigned int>(proj_type) * 100000u
-                                + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
-
-                            const auto& lora = lora_layer.value();
-                            auto& grads = grad_layer->value();
-                            const bool lora_shape_ok =
-                                (lora.A.Rank >= 2 && lora.B.Rank >= 2 &&
-                                 static_cast<int>(lora.A.Sizes[0]) == rank &&
-                                 static_cast<int>(lora.A.Sizes[1]) == in_features &&
-                                 static_cast<int>(lora.B.Sizes[0]) == out_features &&
-                                 static_cast<int>(lora.B.Sizes[1]) == rank);
-                            const bool grad_shape_ok =
-                                (grads.A.Rank >= 2 && grads.B.Rank >= 2 &&
-                                 static_cast<int>(grads.A.Sizes[0]) == rank &&
-                                 static_cast<int>(grads.A.Sizes[1]) == in_features &&
-                                 static_cast<int>(grads.B.Sizes[0]) == out_features &&
-                                 static_cast<int>(grads.B.Sizes[1]) == rank);
-                            if (!lora_shape_ok || !grad_shape_ok) {
-                                static int warn_count = 0;
-                                if (warn_count < 16) {
-                                    ++warn_count;
-                                    std::fprintf(stderr,
-                                                 "[LORA-SHARED] skip backward due to shape mismatch: layer=%d field=%s "
-                                                 "runtime(in=%d,out=%d,rank=%d) "
-                                                 "A=[%ld,%ld] B=[%ld,%ld] dA=[%ld,%ld] dB=[%ld,%ld]\n",
-                                                 shared_layer, field.c_str(),
-                                                 in_features, out_features, rank,
-                                                 lora.A.Sizes[0], lora.A.Sizes[1],
-                                                 lora.B.Sizes[0], lora.B.Sizes[1],
-                                                 grads.A.Sizes[0], grads.A.Sizes[1],
-                                                 grads.B.Sizes[0], grads.B.Sizes[1]);
+                                Tensor a_flat = a;
+                                Tensor d_out_flat = d_out;
+                                if (a_flat.Rank > 2 && a_flat.Sizes[0] == mB && a_flat.Sizes[1] == mT) {
+                                    a_flat = view_tensor(a_flat, {mB * mT, a_flat.Sizes[a_flat.Rank - 1]});
                                 }
-                            } else {
-                                modules::detail::backward_lora_layer(
-                                    grads.A, grads.B,
-                                    *dA_use,
-                                    d_out_flat, 0,
-                                    a_flat,
-                                    lora.A, lora.B,
-                                    scaling,
-                                    dropout, dropout_seed, training,
-                                    mLoRARunState->intermediate, mLoRARunState->slice,
-                                    BT, in_features, out_features, rank, lora_accum,
-                                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
-                            }
+                                if (d_out_flat.Rank > 2 && d_out_flat.Sizes[0] == mB && d_out_flat.Sizes[1] == mT) {
+                                    d_out_flat =
+                                        view_tensor(d_out_flat, {mB * mT, d_out_flat.Sizes[d_out_flat.Rank - 1]});
+                                }
+
+                                Tensor dA_tmp{};
+                                Tensor* dA_use = dA_ptr;
+                                if (!dA_use) {
+                                    dA_tmp = mRunState.temp_alloc(a_flat.DType,
+                                                                  {a_flat.Sizes[0], a_flat.Sizes[1]},
+                                                                  "matmul_dA_tmp");
+                                    fill_zero(dA_tmp, mRunState.MainStream);
+                                    mTemps.push_back(dA_tmp);
+                                    dA_use = &dA_tmp;
+                                }
+
+                                const int BT = static_cast<int>(a_flat.Sizes[0]);
+                                const int in_features = static_cast<int>(a_flat.Sizes[1]);
+                                const int out_features = static_cast<int>(d_out_flat.Sizes[1]);
+                                const int rank = mLoRAConfig->rank;
+                                const float scaling = mLoRAConfig->scaling();
+                                const float dropout = mLoRAConfig->dropout;
+                                const bool training = mLoRARunState->is_training;
+                                const int proj_type = is_shared_up ? 7 : 8;
+                                const unsigned int dropout_seed =
+                                    mLoRARunState->dropout_base_seed +
+                                    static_cast<unsigned int>(shared_layer) * 1000000u +
+                                    static_cast<unsigned int>(proj_type) * 100000u +
+                                    static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+
+                                const auto& lora = lora_layer.value();
+                                auto& grads = grad_layer->value();
+                                const bool lora_shape_ok = (lora.A.Rank >= 2 && lora.B.Rank >= 2 &&
+                                                            static_cast<int>(lora.A.Sizes[0]) == rank &&
+                                                            static_cast<int>(lora.A.Sizes[1]) == in_features &&
+                                                            static_cast<int>(lora.B.Sizes[0]) == out_features &&
+                                                            static_cast<int>(lora.B.Sizes[1]) == rank);
+                                const bool grad_shape_ok = (grads.A.Rank >= 2 && grads.B.Rank >= 2 &&
+                                                            static_cast<int>(grads.A.Sizes[0]) == rank &&
+                                                            static_cast<int>(grads.A.Sizes[1]) == in_features &&
+                                                            static_cast<int>(grads.B.Sizes[0]) == out_features &&
+                                                            static_cast<int>(grads.B.Sizes[1]) == rank);
+                                if (!lora_shape_ok || !grad_shape_ok) {
+                                    static int warn_count = 0;
+                                    if (warn_count < 16) {
+                                        ++warn_count;
+                                        std::fprintf(
+                                            stderr,
+                                            "[LORA-SHARED] skip backward due to shape mismatch: layer=%d field=%s "
+                                            "runtime(in=%d,out=%d,rank=%d) "
+                                            "A=[%ld,%ld] B=[%ld,%ld] dA=[%ld,%ld] dB=[%ld,%ld]\n",
+                                            shared_layer,
+                                            field.c_str(),
+                                            in_features,
+                                            out_features,
+                                            rank,
+                                            lora.A.Sizes[0],
+                                            lora.A.Sizes[1],
+                                            lora.B.Sizes[0],
+                                            lora.B.Sizes[1],
+                                            grads.A.Sizes[0],
+                                            grads.A.Sizes[1],
+                                            grads.B.Sizes[0],
+                                            grads.B.Sizes[1]);
+                                    }
+                                } else {
+                                    modules::detail::backward_lora_layer(grads.A,
+                                                                         grads.B,
+                                                                         *dA_use,
+                                                                         d_out_flat,
+                                                                         0,
+                                                                         a_flat,
+                                                                         lora.A,
+                                                                         lora.B,
+                                                                         scaling,
+                                                                         dropout,
+                                                                         dropout_seed,
+                                                                         training,
+                                                                         mLoRARunState->intermediate,
+                                                                         mLoRARunState->slice,
+                                                                         BT,
+                                                                         in_features,
+                                                                         out_features,
+                                                                         rank,
+                                                                         lora_accum,
+                                                                         mRunState.CublasLtHandle,
+                                                                         mRunState.CuBlasWorkspace,
+                                                                         mRunState.MainStream);
+                                }
                             }
                         }
                     }
@@ -821,8 +885,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     }
 
     // Qwen3.5 full-attention LoRA backward for separate q/k/v/o projections.
-    if (mLoRAConfig && mLoRAWeights && mLoRAGrads && mLoRARunState && mLoRAConfig->enabled() &&
-        mComm && is_qwen3_5_model(mConfig)) {
+    if (mLoRAConfig && mLoRAWeights && mLoRAGrads && mLoRARunState && mLoRAConfig->enabled() && mComm &&
+        is_qwen3_5_model(mConfig)) {
         int layer = -1;
         std::string field;
         if (parse_block_param(weight_name, layer, field) && layer >= 0) {
@@ -857,8 +921,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     proj_type = 3;
                 }
 
-                if (lora_layer && grad_layer &&
-                    lora_layer->has_value() && lora_layer->value().has_value() &&
+                if (lora_layer && grad_layer && lora_layer->has_value() && lora_layer->value().has_value() &&
                     grad_layer->has_value() && grad_layer->value().has_value()) {
                     Tensor a_flat = flatten_bt(a, mB, mT);
                     Tensor d_out_flat = flatten_bt(d_out, mB, mT);
@@ -866,7 +929,9 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     Tensor dA_tmp{};
                     Tensor* dA_use = dA_ptr;
                     if (!dA_use) {
-                        dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]}, "matmul_lora_dA_tmp");
+                        dA_tmp = mRunState.temp_alloc(a_flat.DType,
+                                                      {a_flat.Sizes[0], a_flat.Sizes[1]},
+                                                      "matmul_lora_dA_tmp");
                         fill_zero(dA_tmp, mRunState.MainStream);
                         mTemps.push_back(dA_tmp);
                         dA_use = &dA_tmp;
@@ -879,21 +944,19 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     const float scaling = mLoRAConfig->scaling();
                     const float dropout = mLoRAConfig->dropout;
                     const bool training = mLoRARunState->is_training;
-                    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
-                        + static_cast<unsigned int>(layer) * 1000000u
-                        + static_cast<unsigned int>(proj_type) * 100000u
-                        + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+                    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed +
+                                                      static_cast<unsigned int>(layer) * 1000000u +
+                                                      static_cast<unsigned int>(proj_type) * 100000u +
+                                                      static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
                     const auto& lora = lora_layer->value();
                     auto& grads = grad_layer->value();
                     const bool lora_shape_ok =
-                        (lora.A.Rank >= 2 && lora.B.Rank >= 2 &&
-                         static_cast<int>(lora.A.Sizes[0]) == rank &&
+                        (lora.A.Rank >= 2 && lora.B.Rank >= 2 && static_cast<int>(lora.A.Sizes[0]) == rank &&
                          static_cast<int>(lora.A.Sizes[1]) == in_features &&
                          static_cast<int>(lora.B.Sizes[0]) == out_features &&
                          static_cast<int>(lora.B.Sizes[1]) == rank);
                     const bool grad_shape_ok =
-                        (grads.A.Rank >= 2 && grads.B.Rank >= 2 &&
-                         static_cast<int>(grads.A.Sizes[0]) == rank &&
+                        (grads.A.Rank >= 2 && grads.B.Rank >= 2 && static_cast<int>(grads.A.Sizes[0]) == rank &&
                          static_cast<int>(grads.A.Sizes[1]) == in_features &&
                          static_cast<int>(grads.B.Sizes[0]) == out_features &&
                          static_cast<int>(grads.B.Sizes[1]) == rank);
@@ -906,38 +969,54 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                                          "[LORA-Q35] skip backward due to shape mismatch: layer=%d field=%s "
                                          "runtime(in=%d,out=%d,rank=%d) "
                                          "A=[%ld,%ld] B=[%ld,%ld] dA=[%ld,%ld] dB=[%ld,%ld]\n",
-                                         layer, field.c_str(),
-                                         in_features, out_features, rank,
-                                         lora.A.Sizes[0], lora.A.Sizes[1],
-                                         lora.B.Sizes[0], lora.B.Sizes[1],
-                                         grads.A.Sizes[0], grads.A.Sizes[1],
-                                         grads.B.Sizes[0], grads.B.Sizes[1]);
+                                         layer,
+                                         field.c_str(),
+                                         in_features,
+                                         out_features,
+                                         rank,
+                                         lora.A.Sizes[0],
+                                         lora.A.Sizes[1],
+                                         lora.B.Sizes[0],
+                                         lora.B.Sizes[1],
+                                         grads.A.Sizes[0],
+                                         grads.A.Sizes[1],
+                                         grads.B.Sizes[0],
+                                         grads.B.Sizes[1]);
                         }
                     } else {
-                        modules::detail::backward_lora_layer(
-                            grads.A, grads.B,
-                            *dA_use,
-                            d_out_flat, 0,
-                            a_flat,
-                            lora.A, lora.B,
-                            scaling,
-                            dropout, dropout_seed, training,
-                            mLoRARunState->intermediate, mLoRARunState->slice,
-                            BT, in_features, out_features, rank, lora_accum,
-                            mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                        modules::detail::backward_lora_layer(grads.A,
+                                                             grads.B,
+                                                             *dA_use,
+                                                             d_out_flat,
+                                                             0,
+                                                             a_flat,
+                                                             lora.A,
+                                                             lora.B,
+                                                             scaling,
+                                                             dropout,
+                                                             dropout_seed,
+                                                             training,
+                                                             mLoRARunState->intermediate,
+                                                             mLoRARunState->slice,
+                                                             BT,
+                                                             in_features,
+                                                             out_features,
+                                                             rank,
+                                                             lora_accum,
+                                                             mRunState.CublasLtHandle,
+                                                             mRunState.CuBlasWorkspace,
+                                                             mRunState.MainStream);
                     }
                 }
             }
         }
     }
 
-
     // Hook invocation for LoRA backward
     // Skip dense MLP hooks for MoE models - MoE has different backward path (grouped GEMM)
     const bool is_moe = mConfig.NumExperts > 0;
-    const bool is_mlp_hook = op.attrs.matmul_op.has_value() &&
-        (*op.attrs.matmul_op == modules::MatmulOp::MLPUp ||
-         *op.attrs.matmul_op == modules::MatmulOp::MLPDown);
+    const bool is_mlp_hook = op.attrs.matmul_op.has_value() && (*op.attrs.matmul_op == modules::MatmulOp::MLPUp ||
+                                                                *op.attrs.matmul_op == modules::MatmulOp::MLPDown);
     if (hook && *hook && op.attrs.backward_hook_point.has_value() && !(is_moe && is_mlp_hook)) {
         // Temporarily map grads to current backward tensors for LoRA hooks, then restore.
         struct GradPtrs {
@@ -969,20 +1048,11 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
 
             if (dA_ptr) {
                 switch (*op.attrs.matmul_op) {
-                    case modules::MatmulOp::MLPDown:
-                        grads.d_swiglu.Data = dA_ptr->Data;
-                        break;
-                    case modules::MatmulOp::MLPUp:
-                        grads.d_ln2.Data = dA_ptr->Data;
-                        break;
-                    case modules::MatmulOp::AttnOut:
-                        grads.d_att.Data = dA_ptr->Data;
-                        break;
-                    case modules::MatmulOp::QKV:
-                        grads.d_ln1.Data = dA_ptr->Data;
-                        break;
-                    default:
-                        break;
+                    case modules::MatmulOp::MLPDown: grads.d_swiglu.Data = dA_ptr->Data; break;
+                    case modules::MatmulOp::MLPUp: grads.d_ln2.Data = dA_ptr->Data; break;
+                    case modules::MatmulOp::AttnOut: grads.d_att.Data = dA_ptr->Data; break;
+                    case modules::MatmulOp::QKV: grads.d_ln1.Data = dA_ptr->Data; break;
+                    default: break;
                 }
             }
 
@@ -994,20 +1064,11 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             }
 
             switch (*op.attrs.matmul_op) {
-                case modules::MatmulOp::MLPDown:
-                    grads.d_res_ffn.Data = d_out.Data;
-                    break;
-                case modules::MatmulOp::MLPUp:
-                    grads.d_mlp_up.Data = d_out.Data;
-                    break;
-                case modules::MatmulOp::AttnOut:
-                    grads.d_att_out.Data = d_out.Data;
-                    break;
-                case modules::MatmulOp::QKV:
-                    grads.d_qkv.Data = d_out.Data;
-                    break;
-                default:
-                    break;
+                case modules::MatmulOp::MLPDown: grads.d_res_ffn.Data = d_out.Data; break;
+                case modules::MatmulOp::MLPUp: grads.d_mlp_up.Data = d_out.Data; break;
+                case modules::MatmulOp::AttnOut: grads.d_att_out.Data = d_out.Data; break;
+                case modules::MatmulOp::QKV: grads.d_qkv.Data = d_out.Data; break;
+                default: break;
             }
         }
 
@@ -1021,15 +1082,14 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     const int Bv = static_cast<int>(mB);
                     const int Tv = static_cast<int>(mT);
                     const int D = static_cast<int>(mConfig.IntermediateSize);
-                    const bool has_valid_shape =
-                        acts.swiglu.Rank == 3 &&
-                        acts.swiglu.Sizes[0] == mB &&
-                        acts.swiglu.Sizes[1] == mT &&
-                        acts.swiglu.Sizes[2] == D;
+                    const bool has_valid_shape = acts.swiglu.Rank == 3 && acts.swiglu.Sizes[0] == mB &&
+                                                 acts.swiglu.Sizes[1] == mT && acts.swiglu.Sizes[2] == D;
                     if (has_valid_shape) {
                         mRunState.temp_acquire(acts.swiglu);
                     } else {
-                        acts.swiglu = mRunState.temp_alloc(acts.mlp_up.DType, {mB, mT, static_cast<long>(D)}, "matmul_lora_swiglu_recompute");
+                        acts.swiglu = mRunState.temp_alloc(acts.mlp_up.DType,
+                                                           {mB, mT, static_cast<long>(D)},
+                                                           "matmul_lora_swiglu_recompute");
                         mTemps.push_back(acts.swiglu);
                     }
                     switch (mConfig.activation_type) {
@@ -1051,7 +1111,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                 }
             }
         }
-        
+
         (*hook)(layer_idx, do_accumulate, mRunState.MainStream, *op.attrs.backward_hook_point, mHookContext);
 
         if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
@@ -1070,4 +1130,225 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Matmul backward rule
+// Forward: C = A @ B (with optional transpose modes)
+// Backward: dA = dC @ B.T, dB = A.T @ dC (adjusted for transpose modes)
+// -----------------------------------------------------------------------------
+std::vector<Operation> matmul_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    const std::string& A = fwd.inputs[0];
+    const std::string& B = fwd.inputs[1];
+    const std::string& dC = ctx.d_output;
+
+    // Parse transpose mode from forward op
+    std::string trans = get_string_attr(fwd.attrs, "transpose", "NN");
+
+    // Determine backward transpose modes based on forward mode
+    // Forward: C = op(A) @ op(B) where op depends on transpose flags
+    // For NN: C = A @ B       -> dA = dC @ B.T (NT), dB = A.T @ dC (TN)
+    // For NT: C = A @ B.T     -> dA = dC @ B (NN),   dB = dC.T @ A (TN) = A.T @ dC.T ...
+    // For TN: C = A.T @ B     -> dA = B @ dC.T (NT), dB = A @ dC (NN)
+    // For TT: C = A.T @ B.T   -> dA = B.T @ dC.T,    dB = dC.T @ A.T
+
+    // Determine references for A and B in backward pass:
+    // - Parameters are available at backward time (gathered from weight manager)
+    // - Activations must be saved from forward pass (use saved_ref)
+    std::string A_for_dB = ctx.is_param(A) ? A : saved_ref(A);
+    std::string B_for_dA = ctx.is_param(B) ? B : saved_ref(B);
+
+    AttrMap attrs;
+    attrs["transpose"] = AttrValue(trans);
+
+    std::vector<std::string> inputs = {dC, A_for_dB, B_for_dA};
+    std::vector<std::string> outputs = {ctx.d_inputs[0], ctx.d_inputs[1]};
+
+    ops.push_back(make_operation("matmul_backward_" + std::to_string(ctx.op_counter++),
+                                 "matmul_backward",
+                                 "matmul_backward",
+                                 inputs,
+                                 outputs,
+                                 attrs));
+
+    return ops;
+}
+
+}  // namespace
+
+namespace {
+
+// -----------------------------------------------------------------------------
+// Matmul + Bias backward rule
+// Forward: C = A @ B (+ bias), with optional transpose modes
+// Backward: dA = dC @ B.T, dB = A.T @ dC (adjusted for transpose modes), dBias = sum(dC)
+// -----------------------------------------------------------------------------
+std::vector<Operation> matmul_bias_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    const std::string& A = fwd.inputs[0];
+    const std::string& B = fwd.inputs[1];
+    const std::string& dC = ctx.d_output;
+    const std::string bias = (fwd.inputs.size() > 2) ? fwd.inputs[2] : "";
+
+    std::string trans = get_string_attr(fwd.attrs, "transpose", "NN");
+
+    std::string A_for_dB = ctx.is_param(A) ? A : saved_ref(A);
+    std::string B_for_dA = ctx.is_param(B) ? B : saved_ref(B);
+
+    AttrMap attrs;
+    attrs["transpose"] = AttrValue(trans);
+    std::vector<std::string> inputs = {dC, A_for_dB, B_for_dA};
+    std::vector<std::string> outputs = {ctx.d_inputs[0], ctx.d_inputs[1]};
+    ops.push_back(make_operation("matmul_bias_backward_" + std::to_string(ctx.op_counter++),
+                                 "matmul_backward",
+                                 "matmul_backward",
+                                 inputs,
+                                 outputs,
+                                 attrs));
+
+    if (ctx.needs_grad(2) && !bias.empty()) {
+        std::vector<std::string> outputs;
+        outputs.push_back("");
+        outputs.push_back(ctx.d_inputs[2]);
+        ops.push_back(make_operation("matmul_bias_dBias_" + std::to_string(ctx.op_counter++),
+                                     "bias_add_backward",
+                                     "bias_add_backward",
+                                     {dC, bias},
+                                     outputs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("matmul_bias", ::dsl::matmul_bias_backward);
+
+REGISTER_AUTODIFF("matmul", ::dsl::matmul_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// Matmul
+// ------------------------------------------------------------------------
+const int _matmul_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "matmul";
+    sig.min_inputs = 2;
+    sig.max_inputs = 2;
+    sig.min_outputs = 1;
+    sig.max_outputs = 3;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap& attrs, const ShapeEnv&) {
+        if (inputs.size() < 2 || outputs.empty()) {
+            ShapeValidationError err;
+            err.message = "matmul requires 2 inputs and 1 output";
+            return std::make_optional(err);
+        }
+        return validators::check_matmul_dims(inputs[0], inputs[1], outputs[0], attrs);
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// Matmul + Bias
+// ------------------------------------------------------------------------
+const int _matmul_bias_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "matmul_bias";
+    sig.min_inputs = 3;
+    sig.max_inputs = 3;
+    sig.min_outputs = 1;
+    sig.max_outputs = 3;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap& attrs, const ShapeEnv&) {
+        if (inputs.size() < 3 || outputs.empty()) {
+            ShapeValidationError err;
+            err.message = "matmul_bias requires 3 inputs and 1 output";
+            return std::make_optional(err);
+        }
+
+        // Check matmul dims
+        auto matmul_err = validators::check_matmul_dims(inputs[0], inputs[1], outputs[0], attrs);
+        if (matmul_err) return matmul_err;
+
+        // Check bias shape (should be broadcastable with output)
+        const auto& bias_shape = inputs[2];
+        const auto& out_shape = outputs[0];
+        if (bias_shape.size() > out_shape.size()) {
+            ShapeValidationError err;
+            err.message = "matmul_bias: bias rank exceeds output rank";
+            return std::make_optional(err);
+        }
+
+        // Bias last dim should match output last dim
+        if (!bias_shape.empty() && !out_shape.empty()) {
+            if (bias_shape.back() != out_shape.back() && bias_shape.back() != 1) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "matmul_bias: bias last dim (" << bias_shape.back() << ") doesn't match output last dim ("
+                    << out_shape.back() << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// MatmulBackward
+// ------------------------------------------------------------------------
+const int _matmul_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "matmul_backward";
+    sig.min_inputs = 3;
+    sig.max_inputs = 3;
+    sig.min_outputs = 2;
+    sig.max_outputs = 2;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& d_out = inputs[0];
+        const auto& a = inputs[1];
+        const auto& b = inputs[2];
+        const auto& d_a = outputs[0];
+        const auto& d_b = outputs[1];
+
+        // Check shapes match forward matmul
+        if (auto err = validators::check_matmul_dims(a, b, d_out, attrs)) {
+            return err;
+        }
+
+        // Check gradient shapes match input shapes
+        if (auto err = validators::check_same_numel(d_a, a, "d_a", "a", "matmul_backward")) {
+            return err;
+        }
+        if (auto err = validators::check_same_numel(d_b, b, "d_b", "b", "matmul_backward")) {
+            return err;
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

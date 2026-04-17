@@ -9,10 +9,9 @@ Defines:
 - ConcreteDim: Compile-time known dimension
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Union, Optional, List, Dict, Any, Tuple
-import math
+from typing import Any, Union
 
 
 class Dtype(str, Enum):
@@ -169,7 +168,7 @@ class Shape:
         Shape([VariadicDim(), SymbolicDim("C")])  # [*, C]
     """
 
-    dims: List[Dim]
+    dims: list[Dim]
 
     def __str__(self) -> str:
         return "[" + ", ".join(str(d) for d in self.dims) + "]"
@@ -200,7 +199,7 @@ class Shape:
         """Whether all dimensions are concrete."""
         return all(isinstance(d, ConcreteDim) for d in self.dims)
 
-    def concrete_size(self) -> Optional[int]:
+    def concrete_size(self) -> int | None:
         """Total number of elements if fully concrete."""
         if not self.is_concrete():
             return None
@@ -239,8 +238,8 @@ class TensorTypeSpec:
     @classmethod
     def from_dims(
         cls,
-        dims: List[Union[str, int]],
-        dtype: Union[str, Dtype] = Dtype.BF16,
+        dims: list[str | int],
+        dtype: str | Dtype = Dtype.BF16,
         optional: bool = False,
     ) -> "TensorTypeSpec":
         """Create TensorTypeSpec from a list of dimension specs.
@@ -275,7 +274,7 @@ class TupleType:
         TupleType([TensorTypeSpec(...), TensorTypeSpec(...)])
     """
 
-    elements: List[TensorTypeSpec]
+    elements: list[TensorTypeSpec]
 
     def __str__(self) -> str:
         return "(" + ", ".join(str(e) for e in self.elements) + ")"
@@ -295,7 +294,7 @@ class ArrayType:
         ArrayType(32, ModuleRef("DenseTransformerBlock"))
     """
 
-    size: Union[int, str]  # Size can be concrete or symbolic (e.g., "n_layers")
+    size: int | str  # Size can be concrete or symbolic (e.g., "n_layers")
     element_type: Any  # Module reference or TensorTypeSpec
 
     def __str__(self) -> str:
@@ -319,7 +318,7 @@ class ConstExpr:
     def __str__(self) -> str:
         return self.expr_str
 
-    def evaluate(self, env: Dict[str, Any]) -> Any:
+    def evaluate(self, env: dict[str, Any]) -> Any:
         """Evaluate the expression given an environment of bindings."""
         if isinstance(self.value, (int, float, bool, str, type(None))):
             return self.value
@@ -341,7 +340,7 @@ class Constraint:
     condition: ConstExpr
     message: str
 
-    def check(self, env: Dict[str, Any]) -> Tuple[bool, str]:
+    def check(self, env: dict[str, Any]) -> tuple[bool, str]:
         """Check the constraint, return (passed, message)."""
         try:
             result = self.condition.evaluate(env)
@@ -353,6 +352,7 @@ class Constraint:
 
 
 # Precision-related types
+
 
 class TransposeMode(str, Enum):
     """Transpose mode for matmul operations."""
@@ -366,12 +366,12 @@ class TransposeMode(str, Enum):
 class MemoryMode(str, Enum):
     """Memory lifecycle mode for tensors."""
 
-    SAVE = "save"          # Save for backward pass
+    SAVE = "save"  # Save for backward pass
     RECOMPUTE = "recompute"  # Recompute in backward
     TEMPORARY = "temporary"  # Free immediately after use
-    PIN = "pin"            # Keep in GPU memory
-    OFFLOAD = "offload"    # Eligible for CPU offload
-    STREAM = "stream"      # Stream from CPU/NVMe
+    PIN = "pin"  # Keep in GPU memory
+    OFFLOAD = "offload"  # Eligible for CPU offload
+    STREAM = "stream"  # Stream from CPU/NVMe
 
 
 class HookPoint(str, Enum):
@@ -400,20 +400,20 @@ class HookMode(str, Enum):
     """Hook execution mode."""
 
     OBSERVE = "observe"  # Read-only
-    MODIFY = "modify"    # In-place modification
+    MODIFY = "modify"  # In-place modification
     REPLACE = "replace"  # Return replacement
 
 
 class ShardStrategy(str, Enum):
     """Tensor sharding strategy for distributed execution."""
 
-    COLUMN = "column"       # Shard along columns (output dim)
-    ROW = "row"             # Shard along rows (input dim)
+    COLUMN = "column"  # Shard along columns (output dim)
+    ROW = "row"  # Shard along rows (input dim)
     REPLICATED = "replicated"  # Full copy on each device
-    EXPERT = "expert"       # Distribute experts
-    SEQUENCE = "sequence"   # Shard along sequence
-    BATCH = "batch"         # Shard along batch
-    HEAD = "head"           # Shard along head dimension
+    EXPERT = "expert"  # Distribute experts
+    SEQUENCE = "sequence"  # Shard along sequence
+    BATCH = "batch"  # Shard along batch
+    HEAD = "head"  # Shard along head dimension
 
 
 class ScalingStrategy(str, Enum):

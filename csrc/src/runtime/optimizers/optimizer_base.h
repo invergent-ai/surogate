@@ -15,11 +15,11 @@ namespace optimizers {
  * @brief Supported optimizer types
  */
 enum class OptimizerType {
-    ADAMW,              // full-precision AdamW
-    ADAMW_8BIT,         // 8-bit AdamW with softsign/sqrt quantization (FlashOptim-style)
-    MUON,               // Muon optimizer (future)
-    SGD,                // SGD with momentum (future)
-    NORMUON             // NormUon optimizer (future)
+    ADAMW,       // full-precision AdamW
+    ADAMW_8BIT,  // 8-bit AdamW with softsign/sqrt quantization (FlashOptim-style)
+    MUON,        // Muon optimizer (future)
+    SGD,         // SGD with momentum (future)
+    NORMUON      // NormUon optimizer (future)
 };
 
 /**
@@ -59,6 +59,6 @@ inline std::string to_string(OptimizerType type) {
     return std::string(optimizer_type_to_str(type));
 }
 
-} // namespace optimizers
+}  // namespace optimizers
 
-#endif // SUROGATE_SRC_MODULES_OPTIMIZERS_OPTIMIZER_BASE_H
+#endif  // SUROGATE_SRC_MODULES_OPTIMIZERS_OPTIMIZER_BASE_H

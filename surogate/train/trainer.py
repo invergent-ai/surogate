@@ -2,42 +2,36 @@ import math
 import os
 import re
 import shutil
-import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
+
 from surogate import _surogate
 from surogate.core.config.sft_config import SFTConfig
 from surogate.train.early_stopping import EarlyStopping
 from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
-from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.lr_schedule import LRSchedule
-from surogate.train.training_advisor import TrainingAdvisor
 from surogate.train.metrics import MoEMetrics, StepMetrics
+from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.reporter import training_logger_context
+from surogate.train.training_advisor import TrainingAdvisor
 from surogate.train.training_plot import generate_training_plot
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
 from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
-from surogate.utils.tensor import to_surogate_dtype
 from surogate.utils.model import estimate_model_parameters
+from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
 
 
-class SurogateTrainerWrapper():
-    def __init__(
-            self,
-            config: SFTConfig,
-            train_files: List[str],
-            eval_files: Optional[List[str]] = None
-    ):
+class SurogateTrainerWrapper:
+    def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config
         self._block_types = None
         self._train_vision = bool(config.train_vision and config.is_multimodal)
@@ -54,6 +48,7 @@ class SurogateTrainerWrapper():
         model_weights_path = get_model_weights_path(config.model_dir)
 
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
+
         # Pass training-time config overrides that affect graph compilation
         dsl_extra = {}
         if getattr(config, "ep_size", 1) > 1:
@@ -63,12 +58,15 @@ class SurogateTrainerWrapper():
 
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
+
         jit_manifests = compile_jit_kernels(ir_json)
         if jit_manifests:
             config.runtime_config.jit_kernel_manifests = jit_manifests
 
         # Setup data loaders / on-the-fly batcher
-        self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
+        self.total_batch_size = (
+            config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
+        )
         self.chunk_size = config.per_device_train_batch_size * config.sequence_len * config.gpus
 
         if self._train_vision:
@@ -81,7 +79,13 @@ class SurogateTrainerWrapper():
 
             self.train_loader = None
             self.eval_loader = None
-            self._mm_hf_model, self._mm_processor, self._mm_template_processor, self._mm_vision_device, self._mm_rope_fn = init_mm_helpers(self.config)
+            (
+                self._mm_hf_model,
+                self._mm_processor,
+                self._mm_template_processor,
+                self._mm_vision_device,
+                self._mm_rope_fn,
+            ) = init_mm_helpers(self.config)
             self.mm_train_dataset, self.mm_eval_dataset = load_multimodal_datasets(self.config)
             pad_token_id = config.tokenizer.pad_token_id
             if pad_token_id is None:
@@ -103,12 +107,13 @@ class SurogateTrainerWrapper():
             self.steps_per_epoch = self.mm_batcher.steps_per_epoch
         else:
             self.train_loader = _surogate.DataLoader(train_files, self.chunk_size, seed=config.train_seed)
-            self.eval_loader = _surogate.DataLoader(eval_files, self.chunk_size,
-                                                    seed=config.eval_seed) if eval_files else None
+            self.eval_loader = (
+                _surogate.DataLoader(eval_files, self.chunk_size, seed=config.eval_seed) if eval_files else None
+            )
 
             # Calculate steps
             self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size
-            
+
         # Create trainer
         self.start_step = 0
         if config.resume_from_checkpoint:
@@ -116,7 +121,9 @@ class SurogateTrainerWrapper():
             if self.start_step >= 0:
                 self.trainer = _surogate.SurogateTrainer(
                     ngpu=config.gpus,
-                    config=_surogate.PretrainedConfig.from_pretrained(config.model_dir, to_surogate_dtype(config.torch_dtype)),
+                    config=_surogate.PretrainedConfig.from_pretrained(
+                        config.model_dir, to_surogate_dtype(config.torch_dtype)
+                    ),
                     options=config.runtime_config,
                     batch_size=config.per_device_train_batch_size,
                     seq_len=config.sequence_len,
@@ -124,7 +131,7 @@ class SurogateTrainerWrapper():
                     memcpy_all_gather=config.memcpy_all_gather,
                     memcpy_send_recv=config.memcpy_send_recv,
                     lora_config=config.lora_config,
-                    qlora_config=config.qlora_config
+                    qlora_config=config.qlora_config,
                 )
                 # Base model weights must be imported first to initialize the weight structure.
                 # For LoRA: checkpoint only contains adapter weights + optimizer state, so we
@@ -159,11 +166,13 @@ class SurogateTrainerWrapper():
                 logger.warning("No checkpoint found to resume from. Starting training from beginning.")
                 self.start_step = 0
 
-        if not hasattr(self, 'trainer'):
+        if not hasattr(self, "trainer"):
             if config.lora and config.lora_rank and config.lora_alpha and config.lora_target_modules:
                 self.trainer = _surogate.SurogateTrainer(
                     ngpu=config.gpus,
-                    config=_surogate.PretrainedConfig.from_pretrained(config.model_dir, to_surogate_dtype(config.torch_dtype)),
+                    config=_surogate.PretrainedConfig.from_pretrained(
+                        config.model_dir, to_surogate_dtype(config.torch_dtype)
+                    ),
                     options=config.runtime_config,
                     batch_size=config.per_device_train_batch_size,
                     seq_len=config.sequence_len,
@@ -171,7 +180,7 @@ class SurogateTrainerWrapper():
                     memcpy_all_gather=config.memcpy_all_gather,
                     memcpy_send_recv=config.memcpy_send_recv,
                     lora_config=config.lora_config,
-                    qlora_config=config.qlora_config
+                    qlora_config=config.qlora_config,
                 )
                 if config.adapter_path:
                     logger.info(f"Merging adapter from {config.adapter_path} into base weights...")
@@ -181,13 +190,15 @@ class SurogateTrainerWrapper():
             elif config.from_scratch:
                 self.trainer = _surogate.SurogateTrainer(
                     ngpu=config.gpus,
-                    config=_surogate.PretrainedConfig.from_name(config.model_info.model_name, to_surogate_dtype(config.torch_dtype)),
+                    config=_surogate.PretrainedConfig.from_name(
+                        config.model_info.model_name, to_surogate_dtype(config.torch_dtype)
+                    ),
                     options=config.runtime_config,
                     batch_size=config.per_device_train_batch_size,
                     seq_len=config.sequence_len,
                     grad_accum=config.gradient_accumulation_steps,
                     memcpy_all_gather=config.memcpy_all_gather,
-                    memcpy_send_recv=config.memcpy_send_recv
+                    memcpy_send_recv=config.memcpy_send_recv,
                 )
                 self.trainer.init_weights()
             else:
@@ -200,9 +211,9 @@ class SurogateTrainerWrapper():
                     seq_len=config.sequence_len,
                     grad_accum=config.gradient_accumulation_steps,
                     memcpy_all_gather=config.memcpy_all_gather,
-                    memcpy_send_recv=config.memcpy_send_recv
+                    memcpy_send_recv=config.memcpy_send_recv,
                 )
-                
+
         if self.config.from_scratch:
             # Chinchilla token budget (optimal tokens ≈ 20 × params)
             self.num_params = estimate_model_parameters(config.model_info.config)
@@ -247,7 +258,7 @@ class SurogateTrainerWrapper():
             cooldown_steps=config.cooldown_steps,
             final_lr=config.learning_rate * config.final_lr_fraction,
             schedule_type=config.lr_scheduler_type,
-            wsd_decay_steps_fraction=config.wsd_decay_steps_fraction
+            wsd_decay_steps_fraction=config.wsd_decay_steps_fraction,
         )
 
     def _detect_pos_planes(self) -> int:
@@ -255,11 +266,11 @@ class SurogateTrainerWrapper():
 
         All multimodal models currently supported (Qwen3-VL) use 3-plane MRoPE.
         """
-        if getattr(self.config.model_info, 'is_multimodal', False):
+        if getattr(self.config.model_info, "is_multimodal", False):
             return 3
         return 1
 
-    def _load_block_types(self) -> Optional[list]:
+    def _load_block_types(self) -> list | None:
         if self._block_types is not None:
             return self._block_types
 
@@ -300,10 +311,16 @@ class SurogateTrainerWrapper():
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
         """Copy tokenizer, vocab, and config files from source model to output directory."""
         tokenizer_files = [
-            "config.json", "preprocessor_config.json",
-            "tokenizer.json", "tokenizer_config.json",
-            "special_tokens_map.json", "vocab.json", "merges.txt",
-            "added_tokens.json", "chat_template.jinja", "generation_config.json"
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "added_tokens.json",
+            "chat_template.jinja",
+            "generation_config.json",
         ]
         src_path = Path(src_dir)
         dst_path = Path(dst_dir)
@@ -348,17 +365,23 @@ class SurogateTrainerWrapper():
             logger.info(f"Steps per epoch: {self.steps_per_epoch}")
             logger.info(f"Max steps: {self.max_steps}")
             logger.info(
-                f"LR schedule: {self.config.lr_scheduler_type} (warmup={self.warmup_steps}, cooldown={self.config.cooldown_steps})")
-            
+                f"LR schedule: {self.config.lr_scheduler_type} (warmup={self.warmup_steps}, cooldown={self.config.cooldown_steps})"
+            )
+
             if self.config.from_scratch:
                 # Chinchilla token budget
                 planned_tokens = self.max_steps * self.tokens_per_step
                 ratio = planned_tokens / max(self.chinchilla_tokens, 1)
+
                 def _fmt(n):
-                    if n >= 1e12: return f"{n/1e12:.1f}T"
-                    if n >= 1e9: return f"{n/1e9:.1f}B"
-                    if n >= 1e6: return f"{n/1e6:.1f}M"
-                    return f"{n/1e3:.1f}K"
+                    if n >= 1e12:
+                        return f"{n / 1e12:.1f}T"
+                    if n >= 1e9:
+                        return f"{n / 1e9:.1f}B"
+                    if n >= 1e6:
+                        return f"{n / 1e6:.1f}M"
+                    return f"{n / 1e3:.1f}K"
+
                 logger.info(
                     f"Chinchilla budget: {_fmt(self.chinchilla_tokens)} tokens (20 × {_fmt(self.num_params)} params) | "
                     f"Planned: {_fmt(planned_tokens)} tokens ({ratio:.1%} of budget)"
@@ -366,7 +389,7 @@ class SurogateTrainerWrapper():
 
             # Print LoRA info if enabled
             if self.config.lora and self.config.lora_config:
-                logger.info(f"LoRA enabled:")
+                logger.info("LoRA enabled:")
                 logger.info(f"  Rank: {self.config.lora_config.rank}")
                 logger.info(f"  Alpha: {self.config.lora_config.alpha}")
                 logger.info(f"  Scaling: {self.config.lora_config.scaling:.4f}")
@@ -402,13 +425,14 @@ class SurogateTrainerWrapper():
                             adapter_path=str(adapter_dir),
                             output_path=str(merged_dir),
                             max_shard_size="5GB",
-                            cpu_offload=True
+                            cpu_offload=True,
                         )
                         # Generate training plot in merged directory
                         generate_training_plot(self.config.log_file, merged_dir / "training_plot.png")
                     except Exception as e:
                         logger.error(f"Failed to merge adapter: {e}")
                         import traceback
+
                         logger.error(f"Traceback:\n{traceback.format_exc()}")
                         logger.warning("Adapter merge failed, but adapter was saved successfully")
                 else:
@@ -443,15 +467,26 @@ class SurogateTrainerWrapper():
             num_experts_per_tok=self.config.moe_num_experts_per_tok,
         )
         advisor = TrainingAdvisor(
-            logger, phase_detector, gradient_tracker, plateau_detector,
-            loss_guard, moe_monitor, self.lr_schedule, self.max_steps,
+            logger,
+            phase_detector,
+            gradient_tracker,
+            plateau_detector,
+            loss_guard,
+            moe_monitor,
+            self.lr_schedule,
+            self.max_steps,
             warmup_steps=self.warmup_steps,
         )
 
         # Early stopping
         if self.config.early_stop:
             num_params = estimate_model_parameters(self.config.model_info.config)
-            tokens_per_step = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+            tokens_per_step = (
+                self.config.per_device_train_batch_size
+                * self.config.sequence_len
+                * self.config.gradient_accumulation_steps
+                * self.config.gpus
+            )
             early_stopping = EarlyStopping(logger, num_params, tokens_per_step)
         else:
             early_stopping = None
@@ -460,10 +495,20 @@ class SurogateTrainerWrapper():
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
         for step in range(self.start_step, self.max_steps):
             # Periodic evaluation (before training step)
-            if self.mm_eval_dataset is not None and self.config.eval_steps > 0 and step % self.config.eval_steps == 0 and step > self.start_step:
+            if (
+                self.mm_eval_dataset is not None
+                and self.config.eval_steps > 0
+                and step % self.config.eval_steps == 0
+                and step > self.start_step
+            ):
                 val_loss, elapsed_ms, batches_processed = self.run_evaluation_mm(max_steps=100)
                 epoch = self.mm_batcher.epoch() + 0.01 * self.mm_batcher.progress()
-                eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
+                eval_tokens = (
+                    batches_processed
+                    * self.config.per_device_train_batch_size
+                    * self.config.sequence_len
+                    * self.config.gpus
+                )
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
                 if early_stopping is not None and early_stopping.check_eval(val_loss, step):
                     break
@@ -479,16 +524,19 @@ class SurogateTrainerWrapper():
                     generate_training_plot(self.config.log_file, checkpoint_plot_path)
 
                     if self.config.save_total_limit > 0:
-                        removed = _surogate.clean_old_checkpoints(self.config.checkpoint_dir, self.config.save_total_limit,
-                                                                  -1)
+                        removed = _surogate.clean_old_checkpoints(
+                            self.config.checkpoint_dir, self.config.save_total_limit, -1
+                        )
                         if removed:
                             logger.info(
-                                f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}")
+                                f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}"
+                            )
                 except Exception as e:
                     logger.error(f"Failed to save checkpoint at step {step}: {e}")
                     logger.error(f"Exception type: {type(e).__name__}")
                     logger.warning("Training will continue without saving this checkpoint")
                     import traceback
+
                     logger.error(f"Traceback:\n{traceback.format_exc()}")
 
             # Training step
@@ -520,27 +568,32 @@ class SurogateTrainerWrapper():
                 normuon_momentum=self.config.normuon_momentum,
                 normuon_beta2=self.config.normuon_beta2,
                 normuon_lr=lr,
-                normuon_cautious_wd=self.config.normuon_cautious_wd
+                normuon_cautious_wd=self.config.normuon_cautious_wd,
             )
 
             self._maybe_log_lora_grad_stats(step)
             result = self.trainer.update_with_config(opt_config, step + 1)
 
             step_time = time.time() - step_start
-            tokens_processed = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+            tokens_processed = (
+                self.config.per_device_train_batch_size
+                * self.config.sequence_len
+                * self.config.gradient_accumulation_steps
+                * self.config.gpus
+            )
 
             if loss_guard is not None:
-                loss_guard.step(result['loss'], result['norm'], step)
-            plateau_detector.step(result['loss'], step)
-            phase = phase_detector.step(result['loss'], step)
-            gradient_tracker.step(result['norm'], step)
+                loss_guard.step(result["loss"], result["norm"], step)
+            plateau_detector.step(result["loss"], step)
+            phase = phase_detector.step(result["loss"], step)
+            gradient_tracker.step(result["norm"], step)
             train_logger.set_phase(phase.value)
 
             metrics = StepMetrics(
                 step=step,
                 epoch=self.mm_batcher.epoch() + 0.01 * self.mm_batcher.progress(),
-                loss=result['loss'],
-                grad_norm=result['norm'],
+                loss=result["loss"],
+                grad_norm=result["norm"],
                 grad_norm_mean=gradient_tracker.mean,
                 grad_norm_max=gradient_tracker.max,
                 grad_norm_trend=gradient_tracker.trend,
@@ -559,19 +612,33 @@ class SurogateTrainerWrapper():
 
             if step % self.config.logging_steps == 0:
                 if metrics.moe is not None:
-                    train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                              metrics.grad_norm, metrics.loss, metrics.lr,
-                                              metrics.moe.aux_loss,
-                                              metrics.moe.z_loss,
-                                              metrics.moe.load_imbalance,
-                                              metrics.moe.expert_utilization)
+                    train_logger.log_step_moe(
+                        metrics.step,
+                        metrics.epoch,
+                        metrics.tokens,
+                        metrics.elapsed_ms,
+                        metrics.grad_norm,
+                        metrics.loss,
+                        metrics.lr,
+                        metrics.moe.aux_loss,
+                        metrics.moe.z_loss,
+                        metrics.moe.load_imbalance,
+                        metrics.moe.expert_utilization,
+                    )
                 else:
-                    train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                          metrics.grad_norm, metrics.loss, metrics.lr)
+                    train_logger.log_step(
+                        metrics.step,
+                        metrics.epoch,
+                        metrics.tokens,
+                        metrics.elapsed_ms,
+                        metrics.grad_norm,
+                        metrics.loss,
+                        metrics.lr,
+                    )
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
-    def run_evaluation_mm(self, max_steps: int) -> Tuple[float, int, int]:
+    def run_evaluation_mm(self, max_steps: int) -> tuple[float, int, int]:
         if max_steps == 0:
             return 0.0, 0, 0
         if self.mm_eval_dataset is None:
@@ -623,7 +690,9 @@ class SurogateTrainerWrapper():
     def run_training_loop(self, train_logger: _surogate.TrainingRunLogger):
         use_full_step_graphs = True
         if use_full_step_graphs and self.config.optimizer not in ("adamw", "adamw_8bit", "normuon"):
-            raise RuntimeError("DSL training requires optimizer 'adamw', 'adamw_8bit' or 'normuon' for full-step execution.")
+            raise RuntimeError(
+                "DSL training requires optimizer 'adamw', 'adamw_8bit' or 'normuon' for full-step execution."
+            )
         if use_full_step_graphs and not self.config.use_cuda_graphs:
             logger.info("CUDA graphs disabled")
 
@@ -637,7 +706,7 @@ class SurogateTrainerWrapper():
         # provides the canonical 1-plane packed IDs with doc-boundary resets.
         # Pass those IDs through and let C++ expand planes as needed.
         pos_ids = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
-    
+
         # Preload first batch (eager path only)
         if not use_full_step_graphs:
             self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
@@ -653,16 +722,28 @@ class SurogateTrainerWrapper():
             num_experts_per_tok=self.config.moe_num_experts_per_tok,
         )
         advisor = TrainingAdvisor(
-            logger, phase_detector, gradient_tracker, plateau_detector,
-            loss_guard, moe_monitor, self.lr_schedule, self.max_steps,
+            logger,
+            phase_detector,
+            gradient_tracker,
+            plateau_detector,
+            loss_guard,
+            moe_monitor,
+            self.lr_schedule,
+            self.max_steps,
             warmup_steps=self.warmup_steps,
         )
 
         # Early stopping
         if self.config.early_stop:
             from surogate.utils.model import estimate_model_parameters
+
             num_params = estimate_model_parameters(self.config.model_info.config)
-            tokens_per_step = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+            tokens_per_step = (
+                self.config.per_device_train_batch_size
+                * self.config.sequence_len
+                * self.config.gradient_accumulation_steps
+                * self.config.gpus
+            )
             early_stopping = EarlyStopping(logger, num_params, tokens_per_step)
         else:
             early_stopping = None
@@ -677,7 +758,12 @@ class SurogateTrainerWrapper():
                     self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic evaluation (before training step)
-            if self.eval_loader and self.config.eval_steps > 0 and step % self.config.eval_steps == 0 and step > self.start_step:
+            if (
+                self.eval_loader
+                and self.config.eval_steps > 0
+                and step % self.config.eval_steps == 0
+                and step > self.start_step
+            ):
                 # Limit periodic eval to 100 batches for speed; full eval runs at end of training
                 if use_full_step_graphs:
                     chunk = self.config.gpus * self.config.per_device_train_batch_size
@@ -687,11 +773,18 @@ class SurogateTrainerWrapper():
                     )
                 else:
                     eval_pos = pos_ids
-                    val_loss, elapsed_ms, batches_processed = self.run_evaluation(in_tokens, out_tokens, eval_pos, max_steps=100)
+                    val_loss, elapsed_ms, batches_processed = self.run_evaluation(
+                        in_tokens, out_tokens, eval_pos, max_steps=100
+                    )
                 epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
                 # Calculate actual tokens processed based on batches run
                 # Note: eval uses same batch size as training (per_device_train_batch_size) since buffers are shared
-                eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
+                eval_tokens = (
+                    batches_processed
+                    * self.config.per_device_train_batch_size
+                    * self.config.sequence_len
+                    * self.config.gpus
+                )
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
                 if early_stopping is not None and early_stopping.check_eval(val_loss, step):
                     break
@@ -715,16 +808,19 @@ class SurogateTrainerWrapper():
 
                     # Clean old checkpoints
                     if self.config.save_total_limit > 0:
-                        removed = _surogate.clean_old_checkpoints(self.config.checkpoint_dir, self.config.save_total_limit,
-                                                                  -1)
+                        removed = _surogate.clean_old_checkpoints(
+                            self.config.checkpoint_dir, self.config.save_total_limit, -1
+                        )
                         if removed:
                             logger.info(
-                                f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}")
+                                f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}"
+                            )
                 except Exception as e:
                     logger.error(f"Failed to save checkpoint at step {step}: {e}")
                     logger.error(f"Exception type: {type(e).__name__}")
                     logger.warning("Training will continue without saving this checkpoint")
                     import traceback
+
                     logger.error(f"Traceback:\n{traceback.format_exc()}")
 
             # Training step
@@ -765,7 +861,7 @@ class SurogateTrainerWrapper():
                 normuon_momentum=self.config.normuon_momentum,
                 normuon_beta2=self.config.normuon_beta2,
                 normuon_lr=lr,  # Use same LR for NorMuon
-                normuon_cautious_wd=self.config.normuon_cautious_wd
+                normuon_cautious_wd=self.config.normuon_cautious_wd,
             )
             if use_full_step_graphs:
                 result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
@@ -778,21 +874,26 @@ class SurogateTrainerWrapper():
 
             # Build structured metrics for this step
             step_time = time.time() - step_start
-            tokens_processed = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+            tokens_processed = (
+                self.config.per_device_train_batch_size
+                * self.config.sequence_len
+                * self.config.gradient_accumulation_steps
+                * self.config.gpus
+            )
 
             # Check for loss spikes / gradient explosions
             if loss_guard is not None:
-                loss_guard.step(result['loss'], result['norm'], step)
-            plateau_detector.step(result['loss'], step)
-            phase = phase_detector.step(result['loss'], step)
-            gradient_tracker.step(result['norm'], step)
+                loss_guard.step(result["loss"], result["norm"], step)
+            plateau_detector.step(result["loss"], step)
+            phase = phase_detector.step(result["loss"], step)
+            gradient_tracker.step(result["norm"], step)
             train_logger.set_phase(phase.value)
 
             metrics = StepMetrics(
                 step=step,
                 epoch=self.train_loader.epoch() + 0.01 * self.train_loader.progress(),
-                loss=result['loss'],
-                grad_norm=result['norm'],
+                loss=result["loss"],
+                grad_norm=result["norm"],
                 grad_norm_mean=gradient_tracker.mean,
                 grad_norm_max=gradient_tracker.max,
                 grad_norm_trend=gradient_tracker.trend,
@@ -812,15 +913,29 @@ class SurogateTrainerWrapper():
             # Log training step
             if step % self.config.logging_steps == 0:
                 if metrics.moe is not None:
-                    train_logger.log_step_moe(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                              metrics.grad_norm, metrics.loss, metrics.lr,
-                                              metrics.moe.aux_loss,
-                                              metrics.moe.z_loss,
-                                              metrics.moe.load_imbalance,
-                                              metrics.moe.expert_utilization)
+                    train_logger.log_step_moe(
+                        metrics.step,
+                        metrics.epoch,
+                        metrics.tokens,
+                        metrics.elapsed_ms,
+                        metrics.grad_norm,
+                        metrics.loss,
+                        metrics.lr,
+                        metrics.moe.aux_loss,
+                        metrics.moe.z_loss,
+                        metrics.moe.load_imbalance,
+                        metrics.moe.expert_utilization,
+                    )
                 else:
-                    train_logger.log_step(metrics.step, metrics.epoch, metrics.tokens, metrics.elapsed_ms,
-                                          metrics.grad_norm, metrics.loss, metrics.lr)
+                    train_logger.log_step(
+                        metrics.step,
+                        metrics.epoch,
+                        metrics.tokens,
+                        metrics.elapsed_ms,
+                        metrics.grad_norm,
+                        metrics.loss,
+                        metrics.lr,
+                    )
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
@@ -878,8 +993,11 @@ class SurogateTrainerWrapper():
                 inf_count = torch.isinf(t_f).sum().item()
                 logger.info(
                     "  NaN/Inf in LoRA grad '%s' shape=%s nan=%d inf=%d abs_max=%.6g",
-                    name, list(t.shape), nan_count, inf_count,
-                    t_f[~torch.isnan(t_f)].abs().max().item() if nan_count < t_f.numel() else float('nan')
+                    name,
+                    list(t.shape),
+                    nan_count,
+                    inf_count,
+                    t_f[~torch.isnan(t_f)].abs().max().item() if nan_count < t_f.numel() else float("nan"),
                 )
             sq = (t_f * t_f).sum()
             total_sq = sq if total_sq is None else total_sq + sq
@@ -945,7 +1063,11 @@ class SurogateTrainerWrapper():
         max_abs_val = max_abs.item() if max_abs is not None else float("nan")
         logger.info(
             "LoRA grad debug: step=%d tensors=%d norm=%.6g max_abs=%.6g nan=%s",
-            step, tensor_count, total_norm, max_abs_val, any_nan
+            step,
+            tensor_count,
+            total_norm,
+            max_abs_val,
+            any_nan,
         )
 
         if module_stats:
@@ -1022,7 +1144,9 @@ class SurogateTrainerWrapper():
                     stat["nan"],
                 )
 
-    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: Optional[np.ndarray], max_steps: int) -> Tuple[float, int, int]:
+    def run_evaluation(
+        self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: np.ndarray | None, max_steps: int
+    ) -> tuple[float, int, int]:
         """
         Run evaluation on test set.
         Args:

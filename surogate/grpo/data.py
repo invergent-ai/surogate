@@ -1,10 +1,11 @@
 """Data adapter: converts MicroBatch to numpy arrays for Surogate."""
 
-import numpy as np
 from pathlib import Path
 
-from surogate.utils.logger import get_logger
+import numpy as np
+
 from surogate.grpo.transport import setup_micro_batch_receiver
+from surogate.utils.logger import get_logger
 
 logger = get_logger()
 

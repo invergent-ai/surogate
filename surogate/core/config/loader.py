@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Type, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union
 from urllib.request import urlopen
+
 import yaml
+
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 
@@ -13,16 +15,18 @@ if TYPE_CHECKING:
     from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
     from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
     from surogate.core.config.sft_config import SFTConfig
+
     SurogateConfig = Union[SFTConfig, GRPOInferenceConfig, GRPOOrchestratorConfig]
 
 logger = get_logger()
 
-def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
+
+def load_config(config_cls: type[SurogateConfig], path: str) -> SurogateConfig:
     # Check if path is an HTTP(S) URL
-    if path.startswith(('http://', 'https://')):
+    if path.startswith(("http://", "https://")):
         logger.info(f"Fetching config from URL: {path}")
         with urlopen(path) as response:
-            content = response.read().decode('utf-8')
+            content = response.read().decode("utf-8")
             cfg_dict = yaml.safe_load(content)
     else:
         with open(path, encoding="utf-8") as file:
@@ -31,13 +35,11 @@ def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
     # Expand environment variables
     cfg_dict = _expand_env_vars(cfg_dict)
     cfg: DictDefault = DictDefault(cfg_dict)
-    
+
     config = config_cls(cfg)
     cfg.config_path = path
 
-    cfg_to_log = {
-        k: v for k, v in cfg.items() if v is not None
-    }
+    cfg_to_log = {k: v for k, v in cfg.items() if v is not None}
 
     logger.debug(
         "config:\n%s",
@@ -45,6 +47,7 @@ def load_config(config_cls: Type[SurogateConfig], path: str) -> SurogateConfig:
     )
 
     return config
+
 
 def _expand_env_vars(obj: Any) -> Any:
     """
@@ -57,7 +60,7 @@ def _expand_env_vars(obj: Any) -> Any:
         return [_expand_env_vars(item) for item in obj]
     elif isinstance(obj, str):
         # Match ${VAR_NAME} pattern
-        pattern = r'\$\{([^}]+)\}'
+        pattern = r"\$\{([^}]+)\}"
 
         def replace_env_var(match):
             var_name = match.group(1)
@@ -71,6 +74,3 @@ def _expand_env_vars(obj: Any) -> Any:
         return re.sub(pattern, replace_env_var, obj)
     else:
         return obj
-
-
-

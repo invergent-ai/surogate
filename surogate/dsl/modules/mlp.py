@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
-from ..decorators import module, forward, save, Param
+from ..decorators import Param, forward, module, save
+from ..dim import B, Dim, T
 from ..graph_builder import graph
-from ..dim import Dim, B, T
 from ..hf import fuse
+from ..tensor_type import Tensor
 
 
 @module
@@ -43,7 +43,7 @@ class SwiGLUMLP:
 
     @forward
     @save("x", "up")
-    def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
+    def forward(self, x: Tensor[B, T, C]) -> Tensor[B, T, C]:
         with graph() as g:
             # Flatten
             x_flat = g.view(x, shape=[B * T, self.C])
@@ -95,7 +95,7 @@ class GatedMLP:
     down_weight = Param(Tensor["C", "M"])
 
     @forward
-    def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
+    def forward(self, x: Tensor[B, T, C]) -> Tensor[B, T, C]:
         with graph() as g:
             x_flat = g.view(x, shape=[B * T, self.C])
 

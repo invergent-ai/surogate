@@ -38,14 +38,30 @@ struct LoRAAdapterConfig {
         return TargetModules.count(module_name) > 0;
     }
 
-    [[nodiscard]] bool applies_to_q() const { return applies_to("q_proj"); }
-    [[nodiscard]] bool applies_to_k() const { return applies_to("k_proj"); }
-    [[nodiscard]] bool applies_to_v() const { return applies_to("v_proj"); }
-    [[nodiscard]] bool applies_to_o() const { return applies_to("o_proj"); }
-    [[nodiscard]] bool applies_to_gate() const { return applies_to("gate_proj"); }
-    [[nodiscard]] bool applies_to_gate_up() const { return applies_to("gate_up_proj"); }
-    [[nodiscard]] bool applies_to_up() const { return applies_to("up_proj"); }
-    [[nodiscard]] bool applies_to_down() const { return applies_to("down_proj"); }
+    [[nodiscard]] bool applies_to_q() const {
+        return applies_to("q_proj");
+    }
+    [[nodiscard]] bool applies_to_k() const {
+        return applies_to("k_proj");
+    }
+    [[nodiscard]] bool applies_to_v() const {
+        return applies_to("v_proj");
+    }
+    [[nodiscard]] bool applies_to_o() const {
+        return applies_to("o_proj");
+    }
+    [[nodiscard]] bool applies_to_gate() const {
+        return applies_to("gate_proj");
+    }
+    [[nodiscard]] bool applies_to_gate_up() const {
+        return applies_to("gate_up_proj");
+    }
+    [[nodiscard]] bool applies_to_up() const {
+        return applies_to("up_proj");
+    }
+    [[nodiscard]] bool applies_to_down() const {
+        return applies_to("down_proj");
+    }
 
     [[nodiscard]] bool applies_to_attention() const {
         return applies_to_q() || applies_to_k() || applies_to_v() || applies_to_o();
@@ -59,4 +75,4 @@ struct LoRAAdapterConfig {
 // Backwards-compatible alias.
 using LoRAConfig = LoRAAdapterConfig;
 
-#endif // SUROGATE_SRC_CONFIG_LORA_ADAPTER_CONFIG_H
+#endif  // SUROGATE_SRC_CONFIG_LORA_ADAPTER_CONFIG_H

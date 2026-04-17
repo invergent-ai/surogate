@@ -58,7 +58,7 @@ class TrainingAdvisor:
         self.phase_detector = phase_detector
         self.gradient_tracker = gradient_tracker
         self.plateau_detector = plateau_detector
-        self.loss_guard = loss_guard          # may be None
+        self.loss_guard = loss_guard  # may be None
         self.moe_monitor = moe_monitor
         self.lr_schedule = lr_schedule
         self.max_steps = max_steps
@@ -105,9 +105,7 @@ class TrainingAdvisor:
     # Rule 1: Plateau + flat gradients + high LR
     # ------------------------------------------------------------------
 
-    def _check_plateau_high_lr(
-        self, metrics: StepMetrics, phase: TrainingPhase, step: int
-    ) -> None:
+    def _check_plateau_high_lr(self, metrics: StepMetrics, phase: TrainingPhase, step: int) -> None:
         if phase != TrainingPhase.PLATEAU:
             self._plateau_grad_flat_count = 0
             return
@@ -145,9 +143,7 @@ class TrainingAdvisor:
     # Rule 2: Diverging + gradient trend up + MoE imbalance
     # ------------------------------------------------------------------
 
-    def _check_diverging_moe_collapse(
-        self, metrics: StepMetrics, phase: TrainingPhase, step: int
-    ) -> None:
+    def _check_diverging_moe_collapse(self, metrics: StepMetrics, phase: TrainingPhase, step: int) -> None:
         if phase != TrainingPhase.DIVERGING:
             return
         if metrics.moe is None:
@@ -179,9 +175,7 @@ class TrainingAdvisor:
     # Rule 3: Converging + gradient shrinking + loss stalling
     # ------------------------------------------------------------------
 
-    def _check_gradient_vanishing(
-        self, metrics: StepMetrics, phase: TrainingPhase, step: int
-    ) -> None:
+    def _check_gradient_vanishing(self, metrics: StepMetrics, phase: TrainingPhase, step: int) -> None:
         if phase != TrainingPhase.CONVERGING:
             self._converging_grad_shrink_count = 0
             return
@@ -217,9 +211,7 @@ class TrainingAdvisor:
     # Rule 4: Loss spike + MoE utilization drop
     # ------------------------------------------------------------------
 
-    def _check_spike_moe_correlation(
-        self, metrics: StepMetrics, phase: TrainingPhase, step: int
-    ) -> None:
+    def _check_spike_moe_correlation(self, metrics: StepMetrics, phase: TrainingPhase, step: int) -> None:
         if self.loss_guard is None or metrics.moe is None:
             return
 
@@ -246,9 +238,7 @@ class TrainingAdvisor:
     # Rule 5: Multiple LR reductions with no improvement
     # ------------------------------------------------------------------
 
-    def _check_lr_reductions_ineffective(
-        self, metrics: StepMetrics, phase: TrainingPhase, step: int
-    ) -> None:
+    def _check_lr_reductions_ineffective(self, metrics: StepMetrics, phase: TrainingPhase, step: int) -> None:
         if self.loss_guard is None:
             return
 
@@ -273,9 +263,7 @@ class TrainingAdvisor:
     # Rule 6: Warmup ended but loss still dropping steeply
     # ------------------------------------------------------------------
 
-    def _check_warmup_too_short(
-        self, metrics: StepMetrics, phase: TrainingPhase, step: int
-    ) -> None:
+    def _check_warmup_too_short(self, metrics: StepMetrics, phase: TrainingPhase, step: int) -> None:
         if self._warmup_checked:
             return
         if self.warmup_steps <= 0:

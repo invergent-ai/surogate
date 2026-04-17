@@ -31,7 +31,7 @@ bool is_lm_head_name(const std::string& name) {
     return name == "lm_head" || name == "lm_head_weight";
 }
 
-} // namespace
+}  // namespace
 
 DslGradStore::DslGradStore(const DslParamStore& params,
                            const std::shared_ptr<TensorAllocator>& allocator,
@@ -133,8 +133,7 @@ void DslGradStore::configure(const DslGradStoreConfig& config) {
     // (single-GPU cpu_training path; Python validation ensures this is only cpu_training).
     if (mOffloadGrads && !mConfig.shard_gradients && mConfig.num_shards > 1 && !mCpuTraining) {
         throw std::logic_error(
-            "offload_grads on multi-GPU requires shard_gradients=true (ZeRO-2) or cpu_training=true."
-        );
+            "offload_grads on multi-GPU requires shard_gradients=true (ZeRO-2) or cpu_training=true.");
     }
 
     // Early exit if no gradients to manage (e.g., LoRA-only training)
@@ -178,14 +177,15 @@ void DslGradStore::build_layer_grad_map() {
                     try {
                         layer_idx = std::stoi(name.substr(pos, dot_pos - pos));
                         return true;
-                    } catch (...) {}
+                    } catch (...) {
+                    }
                 }
             }
             return false;
         };
 
-        if (extract_layer("blocks.") || extract_layer("layers.") ||
-            extract_layer("model.layers.") || extract_layer("model.blocks.")) {
+        if (extract_layer("blocks.") || extract_layer("layers.") || extract_layer("model.layers.") ||
+            extract_layer("model.blocks.")) {
             if (layer_idx >= 0 && layer_idx < mConfig.num_layers) {
                 mLayerGradNames[layer_idx].push_back(name);
                 mHasLayerGrads = true;
@@ -197,8 +197,12 @@ void DslGradStore::build_layer_grad_map() {
 
 void DslGradStore::build_zero_segments() {
     // Free previous segment arrays if they exist (e.g., rebuild after enable_streaming)
-    if (mZeroPtrs.Data) { cudaFree(mZeroPtrs.Data); }
-    if (mZeroSizes.Data) { cudaFree(mZeroSizes.Data); }
+    if (mZeroPtrs.Data) {
+        cudaFree(mZeroPtrs.Data);
+    }
+    if (mZeroSizes.Data) {
+        cudaFree(mZeroSizes.Data);
+    }
     mZeroPtrs = {};
     mZeroSizes = {};
     mZeroCount = 0;
@@ -232,15 +236,11 @@ void DslGradStore::build_zero_segments() {
     }
 
     const long bytes = static_cast<long>(static_cast<std::size_t>(mZeroCount) * sizeof(std::uint64_t));
-    mZeroPtrs = mAllocator->allocate(ETensorDType::BYTE, "grad_zero_ptrs",
-                                     EAllocationType::ON_DEVICE, {bytes});
-    mZeroSizes = mAllocator->allocate(ETensorDType::BYTE, "grad_zero_sizes",
-                                      EAllocationType::ON_DEVICE, {bytes});
+    mZeroPtrs = mAllocator->allocate(ETensorDType::BYTE, "grad_zero_ptrs", EAllocationType::ON_DEVICE, {bytes});
+    mZeroSizes = mAllocator->allocate(ETensorDType::BYTE, "grad_zero_sizes", EAllocationType::ON_DEVICE, {bytes});
 
-    CUDA_CHECK(cudaMemcpy(mZeroPtrs.Data, ptrs.data(),
-                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(mZeroSizes.Data, sizes.data(),
-                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mZeroPtrs.Data, ptrs.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mZeroSizes.Data, sizes.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
 }
 
 void DslGradStore::create_layer_events(int num_layers) {
@@ -338,7 +338,8 @@ void DslGradStore::zero_all(cudaStream_t stream) {
     if (mZeroCount > 0 && mZeroPtrs.Data && mZeroSizes.Data) {
         zero_device_segments(reinterpret_cast<const std::uint64_t*>(mZeroPtrs.Data),
                              reinterpret_cast<const std::uint64_t*>(mZeroSizes.Data),
-                             mZeroCount, stream);
+                             mZeroCount,
+                             stream);
     }
 }
 
@@ -464,9 +465,8 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
     const auto& grad_names = mLayerGradNames[layer_idx];
     if (grad_names.empty()) return;
 
-    cudaEvent_t ev = (layer_idx < static_cast<int>(mLayerReduceEvents.size()))
-                         ? mLayerReduceEvents[layer_idx]
-                         : nullptr;
+    cudaEvent_t ev =
+        (layer_idx < static_cast<int>(mLayerReduceEvents.size())) ? mLayerReduceEvents[layer_idx] : nullptr;
 
     const bool ep_active = comm.ep_enabled();
 
@@ -541,8 +541,7 @@ void DslGradStore::allocate_sharded_grads() {
         long shard_size = (full_size + mConfig.num_shards - 1) / mConfig.num_shards;
         shard_shape[0] = shard_size;
 
-        Tensor shard = mAllocator->allocate(full.DType, ("ds_" + name).c_str(),
-                                             mOffloadAlloc, shard_shape);
+        Tensor shard = mAllocator->allocate(full.DType, ("ds_" + name).c_str(), mOffloadAlloc, shard_shape);
         mShardedGrads.emplace(name, shard);
     }
 }
@@ -567,8 +566,7 @@ void DslGradStore::accumulate_to_sharded(int layer_idx, cudaStream_t stream) {
 
         if (mMicroStep == 0) {
             // First micro-step: copy (overwrite)
-            CUDA_CHECK(cudaMemcpyAsync(shard.Data, full.Data, shard_bytes,
-                                        cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(shard.Data, full.Data, shard_bytes, cudaMemcpyDeviceToHost, stream));
         } else {
             // Subsequent micro-steps: accumulate
             // For host-resident shards, we use a simple kernel that writes to pinned memory.
@@ -611,8 +609,7 @@ std::string DslGradStore::base_grad_name(const std::string& name) {
             auto num_start = pos + std::strlen(prefix);
             auto dot_pos = name.find('.', num_start);
             if (dot_pos != std::string::npos) {
-                return name.substr(0, pos) + std::string(prefix, std::strlen(prefix) - 1) +
-                       "[]" + name.substr(dot_pos);
+                return name.substr(0, pos) + std::string(prefix, std::strlen(prefix) - 1) + "[]" + name.substr(dot_pos);
             }
         }
     }
@@ -652,9 +649,9 @@ void DslGradStore::allocate_streaming_buffers(const DslParamStore& params) {
         const auto& name = kv.first;
         const auto& gpu_grad = kv.second;
         std::vector<long> shape(gpu_grad.Sizes.begin(), gpu_grad.Sizes.begin() + gpu_grad.Rank);
-        mCpuGrads.emplace(name,
-            mAllocator->allocate(gpu_grad.DType, ("cpu_d_" + name).c_str(),
-                                 EAllocationType::PINNED, shape));
+        mCpuGrads.emplace(
+            name,
+            mAllocator->allocate(gpu_grad.DType, ("cpu_d_" + name).c_str(), EAllocationType::PINNED, shape));
     }
 
     // 2. Allocate CPU staging buffer (for micro-step > 0 accumulation)
@@ -672,7 +669,8 @@ void DslGradStore::allocate_streaming_buffers(const DslParamStore& params) {
             long existing_nelem = 0;
             if (sit != max_shapes.end()) {
                 existing_nelem = 1;
-                for (auto d : sit->second) existing_nelem *= d;
+                for (auto d : sit->second)
+                    existing_nelem *= d;
             }
             if (sit == max_shapes.end() || grad.nelem() > existing_nelem) {
                 max_shapes[base] = shape;
@@ -682,9 +680,9 @@ void DslGradStore::allocate_streaming_buffers(const DslParamStore& params) {
     }
 
     for (const auto& [base, shape] : max_shapes) {
-        mCpuStagingBuffer.emplace(base,
-            mAllocator->allocate(base_dtypes[base], ("staging_d_" + base).c_str(),
-                                 EAllocationType::PINNED, shape));
+        mCpuStagingBuffer.emplace(
+            base,
+            mAllocator->allocate(base_dtypes[base], ("staging_d_" + base).c_str(), EAllocationType::PINNED, shape));
     }
 
     // 3. Allocate double-buffered GPU gradient slots (sized for max layer)
@@ -692,15 +690,15 @@ void DslGradStore::allocate_streaming_buffers(const DslParamStore& params) {
         auto& slot = mGradSlots[s];
         for (const auto& [base, shape] : max_shapes) {
             slot.buffers.emplace(base,
-                mAllocator->allocate(base_dtypes[base],
-                    ("grad_slot" + std::to_string(s) + "_" + base).c_str(),
-                    EAllocationType::ON_DEVICE, shape));
+                                 mAllocator->allocate(base_dtypes[base],
+                                                      ("grad_slot" + std::to_string(s) + "_" + base).c_str(),
+                                                      EAllocationType::ON_DEVICE,
+                                                      shape));
         }
     }
 
     // 4. Allocate gradient norm accumulator (single float on GPU)
-    mLayerNormAccum = mAllocator->allocate(ETensorDType::FP32, "grad_norm_accum",
-                                            EAllocationType::ON_DEVICE, {1});
+    mLayerNormAccum = mAllocator->allocate(ETensorDType::FP32, "grad_norm_accum", EAllocationType::ON_DEVICE, {1});
 }
 
 void DslGradStore::create_streaming_events() {
@@ -717,9 +715,18 @@ void DslGradStore::create_streaming_events() {
 void DslGradStore::destroy_streaming_events() noexcept {
     for (int s = 0; s < kNumGradSlots; ++s) {
         auto& slot = mGradSlots[s];
-        if (slot.d2h_done) { cudaEventDestroy(slot.d2h_done); slot.d2h_done = nullptr; }
-        if (slot.compute_done) { cudaEventDestroy(slot.compute_done); slot.compute_done = nullptr; }
-        if (slot.reduce_done) { cudaEventDestroy(slot.reduce_done); slot.reduce_done = nullptr; }
+        if (slot.d2h_done) {
+            cudaEventDestroy(slot.d2h_done);
+            slot.d2h_done = nullptr;
+        }
+        if (slot.compute_done) {
+            cudaEventDestroy(slot.compute_done);
+            slot.compute_done = nullptr;
+        }
+        if (slot.reduce_done) {
+            cudaEventDestroy(slot.reduce_done);
+            slot.reduce_done = nullptr;
+        }
     }
 }
 
@@ -765,8 +772,7 @@ void DslGradStore::reduce_layer_grads(int layer_idx, cudaStream_t stream, NCCLCo
     comm.execute_transaction(slot.reduce_done);
 }
 
-void DslGradStore::offload_layer_grads(int layer_idx, cudaStream_t compute_stream,
-                                        cudaStream_t copy_stream) {
+void DslGradStore::offload_layer_grads(int layer_idx, cudaStream_t compute_stream, cudaStream_t copy_stream) {
     if (!mStreamGrads || layer_idx < 0 || layer_idx >= static_cast<int>(mLayerGradNames.size())) {
         return;
     }
@@ -800,9 +806,11 @@ void DslGradStore::offload_layer_grads(int layer_idx, cudaStream_t compute_strea
             auto grad_it = mGrads.find(name);
             auto cpu_it = mCpuGrads.find(name);
             if (grad_it == mGrads.end() || cpu_it == mCpuGrads.end()) continue;
-            CUDA_CHECK(cudaMemcpyAsync(cpu_it->second.Data, grad_it->second.Data,
-                                        grad_it->second.bytes(), cudaMemcpyDeviceToHost,
-                                        copy_stream));
+            CUDA_CHECK(cudaMemcpyAsync(cpu_it->second.Data,
+                                       grad_it->second.Data,
+                                       grad_it->second.bytes(),
+                                       cudaMemcpyDeviceToHost,
+                                       copy_stream));
         }
     } else {
         // Subsequent micro-steps: D2H to staging, then CPU accumulate in wait_all_offloads
@@ -811,9 +819,11 @@ void DslGradStore::offload_layer_grads(int layer_idx, cudaStream_t compute_strea
             auto base = base_grad_name(name);
             auto staging_it = mCpuStagingBuffer.find(base);
             if (grad_it == mGrads.end() || staging_it == mCpuStagingBuffer.end()) continue;
-            CUDA_CHECK(cudaMemcpyAsync(staging_it->second.Data, grad_it->second.Data,
-                                        grad_it->second.bytes(), cudaMemcpyDeviceToHost,
-                                        copy_stream));
+            CUDA_CHECK(cudaMemcpyAsync(staging_it->second.Data,
+                                       grad_it->second.Data,
+                                       grad_it->second.bytes(),
+                                       cudaMemcpyDeviceToHost,
+                                       copy_stream));
         }
     }
 
@@ -836,13 +846,19 @@ void DslGradStore::offload_non_block_grads(cudaStream_t stream) {
         if (!grad_it->second.Data) continue;
 
         if (mMicroStep == 0) {
-            CUDA_CHECK(cudaMemcpyAsync(cpu_it->second.Data, grad_it->second.Data,
-                                        grad_it->second.bytes(), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(cpu_it->second.Data,
+                                       grad_it->second.Data,
+                                       grad_it->second.bytes(),
+                                       cudaMemcpyDeviceToHost,
+                                       stream));
         } else {
             // For non-block grads, accumulate was done on GPU via mAccumulateTensors
             // so GPU has the accumulated result. Just copy it.
-            CUDA_CHECK(cudaMemcpyAsync(cpu_it->second.Data, grad_it->second.Data,
-                                        grad_it->second.bytes(), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(cpu_it->second.Data,
+                                       grad_it->second.Data,
+                                       grad_it->second.bytes(),
+                                       cudaMemcpyDeviceToHost,
+                                       stream));
         }
     }
 }
@@ -904,4 +920,4 @@ const std::vector<std::string>& DslGradStore::layer_grad_names(int layer_idx) co
     return mLayerGradNames[layer_idx];
 }
 
-} // namespace dsl
+}  // namespace dsl

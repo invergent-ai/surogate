@@ -26,10 +26,10 @@ static constexpr Rank RANK_MAX = std::numeric_limits<Rank>::max();
 // ---- Fast hash for byte vectors (FNV-1a) ----
 struct ByteVecHash {
     size_t operator()(const std::vector<uint8_t>& v) const noexcept {
-        size_t h = 14695981039346656037ULL; // FNV offset basis
+        size_t h = 14695981039346656037ULL;  // FNV offset basis
         for (uint8_t b : v) {
             h ^= b;
-            h *= 1099511628211ULL; // FNV prime
+            h *= 1099511628211ULL;  // FNV prime
         }
         return h;
     }
@@ -89,7 +89,10 @@ static constexpr size_t SMALL_PIECE_THRESHOLD = 128;
 inline std::vector<Rank> bpe_merge_small(const uint8_t* piece, size_t piece_len, const EncoderLookup& enc) {
     // parts[i] = (start_offset, rank_of_pair_starting_at_i)
     // Two sentinel entries at the end.
-    struct Part { size_t start; Rank rank; };
+    struct Part {
+        size_t start;
+        Rank rank;
+    };
 
     std::vector<Part> parts;
     parts.reserve(piece_len + 1);
@@ -156,11 +159,11 @@ inline std::vector<Rank> bpe_merge_large(const uint8_t* piece, size_t piece_len,
     // State per byte position. state[i] represents the live token starting at byte i.
     // After merges, dead states are skipped via the linked-list traversal (end pointers).
     struct State {
-        size_t prev;       // Byte position of previous live token (SIZE_MAX if first)
-        size_t end;        // Byte position where this token ends (exclusive)
-        size_t next_end;   // End of the NEXT live token (for 3-token merge lookahead)
-        Rank next_rank;    // Rank of merge [start .. next_end), RANK_MAX if none
-        Rank cur_rank;     // Rank of this (possibly merged) token, RANK_MAX if unmerged
+        size_t prev;      // Byte position of previous live token (SIZE_MAX if first)
+        size_t end;       // Byte position where this token ends (exclusive)
+        size_t next_end;  // End of the NEXT live token (for 3-token merge lookahead)
+        Rank next_rank;   // Rank of merge [start .. next_end), RANK_MAX if none
+        Rank cur_rank;    // Rank of this (possibly merged) token, RANK_MAX if unmerged
     };
 
     struct Merge {
@@ -211,7 +214,7 @@ inline std::vector<Rank> bpe_merge_large(const uint8_t* piece, size_t piece_len,
         heap.pop();
 
         if (rank == RANK_MAX) break;
-        if (rank != state[left_start].next_rank) continue; // stale entry
+        if (rank != state[left_start].next_rank) continue;  // stale entry
 
         size_t right_start = state[left_start].end;
         size_t right_end = state[left_start].next_end;
@@ -272,4 +275,4 @@ inline std::vector<Rank> byte_pair_encode(const std::string& piece, const Encode
     return byte_pair_encode(reinterpret_cast<const uint8_t*>(piece.data()), piece.size(), enc);
 }
 
-} // namespace tokenizer
+}  // namespace tokenizer

@@ -19,6 +19,7 @@
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"
@@ -79,10 +80,8 @@ inline bool is_capture_unsafe_op_type(CompiledOpType type) {
         case CompiledOpType::EpDispatch:
         case CompiledOpType::EpCombine:
         case CompiledOpType::EpDispatchBackward:
-        case CompiledOpType::EpCombineBackward:
-            return true;
-        default:
-            return false;
+        case CompiledOpType::EpCombineBackward: return true;
+        default: return false;
     }
 }
 
@@ -113,9 +112,15 @@ bool infer_known_tensor_shape(std::string_view name,
             size_t after_pos = pos + std::strlen(pat);
             bool all_digits = after_pos < field.size();
             for (size_t i = after_pos; i < field.size(); ++i) {
-                if (!std::isdigit(static_cast<unsigned char>(field[i]))) { all_digits = false; break; }
+                if (!std::isdigit(static_cast<unsigned char>(field[i]))) {
+                    all_digits = false;
+                    break;
+                }
             }
-            if (all_digits) { field = field.substr(0, pos); break; }
+            if (all_digits) {
+                field = field.substr(0, pos);
+                break;
+            }
         }
 
         const long C = config.HiddenSize;
@@ -126,8 +131,8 @@ bool infer_known_tensor_shape(std::string_view name,
         const long Hs = config.head_size();
         const long QKV = config.qkv_channels();
 
-        if (field == "ln1" || field == "ln2" || field == "att_out" || field == "mlp_down" ||
-            field == "res_att" || field == "res_ffn" || field == "res_in") {
+        if (field == "ln1" || field == "ln2" || field == "att_out" || field == "mlp_down" || field == "res_att" ||
+            field == "res_ffn" || field == "res_in") {
             shape = {B, T, C};
             return true;
         }
@@ -189,8 +194,8 @@ bool infer_known_tensor_shape(std::string_view name,
         }
     }
 
-    if (name == "x0" || name == "encoded" || name == "ln_final" || name == "xF" ||
-        name == "final_residual" || name == "residual_final") {
+    if (name == "x0" || name == "encoded" || name == "ln_final" || name == "xF" || name == "final_residual" ||
+        name == "residual_final") {
         shape = {B, T, config.HiddenSize};
         return true;
     }
@@ -210,8 +215,7 @@ bool infer_known_tensor_shape(std::string_view name,
     return false;
 }
 
-}
-
+}  // namespace
 
 // ============================================================================
 // Operation type conversion
@@ -343,7 +347,6 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
     return it != type_map.end() ? it->second : CompiledOpType::Unknown;
 }
 
-
 // ============================================================================
 // GraphCompiler implementation
 // ============================================================================
@@ -353,12 +356,11 @@ GraphCompiler::GraphCompiler(const Module& module,
                              const RuntimeOptions& options,
                              DslParamStore& weights,
                              DslGradStore& grads)
-    : mModule(module)
-    , mConfig(config)
-    , mOptions(options)
-    , mWeights(weights)
-    , mGrads(grads)
-{
+    : mModule(module),
+      mConfig(config),
+      mOptions(options),
+      mWeights(weights),
+      mGrads(grads) {
     // Initialize slot registry from DSL layout (no built-in fallback - all slots must be
     // explicitly declared in Python DSL)
     if (mModule.activation_layout.has_value()) {
@@ -375,65 +377,65 @@ GraphCompiler::GraphCompiler(const Module& module,
     // (different block types with different head_size/QKV/MLP dims) by checking
     // if any block params have varying shapes.
     if (mModule.forward.has_value()) {
-            const auto& graph = mModule.forward.value();
-            const int num_layers = config.NumLayers;
-            const long hq = config.NumQueryHeads;
-            const long default_hkv = config.NumKeyValHeads;
-            const long default_hs = config.head_size();
-            const long default_dff = config.IntermediateSize;
+        const auto& graph = mModule.forward.value();
+        const int num_layers = config.NumLayers;
+        const long hq = config.NumQueryHeads;
+        const long default_hkv = config.NumKeyValHeads;
+        const long default_hs = config.head_size();
+        const long default_dff = config.IntermediateSize;
 
-            mPerLayerDims.resize(static_cast<std::size_t>(num_layers));
-            for (int i = 0; i < num_layers; ++i) {
-                auto& d = mPerLayerDims[static_cast<std::size_t>(i)];
-                d.head_size = default_hs;
-                d.qkv_channels = default_hs * (hq + 2 * default_hkv);
-                d.attn_dim = hq * default_hs;
-                d.intermediate = default_dff;
-                d.mlp_up = 2 * default_dff;
+        mPerLayerDims.resize(static_cast<std::size_t>(num_layers));
+        for (int i = 0; i < num_layers; ++i) {
+            auto& d = mPerLayerDims[static_cast<std::size_t>(i)];
+            d.head_size = default_hs;
+            d.qkv_channels = default_hs * (hq + 2 * default_hkv);
+            d.attn_dim = hq * default_hs;
+            d.intermediate = default_dff;
+            d.mlp_up = 2 * default_dff;
+        }
+        for (const auto& [name, info] : graph.params) {
+            int layer_idx = -1;
+            std::string field;
+            if (!parse_block_param(name, layer_idx, field)) continue;
+            if (layer_idx < 0 || layer_idx >= num_layers || info.shape.size() < 2) continue;
+            long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
+            long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
+            if (s0 == 0 || s1 == 0) continue;
+            auto& d = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
+            if (field == "qkv_weight") {
+                d.qkv_channels = s0;
+                long total_heads = hq + 2 * default_hkv;
+                if (total_heads > 0) d.head_size = s0 / total_heads;
+                d.attn_dim = hq * d.head_size;
+            } else if (field == "self_attn_q_weight") {
+                d.qkv_channels = s0;
+                if (hq > 0) d.head_size = s0 / hq;
+                d.attn_dim = s0;
+            } else if (field == "out_weight") {
+                d.attn_dim = s1;
+                if (hq > 0) d.head_size = s1 / hq;
+            } else if (field == "mlp_down_weight") {
+                d.intermediate = s1;
+                d.mlp_up = s1;
+            } else if (field == "mlp_gate_weight") {
+                d.intermediate = s0;
+                d.mlp_up = s0;
             }
-            for (const auto& [name, info] : graph.params) {
-                int layer_idx = -1;
-                std::string field;
-                if (!parse_block_param(name, layer_idx, field)) continue;
-                if (layer_idx < 0 || layer_idx >= num_layers || info.shape.size() < 2) continue;
-                long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
-                long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
-                if (s0 == 0 || s1 == 0) continue;
-                auto& d = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
-                if (field == "qkv_weight") {
-                    d.qkv_channels = s0;
-                    long total_heads = hq + 2 * default_hkv;
-                    if (total_heads > 0) d.head_size = s0 / total_heads;
-                    d.attn_dim = hq * d.head_size;
-                } else if (field == "self_attn_q_weight") {
-                    d.qkv_channels = s0;
-                    if (hq > 0) d.head_size = s0 / hq;
-                    d.attn_dim = s0;
-                } else if (field == "out_weight") {
-                    d.attn_dim = s1;
-                    if (hq > 0) d.head_size = s1 / hq;
-                } else if (field == "mlp_down_weight") {
-                    d.intermediate = s1;
-                    d.mlp_up = s1;
-                } else if (field == "mlp_gate_weight") {
-                    d.intermediate = s0;
-                    d.mlp_up = s0;
-                }
+        }
+        // Detect hybrid blocks: check if per-layer dims actually differ
+        for (std::size_t pi = 1; pi < mPerLayerDims.size(); ++pi) {
+            if (mPerLayerDims[pi].head_size != mPerLayerDims[0].head_size ||
+                mPerLayerDims[pi].qkv_channels != mPerLayerDims[0].qkv_channels ||
+                mPerLayerDims[pi].attn_dim != mPerLayerDims[0].attn_dim ||
+                mPerLayerDims[pi].intermediate != mPerLayerDims[0].intermediate) {
+                mHasHybridBlocks = true;
+                break;
             }
-            // Detect hybrid blocks: check if per-layer dims actually differ
-            for (std::size_t pi = 1; pi < mPerLayerDims.size(); ++pi) {
-                if (mPerLayerDims[pi].head_size != mPerLayerDims[0].head_size ||
-                    mPerLayerDims[pi].qkv_channels != mPerLayerDims[0].qkv_channels ||
-                    mPerLayerDims[pi].attn_dim != mPerLayerDims[0].attn_dim ||
-                    mPerLayerDims[pi].intermediate != mPerLayerDims[0].intermediate) {
-                    mHasHybridBlocks = true;
-                    break;
-                }
-            }
-            if (!mHasHybridBlocks) {
-                // All layers have the same dims — no need for per-layer tracking
-                mPerLayerDims.clear();
-            }
+        }
+        if (!mHasHybridBlocks) {
+            // All layers have the same dims — no need for per-layer tracking
+            mPerLayerDims.clear();
+        }
     }
 }
 
@@ -464,9 +466,7 @@ void GraphCompiler::update_dimensions(long B, long T) {
     // (in case DSL IR uses the canonical short names)
     mShapeEnv.values["C"] = mConfig.HiddenSize;
     mShapeEnv.values["D"] = mConfig.head_size();
-    const long moe_m = (mConfig.MoeIntermediateSize > 0)
-        ? mConfig.MoeIntermediateSize
-        : mConfig.IntermediateSize;
+    const long moe_m = (mConfig.MoeIntermediateSize > 0) ? mConfig.MoeIntermediateSize : mConfig.IntermediateSize;
     const long up_factor = mConfig.mlp_up_factor();
     mShapeEnv.values["M"] = moe_m;
     mShapeEnv.values["MUp"] = up_factor * moe_m;
@@ -497,8 +497,8 @@ CompiledOpType GraphCompiler::classify_op(const std::string& op_type) const {
     return op_type_from_string(op_type);
 }
 
-TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output,
-                                            const Operation& op, const ShapeEnv& env) {
+TensorRef
+GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const Operation& op, const ShapeEnv& env) {
     TensorRef ref;
     ref.name = name;
     // Pre-compute gradient flag at compile time to avoid runtime string prefix checks.
@@ -575,8 +575,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                 ref.shape = resolve_shape(slot_entry->shape, env);
                 // For hybrid models, the slot has concrete shapes from the first
                 // block type. Override with per-layer dims when they differ.
-                if (layer_idx >= 0 &&
-                    static_cast<std::size_t>(layer_idx) < mPerLayerDims.size() &&
+                if (layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < mPerLayerDims.size() &&
                     !ref.shape.empty()) {
                     const auto& pld = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
                     const long B = mB;
@@ -652,9 +651,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             // For hybrid models (per-layer dims differ), resolve symbolic slot
             // shapes against the LAYER env, not the global env, so gradient
             // slot shapes match the forward activation shapes at this layer.
-            const ShapeEnv layer_env = (layer_idx >= 0 && mHasHybridBlocks)
-                ? make_layer_env(layer_idx)
-                : mShapeEnv;
+            const ShapeEnv layer_env = (layer_idx >= 0 && mHasHybridBlocks) ? make_layer_env(layer_idx) : mShapeEnv;
 
             const std::string base_field = strip_ssa_suffix(field);
 
@@ -691,9 +688,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             // Without this, gradient slots for hybrid-dim fields end up sized
             // with global/default dims — downstream view_backward will claim
             // more elements than the underlying allocation holds.
-            if (layer_idx >= 0 &&
-                static_cast<std::size_t>(layer_idx) < mPerLayerDims.size() &&
-                !ref.shape.empty()) {
+            if (layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < mPerLayerDims.size() && !ref.shape.empty()) {
                 const auto& pld = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
                 const long B = mB;
                 const long T = mT;
@@ -783,10 +778,14 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             bool all_digits = after_pos < fwd_name.size();
             for (std::size_t i = after_pos; i < fwd_name.size(); ++i) {
                 if (!std::isdigit(static_cast<unsigned char>(fwd_name[i]))) {
-                    all_digits = false; break;
+                    all_digits = false;
+                    break;
                 }
             }
-            if (all_digits) { fwd_name = fwd_name.substr(0, pos); break; }
+            if (all_digits) {
+                fwd_name = fwd_name.substr(0, pos);
+                break;
+            }
         }
         std::vector<long> resolved;
         if (resolve_tensor_shape(fwd_name, resolved)) {
@@ -805,9 +804,7 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
     return ref;
 }
 
-
-CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type,
-                                           const ShapeEnv& env) {
+CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const ShapeEnv& env) {
     CompiledAttrs attrs;
 
     // Epsilon for normalization ops
@@ -946,8 +943,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
             auto matmul_op = matmul_op_from_weight(op.inputs[1], layer_idx);
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
-            attrs.allow_quant = matmul_op.has_value() &&
-                                allow_quant_layer(mOptions, mConfig, layer_idx);
+            attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
             if (matmul_op.has_value()) {
                 switch (*matmul_op) {
                     case modules::MatmulOp::QKV:
@@ -962,8 +958,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                     case modules::MatmulOp::MLPDown:
                         attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPDownProjection;
                         break;
-                    default:
-                        break;
+                    default: break;
                 }
             }
         }
@@ -976,8 +971,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
             auto matmul_op = matmul_op_from_weight(op.inputs[1], layer_idx);
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
-            attrs.allow_quant = matmul_op.has_value() &&
-                                allow_quant_layer(mOptions, mConfig, layer_idx);
+            attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
             if (matmul_op.has_value() && *matmul_op == modules::MatmulOp::MLPUp) {
                 attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
             }
@@ -1006,8 +1000,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                     attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPDownBackward;
                 }
                 attrs.layer_idx = layer_idx;
-                attrs.allow_quant = attrs.matmul_op.has_value() &&
-                                    allow_quant_layer(mOptions, mConfig, layer_idx);
+                attrs.allow_quant = attrs.matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
             }
         }
     }
@@ -1024,16 +1017,15 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
                     attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
                 }
                 attrs.layer_idx = layer_idx;
-                attrs.allow_quant = attrs.matmul_op.has_value() &&
-                                    allow_quant_layer(mOptions, mConfig, layer_idx);
+                attrs.allow_quant = attrs.matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
             }
         }
     }
 
     // MoE-specific attributes
-    if (type == CompiledOpType::MoETopK || type == CompiledOpType::MoEPermute ||
-        type == CompiledOpType::MoEUnpermute || type == CompiledOpType::MoETopKBackward ||
-        type == CompiledOpType::MoEPermuteBackward || type == CompiledOpType::MoEUnpermuteBackward) {
+    if (type == CompiledOpType::MoETopK || type == CompiledOpType::MoEPermute || type == CompiledOpType::MoEUnpermute ||
+        type == CompiledOpType::MoETopKBackward || type == CompiledOpType::MoEPermuteBackward ||
+        type == CompiledOpType::MoEUnpermuteBackward) {
         // top_k attribute
         if (auto* top_k_attr = find_attr(op.attrs, "top_k")) {
             if (auto v = attr_int(*top_k_attr)) {
@@ -1078,8 +1070,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
-    if (type == CompiledOpType::MoEGroupedGemmGateUp ||
-        type == CompiledOpType::MoEGroupedGemmGateUpBackward) {
+    if (type == CompiledOpType::MoEGroupedGemmGateUp || type == CompiledOpType::MoEGroupedGemmGateUpBackward) {
         if (auto* interleaved_attr = find_attr(op.attrs, "gate_up_interleaved")) {
             if (auto v = attr_bool(*interleaved_attr)) {
                 attrs.gate_up_interleaved = *v;
@@ -1222,8 +1213,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
-    if (type == CompiledOpType::RepeatInterleaveHeads ||
-        type == CompiledOpType::RepeatInterleaveHeadsBackward) {
+    if (type == CompiledOpType::RepeatInterleaveHeads || type == CompiledOpType::RepeatInterleaveHeadsBackward) {
         if (auto* attr = find_attr(op.attrs, "repeats")) {
             if (auto v = attr_int(*attr)) {
                 attrs.repeat_factor = static_cast<int>(*v);
@@ -1232,8 +1222,7 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
     }
 
     // Qwen3.5 gated delta rule attributes
-    if (type == CompiledOpType::ChunkGatedDeltaRule ||
-        type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
+    if (type == CompiledOpType::ChunkGatedDeltaRule || type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
         if (auto* attr = find_attr(op.attrs, "chunk_size")) {
             if (auto v = attr_int(*attr)) {
                 attrs.chunk_size = static_cast<int>(*v);
@@ -1269,15 +1258,11 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
     }
     if (mConfig.NumExperts > 0) {
         // MoE ops need pre-resolved IDs for expert_offsets and gather_indices
-        if (type == CompiledOpType::MoEGroupedGemm ||
-            type == CompiledOpType::MoEGroupedGemmGateUp ||
-            type == CompiledOpType::MoEGroupedGemmDown ||
-            type == CompiledOpType::MoEGroupedGemmBackward ||
+        if (type == CompiledOpType::MoEGroupedGemm || type == CompiledOpType::MoEGroupedGemmGateUp ||
+            type == CompiledOpType::MoEGroupedGemmDown || type == CompiledOpType::MoEGroupedGemmBackward ||
             type == CompiledOpType::MoEGroupedGemmGateUpBackward ||
-            type == CompiledOpType::MoEGroupedGemmDownBackward ||
-            type == CompiledOpType::MoEExpertBiasAdd ||
-            type == CompiledOpType::MoEExpertBiasAddBackward ||
-            type == CompiledOpType::MoEPermute ||
+            type == CompiledOpType::MoEGroupedGemmDownBackward || type == CompiledOpType::MoEExpertBiasAdd ||
+            type == CompiledOpType::MoEExpertBiasAddBackward || type == CompiledOpType::MoEPermute ||
             type == CompiledOpType::MoEPermuteBackward) {
             if (auto it = mTensorIdMap.find("moe_expert_offsets"); it != mTensorIdMap.end()) {
                 attrs.moe_offsets_tensor_id = it->second;
@@ -1292,7 +1277,6 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
 
     return attrs;
 }
-
 
 void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
     graph.layer_start_indices.resize(mConfig.NumLayers, SIZE_MAX);
@@ -1315,10 +1299,8 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
             case TensorSlot::BlockDLN2:
             case TensorSlot::BlockDResAtt:
             case TensorSlot::BlockDResFFN:
-            case TensorSlot::DLoss:
-                return true;
-            default:
-                return false;
+            case TensorSlot::DLoss: return true;
+            default: return false;
         }
     };
 
@@ -1431,7 +1413,6 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
     }
 }
 
-
 void CompiledGraph::compute_layer_segments() {
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
@@ -1439,7 +1420,7 @@ void CompiledGraph::compute_layer_segments() {
     // Build an interval map of MLP tile group op ranges within each layer.
     // These must run eagerly as a group (tiled execution uses dynamic chunk loops).
     // Key: start_op_idx → end_op_idx (inclusive), so the whole group becomes one eager segment.
-    std::unordered_map<std::size_t, std::size_t> mlp_tile_starts; // start → end+1
+    std::unordered_map<std::size_t, std::size_t> mlp_tile_starts;  // start → end+1
     for (const auto& tg : mlp_tile_groups) {
         mlp_tile_starts[tg.start_op_idx] = tg.end_op_idx + 1;
     }
@@ -1460,10 +1441,8 @@ void CompiledGraph::compute_layer_segments() {
             // Graph-breaking ops: must run eagerly because they are
             // capture-unsafe (dynamic cu_seqlens, JIT kernel loading,
             // MoE/EP per-step host bookkeeping, etc.)
-            const bool graph_breaking =
-                ty == CompiledOpType::FlashAttention ||
-                ty == CompiledOpType::FlashAttentionBackward ||
-                is_capture_unsafe_op_type(ty);
+            const bool graph_breaking = ty == CompiledOpType::FlashAttention ||
+                                        ty == CompiledOpType::FlashAttentionBackward || is_capture_unsafe_op_type(ty);
 
             // Check if this op starts an MLP tile group
             auto tile_it = mlp_tile_starts.find(i);
@@ -1482,7 +1461,7 @@ void CompiledGraph::compute_layer_segments() {
                 std::size_t tile_end = tile_it->second;
                 if (tile_end > end) tile_end = end;
                 segs.push_back({i, tile_end, /*eager=*/true});
-                i = tile_end - 1; // loop will ++i
+                i = tile_end - 1;  // loop will ++i
                 seg_start = tile_end;
             }
         }
@@ -1492,7 +1471,6 @@ void CompiledGraph::compute_layer_segments() {
         }
     }
 }
-
 
 // ============================================================================
 // Shape Validation Methods
@@ -1514,16 +1492,17 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
     if (it != mTensorShapes.end()) {
         shape = it->second.dims;
         if (mDebugShapes && starts_with(name, "d_")) {
-            fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> cache %s (src: %s)\n",
-                    name.c_str(), format_shape(shape).c_str(),
+            fprintf(stderr,
+                    "[DEBUG_SHAPES] resolve '%s' -> cache %s (src: %s)\n",
+                    name.c_str(),
+                    format_shape(shape).c_str(),
                     it->second.source_op.c_str());
         }
         return true;
     }
 
     // Check IR tensor info
-    auto check_tensor_info = [&](const std::unordered_map<std::string, TensorInfo>& tensors,
-                                  const char* source) {
+    auto check_tensor_info = [&](const std::unordered_map<std::string, TensorInfo>& tensors, const char* source) {
         auto it = tensors.find(name);
         if (it != tensors.end() && !it->second.shape.empty()) {
             shape = resolve_shape(it->second.shape, mShapeEnv);
@@ -1532,8 +1511,11 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
             ts.inferred = false;
             mTensorShapes[name] = ts;
             if (mDebugShapes && starts_with(name, "d_")) {
-                fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> IR %s %s\n",
-                        name.c_str(), source, format_shape(shape).c_str());
+                fprintf(stderr,
+                        "[DEBUG_SHAPES] resolve '%s' -> IR %s %s\n",
+                        name.c_str(),
+                        source,
+                        format_shape(shape).c_str());
             }
             return true;
         }
@@ -1553,8 +1535,7 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
         ts.inferred = true;
         mTensorShapes[name] = ts;
         if (mDebugShapes && starts_with(name, "d_")) {
-            fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> inferred %s\n",
-                    name.c_str(), format_shape(shape).c_str());
+            fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> inferred %s\n", name.c_str(), format_shape(shape).c_str());
         }
         return true;
     }
@@ -1566,18 +1547,15 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
     }
 
     if (mDebugShapes && starts_with(name, "d_")) {
-        fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> FAILED (no shape found)\n",
-                name.c_str());
+        fprintf(stderr, "[DEBUG_SHAPES] resolve '%s' -> FAILED (no shape found)\n", name.c_str());
     }
     return false;
 }
 
-void GraphCompiler::infer_output_shapes(
-    const Operation& op,
-    CompiledOpType type,
-    const std::vector<std::vector<long>>& input_shapes,
-    std::vector<std::vector<long>>& output_shapes) {
-
+void GraphCompiler::infer_output_shapes(const Operation& op,
+                                        CompiledOpType type,
+                                        const std::vector<std::vector<long>>& input_shapes,
+                                        std::vector<std::vector<long>>& output_shapes) {
     output_shapes.clear();
 
     // Infer output shapes based on operation type
@@ -1746,8 +1724,7 @@ void GraphCompiler::infer_output_shapes(
 
             if (split_sizes.empty() && !op.outputs.empty()) {
                 if (in_shape[dim] % static_cast<long>(op.outputs.size()) == 0) {
-                    split_sizes.assign(op.outputs.size(),
-                                       in_shape[dim] / static_cast<long>(op.outputs.size()));
+                    split_sizes.assign(op.outputs.size(), in_shape[dim] / static_cast<long>(op.outputs.size()));
                 }
             }
 
@@ -1805,7 +1782,7 @@ void GraphCompiler::infer_output_shapes(
         case CompiledOpType::Embedding: {
             // Output = indices_shape + [embedding_dim]
             if (input_shapes.size() >= 2 && !input_shapes[1].empty()) {
-                auto out_shape = input_shapes[0];  // indices shape
+                auto out_shape = input_shapes[0];         // indices shape
                 out_shape.push_back(input_shapes[1][1]);  // embedding dim
                 output_shapes.push_back(out_shape);
             }
@@ -2086,11 +2063,8 @@ void GraphCompiler::infer_output_shapes(
             //   initial_state [B, H, K, V] (optional)
             // Outputs:
             //   out [B, T, H, V], final_state [B, H, K, V] (optional by caller contract)
-            if (input_shapes.size() >= 3 &&
-                !input_shapes[0].empty() &&
-                !input_shapes[2].empty() &&
-                input_shapes[0].size() == 4 &&
-                input_shapes[2].size() == 4) {
+            if (input_shapes.size() >= 3 && !input_shapes[0].empty() && !input_shapes[2].empty() &&
+                input_shapes[0].size() == 4 && input_shapes[2].size() == 4) {
                 const auto& q_shape = input_shapes[0];
                 const auto& v_shape = input_shapes[2];
                 output_shapes.push_back({q_shape[0], q_shape[1], q_shape[2], v_shape[3]});
@@ -2105,19 +2079,16 @@ void GraphCompiler::infer_output_shapes(
             //   v [B,T,H,V], g [B,T,H], beta [B,T,H], initial_state [B,H,K,V] (optional)
             // Outputs:
             //   d_q, d_k, d_v, d_g, d_beta, d_initial_state
-            if (input_shapes.size() >= 7 &&
-                input_shapes[2].size() == 4 &&
-                input_shapes[4].size() == 4 &&
-                input_shapes[5].size() == 3 &&
-                input_shapes[6].size() == 3) {
+            if (input_shapes.size() >= 7 && input_shapes[2].size() == 4 && input_shapes[4].size() == 4 &&
+                input_shapes[5].size() == 3 && input_shapes[6].size() == 3) {
                 const auto& q_shape = input_shapes[2];
                 const auto& v_shape = input_shapes[4];
                 const auto& g_shape = input_shapes[5];
-                output_shapes.push_back(q_shape);  // d_q
-                output_shapes.push_back(q_shape);  // d_k
-                output_shapes.push_back(v_shape);  // d_v
-                output_shapes.push_back(g_shape);  // d_g
-                output_shapes.push_back(g_shape);  // d_beta
+                output_shapes.push_back(q_shape);                                           // d_q
+                output_shapes.push_back(q_shape);                                           // d_k
+                output_shapes.push_back(v_shape);                                           // d_v
+                output_shapes.push_back(g_shape);                                           // d_g
+                output_shapes.push_back(g_shape);                                           // d_beta
                 output_shapes.push_back({q_shape[0], q_shape[2], q_shape[3], v_shape[3]});  // d_initial_state
             }
             break;
@@ -2174,12 +2145,7 @@ void GraphCompiler::infer_output_shapes(
     }
 }
 
-
-void GraphCompiler::validate_operation_shapes(
-    const Operation& op,
-    CompiledOpType type,
-    size_t op_index) {
-
+void GraphCompiler::validate_operation_shapes(const Operation& op, CompiledOpType type, size_t op_index) {
     using namespace shape_checker;
 
     // Get operation signature
@@ -2207,8 +2173,10 @@ void GraphCompiler::validate_operation_shapes(
     // If we couldn't resolve some input shapes, we can't validate
     if (!unresolved_inputs.empty()) {
         if (mDebugShapes && starts_with(op.name, "matmul")) {
-            fprintf(stderr, "[DEBUG_SHAPES] validate '%s' (id: %s) SKIPPED — unresolved inputs:",
-                    op.name.c_str(), op.id.c_str());
+            fprintf(stderr,
+                    "[DEBUG_SHAPES] validate '%s' (id: %s) SKIPPED — unresolved inputs:",
+                    op.name.c_str(),
+                    op.id.c_str());
             for (const auto& u : unresolved_inputs) {
                 fprintf(stderr, " '%s'", u.c_str());
             }
@@ -2256,10 +2224,10 @@ void GraphCompiler::validate_operation_shapes(
             // Build detailed error message
             std::ostringstream oss;
             oss << "\n╔═══════════════════════════════════════════════════════╗\n"
-                <<   "║ Found Shape Validation Error during Graph Compilation ║\n"
-                <<   "╚═══════════════════════════════════════════════════════╝\n\n"
-                <<   "Operation: #" << op_index << " (id: '" << op.id << "')\n"
-                <<   "Type:      " << op.name << "\n\n";
+                << "║ Found Shape Validation Error during Graph Compilation ║\n"
+                << "╚═══════════════════════════════════════════════════════╝\n\n"
+                << "Operation: #" << op_index << " (id: '" << op.id << "')\n"
+                << "Type:      " << op.name << "\n\n";
 
             // Show operation attributes if any
             bool has_attrs = false;
@@ -2348,7 +2316,6 @@ void GraphCompiler::validate_operation_shapes(
     }
 }
 
-
 int GraphCompiler::assign_tensor_id(const std::string& name) {
     auto [it, inserted] = mTensorIdMap.emplace(name, mNextTensorId);
     if (inserted) mNextTensorId++;
@@ -2359,7 +2326,11 @@ void GraphCompiler::register_external_names(CompiledGraph& graph) {
     // Register well-known tensor names that are bound during execute_forward/backward init
     // but may not appear in any op's TensorRef (e.g., they are injected before the dispatch loop).
     static const char* const kForwardNames[] = {
-        "token_ids", "position_ids", "visual_pos_masks", "visual_embeds", "x0",
+        "token_ids",
+        "position_ids",
+        "visual_pos_masks",
+        "visual_embeds",
+        "x0",
     };
     for (const char* name : kForwardNames) {
         assign_tensor_id(name);
@@ -2367,10 +2338,16 @@ void GraphCompiler::register_external_names(CompiledGraph& graph) {
 
     // Backward init bindings
     static const char* const kBackwardNames[] = {
-        "d_logits", "d_logits_flat",
-        "d_xF_flat", "d_xF", "d_ln_final", "d_ln_final_flat",
-        "d_encoded", "d_x0",
-        "d_xN", "d_residualN",
+        "d_logits",
+        "d_logits_flat",
+        "d_xF_flat",
+        "d_xF",
+        "d_ln_final",
+        "d_ln_final_flat",
+        "d_encoded",
+        "d_x0",
+        "d_xN",
+        "d_residualN",
     };
     for (const char* name : kBackwardNames) {
         assign_tensor_id(name);
@@ -2428,8 +2405,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
                     meta.block_layer_idx = -1;
                 }
             }
-        }
-        else if (name.rfind("d_layer", 0) == 0) {
+        } else if (name.rfind("d_layer", 0) == 0) {
             // "d_layer{N}.xxx" — gradient of cross-layer connector
             meta.flags |= TensorMeta::kDBlocks;
             auto dot_pos = name.find('.', 7);  // skip "d_layer"
@@ -2453,8 +2429,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
                     meta.block_layer_idx = -1;
                 }
             }
-        }
-        else if (name.rfind("layer", 0) == 0 && name.size() > 5 && std::isdigit(name[5])) {
+        } else if (name.rfind("layer", 0) == 0 && name.size() > 5 && std::isdigit(name[5])) {
             // "layer{N}.xxx" — cross-layer connector with parseable layer index
             meta.flags |= TensorMeta::kBlocks;
             auto dot_pos = name.find('.', 5);  // skip "layer"
@@ -2481,7 +2456,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
                 for (const auto& [n, i] : mTensorIdMap) {
                     if (i == it->second) return n;
                 }
-                return name; // fallback
+                return name;  // fallback
             }();
             // Simple heuristic: higher tensor_id = later in compilation = latest SSA version
             if (id > it->second) {
@@ -2503,7 +2478,7 @@ void GraphCompiler::reset_tid_namespace() {
     mTensorDtypes.clear();
 }
 
-CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
+CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is_backward) {
     update_dimensions(B, T);
 
     // Note: mTensorIdMap, mNextTensorId, mExtraShapes, mTensorShapes, and
@@ -2627,8 +2602,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
     for (std::size_t idx = 0; idx < graph.operations.size(); ++idx) {
         const auto& op = graph.operations[idx];
-        const std::string& op_type =
-            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
 
         CompiledOp compiled;
         compiled.original_idx = static_cast<std::uint16_t>(idx);
@@ -2639,6 +2613,14 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             throw std::runtime_error("GraphCompiler: unsupported operation type: " + op_type);
         }
 
+        // Bake the dispatch function pointer into the op. For the
+        // backward graph prefer the backward_fn; for the forward graph
+        // use forward_fn. Null means "no handler" — execute will throw
+        // when it tries to call it.
+        if (const OpDescriptor* desc = OpRegistry::instance().find(compiled.type)) {
+            compiled.fn = is_backward ? desc->backward_fn : desc->forward_fn;
+        }
+
         // Validate operation shapes at compile time.
         // In hybrid models (e.g., Gemma4 with sliding + full attention), per-block
         // shapes may vary, and the global shape env only stores one set of dims.
@@ -2646,8 +2628,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
         try {
             validate_operation_shapes(op, compiled.type, idx);
         } catch (const std::exception& e) {
-            if (mConfig.architecture == modules::ArchitectureType::Hybrid ||
-                !mConfig.layer_overrides.empty() ||
+            if (mConfig.architecture == modules::ArchitectureType::Hybrid || !mConfig.layer_overrides.empty() ||
                 mHasHybridBlocks) {
                 // Hybrid model: shape mismatch likely due to per-block-type dimension
                 // variation. Silently continue — runtime will use correct shapes.
@@ -2707,8 +2688,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     // output[1] = y (normalized) [B, T, C] BF16
                     // output[2] = rstd [B*T] FP32
                     if (i == 0 || i == 1) {
-                        ref.dtype = !compiled.inputs.empty() ? compiled.inputs[0].dtype
-                                                             : ETensorDType::BF16;
+                        ref.dtype = !compiled.inputs.empty() ? compiled.inputs[0].dtype : ETensorDType::BF16;
                         ref.shape = {B, T, C};
                     } else if (i == 2) {
                         ref.dtype = ETensorDType::FP32;
@@ -2860,8 +2840,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                             ref.shape = {B, Hq, T};
                         }
                     }
-                } else if (compiled.type == CompiledOpType::Add ||
-                           compiled.type == CompiledOpType::BiasAdd) {
+                } else if (compiled.type == CompiledOpType::Add || compiled.type == CompiledOpType::BiasAdd) {
                     // Match output to first input (broadcasting not supported in compiled add path).
                     if (!compiled.inputs.empty()) {
                         ref.dtype = compiled.inputs[0].dtype;
@@ -2878,8 +2857,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                             ref.shape = compiled.inputs[0].shape;
                         }
                     }
-                } else if (compiled.type == CompiledOpType::Matmul ||
-                           compiled.type == CompiledOpType::MatmulBias) {
+                } else if (compiled.type == CompiledOpType::Matmul || compiled.type == CompiledOpType::MatmulBias) {
                     // Infer output shape from matmul dimensions: C = A @ B
                     // NT: A [M, K], B [N, K] -> C [M, N]
                     // NN: A [M, K], B [K, N] -> C [M, N]
@@ -2910,8 +2888,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     }
                 } else if (compiled.type == CompiledOpType::MatmulSwiGLU) {
                     // outputs: out [B, T, D], up_out [M, 2D]
-                    ETensorDType base_dtype =
-                        !compiled.inputs.empty() ? compiled.inputs[0].dtype : ETensorDType::BF16;
+                    ETensorDType base_dtype = !compiled.inputs.empty() ? compiled.inputs[0].dtype : ETensorDType::BF16;
                     long Ndim = 0;
                     if (compiled.inputs.size() > 1 && compiled.inputs[1].shape.size() >= 2) {
                         Ndim = compiled.inputs[1].shape[1];
@@ -2929,8 +2906,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         ref.dtype = base_dtype;
                         ref.shape = {Mdim, Ndim > 0 ? Ndim : (2 * Ddim)};
                     }
-                } else if (compiled.type == CompiledOpType::RMSNorm ||
-                           compiled.type == CompiledOpType::LayerNorm) {
+                } else if (compiled.type == CompiledOpType::RMSNorm || compiled.type == CompiledOpType::LayerNorm) {
                     // Standalone norm ops: output[0] = y (same as input x),
                     // output[1] = rstd (FP32, input rows).
                     // This covers Gemma4 per-head Q/K/V norms over 2D inputs
@@ -2966,8 +2942,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 } else if (compiled.type == CompiledOpType::Narrow) {
                     // output = input shape with narrow dim replaced by length.
                     // Reuses `split_concat_dim` (common "dim" attr, same as dispatch_narrow).
-                    if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty() &&
-                        ref.shape.empty()) {
+                    if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty() && ref.shape.empty()) {
                         const auto& in_shape = compiled.inputs[0].shape;
                         const int rank = static_cast<int>(in_shape.size());
                         int dim = compiled.attrs.split_concat_dim;
@@ -2982,8 +2957,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     if (!compiled.inputs.empty()) {
                         ref.dtype = compiled.inputs[0].dtype;
                     }
-                } else if (compiled.type == CompiledOpType::Zeros ||
-                           compiled.type == CompiledOpType::Ones) {
+                } else if (compiled.type == CompiledOpType::Zeros || compiled.type == CompiledOpType::Ones) {
                     // Preserve explicit output dtype/shape from graph.
                     // Read dtype from op attributes if specified
                     if (auto* dtype_attr = find_attr(op.attrs, "dtype")) {
@@ -3022,8 +2996,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     if (ref.shape.empty()) {
                         ref.shape = {B, T, C};
                     }
-                } else if (compiled.type == CompiledOpType::RoPE ||
-                           compiled.type == CompiledOpType::RoPEBackward) {
+                } else if (compiled.type == CompiledOpType::RoPE || compiled.type == CompiledOpType::RoPEBackward) {
                     // RoPE outputs match input dtype/shape.
                     if (!compiled.inputs.empty()) {
                         ref.dtype = compiled.inputs[0].dtype;
@@ -3078,8 +3051,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     } else {
                         ref.dtype = ETensorDType::BF16;
                     }
-                } else if (compiled.type == CompiledOpType::View ||
-                           compiled.type == CompiledOpType::ViewBackward) {
+                } else if (compiled.type == CompiledOpType::View || compiled.type == CompiledOpType::ViewBackward) {
                     // View preserves dtype from input; shape comes from mExtraShapes
                     // (populated by the pre-scan) or from resolve_tensor_ref.
                     if (!compiled.inputs.empty()) {
@@ -3124,15 +3096,17 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                             return r;
                         };
                         const char* source = "resolve_tensor_ref";
-                        if (find_attr(op.attrs, "shape")) source = "shape attr";
-                        else if (find_attr(op.attrs, "shape_like")) source = "shape_like attr";
-                        fprintf(stderr, "[DEBUG_SHAPES] View output '%s' shape=%s (via %s)\n",
+                        if (find_attr(op.attrs, "shape"))
+                            source = "shape attr";
+                        else if (find_attr(op.attrs, "shape_like"))
+                            source = "shape_like attr";
+                        fprintf(stderr,
+                                "[DEBUG_SHAPES] View output '%s' shape=%s (via %s)\n",
                                 op.outputs[i].c_str(),
                                 ref.shape.empty() ? "<empty>" : fmt(ref.shape).c_str(),
                                 source);
                     }
-                } else if (compiled.type == CompiledOpType::MoESigmoid ||
-                           compiled.type == CompiledOpType::MoESoftmax) {
+                } else if (compiled.type == CompiledOpType::MoESigmoid || compiled.type == CompiledOpType::MoESoftmax) {
                     // Output dtype/shape matches input (router logits)
                     if (!compiled.inputs.empty()) {
                         ref.dtype = compiled.inputs[0].dtype;
@@ -3211,8 +3185,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         ref.dtype = compiled.inputs[0].dtype;
                     }
                     long num_tokens = B * T;
-                    if (!compiled.inputs.empty() && compiled.inputs.size() > 1 &&
-                        !compiled.inputs[1].shape.empty()) {
+                    if (!compiled.inputs.empty() && compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
                         // routing_weights shape is [B*T, K]
                         num_tokens = compiled.inputs[1].shape[0];
                     }
@@ -3335,12 +3308,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         }
                         ref.shape = {B * T * top_k, C};
                     }
-                } else if (compiled.type == CompiledOpType::Silu ||
-                           compiled.type == CompiledOpType::Relu2 ||
-                           compiled.type == CompiledOpType::Mul ||
-                           compiled.type == CompiledOpType::Scale ||
-                           compiled.type == CompiledOpType::Gelu ||
-                           compiled.type == CompiledOpType::SiluBackward ||
+                } else if (compiled.type == CompiledOpType::Silu || compiled.type == CompiledOpType::Relu2 ||
+                           compiled.type == CompiledOpType::Mul || compiled.type == CompiledOpType::Scale ||
+                           compiled.type == CompiledOpType::Gelu || compiled.type == CompiledOpType::SiluBackward ||
                            compiled.type == CompiledOpType::Relu2Backward ||
                            compiled.type == CompiledOpType::MulBackward ||
                            compiled.type == CompiledOpType::GeluBackward) {
@@ -3360,9 +3330,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         } else if (!compiled.inputs.empty()) {
                             ref.dtype = compiled.inputs[0].dtype;
                         }
-                        if (ref.shape.empty() &&
-                            compiled.inputs.size() > 2 &&
-                            compiled.inputs[0].shape.size() == 4 &&
+                        if (ref.shape.empty() && compiled.inputs.size() > 2 && compiled.inputs[0].shape.size() == 4 &&
                             compiled.inputs[2].shape.size() == 4) {
                             const auto& q_shape = compiled.inputs[0].shape;
                             const auto& v_shape = compiled.inputs[2].shape;
@@ -3370,9 +3338,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         }
                     } else if (i == 1) {
                         ref.dtype = ETensorDType::FP32;
-                        if (ref.shape.empty() &&
-                            compiled.inputs.size() > 2 &&
-                            compiled.inputs[0].shape.size() == 4 &&
+                        if (ref.shape.empty() && compiled.inputs.size() > 2 && compiled.inputs[0].shape.size() == 4 &&
                             compiled.inputs[2].shape.size() == 4) {
                             const auto& q_shape = compiled.inputs[0].shape;
                             const auto& v_shape = compiled.inputs[2].shape;
@@ -3407,8 +3373,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         }
                     } else if (i == 5) {
                         ref.dtype = ETensorDType::FP32;
-                        if (compiled.inputs.size() > 4 &&
-                            compiled.inputs[2].shape.size() == 4 &&
+                        if (compiled.inputs.size() > 4 && compiled.inputs[2].shape.size() == 4 &&
                             compiled.inputs[4].shape.size() == 4) {
                             const auto& q_shape = compiled.inputs[2].shape;
                             const auto& v_shape = compiled.inputs[4].shape;
@@ -3450,18 +3415,23 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         static std::once_flag warned_once;
                         std::call_once(warned_once, []() {
                             fprintf(stderr,
-                                "[graph_compiler] warning: using {B,T,C} fallback for unknown "
-                                "Mapped-slot output shape; set SUROGATE_DEBUG_SHAPE_FALLBACK=1 "
-                                "to see each occurrence.\n");
+                                    "[graph_compiler] warning: using {B,T,C} fallback for unknown "
+                                    "Mapped-slot output shape; set SUROGATE_DEBUG_SHAPE_FALLBACK=1 "
+                                    "to see each occurrence.\n");
                             fflush(stderr);
                         });
                         if (const char* dbg = std::getenv("SUROGATE_DEBUG_SHAPE_FALLBACK");
                             dbg && std::string(dbg) == "1") {
                             fprintf(stderr,
-                                "[graph_compiler] shape fallback {B=%ld,T=%ld,C=%ld} applied to "
-                                "op=%s type=%d output[%zu]=%s (resolve_tensor_ref gave empty shape)\n",
-                                B, T, C, op.id.c_str(),
-                                static_cast<int>(compiled.type), i, op.outputs[i].c_str());
+                                    "[graph_compiler] shape fallback {B=%ld,T=%ld,C=%ld} applied to "
+                                    "op=%s type=%d output[%zu]=%s (resolve_tensor_ref gave empty shape)\n",
+                                    B,
+                                    T,
+                                    C,
+                                    op.id.c_str(),
+                                    static_cast<int>(compiled.type),
+                                    i,
+                                    op.outputs[i].c_str());
                             fflush(stderr);
                         }
                     }
@@ -3485,8 +3455,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 const long Bdim = mB;
                 const long Tdim = mT;
                 long emb_dim = mConfig.HiddenSize;
-                if (compiled.inputs.size() > 1 &&
-                    compiled.inputs[1].shape.size() >= 2) {
+                if (compiled.inputs.size() > 1 && compiled.inputs[1].shape.size() >= 2) {
                     emb_dim = compiled.inputs[1].shape.back();
                 }
                 const bool is_main_embedding = (emb_dim == mConfig.HiddenSize);
@@ -3503,8 +3472,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     if (mWeights.has(*base)) {
                         ref.dtype = *mOptions.GradientType;
                         if (const char* env = std::getenv("SUROGATE_DEBUG_GRAD_DTYPE")) {
-                            fprintf(stderr, "[DEBUG_GRAD_DTYPE] %s -> %s\n",
-                                    ref.name.c_str(), dtype_to_str(ref.dtype));
+                            fprintf(stderr, "[DEBUG_GRAD_DTYPE] %s -> %s\n", ref.name.c_str(), dtype_to_str(ref.dtype));
                         }
                     }
                 }
@@ -3512,8 +3480,11 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
             if (const char* env = std::getenv("SUROGATE_DEBUG_DTYPES")) {
                 if (ref.name.find("xF") != std::string::npos) {
-                    fprintf(stderr, "[DEBUG_DTYPES] op=%s output=%s dtype=%s\n",
-                            op.id.c_str(), ref.name.c_str(), dtype_to_str(ref.dtype));
+                    fprintf(stderr,
+                            "[DEBUG_DTYPES] op=%s output=%s dtype=%s\n",
+                            op.id.c_str(),
+                            ref.name.c_str(),
+                            dtype_to_str(ref.dtype));
                 }
             }
 
@@ -3591,13 +3562,11 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
         const auto& ops = result.ops;
         for (std::size_t i = 0; i < ops.size(); ++i) {
             // Look for matmul ops with mlp_up_weight
-            if (ops[i].type != CompiledOpType::Matmul &&
-                ops[i].type != CompiledOpType::MatmulBias) continue;
+            if (ops[i].type != CompiledOpType::Matmul && ops[i].type != CompiledOpType::MatmulBias) continue;
 
             bool is_up = false;
             for (const auto& inp : ops[i].inputs) {
-                if (inp.name.size() >= 13 &&
-                    inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
+                if (inp.name.size() >= 13 && inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
                     is_up = true;
                     break;
                 }
@@ -3614,11 +3583,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             std::size_t down_idx = 0;
             bool found_down = false;
             for (std::size_t j = i + 1; j < ops.size() && j <= i + 5; ++j) {
-                if (ops[j].type != CompiledOpType::Matmul &&
-                    ops[j].type != CompiledOpType::MatmulBias) continue;
+                if (ops[j].type != CompiledOpType::Matmul && ops[j].type != CompiledOpType::MatmulBias) continue;
                 for (const auto& inp : ops[j].inputs) {
-                    if (inp.name.size() >= 15 &&
-                        inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
+                    if (inp.name.size() >= 15 && inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
                         down_idx = j;
                         found_down = true;
                         break;
@@ -3644,8 +3611,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
             bool is_down = false;
             for (const auto& inp : ops[i].inputs) {
-                if (inp.name.size() >= 15 &&
-                    inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
+                if (inp.name.size() >= 15 && inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
                     is_down = true;
                     break;
                 }
@@ -3664,8 +3630,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             for (std::size_t j = i + 1; j < ops.size() && j <= i + 6; ++j) {
                 if (ops[j].type != CompiledOpType::MatmulBackward) continue;
                 for (const auto& inp : ops[j].inputs) {
-                    if (inp.name.size() >= 13 &&
-                        inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
+                    if (inp.name.size() >= 13 && inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
                         up_idx = j;
                         found_up = true;
                         break;
@@ -3685,7 +3650,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
         }
 
         if (!result.mlp_tile_groups.empty()) {
-            std::fprintf(stderr, "[long_context] Detected %zu MLP tile groups for tiled execution\n",
+            std::fprintf(stderr,
+                         "[long_context] Detected %zu MLP tile groups for tiled execution\n",
                          result.mlp_tile_groups.size());
         }
     }
@@ -3693,5 +3659,4 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
     return result;
 }
 
-
-}
+}  // namespace dsl

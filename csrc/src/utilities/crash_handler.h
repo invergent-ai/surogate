@@ -45,6 +45,6 @@ std::string capture_stacktrace(int skip_frames = 1, int max_frames = 32);
  */
 void print_stacktrace(int max_frames = 32);
 
-} // namespace surogate
+}  // namespace surogate
 
-#endif // SUROGATE_SRC_UTILITIES_CRASH_HANDLER_H
+#endif  // SUROGATE_SRC_UTILITIES_CRASH_HANDLER_H

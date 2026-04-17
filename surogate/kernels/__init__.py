@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from surogate.kernels.compiler import compile_triton_kernel
-from surogate.kernels.triton.gated_delta_rule import compile_gated_delta_rule
 from surogate.kernels.jit_compile import compile_jit_kernels
+from surogate.kernels.triton.gated_delta_rule import compile_gated_delta_rule
 
 __all__ = [
     "compile_triton_kernel",

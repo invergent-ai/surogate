@@ -48,8 +48,7 @@ namespace {
 /// Copy position IDs to the device-side PositionIDs buffer, replicating a single
 /// plane across all 3 mRoPE planes when the model uses multimodal RoPE but the
 /// caller provides only one plane (e.g. text-only GRPO training).
-inline void copy_position_ids_to_device(const Tensor& src_pos, Tensor& dst_pos,
-                                        long B, long T, cudaStream_t stream) {
+inline void copy_position_ids_to_device(const Tensor& src_pos, Tensor& dst_pos, long B, long T, cudaStream_t stream) {
     const std::size_t plane_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * sizeof(std::int32_t);
     const std::size_t src_bytes = src_pos.bytes();
     const auto kind = (src_pos.Device == -1) ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
@@ -66,8 +65,12 @@ inline void copy_position_ids_to_device(const Tensor& src_pos, Tensor& dst_pos,
 }
 
 /// Overload for raw CPU pointer + known element count (used by execute_logprobs_forward).
-inline void copy_position_ids_to_device(const std::int32_t* src_cpu, std::size_t src_bytes,
-                                        Tensor& dst_pos, long B, long T, cudaStream_t stream) {
+inline void copy_position_ids_to_device(const std::int32_t* src_cpu,
+                                        std::size_t src_bytes,
+                                        Tensor& dst_pos,
+                                        long B,
+                                        long T,
+                                        cudaStream_t stream) {
     const std::size_t plane_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * sizeof(std::int32_t);
 
     if (dst_pos.Rank == 3 && dst_pos.Sizes[0] == 3 && src_bytes <= plane_bytes) {
@@ -120,10 +123,8 @@ inline bool is_capture_unsafe_op_type(CompiledOpType type) {
         case CompiledOpType::EpDispatch:
         case CompiledOpType::EpCombine:
         case CompiledOpType::EpDispatchBackward:
-        case CompiledOpType::EpCombineBackward:
-            return true;
-        default:
-            return false;
+        case CompiledOpType::EpCombineBackward: return true;
+        default: return false;
     }
 }
 
@@ -154,7 +155,11 @@ inline void record_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream
 void reduce_loss(DslRunState& rs, long B, long T, NCCLCommunicator& comm) {
     deterministic_sum(rs.Losses.template get<float>(), rs.Losses.template get<float>(), B * T, rs.MainStream);
     comm.reduce_loss(rs.Losses.template get<float>(), rs.MainStream);
-    CUDA_CHECK(cudaMemcpyAsync(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.LossHost,
+                               rs.Losses.template get<float>(),
+                               sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
 }
 
 void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cudaStream_t stream) {
@@ -172,13 +177,18 @@ void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cuda
     throw std::runtime_error("DSL graph executor: bias_add unsupported dtype");
 }
 
-Tensor recompute_lora_rmsnorm(modules::LoRARunState& lora_rs, const Tensor& residual, const Tensor& weight,
-                              float eps, int B, int T, int C, cudaStream_t stream) {
+Tensor recompute_lora_rmsnorm(modules::LoRARunState& lora_rs,
+                              const Tensor& residual,
+                              const Tensor& weight,
+                              float eps,
+                              int B,
+                              int T,
+                              int C,
+                              cudaStream_t stream) {
     if (!lora_rs.recompute_ln.Data || !lora_rs.recompute_rstd.Data) {
         throw std::runtime_error("DSL graph executor: LoRA recompute buffers not allocated");
     }
-    rmsnorm_forward(lora_rs.recompute_ln, lora_rs.recompute_rstd,
-                    residual, weight, nullptr, eps, B, T, C, stream);
+    rmsnorm_forward(lora_rs.recompute_ln, lora_rs.recompute_rstd, residual, weight, nullptr, eps, B, T, C, stream);
     return lora_rs.recompute_ln;
 }
 
@@ -199,8 +209,7 @@ std::string debug_dump_sanitize(const std::string& name) {
     return result;
 }
 
-void debug_dump_tensor(const std::string& name, const Tensor& t,
-                       const std::string& dump_dir, cudaStream_t stream) {
+void debug_dump_tensor(const std::string& name, const Tensor& t, const std::string& dump_dir, cudaStream_t stream) {
     if (!t.Data || t.nelem() <= 0) {
         return;
     }
@@ -209,12 +218,10 @@ void debug_dump_tensor(const std::string& name, const Tensor& t,
     std::vector<float> host_data(nelem);
 
     if (t.DType == ETensorDType::FP32) {
-        CUDA_CHECK(cudaMemcpy(host_data.data(), t.Data,
-                              nelem * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host_data.data(), t.Data, nelem * sizeof(float), cudaMemcpyDeviceToHost));
     } else if (t.DType == ETensorDType::BF16) {
         std::vector<uint16_t> bf16_data(nelem);
-        CUDA_CHECK(cudaMemcpy(bf16_data.data(), t.Data,
-                              nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(bf16_data.data(), t.Data, nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < nelem; ++i) {
             uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
             float val;
@@ -223,8 +230,7 @@ void debug_dump_tensor(const std::string& name, const Tensor& t,
         }
     } else if (t.DType == ETensorDType::FP16) {
         std::vector<uint16_t> fp16_data(nelem);
-        CUDA_CHECK(cudaMemcpy(fp16_data.data(), t.Data,
-                              nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(fp16_data.data(), t.Data, nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < nelem; ++i) {
             __half h;
             std::memcpy(&h, &fp16_data[i], sizeof(__half));
@@ -270,8 +276,10 @@ std::vector<std::string> debug_dump_parse_tensor_list(const char* env_val) {
         }
         std::string tok = s.substr(pos, next - pos);
         // Trim whitespace
-        while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
-        while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+        while (!tok.empty() && tok.front() == ' ')
+            tok.erase(tok.begin());
+        while (!tok.empty() && tok.back() == ' ')
+            tok.pop_back();
         if (!tok.empty()) {
             names.push_back(std::move(tok));
         }
@@ -374,10 +382,9 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
     }
     mHasLossOp = false;
     for (const auto& op : mForward->operations) {
-        const std::string& op_type =
-            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
-        if (op_type == "fused_lm_head_loss" || op_type == "lm_head_loss" ||
-            op_type == "cross_entropy_loss" || op_type == "cross_entropy") {
+        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        if (op_type == "fused_lm_head_loss" || op_type == "lm_head_loss" || op_type == "cross_entropy_loss" ||
+            op_type == "cross_entropy") {
             mHasLossOp = true;
             break;
         }
@@ -414,8 +421,7 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
             save_set.erase("logits");
             mSaveList.assign(save_set.begin(), save_set.end());
         } catch (const std::exception& e) {
-            throw std::runtime_error(
-                std::string("DSL graph executor: autodiff failed: ") + e.what());
+            throw std::runtime_error(std::string("DSL graph executor: autodiff failed: ") + e.what());
         }
     }
 
@@ -444,10 +450,9 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
     }
 
     auto is_noncapturable_op = [&](const Operation& op) {
-        const std::string& op_type =
-            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
-        const bool is_embedding_bwd = (op_type == "embedding_backward" || op_type == "encoder_backward"
-                                       || op.name == "embedding_backward" || op.name == "encoder_backward");
+        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        const bool is_embedding_bwd = (op_type == "embedding_backward" || op_type == "encoder_backward" ||
+                                       op.name == "embedding_backward" || op.name == "encoder_backward");
         return is_embedding_bwd;
     };
 
@@ -607,20 +612,11 @@ void GraphExecutor::record_matmul_plan(int layer_idx, modules::MatmulOp op, cons
     }
     auto& layer_plan = mForwardPlan[static_cast<std::size_t>(layer_idx)];
     switch (op) {
-        case modules::MatmulOp::QKV:
-            layer_plan.qkv = plan;
-            break;
-        case modules::MatmulOp::AttnOut:
-            layer_plan.out_proj = plan;
-            break;
-        case modules::MatmulOp::MLPUp:
-            layer_plan.mlp_up = plan;
-            break;
-        case modules::MatmulOp::MLPDown:
-            layer_plan.mlp_down = plan;
-            break;
-        default:
-            break;
+        case modules::MatmulOp::QKV: layer_plan.qkv = plan; break;
+        case modules::MatmulOp::AttnOut: layer_plan.out_proj = plan; break;
+        case modules::MatmulOp::MLPUp: layer_plan.mlp_up = plan; break;
+        case modules::MatmulOp::MLPDown: layer_plan.mlp_down = plan; break;
+        default: break;
     }
 }
 
@@ -649,14 +645,15 @@ void GraphExecutor::init_compiled_execution() {
         mCompiledExecutor->set_recipe(mOptions.TrainingRecipe.get());
     }
     mCompiledExecutor->set_hook_context(mHookContext);
-    mCompiledExecutor->set_recompute_fn(
-        [this](int layer_idx, long B, long T, bool /*use_graph*/) {
-            if (mCompiledForward) {
-                mCompiledExecutor->replay_layer_forward(
-                    layer_idx, B, T, *mCompiledForward,
-                    mHasReplayForwardHook ? &mReplayForwardHook : nullptr);
-            }
-        });
+    mCompiledExecutor->set_recompute_fn([this](int layer_idx, long B, long T, bool /*use_graph*/) {
+        if (mCompiledForward) {
+            mCompiledExecutor->replay_layer_forward(layer_idx,
+                                                    B,
+                                                    T,
+                                                    *mCompiledForward,
+                                                    mHasReplayForwardHook ? &mReplayForwardHook : nullptr);
+        }
+    });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
     mCompiledExecutor->set_fp8_cache_transposed(&mFP8WeightCacheT);
     mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
@@ -668,52 +665,50 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_embedding_outputs(mEmbeddingOutputs);
     mCompiledExecutor->set_slot_registry(&mCompiler->slot_registry());
     // Wire up debug dump callback (used by ops for non-finite diagnostics).
-    mCompiledExecutor->set_debug_dump_fn(
-        [this](const std::vector<std::string>& names, int /*layer_idx*/) {
-            static const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
-            if (!dir_env || !*dir_env) {
-                return;
+    mCompiledExecutor->set_debug_dump_fn([this](const std::vector<std::string>& names, int /*layer_idx*/) {
+        static const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        if (!dir_env || !*dir_env) {
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        for (const auto& name : names) {
+            const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
+            if (t && t->Data) {
+                debug_dump_tensor(name, *t, std::string(dir_env), mRunState.MainStream);
             }
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            for (const auto& name : names) {
-                const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
-                if (t && t->Data) {
-                    debug_dump_tensor(name, *t, std::string(dir_env), mRunState.MainStream);
-                }
-            }
-        });
+        }
+    });
     // Per-layer dump callback: dump block-prefixed tensors at layer boundaries
     // (before shared activation buffers are overwritten by the next layer).
-    mCompiledExecutor->set_debug_dump_layer_fn(
-        [this](int layer_idx) {
-            static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
-            static const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
-            if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
-                return;
+    mCompiledExecutor->set_debug_dump_layer_fn([this](int layer_idx) {
+        static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+        static const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
+            return;
+        }
+        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+        auto tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+        bool found = false;
+        for (const auto& name : tensor_names) {
+            if (name.rfind(prefix, 0) == 0) {
+                found = true;
+                break;
             }
-            const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
-            auto tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
-            bool found = false;
-            for (const auto& name : tensor_names) {
-                if (name.rfind(prefix, 0) == 0) {
-                    found = true;
-                    break;
-                }
+        }
+        if (!found) {
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        for (const auto& name : tensor_names) {
+            if (name.rfind(prefix, 0) != 0) {
+                continue;
             }
-            if (!found) {
-                return;
+            const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
+            if (t && t->Data) {
+                debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
             }
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            for (const auto& name : tensor_names) {
-                if (name.rfind(prefix, 0) != 0) {
-                    continue;
-                }
-                const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
-                if (t && t->Data) {
-                    debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
-                }
-            }
-        });
+        }
+    });
 
     // Graphs will be compiled lazily on first forward when B/T are known
     mCompiledB = 0;
@@ -734,11 +729,13 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // TensorRef leaks into backward execution.
         mCompiler->reset_tid_namespace();
         if (mForward) {
-            mCompiledForward = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
+            mCompiledForward =
+                std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T, /*is_backward=*/false));
             mCompiledForward->compute_layer_segments();
         }
         if (mBackward) {
-            mCompiledBackward = std::make_unique<CompiledGraph>(mCompiler->compile(*mBackward, B, T));
+            mCompiledBackward =
+                std::make_unique<CompiledGraph>(mCompiler->compile(*mBackward, B, T, /*is_backward=*/true));
             mCompiledBackward->compute_layer_segments();
         }
         mCompiledB = B;
@@ -805,20 +802,13 @@ long GraphExecutor::estimate_backward_stack_peak(long B, long T) {
             bool on_stack = false;
             switch (ref.slot) {
                 case TensorSlot::Temporary:
-                case TensorSlot::Mapped:
-                    on_stack = true;
-                    break;
+                case TensorSlot::Mapped: on_stack = true; break;
                 case TensorSlot::BlockDQKV:
                 case TensorSlot::BlockDMLPUp:
-                case TensorSlot::BlockDSwiGLU:
-                    on_stack = bwd_on_stack;
-                    break;
+                case TensorSlot::BlockDSwiGLU: on_stack = bwd_on_stack; break;
                 case TensorSlot::BlockMLPUp:
-                case TensorSlot::BlockSwiGLU:
-                    on_stack = ffn_on_stack;
-                    break;
-                default:
-                    break;
+                case TensorSlot::BlockSwiGLU: on_stack = ffn_on_stack; break;
+                default: break;
             }
             if (on_stack) {
                 current += aligned(tensor_bytes(ref.dtype, ref.shape));
@@ -841,32 +831,30 @@ long GraphExecutor::estimate_backward_stack_peak(long B, long T) {
                 V = op.inputs[2].shape[3];
             }
             if (H > 0 && K > 0 && V > 0) {
-                const long chunk_size = op.attrs.chunk_size > 0
-                                            ? static_cast<long>(op.attrs.chunk_size)
-                                            : 64L;
+                const long chunk_size = op.attrs.chunk_size > 0 ? static_cast<long>(op.attrs.chunk_size) : 64L;
                 const long NT = (T + chunk_size - 1) / chunk_size;
                 const long BF16 = 2, FP32 = 4;
                 // Forward recompute temps
                 long internal = 0;
-                internal += aligned(B * T * H * FP32);            // g_cum
-                internal += aligned(B * T * H * chunk_size * FP32); // A
-                internal += aligned(B * T * H * chunk_size * BF16); // Ai
-                internal += aligned(B * T * H * K * BF16);         // w
-                internal += aligned(B * T * H * V * BF16);         // u
-                internal += aligned(B * NT * H * K * V * BF16);    // h
-                internal += aligned(B * H * K * V * FP32);         // ht_dummy
-                internal += aligned(B * T * H * V * BF16);         // v_new
-                internal += aligned(B * H * K * V * BF16);         // h0_buf
+                internal += aligned(B * T * H * FP32);               // g_cum
+                internal += aligned(B * T * H * chunk_size * FP32);  // A
+                internal += aligned(B * T * H * chunk_size * BF16);  // Ai
+                internal += aligned(B * T * H * K * BF16);           // w
+                internal += aligned(B * T * H * V * BF16);           // u
+                internal += aligned(B * NT * H * K * V * BF16);      // h
+                internal += aligned(B * H * K * V * FP32);           // ht_dummy
+                internal += aligned(B * T * H * V * BF16);           // v_new
+                internal += aligned(B * H * K * V * BF16);           // h0_buf
                 // L2-norm temps (forward + backward)
-                internal += aligned(B * T * H * K * BF16) * 4;    // q_norm, k_norm, dq_norm, dk_norm
-                internal += aligned(B * T * H * FP32) * 4;        // q_rstd, k_rstd (fwd+bwd)
+                internal += aligned(B * T * H * K * BF16) * 4;  // q_norm, k_norm, dq_norm, dk_norm
+                internal += aligned(B * T * H * FP32) * 4;      // q_rstd, k_rstd (fwd+bwd)
                 // Backward-specific temps
-                internal += aligned(B * NT * H * K * V * BF16);   // dh
-                internal += aligned(B * T * H * V * BF16);         // dv2
-                internal += aligned(B * H * K * V * FP32);         // dht_zero
-                internal += aligned(B * T * H * K * BF16);         // dw
-                internal += aligned(B * T * H * FP32);             // dg_wy
-                internal += aligned(B * T * H * FP32);             // dg_out
+                internal += aligned(B * NT * H * K * V * BF16);  // dh
+                internal += aligned(B * T * H * V * BF16);       // dv2
+                internal += aligned(B * H * K * V * FP32);       // dht_zero
+                internal += aligned(B * T * H * K * BF16);       // dw
+                internal += aligned(B * T * H * FP32);           // dg_wy
+                internal += aligned(B * T * H * FP32);           // dg_out
                 // dg_nk: NK * B * T * H * FP32 (NK = K / chunk_size, at least 1)
                 const long NK = std::max(1L, K / chunk_size);
                 internal += aligned(NK * B * T * H * FP32);
@@ -916,7 +904,10 @@ const std::unordered_map<std::string, size_t>& GraphExecutor::saved_buffers_size
     return empty;
 }
 
-void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool full,
+void GraphExecutor::execute_forward(long B,
+                                    long T,
+                                    NCCLCommunicator& comm,
+                                    bool full,
                                     const modules::ForwardHook* hook) {
     // Store forward hook for replay (LoRA deltas must be applied during recompute)
     if (hook && *hook) {
@@ -953,8 +944,7 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         mGraphT = T;
     }
     mCompiledExecutor->set_split_attention_graphs(use_split_attention);
-    const bool recompute_active =
-        mOptions.recompute_enabled() && mCompiledForward != nullptr;
+    const bool recompute_active = mOptions.recompute_enabled() && mCompiledForward != nullptr;
     mCompiledExecutor->set_recompute_enabled(recompute_active);
     const bool capturing = use_graphs && mForwardGraph == nullptr;
     if (!use_graphs || capturing) {
@@ -1007,8 +997,12 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         mCompiledExecutor->save_tensors(mSaveList);
     };
 
-    trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mForwardGraph, use_graphs,
-                                           rs.Stack, mForwardCheckpoint);
+    trace_or_execute_cuda_graph_with_stack(run_ops,
+                                           rs.MainStream,
+                                           mForwardGraph,
+                                           use_graphs,
+                                           rs.Stack,
+                                           mForwardCheckpoint);
     // On CUDA graph replay, run_ops isn't executed, so saved tensors are stale.
     // Refresh them here to reflect the current forward activations.
     if (use_graphs && !capturing) {
@@ -1017,8 +1011,12 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
     mCompiledExecutor->set_capturing(false);
 }
 
-void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int grad_accum_steps,
-                                     int micro_step, const modules::BackwardHook* hook,
+void GraphExecutor::execute_backward(long B,
+                                     long T,
+                                     NCCLCommunicator& comm,
+                                     int grad_accum_steps,
+                                     int micro_step,
+                                     const modules::BackwardHook* hook,
                                      bool skip_zeroing) {
     compile_graphs(B, T);
 
@@ -1037,16 +1035,14 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
     const bool use_split_attention_bwd = needs_split_bwd && mOptions.UseCudaGraphs && !in_capture;
-    const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture &&
-                            !needs_split_bwd;
+    const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture && !needs_split_bwd;
     mCompiledExecutor->set_split_attention_graphs(use_split_attention_bwd);
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
         mGraphT = T;
     }
-    const bool recompute_active =
-        mOptions.recompute_enabled() && mCompiledForward != nullptr;
+    const bool recompute_active = mOptions.recompute_enabled() && mCompiledForward != nullptr;
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
     if (capturing) {
@@ -1061,12 +1057,15 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
         mCompiledExecutor->set_recompute_enabled(recompute_active);
         mCompiledExecutor->set_recompute_use_graphs(use_graphs && !capturing);
         mCompiledExecutor->set_capturing(capturing);
-        mCompiledExecutor->execute_backward(*mCompiledBackward, comm, grad_accum_steps, micro_step, hook,
-                                             skip_zeroing);
+        mCompiledExecutor->execute_backward(*mCompiledBackward, comm, grad_accum_steps, micro_step, hook, skip_zeroing);
     };
 
-    trace_or_execute_cuda_graph_with_stack(run_ops, rs.MainStream, mBackwardGraph[graph_idx], use_graphs,
-                                           rs.Stack, mBackwardCheckpoint[graph_idx]);
+    trace_or_execute_cuda_graph_with_stack(run_ops,
+                                           rs.MainStream,
+                                           mBackwardGraph[graph_idx],
+                                           use_graphs,
+                                           rs.Stack,
+                                           mBackwardCheckpoint[graph_idx]);
     mCompiledExecutor->set_capturing(false);
 }
 
@@ -1080,8 +1079,9 @@ std::vector<std::byte> GraphExecutor::rng_state() const {
     auto view = tmp.rdbuf()->view();
     std::vector<std::byte> state;
     state.reserve(view.size());
-    std::transform(view.begin(), view.end(), std::back_inserter(state),
-                   [](char c) { return static_cast<std::byte>(c); });
+    std::transform(view.begin(), view.end(), std::back_inserter(state), [](char c) {
+        return static_cast<std::byte>(c);
+    });
     return state;
 }
 
@@ -1127,33 +1127,47 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
 
     // Copy inputs and position ids to device.
     {
-        const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
+        const std::size_t input_bytes =
+            static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
-            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, rs.Targets_CPU.Data, target_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data,
+                                       rs.Targets_CPU.Data,
+                                       target_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
         if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
             const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data,
+                                       rs.VisualPosMasks_CPU.Data,
+                                       mask_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
         if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
             const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data,
+                                       rs.VisualEmbeds_CPU.Data,
+                                       embed_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
-        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+        if (!rs.DeepstackVisualEmbeds.empty() &&
+            rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
             for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
                 if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
                     continue;
                 }
                 const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
-                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
-                                           cudaMemcpyHostToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data,
+                                           rs.DeepstackVisualEmbeds_CPU[i].Data,
+                                           bytes,
+                                           cudaMemcpyHostToDevice,
+                                           rs.MainStream));
             }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
@@ -1165,7 +1179,11 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
 }
 
-float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
+float GraphExecutor::validate(Tensor inputs,
+                              Tensor position_ids,
+                              Tensor targets,
+                              NCCLCommunicator& comm,
+                              int micro_step) {
     auto& rs = mRunState;
 
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
@@ -1200,36 +1218,55 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
 
     // Copy inputs and position ids to device.
     {
-        const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
+        const std::size_t input_bytes =
+            static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
             if (targets.Device == -1) {
-                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data,
+                                           targets.Data,
+                                           target_bytes,
+                                           cudaMemcpyHostToDevice,
+                                           rs.MainStream));
             } else {
-                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data,
+                                           targets.Data,
+                                           target_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           rs.MainStream));
             }
         }
         if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
             const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data,
+                                       rs.VisualPosMasks_CPU.Data,
+                                       mask_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
         if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
             const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data,
+                                       rs.VisualEmbeds_CPU.Data,
+                                       embed_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
-        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+        if (!rs.DeepstackVisualEmbeds.empty() &&
+            rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
             for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
                 if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
                     continue;
                 }
                 const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
-                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
-                                           cudaMemcpyHostToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data,
+                                           rs.DeepstackVisualEmbeds_CPU[i].Data,
+                                           bytes,
+                                           cudaMemcpyHostToDevice,
+                                           rs.MainStream));
             }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
@@ -1244,8 +1281,10 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
     comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     comm.all_reduce_sum_int(rs.CorrectCount.template get<int>(), /*n=*/1, rs.MainStream);
 
-    CUDA_CHECK(cudaMemcpyAsync(rs.NormHost, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
-    CUDA_CHECK(cudaMemcpyAsync(rs.AccuracyHost, rs.CorrectCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(rs.NormHost, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(rs.AccuracyHost, rs.CorrectCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     int valid_tokens = *reinterpret_cast<int*>(rs.NormHost);
@@ -1264,7 +1303,11 @@ float GraphExecutor::validate(Tensor inputs, Tensor position_ids, Tensor targets
     return *rs.LossHost;
 }
 
-void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {
+void GraphExecutor::backward(Tensor inputs,
+                             Tensor targets,
+                             NCCLCommunicator& comm,
+                             int grad_accum_steps,
+                             int micro_step) {
     auto& rs = mRunState;
     auto& grads = mGrads;
     const auto& config = mConfig;
@@ -1290,8 +1333,8 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
         if (!skip_target_copy) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes,
-                                       cudaMemcpyHostToDevice, target_stream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, target_stream));
             record_event_if_not_capturing(rs.TransferDone, target_stream);
         }
     }
@@ -1365,7 +1408,10 @@ void GraphExecutor::backward(Tensor inputs, Tensor targets, NCCLCommunicator& co
     }
 }
 
-void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step,
+void GraphExecutor::forward_with_hook(Tensor inputs,
+                                      Tensor position_ids,
+                                      NCCLCommunicator& comm,
+                                      int micro_step,
                                       const modules::ForwardHook& hook) {
     auto& rs = mRunState;
 
@@ -1402,33 +1448,47 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
 
     // Copy inputs and position ids to device.
     {
-        const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
+        const std::size_t input_bytes =
+            static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(rs.Targets.DType);
-            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, rs.Targets_CPU.Data, target_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data,
+                                       rs.Targets_CPU.Data,
+                                       target_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
         if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
             const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data,
+                                       rs.VisualPosMasks_CPU.Data,
+                                       mask_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
         if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
             const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data,
+                                       rs.VisualEmbeds_CPU.Data,
+                                       embed_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
-        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+        if (!rs.DeepstackVisualEmbeds.empty() &&
+            rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
             for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
                 if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
                     continue;
                 }
                 const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
-                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
-                                           cudaMemcpyHostToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data,
+                                           rs.DeepstackVisualEmbeds_CPU[i].Data,
+                                           bytes,
+                                           cudaMemcpyHostToDevice,
+                                           rs.MainStream));
             }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
@@ -1445,8 +1505,12 @@ void GraphExecutor::forward_with_hook(Tensor inputs, Tensor position_ids, NCCLCo
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
 }
 
-float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm,
-                                        int micro_step, const modules::ForwardHook& hook) {
+float GraphExecutor::validate_with_hook(Tensor inputs,
+                                        Tensor position_ids,
+                                        Tensor targets,
+                                        NCCLCommunicator& comm,
+                                        int micro_step,
+                                        const modules::ForwardHook& hook) {
     auto& rs = mRunState;
 
     if (mLoRAConfig && mLoRAConfig->enabled() && mLoRARunState) {
@@ -1481,36 +1545,55 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
 
     // Copy inputs and position ids to device.
     {
-        const std::size_t input_bytes = static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
+        const std::size_t input_bytes =
+            static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(inputs.DType);
         CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, inputs.Data, input_bytes, cudaMemcpyHostToDevice, rs.MainStream));
         copy_position_ids_to_device(position_ids, rs.PositionIDs, B, T, rs.MainStream);
         if (mHasLossOp) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
             if (targets.Device == -1) {
-                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data,
+                                           targets.Data,
+                                           target_bytes,
+                                           cudaMemcpyHostToDevice,
+                                           rs.MainStream));
             } else {
-                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyDeviceToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data,
+                                           targets.Data,
+                                           target_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           rs.MainStream));
             }
         }
         if (rs.VisualPosMasks.Data && rs.VisualPosMasks_CPU.Data) {
             const std::size_t mask_bytes = rs.VisualPosMasks.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data, rs.VisualPosMasks_CPU.Data, mask_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualPosMasks.Data,
+                                       rs.VisualPosMasks_CPU.Data,
+                                       mask_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
         if (rs.VisualEmbeds.Data && rs.VisualEmbeds_CPU.Data) {
             const std::size_t embed_bytes = rs.VisualEmbeds.bytes();
-            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data, rs.VisualEmbeds_CPU.Data, embed_bytes,
-                                       cudaMemcpyHostToDevice, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(rs.VisualEmbeds.Data,
+                                       rs.VisualEmbeds_CPU.Data,
+                                       embed_bytes,
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
-        if (!rs.DeepstackVisualEmbeds.empty() && rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
+        if (!rs.DeepstackVisualEmbeds.empty() &&
+            rs.DeepstackVisualEmbeds.size() == rs.DeepstackVisualEmbeds_CPU.size()) {
             for (std::size_t i = 0; i < rs.DeepstackVisualEmbeds.size(); ++i) {
                 if (!rs.DeepstackVisualEmbeds[i].Data || !rs.DeepstackVisualEmbeds_CPU[i].Data) {
                     continue;
                 }
                 const std::size_t bytes = rs.DeepstackVisualEmbeds[i].bytes();
-                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data, rs.DeepstackVisualEmbeds_CPU[i].Data, bytes,
-                                           cudaMemcpyHostToDevice, rs.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(rs.DeepstackVisualEmbeds[i].Data,
+                                           rs.DeepstackVisualEmbeds_CPU[i].Data,
+                                           bytes,
+                                           cudaMemcpyHostToDevice,
+                                           rs.MainStream));
             }
         }
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
@@ -1530,8 +1613,10 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
     comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     comm.all_reduce_sum_int(rs.CorrectCount.template get<int>(), /*n=*/1, rs.MainStream);
 
-    CUDA_CHECK(cudaMemcpyAsync(rs.NormHost, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
-    CUDA_CHECK(cudaMemcpyAsync(rs.AccuracyHost, rs.CorrectCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(rs.NormHost, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(rs.AccuracyHost, rs.CorrectCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     int valid_tokens = *reinterpret_cast<int*>(rs.NormHost);
@@ -1550,8 +1635,12 @@ float GraphExecutor::validate_with_hook(Tensor inputs, Tensor position_ids, Tens
     return *rs.LossHost;
 }
 
-void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommunicator& comm,
-                                       int grad_accum_steps, int micro_step, const modules::BackwardHook& hook) {
+void GraphExecutor::backward_with_hook(Tensor inputs,
+                                       Tensor targets,
+                                       NCCLCommunicator& comm,
+                                       int grad_accum_steps,
+                                       int micro_step,
+                                       const modules::BackwardHook& hook) {
     auto& rs = mRunState;
     auto& grads = mGrads;
     const auto& config = mConfig;
@@ -1574,8 +1663,8 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
         if (!skip_target_copy) {
             const std::size_t target_bytes =
                 static_cast<std::size_t>(B) * static_cast<std::size_t>(T) * get_dtype_size(targets.DType);
-            CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes,
-                                       cudaMemcpyHostToDevice, target_stream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(rs.Targets.Data, targets.Data, target_bytes, cudaMemcpyHostToDevice, target_stream));
             record_event_if_not_capturing(rs.TransferDone, target_stream);
         }
     }
@@ -1656,15 +1745,15 @@ void GraphExecutor::backward_with_hook(Tensor inputs, Tensor targets, NCCLCommun
 // Log-prob forward (no KV-cache, no gradients, log-probability extraction)
 // ============================================================================
 
-void GraphExecutor::execute_logprobs_forward(long B, long T,
-                                              const std::int32_t* input_ids_cpu,
-                                              const std::int32_t* targets_cpu,
-                                              float* logprobs_cpu,
-                                              const modules::ForwardHook* hook,
-                                              NCCLCommunicator& comm,
-                                              const std::int32_t* position_ids_cpu,
-                                              const float* temperatures_cpu)
-{
+void GraphExecutor::execute_logprobs_forward(long B,
+                                             long T,
+                                             const std::int32_t* input_ids_cpu,
+                                             const std::int32_t* targets_cpu,
+                                             float* logprobs_cpu,
+                                             const modules::ForwardHook* hook,
+                                             NCCLCommunicator& comm,
+                                             const std::int32_t* position_ids_cpu,
+                                             const float* temperatures_cpu) {
     if (!mCompiledExecutor) {
         throw std::runtime_error("GraphExecutor: compiled executor not initialized");
     }
@@ -1679,10 +1768,8 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     const std::size_t token_bytes = static_cast<std::size_t>(BT) * sizeof(std::int32_t);
 
     // Copy input IDs and targets to device.
-    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, input_ids_cpu, token_bytes,
-                               cudaMemcpyHostToDevice, rs.MainStream));
-    CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets_cpu, token_bytes,
-                               cudaMemcpyHostToDevice, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.Inputs.Data, input_ids_cpu, token_bytes, cudaMemcpyHostToDevice, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(rs.Targets.Data, targets_cpu, token_bytes, cudaMemcpyHostToDevice, rs.MainStream));
 
     // Copy or build position IDs.
     if (position_ids_cpu) {
@@ -1703,8 +1790,7 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     // Allocate GPU buffer for per-token log-probs.
     float* logprobs_gpu = nullptr;
     CUDA_CHECK(cudaMalloc(&logprobs_gpu, static_cast<std::size_t>(BT) * sizeof(float)));
-    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0,
-                               static_cast<std::size_t>(BT) * sizeof(float), rs.MainStream));
+    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0, static_cast<std::size_t>(BT) * sizeof(float), rs.MainStream));
 
     // Optional per-token inverse temperature buffer.
     float* inv_temperature_gpu = nullptr;
@@ -1714,9 +1800,11 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
             inv_temp[static_cast<std::size_t>(i)] = 1.0f / temperatures_cpu[i];
         }
         CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, static_cast<std::size_t>(BT) * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu, inv_temp.data(),
+        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu,
+                                   inv_temp.data(),
                                    static_cast<std::size_t>(BT) * sizeof(float),
-                                   cudaMemcpyHostToDevice, rs.MainStream));
+                                   cudaMemcpyHostToDevice,
+                                   rs.MainStream));
         mCompiledExecutor->set_inv_temperature_context(inv_temperature_gpu);
     }
 
@@ -1732,9 +1820,11 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
     mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, hook);
 
     // Copy results back to CPU.
-    CUDA_CHECK(cudaMemcpyAsync(logprobs_cpu, logprobs_gpu,
+    CUDA_CHECK(cudaMemcpyAsync(logprobs_cpu,
+                               logprobs_gpu,
                                static_cast<std::size_t>(BT) * sizeof(float),
-                               cudaMemcpyDeviceToHost, rs.MainStream));
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
     CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
 
     // Cleanup.
@@ -1751,13 +1841,14 @@ void GraphExecutor::execute_logprobs_forward(long B, long T,
 // Custom d_loss backward (GRPO: external per-token gradient multipliers)
 // ============================================================================
 
-void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
-                                                const float* per_token_grads_cpu,
-                                                NCCLCommunicator& comm,
-                                                int grad_accum_steps, int micro_step,
-                                                const modules::BackwardHook* hook,
-                                                const float* temperatures_cpu)
-{
+void GraphExecutor::backward_with_custom_dloss(Tensor inputs,
+                                               Tensor targets,
+                                               const float* per_token_grads_cpu,
+                                               NCCLCommunicator& comm,
+                                               int grad_accum_steps,
+                                               int micro_step,
+                                               const modules::BackwardHook* hook,
+                                               const float* temperatures_cpu) {
     auto& rs = mRunState;
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
@@ -1767,8 +1858,11 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
     // These replace the standard d_loss=1.0 seeding in dispatch_fused_lm_head_loss_backward.
     float* custom_dloss_gpu = nullptr;
     CUDA_CHECK(cudaMalloc(&custom_dloss_gpu, BT * sizeof(float)));
-    CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu, per_token_grads_cpu,
-                               BT * sizeof(float), cudaMemcpyHostToDevice, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu,
+                               per_token_grads_cpu,
+                               BT * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               rs.MainStream));
     mCompiledExecutor->set_custom_dloss_context(custom_dloss_gpu);
 
     float* inv_temperature_gpu = nullptr;
@@ -1778,8 +1872,11 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
             inv_temp[i] = 1.0f / temperatures_cpu[i];
         }
         CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, BT * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu, inv_temp.data(),
-                                   BT * sizeof(float), cudaMemcpyHostToDevice, rs.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu,
+                                   inv_temp.data(),
+                                   BT * sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   rs.MainStream));
         mCompiledExecutor->set_inv_temperature_context(inv_temperature_gpu);
     }
 
@@ -1807,9 +1904,7 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs, Tensor targets,
 // Document masking (Flash Attention varlen)
 // ============================================================================
 
-void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu,
-                                     int num_docs, int max_seqlen, int total_q)
-{
+void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q) {
     const int count = num_docs + 1;
     // Reallocate GPU buffer if size changed
     if (mCuSeqlensGpu && mCuSeqlensCount != count) {
@@ -1817,24 +1912,23 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu,
         mCuSeqlensGpu = nullptr;
     }
     if (!mCuSeqlensGpu) {
-        CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu,
-                              static_cast<std::size_t>(count) * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(count) * sizeof(std::int32_t)));
         mCuSeqlensCount = count;
     }
-    CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu, cu_seqlens_cpu,
+    CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
+                               cu_seqlens_cpu,
                                static_cast<std::size_t>(count) * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, mRunState.MainStream));
+                               cudaMemcpyHostToDevice,
+                               mRunState.MainStream));
     mDocMaskingNumDocs = num_docs;
     mDocMaskingMaxSeqlen = max_seqlen;
     mDocMaskingTotalQ = total_q;
     if (mCompiledExecutor) {
-        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu, num_docs,
-                                                    max_seqlen, total_q);
+        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu, num_docs, max_seqlen, total_q);
     }
 }
 
-void GraphExecutor::clear_doc_masking()
-{
+void GraphExecutor::clear_doc_masking() {
     if (mCompiledExecutor) {
         mCompiledExecutor->clear_doc_masking_context();
     }

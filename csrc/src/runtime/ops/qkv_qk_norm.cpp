@@ -12,6 +12,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -43,8 +46,16 @@ void log_qkv_mismatch(const char* op_name,
                       const Tensor& q_rstd,
                       const Tensor& k_rstd) {
     fprintf(stderr, "[QKV_DEBUG] %s qkv shape mismatch\n", op_name);
-    fprintf(stderr, "  B=%d T=%d expected_qkv=%d actual_qkv=%ld Hq=%d Hkv=%d Hs=%d shard_weights=%d\n",
-            B, T, expected_qkv, actual_qkv, Hq, Hkv, Hs, shard_weights ? 1 : 0);
+    fprintf(stderr,
+            "  B=%d T=%d expected_qkv=%d actual_qkv=%ld Hq=%d Hkv=%d Hs=%d shard_weights=%d\n",
+            B,
+            T,
+            expected_qkv,
+            actual_qkv,
+            Hq,
+            Hkv,
+            Hs,
+            shard_weights ? 1 : 0);
     log_tensor_shape("qkv", qkv);
     log_tensor_shape("q_norm", q_norm);
     log_tensor_shape("k_norm", k_norm);
@@ -66,34 +77,41 @@ void CompiledExecutor::dispatch_qkv_qk_norm(const CompiledOp& op) {
     const Tensor& qkv_out_candidate = ensure_output_tensor(op.outputs[0]);
     const Tensor& q_rstd_candidate = ensure_output_tensor(op.outputs[1]);
     const Tensor& k_rstd_candidate = ensure_output_tensor(op.outputs[2]);
-    const std::vector<long> qkv_shape(
-        qkv_in.Sizes.begin(), qkv_in.Sizes.begin() + qkv_in.Rank);
+    const std::vector<long> qkv_shape(qkv_in.Sizes.begin(), qkv_in.Sizes.begin() + qkv_in.Rank);
     const std::vector<long> q_rstd_shape =
         !op.outputs[1].shape.empty() ? op.outputs[1].shape : std::vector<long>{mB, mT, Hq};
     const std::vector<long> k_rstd_shape =
         !op.outputs[2].shape.empty() ? op.outputs[2].shape : std::vector<long>{mB, mT, Hkv};
-    Tensor qkv_out = ensure_output_tensor_or_persistent(
-        qkv_out_candidate,
-        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
-        op.op_id + "." + op.outputs[0].name + ".qkv_out",
-        qkv_in.DType, qkv_shape, "qkv_qk_norm");
-    Tensor q_rstd = ensure_output_tensor_or_persistent(
-        q_rstd_candidate,
-        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
-        op.op_id + "." + op.outputs[1].name + ".q_rstd",
-        ETensorDType::FP32, q_rstd_shape, "qkv_qk_norm");
-    Tensor k_rstd = ensure_output_tensor_or_persistent(
-        k_rstd_candidate,
-        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
-        op.op_id + "." + op.outputs[2].name + ".k_rstd",
-        ETensorDType::FP32, k_rstd_shape, "qkv_qk_norm");
+    Tensor qkv_out = ensure_output_tensor_or_persistent(qkv_out_candidate,
+                                                        mRunState,
+                                                        mMoeSavedBuffers,
+                                                        mMoeSavedSizes,
+                                                        op.op_id + "." + op.outputs[0].name + ".qkv_out",
+                                                        qkv_in.DType,
+                                                        qkv_shape,
+                                                        "qkv_qk_norm");
+    Tensor q_rstd = ensure_output_tensor_or_persistent(q_rstd_candidate,
+                                                       mRunState,
+                                                       mMoeSavedBuffers,
+                                                       mMoeSavedSizes,
+                                                       op.op_id + "." + op.outputs[1].name + ".q_rstd",
+                                                       ETensorDType::FP32,
+                                                       q_rstd_shape,
+                                                       "qkv_qk_norm");
+    Tensor k_rstd = ensure_output_tensor_or_persistent(k_rstd_candidate,
+                                                       mRunState,
+                                                       mMoeSavedBuffers,
+                                                       mMoeSavedSizes,
+                                                       op.op_id + "." + op.outputs[2].name + ".k_rstd",
+                                                       ETensorDType::FP32,
+                                                       k_rstd_shape,
+                                                       "qkv_qk_norm");
     int qkv_channels = Hs * (Hq + 2 * Hkv);
     const int qkv_expected = qkv_channels;
 
     if (qkv_in.Data != qkv_out.Data) {
-        CUDA_CHECK(cudaMemcpyAsync(qkv_out.Data, qkv_in.Data,
-                                   qkv_in.bytes(),
-                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(qkv_out.Data, qkv_in.Data, qkv_in.bytes(), cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
 
     auto actual_qkv_channels = [](const Tensor& t) -> long {
@@ -105,14 +123,23 @@ void CompiledExecutor::dispatch_qkv_qk_norm(const CompiledOp& op) {
         }
         return 0;
     };
-    const long qkv_actual = actual_qkv_channels(qkv_in) > 0 ? actual_qkv_channels(qkv_in)
-                                                            : actual_qkv_channels(qkv_out);
+    const long qkv_actual =
+        actual_qkv_channels(qkv_in) > 0 ? actual_qkv_channels(qkv_in) : actual_qkv_channels(qkv_out);
     if (qkv_actual > 0 && qkv_actual != qkv_expected && !mOptions.ShardWeights) {
         log_qkv_mismatch("qkv_qk_norm",
-                         static_cast<int>(mB), static_cast<int>(mT),
-                         qkv_expected, qkv_actual,
-                         Hq, Hkv, Hs, false,
-                         qkv_in, q_norm, k_norm, q_rstd, k_rstd);
+                         static_cast<int>(mB),
+                         static_cast<int>(mT),
+                         qkv_expected,
+                         qkv_actual,
+                         Hq,
+                         Hkv,
+                         Hs,
+                         false,
+                         qkv_in,
+                         q_norm,
+                         k_norm,
+                         q_rstd,
+                         k_rstd);
         throw std::runtime_error("qkv_qk_norm: unexpected qkv shape (no sharding enabled)");
     }
     if (qkv_actual > 0 && qkv_actual != qkv_channels) {
@@ -144,11 +171,17 @@ void CompiledExecutor::dispatch_qkv_qk_norm(const CompiledOp& op) {
         static_cast<long>(qkv_out.nelem()) >= qkv_needed) {
         qkv_view = view_tensor(qkv_out, {mB, mT, qkv_channels});
     }
-    if (qkv_view.Rank != 3 || qkv_view.Sizes[0] != mB || qkv_view.Sizes[1] != mT ||
-        qkv_view.Sizes[2] != qkv_channels) {
+    if (qkv_view.Rank != 3 || qkv_view.Sizes[0] != mB || qkv_view.Sizes[1] != mT || qkv_view.Sizes[2] != qkv_channels) {
         fprintf(stderr, "[QKV_DEBUG] qkv_qk_norm pre-kernel shape mismatch\n");
-        fprintf(stderr, "  expected=[%ld,%ld,%d] cfg: Hq=%d Hkv=%d Hs=%d shard_weights=%d\n",
-                mB, mT, qkv_channels, Hq, Hkv, Hs, mOptions.ShardWeights ? 1 : 0);
+        fprintf(stderr,
+                "  expected=[%ld,%ld,%d] cfg: Hq=%d Hkv=%d Hs=%d shard_weights=%d\n",
+                mB,
+                mT,
+                qkv_channels,
+                Hq,
+                Hkv,
+                Hs,
+                mOptions.ShardWeights ? 1 : 0);
         log_tensor_shape("qkv_in", qkv_in);
         log_tensor_shape("qkv_out", qkv_out);
         log_tensor_shape("qkv_view", qkv_view);
@@ -172,14 +205,28 @@ void CompiledExecutor::dispatch_qkv_qk_norm(const CompiledOp& op) {
     Tensor k_rstd_view = view_rstd(k_rstd, Hkv);
     const int q_rows = Hq * Hs;
 
-    qkv_head_rmsnorm_forward(qkv_view, q_rstd_view, q_norm,
+    qkv_head_rmsnorm_forward(qkv_view,
+                             q_rstd_view,
+                             q_norm,
                              op.attrs.eps,
-                             static_cast<int>(mB), static_cast<int>(mT),
-                             qkv_channels, Hq, Hs, 0, mRunState.MainStream);
-    qkv_head_rmsnorm_forward(qkv_view, k_rstd_view, k_norm,
+                             static_cast<int>(mB),
+                             static_cast<int>(mT),
+                             qkv_channels,
+                             Hq,
+                             Hs,
+                             0,
+                             mRunState.MainStream);
+    qkv_head_rmsnorm_forward(qkv_view,
+                             k_rstd_view,
+                             k_norm,
                              op.attrs.eps,
-                             static_cast<int>(mB), static_cast<int>(mT),
-                             qkv_channels, Hkv, Hs, q_rows, mRunState.MainStream);
+                             static_cast<int>(mB),
+                             static_cast<int>(mT),
+                             qkv_channels,
+                             Hkv,
+                             Hs,
+                             q_rows,
+                             mRunState.MainStream);
 
     store_tensor(op.outputs[0], qkv_out);
     store_tensor(op.outputs[1], q_rstd);
@@ -217,13 +264,15 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
         accum_k = mAccumulateTensors.count(op.outputs[2].name) > 0;
     }
 
-    const std::vector<long> d_qkv_shape(
-        qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
-    Tensor d_qkv = ensure_output_tensor_or_persistent(
-        ensure_output_tensor(op.outputs[0]),
-        mRunState, mMoeSavedBuffers, mMoeSavedSizes,
-        op.op_id + "." + op.outputs[0].name + ".d_qkv",
-        d_out.DType, d_qkv_shape, "qkv_qk_norm_backward");
+    const std::vector<long> d_qkv_shape(qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
+    Tensor d_qkv = ensure_output_tensor_or_persistent(ensure_output_tensor(op.outputs[0]),
+                                                      mRunState,
+                                                      mMoeSavedBuffers,
+                                                      mMoeSavedSizes,
+                                                      op.op_id + "." + op.outputs[0].name + ".d_qkv",
+                                                      d_out.DType,
+                                                      d_qkv_shape,
+                                                      "qkv_qk_norm_backward");
 
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -240,14 +289,22 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
         }
         return 0;
     };
-    const long qkv_actual = actual_qkv_channels(qkv) > 0 ? actual_qkv_channels(qkv)
-                                                         : actual_qkv_channels(d_out);
+    const long qkv_actual = actual_qkv_channels(qkv) > 0 ? actual_qkv_channels(qkv) : actual_qkv_channels(d_out);
     if (qkv_actual > 0 && qkv_actual != qkv_expected && !mOptions.ShardWeights) {
         log_qkv_mismatch("qkv_qk_norm_backward",
-                         static_cast<int>(mB), static_cast<int>(mT),
-                         qkv_expected, qkv_actual,
-                         Hq, Hkv, Hs, false,
-                         qkv, q_norm, k_norm, q_rstd, k_rstd);
+                         static_cast<int>(mB),
+                         static_cast<int>(mT),
+                         qkv_expected,
+                         qkv_actual,
+                         Hq,
+                         Hkv,
+                         Hs,
+                         false,
+                         qkv,
+                         q_norm,
+                         k_norm,
+                         q_rstd,
+                         k_rstd);
         throw std::runtime_error("qkv_qk_norm_backward: unexpected qkv shape (no sharding enabled)");
     }
     if (qkv_actual > 0 && qkv_actual != qkv_channels) {
@@ -275,8 +332,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
     const int q_rows = Hq * Hs;
     auto view_qkv = [&](Tensor& t) -> Tensor {
         const long needed = static_cast<long>(mB) * static_cast<long>(mT) * qkv_channels;
-        if ((t.Rank == 4 || (t.Rank == 3 && t.Sizes[2] != qkv_channels)) &&
-            static_cast<long>(t.nelem()) >= needed) {
+        if ((t.Rank == 4 || (t.Rank == 3 && t.Sizes[2] != qkv_channels)) && static_cast<long>(t.nelem()) >= needed) {
             return view_tensor(t, {mB, mT, static_cast<long>(qkv_channels)});
         }
         return t;
@@ -302,38 +358,90 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
     // Compute d_weight before overwriting d_out_view.
     if (d_q_norm) {
         if (d_q_norm->DType == ETensorDType::FP32 && q_norm.DType != ETensorDType::FP32) {
-            qkv_head_rmsnorm_backward_dweight_fp32(*d_q_norm, d_out_view, qkv_view, q_norm,
-                                                   static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                                   Hq, Hs, 0, accum_q, mRunState.MainStream);
+            qkv_head_rmsnorm_backward_dweight_fp32(*d_q_norm,
+                                                   d_out_view,
+                                                   qkv_view,
+                                                   q_norm,
+                                                   static_cast<int>(mB),
+                                                   static_cast<int>(mT),
+                                                   qkv_channels,
+                                                   Hq,
+                                                   Hs,
+                                                   0,
+                                                   accum_q,
+                                                   mRunState.MainStream);
         } else {
-            qkv_head_rmsnorm_backward_dweight(*d_q_norm, d_out_view, qkv_view, q_norm,
-                                              static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                              Hq, Hs, 0, accum_q, mRunState.MainStream);
+            qkv_head_rmsnorm_backward_dweight(*d_q_norm,
+                                              d_out_view,
+                                              qkv_view,
+                                              q_norm,
+                                              static_cast<int>(mB),
+                                              static_cast<int>(mT),
+                                              qkv_channels,
+                                              Hq,
+                                              Hs,
+                                              0,
+                                              accum_q,
+                                              mRunState.MainStream);
         }
     }
     if (d_k_norm) {
         if (d_k_norm->DType == ETensorDType::FP32 && k_norm.DType != ETensorDType::FP32) {
-            qkv_head_rmsnorm_backward_dweight_fp32(*d_k_norm, d_out_view, qkv_view, k_norm,
-                                                   static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                                   Hkv, Hs, q_rows, accum_k, mRunState.MainStream);
+            qkv_head_rmsnorm_backward_dweight_fp32(*d_k_norm,
+                                                   d_out_view,
+                                                   qkv_view,
+                                                   k_norm,
+                                                   static_cast<int>(mB),
+                                                   static_cast<int>(mT),
+                                                   qkv_channels,
+                                                   Hkv,
+                                                   Hs,
+                                                   q_rows,
+                                                   accum_k,
+                                                   mRunState.MainStream);
         } else {
-            qkv_head_rmsnorm_backward_dweight(*d_k_norm, d_out_view, qkv_view, k_norm,
-                                              static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                              Hkv, Hs, q_rows, accum_k, mRunState.MainStream);
+            qkv_head_rmsnorm_backward_dweight(*d_k_norm,
+                                              d_out_view,
+                                              qkv_view,
+                                              k_norm,
+                                              static_cast<int>(mB),
+                                              static_cast<int>(mT),
+                                              qkv_channels,
+                                              Hkv,
+                                              Hs,
+                                              q_rows,
+                                              accum_k,
+                                              mRunState.MainStream);
         }
     }
 
     if (d_qkv_view.Data != d_out_view.Data) {
         const std::size_t bytes = static_cast<std::size_t>(d_out_view.nelem()) * get_dtype_size(d_out_view.DType);
-        CUDA_CHECK(cudaMemcpyAsync(d_qkv_view.Data, d_out_view.Data, bytes,
-                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(d_qkv_view.Data, d_out_view.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
-    qkv_head_rmsnorm_backward_dx(d_qkv_view, qkv_view, q_norm, q_rstd_view,
-                                 static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                 Hq, Hs, 0, mRunState.MainStream);
-    qkv_head_rmsnorm_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd_view,
-                                 static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
-                                 Hkv, Hs, q_rows, mRunState.MainStream);
+    qkv_head_rmsnorm_backward_dx(d_qkv_view,
+                                 qkv_view,
+                                 q_norm,
+                                 q_rstd_view,
+                                 static_cast<int>(mB),
+                                 static_cast<int>(mT),
+                                 qkv_channels,
+                                 Hq,
+                                 Hs,
+                                 0,
+                                 mRunState.MainStream);
+    qkv_head_rmsnorm_backward_dx(d_qkv_view,
+                                 qkv_view,
+                                 k_norm,
+                                 k_rstd_view,
+                                 static_cast<int>(mB),
+                                 static_cast<int>(mT),
+                                 qkv_channels,
+                                 Hkv,
+                                 Hs,
+                                 q_rows,
+                                 mRunState.MainStream);
 
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         store_tensor(op.outputs[0], d_qkv);
@@ -346,4 +454,161 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// QK-Norm backward rule (no RoPE)
+// Forward: qkv_out, q_rstd, k_rstd = qkv_qk_norm(qkv, q_norm_w, k_norm_w)
+// Backward: d_qkv, d_q_norm_w, d_k_norm_w = qkv_qk_norm_backward(...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> qkv_qk_norm_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 3 || fwd.outputs.size() < 3) {
+        return ops;
+    }
+
+    std::string qkv_out = fwd.outputs[0];
+    std::string q_rstd = fwd.outputs[1];
+    std::string k_rstd = fwd.outputs[2];
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");
+
+    ops.push_back(make_operation(
+        "qkv_qk_norm_backward_" + std::to_string(ctx.op_counter++),
+        "qkv_qk_norm_backward",
+        "qkv_qk_norm_backward",
+        {ctx.d_output, saved_ref(qkv_out), fwd.inputs[1], fwd.inputs[2], saved_ref(q_rstd), saved_ref(k_rstd)},
+        outputs));
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("qkv_qk_norm", ::dsl::qkv_qk_norm_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// QKVQKNorm
+// ------------------------------------------------------------------------
+const int _qkv_qk_norm_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "qkv_qk_norm";
+    sig.min_inputs = 3;
+    sig.max_inputs = 3;
+    sig.min_outputs = 3;
+    sig.max_outputs = 3;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& qkv = inputs[0];
+        const auto& q_norm = inputs[1];
+        const auto& k_norm = inputs[2];
+        const auto& qkv_out = outputs[0];
+        const auto& q_rstd = outputs[1];
+        const auto& k_rstd = outputs[2];
+
+        // Check qkv rank >= 2
+        if (qkv.size() < 2) {
+            ShapeValidationError err;
+            err.message = "qkv_qk_norm: qkv must have rank >= 2";
+            return std::make_optional(err);
+        }
+
+        // Check q_norm and k_norm are 1D
+        if (auto err = validators::check_rank(q_norm, 1, "q_norm", "qkv_qk_norm")) {
+            return err;
+        }
+        if (auto err = validators::check_rank(k_norm, 1, "k_norm", "qkv_qk_norm")) {
+            return err;
+        }
+
+        // Check output shape matches input
+        if (auto err = validators::check_same_numel(qkv_out, qkv, "qkv_out", "qkv", "qkv_qk_norm")) {
+            return err;
+        }
+
+        // Check q_rstd/k_rstd rank (allow 1, 2, or 3)
+        if (!q_rstd.empty() && q_rstd.size() > 3) {
+            ShapeValidationError err;
+            err.message = "qkv_qk_norm: q_rstd must be rank 1, 2, or 3";
+            return std::make_optional(err);
+        }
+        if (!k_rstd.empty() && k_rstd.size() > 3) {
+            ShapeValidationError err;
+            err.message = "qkv_qk_norm: k_rstd must be rank 1, 2, or 3";
+            return std::make_optional(err);
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// QKVQKNormBackward
+// ------------------------------------------------------------------------
+const int _qkv_qk_norm_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "qkv_qk_norm_backward";
+    sig.min_inputs = 6;
+    sig.max_inputs = 6;
+    sig.min_outputs = 1;
+    sig.max_outputs = 3;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& d_out = inputs[0];
+        const auto& qkv = inputs[1];
+        const auto& q_norm = inputs[2];
+        const auto& k_norm = inputs[3];
+        const auto& d_qkv = outputs[0];
+
+        // d_qkv should match d_out and qkv
+        if (auto err = validators::check_same_numel(d_qkv, d_out, "d_qkv", "d_out", "qkv_qk_norm_backward")) {
+            return err;
+        }
+        if (auto err = validators::check_same_numel(d_qkv, qkv, "d_qkv", "qkv", "qkv_qk_norm_backward")) {
+            return err;
+        }
+
+        if (outputs.size() > 1) {
+            const auto& d_q_norm = outputs[1];
+            if (auto err =
+                    validators::check_same_numel(d_q_norm, q_norm, "d_q_norm", "q_norm", "qkv_qk_norm_backward")) {
+                return err;
+            }
+        }
+        if (outputs.size() > 2) {
+            const auto& d_k_norm = outputs[2];
+            if (auto err =
+                    validators::check_same_numel(d_k_norm, k_norm, "d_k_norm", "k_norm", "qkv_qk_norm_backward")) {
+                return err;
+            }
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

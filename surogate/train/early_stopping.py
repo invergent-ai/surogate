@@ -80,7 +80,7 @@ class EarlyStopping:
 
         # --- convergence score ---
         # stability: 1 - coefficient of variation of last 5 evals
-        window = self.eval_losses[-min(5, len(self.eval_losses)):]
+        window = self.eval_losses[-min(5, len(self.eval_losses)) :]
         mean = float(np.mean(window))
         std = float(np.std(window))
         cv = std / max(mean, 1e-8)
@@ -102,12 +102,9 @@ class EarlyStopping:
 
         if self.convergence_count >= self.patience:
             self.reason = (
-                f"convergence (score {score:.3f} > {self.convergence_threshold} "
-                f"for {self.patience} consecutive evals)"
+                f"convergence (score {score:.3f} > {self.convergence_threshold} for {self.patience} consecutive evals)"
             )
-            self.logger.warning(
-                f"Early stopping at step {step}: {self.reason}"
-            )
+            self.logger.warning(f"Early stopping at step {step}: {self.reason}")
             return True
 
         return False
@@ -142,9 +139,7 @@ class EarlyStopping:
                         f"(current {rolling_mean:.2e} < "
                         f"{self.efficiency_drop:.0%} of peak {self.peak_efficiency:.2e})"
                     )
-                    self.logger.warning(
-                        f"Early stopping at step {step}: {self.reason}"
-                    )
+                    self.logger.warning(f"Early stopping at step {step}: {self.reason}")
                     self.prev_loss = loss
                     return True
 
@@ -161,13 +156,8 @@ class EarlyStopping:
             self.diverge_count = 0
 
         if self.diverge_count >= self.diverge_steps:
-            self.reason = (
-                f"sustained divergence "
-                f"(DIVERGING for {self.diverge_steps} consecutive steps)"
-            )
-            self.logger.warning(
-                f"Early stopping at step {step}: {self.reason}"
-            )
+            self.reason = f"sustained divergence (DIVERGING for {self.diverge_steps} consecutive steps)"
+            self.logger.warning(f"Early stopping at step {step}: {self.reason}")
             return True
 
         # ---- Criterion 4: sustained plateau ----
@@ -177,13 +167,8 @@ class EarlyStopping:
             self.plateau_count = 0
 
         if self.plateau_count >= self.plateau_steps:
-            self.reason = (
-                f"sustained plateau "
-                f"(PLATEAU for {self.plateau_steps} consecutive steps)"
-            )
-            self.logger.warning(
-                f"Early stopping at step {step}: {self.reason}"
-            )
+            self.reason = f"sustained plateau (PLATEAU for {self.plateau_steps} consecutive steps)"
+            self.logger.warning(f"Early stopping at step {step}: {self.reason}")
             return True
 
         return False

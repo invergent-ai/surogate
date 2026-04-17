@@ -1,29 +1,28 @@
-from typing import Any, Dict, Optional, List
+from typing import Any
 
 from surogate.core.datasets.preprocessor.response import ResponsePreprocessor
 
 
 class AlpacaPreprocessor(ResponsePreprocessor):
-
     @classmethod
     def concat_inst_input(cls, instruction, input_):
         if instruction and input_:
-            query = f'{instruction}\n{input_}'
+            query = f"{instruction}\n{input_}"
         else:
             query = instruction or input_
-        assert isinstance(query, str), f'query: {query}'
+        assert isinstance(query, str), f"query: {query}"
         return query
 
-    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        instruction = row.get('instruction', None)
-        input_ = row.get('input', None)
-        output = row.get('output', None)
+    def preprocess(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        instruction = row.get("instruction", None)
+        input_ = row.get("input", None)
+        output = row.get("output", None)
         if output is not None:
-            row['response'] = output
-        row['query'] = self.concat_inst_input(instruction, input_)
+            row["response"] = output
+        row["query"] = self.concat_inst_input(instruction, input_)
         return super().preprocess(row)
 
-    def preprocess_batch(self, rows: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
+    def preprocess_batch(self, rows: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
         """Process a batch of Alpaca dataset rows efficiently.
 
         1. Batches instruction/input concatenation operations
@@ -39,19 +38,19 @@ class AlpacaPreprocessor(ResponsePreprocessor):
         # Extract and concatenate instructions/inputs in batch
         processed_rows = []
         for row in rows:
-            instruction = row.get('instruction')
-            input_ = row.get('input')
-            output = row.get('output')
+            instruction = row.get("instruction")
+            input_ = row.get("input")
+            output = row.get("output")
 
-            new_row = {k: v for k, v in row.items() if k not in {'instruction', 'input', 'output'}}
+            new_row = {k: v for k, v in row.items() if k not in {"instruction", "input", "output"}}
 
             if output is not None:
-                new_row['response'] = output
-            new_row['query'] = self.concat_inst_input(instruction, input_)
+                new_row["response"] = output
+            new_row["query"] = self.concat_inst_input(instruction, input_)
             processed_rows.append(new_row)
 
         # Call parent's preprocess_batch if it exists, otherwise fallback to per-row
-        if hasattr(super(), 'preprocess_batch'):
+        if hasattr(super(), "preprocess_batch"):
             return super().preprocess_batch(processed_rows)
         else:
             # Fallback to sequential processing via parent preprocess

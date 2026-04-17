@@ -38,7 +38,9 @@ def compile_jit_kernels(ir_json: str) -> dict[str, str]:
         H, K, V = _extract_gdr_dims(ir)
         logger.info(
             "Model uses gated delta rule (H=%d, K=%d, V=%d) — compiling Triton kernels...",
-            H, K, V,
+            H,
+            K,
+            V,
         )
         gdr_manifests = _compile_gated_delta_rule(H, K, V)
         manifests.update(gdr_manifests)
@@ -97,8 +99,7 @@ def _extract_gdr_dims(ir: dict) -> tuple[int, int, int]:
 
     if H == 0 or K == 0:
         raise ValueError(
-            "Cannot determine H, K, V dimensions for gated delta rule from IR. "
-            f"Config keys: {list(config.keys())}"
+            f"Cannot determine H, K, V dimensions for gated delta rule from IR. Config keys: {list(config.keys())}"
         )
 
     return H, K, V
@@ -121,7 +122,10 @@ def _compile_gated_delta_rule(H: int, K: int, V: int) -> dict[str, str]:
         dims={"H": H, "K": K, "V": V},
         sm=_detect_sm(),
         compile_fn=lambda output_dir: compile_gated_delta_rule(
-            H=H, K=K, V=V, output_dir=output_dir,
+            H=H,
+            K=K,
+            V=V,
+            output_dir=output_dir,
         ),
     )
 
@@ -129,8 +133,10 @@ def _compile_gated_delta_rule(H: int, K: int, V: int) -> dict[str, str]:
 def _detect_sm() -> int:
     """Detect SM version from current GPU."""
     import torch
+
     if torch.cuda.is_available():
         cap = torch.cuda.get_device_capability()
         return cap[0] * 10 + cap[1]
     from surogate.kernels.compiler import _detect_sm
+
     return _detect_sm()

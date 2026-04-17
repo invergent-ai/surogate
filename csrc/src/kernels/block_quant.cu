@@ -39,13 +39,13 @@
  * @param K Number of columns in the weight matrix.
  * @param scale_cols Number of columns in the block_scales tensor (ceil(K/BLOCK_SIZE)).
  */
-template<int BLOCK_SIZE = 128>
-__global__ void quantize_per_block_kernel(
-    __nv_fp8_e4m3* __restrict__ out,
-    float* __restrict__ block_scales,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int scale_cols)
-{
+template <int BLOCK_SIZE = 128>
+__global__ void quantize_per_block_kernel(__nv_fp8_e4m3* __restrict__ out,
+                                          float* __restrict__ block_scales,
+                                          const nv_bfloat16* __restrict__ in,
+                                          int M,
+                                          int K,
+                                          int scale_cols) {
     // Each CUDA block handles one (BLOCK_SIZE x BLOCK_SIZE) tile
     const int block_row = blockIdx.x;
     const int block_col = blockIdx.y;
@@ -112,7 +112,9 @@ __global__ void quantize_per_block_kernel(
 
         float val = (float)in[global_idx];
         __nv_fp8_e4m3 result;
-        result.__x = __nv_cvt_float_to_fp8(val * quant_scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+        result.__x = __nv_cvt_float_to_fp8(val * quant_scale,
+                                           __nv_saturation_t::__NV_SATFINITE,
+                                           __nv_fp8_interpretation_t::__NV_E4M3);
         out[global_idx] = result;
     }
 }
@@ -131,13 +133,13 @@ __global__ void quantize_per_block_kernel(
  * @param K Number of columns in the weight matrix.
  * @param scale_cols Number of columns in the block_scales tensor.
  */
-template<int BLOCK_SIZE = 128>
-__global__ void dequantize_per_block_kernel(
-    nv_bfloat16* __restrict__ out,
-    const __nv_fp8_e4m3* __restrict__ in,
-    const float* __restrict__ block_scales,
-    int M, int K, int scale_cols)
-{
+template <int BLOCK_SIZE = 128>
+__global__ void dequantize_per_block_kernel(nv_bfloat16* __restrict__ out,
+                                            const __nv_fp8_e4m3* __restrict__ in,
+                                            const float* __restrict__ block_scales,
+                                            int M,
+                                            int K,
+                                            int scale_cols) {
     // Grid-stride loop for processing all elements
     const long total_elements = (long)M * K;
 
@@ -173,13 +175,13 @@ __global__ void dequantize_per_block_kernel(
  * @param K Number of columns in the weight matrix.
  * @param scale_cols Number of columns in the block_scales tensor.
  */
-template<int BLOCK_SIZE = 128>
-__global__ void dequantize_per_block_vec_kernel(
-    nv_bfloat16* __restrict__ out,
-    const __nv_fp8_e4m3* __restrict__ in,
-    const float* __restrict__ block_scales,
-    int M, int K, int scale_cols)
-{
+template <int BLOCK_SIZE = 128>
+__global__ void dequantize_per_block_vec_kernel(nv_bfloat16* __restrict__ out,
+                                                const __nv_fp8_e4m3* __restrict__ in,
+                                                const float* __restrict__ block_scales,
+                                                int M,
+                                                int K,
+                                                int scale_cols) {
     // Process 8 elements per thread (8 bytes FP8 -> 16 bytes BF16)
     constexpr int VEC_SIZE = 8;
     using fp8_vec_t = GenericVector<__nv_fp8_e4m3, VEC_SIZE>;
@@ -189,15 +191,13 @@ __global__ void dequantize_per_block_vec_kernel(
     const long vec_elements = total_elements / VEC_SIZE * VEC_SIZE;
 
     // Vectorized processing
-    for (long idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
-         idx < vec_elements;
+    for (long idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE; idx < vec_elements;
          idx += gridDim.x * blockDim.x * VEC_SIZE) {
-
         // Load 8 FP8 values
         fp8_vec_t fp8_vals = fp8_vec_t::load(in + idx);
         bf16_vec_t bf16_vals;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
             const long elem_idx = idx + i;
             const int row = elem_idx / K;
@@ -206,7 +206,8 @@ __global__ void dequantize_per_block_vec_kernel(
             const int block_col = col / BLOCK_SIZE;
 
             const float scale = block_scales[block_row * scale_cols + block_col];
-            float fp32_val = __half2float(__nv_cvt_fp8_to_halfraw(fp8_vals[i].__x, __nv_fp8_interpretation_t::__NV_E4M3));
+            float fp32_val =
+                __half2float(__nv_cvt_fp8_to_halfraw(fp8_vals[i].__x, __nv_fp8_interpretation_t::__NV_E4M3));
             bf16_vals[i] = (nv_bfloat16)(fp32_val * scale);
         }
 
@@ -214,10 +215,8 @@ __global__ void dequantize_per_block_vec_kernel(
     }
 
     // Handle remaining elements (if total_elements is not divisible by VEC_SIZE)
-    for (long idx = vec_elements + blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total_elements;
+    for (long idx = vec_elements + blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements;
          idx += gridDim.x * blockDim.x) {
-
         const int row = idx / K;
         const int col = idx % K;
         const int block_row = row / BLOCK_SIZE;
@@ -259,14 +258,14 @@ __global__ void dequantize_per_block_vec_kernel(
  * @param K Number of columns.
  * @param scale_cols Number of columns in block_scales tensor.
  */
-template<int BLOCK_SIZE = 128>
-__global__ void fused_dequant_requant_per_block_to_tensor_kernel(
-    __nv_fp8_e4m3* __restrict__ out,
-    float* __restrict__ out_scale,
-    const __nv_fp8_e4m3* __restrict__ in,
-    const float* __restrict__ block_scales,
-    int M, int K, int scale_cols)
-{
+template <int BLOCK_SIZE = 128>
+__global__ void fused_dequant_requant_per_block_to_tensor_kernel(__nv_fp8_e4m3* __restrict__ out,
+                                                                 float* __restrict__ out_scale,
+                                                                 const __nv_fp8_e4m3* __restrict__ in,
+                                                                 const float* __restrict__ block_scales,
+                                                                 int M,
+                                                                 int K,
+                                                                 int scale_cols) {
     const long total_elements = (long)M * K;
 
     // Shared memory for block-level abs_max reduction
@@ -279,10 +278,7 @@ __global__ void fused_dequant_requant_per_block_to_tensor_kernel(
     // Phase 1: Dequantize and find local abs_max
     float thread_absmax = 0.0f;
 
-    for (long idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total_elements;
-         idx += gridDim.x * blockDim.x) {
-
+    for (long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += gridDim.x * blockDim.x) {
         const int row = idx / K;
         const int col = idx % K;
         const int block_row = row / BLOCK_SIZE;
@@ -329,21 +325,18 @@ __global__ void fused_dequant_requant_per_block_to_tensor_kernel(
  * @param K Number of columns.
  * @param scale_cols Number of columns in block_scales tensor.
  */
-template<int BLOCK_SIZE = 128>
-__global__ void requantize_to_per_tensor_kernel(
-    __nv_fp8_e4m3* __restrict__ out,
-    float tensor_scale,
-    const __nv_fp8_e4m3* __restrict__ in,
-    const float* __restrict__ block_scales,
-    int M, int K, int scale_cols)
-{
+template <int BLOCK_SIZE = 128>
+__global__ void requantize_to_per_tensor_kernel(__nv_fp8_e4m3* __restrict__ out,
+                                                float tensor_scale,
+                                                const __nv_fp8_e4m3* __restrict__ in,
+                                                const float* __restrict__ block_scales,
+                                                int M,
+                                                int K,
+                                                int scale_cols) {
     const long total_elements = (long)M * K;
     const float quant_scale = 448.0f / fmaxf(tensor_scale, 1e-10f);
 
-    for (long idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total_elements;
-         idx += gridDim.x * blockDim.x) {
-
+    for (long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += gridDim.x * blockDim.x) {
         const int row = idx / K;
         const int col = idx % K;
         const int block_row = row / BLOCK_SIZE;
@@ -358,8 +351,8 @@ __global__ void requantize_to_per_tensor_kernel(
         // Requantize to per-tensor FP8
         __nv_fp8_e4m3 result;
         result.__x = __nv_cvt_float_to_fp8(fp32_val * quant_scale,
-                                            __nv_saturation_t::__NV_SATFINITE,
-                                            __nv_fp8_interpretation_t::__NV_E4M3);
+                                           __nv_saturation_t::__NV_SATFINITE,
+                                           __nv_fp8_interpretation_t::__NV_E4M3);
         out[idx] = result;
     }
 }
@@ -383,15 +376,14 @@ __global__ void requantize_to_per_tensor_kernel(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_per_block(
-    __nv_fp8_e4m3* out,
-    float* block_scales,
-    const nv_bfloat16* in,
-    int M, int K,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_per_block(__nv_fp8_e4m3* out,
+                        float* block_scales,
+                        const nv_bfloat16* in,
+                        int M,
+                        int K,
+                        int block_size,
+                        const cudaDeviceProp& dp,
+                        cudaStream_t stream) {
     const int scale_rows = div_ceil(M, block_size);
     const int scale_cols = div_ceil(K, block_size);
 
@@ -400,14 +392,11 @@ void quantize_per_block(
     const int threads_per_block = 256;  // Good for shared memory reduction
 
     if (block_size == 128) {
-        quantize_per_block_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-            out, block_scales, in, M, K, scale_cols);
+        quantize_per_block_kernel<128><<<grid, threads_per_block, 0, stream>>>(out, block_scales, in, M, K, scale_cols);
     } else if (block_size == 64) {
-        quantize_per_block_kernel<64><<<grid, threads_per_block, 0, stream>>>(
-            out, block_scales, in, M, K, scale_cols);
+        quantize_per_block_kernel<64><<<grid, threads_per_block, 0, stream>>>(out, block_scales, in, M, K, scale_cols);
     } else if (block_size == 256) {
-        quantize_per_block_kernel<256><<<grid, threads_per_block, 0, stream>>>(
-            out, block_scales, in, M, K, scale_cols);
+        quantize_per_block_kernel<256><<<grid, threads_per_block, 0, stream>>>(out, block_scales, in, M, K, scale_cols);
     } else {
         throw std::runtime_error("quantize_per_block: unsupported block_size (must be 64, 128, or 256)");
     }
@@ -428,15 +417,14 @@ void quantize_per_block(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void dequantize_per_block(
-    nv_bfloat16* out,
-    const __nv_fp8_e4m3* in,
-    const float* block_scales,
-    int M, int K,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_per_block(nv_bfloat16* out,
+                          const __nv_fp8_e4m3* in,
+                          const float* block_scales,
+                          int M,
+                          int K,
+                          int block_size,
+                          const cudaDeviceProp& dp,
+                          cudaStream_t stream) {
     const int scale_cols = div_ceil(K, block_size);
 
     // Use vectorized kernel for better throughput
@@ -445,17 +433,17 @@ void dequantize_per_block(
     // Compute number of blocks to saturate the GPU
     // Use at least 2x SM count to ensure good occupancy
     const int num_blocks = std::max(2 * dp.multiProcessorCount,
-                                     (int)((M * (long)K + threads_per_block * 8 - 1) / (threads_per_block * 8)));
+                                    (int)((M * (long)K + threads_per_block * 8 - 1) / (threads_per_block * 8)));
 
     if (block_size == 128) {
-        dequantize_per_block_vec_kernel<128><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, in, block_scales, M, K, scale_cols);
+        dequantize_per_block_vec_kernel<128>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, in, block_scales, M, K, scale_cols);
     } else if (block_size == 64) {
-        dequantize_per_block_vec_kernel<64><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, in, block_scales, M, K, scale_cols);
+        dequantize_per_block_vec_kernel<64>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, in, block_scales, M, K, scale_cols);
     } else if (block_size == 256) {
-        dequantize_per_block_vec_kernel<256><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, in, block_scales, M, K, scale_cols);
+        dequantize_per_block_vec_kernel<256>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, in, block_scales, M, K, scale_cols);
     } else {
         throw std::runtime_error("dequantize_per_block: unsupported block_size (must be 64, 128, or 256)");
     }
@@ -483,34 +471,33 @@ void dequantize_per_block(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void fused_dequant_requant_per_block_to_tensor(
-    __nv_fp8_e4m3* out,
-    float* out_scale,
-    const __nv_fp8_e4m3* in,
-    const float* block_scales,
-    int M, int K,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void fused_dequant_requant_per_block_to_tensor(__nv_fp8_e4m3* out,
+                                               float* out_scale,
+                                               const __nv_fp8_e4m3* in,
+                                               const float* block_scales,
+                                               int M,
+                                               int K,
+                                               int block_size,
+                                               const cudaDeviceProp& dp,
+                                               cudaStream_t stream) {
     const int scale_cols = div_ceil(K, block_size);
     const int threads_per_block = 256;
-    const int num_blocks = std::max(2 * dp.multiProcessorCount,
-                                     (int)((M * (long)K + threads_per_block - 1) / threads_per_block));
+    const int num_blocks =
+        std::max(2 * dp.multiProcessorCount, (int)((M * (long)K + threads_per_block - 1) / threads_per_block));
 
     // Initialize output scale to zero (will be updated by atomicMax)
     CUDA_CHECK(cudaMemsetAsync(out_scale, 0, sizeof(float), stream));
 
     // Pass 1: Compute global abs_max via atomic updates
     if (block_size == 128) {
-        fused_dequant_requant_per_block_to_tensor_kernel<128><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, out_scale, in, block_scales, M, K, scale_cols);
+        fused_dequant_requant_per_block_to_tensor_kernel<128>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, out_scale, in, block_scales, M, K, scale_cols);
     } else if (block_size == 64) {
-        fused_dequant_requant_per_block_to_tensor_kernel<64><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, out_scale, in, block_scales, M, K, scale_cols);
+        fused_dequant_requant_per_block_to_tensor_kernel<64>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, out_scale, in, block_scales, M, K, scale_cols);
     } else if (block_size == 256) {
-        fused_dequant_requant_per_block_to_tensor_kernel<256><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, out_scale, in, block_scales, M, K, scale_cols);
+        fused_dequant_requant_per_block_to_tensor_kernel<256>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, out_scale, in, block_scales, M, K, scale_cols);
     } else {
         throw std::runtime_error("fused_dequant_requant: unsupported block_size (must be 64, 128, or 256)");
     }
@@ -523,14 +510,14 @@ void fused_dequant_requant_per_block_to_tensor(
     CUDA_CHECK(cudaStreamSynchronize(stream));  // Must sync to get the scale
 
     if (block_size == 128) {
-        requantize_to_per_tensor_kernel<128><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, h_scale, in, block_scales, M, K, scale_cols);
+        requantize_to_per_tensor_kernel<128>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, h_scale, in, block_scales, M, K, scale_cols);
     } else if (block_size == 64) {
-        requantize_to_per_tensor_kernel<64><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, h_scale, in, block_scales, M, K, scale_cols);
+        requantize_to_per_tensor_kernel<64>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, h_scale, in, block_scales, M, K, scale_cols);
     } else if (block_size == 256) {
-        requantize_to_per_tensor_kernel<256><<<num_blocks, threads_per_block, 0, stream>>>(
-            out, h_scale, in, block_scales, M, K, scale_cols);
+        requantize_to_per_tensor_kernel<256>
+            <<<num_blocks, threads_per_block, 0, stream>>>(out, h_scale, in, block_scales, M, K, scale_cols);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -541,8 +528,8 @@ void fused_dequant_requant_per_block_to_tensor(
     //
     // This layout matches Tensor::scale() which returns Stats + 1
     float stats[2];
-    stats[0] = h_scale;              // absmax
-    stats[1] = h_scale / 448.0f;     // dequant scale
+    stats[0] = h_scale;           // absmax
+    stats[1] = h_scale / 448.0f;  // dequant scale
     CUDA_CHECK(cudaMemcpyAsync(out_scale, stats, 2 * sizeof(float), cudaMemcpyHostToDevice, stream));
 }
 
@@ -560,14 +547,12 @@ void fused_dequant_requant_per_block_to_tensor(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_per_block(
-    Tensor& out,
-    Tensor& block_scales,
-    const Tensor& in,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_per_block(Tensor& out,
+                        Tensor& block_scales,
+                        const Tensor& in,
+                        int block_size,
+                        const cudaDeviceProp& dp,
+                        cudaStream_t stream) {
     if (in.DType != ETensorDType::BF16) {
         throw std::runtime_error("quantize_per_block: input must be BF16");
     }
@@ -584,11 +569,14 @@ void quantize_per_block(
     const int M = in.Sizes[0];
     const int K = in.Sizes[1];
 
-    quantize_per_block(
-        out.get<__nv_fp8_e4m3>(),
-        block_scales.get<float>(),
-        in.get<nv_bfloat16>(),
-        M, K, block_size, dp, stream);
+    quantize_per_block(out.get<__nv_fp8_e4m3>(),
+                       block_scales.get<float>(),
+                       in.get<nv_bfloat16>(),
+                       M,
+                       K,
+                       block_size,
+                       dp,
+                       stream);
 }
 
 /**
@@ -601,14 +589,12 @@ void quantize_per_block(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void dequantize_per_block(
-    Tensor& out,
-    const Tensor& in,
-    const Tensor& block_scales,
-    int block_size,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_per_block(Tensor& out,
+                          const Tensor& in,
+                          const Tensor& block_scales,
+                          int block_size,
+                          const cudaDeviceProp& dp,
+                          cudaStream_t stream) {
     if (out.DType != ETensorDType::BF16) {
         throw std::runtime_error("dequantize_per_block: output must be BF16");
     }
@@ -625,9 +611,12 @@ void dequantize_per_block(
     const int M = in.Sizes[0];
     const int K = in.Sizes[1];
 
-    dequantize_per_block(
-        out.get<nv_bfloat16>(),
-        in.get<__nv_fp8_e4m3>(),
-        block_scales.get<float>(),
-        M, K, block_size, dp, stream);
+    dequantize_per_block(out.get<nv_bfloat16>(),
+                         in.get<__nv_fp8_e4m3>(),
+                         block_scales.get<float>(),
+                         M,
+                         K,
+                         block_size,
+                         dp,
+                         stream);
 }

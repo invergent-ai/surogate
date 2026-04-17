@@ -125,5 +125,3 @@ def inject_noise_model(model_dir: Path, sigma: float) -> int:
     for st_file in sorted(model_dir.glob("*.safetensors")):
         total += inject_noise_into_safetensors(st_file, sigma)
     return total
-
-

@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -34,4 +36,24 @@ void CompiledExecutor::dispatch_mamba_out_proj_backward(const CompiledOp& op, co
     dispatch_matmul_backward(op, hook);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Mamba out_proj backward rule
+// Forward: out = mamba_out_proj(inp, weight)
+// This is just a matmul, so we delegate to the matmul rule via the
+// registry (its definition lives in runtime/ops/matmul.cpp).
+// -----------------------------------------------------------------------------
+std::vector<Operation> mamba_out_proj_backward(const BackwardRuleContext& ctx) {
+    const OpDescriptor* desc = OpRegistry::instance().find_by_name("matmul");
+    if (!desc || !desc->autodiff_fn) {
+        throw std::runtime_error("mamba_out_proj_backward: matmul autodiff rule not registered");
+    }
+    return desc->autodiff_fn(ctx);
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("mamba_out_proj", ::dsl::mamba_out_proj_backward);

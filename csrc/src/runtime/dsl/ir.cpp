@@ -276,7 +276,9 @@ ActivationLayoutIR parse_activation_layout(const nlohmann::json& layout_json) {
 class ExprParser {
 public:
     ExprParser(std::string_view expr, const ShapeEnv& env)
-        : mExpr(expr), mEnv(env) {}
+        : mExpr(expr),
+          mEnv(env) {
+    }
 
     long parse() {
         long value = parse_expr();
@@ -412,7 +414,7 @@ private:
     std::size_t mPos = 0;
 };
 
-} // namespace
+}  // namespace
 
 IRFile load_ir_from_json(const nlohmann::json& root) {
     IRFile ir;
@@ -512,8 +514,7 @@ ShapeEnv make_shape_env(const Module& module, long B, long T) {
 
 long resolve_dim(const Dim& dim, const ShapeEnv& env) {
     switch (dim.kind) {
-        case DimKind::Concrete:
-            return dim.value;
+        case DimKind::Concrete: return dim.value;
         case DimKind::Symbolic: {
             auto it = env.values.find(dim.expr);
             if (it == env.values.end()) {
@@ -525,8 +526,7 @@ long resolve_dim(const Dim& dim, const ShapeEnv& env) {
             ExprParser parser(dim.expr, env);
             return parser.parse();
         }
-        case DimKind::Variadic:
-            throw std::runtime_error("Cannot resolve variadic dimension in DSL IR");
+        case DimKind::Variadic: throw std::runtime_error("Cannot resolve variadic dimension in DSL IR");
     }
     throw std::runtime_error("Unsupported dim kind in DSL IR");
 }
@@ -609,4 +609,4 @@ std::vector<std::string> ActivationLayoutIR::get_save_list() const {
     return save_list;
 }
 
-} // namespace dsl
+}  // namespace dsl

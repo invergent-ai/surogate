@@ -58,7 +58,8 @@ void record_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
 }
 
 LoRAAdamW8BitStateContainer::LoRAAdamW8BitStateContainer(modules::LoRAAdamW8BitState* state)
-    : mState(state) {}
+    : mState(state) {
+}
 
 void LoRAAdamW8BitStateContainer::iterate_tensors(
     const std::function<void(std::string, const TensorShard&)>& callback) {
@@ -71,10 +72,10 @@ void LoRAAdamW8BitStateContainer::iterate_tensors(
 }
 
 LoRANorMuonStateContainer::LoRANorMuonStateContainer(modules::LoRANorMuonState* state)
-    : mState(state) {}
+    : mState(state) {
+}
 
-void LoRANorMuonStateContainer::iterate_tensors(
-    const std::function<void(std::string, const TensorShard&)>& callback) {
+void LoRANorMuonStateContainer::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
     if (!mState) return;
     if (!mState->momentum_state.Data) return;
     callback("lora_normuon.momentum_state", TensorShard(mState->momentum_state));
@@ -393,10 +394,9 @@ DslModel::MappingSpec parse_mapping_spec(const AttrValue& value) {
     return spec;
 }
 
-const DslModel::MappingSpec* find_mapping_spec(
-    const std::unordered_map<std::string, DslModel::MappingSpec>& mapping,
-    const std::string& internal_name,
-    int& layer_idx) {
+const DslModel::MappingSpec* find_mapping_spec(const std::unordered_map<std::string, DslModel::MappingSpec>& mapping,
+                                               const std::string& internal_name,
+                                               int& layer_idx) {
     layer_idx = -1;
     auto it = mapping.find(internal_name);
     if (it != mapping.end()) {
@@ -436,7 +436,8 @@ Tensor slice_dim0(const Tensor& base, long offset, long length) {
 
 bool is_norm_param_name(const std::string& name) {
     auto lower = to_lower(name);
-    return lower.find("norm") != std::string::npos || lower.find("ln1") != std::string::npos || lower.find("ln2") != std::string::npos;
+    return lower.find("norm") != std::string::npos || lower.find("ln1") != std::string::npos ||
+           lower.find("ln2") != std::string::npos;
 }
 
 bool is_bias_param_name(const std::string& name) {

@@ -12,10 +12,10 @@ from surogate.train.phase_detector import PhaseDetector, TrainingPhase
 from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.training_advisor import TrainingAdvisor
 
-
 # ---------------------------------------------------------------------------
 # Helpers — minimal stubs that expose the state the advisor reads
 # ---------------------------------------------------------------------------
+
 
 class FakeLossGuard:
     """Minimal stub exposing the fields TrainingAdvisor reads."""
@@ -28,8 +28,12 @@ class FakeLossGuard:
 
 def _make_schedule(base_lr=1e-3, max_steps=1000):
     return LRSchedule(
-        base_lr=base_lr, max_steps=max_steps, warmup_steps=100,
-        cooldown_steps=0, final_lr=1e-5, schedule_type="cosine",
+        base_lr=base_lr,
+        max_steps=max_steps,
+        warmup_steps=100,
+        cooldown_steps=0,
+        final_lr=1e-5,
+        schedule_type="cosine",
     )
 
 
@@ -61,8 +65,12 @@ def _make_advisor(
 
 def _make_metrics(step=0, loss=2.0, grad_norm=1.0, lr=1e-3, phase="converging", moe=None):
     return StepMetrics(
-        step=step, loss=loss, grad_norm=grad_norm, lr=lr,
-        phase=phase, moe=moe,
+        step=step,
+        loss=loss,
+        grad_norm=grad_norm,
+        lr=lr,
+        phase=phase,
+        moe=moe,
     )
 
 
@@ -75,6 +83,7 @@ def logger():
 # Rule 1: Plateau + flat gradients + high LR
 # ---------------------------------------------------------------------------
 
+
 class TestPlateauHighLR:
     def test_warns_on_sustained_plateau_with_flat_grads(self, logger, caplog):
         phase_det = PhaseDetector(logger)
@@ -82,8 +91,11 @@ class TestPlateauHighLR:
         sched = _make_schedule(base_lr=1e-3, max_steps=1000)
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, gradient_tracker=grad_tracker,
-            lr_schedule=sched, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            gradient_tracker=grad_tracker,
+            lr_schedule=sched,
+            cooldown=0,
         )
 
         # Force phase to PLATEAU
@@ -104,8 +116,11 @@ class TestPlateauHighLR:
         sched = _make_schedule(base_lr=1e-3, max_steps=1000)
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, gradient_tracker=grad_tracker,
-            lr_schedule=sched, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            gradient_tracker=grad_tracker,
+            lr_schedule=sched,
+            cooldown=0,
         )
 
         phase_det.current_phase = TrainingPhase.PLATEAU
@@ -124,7 +139,9 @@ class TestPlateauHighLR:
         grad_tracker = GradientTracker(logger, window=20, warmup=5)
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, gradient_tracker=grad_tracker,
+            logger,
+            phase_detector=phase_det,
+            gradient_tracker=grad_tracker,
             cooldown=0,
         )
 
@@ -153,6 +170,7 @@ class TestPlateauHighLR:
 # Rule 2: Diverging + gradient trend up + MoE imbalance
 # ---------------------------------------------------------------------------
 
+
 class TestDivergingMoECollapse:
     def test_warns_on_diverging_with_moe_issues(self, logger, caplog):
         phase_det = PhaseDetector(logger)
@@ -160,8 +178,11 @@ class TestDivergingMoECollapse:
         moe_mon = MoEMonitor(logger, warmup=3, cooldown=0)
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, gradient_tracker=grad_tracker,
-            moe_monitor=moe_mon, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            gradient_tracker=grad_tracker,
+            moe_monitor=moe_mon,
+            cooldown=0,
         )
 
         phase_det.current_phase = TrainingPhase.DIVERGING
@@ -173,14 +194,21 @@ class TestDivergingMoECollapse:
 
         # Feed bad MoE metrics so diagnostics are unhealthy
         for i in range(10):
-            moe_mon.step(MoEMetrics(
-                aux_loss=0.1, z_loss=0.01,
-                load_imbalance=12.0, expert_utilization=0.3,
-            ), step=i)
+            moe_mon.step(
+                MoEMetrics(
+                    aux_loss=0.1,
+                    z_loss=0.01,
+                    load_imbalance=12.0,
+                    expert_utilization=0.3,
+                ),
+                step=i,
+            )
 
         moe_metrics = MoEMetrics(
-            aux_loss=0.1, z_loss=0.01,
-            load_imbalance=12.0, expert_utilization=0.3,
+            aux_loss=0.1,
+            z_loss=0.01,
+            load_imbalance=12.0,
+            expert_utilization=0.3,
         )
         metrics = _make_metrics(step=15, phase="diverging", moe=moe_metrics)
 
@@ -195,7 +223,9 @@ class TestDivergingMoECollapse:
         grad_tracker = GradientTracker(logger, window=10, warmup=5)
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, gradient_tracker=grad_tracker,
+            logger,
+            phase_detector=phase_det,
+            gradient_tracker=grad_tracker,
             cooldown=0,
         )
 
@@ -215,6 +245,7 @@ class TestDivergingMoECollapse:
 # Rule 3: Converging + gradient shrinking + loss stalling
 # ---------------------------------------------------------------------------
 
+
 class TestGradientVanishing:
     def test_warns_on_vanishing_gradients(self, logger, caplog):
         phase_det = PhaseDetector(logger)
@@ -222,8 +253,11 @@ class TestGradientVanishing:
         plateau_det = PlateauDetector(logger, warmup=5, window=20)
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, gradient_tracker=grad_tracker,
-            plateau_detector=plateau_det, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            gradient_tracker=grad_tracker,
+            plateau_detector=plateau_det,
+            cooldown=0,
         )
 
         phase_det.current_phase = TrainingPhase.CONVERGING
@@ -249,8 +283,11 @@ class TestGradientVanishing:
         plateau_det = PlateauDetector(logger)
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, gradient_tracker=grad_tracker,
-            plateau_detector=plateau_det, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            gradient_tracker=grad_tracker,
+            plateau_detector=plateau_det,
+            cooldown=0,
         )
 
         phase_det.current_phase = TrainingPhase.CONVERGING
@@ -271,6 +308,7 @@ class TestGradientVanishing:
 # Rule 4: Loss spike + MoE utilization drop
 # ---------------------------------------------------------------------------
 
+
 class TestSpikeMoECorrelation:
     def test_warns_when_spike_and_low_utilization(self, logger, caplog):
         loss_guard = FakeLossGuard()
@@ -278,12 +316,17 @@ class TestSpikeMoECorrelation:
         moe_mon = MoEMonitor(logger, warmup=3, utilization_warn=0.8, cooldown=0)
 
         advisor = _make_advisor(
-            logger, loss_guard=loss_guard, moe_monitor=moe_mon, cooldown=0,
+            logger,
+            loss_guard=loss_guard,
+            moe_monitor=moe_mon,
+            cooldown=0,
         )
 
         moe_metrics = MoEMetrics(
-            aux_loss=0.05, z_loss=0.01,
-            load_imbalance=5.0, expert_utilization=0.4,
+            aux_loss=0.05,
+            z_loss=0.01,
+            load_imbalance=5.0,
+            expert_utilization=0.4,
         )
         metrics = _make_metrics(step=100, moe=moe_metrics)
 
@@ -297,12 +340,16 @@ class TestSpikeMoECorrelation:
         loss_guard.last_trigger_step = 50  # too long ago
 
         advisor = _make_advisor(
-            logger, loss_guard=loss_guard, cooldown=0,
+            logger,
+            loss_guard=loss_guard,
+            cooldown=0,
         )
 
         moe_metrics = MoEMetrics(
-            aux_loss=0.05, z_loss=0.01,
-            load_imbalance=5.0, expert_utilization=0.4,
+            aux_loss=0.05,
+            z_loss=0.01,
+            load_imbalance=5.0,
+            expert_utilization=0.4,
         )
         metrics = _make_metrics(step=100, moe=moe_metrics)
 
@@ -315,8 +362,10 @@ class TestSpikeMoECorrelation:
         advisor = _make_advisor(logger, loss_guard=None, cooldown=0)
 
         moe_metrics = MoEMetrics(
-            aux_loss=0.05, z_loss=0.01,
-            load_imbalance=5.0, expert_utilization=0.4,
+            aux_loss=0.05,
+            z_loss=0.01,
+            load_imbalance=5.0,
+            expert_utilization=0.4,
         )
         metrics = _make_metrics(step=100, moe=moe_metrics)
 
@@ -330,6 +379,7 @@ class TestSpikeMoECorrelation:
 # Rule 5: Multiple LR reductions with no improvement
 # ---------------------------------------------------------------------------
 
+
 class TestLRReductionsIneffective:
     def test_warns_after_multiple_reductions_no_converging(self, logger, caplog):
         phase_det = PhaseDetector(logger)
@@ -337,7 +387,10 @@ class TestLRReductionsIneffective:
         loss_guard.num_reductions = 3
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, loss_guard=loss_guard, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            loss_guard=loss_guard,
+            cooldown=0,
         )
 
         phase_det.current_phase = TrainingPhase.UNSTABLE
@@ -355,7 +408,10 @@ class TestLRReductionsIneffective:
         loss_guard.num_reductions = 3
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, loss_guard=loss_guard, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            loss_guard=loss_guard,
+            cooldown=0,
         )
 
         phase_det.current_phase = TrainingPhase.CONVERGING
@@ -372,7 +428,10 @@ class TestLRReductionsIneffective:
         loss_guard.num_reductions = 1
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, loss_guard=loss_guard, cooldown=0,
+            logger,
+            phase_detector=phase_det,
+            loss_guard=loss_guard,
+            cooldown=0,
         )
 
         phase_det.current_phase = TrainingPhase.DIVERGING
@@ -388,13 +447,16 @@ class TestLRReductionsIneffective:
 # Rule 6: Warmup too short
 # ---------------------------------------------------------------------------
 
+
 class TestWarmupTooShort:
     def test_warns_when_loss_still_dropping_at_warmup_end(self, logger, caplog):
         plateau_det = PlateauDetector(logger, warmup=5, window=20)
 
         advisor = _make_advisor(
-            logger, plateau_detector=plateau_det,
-            warmup_steps=100, cooldown=0,
+            logger,
+            plateau_detector=plateau_det,
+            warmup_steps=100,
+            cooldown=0,
         )
 
         # Simulate loss history with a steep downward trend at warmup boundary
@@ -416,8 +478,10 @@ class TestWarmupTooShort:
         plateau_det = PlateauDetector(logger, warmup=5, window=20)
 
         advisor = _make_advisor(
-            logger, plateau_detector=plateau_det,
-            warmup_steps=100, cooldown=0,
+            logger,
+            plateau_detector=plateau_det,
+            warmup_steps=100,
+            cooldown=0,
         )
 
         # Flat loss at warmup boundary
@@ -438,8 +502,10 @@ class TestWarmupTooShort:
         plateau_det = PlateauDetector(logger, warmup=5, window=20)
 
         advisor = _make_advisor(
-            logger, plateau_detector=plateau_det,
-            warmup_steps=100, cooldown=0,
+            logger,
+            plateau_detector=plateau_det,
+            warmup_steps=100,
+            cooldown=0,
         )
 
         for i in range(10):
@@ -462,6 +528,7 @@ class TestWarmupTooShort:
 # Cooldown
 # ---------------------------------------------------------------------------
 
+
 class TestAdvisorCooldown:
     def test_cooldown_suppresses_repeated_warnings(self, logger, caplog):
         phase_det = PhaseDetector(logger)
@@ -469,7 +536,9 @@ class TestAdvisorCooldown:
         loss_guard.num_reductions = 3
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, loss_guard=loss_guard,
+            logger,
+            phase_detector=phase_det,
+            loss_guard=loss_guard,
             cooldown=50,
         )
 
@@ -488,7 +557,9 @@ class TestAdvisorCooldown:
         loss_guard.num_reductions = 3
 
         advisor = _make_advisor(
-            logger, phase_detector=phase_det, loss_guard=loss_guard,
+            logger,
+            phase_detector=phase_det,
+            loss_guard=loss_guard,
             cooldown=10,
         )
 
@@ -496,7 +567,7 @@ class TestAdvisorCooldown:
 
         with caplog.at_level(logging.WARNING):
             advisor.step(_make_metrics(step=0, phase="unstable"), 0)
-            advisor.step(_make_metrics(step=5, phase="unstable"), 5)   # within cooldown
+            advisor.step(_make_metrics(step=5, phase="unstable"), 5)  # within cooldown
             advisor.step(_make_metrics(step=10, phase="unstable"), 10)  # after cooldown
 
         warnings = [r for r in caplog.records if "LR reductions not helping" in r.message]

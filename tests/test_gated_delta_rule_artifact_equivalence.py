@@ -106,7 +106,7 @@ def test_gated_delta_rule_surogate_matches_fla_artifacts() -> None:
         pytest.skip(
             "Missing artifacts. Generate both first:\n"
             "  1) pytest -q tests/test_gated_delta_rule_reference.py\n"
-            "  2) ./csrc/build/unit-tests \"[kernels][gated_delta_rule][dump]\""
+            '  2) ./csrc/build/unit-tests "[kernels][gated_delta_rule][dump]"'
         )
 
     suro_report = json.loads(suro_path.read_text())

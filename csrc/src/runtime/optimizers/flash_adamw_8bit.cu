@@ -32,11 +32,10 @@ constexpr int FLASH_BLOCK_THREADS = 256;
 // Elements per thread block = threads * (GROUP_SIZE / warp_size) but we process
 // one group per warp, so BLOCK_SIZE_N = FLASH_BLOCK_THREADS elements.
 // Each thread block processes BLOCK_SIZE_N elements in a grid-stride loop.
-constexpr int FLASH_BLOCK_SIZE_N = FLASH_BLOCK_THREADS * 4;  // 1024 elements per block iteration
+constexpr int FLASH_BLOCK_SIZE_N = FLASH_BLOCK_THREADS * 4;                    // 1024 elements per block iteration
 constexpr int FLASH_GROUPS_PER_BLOCK = FLASH_BLOCK_SIZE_N / FLASH_GROUP_SIZE;  // 32 groups
 
-static_assert(FLASH_BLOCK_SIZE_N % FLASH_GROUP_SIZE == 0,
-              "BLOCK_SIZE_N must be a multiple of GROUP_SIZE");
+static_assert(FLASH_BLOCK_SIZE_N % FLASH_GROUP_SIZE == 0, "BLOCK_SIZE_N must be a multiple of GROUP_SIZE");
 static_assert(FLASH_GROUPS_PER_BLOCK > 0, "Must have at least one group per block");
 
 // Elements per thread
@@ -67,25 +66,23 @@ __device__ __forceinline__ float inverse_softsign(float y) {
 // - Just: absmax -> normalize -> softsign/linear -> round to int8
 
 template <typename T>
-__launch_bounds__(FLASH_BLOCK_THREADS, 3)
-__global__ void kFlashAdamW8bitKernel(
-    T* p,
-    T* __restrict__ const g,
-    signed char* state1,       // momentum as int8
-    unsigned char* state2,     // variance as uint8
-    half* scales1,             // FP16 scales for momentum
-    half* scales2,             // FP16 scales for variance
-    const float beta1,
-    const float beta2,
-    const float eps,
-    const int step,
-    const float lr,
-    float weight_decay,
-    const float* __restrict__ opt_params,
-    const int* __restrict__ opt_step,
-    const float* __restrict__ gnorm_scale_ptr,
-    const int n
-) {
+__launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
+    void kFlashAdamW8bitKernel(T* p,
+                               T* __restrict__ const g,
+                               signed char* state1,    // momentum as int8
+                               unsigned char* state2,  // variance as uint8
+                               half* scales1,          // FP16 scales for momentum
+                               half* scales2,          // FP16 scales for variance
+                               const float beta1,
+                               const float beta2,
+                               const float eps,
+                               const int step,
+                               const float lr,
+                               float weight_decay,
+                               const float* __restrict__ opt_params,
+                               const int* __restrict__ opt_step,
+                               const float* __restrict__ gnorm_scale_ptr,
+                               const int n) {
     // Read gnorm_scale from device memory (allows CUDA graph capture)
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
@@ -129,8 +126,8 @@ __global__ void kFlashAdamW8bitKernel(
         // Each thread loads FLASH_N_PER_THREAD consecutive elements
         const int thread_offset = base_idx + threadIdx.x * FLASH_N_PER_THREAD;
 
-        // --- Phase 1: Load gradients and dequantize states ---
-        #pragma unroll
+// --- Phase 1: Load gradients and dequantize states ---
+#pragma unroll
         for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -177,24 +174,22 @@ __global__ void kFlashAdamW8bitKernel(
         }
         __syncthreads();
 
-        // Each thread atomically updates the absmax for its groups
-        #pragma unroll
+// Each thread atomically updates the absmax for its groups
+#pragma unroll
         for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
                 const int local_group = (idx - base_idx) / FLASH_GROUP_SIZE;
-                atomicMax(reinterpret_cast<int*>(&smem_absmax1[local_group]),
-                         __float_as_int(fabsf(m_vals[j])));
+                atomicMax(reinterpret_cast<int*>(&smem_absmax1[local_group]), __float_as_int(fabsf(m_vals[j])));
                 // For variance, we store sqrt(v), so compute absmax of sqrt(v)
                 float v_sqrt = sqrtf(v_vals[j]);
-                atomicMax(reinterpret_cast<int*>(&smem_absmax2[local_group]),
-                         __float_as_int(v_sqrt));
+                atomicMax(reinterpret_cast<int*>(&smem_absmax2[local_group]), __float_as_int(v_sqrt));
             }
         }
         __syncthreads();
 
-        // --- Phase 3: Update parameters ---
-        #pragma unroll
+// --- Phase 3: Update parameters ---
+#pragma unroll
         for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -218,8 +213,8 @@ __global__ void kFlashAdamW8bitKernel(
             }
         }
 
-        // --- Phase 4: Quantize and store states ---
-        #pragma unroll
+// --- Phase 4: Quantize and store states ---
+#pragma unroll
         for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -264,77 +259,154 @@ __global__ void kFlashAdamW8bitKernel(
 // Host-side launch functions
 
 template <typename T>
-static void launch_flash_adamw_8bit(
-    T* p,
-    const T* g,
-    signed char* state1,
-    unsigned char* state2,
-    half* scales1,
-    half* scales2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-) {
+static void launch_flash_adamw_8bit(T* p,
+                                    const T* g,
+                                    signed char* state1,
+                                    unsigned char* state2,
+                                    half* scales1,
+                                    half* scales2,
+                                    size_t n,
+                                    float lr,
+                                    float beta1,
+                                    float beta2,
+                                    int step,
+                                    float eps,
+                                    float weight_decay,
+                                    const float* gnorm_scale,
+                                    const float* opt_params,
+                                    const int* opt_step,
+                                    cudaStream_t stream) {
     if (n == 0) return;
 
     int total_blocks = (int)div_ceil(n, (size_t)FLASH_BLOCK_SIZE_N);
     // Cap grid size to avoid excessive blocks
     int grid_size = std::min(total_blocks, 1024);
 
-    kFlashAdamW8bitKernel<T>
-        <<<grid_size, FLASH_BLOCK_THREADS, 0, stream>>>(
-            p, const_cast<T*>(g), state1, state2, scales1, scales2,
-            beta1, beta2, eps, step, lr, weight_decay,
-            opt_params, opt_step, gnorm_scale, (int)n
-        );
+    kFlashAdamW8bitKernel<T><<<grid_size, FLASH_BLOCK_THREADS, 0, stream>>>(p,
+                                                                            const_cast<T*>(g),
+                                                                            state1,
+                                                                            state2,
+                                                                            scales1,
+                                                                            scales2,
+                                                                            beta1,
+                                                                            beta2,
+                                                                            eps,
+                                                                            step,
+                                                                            lr,
+                                                                            weight_decay,
+                                                                            opt_params,
+                                                                            opt_step,
+                                                                            gnorm_scale,
+                                                                            (int)n);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void flash_adamw_update_8bit(
-    float* p, const float* g,
-    signed char* state1, unsigned char* state2,
-    half* scales1, half* scales2,
-    size_t n, float lr, float beta1, float beta2, int step,
-    float eps, float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step, cudaStream_t stream
-) {
-    launch_flash_adamw_8bit(p, g, state1, state2, scales1, scales2,
-                            n, lr, beta1, beta2, step, eps, weight_decay,
-                            gnorm_scale, opt_params, opt_step, stream);
+void flash_adamw_update_8bit(float* p,
+                             const float* g,
+                             signed char* state1,
+                             unsigned char* state2,
+                             half* scales1,
+                             half* scales2,
+                             size_t n,
+                             float lr,
+                             float beta1,
+                             float beta2,
+                             int step,
+                             float eps,
+                             float weight_decay,
+                             const float* gnorm_scale,
+                             const float* opt_params,
+                             const int* opt_step,
+                             cudaStream_t stream) {
+    launch_flash_adamw_8bit(p,
+                            g,
+                            state1,
+                            state2,
+                            scales1,
+                            scales2,
+                            n,
+                            lr,
+                            beta1,
+                            beta2,
+                            step,
+                            eps,
+                            weight_decay,
+                            gnorm_scale,
+                            opt_params,
+                            opt_step,
+                            stream);
 }
 
-void flash_adamw_update_8bit(
-    nv_bfloat16* p, const nv_bfloat16* g,
-    signed char* state1, unsigned char* state2,
-    half* scales1, half* scales2,
-    size_t n, float lr, float beta1, float beta2, int step,
-    float eps, float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step, cudaStream_t stream
-) {
-    launch_flash_adamw_8bit(p, g, state1, state2, scales1, scales2,
-                            n, lr, beta1, beta2, step, eps, weight_decay,
-                            gnorm_scale, opt_params, opt_step, stream);
+void flash_adamw_update_8bit(nv_bfloat16* p,
+                             const nv_bfloat16* g,
+                             signed char* state1,
+                             unsigned char* state2,
+                             half* scales1,
+                             half* scales2,
+                             size_t n,
+                             float lr,
+                             float beta1,
+                             float beta2,
+                             int step,
+                             float eps,
+                             float weight_decay,
+                             const float* gnorm_scale,
+                             const float* opt_params,
+                             const int* opt_step,
+                             cudaStream_t stream) {
+    launch_flash_adamw_8bit(p,
+                            g,
+                            state1,
+                            state2,
+                            scales1,
+                            scales2,
+                            n,
+                            lr,
+                            beta1,
+                            beta2,
+                            step,
+                            eps,
+                            weight_decay,
+                            gnorm_scale,
+                            opt_params,
+                            opt_step,
+                            stream);
 }
 
-void flash_adamw_update_8bit(
-    half* p, const half* g,
-    signed char* state1, unsigned char* state2,
-    half* scales1, half* scales2,
-    size_t n, float lr, float beta1, float beta2, int step,
-    float eps, float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step, cudaStream_t stream
-) {
-    launch_flash_adamw_8bit(p, g, state1, state2, scales1, scales2,
-                            n, lr, beta1, beta2, step, eps, weight_decay,
-                            gnorm_scale, opt_params, opt_step, stream);
+void flash_adamw_update_8bit(half* p,
+                             const half* g,
+                             signed char* state1,
+                             unsigned char* state2,
+                             half* scales1,
+                             half* scales2,
+                             size_t n,
+                             float lr,
+                             float beta1,
+                             float beta2,
+                             int step,
+                             float eps,
+                             float weight_decay,
+                             const float* gnorm_scale,
+                             const float* opt_params,
+                             const int* opt_step,
+                             cudaStream_t stream) {
+    launch_flash_adamw_8bit(p,
+                            g,
+                            state1,
+                            state2,
+                            scales1,
+                            scales2,
+                            n,
+                            lr,
+                            beta1,
+                            beta2,
+                            step,
+                            eps,
+                            weight_decay,
+                            gnorm_scale,
+                            opt_params,
+                            opt_step,
+                            stream);
 }
 
 // ----------------------------------------------------------------------------
@@ -346,27 +418,25 @@ void flash_adamw_update_8bit(
 // for tensor i (must be GROUP_SIZE-aligned).
 
 template <typename T>
-__launch_bounds__(FLASH_BLOCK_THREADS, 3)
-__global__ void kFlashAdamW8bitMultiTensorKernel(
-    T** params,
-    T** __restrict__ const grads,
-    const int* sizes,
-    int num_tensors,
-    signed char* state1,
-    unsigned char* state2,
-    half* scales1,
-    half* scales2,
-    const int* state_offsets,
-    const float beta1,
-    const float beta2,
-    const float eps,
-    const int step,
-    const float lr,
-    float weight_decay,
-    const float* __restrict__ opt_params,
-    const int* __restrict__ opt_step,
-    const float* __restrict__ gnorm_scale_ptr
-) {
+__launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
+    void kFlashAdamW8bitMultiTensorKernel(T** params,
+                                          T** __restrict__ const grads,
+                                          const int* sizes,
+                                          int num_tensors,
+                                          signed char* state1,
+                                          unsigned char* state2,
+                                          half* scales1,
+                                          half* scales2,
+                                          const int* state_offsets,
+                                          const float beta1,
+                                          const float beta2,
+                                          const float eps,
+                                          const int step,
+                                          const float lr,
+                                          float weight_decay,
+                                          const float* __restrict__ opt_params,
+                                          const int* __restrict__ opt_step,
+                                          const float* __restrict__ gnorm_scale_ptr) {
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
     float beta2_val = beta2;
@@ -414,8 +484,8 @@ __global__ void kFlashAdamW8bitMultiTensorKernel(
             const int base_idx = block_idx * FLASH_BLOCK_SIZE_N;
             const int thread_offset = base_idx + threadIdx.x * FLASH_N_PER_THREAD;
 
-            // Phase 1: Load and dequantize
-            #pragma unroll
+// Phase 1: Load and dequantize
+#pragma unroll
             for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
@@ -456,22 +526,20 @@ __global__ void kFlashAdamW8bitMultiTensorKernel(
             }
             __syncthreads();
 
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
                     const int local_group = (idx - base_idx) / FLASH_GROUP_SIZE;
-                    atomicMax(reinterpret_cast<int*>(&smem_absmax1[local_group]),
-                             __float_as_int(fabsf(m_vals[j])));
+                    atomicMax(reinterpret_cast<int*>(&smem_absmax1[local_group]), __float_as_int(fabsf(m_vals[j])));
                     float v_sqrt = sqrtf(v_vals[j]);
-                    atomicMax(reinterpret_cast<int*>(&smem_absmax2[local_group]),
-                             __float_as_int(v_sqrt));
+                    atomicMax(reinterpret_cast<int*>(&smem_absmax2[local_group]), __float_as_int(v_sqrt));
                 }
             }
             __syncthreads();
 
-            // Phase 3: Update parameters
-            #pragma unroll
+// Phase 3: Update parameters
+#pragma unroll
             for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
@@ -488,8 +556,8 @@ __global__ void kFlashAdamW8bitMultiTensorKernel(
                 }
             }
 
-            // Phase 4: Quantize and store
-            #pragma unroll
+// Phase 4: Quantize and store
+#pragma unroll
             for (int j = 0; j < FLASH_N_PER_THREAD; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
@@ -532,80 +600,154 @@ __global__ void kFlashAdamW8bitMultiTensorKernel(
 // Multi-tensor host-side launch functions
 
 template <typename T>
-static void launch_flash_adamw_8bit_multi_tensor(
-    T** params, T** grads, const int* sizes, int num_tensors,
-    signed char* state1, unsigned char* state2,
-    half* scales1, half* scales2,
-    const int* state_offsets, size_t total_params,
-    float lr, float beta1, float beta2, int step, float eps,
-    float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step,
-    cudaStream_t stream
-) {
+static void launch_flash_adamw_8bit_multi_tensor(T** params,
+                                                 T** grads,
+                                                 const int* sizes,
+                                                 int num_tensors,
+                                                 signed char* state1,
+                                                 unsigned char* state2,
+                                                 half* scales1,
+                                                 half* scales2,
+                                                 const int* state_offsets,
+                                                 size_t total_params,
+                                                 float lr,
+                                                 float beta1,
+                                                 float beta2,
+                                                 int step,
+                                                 float eps,
+                                                 float weight_decay,
+                                                 const float* gnorm_scale,
+                                                 const float* opt_params,
+                                                 const int* opt_step,
+                                                 cudaStream_t stream) {
     if (num_tensors == 0 || total_params == 0) return;
 
     int total_blocks = (int)div_ceil(total_params, (size_t)FLASH_BLOCK_SIZE_N);
     int grid_size = std::min(total_blocks, 256);
 
-    kFlashAdamW8bitMultiTensorKernel<T>
-        <<<grid_size, FLASH_BLOCK_THREADS, 0, stream>>>(
-            params, const_cast<T**>(grads), sizes, num_tensors,
-            state1, state2, scales1, scales2, state_offsets,
-            beta1, beta2, eps, step, lr, weight_decay,
-            opt_params, opt_step, gnorm_scale
-        );
+    kFlashAdamW8bitMultiTensorKernel<T><<<grid_size, FLASH_BLOCK_THREADS, 0, stream>>>(params,
+                                                                                       const_cast<T**>(grads),
+                                                                                       sizes,
+                                                                                       num_tensors,
+                                                                                       state1,
+                                                                                       state2,
+                                                                                       scales1,
+                                                                                       scales2,
+                                                                                       state_offsets,
+                                                                                       beta1,
+                                                                                       beta2,
+                                                                                       eps,
+                                                                                       step,
+                                                                                       lr,
+                                                                                       weight_decay,
+                                                                                       opt_params,
+                                                                                       opt_step,
+                                                                                       gnorm_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void flash_adamw_update_8bit_multi_tensor(
-    float** params, float** grads, const int* sizes, int num_tensors,
-    signed char* state1, unsigned char* state2,
-    half* scales1, half* scales2,
-    const int* state_offsets, size_t total_params,
-    float lr, float beta1, float beta2, int step, float eps,
-    float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step, cudaStream_t stream
-) {
-    launch_flash_adamw_8bit_multi_tensor(params, grads, sizes, num_tensors,
-        state1, state2, scales1, scales2, state_offsets, total_params,
-        lr, beta1, beta2, step, eps, weight_decay, gnorm_scale,
-        opt_params, opt_step, stream);
+void flash_adamw_update_8bit_multi_tensor(float** params,
+                                          float** grads,
+                                          const int* sizes,
+                                          int num_tensors,
+                                          signed char* state1,
+                                          unsigned char* state2,
+                                          half* scales1,
+                                          half* scales2,
+                                          const int* state_offsets,
+                                          size_t total_params,
+                                          float lr,
+                                          float beta1,
+                                          float beta2,
+                                          int step,
+                                          float eps,
+                                          float weight_decay,
+                                          const float* gnorm_scale,
+                                          const float* opt_params,
+                                          const int* opt_step,
+                                          cudaStream_t stream) {
+    launch_flash_adamw_8bit_multi_tensor(params,
+                                         grads,
+                                         sizes,
+                                         num_tensors,
+                                         state1,
+                                         state2,
+                                         scales1,
+                                         scales2,
+                                         state_offsets,
+                                         total_params,
+                                         lr,
+                                         beta1,
+                                         beta2,
+                                         step,
+                                         eps,
+                                         weight_decay,
+                                         gnorm_scale,
+                                         opt_params,
+                                         opt_step,
+                                         stream);
 }
 
-void flash_adamw_update_8bit_multi_tensor(
-    nv_bfloat16** params, nv_bfloat16** grads, const int* sizes, int num_tensors,
-    signed char* state1, unsigned char* state2,
-    half* scales1, half* scales2,
-    const int* state_offsets, size_t total_params,
-    float lr, float beta1, float beta2, int step, float eps,
-    float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step, cudaStream_t stream
-) {
-    launch_flash_adamw_8bit_multi_tensor(params, grads, sizes, num_tensors,
-        state1, state2, scales1, scales2, state_offsets, total_params,
-        lr, beta1, beta2, step, eps, weight_decay, gnorm_scale,
-        opt_params, opt_step, stream);
+void flash_adamw_update_8bit_multi_tensor(nv_bfloat16** params,
+                                          nv_bfloat16** grads,
+                                          const int* sizes,
+                                          int num_tensors,
+                                          signed char* state1,
+                                          unsigned char* state2,
+                                          half* scales1,
+                                          half* scales2,
+                                          const int* state_offsets,
+                                          size_t total_params,
+                                          float lr,
+                                          float beta1,
+                                          float beta2,
+                                          int step,
+                                          float eps,
+                                          float weight_decay,
+                                          const float* gnorm_scale,
+                                          const float* opt_params,
+                                          const int* opt_step,
+                                          cudaStream_t stream) {
+    launch_flash_adamw_8bit_multi_tensor(params,
+                                         grads,
+                                         sizes,
+                                         num_tensors,
+                                         state1,
+                                         state2,
+                                         scales1,
+                                         scales2,
+                                         state_offsets,
+                                         total_params,
+                                         lr,
+                                         beta1,
+                                         beta2,
+                                         step,
+                                         eps,
+                                         weight_decay,
+                                         gnorm_scale,
+                                         opt_params,
+                                         opt_step,
+                                         stream);
 }
 
 // ----------------------------------------------------------------------------
 // State initialization kernel
 
-__global__ void kInitFlashAdamW8bitState(
-    signed char* state1,
-    unsigned char* state2,
-    half* scales1,
-    half* scales2,
-    size_t n,
-    size_t num_groups
-) {
+__global__ void kInitFlashAdamW8bitState(signed char* state1,
+                                         unsigned char* state2,
+                                         half* scales1,
+                                         half* scales2,
+                                         size_t n,
+                                         size_t num_groups) {
     const size_t total = n > num_groups ? n : num_groups;
     const size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-    for (size_t idx = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
+    for (size_t idx =
+             static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
          idx < total;
          idx += stride) {
         if (idx < n) {
-            state1[idx] = 0;   // Zero momentum (int8)
-            state2[idx] = 0;   // Zero variance (uint8)
+            state1[idx] = 0;  // Zero momentum (int8)
+            state2[idx] = 0;  // Zero variance (uint8)
         }
         if (idx < num_groups) {
             scales1[idx] = __float2half(1e-7f);  // Small positive scale
@@ -614,14 +756,12 @@ __global__ void kInitFlashAdamW8bitState(
     }
 }
 
-void init_flash_adamw8bit_state(
-    signed char* state1,
-    unsigned char* state2,
-    half* scales1,
-    half* scales2,
-    size_t n,
-    cudaStream_t stream
-) {
+void init_flash_adamw8bit_state(signed char* state1,
+                                unsigned char* state2,
+                                half* scales1,
+                                half* scales2,
+                                size_t n,
+                                cudaStream_t stream) {
     if (n == 0) return;
 
     const size_t num_groups = flash_adamw8bit_num_scales(n);
@@ -631,10 +771,8 @@ void init_flash_adamw8bit_state(
     const size_t blocks_ideal = div_ceil(total_elements, (size_t)threads);
     const int blocks = static_cast<int>(std::min(blocks_ideal, (size_t)65535));
 
-    kInitFlashAdamW8bitState<<<blocks, threads, 0, stream>>>(
-        state1, state2, scales1, scales2, n, num_groups
-    );
+    kInitFlashAdamW8bitState<<<blocks, threads, 0, stream>>>(state1, state2, scales1, scales2, n, num_groups);
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace optimizers
+}  // namespace optimizers

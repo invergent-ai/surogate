@@ -15,10 +15,12 @@ namespace modules {
 /**
  * @brief Type trait to detect if a weights struct has experts
  */
-template<typename T>
+template <typename T>
 struct has_experts {
-    template<typename U> static auto test(U* p) -> decltype(p->experts, std::true_type());
-    template<typename U> static auto test(...) -> std::false_type;
+    template <typename U>
+    static auto test(U* p) -> decltype(p->experts, std::true_type());
+    template <typename U>
+    static auto test(...) -> std::false_type;
     static constexpr bool value = decltype(test<T>(nullptr))::value;
 };
 
@@ -28,18 +30,20 @@ struct has_experts {
  * A is (rank, in_features) - initialized with Kaiming uniform
  * B is (out_features, rank) - initialized with zeros
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRALayerWeights {
     TTensor A;  ///< (rank, in_features)
     TTensor B;  ///< (out_features, rank)
 
-    [[nodiscard]] bool has_value() const { return A.Data != nullptr; }
+    [[nodiscard]] bool has_value() const {
+        return A.Data != nullptr;
+    }
 };
 
 /**
  * @brief LoRA weights for attention projections
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRAAttentionWeights {
     std::optional<LoRALayerWeights<TTensor>> q;  ///< Query projection
     std::optional<LoRALayerWeights<TTensor>> k;  ///< Key projection
@@ -50,18 +54,16 @@ struct LoRAAttentionWeights {
 /**
  * @brief LoRA weights for MLP projections
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRAMLPWeights {
-    std::optional<LoRALayerWeights<TTensor>> gate;  ///< Gate projection
+    std::optional<LoRALayerWeights<TTensor>> gate;     ///< Gate projection
     std::optional<LoRALayerWeights<TTensor>> gate_up;  ///< Fused gate+up projection
-    std::optional<LoRALayerWeights<TTensor>> up;    ///< Up projection
-    std::optional<LoRALayerWeights<TTensor>> down;  ///< Down projection
+    std::optional<LoRALayerWeights<TTensor>> up;       ///< Up projection
+    std::optional<LoRALayerWeights<TTensor>> down;     ///< Down projection
 
     [[nodiscard]] bool has_any() const {
-        return (gate.has_value() && gate->has_value()) ||
-               (gate_up.has_value() && gate_up->has_value()) ||
-               (up.has_value() && up->has_value()) ||
-               (down.has_value() && down->has_value());
+        return (gate.has_value() && gate->has_value()) || (gate_up.has_value() && gate_up->has_value()) ||
+               (up.has_value() && up->has_value()) || (down.has_value() && down->has_value());
     }
 };
 
@@ -71,18 +73,16 @@ struct LoRAMLPWeights {
  * Each expert has its own independent LoRA adapters for gate, up, and down projections.
  * This enables per-expert fine-tuning in MoE models.
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRAExpertWeights {
-    std::optional<LoRALayerWeights<TTensor>> gate;  ///< Gate projection LoRA
+    std::optional<LoRALayerWeights<TTensor>> gate;     ///< Gate projection LoRA
     std::optional<LoRALayerWeights<TTensor>> gate_up;  ///< Fused gate+up projection LoRA
-    std::optional<LoRALayerWeights<TTensor>> up;    ///< Up projection LoRA
-    std::optional<LoRALayerWeights<TTensor>> down;  ///< Down projection LoRA
+    std::optional<LoRALayerWeights<TTensor>> up;       ///< Up projection LoRA
+    std::optional<LoRALayerWeights<TTensor>> down;     ///< Down projection LoRA
 
     [[nodiscard]] bool has_any() const {
-        return (gate.has_value() && gate->has_value()) ||
-               (gate_up.has_value() && gate_up->has_value()) ||
-               (up.has_value() && up->has_value()) ||
-               (down.has_value() && down->has_value());
+        return (gate.has_value() && gate->has_value()) || (gate_up.has_value() && gate_up->has_value()) ||
+               (up.has_value() && up->has_value()) || (down.has_value() && down->has_value());
     }
 };
 
@@ -94,33 +94,33 @@ struct LoRAExpertWeights {
  * 1. Separate: std::vector<LoRAExpertWeights> - used for sequential expert execution
  * 2. Grouped: single tensors with expert dimension - used for high-performance grouped GEMM
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRAGroupedLayerWeights {
     TTensor A;  ///< (num_experts, rank, in_features)
     TTensor B;  ///< (num_experts, out_features, rank)
 
-    [[nodiscard]] bool has_value() const { return A.Data != nullptr; }
+    [[nodiscard]] bool has_value() const {
+        return A.Data != nullptr;
+    }
 };
 
 /**
  * @brief Grouped LoRA weights for MoE experts
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRAGroupedExpertWeights {
-    std::optional<LoRAGroupedLayerWeights<TTensor>> gate;  ///< Gate projection LoRA
+    std::optional<LoRAGroupedLayerWeights<TTensor>> gate;     ///< Gate projection LoRA
     std::optional<LoRAGroupedLayerWeights<TTensor>> gate_up;  ///< Fused gate+up projection LoRA
-    std::optional<LoRAGroupedLayerWeights<TTensor>> up;    ///< Up projection LoRA
-    std::optional<LoRAGroupedLayerWeights<TTensor>> down;  ///< Down projection LoRA
+    std::optional<LoRAGroupedLayerWeights<TTensor>> up;       ///< Up projection LoRA
+    std::optional<LoRAGroupedLayerWeights<TTensor>> down;     ///< Down projection LoRA
 
     [[nodiscard]] bool has_any() const {
-        return (gate.has_value() && gate->has_value()) ||
-               (gate_up.has_value() && gate_up->has_value()) ||
-               (up.has_value() && up->has_value()) ||
-               (down.has_value() && down->has_value());
+        return (gate.has_value() && gate->has_value()) || (gate_up.has_value() && gate_up->has_value()) ||
+               (up.has_value() && up->has_value()) || (down.has_value() && down->has_value());
     }
 };
 
-template<typename TTensor>
+template <typename TTensor>
 struct LoRAMoEWeights {
     // Optional shared expert (Nemotron/DeepSeek)
     std::optional<LoRAMLPWeights<TTensor>> shared;
@@ -159,23 +159,24 @@ struct LoRAMoEWeights {
 /**
  * @brief LoRA weights for a transformer block
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRABlockWeights {
     LoRAAttentionWeights<TTensor> attention;
-    LoRAMLPWeights<TTensor> mlp;       ///< For dense models
-    LoRAMoEWeights<TTensor> moe;       ///< For MoE models (per-expert LoRA)
-    std::optional<LoRALayerWeights<TTensor>> router;  ///< Router gate LoRA for MoE (when train_router enabled) - PEFT-compatible
+    LoRAMLPWeights<TTensor> mlp;  ///< For dense models
+    LoRAMoEWeights<TTensor> moe;  ///< For MoE models (per-expert LoRA)
+    std::optional<LoRALayerWeights<TTensor>>
+        router;  ///< Router gate LoRA for MoE (when train_router enabled) - PEFT-compatible
 };
 
 /**
  * @brief Complete LoRA adapter weights
  */
-template<typename TTensor>
+template <typename TTensor>
 struct LoRAWeightsSet {
     std::vector<LoRABlockWeights<TTensor>> blocks;
     ModularLoRAConfig config;
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_TYPES_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_TYPES_H

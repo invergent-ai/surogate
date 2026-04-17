@@ -15,9 +15,9 @@
 
 /// Metadata describing a compiled JIT kernel.
 struct JitKernelMeta {
-    std::string name;            ///< Kernel function name (mangled, as in the cubin)
-    int num_warps = 4;           ///< Warps per block (block_x = num_warps * 32)
-    int shared_mem_bytes = 0;    ///< Dynamic shared memory in bytes
+    std::string name;          ///< Kernel function name (mangled, as in the cubin)
+    int num_warps = 4;         ///< Warps per block (block_x = num_warps * 32)
+    int shared_mem_bytes = 0;  ///< Dynamic shared memory in bytes
 
     /// Number of extra null-pointer parameters the compiler appends after user params.
     /// Triton 3.x adds 2 (global_scratch, profile_scratch); plain CUDA kernels use 0.
@@ -72,26 +72,28 @@ public:
     void launch(dim3 grid, void** args, cudaStream_t stream) const;
 
     /// Launch with explicit block dimensions and shared memory (overrides metadata).
-    void launch(dim3 grid, dim3 block, int shared_mem_bytes,
-                void** args, cudaStream_t stream) const;
+    void launch(dim3 grid, dim3 block, int shared_mem_bytes, void** args, cudaStream_t stream) const;
 
     /// Launch a Triton-compiled kernel. Appends `extra_null_params` null pointer
     /// args to the user-provided args array before launching.
     /// @param num_user_args  Number of user-supplied args in the array.
-    void launch_triton(dim3 grid, void** user_args, int num_user_args,
-                       cudaStream_t stream) const;
+    void launch_triton(dim3 grid, void** user_args, int num_user_args, cudaStream_t stream) const;
 
-    [[nodiscard]] const JitKernelMeta& meta() const { return meta_; }
-    [[nodiscard]] CUfunction function() const { return function_; }
+    [[nodiscard]] const JitKernelMeta& meta() const {
+        return meta_;
+    }
+    [[nodiscard]] CUfunction function() const {
+        return function_;
+    }
 
 private:
     JitKernel() = default;
     void init_function();
 
-    CUmodule   module_   = nullptr;
-    CUlibrary  library_  = nullptr;  ///< CUDA 12+ library handle (for Blackwell)
+    CUmodule module_ = nullptr;
+    CUlibrary library_ = nullptr;  ///< CUDA 12+ library handle (for Blackwell)
     CUfunction function_ = nullptr;
     JitKernelMeta meta_;
 };
 
-#endif // SUROGATE_SRC_RUNTIME_JIT_JIT_KERNEL_H
+#endif  // SUROGATE_SRC_RUNTIME_JIT_JIT_KERNEL_H

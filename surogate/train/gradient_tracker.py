@@ -80,10 +80,7 @@ class GradientTracker:
         else:
             self.trend_count = 0
 
-        if (
-            self.trend_count >= self.patience
-            and step - self.last_warn_step >= self.cooldown
-        ):
+        if self.trend_count >= self.patience and step - self.last_warn_step >= self.cooldown:
             self.logger.warning(
                 f"Gradient acceleration at step {step}: "
                 f"grad norms trending upward over last {len(self.history)} steps "

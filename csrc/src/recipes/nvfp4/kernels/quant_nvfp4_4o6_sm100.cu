@@ -54,7 +54,11 @@ constexpr int kBlockSize = 16;
 constexpr float k4o6TensorScaleFactor = 384.0f * 4.0f;  // = 1536 for adaptive 4/6
 
 // Error metric enum
-enum class ErrorMetric { MSE, L1, AbsMax };
+enum class ErrorMetric {
+    MSE,
+    L1,
+    AbsMax
+};
 
 // ============================================================================
 // PTX Intrinsics for SM100+ FP4 Quantization
@@ -66,31 +70,32 @@ __device__ __forceinline__ float rcp_approx_ftz(float a) {
     return b;
 }
 
-__device__ __forceinline__ void fp32x8_to_e2m1x8_with_dequant(
-    float (&scaled)[8],
-    uint32_t& out_fp4,
-    float (&out_dequant)[8])
-{
+__device__ __forceinline__ void
+fp32x8_to_e2m1x8_with_dequant(float (&scaled)[8], uint32_t& out_fp4, float (&out_dequant)[8]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     uint32_t dq1, dq2, dq3, dq4;
 
-    asm volatile(
-        "{\n"
-        ".reg .b8 byte0, byte1, byte2, byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte0, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte1, %8, %7;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte2, %10, %9;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte3, %12, %11;\n"
-        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-        "cvt.rn.f16x2.e2m1x2 %1, byte0;\n"
-        "cvt.rn.f16x2.e2m1x2 %2, byte1;\n"
-        "cvt.rn.f16x2.e2m1x2 %3, byte2;\n"
-        "cvt.rn.f16x2.e2m1x2 %4, byte3;\n"
-        "}"
-        : "=r"(out_fp4), "=r"(dq1), "=r"(dq2), "=r"(dq3), "=r"(dq4)
-        : "f"(scaled[0]), "f"(scaled[1]), "f"(scaled[2]), "f"(scaled[3]),
-          "f"(scaled[4]), "f"(scaled[5]), "f"(scaled[6]), "f"(scaled[7])
-    );
+    asm volatile("{\n"
+                 ".reg .b8 byte0, byte1, byte2, byte3;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte0, %6, %5;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte1, %8, %7;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte2, %10, %9;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte3, %12, %11;\n"
+                 "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+                 "cvt.rn.f16x2.e2m1x2 %1, byte0;\n"
+                 "cvt.rn.f16x2.e2m1x2 %2, byte1;\n"
+                 "cvt.rn.f16x2.e2m1x2 %3, byte2;\n"
+                 "cvt.rn.f16x2.e2m1x2 %4, byte3;\n"
+                 "}"
+                 : "=r"(out_fp4), "=r"(dq1), "=r"(dq2), "=r"(dq3), "=r"(dq4)
+                 : "f"(scaled[0]),
+                   "f"(scaled[1]),
+                   "f"(scaled[2]),
+                   "f"(scaled[3]),
+                   "f"(scaled[4]),
+                   "f"(scaled[5]),
+                   "f"(scaled[6]),
+                   "f"(scaled[7]));
 
     out_dequant[0] = __half2float(__ushort_as_half(dq1 & 0xFFFF));
     out_dequant[1] = __half2float(__ushort_as_half((dq1 >> 16) & 0xFFFF));
@@ -103,27 +108,32 @@ __device__ __forceinline__ void fp32x8_to_e2m1x8_with_dequant(
 #else
     // Fallback for non-SM100 device compilation (should never be called at runtime)
     out_fp4 = 0;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) out_dequant[i] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        out_dequant[i] = 0.0f;
 #endif
 }
 
 __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     uint32_t val;
-    asm volatile(
-        "{\n"
-        ".reg .b8 byte0, byte1, byte2, byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-        "}"
-        : "=r"(val)
-        : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
-          "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7])
-    );
+    asm volatile("{\n"
+                 ".reg .b8 byte0, byte1, byte2, byte3;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+                 "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+                 "}"
+                 : "=r"(val)
+                 : "f"(array[0]),
+                   "f"(array[1]),
+                   "f"(array[2]),
+                   "f"(array[3]),
+                   "f"(array[4]),
+                   "f"(array[5]),
+                   "f"(array[6]),
+                   "f"(array[7]));
     return val;
 #else
     // Fallback for non-SM100 device compilation (should never be called at runtime)
@@ -136,14 +146,10 @@ __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&array)[8]) {
 // ============================================================================
 
 template <ErrorMetric Metric>
-__device__ __forceinline__ float compute_error(
-    float (&original)[8],
-    float (&dequant)[8],
-    float scale)
-{
+__device__ __forceinline__ float compute_error(float (&original)[8], float (&dequant)[8], float scale) {
     float err = 0.0f;
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 8; ++i) {
         float reconstructed = dequant[i] * scale;
         float diff = reconstructed - original[i];
@@ -164,22 +170,19 @@ __device__ __forceinline__ float compute_error(
 // ============================================================================
 
 template <ErrorMetric Metric>
-__device__ __forceinline__ void quantize_block_4o6(
-    float (&vals)[16],
-    float global_encode_scale,
-    uint8_t (&out_fp4)[8],
-    uint8_t& out_block_scale)
-{
+__device__ __forceinline__ void
+quantize_block_4o6(float (&vals)[16], float global_encode_scale, uint8_t (&out_fp4)[8], uint8_t& out_block_scale) {
     // Find block amax
     float block_amax = 0.0f;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 16; ++i) {
         block_amax = fmaxf(block_amax, fabsf(vals[i]));
     }
 
     if (block_amax == 0.0f) {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) out_fp4[i] = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            out_fp4[i] = 0;
         out_block_scale = 0;
         return;
     }
@@ -197,18 +200,19 @@ __device__ __forceinline__ void quantize_block_4o6(
     float err_6 = 0.0f, err_4 = 0.0f;
     uint32_t fp4_6[2], fp4_4[2];
 
-    #pragma unroll
+#pragma unroll
     for (int g = 0; g < 2; ++g) {
         float group[8];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < 8; ++i) {
             group[i] = vals[g * 8 + i];
         }
 
         // Quantize with max=6.0
         float scaled_6[8];
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) scaled_6[i] = group[i] * encode_scale_6;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            scaled_6[i] = group[i] * encode_scale_6;
 
         float dequant_6[8];
         fp32x8_to_e2m1x8_with_dequant(scaled_6, fp4_6[g], dequant_6);
@@ -217,8 +221,9 @@ __device__ __forceinline__ void quantize_block_4o6(
 
         // Quantize with max=4.0
         float scaled_4[8];
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) scaled_4[i] = group[i] * encode_scale_4;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            scaled_4[i] = group[i] * encode_scale_4;
 
         float dequant_4[8];
         fp32x8_to_e2m1x8_with_dequant(scaled_4, fp4_4[g], dequant_4);
@@ -230,7 +235,7 @@ __device__ __forceinline__ void quantize_block_4o6(
     uint32_t* selected_fp4 = use_scale_4 ? fp4_4 : fp4_6;
     float selected_recon_scale = use_scale_4 ? recon_scale_4 : recon_scale_6;
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 4; ++i) {
         out_fp4[i] = (selected_fp4[0] >> (i * 8)) & 0xFF;
         out_fp4[i + 4] = (selected_fp4[1] >> (i * 8)) & 0xFF;
@@ -256,28 +261,27 @@ __device__ __forceinline__ void quantize_block_4o6(
     // Convert to UE4M3 using the same method as standard quantization
     // Clamp to representable range and use hardware conversion
     decode_scale = fminf(fmaxf(decode_scale, 1.0f / 128.0f), 480.0f);
-    out_block_scale = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
-                                            __nv_fp8_interpretation_t::__NV_E4M3);
+    out_block_scale =
+        __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
 }
 
 template <ErrorMetric Metric>
-__device__ __forceinline__ void quantize_block_4o6_stochastic(
-    float (&vals)[16],
-    float global_encode_scale,
-    uint32_t (&random)[4],
-    uint8_t (&out_fp4)[8],
-    uint8_t& out_block_scale)
-{
+__device__ __forceinline__ void quantize_block_4o6_stochastic(float (&vals)[16],
+                                                              float global_encode_scale,
+                                                              uint32_t (&random)[4],
+                                                              uint8_t (&out_fp4)[8],
+                                                              uint8_t& out_block_scale) {
     // Find block amax
     float block_amax = 0.0f;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 16; ++i) {
         block_amax = fmaxf(block_amax, fabsf(vals[i]));
     }
 
     if (block_amax == 0.0f) {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) out_fp4[i] = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            out_fp4[i] = 0;
         out_block_scale = 0;
         return;
     }
@@ -293,16 +297,16 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
     float err_6 = 0.0f, err_4 = 0.0f;
     uint32_t fp4_6[2], fp4_4[2];
 
-    #pragma unroll
+#pragma unroll
     for (int g = 0; g < 2; ++g) {
         float group[8];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < 8; ++i) {
             group[i] = vals[g * 8 + i];
         }
 
         float scaled_6[8], scaled_4[8];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < 8; ++i) {
             scaled_6[i] = group[i] * encode_scale_6;
             scaled_4[i] = group[i] * encode_scale_4;
@@ -324,10 +328,10 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
     // Apply stochastic rounding with the selected scale
     uint32_t fp4_stochastic[2];
 
-    #pragma unroll
+#pragma unroll
     for (int g = 0; g < 2; ++g) {
         float group[8];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < 8; ++i) {
             float scaled = vals[g * 8 + i] * selected_encode_scale;
             uint32_t rand_bits = (random[g * 2 + (i / 4)] >> ((i % 4) * 8)) & 0xFF;
@@ -337,7 +341,7 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
         fp4_stochastic[g] = fp32x8_to_e2m1x8(group);
     }
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 4; ++i) {
         out_fp4[i] = (fp4_stochastic[0] >> (i * 8)) & 0xFF;
         out_fp4[i + 4] = (fp4_stochastic[1] >> (i * 8)) & 0xFF;
@@ -349,8 +353,8 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
 
     // Convert to UE4M3 using the same method as standard quantization
     decode_scale = fminf(fmaxf(decode_scale, 1.0f / 128.0f), 480.0f);
-    out_block_scale = __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE,
-                                            __nv_fp8_interpretation_t::__NV_E4M3);
+    out_block_scale =
+        __nv_cvt_float_to_fp8(decode_scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
 }
 
 // ============================================================================
@@ -375,8 +379,8 @@ __device__ __forceinline__ void quantize_block_4o6_stochastic(
  */
 __device__ __forceinline__ int cutlass_scale_index(int row, int scale_col, int num_scale_cols) {
     // CUTLASS Sm1xxBlkScaledConfig atom dimensions
-    constexpr int kRowsPerAtom = 128;  // Blk_MN
-    constexpr int kColsPerAtom = 4;    // Blk_SF
+    constexpr int kRowsPerAtom = 128;                       // Blk_MN
+    constexpr int kColsPerAtom = 4;                         // Blk_SF
     constexpr int kAtomSize = kRowsPerAtom * kColsPerAtom;  // 512 scales per atom
 
     // Which atom are we in?
@@ -410,13 +414,13 @@ __device__ __forceinline__ int cutlass_scale_index(int row, int scale_col, int n
 // ============================================================================
 
 template <ErrorMetric Metric>
-__global__ void quantize_4o6_cutlass_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const float* __restrict__ global_amax,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int num_scale_cols)
-{
+__global__ void quantize_4o6_cutlass_kernel(uint8_t* __restrict__ out_fp4,
+                                            uint8_t* __restrict__ block_scales,
+                                            const float* __restrict__ global_amax,
+                                            const nv_bfloat16* __restrict__ in,
+                                            int M,
+                                            int K,
+                                            int num_scale_cols) {
     int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_blocks = M * num_scale_cols;
 
@@ -432,11 +436,10 @@ __global__ void quantize_4o6_cutlass_kernel(
     // - For max=4: decode_scale = block_amax / 4 * 1536 / global_amax = block_amax * 384 / global_amax
     // Both 256 and 384 fit in UE4M3 (max ~480).
     float g_amax = *global_amax;
-    float global_encode_scale = (g_amax > 0.0f) ?
-        k4o6TensorScaleFactor * rcp_approx_ftz(fmaxf(g_amax, 1e-12f)) : 1.0f;
+    float global_encode_scale = (g_amax > 0.0f) ? k4o6TensorScaleFactor * rcp_approx_ftz(fmaxf(g_amax, 1e-12f)) : 1.0f;
 
     float vals[16];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 16; ++i) {
         int col = col_start + i;
         if (col < K) {
@@ -451,7 +454,7 @@ __global__ void quantize_4o6_cutlass_kernel(
     quantize_block_4o6<Metric>(vals, global_encode_scale, fp4_out, block_scale);
 
     int fp4_col_start = col_start / 2;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 8; ++i) {
         int fp4_col = fp4_col_start + i;
         if (fp4_col < K / 2) {
@@ -464,14 +467,14 @@ __global__ void quantize_4o6_cutlass_kernel(
 }
 
 template <ErrorMetric Metric>
-__global__ void quantize_4o6_stochastic_cutlass_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const float* __restrict__ global_amax,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int num_scale_cols,
-    unsigned int seed)
-{
+__global__ void quantize_4o6_stochastic_cutlass_kernel(uint8_t* __restrict__ out_fp4,
+                                                       uint8_t* __restrict__ block_scales,
+                                                       const float* __restrict__ global_amax,
+                                                       const nv_bfloat16* __restrict__ in,
+                                                       int M,
+                                                       int K,
+                                                       int num_scale_cols,
+                                                       unsigned int seed) {
     int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_blocks = M * num_scale_cols;
 
@@ -483,11 +486,10 @@ __global__ void quantize_4o6_stochastic_cutlass_kernel(
 
     // Compute global encode scale for 4/6 quantization (same as non-stochastic version).
     float g_amax = *global_amax;
-    float global_encode_scale = (g_amax > 0.0f) ?
-        k4o6TensorScaleFactor * rcp_approx_ftz(fmaxf(g_amax, 1e-12f)) : 1.0f;
+    float global_encode_scale = (g_amax > 0.0f) ? k4o6TensorScaleFactor * rcp_approx_ftz(fmaxf(g_amax, 1e-12f)) : 1.0f;
 
     float vals[16];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 16; ++i) {
         int col = col_start + i;
         if (col < K) {
@@ -499,7 +501,7 @@ __global__ void quantize_4o6_stochastic_cutlass_kernel(
 
     uint32_t random[4];
     uint32_t state = seed ^ (block_idx * 1103515245 + 12345);
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 4; ++i) {
         state = state * 1103515245 + 12345;
         random[i] = state;
@@ -510,7 +512,7 @@ __global__ void quantize_4o6_stochastic_cutlass_kernel(
     quantize_block_4o6_stochastic<Metric>(vals, global_encode_scale, random, fp4_out, block_scale);
 
     int fp4_col_start = col_start / 2;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 8; ++i) {
         int fp4_col = fp4_col_start + i;
         if (fp4_col < K / 2) {
@@ -534,79 +536,103 @@ using nvfp4_4o6_impl::ErrorMetric;
 using nvfp4_4o6_impl::quantize_4o6_cutlass_kernel;
 using nvfp4_4o6_impl::quantize_4o6_stochastic_cutlass_kernel;
 
-void quantize_4o6_cutlass_mse(
-    uint8_t* out_fp4, uint8_t* block_scales, const float* global_amax,
-    const nv_bfloat16* in, int M, int K, int num_scale_cols, cudaStream_t stream)
-{
+void quantize_4o6_cutlass_mse(uint8_t* out_fp4,
+                              uint8_t* block_scales,
+                              const float* global_amax,
+                              const nv_bfloat16* in,
+                              int M,
+                              int K,
+                              int num_scale_cols,
+                              cudaStream_t stream) {
     int total_blocks = M * num_scale_cols;
     int threads = 256;
     int blocks = (total_blocks + threads - 1) / threads;
 
-    quantize_4o6_cutlass_kernel<ErrorMetric::MSE><<<blocks, threads, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
+    quantize_4o6_cutlass_kernel<ErrorMetric::MSE>
+        <<<blocks, threads, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
 }
 
-void quantize_4o6_cutlass_l1(
-    uint8_t* out_fp4, uint8_t* block_scales, const float* global_amax,
-    const nv_bfloat16* in, int M, int K, int num_scale_cols, cudaStream_t stream)
-{
+void quantize_4o6_cutlass_l1(uint8_t* out_fp4,
+                             uint8_t* block_scales,
+                             const float* global_amax,
+                             const nv_bfloat16* in,
+                             int M,
+                             int K,
+                             int num_scale_cols,
+                             cudaStream_t stream) {
     int total_blocks = M * num_scale_cols;
     int threads = 256;
     int blocks = (total_blocks + threads - 1) / threads;
 
-    quantize_4o6_cutlass_kernel<ErrorMetric::L1><<<blocks, threads, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
+    quantize_4o6_cutlass_kernel<ErrorMetric::L1>
+        <<<blocks, threads, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
 }
 
-void quantize_4o6_cutlass_absmax(
-    uint8_t* out_fp4, uint8_t* block_scales, const float* global_amax,
-    const nv_bfloat16* in, int M, int K, int num_scale_cols, cudaStream_t stream)
-{
+void quantize_4o6_cutlass_absmax(uint8_t* out_fp4,
+                                 uint8_t* block_scales,
+                                 const float* global_amax,
+                                 const nv_bfloat16* in,
+                                 int M,
+                                 int K,
+                                 int num_scale_cols,
+                                 cudaStream_t stream) {
     int total_blocks = M * num_scale_cols;
     int threads = 256;
     int blocks = (total_blocks + threads - 1) / threads;
 
-    quantize_4o6_cutlass_kernel<ErrorMetric::AbsMax><<<blocks, threads, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
+    quantize_4o6_cutlass_kernel<ErrorMetric::AbsMax>
+        <<<blocks, threads, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
 }
 
-void quantize_4o6_stochastic_cutlass_mse(
-    uint8_t* out_fp4, uint8_t* block_scales, const float* global_amax,
-    const nv_bfloat16* in, int M, int K, int num_scale_cols,
-    unsigned int seed, cudaStream_t stream)
-{
+void quantize_4o6_stochastic_cutlass_mse(uint8_t* out_fp4,
+                                         uint8_t* block_scales,
+                                         const float* global_amax,
+                                         const nv_bfloat16* in,
+                                         int M,
+                                         int K,
+                                         int num_scale_cols,
+                                         unsigned int seed,
+                                         cudaStream_t stream) {
     int total_blocks = M * num_scale_cols;
     int threads = 256;
     int blocks = (total_blocks + threads - 1) / threads;
 
-    quantize_4o6_stochastic_cutlass_kernel<ErrorMetric::MSE><<<blocks, threads, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
+    quantize_4o6_stochastic_cutlass_kernel<ErrorMetric::MSE>
+        <<<blocks, threads, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
 }
 
-void quantize_4o6_stochastic_cutlass_l1(
-    uint8_t* out_fp4, uint8_t* block_scales, const float* global_amax,
-    const nv_bfloat16* in, int M, int K, int num_scale_cols,
-    unsigned int seed, cudaStream_t stream)
-{
+void quantize_4o6_stochastic_cutlass_l1(uint8_t* out_fp4,
+                                        uint8_t* block_scales,
+                                        const float* global_amax,
+                                        const nv_bfloat16* in,
+                                        int M,
+                                        int K,
+                                        int num_scale_cols,
+                                        unsigned int seed,
+                                        cudaStream_t stream) {
     int total_blocks = M * num_scale_cols;
     int threads = 256;
     int blocks = (total_blocks + threads - 1) / threads;
 
-    quantize_4o6_stochastic_cutlass_kernel<ErrorMetric::L1><<<blocks, threads, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
+    quantize_4o6_stochastic_cutlass_kernel<ErrorMetric::L1>
+        <<<blocks, threads, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
 }
 
-void quantize_4o6_stochastic_cutlass_absmax(
-    uint8_t* out_fp4, uint8_t* block_scales, const float* global_amax,
-    const nv_bfloat16* in, int M, int K, int num_scale_cols,
-    unsigned int seed, cudaStream_t stream)
-{
+void quantize_4o6_stochastic_cutlass_absmax(uint8_t* out_fp4,
+                                            uint8_t* block_scales,
+                                            const float* global_amax,
+                                            const nv_bfloat16* in,
+                                            int M,
+                                            int K,
+                                            int num_scale_cols,
+                                            unsigned int seed,
+                                            cudaStream_t stream) {
     int total_blocks = M * num_scale_cols;
     int threads = 256;
     int blocks = (total_blocks + threads - 1) / threads;
 
-    quantize_4o6_stochastic_cutlass_kernel<ErrorMetric::AbsMax><<<blocks, threads, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
+    quantize_4o6_stochastic_cutlass_kernel<ErrorMetric::AbsMax>
+        <<<blocks, threads, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
 }
 
 bool is_supported() {
@@ -620,29 +646,47 @@ bool is_supported() {
 // Stub implementations for non-SM100 builds
 namespace nvfp4_4o6_sm100 {
 
-void quantize_4o6_cutlass_mse(
-    uint8_t*, uint8_t*, const float*, const nv_bfloat16*,
-    int, int, int, cudaStream_t) {}
+void quantize_4o6_cutlass_mse(uint8_t*, uint8_t*, const float*, const nv_bfloat16*, int, int, int, cudaStream_t) {
+}
 
-void quantize_4o6_cutlass_l1(
-    uint8_t*, uint8_t*, const float*, const nv_bfloat16*,
-    int, int, int, cudaStream_t) {}
+void quantize_4o6_cutlass_l1(uint8_t*, uint8_t*, const float*, const nv_bfloat16*, int, int, int, cudaStream_t) {
+}
 
-void quantize_4o6_cutlass_absmax(
-    uint8_t*, uint8_t*, const float*, const nv_bfloat16*,
-    int, int, int, cudaStream_t) {}
+void quantize_4o6_cutlass_absmax(uint8_t*, uint8_t*, const float*, const nv_bfloat16*, int, int, int, cudaStream_t) {
+}
 
-void quantize_4o6_stochastic_cutlass_mse(
-    uint8_t*, uint8_t*, const float*, const nv_bfloat16*,
-    int, int, int, unsigned int, cudaStream_t) {}
+void quantize_4o6_stochastic_cutlass_mse(uint8_t*,
+                                         uint8_t*,
+                                         const float*,
+                                         const nv_bfloat16*,
+                                         int,
+                                         int,
+                                         int,
+                                         unsigned int,
+                                         cudaStream_t) {
+}
 
-void quantize_4o6_stochastic_cutlass_l1(
-    uint8_t*, uint8_t*, const float*, const nv_bfloat16*,
-    int, int, int, unsigned int, cudaStream_t) {}
+void quantize_4o6_stochastic_cutlass_l1(uint8_t*,
+                                        uint8_t*,
+                                        const float*,
+                                        const nv_bfloat16*,
+                                        int,
+                                        int,
+                                        int,
+                                        unsigned int,
+                                        cudaStream_t) {
+}
 
-void quantize_4o6_stochastic_cutlass_absmax(
-    uint8_t*, uint8_t*, const float*, const nv_bfloat16*,
-    int, int, int, unsigned int, cudaStream_t) {}
+void quantize_4o6_stochastic_cutlass_absmax(uint8_t*,
+                                            uint8_t*,
+                                            const float*,
+                                            const nv_bfloat16*,
+                                            int,
+                                            int,
+                                            int,
+                                            unsigned int,
+                                            cudaStream_t) {
+}
 
 bool is_supported() {
     return false;

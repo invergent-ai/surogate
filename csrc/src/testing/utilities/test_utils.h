@@ -19,8 +19,8 @@ inline uint16_t float_to_bf16_bits(float f) {
     uint32_t u;
     std::memcpy(&u, &f, sizeof(u));
     // round to nearest even on the cut at 16 LSBs
-    uint32_t lsb = (u >> 16) & 1u;                // last bit that will remain
-    uint32_t rounding_bias = 0x7FFFu + lsb;       // RN-even
+    uint32_t lsb = (u >> 16) & 1u;           // last bit that will remain
+    uint32_t rounding_bias = 0x7FFFu + lsb;  // RN-even
     u += rounding_bias;
     return static_cast<uint16_t>(u >> 16);
 }
@@ -41,14 +41,14 @@ inline nv_bfloat16 make_nvbf16_from_float(float f) {
 
 // -----------------------------------------------------------------------------
 
-template<typename T>
+template <typename T>
 inline thrust::device_vector<T> to_device(const std::vector<T>& h_vec) {
     thrust::device_vector<T> d_vec(h_vec.size());
     thrust::copy(h_vec.begin(), h_vec.end(), d_vec.begin());
     return d_vec;
 }
 
-template<typename T>
+template <typename T>
 inline std::vector<T> from_device(const thrust::device_vector<T>& d_vec) {
     std::vector<T> h_vec(d_vec.size());
     thrust::copy(d_vec.begin(), d_vec.end(), h_vec.begin());
@@ -57,7 +57,7 @@ inline std::vector<T> from_device(const thrust::device_vector<T>& d_vec) {
 
 inline std::vector<nv_bfloat16> to_bf16(const std::vector<float>& vec) {
     std::vector<nv_bfloat16> result(vec.size());
-    for(size_t i = 0; i < vec.size(); ++i) {
+    for (size_t i = 0; i < vec.size(); ++i) {
         result[i] = make_nvbf16_from_float(vec[i]);
     }
     return result;
@@ -65,7 +65,7 @@ inline std::vector<nv_bfloat16> to_bf16(const std::vector<float>& vec) {
 
 inline std::vector<float> round_bf16(const std::vector<float>& vec) {
     std::vector<float> result(vec.size());
-    for(size_t i = 0; i < vec.size(); ++i) {
+    for (size_t i = 0; i < vec.size(); ++i) {
         result[i] = bf16_bits_to_float(float_to_bf16_bits(vec[i]));
     }
     return result;
@@ -85,7 +85,8 @@ inline std::vector<float> uniform_host(long n, float low, float high, uint64_t s
 inline void fill_normal(std::vector<float>& v, float mean = 0.0f, float stddev = 1.0f, uint64_t seed = 12345ULL) {
     std::mt19937_64 gen(seed);
     std::normal_distribution<float> dist(mean, stddev);
-    for (auto& x : v) x = dist(gen);
+    for (auto& x : v)
+        x = dist(gen);
 }
 
-} // namespace testing_utils
+}  // namespace testing_utils

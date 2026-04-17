@@ -56,9 +56,9 @@ struct FP8WeightCacheEntry {
 
 // FP4 weight cache entry for NVFP4 recipe (Blackwell+)
 struct FP4WeightCacheEntry {
-    Tensor data;      ///< FP4 packed data (N, K/2) for forward; (K, N/2) for transposed
-    Tensor scales;    ///< Block scales (FP8 E4M3, CUTLASS layout)
-    Tensor amax;      ///< Global amax (FP32, single element)
+    Tensor data;    ///< FP4 packed data (N, K/2) for forward; (K, N/2) for transposed
+    Tensor scales;  ///< Block scales (FP8 E4M3, CUTLASS layout)
+    Tensor amax;    ///< Global amax (FP32, single element)
     bool initialized = false;
 };
 

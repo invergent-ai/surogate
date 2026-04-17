@@ -9,12 +9,7 @@
 
 namespace ep {
 
-float compute_imbalance_ratio(
-    const int* global_expert_counts,
-    int num_experts,
-    int ep_size,
-    int num_local_experts) {
-
+float compute_imbalance_ratio(const int* global_expert_counts, int num_experts, int ep_size, int num_local_experts) {
     // Compute per-GPU load under default assignment
     std::vector<long> gpu_loads(ep_size, 0);
     for (int e = 0; e < num_experts; ++e) {
@@ -32,15 +27,13 @@ float compute_imbalance_ratio(
     return static_cast<float>(max_load) / mean_load;
 }
 
-LPTPlan compute_lpt_plan(
-    const int* global_expert_counts,
-    int num_experts,
-    int ep_size,
-    int ep_rank,
-    int num_local_experts,
-    float max_tokens_factor,
-    int min_tokens_per_gemm) {
-
+LPTPlan compute_lpt_plan(const int* global_expert_counts,
+                         int num_experts,
+                         int ep_size,
+                         int ep_rank,
+                         int num_local_experts,
+                         float max_tokens_factor,
+                         int min_tokens_per_gemm) {
     LPTPlan plan;
     plan.expert_assignments.resize(num_experts);
     plan.gpu_loads.resize(ep_size, 0);
@@ -52,9 +45,8 @@ LPTPlan compute_lpt_plan(
         total_tokens += global_expert_counts[e];
     }
     const long balanced_tokens = (ep_size > 0) ? total_tokens / ep_size : total_tokens;
-    int max_tokens_per_gpu = (balanced_tokens > 0)
-        ? static_cast<int>(max_tokens_factor * balanced_tokens)
-        : static_cast<int>(total_tokens);
+    int max_tokens_per_gpu =
+        (balanced_tokens > 0) ? static_cast<int>(max_tokens_factor * balanced_tokens) : static_cast<int>(total_tokens);
     max_tokens_per_gpu = std::max(max_tokens_per_gpu, 1);
 
     // Pre-compute native load per GPU
@@ -76,8 +68,9 @@ LPTPlan compute_lpt_plan(
     for (int e = 0; e < num_experts; ++e) {
         sorted_experts[e] = {e, global_expert_counts[e]};
     }
-    std::sort(sorted_experts.begin(), sorted_experts.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::sort(sorted_experts.begin(), sorted_experts.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
 
     // Effective load = assigned + pending native (accounts for future arrivals)
     auto effective_load = [&](int gpu) -> int {
@@ -97,15 +90,13 @@ LPTPlan compute_lpt_plan(
 
         if (native_available >= expert_tokens) {
             // Case 1: Native GPU can handle all tokens
-            plan.expert_assignments[expert_id].push_back(
-                {native_gpu, 0, expert_tokens});
+            plan.expert_assignments[expert_id].push_back({native_gpu, 0, expert_tokens});
             assigned[native_gpu] += expert_tokens;
 
         } else if (native_available > 0) {
             // Case 2: Partial on native, spill rest to helper(s)
             int native_chunk = std::min(native_available, expert_tokens);
-            plan.expert_assignments[expert_id].push_back(
-                {native_gpu, 0, native_chunk});
+            plan.expert_assignments[expert_id].push_back({native_gpu, 0, native_chunk});
             assigned[native_gpu] += native_chunk;
 
             int remaining = expert_tokens - native_chunk;
@@ -138,21 +129,17 @@ LPTPlan compute_lpt_plan(
                 }
 
                 int helper_available = max_tokens_per_gpu - best_eff;
-                int chunk = (helper_available > 0)
-                    ? std::min(remaining, helper_available)
-                    : remaining;
+                int chunk = (helper_available > 0) ? std::min(remaining, helper_available) : remaining;
 
                 // Skip tiny chunks unless it's all that's left
                 if (chunk < min_tokens_per_gemm && remaining > chunk) {
                     chunk = remaining;
                 }
 
-                plan.expert_assignments[expert_id].push_back(
-                    {best_gpu, token_offset, token_offset + chunk});
+                plan.expert_assignments[expert_id].push_back({best_gpu, token_offset, token_offset + chunk});
                 assigned[best_gpu] += chunk;
 
-                plan.weight_transfers.push_back(
-                    {expert_id, native_gpu, best_gpu});
+                plan.weight_transfers.push_back({expert_id, native_gpu, best_gpu});
 
                 token_offset += chunk;
                 remaining -= chunk;
@@ -169,8 +156,7 @@ LPTPlan compute_lpt_plan(
                 if (g == native_gpu) continue;
                 helpers.push_back({g, effective_load(g)});
             }
-            std::sort(helpers.begin(), helpers.end(),
-                      [](const auto& a, const auto& b) { return a.second < b.second; });
+            std::sort(helpers.begin(), helpers.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
 
             for (const auto& [helper_gpu, helper_eff] : helpers) {
                 if (remaining <= 0) break;
@@ -183,12 +169,10 @@ LPTPlan compute_lpt_plan(
                     continue;
                 }
 
-                plan.expert_assignments[expert_id].push_back(
-                    {helper_gpu, token_offset, token_offset + chunk});
+                plan.expert_assignments[expert_id].push_back({helper_gpu, token_offset, token_offset + chunk});
                 assigned[helper_gpu] += chunk;
 
-                plan.weight_transfers.push_back(
-                    {expert_id, native_gpu, helper_gpu});
+                plan.weight_transfers.push_back({expert_id, native_gpu, helper_gpu});
 
                 token_offset += chunk;
                 remaining -= chunk;
@@ -197,13 +181,11 @@ LPTPlan compute_lpt_plan(
             // Force remaining to least loaded helper if all at capacity
             if (remaining > 0) {
                 int fallback_gpu = helpers.empty() ? native_gpu : helpers[0].first;
-                plan.expert_assignments[expert_id].push_back(
-                    {fallback_gpu, token_offset, token_offset + remaining});
+                plan.expert_assignments[expert_id].push_back({fallback_gpu, token_offset, token_offset + remaining});
                 assigned[fallback_gpu] += remaining;
 
                 if (fallback_gpu != native_gpu) {
-                    plan.weight_transfers.push_back(
-                        {expert_id, native_gpu, fallback_gpu});
+                    plan.weight_transfers.push_back({expert_id, native_gpu, fallback_gpu});
                 }
             }
         }

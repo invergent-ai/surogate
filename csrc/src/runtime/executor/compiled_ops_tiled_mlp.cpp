@@ -57,7 +57,8 @@ namespace dsl {
 //   → matmul → down[chunk, C] → write into full_output
 void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
                                          const MlpTileGroup& group,
-                                         long B, long T,
+                                         long B,
+                                         long T,
                                          const modules::ForwardHook* hook) {
     // The first op is a view: [B,T,C] → [B*T,C]. Get the 3D input.
     const auto& first_view_op = graph.ops[group.start_op_idx];
@@ -75,13 +76,11 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
         const auto& op = graph.ops[idx];
         if (op.type != CompiledOpType::Matmul && op.type != CompiledOpType::MatmulBias) continue;
         for (const auto& inp : op.inputs) {
-            if (inp.name.size() >= 13 &&
-                inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
+            if (inp.name.size() >= 13 && inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
                 up_weight = resolve_tensor(inp);
                 up_matmul_op = &op;
             }
-            if (inp.name.size() >= 15 &&
-                inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
+            if (inp.name.size() >= 15 && inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
                 down_weight = resolve_tensor(inp);
                 down_matmul_op = &op;
             }
@@ -91,8 +90,8 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
         throw std::runtime_error("execute_tiled_mlp: could not find MLP weights in tile group");
     }
 
-    const long MUp = up_weight.Sizes[0];   // [MUp, C] with NT transpose
-    const long M = MUp / 2;                // SwiGLU halves the dimension
+    const long MUp = up_weight.Sizes[0];  // [MUp, C] with NT transpose
+    const long M = MUp / 2;               // SwiGLU halves the dimension
     const ETensorDType dtype = full_input.DType;
 
     // Pre-allocate full output [B*T, C]
@@ -105,7 +104,8 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
     for (long chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
         const long offset = chunk_idx * chunk_size;
         const long N = std::min(chunk_size, BT - offset);
-        const std::size_t byte_offset = static_cast<std::size_t>(offset) * static_cast<std::size_t>(C) * static_cast<std::size_t>(get_dtype_size(dtype));
+        const std::size_t byte_offset = static_cast<std::size_t>(offset) * static_cast<std::size_t>(C) *
+                                        static_cast<std::size_t>(get_dtype_size(dtype));
 
         // Narrow input: [N, C]
         Tensor chunk_in = full_input;
@@ -122,17 +122,26 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(chunk_in, up_weight, up_matmul_op->attrs.transpose, mm_M, mm_N, mm_K);
-            matmul(up_out, up_weight, chunk_in, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   mm_N, mm_M, mm_K, swap_transpose(up_matmul_op->attrs.transpose),
-                   false, mRunState.MainStream);
+            matmul(up_out,
+                   up_weight,
+                   chunk_in,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   mm_N,
+                   mm_M,
+                   mm_K,
+                   swap_transpose(up_matmul_op->attrs.transpose),
+                   false,
+                   mRunState.MainStream);
         }
 
         // 2) SwiGLU: [N, MUp] → [N, M] (operate in 2D, swiglu_forward handles it as B=1, T=N)
         Tensor act_out = mRunState.temp_alloc(dtype, {N, M}, "act_out");
         mTemps.push_back(act_out);
-        swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M),
-                       mRunState.MainStream);
+        swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M), mRunState.MainStream);
 
         // 3) Down-proj matmul: [N, M] × [C, M]^T → [N, C]
         //    Write directly into the full_output at the correct offset
@@ -142,10 +151,20 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(act_out, down_weight, down_matmul_op->attrs.transpose, mm_M, mm_N, mm_K);
-            matmul(chunk_out, down_weight, act_out, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   mm_N, mm_M, mm_K, swap_transpose(down_matmul_op->attrs.transpose),
-                   false, mRunState.MainStream);
+            matmul(chunk_out,
+                   down_weight,
+                   act_out,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   mm_N,
+                   mm_M,
+                   mm_K,
+                   swap_transpose(down_matmul_op->attrs.transpose),
+                   false,
+                   mRunState.MainStream);
         }
 
         // Restore stack — free chunk intermediates (up_out, act_out)
@@ -187,9 +206,10 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
 //   3. Backward swiglu: d_up = swiglu_backward(d_act, up_out)
 //   4. Backward up-proj: d_ln2_chunk = d_up @ up_weight, d_up_weight += ln2_chunk^T @ d_up
 void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph,
-                                                   const MlpTileGroup& group,
-                                                   long B, long T,
-                                                   const modules::BackwardHook* hook) {
+                                                  const MlpTileGroup& group,
+                                                  long B,
+                                                  long T,
+                                                  const modules::BackwardHook* hook) {
     const long BT = B * T;
 
     // Find the matmul_backward ops and extract weight/gradient references
@@ -199,12 +219,10 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
         const auto& op = bwd_graph.ops[idx];
         if (op.type != CompiledOpType::MatmulBackward) continue;
         for (const auto& inp : op.inputs) {
-            if (inp.name.size() >= 15 &&
-                inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
+            if (inp.name.size() >= 15 && inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
                 down_bwd_op = &op;
             }
-            if (inp.name.size() >= 13 &&
-                inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
+            if (inp.name.size() >= 13 && inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
                 up_bwd_op = &op;
             }
         }
@@ -271,7 +289,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
     bool base_accumulate_up = mAccumulateTensors.count(dB_up_name) > 0;
 
     // Compute backward transpose modes for NT forward
-    EMMTranspose mode_dA = EMMTranspose::NN;  // dA = d_out @ B (NN for NT forward)
+    EMMTranspose mode_dA = EMMTranspose::NN;     // dA = d_out @ B (NN for NT forward)
     EMMTranspose mode_dB_rm = EMMTranspose::TN;  // dB = d_out^T @ A (TN for NT forward)
 
     // Chunk size: min(B*T, C) — same as forward
@@ -354,15 +372,25 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(ln2_chunk, up_weight, fwd_mode, mm_M, mm_N, mm_K);
-            matmul(up_out, up_weight, ln2_chunk, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   mm_N, mm_M, mm_K, swap_transpose(fwd_mode), false, mRunState.MainStream);
+            matmul(up_out,
+                   up_weight,
+                   ln2_chunk,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   mm_N,
+                   mm_M,
+                   mm_K,
+                   swap_transpose(fwd_mode),
+                   false,
+                   mRunState.MainStream);
         }
 
         // 2) SwiGLU: act_out = swiglu(up_out) → [N, M]
         Tensor act_out = mRunState.temp_alloc(dtype, {N, M}, "act_out");
-        swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M),
-                       mRunState.MainStream);
+        swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M), mRunState.MainStream);
 
         // ---- Backward for this chunk ----
         // 3) Down-proj backward: dA = d_out_chunk @ down_weight (activation grad)
@@ -370,18 +398,40 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(d_out_chunk, down_weight, mode_dA, mm_M, mm_N, mm_K);
-            matmul(d_act, down_weight, d_out_chunk, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   mm_N, mm_M, mm_K, swap_transpose(mode_dA), false, mRunState.MainStream);
+            matmul(d_act,
+                   down_weight,
+                   d_out_chunk,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   mm_N,
+                   mm_M,
+                   mm_K,
+                   swap_transpose(mode_dA),
+                   false,
+                   mRunState.MainStream);
         }
         // dB = d_out_chunk^T @ act_out (weight grad, accumulated)
         if (d_down_weight_ptr && d_down_weight_ptr->Data) {
             bool accum = base_accumulate_down || (chunk_idx > 0);
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(d_out_chunk, act_out, mode_dB_rm, mm_M, mm_N, mm_K);
-            matmul(*d_down_weight_ptr, act_out, d_out_chunk, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   mm_N, mm_M, mm_K, swap_transpose(mode_dB_rm), accum, mRunState.MainStream);
+            matmul(*d_down_weight_ptr,
+                   act_out,
+                   d_out_chunk,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   mm_N,
+                   mm_M,
+                   mm_K,
+                   swap_transpose(mode_dB_rm),
+                   accum,
+                   mRunState.MainStream);
         }
 
         // LoRA backward hook for down-proj
@@ -403,10 +453,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
             acts.swiglu = act_out;
             // acts.mlp_up: the pre-activation [N, MUp] (needed for swiglu recompute)
             acts.mlp_up = up_out;
-            invoke_chunk_lora_hook(down_bwd_op->attrs.backward_hook_point,
-                                   lora_accum,
-                                   N,
-                                   false);
+            invoke_chunk_lora_hook(down_bwd_op->attrs.backward_hook_point, lora_accum, N, false);
             // Restore full-size tensors
             grads.d_swiglu = prev_d_swiglu;
             grads.d_res_ffn = prev_d_res_ffn;
@@ -416,25 +463,53 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
 
         // 4) SwiGLU backward: d_up = swiglu_backward(d_act, up_out) → [N, MUp]
         Tensor d_up = mRunState.temp_alloc(dtype, {N, MUp}, "d_up");
-        swiglu_backward(d_up, d_act, up_out, nullptr,
-                        1, static_cast<int>(N), static_cast<int>(M), mRunState.MainStream);
+        swiglu_backward(d_up,
+                        d_act,
+                        up_out,
+                        nullptr,
+                        1,
+                        static_cast<int>(N),
+                        static_cast<int>(M),
+                        mRunState.MainStream);
 
         // 5) Up-proj backward: dA = d_up @ up_weight (activation grad → d_ln2_chunk)
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(d_up, up_weight, mode_dA, mm_M, mm_N, mm_K);
-            matmul(d_ln2_chunk, up_weight, d_up, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   mm_N, mm_M, mm_K, swap_transpose(mode_dA), false, mRunState.MainStream);
+            matmul(d_ln2_chunk,
+                   up_weight,
+                   d_up,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   mm_N,
+                   mm_M,
+                   mm_K,
+                   swap_transpose(mode_dA),
+                   false,
+                   mRunState.MainStream);
         }
         // dB = d_up^T @ ln2_chunk (weight grad, accumulated)
         if (d_up_weight_ptr && d_up_weight_ptr->Data) {
             bool accum = base_accumulate_up || (chunk_idx > 0);
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(d_up, ln2_chunk, mode_dB_rm, mm_M, mm_N, mm_K);
-            matmul(*d_up_weight_ptr, ln2_chunk, d_up, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   mm_N, mm_M, mm_K, swap_transpose(mode_dB_rm), accum, mRunState.MainStream);
+            matmul(*d_up_weight_ptr,
+                   ln2_chunk,
+                   d_up,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   mm_N,
+                   mm_M,
+                   mm_K,
+                   swap_transpose(mode_dB_rm),
+                   accum,
+                   mRunState.MainStream);
         }
 
         // LoRA backward hook for up-proj
@@ -450,10 +525,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
             grads.d_ln2 = d_ln2_chunk;
             grads.d_mlp_up = d_up;
             acts.ln2 = ln2_chunk;
-            invoke_chunk_lora_hook(up_bwd_op->attrs.backward_hook_point,
-                                   lora_accum,
-                                   N,
-                                   true);
+            invoke_chunk_lora_hook(up_bwd_op->attrs.backward_hook_point, lora_accum, N, true);
             // Restore full-size tensors
             grads.d_ln2 = prev_d_ln2;
             grads.d_mlp_up = prev_d_mlp_up;

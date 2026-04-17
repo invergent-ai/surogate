@@ -25,12 +25,12 @@ namespace dsl {
 /// the tensor data from the HuggingFace SafeTensors file(s).
 struct MappingSpec {
     enum class Kind {
-        Direct,         ///< 1-to-1: single HF tensor -> internal param
-        Fuse,           ///< Concatenate multiple HF tensors along `dim`
-        Split,          ///< Extract a sub-range from one HF tensor
-        Transform,      ///< Load then apply a function (e.g. transpose)
-        TiedTo,         ///< This param is a copy of another internal param
-        StackExperts,   ///< Stack per-expert HF tensors into [E, ...] format
+        Direct,        ///< 1-to-1: single HF tensor -> internal param
+        Fuse,          ///< Concatenate multiple HF tensors along `dim`
+        Split,         ///< Extract a sub-range from one HF tensor
+        Transform,     ///< Load then apply a function (e.g. transpose)
+        TiedTo,        ///< This param is a copy of another internal param
+        StackExperts,  ///< Stack per-expert HF tensors into [E, ...] format
         Unknown,
     };
 

@@ -85,3 +85,45 @@ override-dependencies = [
 
 [project.entry-points."vllm.general_plugins"]
 surogate = "surogate.grpo.inference.patches:transformers_v5_compat"
+
+# ────────── Python formatter / linter ──────────
+# Aligned with .clang-format for LLM/agent ergonomics: stable line boundaries,
+# no aggressive re-flowing on edit, grep-friendly structure.
+[tool.ruff]
+line-length = 120                # matches .clang-format ColumnLimit
+target-version = "py312"
+extend-exclude = [
+    "build",                     # scikit-build output
+    ".venv",
+    "csrc/build",
+    "csrc/third_party",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false   # a trailing comma keeps items one-per-line,
+                                    # which preserves grep targets and diff stability.
+line-ending = "lf"
+
+[tool.ruff.lint]
+# Conservative default set. Style-heavy rules (like line-length W505) are OFF
+# because the formatter handles whitespace; lint is for correctness bugs.
+select = [
+    "E",   # pycodestyle errors (indentation, whitespace correctness)
+    "F",   # pyflakes (unused imports, undefined names)
+    "W",   # pycodestyle warnings
+    "I",   # isort (import ordering) — deterministic insert slots for new imports
+    "B",   # flake8-bugbear (likely bugs, e.g. mutable default args)
+    "UP",  # pyupgrade (use modern syntax)
+]
+ignore = [
+    "E501",  # line-too-long — formatter already handles it
+    "E741",  # ambiguous single-letter names (e.g. `l`, `I`) — common in ML code
+    "B008",  # function calls in argument defaults — common pattern with torch
+    "B905",  # zip() without explicit strict= — not all call sites need strict
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]         # re-exports without use are intentional
+"tests/**" = ["F401", "F811"]    # test fixtures often shadow/reimport

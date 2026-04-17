@@ -59,10 +59,7 @@ class PlateauDetector:
         else:
             self.plateau_count = 0
 
-        if (
-            self.plateau_count >= self.patience
-            and step - self.last_warn_step >= self.cooldown
-        ):
+        if self.plateau_count >= self.patience and step - self.last_warn_step >= self.cooldown:
             self.logger.warning(
                 f"Plateau detected at step {step}: "
                 f"loss barely improving over last {len(self.history)} steps "

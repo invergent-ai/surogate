@@ -34,19 +34,35 @@ namespace recipes::bf16 {
  * @param reuse_inp_quant Whether to reuse existing quantized input
  * @param stream CUDA stream
  */
-template<typename RunState>
+template <typename RunState>
 inline void forward_matmul(Tensor& out,
-                           Tensor& inp, Tensor& inp_q,
-                           Tensor& weight, std::optional<Tensor> bias,
+                           Tensor& inp,
+                           Tensor& inp_q,
+                           Tensor& weight,
+                           std::optional<Tensor> bias,
                            RunState& rs,
-                           int B, int T, int C, int OC,
+                           int B,
+                           int T,
+                           int C,
+                           int OC,
                            bool reuse_inp_quant,
                            cudaStream_t stream) {
     if (weight.DType == inp.DType) {
         // Same dtype - direct matmul
-        matmul(out, weight, inp, bias, nullptr, nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+        matmul(out,
+               weight,
+               inp,
+               bias,
+               nullptr,
+               nullptr,
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               OC,
+               B * T,
+               C,
+               EMMTranspose::TN,
+               /*accumulate=*/false,
+               stream);
         return;
     }
 
@@ -59,19 +75,40 @@ inline void forward_matmul(Tensor& out,
         if (!inp_q.abs_max()) {
             throw std::runtime_error("bf16::forward_matmul: quant buffer missing abs_max/scale Stats");
         }
-        quantize_with_abs_max(inp_q, inp_q.scale(), inp, inp_q.abs_max(),
-                              (long)B * T * C, rs.DeviceProp, stream);
+        quantize_with_abs_max(inp_q, inp_q.scale(), inp, inp_q.abs_max(), (long)B * T * C, rs.DeviceProp, stream);
     }
 
     if (weight.DType == ETensorDType::BF16) {
-        matmul(out, weight, inp_q, bias, nullptr, nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+        matmul(out,
+               weight,
+               inp_q,
+               bias,
+               nullptr,
+               nullptr,
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               OC,
+               B * T,
+               C,
+               EMMTranspose::TN,
+               /*accumulate=*/false,
+               stream);
     } else {
         // FP8 weight with scale
-        matmul(out, weight, inp_q, bias, weight.scale(), inp_q.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, B * T, C, EMMTranspose::TN, /*accumulate=*/false, stream);
+        matmul(out,
+               weight,
+               inp_q,
+               bias,
+               weight.scale(),
+               inp_q.scale(),
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               OC,
+               B * T,
+               C,
+               EMMTranspose::TN,
+               /*accumulate=*/false,
+               stream);
     }
 }
 
@@ -100,15 +137,20 @@ inline void forward_matmul(Tensor& out,
  * @param stream CUDA stream
  * @param skip_weight_grad Skip weight gradient computation (for LoRA-only mode)
  */
-template<typename RunState>
+template <typename RunState>
 inline void backward_matmul(Tensor& dinp,
-                            Tensor& dweight, std::optional<Tensor> dbias,
+                            Tensor& dweight,
+                            std::optional<Tensor> dbias,
                             Tensor& dout,
                             Tensor& inp,
-                            Tensor& weight, std::optional<Tensor> bias_buffer,
+                            Tensor& weight,
+                            std::optional<Tensor> bias_buffer,
                             bool accumulate_gradient,
                             RunState& rs,
-                            int B, int T, int C, int OC,
+                            int B,
+                            int T,
+                            int C,
+                            int OC,
                             cudaStream_t stream,
                             bool skip_weight_grad = false) {
     const int BT = B * T;
@@ -118,9 +160,20 @@ inline void backward_matmul(Tensor& dinp,
     Tensor weight_tp = rs.temp_alloc(weight.DType, {(long)C, (long)OC}, "weight_tp");
     transpose(weight_tp, weight, OC, C, stream);
 
-    matmul(dinp, weight_tp, dout, std::nullopt, nullptr, nullptr,
-           rs.CublasLtHandle, rs.CuBlasWorkspace,
-           C, BT, OC, EMMTranspose::TN, /*accumulate=*/false, stream);
+    matmul(dinp,
+           weight_tp,
+           dout,
+           std::nullopt,
+           nullptr,
+           nullptr,
+           rs.CublasLtHandle,
+           rs.CuBlasWorkspace,
+           C,
+           BT,
+           OC,
+           EMMTranspose::TN,
+           /*accumulate=*/false,
+           stream);
 
     rs.temp_free(weight_tp);
 
@@ -136,9 +189,20 @@ inline void backward_matmul(Tensor& dinp,
 
         // dweight (OC, C) = dout_tp (OC, BT) @ inp_tp^T (BT, C)
         // Using TN: dweight = dout_tp @ inp_tp with N transposed
-        matmul(dweight, dout_tp, inp_tp, std::nullopt, nullptr, nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               OC, C, BT, EMMTranspose::TN, /*accumulate=*/accumulate_gradient, stream);
+        matmul(dweight,
+               dout_tp,
+               inp_tp,
+               std::nullopt,
+               nullptr,
+               nullptr,
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               OC,
+               C,
+               BT,
+               EMMTranspose::TN,
+               /*accumulate=*/accumulate_gradient,
+               stream);
 
         rs.temp_free(dout_tp);
         rs.temp_free(inp_tp);

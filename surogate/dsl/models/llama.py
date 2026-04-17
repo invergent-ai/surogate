@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from .. import nn
+from ..blocks.llama import LlamaBlock
+from ..hf import build_dense_block_mappings
 from ..nn import STANDARD_MODEL_NAME_REMAP
 from ..specs import ActivationScope
-from ..hf import build_dense_block_mappings
-from ..blocks.llama import LlamaBlock
 
 
 @nn.hf_config(
@@ -60,7 +60,8 @@ class LlamaModel(nn.Model):
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.BlockStack(
-            n_layers, LlamaBlock,
+            n_layers,
+            LlamaBlock,
             d_model=d_model,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
@@ -77,10 +78,8 @@ class LlamaModel(nn.Model):
 
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", ("T",), dtype="int32", scope=G)
-        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                                  aliases=["labels"])
-        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
-                                  scope=G, aliases=["rope_freqs"])
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
+        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32", scope=G, aliases=["rope_freqs"])
 
         _h = ("B", "T", "d_model")
         self._register_activation("residual0", _h, scope=G)
@@ -90,10 +89,8 @@ class LlamaModel(nn.Model):
         self._register_activation("residual_final", _h, scope=G)
         self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
         self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                                  save=True, scope=G)
-        self._register_activation("loss", ("B * T",), dtype="fp32",
-                                  aliases=["losses"], scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
         x = self.embedding(token_ids)
         residual = self._zeros(["B", "T", "d_model"])

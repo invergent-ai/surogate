@@ -38,13 +38,12 @@
  * @param seed Global seed value.
  * @return Pseudo-random 32-bit unsigned integer.
  */
-__device__ __host__ constexpr unsigned int squirrel_noise_5(unsigned int positionX, unsigned int seed)
-{
-    constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
-    constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
-    constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
-    constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
-    constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
+__device__ __host__ constexpr unsigned int squirrel_noise_5(unsigned int positionX, unsigned int seed) {
+    constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;  // 11010010101010000000101000111111
+    constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;  // 10101000100001001111000110010111
+    constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B;  // 01101100011100110110111101001011
+    constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;  // 10110111100111110011101010111011
+    constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;  // 00011011010101101100010011110101
     unsigned int mangledBits = positionX;
     mangledBits *= SQ5_BIT_NOISE1;
     mangledBits += seed;
@@ -72,9 +71,8 @@ __device__ __host__ constexpr unsigned int squirrel_noise_5(unsigned int positio
  * @param seed Global seed value.
  * @return Pseudo-random 32-bit unsigned integer.
  */
-__device__ __host__ constexpr unsigned int get_noise_2d(int indexX, int indexY, unsigned int seed)
-{
-    constexpr unsigned int PRIME_NUMBER = 198491317u; // Large prime number with non-boring bits
+__device__ __host__ constexpr unsigned int get_noise_2d(int indexX, int indexY, unsigned int seed) {
+    constexpr unsigned int PRIME_NUMBER = 198491317u;  // Large prime number with non-boring bits
     unsigned int x = static_cast<unsigned int>(indexX);
     unsigned int y = static_cast<unsigned int>(indexY);
 
@@ -95,14 +93,14 @@ __device__ __host__ constexpr unsigned int get_noise_2d(int indexX, int indexY, 
  * @param seed Random seed (updated per step via xorshift).
  * @param noise If true, generates per-thread noise; if false, uses seed directly.
  */
-__device__ __forceinline__ void stochastic_rounding(float in, nv_bfloat16 *out, unsigned int seed, bool noise=true) {
+__device__ __forceinline__ void stochastic_rounding(float in, nv_bfloat16* out, unsigned int seed, bool noise = true) {
     // todo - is this stochastic rounding *too good*? can we cut any corners?
     // makes sure each thread gets a different random number
     unsigned int random = noise ? get_noise_2d(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed) : seed;
     unsigned int threshold = random & 0xFFFF;
     unsigned int float_bits = __float_as_uint(in);
     unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits & ~0xFFFF);
     *out = __float2bfloat16_rn(__uint_as_float(float_bits));
 }
 
@@ -120,7 +118,8 @@ __device__ __forceinline__ void stochastic_rounding(float in, nv_bfloat16 *out, 
  * @param seed Random seed (updated per step via xorshift).
  * @param noise If true, generates per-thread noise; if false, uses seed directly.
  */
-__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out, unsigned int seed, bool noise=true) {
+__device__ __forceinline__ void
+stochastic_rounding(float in, __nv_fp8_e4m3* out, unsigned int seed, bool noise = true) {
     if (fabs(in) > 448.f) {
         out->__x = __nv_cvt_float_to_fp8(in, __NV_SATFINITE, __NV_E4M3);
     } else if (fabs(in) < 0.015625) {
@@ -132,7 +131,7 @@ __device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out
         unsigned int threshold = random & 0xFFFFF;
         unsigned int float_bits = __float_as_uint(in);
         unsigned int rounded_bits = float_bits & 0x000FFFFF;
-        float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFFF) : (float_bits  & ~0xFFFFF);
+        float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFFF) : (float_bits & ~0xFFFFF);
         out->__x = __nv_cvt_float_to_fp8(__uint_as_float(float_bits), __NV_SATFINITE, __NV_E4M3);
     }
 }
@@ -148,8 +147,8 @@ __device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out
  * @param seed Unused (kept for API consistency).
  * @param noise Unused (kept for API consistency).
  */
-__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int seed, bool noise=true) {
+__device__ __forceinline__ void stochastic_rounding(float in, float* out, unsigned int seed, bool noise = true) {
     *out = in;
 }
 
-#endif //SUROGATE_SQUIRREL_NOISE_CUH
+#endif  //SUROGATE_SQUIRREL_NOISE_CUH

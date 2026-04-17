@@ -16,8 +16,10 @@
 
 namespace modules {
 
-ModularLoRAGradsManager::ModularLoRAGradsManager(const Config& config, const std::shared_ptr<TensorAllocator>& allocator)
-    : mConfig(config), mAllocator(allocator) {
+ModularLoRAGradsManager::ModularLoRAGradsManager(const Config& config,
+                                                 const std::shared_ptr<TensorAllocator>& allocator)
+    : mConfig(config),
+      mAllocator(allocator) {
     mFullGrads.config = config.lora_config;
     mShardedGrads.config = config.lora_config;
 
@@ -46,20 +48,20 @@ void ModularLoRAGradsManager::allocate_gradients() {
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
-        std::transform(h.begin(), h.end(), h.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        std::transform(n.begin(), n.end(), n.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         return h.find(n) != std::string::npos;
     };
     const bool model_is_qwen3_5 =
-        mConfig.model_config &&
-        (contains_ci(mConfig.model_config->ModelTypeName, "qwen3_5") ||
-         contains_ci(mConfig.model_config->ModelTypeName, "qwen3.5") ||
-         contains_ci(mConfig.model_config->ArchitectureName, "qwen3_5") ||
-         contains_ci(mConfig.model_config->ArchitectureName, "qwen3.5"));
-    const bool use_shared_expert = mConfig.model_config &&
-                                   mConfig.model_config->moe_config.has_value() &&
+        mConfig.model_config && (contains_ci(mConfig.model_config->ModelTypeName, "qwen3_5") ||
+                                 contains_ci(mConfig.model_config->ModelTypeName, "qwen3.5") ||
+                                 contains_ci(mConfig.model_config->ArchitectureName, "qwen3_5") ||
+                                 contains_ci(mConfig.model_config->ArchitectureName, "qwen3.5"));
+    const bool use_shared_expert = mConfig.model_config && mConfig.model_config->moe_config.has_value() &&
                                    mConfig.model_config->moe_config->use_shared_expert;
     const int shared_D = use_shared_expert && mConfig.model_config->moe_config->shared_expert_size > 0
                              ? mConfig.model_config->moe_config->shared_expert_size
@@ -76,24 +78,33 @@ void ModularLoRAGradsManager::allocate_gradients() {
         if constexpr (!kAllocateLegacyShardedGradStorage) {
             return w;
         }
-        w.A = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {r, in_f}));
-        w.B = mAllocator->allocate_shard(mConfig.grad_dtype, /*shard_idx=*/0, /*num_shards=*/1, (name + "_B").c_str(), {out_f, r});
+        w.A = TensorShard(
+            mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {r, in_f}));
+        w.B = mAllocator->allocate_shard(mConfig.grad_dtype,
+                                         /*shard_idx=*/0,
+                                         /*num_shards=*/1,
+                                         (name + "_B").c_str(),
+                                         {out_f, r});
         return w;
     };
 
     auto alloc_grouped_full = [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<Tensor> {
         LoRAGroupedLayerWeights<Tensor> w;
         w.A = mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {E, r, in_f});
-        w.B = mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r});
+        w.B =
+            mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r});
         return w;
     };
-    auto alloc_grouped_shard = [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<TensorShard> {
+    auto alloc_grouped_shard =
+        [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<TensorShard> {
         LoRAGroupedLayerWeights<TensorShard> w;
         if constexpr (!kAllocateLegacyShardedGradStorage) {
             return w;
         }
-        w.A = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {E, r, in_f}));
-        w.B = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r}));
+        w.A = TensorShard(
+            mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {E, r, in_f}));
+        w.B = TensorShard(
+            mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r}));
         return w;
     };
 
@@ -109,9 +120,8 @@ void ModularLoRAGradsManager::allocate_gradients() {
         if (mConfig.model_config) {
             bt = mConfig.model_config->get_block_type(l);
             is_hybrid = (mConfig.model_config->architecture == ArchitectureType::Hybrid);
-            const bool is_qwen3_family =
-                contains_ci(mConfig.model_config->ModelTypeName, "qwen3") ||
-                contains_ci(mConfig.model_config->ArchitectureName, "qwen3");
+            const bool is_qwen3_family = contains_ci(mConfig.model_config->ModelTypeName, "qwen3") ||
+                                         contains_ci(mConfig.model_config->ArchitectureName, "qwen3");
             is_qwen3_hybrid = is_hybrid && is_qwen3_family;
         }
         const int q_lora_out = model_is_qwen3_5 ? (2 * q_out) : q_out;
@@ -119,7 +129,7 @@ void ModularLoRAGradsManager::allocate_gradients() {
         // Attention LoRA grads: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
         // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
         const bool has_attention = (bt == BlockType::Dense || bt == BlockType::Attention ||
-                                   ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
+                                    ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
         if (has_attention) {
             if (mConfig.lora_config.applies_to_q()) {
                 full.attention.q = alloc_full(C, q_lora_out, prefix + "_q");
@@ -143,22 +153,18 @@ void ModularLoRAGradsManager::allocate_gradients() {
         // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
         const bool has_global_moe = (mConfig.num_experts > 0);
         const bool layer_is_moe =
-            (bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
-            (bt == BlockType::Dense && has_global_moe);
+            (bt == BlockType::MoE || bt == BlockType::SwitchMoE) || (bt == BlockType::Dense && has_global_moe);
         // Qwen3.5 hybrid blocks (both linear-attention and full-attention)
         // contain standard MLP projections that should support LoRA.
         const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_hybrid;
         const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_hybrid;
-        const bool layer_is_dense_mlp = (bt == BlockType::MLP) ||
-                                         (bt == BlockType::Dense && !has_global_moe) ||
-                                         layer_is_qwen3_linear_mlp ||
-                                         layer_is_qwen3_attention_mlp;
+        const bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
+                                        layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
 
         if (layer_is_moe && E > 0) {
             const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
-                                       mConfig.lora_config.applies_to_gate_up() ||
-                                       mConfig.lora_config.applies_to_up() ||
-                                       mConfig.lora_config.applies_to_down();
+                                      mConfig.lora_config.applies_to_gate_up() || mConfig.lora_config.applies_to_up() ||
+                                      mConfig.lora_config.applies_to_down();
             if (has_mlp_lora) {
                 full.moe.use_grouped = true;
                 shard.moe.use_grouped = true;
@@ -183,8 +189,8 @@ void ModularLoRAGradsManager::allocate_gradients() {
             }
 
             if (use_shared_expert) {
-                const bool has_shared_lora = mConfig.lora_config.applies_to_up() ||
-                                             mConfig.lora_config.applies_to_down();
+                const bool has_shared_lora =
+                    mConfig.lora_config.applies_to_up() || mConfig.lora_config.applies_to_down();
                 if (has_shared_lora) {
                     full.moe.shared.emplace();
                     shard.moe.shared.emplace();
@@ -276,8 +282,8 @@ void ModularLoRAGradsManager::end_micro_step(cudaStream_t stream, NCCLCommunicat
     }
 }
 
-LoRABlockWeights<Tensor>& ModularLoRAGradsManager::get_block_full(
-    int layer_idx, cudaStream_t stream, NCCLCommunicator& comm, bool& accumulate) {
+LoRABlockWeights<Tensor>&
+ModularLoRAGradsManager::get_block_full(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm, bool& accumulate) {
     (void)stream;
     (void)comm;
     accumulate = !mIsFirstMicroStep;
@@ -375,4 +381,4 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
     }
 }
 
-} // namespace modules
+}  // namespace modules

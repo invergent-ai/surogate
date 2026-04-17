@@ -39,30 +39,30 @@
  * @param rows Number of rows in source (columns in destination).
  * @param cols Number of columns in source (rows in destination).
  */
-template<int VEC_SIZE, typename F, typename TD, class TS>
+template <int VEC_SIZE, typename F, typename TD, class TS>
 __device__ void apply_and_transpose_helper(F&& op, TD* dest, const TS* src, int rows, int cols) {
-    long r = VEC_SIZE*(blockIdx.x * blockDim.x + threadIdx.x);
-    long c = VEC_SIZE*(blockIdx.y * blockDim.y + threadIdx.y);
-    if(c >= cols || r >= rows) {
+    long r = VEC_SIZE * (blockIdx.x * blockDim.x + threadIdx.x);
+    long c = VEC_SIZE * (blockIdx.y * blockDim.y + threadIdx.y);
+    if (c >= cols || r >= rows) {
         return;
     }
 
     using src_vec_t = GenericVector<TS, VEC_SIZE>;
     src_vec_t cache[VEC_SIZE];
-    for(int i = 0; i < VEC_SIZE; i++) {
+    for (int i = 0; i < VEC_SIZE; i++) {
         cache[i] = src_vec_t::load(src + c + (i + r) * cols);
     }
     using dst_vec_t = GenericVector<TD, VEC_SIZE>;
     dst_vec_t save[VEC_SIZE];
-    for(int i = 0; i < VEC_SIZE; i++) {
-        for(int j = 0; j < VEC_SIZE; j++) {
+    for (int i = 0; i < VEC_SIZE; i++) {
+        for (int j = 0; j < VEC_SIZE; j++) {
             save[i][j] = TD{op(cache[j][i])};
         }
     }
 
-    for(int j = 0; j < VEC_SIZE; j++) {
-        save[j].store(dest + (c+j) * rows + r);
+    for (int j = 0; j < VEC_SIZE; j++) {
+        save[j].store(dest + (c + j) * rows + r);
     }
 }
 
-#endif //SUROGATE_SRC_KERNELS_TRANSPOSE_TEMPLATE_CUH
+#endif  //SUROGATE_SRC_KERNELS_TRANSPOSE_TEMPLATE_CUH

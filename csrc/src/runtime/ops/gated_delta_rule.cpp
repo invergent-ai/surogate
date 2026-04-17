@@ -16,6 +16,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "utilities/comm.h"
 #include "utilities/utils.h"
@@ -39,21 +42,20 @@ Tensor make_persistent_tensor(DslRunState& run_state,
         Tensor t;
         t.DType = dtype;
         t.Rank = static_cast<int>(shape.size());
-        for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[static_cast<size_t>(i)];
+        for (int i = 0; i < t.Rank; ++i)
+            t.Sizes[i] = shape[static_cast<size_t>(i)];
         return t;
     }
 
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    const bool capturing =
-        (cudaStreamIsCapturing(run_state.MainStream, &capture_status) == cudaSuccess &&
-         capture_status != cudaStreamCaptureStatusNone);
+    const bool capturing = (cudaStreamIsCapturing(run_state.MainStream, &capture_status) == cudaSuccess &&
+                            capture_status != cudaStreamCaptureStatusNone);
 
     auto it = buffers.find(key);
     if (it == buffers.end() || sizes[key] < bytes) {
         if (capturing) {
-            throw std::runtime_error(
-                "gated_delta_rule: missing preallocated persistent buffer for '" + key +
-                "' during CUDA graph capture");
+            throw std::runtime_error("gated_delta_rule: missing preallocated persistent buffer for '" + key +
+                                     "' during CUDA graph capture");
         }
         if (it != buffers.end() && it->second != nullptr) {
             CUDA_CHECK(cudaFree(it->second));
@@ -67,34 +69,36 @@ Tensor make_persistent_tensor(DslRunState& run_state,
     Tensor t;
     t.DType = dtype;
     t.Rank = static_cast<int>(shape.size());
-    for (int i = 0; i < t.Rank; ++i) t.Sizes[i] = shape[static_cast<size_t>(i)];
+    for (int i = 0; i < t.Rank; ++i)
+        t.Sizes[i] = shape[static_cast<size_t>(i)];
     t.Data = static_cast<std::byte*>(buffers[key]);
     return t;
 }
 
-
 bool tensor_shape_matches(const Tensor& t, long n0, long n1, long n2, long n3) {
-    return t.Rank == 4 &&
-           t.Sizes[0] == n0 &&
-           t.Sizes[1] == n1 &&
-           t.Sizes[2] == n2 &&
-           t.Sizes[3] == n3;
+    return t.Rank == 4 && t.Sizes[0] == n0 && t.Sizes[1] == n1 && t.Sizes[2] == n2 && t.Sizes[3] == n3;
 }
 
-inline int cdiv(int a, int b) { return (a + b - 1) / b; }
+inline int cdiv(int a, int b) {
+    return (a + b - 1) / b;
+}
 inline int next_power_of_2(int v) {
     v--;
-    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
     return v + 1;
 }
 
 }  // namespace
 
-void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
-                                                         const char* op_name) {
+void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, const char* op_name) {
     if (!mGdrKernels.is_ready()) {
         throw std::runtime_error(
-            std::string(op_name) + ": JIT Triton kernels not loaded. "
+            std::string(op_name) +
+            ": JIT Triton kernels not loaded. "
             "Ensure compile_jit_kernels() ran in Python and manifests were passed via RuntimeOptions.");
     }
     if (op.inputs.size() < 5) {
@@ -108,8 +112,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     Tensor& beta = resolve_tensor(op.inputs[4]);
 
     if (q.Rank != 4 || k.Rank != 4 || v.Rank != 4 || g_input.Rank != 3 || beta.Rank != 3) {
-        throw std::runtime_error(
-            std::string(op_name) + ": expected q/k/v rank 4 and g/beta rank 3");
+        throw std::runtime_error(std::string(op_name) + ": expected q/k/v rank 4 and g/beta rank 3");
     }
 
     const long B = q.Sizes[0];
@@ -144,23 +147,29 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         }
     }
     if (!out_is_ref) {
-        out_val = make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
-                                         op.op_id + ".out_fallback", v.DType, {B, T, H, V});
+        out_val = make_persistent_tensor(mRunState,
+                                         mMoeSavedBuffers,
+                                         mMoeSavedSizes,
+                                         op.op_id + ".out_fallback",
+                                         v.DType,
+                                         {B, T, H, V});
     }
 
     Tensor state_val;
     bool state_is_ref = false;
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         Tensor& state_ref = ensure_output_tensor(op.outputs[1]);
-        if (state_ref.DType == ETensorDType::FP32 &&
-            tensor_shape_matches(state_ref, B, H, K, V)) {
+        if (state_ref.DType == ETensorDType::FP32 && tensor_shape_matches(state_ref, B, H, K, V)) {
             state_val = state_ref;
             state_is_ref = true;
         }
     }
     if (!state_is_ref) {
-        state_val = make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
-                                           op.op_id + ".state_fallback", ETensorDType::FP32,
+        state_val = make_persistent_tensor(mRunState,
+                                           mMoeSavedBuffers,
+                                           mMoeSavedSizes,
+                                           op.op_id + ".state_fallback",
+                                           ETensorDType::FP32,
                                            {B, H, K, V});
     }
     Tensor* out_ptr = &out_val;
@@ -196,19 +205,21 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
 
         // L2 norm Q: (x, y, rstd, T)
         {
-            void* x = q.Data; void* y = q_norm.Data; void* r = q_rstd.Data;
+            void* x = q.Data;
+            void* y = q_norm.Data;
+            void* r = q_rstd.Data;
             int32_t T_val = static_cast<int32_t>(T);
-            void* args[] = { &x, &y, &r, &T_val };
-            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                                     args, 4, stream);
+            void* args[] = {&x, &y, &r, &T_val};
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 4, stream);
         }
         // L2 norm K: same kernel (D=K)
         {
-            void* x = k.Data; void* y = k_norm.Data; void* r = k_rstd.Data;
+            void* x = k.Data;
+            void* y = k_norm.Data;
+            void* r = k_rstd.Data;
             int32_t T_val = static_cast<int32_t>(T);
-            void* args[] = { &x, &y, &r, &T_val };
-            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                                     args, 4, stream);
+            void* args[] = {&x, &y, &r, &T_val};
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 4, stream);
         }
         q_eff = q_norm.Data;
         k_eff = k_norm.Data;
@@ -251,9 +262,8 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         void* g_in_ptr = g_input.Data;
         void* g_out_ptr = g_cum.Data;
         int32_t T_val = static_cast<int32_t>(T);
-        void* args[] = { &g_in_ptr, &g_out_ptr, &T_val };
-        mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                               args, 3, stream);
+        void* args[] = {&g_in_ptr, &g_out_ptr, &T_val};
+        mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
     }
 
     // 2. kkt_fwd: (k, g_cum, beta, A, T) grid=(NT, B*H)
@@ -262,9 +272,8 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         void* beta_ptr = beta.Data;
         void* A_ptr = A.Data;
         int32_t T_val = static_cast<int32_t>(T);
-        void* args[] = { &k_eff, &g_ptr, &beta_ptr, &A_ptr, &T_val };
-        mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                            args, 5, stream);
+        void* args[] = {&k_eff, &g_ptr, &beta_ptr, &A_ptr, &T_val};
+        mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
     }
 
     // 3. solve_tril: (A, Ai, T) grid=(NT, B*H)
@@ -272,9 +281,8 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         void* A_ptr = A.Data;
         void* Ai_ptr = Ai.Data;
         int32_t T_val = static_cast<int32_t>(T);
-        void* args[] = { &A_ptr, &Ai_ptr, &T_val };
-        mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                               args, 3, stream);
+        void* args[] = {&A_ptr, &Ai_ptr, &T_val};
+        mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
     }
 
     // 4. wy_fwd: (k, v, beta, w, u, Ai, g_cum, T) grid=(NT, B*H)
@@ -286,9 +294,8 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         void* Ai_ptr = Ai.Data;
         void* g_ptr = g_cum.Data;
         int32_t T_val = static_cast<int32_t>(T);
-        void* args[] = { &k_eff, &v_ptr, &beta_ptr, &w_ptr, &u_ptr, &Ai_ptr, &g_ptr, &T_val };
-        mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                           args, 8, stream);
+        void* args[] = {&k_eff, &v_ptr, &beta_ptr, &w_ptr, &u_ptr, &Ai_ptr, &g_ptr, &T_val};
+        mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 8, stream);
     }
 
     // 5. fwd_h: (k, u, w, v_new, g_cum, h, h0, ht, T) grid=(cdiv(V,BV_h), B*H)
@@ -300,10 +307,11 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         void* h_ptr = h.Data;
         void* ht_ptr = final_state_ptr->Data;
         int32_t T_val = static_cast<int32_t>(T);
-        void* args[] = { &k_eff, &u_ptr, &w_ptr, &vn_ptr, &g_ptr, &h_ptr, &h0_ptr, &ht_ptr, &T_val };
-        mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)),
-                           static_cast<unsigned>(BH), 1},
-                          args, 9, stream);
+        void* args[] = {&k_eff, &u_ptr, &w_ptr, &vn_ptr, &g_ptr, &h_ptr, &h0_ptr, &ht_ptr, &T_val};
+        mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), static_cast<unsigned>(BH), 1},
+                          args,
+                          9,
+                          stream);
     }
 
     // 6. fwd_o: (q, k, v_new, h, g_cum, o, scale, T) grid=(cdiv(V,BV_o), NT, B*H)
@@ -314,11 +322,13 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         void* o_ptr = out_ptr->Data;
         float scale_val = scale;
         int32_t T_val = static_cast<int32_t>(T);
-        void* args[] = { &q_eff, &k_eff, &vn_ptr, &h_ptr, &g_ptr, &o_ptr, &scale_val, &T_val };
+        void* args[] = {&q_eff, &k_eff, &vn_ptr, &h_ptr, &g_ptr, &o_ptr, &scale_val, &T_val};
         mGdrKernels.fwd_o({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_o)),
                            static_cast<unsigned>(NT),
                            static_cast<unsigned>(BH)},
-                          args, 8, stream);
+                          args,
+                          8,
+                          stream);
     }
 
     CUDA_CHECK(cudaGetLastError());
@@ -340,18 +350,20 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     if (debug_replay) {
         fprintf(stderr, "[GDR_BWD] inputs=%zu outputs=%zu\n", op.inputs.size(), op.outputs.size());
         for (std::size_t i = 0; i < op.inputs.size(); ++i) {
-            fprintf(stderr, "[GDR_BWD]   input[%zu] name='%s' slot=%d layer=%d tid=%d\n",
-                    i, op.inputs[i].name.c_str(), static_cast<int>(op.inputs[i].slot),
-                    op.inputs[i].layer_idx, op.inputs[i].tensor_id);
+            fprintf(stderr,
+                    "[GDR_BWD]   input[%zu] name='%s' slot=%d layer=%d tid=%d\n",
+                    i,
+                    op.inputs[i].name.c_str(),
+                    static_cast<int>(op.inputs[i].slot),
+                    op.inputs[i].layer_idx,
+                    op.inputs[i].tensor_id);
         }
     }
     if (!mGdrKernels.is_ready()) {
-        throw std::runtime_error(
-            "chunk_gated_delta_rule_backward: JIT Triton kernels not loaded.");
+        throw std::runtime_error("chunk_gated_delta_rule_backward: JIT Triton kernels not loaded.");
     }
     if (op.inputs.size() < 7) {
-        throw std::runtime_error(
-            "chunk_gated_delta_rule_backward: expected at least 7 inputs");
+        throw std::runtime_error("chunk_gated_delta_rule_backward: expected at least 7 inputs");
     }
 
     if (debug_replay) fprintf(stderr, "[GDR_BWD] resolving d_out...\n");
@@ -391,21 +403,23 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     // Allocate gradient outputs.
     // IMPORTANT: Do NOT store pointers into mTemps — subsequent push_back() calls
     // can reallocate the vector, invalidating any prior pointers. Store as values.
-    auto ensure_or_temp_val = [&](std::size_t out_idx,
-                                  ETensorDType dtype,
-                                  const std::vector<long>& shape) -> Tensor {
+    auto ensure_or_temp_val = [&](std::size_t out_idx, ETensorDType dtype, const std::vector<long>& shape) -> Tensor {
         if (op.outputs.size() > out_idx && !op.outputs[out_idx].name.empty()) {
             Tensor& out_ref = ensure_output_tensor(op.outputs[out_idx]);
             bool ok = true;
             if (out_ref.DType != dtype) ok = false;
             if (shape.size() == 4 && !tensor_shape_matches(out_ref, shape[0], shape[1], shape[2], shape[3])) ok = false;
             if (shape.size() == 3 && (out_ref.Rank != 3 || out_ref.Sizes[0] != shape[0] ||
-                out_ref.Sizes[1] != shape[1] || out_ref.Sizes[2] != shape[2])) ok = false;
+                                      out_ref.Sizes[1] != shape[1] || out_ref.Sizes[2] != shape[2]))
+                ok = false;
             if (ok) return out_ref;
         }
-        return make_persistent_tensor(mRunState, mMoeSavedBuffers, mMoeSavedSizes,
+        return make_persistent_tensor(mRunState,
+                                      mMoeSavedBuffers,
+                                      mMoeSavedSizes,
                                       op.op_id + ".bwd_out" + std::to_string(out_idx) + ".fallback",
-                                      dtype, shape);
+                                      dtype,
+                                      shape);
     };
 
     if (debug_replay) fprintf(stderr, "[GDR_BWD] allocating outputs B=%ld T=%ld H=%ld K=%ld V=%ld\n", B, T, H, K, V);
@@ -465,19 +479,21 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         mTemps.push_back(k_rstd_bwd);
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: launching q_norm kernel...\n");
         {
-            void* x = q.Data; void* y = q_norm_bwd.Data; void* r = q_rstd_bwd.Data;
+            void* x = q.Data;
+            void* y = q_norm_bwd.Data;
+            void* r = q_rstd_bwd.Data;
             int32_t T_val = static_cast<int32_t>(T);
-            void* args[] = { &x, &y, &r, &T_val };
-            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                                     args, 4, stream);
+            void* args[] = {&x, &y, &r, &T_val};
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 4, stream);
         }
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: launching k_norm kernel...\n");
         {
-            void* x = k.Data; void* y = k_norm_bwd.Data; void* r = k_rstd_bwd.Data;
+            void* x = k.Data;
+            void* y = k_norm_bwd.Data;
+            void* r = k_rstd_bwd.Data;
             int32_t T_val = static_cast<int32_t>(T);
-            void* args[] = { &x, &y, &r, &T_val };
-            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                                     args, 4, stream);
+            void* args[] = {&x, &y, &r, &T_val};
+            mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 4, stream);
         }
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: done, allocating dq/dk norm buffers...\n");
         q_eff = q_norm_bwd.Data;
@@ -486,7 +502,8 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         k_eff_tensor = &k_norm_bwd;
         // Backward pipeline writes dq_norm/dk_norm to temp buffers
         try {
-            if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: temp_alloc dq_norm q.DType=%d\n", static_cast<int>(q.DType));
+            if (debug_replay)
+                fprintf(stderr, "[GDR_BWD] l2norm: temp_alloc dq_norm q.DType=%d\n", static_cast<int>(q.DType));
             dq_norm_buf = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_dq_norm_buf");
             if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: dq_norm_buf.Data=%p\n", dq_norm_buf.Data);
             mTemps.push_back(dq_norm_buf);
@@ -508,27 +525,31 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
     mTemps.push_back(g_cum);
     {
-        void* g_in = g_input.Data; void* g_out = g_cum.Data;
+        void* g_in = g_input.Data;
+        void* g_out = g_cum.Data;
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &g_in, &g_out, &Tv };
+        void* args[] = {&g_in, &g_out, &Tv};
         mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
     }
     // A, Ai
     Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT}, "gated_delta_rule_A");
     mTemps.push_back(A);
     {
-        void* gp = g_cum.Data; void* bp = beta.Data; void* ap = A.Data;
+        void* gp = g_cum.Data;
+        void* bp = beta.Data;
+        void* ap = A.Data;
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &k_eff, &gp, &bp, &ap, &Tv };
+        void* args[] = {&k_eff, &gp, &bp, &ap, &Tv};
         mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
     }
     Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT}, "gated_delta_rule_Ai");
     mTemps.push_back(Ai);
     CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
     {
-        void* ap = A.Data; void* aip = Ai.Data;
+        void* ap = A.Data;
+        void* aip = Ai.Data;
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &ap, &aip, &Tv };
+        void* args[] = {&ap, &aip, &Tv};
         mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
     }
     // w, u
@@ -537,10 +558,14 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor u_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_u_buf");
     mTemps.push_back(u_buf);
     {
-        void* vp = v.Data; void* bp = beta.Data;
-        void* wp = w.Data; void* up = u_buf.Data; void* aip = Ai.Data; void* gp = g_cum.Data;
+        void* vp = v.Data;
+        void* bp = beta.Data;
+        void* wp = w.Data;
+        void* up = u_buf.Data;
+        void* aip = Ai.Data;
+        void* gp = g_cum.Data;
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &k_eff, &vp, &bp, &wp, &up, &aip, &gp, &Tv };
+        void* args[] = {&k_eff, &vp, &bp, &wp, &up, &aip, &gp, &Tv};
         mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 8, stream);
     }
     // h, v_new
@@ -562,13 +587,18 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         h0_ptr = h0_buf.Data;
     }
     {
-        void* up = u_buf.Data; void* wp = w.Data;
-        void* vnp = v_new.Data; void* gp = g_cum.Data; void* hp = h.Data;
+        void* up = u_buf.Data;
+        void* wp = w.Data;
+        void* vnp = v_new.Data;
+        void* gp = g_cum.Data;
+        void* hp = h.Data;
         void* htp = ht_dummy.Data;
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &k_eff, &up, &wp, &vnp, &gp, &hp, &h0_ptr, &htp, &Tv };
-        mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)),
-                           static_cast<unsigned>(BH), 1}, args, 9, stream);
+        void* args[] = {&k_eff, &up, &wp, &vnp, &gp, &hp, &h0_ptr, &htp, &Tv};
+        mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), static_cast<unsigned>(BH), 1},
+                          args,
+                          9,
+                          stream);
     }
 
     // ---- Backward pipeline ----
@@ -577,11 +607,12 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     // bwd_dv_local
     {
         void* gp = g_cum.Data;
-        void* dop = d_out.Data; void* dvp = d_v->Data;
-        float sv = scale; int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &q_eff, &k_eff, &gp, &dop, &dvp, &sv, &Tv };
-        mGdrKernels.bwd_dv_local({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                                 args, 7, stream);
+        void* dop = d_out.Data;
+        void* dvp = d_v->Data;
+        float sv = scale;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = {&q_eff, &k_eff, &gp, &dop, &dvp, &sv, &Tv};
+        mGdrKernels.bwd_dv_local({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 7, stream);
     }
 
     // bwd_dhu
@@ -590,7 +621,8 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor dv2 = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_dv2");
     mTemps.push_back(dv2);
     {
-        void* wp = w.Data; void* gp = g_cum.Data;
+        void* wp = w.Data;
+        void* gp = g_cum.Data;
         void* dhtp = d_final_state ? d_final_state->Data : nullptr;
         Tensor dht_zero;
         if (!dhtp) {
@@ -600,13 +632,17 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             dhtp = dht_zero.Data;
         }
         void* dh0p = d_initial->Data;
-        void* dop = d_out.Data; void* dhp = dh.Data;
-        void* dvp = d_v->Data; void* dv2p = dv2.Data;
-        float sv = scale; int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &q_eff, &k_eff, &wp, &gp, &dhtp, &dh0p, &dop, &dhp, &dvp, &dv2p, &sv, &Tv };
-        mGdrKernels.bwd_dhu({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)),
-                             static_cast<unsigned>(BH), 1},
-                            args, 12, stream);
+        void* dop = d_out.Data;
+        void* dhp = dh.Data;
+        void* dvp = d_v->Data;
+        void* dv2p = dv2.Data;
+        float sv = scale;
+        int32_t Tv = static_cast<int32_t>(T);
+        void* args[] = {&q_eff, &k_eff, &wp, &gp, &dhtp, &dh0p, &dop, &dhp, &dvp, &dv2p, &sv, &Tv};
+        mGdrKernels.bwd_dhu({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), static_cast<unsigned>(BH), 1},
+                            args,
+                            12,
+                            stream);
     }
 
     // bwd_dqkwg
@@ -616,17 +652,22 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     mTemps.push_back(dg_nk);
     {
         void* vnp = v_new.Data;
-        void* gp = g_cum.Data; void* hp = h.Data; void* dop = d_out.Data;
+        void* gp = g_cum.Data;
+        void* hp = h.Data;
+        void* dop = d_out.Data;
         void* dhp = dh.Data;
-        void* dwp = dw.Data; void* dv2p = dv2.Data; void* dgnkp = dg_nk.Data;
+        void* dwp = dw.Data;
+        void* dv2p = dv2.Data;
+        void* dgnkp = dg_nk.Data;
         float sv = scale;
         int32_t Bv = static_cast<int32_t>(B);
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &q_eff, &k_eff, &vnp, &gp, &hp, &dop, &dhp, &dq_data, &dk_data, &dwp, &dv2p, &dgnkp, &sv, &Bv, &Tv };
-        mGdrKernels.bwd_dqkwg({static_cast<unsigned>(NK),
-                                static_cast<unsigned>(NT),
-                                static_cast<unsigned>(BH)},
-                               args, 15, stream);
+        void* args[] =
+            {&q_eff, &k_eff, &vnp, &gp, &hp, &dop, &dhp, &dq_data, &dk_data, &dwp, &dv2p, &dgnkp, &sv, &Bv, &Tv};
+        mGdrKernels.bwd_dqkwg({static_cast<unsigned>(NK), static_cast<unsigned>(NT), static_cast<unsigned>(BH)},
+                              args,
+                              15,
+                              stream);
     }
     const long dg_bth = B * T * H;
 
@@ -642,8 +683,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         float* dg_base = dg_nk.get<float>();
         float* dg_out_ptr = d_g->get<float>();
         // Copy first slice
-        CUDA_CHECK(cudaMemcpyAsync(dg_out_ptr, dg_base, dg_bth * sizeof(float),
-                                    cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dg_out_ptr, dg_base, dg_bth * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         for (int nk = 1; nk < NK; ++nk) {
             // dg_out += dg_nk[nk]
             // Use a simple element-wise add via cublas or a tiny kernel.
@@ -651,8 +691,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             float alpha = 1.0f;
             cublasHandle_t handle = mRunState.cublas_handle();
             cublasSetStream(handle, stream);
-            cublasSaxpy(handle, static_cast<int>(dg_bth), &alpha,
-                        dg_base + nk * dg_bth, 1, dg_out_ptr, 1);
+            cublasSaxpy(handle, static_cast<int>(dg_bth), &alpha, dg_base + nk * dg_bth, 1, dg_out_ptr, 1);
         }
     }
 
@@ -660,14 +699,18 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor dg_wy = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_dg_wy");
     mTemps.push_back(dg_wy);
     {
-        void* vp = v.Data; void* bp = beta.Data;
-        void* gp = g_cum.Data; void* aip = Ai.Data; void* dwp = dw.Data;
-        void* dv2p = dv2.Data; void* dvp = d_v->Data;
-        void* dbp = d_beta->Data; void* dgwyp = dg_wy.Data;
+        void* vp = v.Data;
+        void* bp = beta.Data;
+        void* gp = g_cum.Data;
+        void* aip = Ai.Data;
+        void* dwp = dw.Data;
+        void* dv2p = dv2.Data;
+        void* dvp = d_v->Data;
+        void* dbp = d_beta->Data;
+        void* dgwyp = dg_wy.Data;
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &k_eff, &vp, &bp, &gp, &aip, &dwp, &dv2p, &dk_data, &dvp, &dbp, &dgwyp, &Tv };
-        mGdrKernels.bwd_wy({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                           args, 12, stream);
+        void* args[] = {&k_eff, &vp, &bp, &gp, &aip, &dwp, &dv2p, &dk_data, &dvp, &dbp, &dgwyp, &Tv};
+        mGdrKernels.bwd_wy({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 12, stream);
     }
 
     // dg += dg_wy
@@ -675,43 +718,42 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         float alpha = 1.0f;
         cublasHandle_t handle = mRunState.cublas_handle();
         cublasSetStream(handle, stream);
-        cublasSaxpy(handle, static_cast<int>(B * T * H), &alpha,
-                    dg_wy.get<float>(), 1, d_g->get<float>(), 1);
+        cublasSaxpy(handle, static_cast<int>(B * T * H), &alpha, dg_wy.get<float>(), 1, d_g->get<float>(), 1);
     }
 
     // cumsum_rev: reverse cumulative sum for dg
     Tensor dg_out = mRunState.temp_alloc(d_g->DType, {B, T, H}, "gated_delta_rule_dg_out");
     mTemps.push_back(dg_out);
     {
-        void* dg_in = d_g->Data; void* dg_outp = dg_out.Data;
+        void* dg_in = d_g->Data;
+        void* dg_outp = dg_out.Data;
         int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = { &dg_in, &dg_outp, &Tv };
-        mGdrKernels.cumsum_rev({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                               args, 3, stream);
+        void* args[] = {&dg_in, &dg_outp, &Tv};
+        mGdrKernels.cumsum_rev({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
     }
     // Copy result back to d_g output
-    CUDA_CHECK(cudaMemcpyAsync(d_g->Data, dg_out.Data,
-                                d_g->nelem() * sizeof(float),
-                                cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_g->Data, dg_out.Data, d_g->nelem() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
     // L2 norm backward: map dq_norm/dk_norm -> dq/dk
     if (use_l2norm) {
         // l2norm_bwd(x_norm, rstd, dout, dx, T)
         {
-            void* xn = q_norm_bwd.Data; void* r = q_rstd_bwd.Data;
-            void* dout = dq_norm_buf.Data; void* dx = d_q->Data;
+            void* xn = q_norm_bwd.Data;
+            void* r = q_rstd_bwd.Data;
+            void* dout = dq_norm_buf.Data;
+            void* dx = d_q->Data;
             int32_t T_val = static_cast<int32_t>(T);
-            void* args[] = { &xn, &r, &dout, &dx, &T_val };
-            mGdrKernels.l2norm_bwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                                     args, 5, stream);
+            void* args[] = {&xn, &r, &dout, &dx, &T_val};
+            mGdrKernels.l2norm_bwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
         }
         {
-            void* xn = k_norm_bwd.Data; void* r = k_rstd_bwd.Data;
-            void* dout = dk_norm_buf.Data; void* dx = d_k->Data;
+            void* xn = k_norm_bwd.Data;
+            void* r = k_rstd_bwd.Data;
+            void* dout = dk_norm_buf.Data;
+            void* dx = d_k->Data;
             int32_t T_val = static_cast<int32_t>(T);
-            void* args[] = { &xn, &r, &dout, &dx, &T_val };
-            mGdrKernels.l2norm_bwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
-                                     args, 5, stream);
+            void* args[] = {&xn, &r, &dout, &dx, &T_val};
+            mGdrKernels.l2norm_bwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
         }
     }
 
@@ -729,4 +771,253 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     if (op.outputs.size() > 5 && !op.outputs[5].name.empty()) store_tensor(op.outputs[5], *d_initial);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Qwen3.5 chunk gated delta rule backward rule
+// Forward: out, final_state = chunk_gated_delta_rule(q, k, v, g, beta, initial_state?)
+// Backward: dq, dk, dv, dg, d_beta, d_initial_state =
+//           chunk_gated_delta_rule_backward(d_out, d_final_state, q, k, v, g, beta, initial_state?)
+// -----------------------------------------------------------------------------
+std::vector<Operation> chunk_gated_delta_rule_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 5) {
+        return ops;
+    }
+
+    std::string q = fwd.inputs[0];
+    std::string k = fwd.inputs[1];
+    std::string v = fwd.inputs[2];
+    std::string g = fwd.inputs[3];
+    std::string beta = fwd.inputs[4];
+    std::string initial_state = (fwd.inputs.size() > 5) ? fwd.inputs[5] : "";
+
+    auto resolve_ref = [&](const std::string& name) -> std::string {
+        if (name.empty()) return "";
+        return ctx.is_param(name) ? name : saved_ref(name);
+    };
+
+    std::vector<std::string> inputs;
+    inputs.push_back(ctx.d_output);                                      // d_out
+    inputs.push_back(ctx.d_outputs.size() > 1 ? ctx.d_outputs[1] : "");  // d_final_state (optional)
+    inputs.push_back(resolve_ref(q));
+    inputs.push_back(resolve_ref(k));
+    inputs.push_back(resolve_ref(v));
+    inputs.push_back(resolve_ref(g));
+    inputs.push_back(resolve_ref(beta));
+    if (!initial_state.empty()) {
+        inputs.push_back(resolve_ref(initial_state));
+    }
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // d_q
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // d_k
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // d_v
+    outputs.push_back(ctx.needs_grad(3) ? ctx.d_inputs[3] : "");  // d_g
+    outputs.push_back(ctx.needs_grad(4) ? ctx.d_inputs[4] : "");  // d_beta
+    if (!initial_state.empty() && ctx.needs_grad(5)) {
+        outputs.push_back(ctx.d_inputs[5]);  // d_initial_state
+    }
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"chunk_size", "scale", "use_qk_l2norm_in_kernel"}, "chunk_gated_delta_rule");
+
+    ops.push_back(make_operation("chunk_gated_delta_rule_backward_" + std::to_string(ctx.op_counter++),
+                                 "chunk_gated_delta_rule_backward",
+                                 "chunk_gated_delta_rule_backward",
+                                 inputs,
+                                 outputs,
+                                 attrs));
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("chunk_gated_delta_rule", ::dsl::chunk_gated_delta_rule_backward_rule);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// Qwen3.5 gated delta rule forward ops
+// chunk_gated_delta_rule
+// ------------------------------------------------------------------------
+const int _chunk_gated_delta_rule_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "chunk_gated_delta_rule";
+    sig.min_inputs = 5;
+    sig.max_inputs = 6;
+    sig.min_outputs = 1;
+    sig.max_outputs = 2;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap&, const ShapeEnv&) {
+        if (inputs.size() < 5 || outputs.empty()) {
+            return std::make_optional(
+                ShapeValidationError{"chunk_gated_delta_rule: requires 5-6 inputs and 1-2 outputs"});
+        }
+
+        const auto& q = inputs[0];
+        const auto& k = inputs[1];
+        const auto& v = inputs[2];
+        const auto& g = inputs[3];
+        const auto& beta = inputs[4];
+
+        if (auto err = validators::check_rank(q, 4, "q", "chunk_gated_delta_rule")) return err;
+        if (auto err = validators::check_rank(k, 4, "k", "chunk_gated_delta_rule")) return err;
+        if (auto err = validators::check_rank(v, 4, "v", "chunk_gated_delta_rule")) return err;
+        if (auto err = validators::check_rank(g, 3, "g", "chunk_gated_delta_rule")) return err;
+        if (auto err = validators::check_rank(beta, 3, "beta", "chunk_gated_delta_rule")) return err;
+
+        if (q[0] != k[0] || q[1] != k[1] || q[2] != k[2] || q[3] != k[3]) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule: q and k must have the same shape"});
+        }
+        if (q[0] != v[0] || q[1] != v[1] || q[2] != v[2]) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule: q/k and v must share B/T/H"});
+        }
+        if (g[0] != q[0] || g[1] != q[1] || g[2] != q[2]) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule: g must be [B,T,H]"});
+        }
+        if (beta[0] != q[0] || beta[1] != q[1] || beta[2] != q[2]) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule: beta must be [B,T,H]"});
+        }
+
+        if (inputs.size() > 5 && !inputs[5].empty()) {
+            const auto& initial_state = inputs[5];
+            if (auto err = validators::check_rank(initial_state, 4, "initial_state", "chunk_gated_delta_rule")) {
+                return err;
+            }
+            if (initial_state[0] != q[0] || initial_state[1] != q[2] || initial_state[2] != q[3] ||
+                initial_state[3] != v[3]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule: initial_state must be [B,H,K,V]"});
+            }
+        }
+
+        if (!outputs[0].empty()) {
+            const auto& out = outputs[0];
+            if (auto err = validators::check_rank(out, 4, "out", "chunk_gated_delta_rule")) return err;
+            if (out[0] != q[0] || out[1] != q[1] || out[2] != q[2] || out[3] != v[3]) {
+                return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule: out must be [B,T,H,V]"});
+            }
+        }
+        if (outputs.size() > 1 && !outputs[1].empty()) {
+            const auto& final_state = outputs[1];
+            if (auto err = validators::check_rank(final_state, 4, "final_state", "chunk_gated_delta_rule")) {
+                return err;
+            }
+            if (final_state[0] != q[0] || final_state[1] != q[2] || final_state[2] != q[3] || final_state[3] != v[3]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule: final_state must be [B,H,K,V]"});
+            }
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// Qwen3.5 chunk gated delta rule backward
+// ------------------------------------------------------------------------
+const int _chunk_gated_delta_rule_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "chunk_gated_delta_rule_backward";
+    sig.min_inputs = 7;
+    sig.max_inputs = 8;
+    sig.min_outputs = 5;
+    sig.max_outputs = 6;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap&, const ShapeEnv&) {
+        if (inputs.size() < 7 || outputs.size() < 5) {
+            return std::make_optional(
+                ShapeValidationError{"chunk_gated_delta_rule_backward: requires 7-8 inputs and 5-6 outputs"});
+        }
+
+        const auto& d_out = inputs[0];
+        const auto& q = inputs[2];
+        const auto& k = inputs[3];
+        const auto& v = inputs[4];
+        const auto& g = inputs[5];
+        const auto& beta = inputs[6];
+
+        if (auto err = validators::check_rank(d_out, 4, "d_out", "chunk_gated_delta_rule_backward")) return err;
+        if (auto err = validators::check_rank(q, 4, "q", "chunk_gated_delta_rule_backward")) return err;
+        if (auto err = validators::check_rank(k, 4, "k", "chunk_gated_delta_rule_backward")) return err;
+        if (auto err = validators::check_rank(v, 4, "v", "chunk_gated_delta_rule_backward")) return err;
+        if (auto err = validators::check_rank(g, 3, "g", "chunk_gated_delta_rule_backward")) return err;
+        if (auto err = validators::check_rank(beta, 3, "beta", "chunk_gated_delta_rule_backward")) return err;
+
+        if (!inputs[1].empty()) {
+            if (auto err = validators::check_rank(inputs[1], 4, "d_final_state", "chunk_gated_delta_rule_backward")) {
+                return err;
+            }
+        }
+        if (inputs.size() > 7 && !inputs[7].empty()) {
+            if (auto err = validators::check_rank(inputs[7], 4, "initial_state", "chunk_gated_delta_rule_backward")) {
+                return err;
+            }
+        }
+
+        if (q[0] != k[0] || q[1] != k[1] || q[2] != k[2] || q[3] != k[3]) {
+            return std::make_optional(
+                ShapeValidationError{"chunk_gated_delta_rule_backward: q and k must have the same shape"});
+        }
+        if (q[0] != v[0] || q[1] != v[1] || q[2] != v[2]) {
+            return std::make_optional(
+                ShapeValidationError{"chunk_gated_delta_rule_backward: q/k and v must share B/T/H"});
+        }
+        if (d_out[0] != v[0] || d_out[1] != v[1] || d_out[2] != v[2] || d_out[3] != v[3]) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule_backward: d_out must be [B,T,H,V]"});
+        }
+        if (g[0] != q[0] || g[1] != q[1] || g[2] != q[2]) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule_backward: g must be [B,T,H]"});
+        }
+        if (beta[0] != q[0] || beta[1] != q[1] || beta[2] != q[2]) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule_backward: beta must be [B,T,H]"});
+        }
+
+        if (!outputs[0].empty() && outputs[0] != q) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule_backward: d_q must match q shape"});
+        }
+        if (!outputs[1].empty() && outputs[1] != k) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule_backward: d_k must match k shape"});
+        }
+        if (!outputs[2].empty() && outputs[2] != v) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule_backward: d_v must match v shape"});
+        }
+        if (!outputs[3].empty() && outputs[3] != g) {
+            return std::make_optional(ShapeValidationError{"chunk_gated_delta_rule_backward: d_g must match g shape"});
+        }
+        if (!outputs[4].empty() && outputs[4] != beta) {
+            return std::make_optional(
+                ShapeValidationError{"chunk_gated_delta_rule_backward: d_beta must match beta shape"});
+        }
+        if (outputs.size() > 5 && !outputs[5].empty()) {
+            const auto& d_initial_state = outputs[5];
+            if (auto err =
+                    validators::check_rank(d_initial_state, 4, "d_initial_state", "chunk_gated_delta_rule_backward")) {
+                return err;
+            }
+            if (d_initial_state[0] != q[0] || d_initial_state[1] != q[2] || d_initial_state[2] != q[3] ||
+                d_initial_state[3] != v[3]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: d_initial_state must be [B,H,K,V]"});
+            }
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

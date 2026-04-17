@@ -72,6 +72,7 @@ DUMP_DIR = Path("tmp/onboarding_qwen3_5_dumps")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def resolve_model_path() -> Path | None:
     """Resolve the path to Qwen3.5 weights."""
     env = os.environ.get(ENV_VAR)
@@ -162,9 +163,7 @@ def prepare_mini_model(snapshot_dir: Path) -> Path:
         vis_cfg["num_position_embeddings"] = 256
         config["vision_config"] = vis_cfg
 
-    (MINI_MODEL_DIR / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n"
-    )
+    (MINI_MODEL_DIR / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     for tok_file in [
         "tokenizer.json",
@@ -181,7 +180,7 @@ def prepare_mini_model(snapshot_dir: Path) -> Path:
     index_path = snapshot_dir / "model.safetensors.index.json"
     single_path = snapshot_dir / "model.safetensors"
 
-    def _write_mini_vocab_shard(weight_map: Dict[str, str]) -> str:
+    def _write_mini_vocab_shard(weight_map: dict[str, str]) -> str:
         from safetensors import safe_open
         from safetensors.torch import save_file
 
@@ -274,14 +273,14 @@ def load_dump(name: str) -> np.ndarray:
     return data.reshape(shape)
 
 
-def diff_stats(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+def diff_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     diff = a.astype(np.float32) - b.astype(np.float32)
     rms = float(np.sqrt(np.mean(diff * diff)))
     max_abs = float(np.max(np.abs(diff)))
     return rms, max_abs
 
 
-def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
+def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     inputs = rng.integers(0, vocab_size, size=(BATCH, SEQ_LEN), dtype=np.int32)
     targets = inputs.copy()
@@ -299,7 +298,7 @@ def sample_flat(t: torch.Tensor, max_elems: int = GRAD_SAMPLE_SIZE) -> torch.Ten
     return flat[::step][:max_elems]
 
 
-def grad_diff_stats(rt: torch.Tensor, hf: torch.Tensor) -> Tuple[float, float, float]:
+def grad_diff_stats(rt: torch.Tensor, hf: torch.Tensor) -> tuple[float, float, float]:
     rt_s = sample_flat(rt)
     hf_s = sample_flat(hf)
     diff = rt_s - hf_s
@@ -310,9 +309,9 @@ def grad_diff_stats(rt: torch.Tensor, hf: torch.Tensor) -> Tuple[float, float, f
     return rel_rms, rms, max_abs
 
 
-def build_grad_mapping(layer_types: List[str]) -> Dict[str, str | Tuple[str, str, str]]:
+def build_grad_mapping(layer_types: list[str]) -> dict[str, str | tuple[str, str, str]]:
     """Map Surogate param names to HF param names for selected tensors."""
-    mapping: Dict[str, str | Tuple[str, str, str]] = {}
+    mapping: dict[str, str | tuple[str, str, str]] = {}
 
     linear_idx = next((i for i, t in enumerate(layer_types) if t == "linear_attention"), None)
     attn_idx = next((i for i, t in enumerate(layer_types) if t == "full_attention"), None)
@@ -353,7 +352,8 @@ def build_grad_mapping(layer_types: List[str]) -> Dict[str, str | Tuple[str, str
 # HuggingFace forward/backward
 # ---------------------------------------------------------------------------
 
-def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]:
+
+def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]:
     """Run HF forward and capture per-layer outputs via hooks."""
     from transformers import Qwen3_5ForConditionalGeneration
 
@@ -372,28 +372,31 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
         raise
     model.eval()
 
-    result: Dict[str, np.ndarray] = {}
-    layer_outs: Dict[int, torch.Tensor] = {}
-    mid_states: Dict[int, torch.Tensor] = {}
+    result: dict[str, np.ndarray] = {}
+    layer_outs: dict[int, torch.Tensor] = {}
+    mid_states: dict[int, torch.Tensor] = {}
     hooks = []
 
     for i in range(NUM_LAYERS):
+
         def make_layer_hook(idx):
             def hook_fn(module, args, output):
                 hs = output[0] if isinstance(output, tuple) else output
                 layer_outs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(model.model.language_model.layers[i].register_forward_hook(make_layer_hook(i)))
 
         def make_mid_hook(idx):
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
                 mid_states[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(
-            model.model.language_model.layers[i].post_attention_layernorm.register_forward_pre_hook(
-                make_mid_hook(i)
-            )
+            model.model.language_model.layers[i].post_attention_layernorm.register_forward_pre_hook(make_mid_hook(i))
         )
 
     with torch.no_grad():
@@ -422,8 +425,8 @@ def run_hf_backward(
     model_dir: Path,
     inputs: np.ndarray,
     targets: np.ndarray,
-    grad_mapping: Dict[str, str | Tuple[str, str, str]],
-) -> Dict[str, torch.Tensor]:
+    grad_mapping: dict[str, str | tuple[str, str, str]],
+) -> dict[str, torch.Tensor]:
     """Run HF backward once and collect selected gradients."""
     import torch.nn.functional as F
     from transformers import Qwen3_5ForConditionalGeneration
@@ -458,7 +461,7 @@ def run_hf_backward(
     loss.backward()
 
     named_params = dict(model.named_parameters())
-    grads: Dict[str, torch.Tensor] = {}
+    grads: dict[str, torch.Tensor] = {}
 
     for rt_name, hf_spec in grad_mapping.items():
         if isinstance(hf_spec, tuple):
@@ -483,12 +486,13 @@ def run_hf_backward(
 # Surogate step (forward + backward)
 # ---------------------------------------------------------------------------
 
+
 def run_surogate_step(
     model_dir: Path,
     inputs: np.ndarray,
     targets: np.ndarray,
-    grad_mapping: Dict[str, str | Tuple[str, str, str]],
-) -> Dict[str, torch.Tensor]:
+    grad_mapping: dict[str, str | tuple[str, str, str]],
+) -> dict[str, torch.Tensor]:
     """Run one Surogate training step, dump forward tensors, return selected grads."""
     DUMP_DIR.mkdir(parents=True, exist_ok=True)
     for p in DUMP_DIR.glob("*"):
@@ -539,7 +543,7 @@ def run_surogate_step(
         raise
 
     raw = trainer.get_gradients(0)
-    out: Dict[str, torch.Tensor] = {}
+    out: dict[str, torch.Tensor] = {}
     for rt_name in grad_mapping:
         if rt_name not in raw:
             continue
@@ -622,6 +626,7 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarra
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def model_dir():
     snapshot = resolve_model_path()
@@ -631,7 +636,7 @@ def model_dir():
 
 
 @pytest.fixture(scope="module")
-def layer_types(model_dir) -> List[str]:
+def layer_types(model_dir) -> list[str]:
     config = json.loads((model_dir / "config.json").read_text())
     return config.get("text_config", {}).get("layer_types", [])[:NUM_LAYERS]
 
@@ -677,6 +682,7 @@ def hf_backward_grads(model_dir, inputs_data, grad_mapping):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestQwen35OnboardingForward:
     """Per-layer forward comparison: Surogate vs HuggingFace."""
 
@@ -695,9 +701,7 @@ class TestQwen35OnboardingForward:
             hf_mid = hf[f"mid_state_{i}"]
             rms, max_abs = diff_stats(rt_res_att, hf_mid)
             if rms > RMS_TOL:
-                failures.append(
-                    f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-                )
+                failures.append(f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})")
 
         if failures:
             pytest.fail("Per-layer mid-state mismatches:\n" + "\n".join(failures))
@@ -720,12 +724,10 @@ class TestQwen35OnboardingForward:
             pytest.skip("residual_final dump not available")
 
         rms, max_abs = diff_stats(rt_residual_final, hf_forward_results["pre_norm"])
-        assert rms < RMS_TOL, (
-            f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-        )
+        assert rms < RMS_TOL, f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_summary(self, hf_forward_results):
-        rows: List[Tuple[str, float, float]] = []
+        rows: list[tuple[str, float, float]] = []
         hf = hf_forward_results
 
         for i in range(NUM_LAYERS - 1):
@@ -762,7 +764,7 @@ class TestQwen35OnboardingBackward:
 
     def test_selected_gradients(self, rt_results, hf_backward_grads, grad_mapping):
         failures = []
-        rows: List[Tuple[str, float, float, float]] = []
+        rows: list[tuple[str, float, float, float]] = []
 
         for rt_name in sorted(grad_mapping.keys()):
             rt = rt_results.get(rt_name)
@@ -782,9 +784,7 @@ class TestQwen35OnboardingBackward:
         print("\n--- Qwen3.5 Backward Compare (sampled grads) ---")
         for name, rel_rms, rms, max_abs in rows:
             status = "OK" if (rel_rms <= GRAD_REL_RMS_TOL or rms <= GRAD_RMS_TOL) else "FAIL"
-            print(
-                f"  {name:40s} rel_rms={rel_rms:.4e}  rms={rms:.4e}  max={max_abs:.4e}  [{status}]"
-            )
+            print(f"  {name:40s} rel_rms={rel_rms:.4e}  rms={rms:.4e}  max={max_abs:.4e}  [{status}]")
 
         if failures:
             pytest.fail("Gradient mismatches:\n" + "\n".join(failures))

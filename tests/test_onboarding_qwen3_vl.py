@@ -60,6 +60,7 @@ DUMP_DIR_MM = Path("tmp/onboarding_qwen3_vl_dumps_mm")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def resolve_model_path() -> Path:
     """Resolve the path to Qwen3-VL weights."""
     env = os.environ.get(ENV_VAR)
@@ -91,9 +92,7 @@ def prepare_mini_model(snapshot_dir: Path) -> Path:
         config["text_config"]["num_hidden_layers"] = NUM_LAYERS
     if "num_hidden_layers" in config:
         config["num_hidden_layers"] = NUM_LAYERS
-    (MINI_MODEL_DIR / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n"
-    )
+    (MINI_MODEL_DIR / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     for tok_file in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
         src = snapshot_dir / tok_file
@@ -157,14 +156,14 @@ def load_dump(name: str, dump_dir: Path = DUMP_DIR) -> np.ndarray:
     return data.reshape(shape)
 
 
-def diff_stats(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+def diff_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     diff = a.astype(np.float32) - b.astype(np.float32)
     rms = float(np.sqrt(np.mean(diff * diff)))
     max_abs = float(np.max(np.abs(diff)))
     return rms, max_abs
 
 
-def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
+def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     inputs = rng.integers(0, vocab_size, size=(BATCH, SEQ_LEN), dtype=np.int32)
     targets = inputs.copy()
@@ -173,7 +172,7 @@ def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
     return {"inputs": inputs, "targets": targets}
 
 
-def build_multimodal_payload(model, tokenizer) -> Tuple[Dict[str, np.ndarray], Dict[str, torch.Tensor]]:
+def build_multimodal_payload(model, tokenizer) -> tuple[dict[str, np.ndarray], dict[str, torch.Tensor]]:
     device = next(model.parameters()).device
     config = model.config
     image_token_id = config.image_token_id
@@ -205,25 +204,19 @@ def build_multimodal_payload(model, tokenizer) -> Tuple[Dict[str, np.ndarray], D
     # For Qwen3-VL: Conv3d(3, dim, kernel_size=(2, 16, 16), stride=(2, 16, 16))
     temporal_ps = config.vision_config.temporal_patch_size
     n_patches = grid_h * grid_w  # spatial patches (temporal already folded in grid)
-    pixel_values = torch.zeros(
-        (n_patches, 3, temporal_ps, patch_size, patch_size), dtype=torch.float32, device=device
-    )
+    pixel_values = torch.zeros((n_patches, 3, temporal_ps, patch_size, patch_size), dtype=torch.float32, device=device)
     with torch.no_grad():
         image_embeds, deepstack_image_embeds = model.get_image_features(pixel_values, image_grid_thw=image_grid_thw)
     image_embeds = image_embeds[0]
 
     expected_layers = len(getattr(model.visual, "deepstack_visual_indexes", []))
     if expected_layers and len(deepstack_image_embeds) != expected_layers:
-        raise ValueError(
-            f"deepstack layers mismatch: expected {expected_layers}, got {len(deepstack_image_embeds)}"
-        )
+        raise ValueError(f"deepstack layers mismatch: expected {expected_layers}, got {len(deepstack_image_embeds)}")
 
     visual_mask = (input_ids == image_token_id).squeeze(0)
     num_visual_actual = int(visual_mask.sum().item())
     if num_visual_actual != image_embeds.shape[0]:
-        raise ValueError(
-            f"visual token mismatch: mask has {num_visual_actual}, embeds have {image_embeds.shape[0]}"
-        )
+        raise ValueError(f"visual token mismatch: mask has {num_visual_actual}, embeds have {image_embeds.shape[0]}")
 
     rope_fn = model.get_rope_index if hasattr(model, "get_rope_index") else model.model.get_rope_index
     position_ids, _ = rope_fn(
@@ -242,7 +235,7 @@ def build_multimodal_payload(model, tokenizer) -> Tuple[Dict[str, np.ndarray], D
     packed = np.zeros((SEQ_LEN_MM, hidden), dtype=np.float32)
     packed[:num_visual_actual] = image_embeds.float().cpu().numpy()
 
-    deepstack_packed: List[np.ndarray] = []
+    deepstack_packed: list[np.ndarray] = []
     for ds in deepstack_image_embeds:
         ds_buf = np.zeros_like(packed)
         ds_buf[:num_visual_actual] = ds.float().cpu().numpy()
@@ -269,7 +262,8 @@ def build_multimodal_payload(model, tokenizer) -> Tuple[Dict[str, np.ndarray], D
 # HuggingFace forward
 # ---------------------------------------------------------------------------
 
-def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]:
+
+def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]:
     from transformers import Qwen3VLForConditionalGeneration
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -280,33 +274,34 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     )
     model.eval()
 
-    result: Dict[str, np.ndarray] = {}
-    layer_outs: Dict[int, torch.Tensor] = {}
-    mid_states: Dict[int, torch.Tensor] = {}
-    pre_norm: Dict[str, torch.Tensor] = {}
-    post_norm: Dict[str, torch.Tensor] = {}
+    result: dict[str, np.ndarray] = {}
+    layer_outs: dict[int, torch.Tensor] = {}
+    mid_states: dict[int, torch.Tensor] = {}
+    pre_norm: dict[str, torch.Tensor] = {}
+    post_norm: dict[str, torch.Tensor] = {}
     hooks = []
 
     text_model = model.model.language_model
 
     for i in range(NUM_LAYERS):
+
         def make_layer_hook(idx):
             def hook_fn(module, args, output):
                 hs = output[0] if isinstance(output, tuple) else output
                 layer_outs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(text_model.layers[i].register_forward_hook(make_layer_hook(i)))
 
         def make_mid_hook(idx):
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
                 mid_states[idx] = hs.detach().clone()
+
             return hook_fn
-        hooks.append(
-            text_model.layers[i].post_attention_layernorm.register_forward_pre_hook(
-                make_mid_hook(i)
-            )
-        )
+
+        hooks.append(text_model.layers[i].post_attention_layernorm.register_forward_pre_hook(make_mid_hook(i)))
 
     def pre_norm_hook(_module, args):
         if args and isinstance(args[0], torch.Tensor):
@@ -345,8 +340,8 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     return result
 
 
-def run_hf_forward_multimodal(model_dir: Path) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-    from transformers import Qwen3VLForConditionalGeneration, AutoTokenizer
+def run_hf_forward_multimodal(model_dir: Path) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         str(model_dir),
@@ -359,33 +354,34 @@ def run_hf_forward_multimodal(model_dir: Path) -> Tuple[Dict[str, np.ndarray], D
 
     payload, hf_inputs = build_multimodal_payload(model, tokenizer)
 
-    result: Dict[str, np.ndarray] = {}
-    layer_outs: Dict[int, torch.Tensor] = {}
-    mid_states: Dict[int, torch.Tensor] = {}
-    pre_norm: Dict[str, torch.Tensor] = {}
-    post_norm: Dict[str, torch.Tensor] = {}
+    result: dict[str, np.ndarray] = {}
+    layer_outs: dict[int, torch.Tensor] = {}
+    mid_states: dict[int, torch.Tensor] = {}
+    pre_norm: dict[str, torch.Tensor] = {}
+    post_norm: dict[str, torch.Tensor] = {}
     hooks = []
 
     text_model = model.model.language_model
 
     for i in range(NUM_LAYERS):
+
         def make_layer_hook(idx):
             def hook_fn(module, args, output):
                 hs = output[0] if isinstance(output, tuple) else output
                 layer_outs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(text_model.layers[i].register_forward_hook(make_layer_hook(i)))
 
         def make_mid_hook(idx):
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
                 mid_states[idx] = hs.detach().clone()
+
             return hook_fn
-        hooks.append(
-            text_model.layers[i].post_attention_layernorm.register_forward_pre_hook(
-                make_mid_hook(i)
-            )
-        )
+
+        hooks.append(text_model.layers[i].post_attention_layernorm.register_forward_pre_hook(make_mid_hook(i)))
 
     def pre_norm_hook(_module, args):
         if args and isinstance(args[0], torch.Tensor):
@@ -433,6 +429,7 @@ def run_hf_forward_multimodal(model_dir: Path) -> Tuple[Dict[str, np.ndarray], D
 # Surogate forward
 # ---------------------------------------------------------------------------
 
+
 def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarray) -> None:
     DUMP_DIR.mkdir(parents=True, exist_ok=True)
     for p in DUMP_DIR.glob("*"):
@@ -474,7 +471,7 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarra
     trainer.step(inputs, targets)
 
 
-def run_surogate_forward_multimodal(model_dir: Path, payload: Dict[str, np.ndarray]) -> None:
+def run_surogate_forward_multimodal(model_dir: Path, payload: dict[str, np.ndarray]) -> None:
     DUMP_DIR_MM.mkdir(parents=True, exist_ok=True)
     for p in DUMP_DIR_MM.glob("*"):
         p.unlink()
@@ -524,6 +521,7 @@ def run_surogate_forward_multimodal(model_dir: Path, payload: Dict[str, np.ndarr
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def model_dir():
     snapshot = resolve_model_path()
@@ -557,6 +555,7 @@ def forward_results_multimodal(model_dir):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestQwen3VLOnboarding:
     """Per-layer forward comparison: Surogate vs HuggingFace (text-only)."""
 
@@ -574,9 +573,7 @@ class TestQwen3VLOnboarding:
             hf_mid = hf[f"mid_state_{i}"]
             rms, max_abs = diff_stats(rt_res_att, hf_mid)
             if rms > RMS_TOL:
-                failures.append(
-                    f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-                )
+                failures.append(f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})")
 
         if failures:
             pytest.fail("Per-layer mid-state mismatches:\n" + "\n".join(failures))
@@ -585,9 +582,7 @@ class TestQwen3VLOnboarding:
         hf = forward_results
         rt_xf = load_dump("xF")
         rms, max_abs = diff_stats(rt_xf, hf["post_norm"])
-        assert rms < RMS_TOL, (
-            f"xF (final norm output) rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-        )
+        assert rms < RMS_TOL, f"xF (final norm output) rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_residual_final(self, forward_results):
         hf = forward_results
@@ -598,13 +593,11 @@ class TestQwen3VLOnboarding:
             pytest.skip("residual_final dump not available")
 
         rms, max_abs = diff_stats(rt_residual_final, hf["pre_norm"])
-        assert rms < RMS_TOL, (
-            f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-        )
+        assert rms < RMS_TOL, f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_summary(self, forward_results):
         hf = forward_results
-        rows: List[Tuple[str, float, float]] = []
+        rows: list[tuple[str, float, float]] = []
 
         for i in range(NUM_LAYERS - 1):
             try:
@@ -652,9 +645,7 @@ class TestQwen3VLOnboardingMultimodal:
             hf_mid = hf[f"mid_state_{i}"]
             rms, max_abs = diff_stats(rt_res_att, hf_mid)
             if rms > RMS_TOL:
-                failures.append(
-                    f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-                )
+                failures.append(f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})")
 
         if failures:
             pytest.fail("Per-layer mid-state mismatches:\n" + "\n".join(failures))
@@ -663,9 +654,7 @@ class TestQwen3VLOnboardingMultimodal:
         hf = forward_results_multimodal
         rt_xf = load_dump("xF", dump_dir=DUMP_DIR_MM)
         rms, max_abs = diff_stats(rt_xf, hf["post_norm"])
-        assert rms < RMS_TOL, (
-            f"xF (final norm output) rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-        )
+        assert rms < RMS_TOL, f"xF (final norm output) rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_residual_final(self, forward_results_multimodal):
         hf = forward_results_multimodal
@@ -676,13 +665,11 @@ class TestQwen3VLOnboardingMultimodal:
             pytest.skip("residual_final dump not available")
 
         rms, max_abs = diff_stats(rt_residual_final, hf["pre_norm"])
-        assert rms < RMS_TOL, (
-            f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-        )
+        assert rms < RMS_TOL, f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_summary(self, forward_results_multimodal):
         hf = forward_results_multimodal
-        rows: List[Tuple[str, float, float]] = []
+        rows: list[tuple[str, float, float]] = []
 
         for i in range(NUM_LAYERS - 1):
             try:

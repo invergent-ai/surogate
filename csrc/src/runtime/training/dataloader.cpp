@@ -30,9 +30,8 @@
  * @param world_size Total number of participating ranks.
  * @param seed Global seed used for deterministic shuffling across epochs.
  */
-DataLoader::DataLoader(const std::string& file_pattern, int seq_len, int rank, int world_size, unsigned long seed) :
-       DataLoader(match_files(file_pattern), seq_len, rank, world_size, seed) {
-
+DataLoader::DataLoader(const std::string& file_pattern, int seq_len, int rank, int world_size, unsigned long seed)
+    : DataLoader(match_files(file_pattern), seq_len, rank, world_size, seed) {
 }
 
 /**
@@ -49,26 +48,37 @@ DataLoader::DataLoader(const std::string& file_pattern, int seq_len, int rank, i
  *
  * @throws std::runtime_error If @p file_list is empty, files cannot be opened/parsed, or vocab sizes mismatch.
  */
-DataLoader::DataLoader(const std::vector<std::string>& file_list, int seq_len, int rank, int world_size, unsigned long seed) :
-        mSeqLen(seq_len), mSeed(seed), mRank(rank), mWorldSize(world_size), mChunkIndex(rank) {
+DataLoader::DataLoader(const std::vector<std::string>& file_list,
+                       int seq_len,
+                       int rank,
+                       int world_size,
+                       unsigned long seed)
+    : mSeqLen(seq_len),
+      mSeed(seed),
+      mRank(rank),
+      mWorldSize(world_size),
+      mChunkIndex(rank) {
     if (file_list.empty()) {
         throw std::runtime_error("Empty list of token files provided");
     }
 
-    for(const auto& file_name: file_list) {
+    for (const auto& file_name : file_list) {
         mFileInfos.push_back(parse_token_file_header(file_name));
     }
 
     mVocabSize = mFileInfos[0].VocabSize;
-    for (auto& info: mFileInfos) {
+    for (auto& info : mFileInfos) {
         if (info.VocabSize != mVocabSize) {
-            throw std::runtime_error(fmt::format("Inconsistent vocabulary sizes. Expected {}, got {} in {}.", mVocabSize, info.VocabSize, info.FileName));
+            throw std::runtime_error(fmt::format("Inconsistent vocabulary sizes. Expected {}, got {} in {}.",
+                                                 mVocabSize,
+                                                 info.VocabSize,
+                                                 info.FileName));
         }
     }
 
     std::int64_t total_chunks = 0;
     std::int64_t total_tokens = 0;
-    for (auto& info: mFileInfos) {
+    for (auto& info : mFileInfos) {
         total_tokens += info.NumTokens;
         // NonOverlapping: each chunk is exactly seq_len tokens, no overlap
         // Overlapping: chunks overlap by seq_len-1 tokens (standard for training)
@@ -110,7 +120,8 @@ std::vector<std::string> DataLoader::match_files(const std::string& pattern) {
         std::ranges::sort(files);
     } else {
         globfree(&glob_result);
-        throw std::runtime_error(fmt::format("Failed to match files with pattern '{}': {}", pattern, glob_result.gl_pathv[0]));
+        throw std::runtime_error(
+            fmt::format("Failed to match files with pattern '{}': {}", pattern, glob_result.gl_pathv[0]));
     }
 
     globfree(&glob_result);
@@ -146,19 +157,20 @@ DataLoader::TokenFileInfo DataLoader::parse_token_file_header(const std::string&
     int header[256];
     token_file.read((char*)header, sizeof(header));
     constexpr char MAGIC[] = {'B', 'I', 'N', '.', 'T', 'O', 'K', '\n'};
-    if(std::memcmp(header, MAGIC, sizeof(MAGIC)) != 0) {
-        throw std::runtime_error(fmt::format("Invalid token file: '{}'", std::string_view((char*)header, sizeof(MAGIC))));
+    if (std::memcmp(header, MAGIC, sizeof(MAGIC)) != 0) {
+        throw std::runtime_error(
+            fmt::format("Invalid token file: '{}'", std::string_view((char*)header, sizeof(MAGIC))));
     }
 
     int version = header[2];
-    if(version == 2 || version == 3) {
+    if (version == 2 || version == 3) {
         info.VocabSize = header[5];
-    } else if(version != 1) {
+    } else if (version != 1) {
         throw std::runtime_error(fmt::format("Unsupported token file version: {}", version));
     }
 
     int bytes_per_token = header[3];
-    if(bytes_per_token != 4) {
+    if (bytes_per_token != 4) {
         throw std::runtime_error(fmt::format("Unsupported bytes per token: {}", bytes_per_token));
     }
 
@@ -212,9 +224,7 @@ void DataLoader::shuffle_files() {
 void DataLoader::shuffle_chunks() {
     const auto* file_info = mShuffledFiles.at(mFileIndex);
     int num_tokens = file_info->NumTokens;
-    int num_chunks = file_info->NonOverlapping
-        ? (num_tokens / mSeqLen)
-        : ((num_tokens - 1) / mSeqLen);
+    int num_chunks = file_info->NonOverlapping ? (num_tokens / mSeqLen) : ((num_tokens - 1) / mSeqLen);
     std::ranges::iota_view ids(0, num_chunks);
     mChunkOffsets.assign(std::begin(ids), std::end(ids));
 
@@ -306,11 +316,12 @@ std::int32_t DataLoader::chunk_index() const {
 void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids) {
     assert(inputs.Device == -1);
     assert(targets.Device == -1);
-    if(inputs.nelem() != mSeqLen) {
+    if (inputs.nelem() != mSeqLen) {
         throw std::runtime_error(fmt::format("Expected inputs tensor of {} elements, got {}", mSeqLen, inputs.nelem()));
     }
-    if(targets.nelem() != mSeqLen) {
-        throw std::runtime_error(fmt::format("Expected targets tensor of {} elements, got {}", mSeqLen, targets.nelem()));
+    if (targets.nelem() != mSeqLen) {
+        throw std::runtime_error(
+            fmt::format("Expected targets tensor of {} elements, got {}", mSeqLen, targets.nelem()));
     }
 
     const long header_offset = 1024;
@@ -336,9 +347,8 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids)
 
         // Verify we read the expected number of bytes
         if (mTokenFile.gcount() != static_cast<std::streamsize>(input_bytes)) {
-            throw std::runtime_error("Incomplete read of input data: expected " +
-                                     std::to_string(input_bytes) + " bytes, got " +
-                                     std::to_string(mTokenFile.gcount()));
+            throw std::runtime_error("Incomplete read of input data: expected " + std::to_string(input_bytes) +
+                                     " bytes, got " + std::to_string(mTokenFile.gcount()));
         }
 
         // Seek and read target data
@@ -347,15 +357,15 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids)
 
         // Verify we read the expected number of bytes
         if (mTokenFile.gcount() != static_cast<std::streamsize>(target_bytes)) {
-            throw std::runtime_error("Incomplete read of target data: expected " +
-                                     std::to_string(target_bytes) + " bytes, got " +
-                                     std::to_string(mTokenFile.gcount()));
+            throw std::runtime_error("Incomplete read of target data: expected " + std::to_string(target_bytes) +
+                                     " bytes, got " + std::to_string(mTokenFile.gcount()));
         }
 
         if (position_ids != nullptr) {
             assert(position_ids->Device == -1);
             if (position_ids->nelem() != mSeqLen) {
-                throw std::runtime_error(fmt::format("Expected position_ids tensor of {} elements, got {}", mSeqLen, position_ids->nelem()));
+                throw std::runtime_error(
+                    fmt::format("Expected position_ids tensor of {} elements, got {}", mSeqLen, position_ids->nelem()));
             }
 
             if (file_info->Version >= 3) {
@@ -376,7 +386,7 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids)
             }
         }
 
-        if(file_info->HasMasks) {
+        if (file_info->HasMasks) {
             long masks_start = element_size * file_info->NumTokens + header_offset;
             if (file_info->Version >= 3) {
                 // Skip over PositionIDs block
@@ -390,11 +400,11 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids)
             int start = chunk_pos % 8;
             int end = start + mSeqLen;
             int* target_tokens = targets.get<int>();
-            for(int i = start; i < end; ++i) {
+            for (int i = start; i < end; ++i) {
                 int byte_id = i / 8;
                 int bit_id = i % 8;
                 bool mask_bit = (mMaskBuffer[byte_id] >> bit_id) & 1;
-                if(!mask_bit) {
+                if (!mask_bit) {
                     target_tokens[i - start] = -100;
                 }
             }

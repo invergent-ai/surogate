@@ -26,11 +26,9 @@
  * @throws std::logic_error if @p dim != 0 or if indices are out of bounds.
  */
 Tensor slice(const Tensor& src, int dim, long start, long end) {
-    if (dim != 0)
-        throw std::logic_error("Slices must be contiguous, so only the first dimension can be sliced.");
+    if (dim != 0) throw std::logic_error("Slices must be contiguous, so only the first dimension can be sliced.");
 
-    if (start >= src.Sizes[dim] || end > src.Sizes[dim])
-        throw std::logic_error("Slice out of bounds.");
+    if (start >= src.Sizes[dim] || end > src.Sizes[dim]) throw std::logic_error("Slice out of bounds.");
 
     std::array<long, MAX_TENSOR_DIM> strides{};
 
@@ -70,7 +68,7 @@ void fill_zero(Tensor& dst, cudaStream_t stream) {
                 return;
             }
         } else {
-            cudaGetLastError(); // clear sticky error
+            cudaGetLastError();  // clear sticky error
         }
         // Host/pinned memory - use memset
         std::memset(dst.Data, 0, dst.bytes());
@@ -116,14 +114,13 @@ void do_print(const Tensor& tensor, long offset, long count) {
     auto sz = get_dtype_size(tensor.DType);
     std::vector<TrueType> host_buffer(count);
     CUDA_CHECK(cudaMemcpy(host_buffer.data(), tensor.Data + offset * sz, count * sz, cudaMemcpyDeviceToHost));
-    if constexpr (std::is_same_v<TrueType, std::byte>)
-        std::cout << std::hex;
+    if constexpr (std::is_same_v<TrueType, std::byte>) std::cout << std::hex;
     for (long i = 0; i < count; ++i)
         std::cout << (PrintType)host_buffer[i] << " ";
     std::cout << std::endl;
     std::cout.flags(old_flags);
 }
-} // namespace
+}  // namespace
 
 /**
  * @brief Print a sample of tensor elements to stdout.
@@ -135,30 +132,14 @@ void do_print(const Tensor& tensor, long offset, long count) {
  */
 void Tensor::print_sample(long offset, long count) const {
     switch (DType) {
-    case ETensorDType::FP32:
-        do_print<float, float>(*this, offset, count);
-        break;
-    case ETensorDType::BF16:
-        do_print<nv_bfloat16, float>(*this, offset, count);
-        break;
-    case ETensorDType::FP16:
-        do_print<half, float>(*this, offset, count);
-        break;
-    case ETensorDType::FP8_E4M3:
-        do_print<__nv_fp8_e4m3, float>(*this, offset, count);
-        break;
-    case ETensorDType::FP8_E5M2:
-        do_print<__nv_fp8_e5m2, float>(*this, offset, count);
-        break;
-    case ETensorDType::INT32:
-        do_print<int, int>(*this, offset, count);
-        break;
-    case ETensorDType::INT8:
-        do_print<int8_t, int>(*this, offset, count);
-        break;
-    case ETensorDType::BYTE:
-        do_print<std::byte, int>(*this, offset, count);
-        break;
+        case ETensorDType::FP32: do_print<float, float>(*this, offset, count); break;
+        case ETensorDType::BF16: do_print<nv_bfloat16, float>(*this, offset, count); break;
+        case ETensorDType::FP16: do_print<half, float>(*this, offset, count); break;
+        case ETensorDType::FP8_E4M3: do_print<__nv_fp8_e4m3, float>(*this, offset, count); break;
+        case ETensorDType::FP8_E5M2: do_print<__nv_fp8_e5m2, float>(*this, offset, count); break;
+        case ETensorDType::INT32: do_print<int, int>(*this, offset, count); break;
+        case ETensorDType::INT8: do_print<int8_t, int>(*this, offset, count); break;
+        case ETensorDType::BYTE: do_print<std::byte, int>(*this, offset, count); break;
     }
 }
 
@@ -169,7 +150,11 @@ void Tensor::print_sample(long offset, long count) const {
  *
  * @note This is view-like: it copies the Tensor header and shares the same underlying Data pointer.
  */
-TensorShard::TensorShard(const Tensor& src) : Tensor(src), GlobalShape(src.Sizes), ShardIndex(0), NumShards(1) {
+TensorShard::TensorShard(const Tensor& src)
+    : Tensor(src),
+      GlobalShape(src.Sizes),
+      ShardIndex(0),
+      NumShards(1) {
 }
 
 /**

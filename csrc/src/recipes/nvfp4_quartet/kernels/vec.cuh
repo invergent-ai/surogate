@@ -21,58 +21,58 @@ enum class TransferMode {
     STORE_CG
 };
 
-template<TransferMode Mode>
+template <TransferMode Mode>
 struct Transfer;
 
-template<>
+template <>
 struct Transfer<TransferMode::DEFAULT> {
-    template<class T>
+    template <class T>
     __host__ __device__ static void call(T* dst, const T* src) {
         *dst = *src;
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::LDG> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         *dst = __ldg(src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::LU> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         *dst = __ldlu(src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::LOAD_CS> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         *dst = __ldcs(src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::STORE_CG> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         __stcg(dst, *src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::STORE_CS> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         __stcs(dst, *src);
     }
 };
 
-template<class CopyType, int NBytes, TransferMode Mode, class TrueType>
+template <class CopyType, int NBytes, TransferMode Mode, class TrueType>
 __host__ __device__ void memcpy_as(TrueType* __restrict__ dst, const TrueType* __restrict__ src) {
     static_assert(NBytes % sizeof(TrueType) == 0, "Number of bytes must be a multiple of the true type size");
     static_assert(NBytes % sizeof(CopyType) == 0, "Number of bytes must be a multiple of the copy type size");
@@ -80,7 +80,7 @@ __host__ __device__ void memcpy_as(TrueType* __restrict__ dst, const TrueType* _
 
     const auto* read_address = reinterpret_cast<const CopyType*>(src);
     auto* write_address = reinterpret_cast<CopyType*>(dst);
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < NBytes; i += sizeof(CopyType)) {
         Transfer<Mode>::call(write_address, read_address);
         ++read_address;
@@ -99,7 +99,7 @@ constexpr __host__ __device__ std::size_t alignment_from_size(std::size_t size) 
 
 }  // namespace detail
 
-template<std::size_t Count, detail::TransferMode Mode, class T>
+template <std::size_t Count, detail::TransferMode Mode, class T>
 __host__ __device__ void memcpy_aligned(T* dst, const T* src, std::integral_constant<std::size_t, Count> = {}) {
     static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
 
@@ -119,7 +119,7 @@ __host__ __device__ void memcpy_aligned(T* dst, const T* src, std::integral_cons
     }
 }
 
-template<class ElementType, std::size_t ElementCount>
+template <class ElementType, std::size_t ElementCount>
 class alignas(detail::alignment_from_size(sizeof(ElementType) * ElementCount)) GenericVector {
     static_assert(std::is_trivial_v<ElementType>, "Only trivial types are supported");
 
@@ -142,7 +142,7 @@ public:
         return constant(1.f);
     }
 
-    template<class U>
+    template <class U>
     constexpr static __host__ __device__ GenericVector from(GenericVector<U, ElementCount> other) {
         GenericVector<ElementType, ElementCount> result;
         for (int i = 0; i < ElementCount; ++i) {

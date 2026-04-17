@@ -65,8 +65,7 @@ void XXT_cpu(const std::vector<float>& X, std::vector<float>& C, int M, int K) {
 /**
  * @brief CPU reference for matmul C = A @ B
  */
-void matmul_cpu(const std::vector<float>& A, const std::vector<float>& B,
-                std::vector<float>& C, int M, int K, int N) {
+void matmul_cpu(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int M, int K, int N) {
     C.resize(M * N);
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
@@ -135,13 +134,11 @@ float orthogonality_error(const std::vector<float>& U, int M, int N) {
  */
 void polar_express_cpu_reference(std::vector<float>& X, int M, int N, int num_iters = 5) {
     // Polar Express coefficients
-    const float coeffs[5][3] = {
-        {8.156554524902461f, -22.48329292557795f, 15.878769915207462f},
-        {4.042929935166739f, -2.808917465908714f, 0.5000178451051316f},
-        {3.8916678022926607f, -2.772484153217685f, 0.5060648178503393f},
-        {3.285753657755655f, -2.3681294933425376f, 0.46449024233003106f},
-        {2.3465413258596377f, -1.7097828382687081f, 0.42323551169305323f}
-    };
+    const float coeffs[5][3] = {{8.156554524902461f, -22.48329292557795f, 15.878769915207462f},
+                                {4.042929935166739f, -2.808917465908714f, 0.5000178451051316f},
+                                {3.8916678022926607f, -2.772484153217685f, 0.5060648178503393f},
+                                {3.285753657755655f, -2.3681294933425376f, 0.46449024233003106f},
+                                {2.3465413258596377f, -1.7097828382687081f, 0.42323551169305323f}};
 
     bool transposed = M > N;
     int work_M = transposed ? N : M;
@@ -163,7 +160,8 @@ void polar_express_cpu_reference(std::vector<float>& X, int M, int N, int num_it
     // Spectral normalization
     float norm = frobenius_norm_cpu(work, work_M, work_N);
     float scale = 1.0f / (norm * 1.02f + 1e-6f);
-    for (auto& v : work) v *= scale;
+    for (auto& v : work)
+        v *= scale;
 
     // Iterations
     std::vector<float> A(work_M * work_M);
@@ -210,11 +208,7 @@ void polar_express_cpu_reference(std::vector<float>& X, int M, int N, int num_it
 /**
  * @brief CPU reference for momentum update
  */
-void momentum_update_cpu(
-    std::vector<float>& momentum,
-    const std::vector<float>& gradient,
-    float beta1
-) {
+void momentum_update_cpu(std::vector<float>& momentum, const std::vector<float>& gradient, float beta1) {
     for (size_t i = 0; i < gradient.size(); ++i) {
         momentum[i] = beta1 * momentum[i] + (1.0f - beta1) * gradient[i];
     }
@@ -223,12 +217,10 @@ void momentum_update_cpu(
 /**
  * @brief CPU reference for cautious weight decay update
  */
-void cautious_wd_update_cpu(
-    std::vector<float>& params,
-    const std::vector<float>& update,
-    float lr,
-    float weight_decay
-) {
+void cautious_wd_update_cpu(std::vector<float>& params,
+                            const std::vector<float>& update,
+                            float lr,
+                            float weight_decay) {
     for (size_t i = 0; i < params.size(); ++i) {
         float mask = (update[i] * params[i] >= 0.0f) ? 1.0f : 0.0f;
         params[i] = params[i] - (params[i] * mask * weight_decay * lr) - (update[i] * lr);
@@ -241,7 +233,8 @@ void cautious_wd_update_cpu(
 std::vector<float> random_matrix(int M, int N, std::mt19937& gen) {
     std::normal_distribution<float> dist(0.0f, 1.0f / std::sqrt(static_cast<float>(N)));
     std::vector<float> result(M * N);
-    for (auto& v : result) v = dist(gen);
+    for (auto& v : result)
+        v = dist(gen);
     return result;
 }
 
@@ -280,7 +273,7 @@ float relative_error(const std::vector<float>& actual, const std::vector<float>&
     return std::sqrt(sum_sq_diff) / (std::sqrt(sum_sq_expected) + 1e-8f);
 }
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // Tests
@@ -308,12 +301,13 @@ TEST_CASE("Polar Express produces orthogonal output", "[optimizers][normuon]") {
         thrust::device_vector<nv_bfloat16> d_workspace(ws_size / sizeof(nv_bfloat16) + 1);
 
         // Run Polar Express
-        polar_express(
-            cublas_handle,
-            thrust::raw_pointer_cast(d_X.data()),
-            thrust::raw_pointer_cast(d_workspace.data()),
-            1, M, N, stream
-        );
+        polar_express(cublas_handle,
+                      thrust::raw_pointer_cast(d_X.data()),
+                      thrust::raw_pointer_cast(d_workspace.data()),
+                      1,
+                      M,
+                      N,
+                      stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // Copy back
@@ -339,12 +333,13 @@ TEST_CASE("Polar Express produces orthogonal output", "[optimizers][normuon]") {
         size_t ws_size = polar_express_workspace_size(1, M, N);
         thrust::device_vector<nv_bfloat16> d_workspace(ws_size / sizeof(nv_bfloat16) + 1);
 
-        polar_express(
-            cublas_handle,
-            thrust::raw_pointer_cast(d_X.data()),
-            thrust::raw_pointer_cast(d_workspace.data()),
-            1, M, N, stream
-        );
+        polar_express(cublas_handle,
+                      thrust::raw_pointer_cast(d_X.data()),
+                      thrust::raw_pointer_cast(d_workspace.data()),
+                      1,
+                      M,
+                      N,
+                      stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::vector<nv_bfloat16> result_bf16(M * N);
@@ -366,12 +361,13 @@ TEST_CASE("Polar Express produces orthogonal output", "[optimizers][normuon]") {
         size_t ws_size = polar_express_workspace_size(1, M, N);
         thrust::device_vector<nv_bfloat16> d_workspace(ws_size / sizeof(nv_bfloat16) + 1);
 
-        polar_express(
-            cublas_handle,
-            thrust::raw_pointer_cast(d_X.data()),
-            thrust::raw_pointer_cast(d_workspace.data()),
-            1, M, N, stream
-        );
+        polar_express(cublas_handle,
+                      thrust::raw_pointer_cast(d_X.data()),
+                      thrust::raw_pointer_cast(d_workspace.data()),
+                      1,
+                      M,
+                      N,
+                      stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::vector<nv_bfloat16> result_bf16(M * N);
@@ -406,11 +402,7 @@ TEST_CASE("XXT kernel correctness", "[optimizers][normuon]") {
     thrust::device_vector<nv_bfloat16> d_X(X_bf16);
     thrust::device_vector<nv_bfloat16> d_C(M * M);
 
-    XXT(
-        thrust::raw_pointer_cast(d_X.data()),
-        thrust::raw_pointer_cast(d_C.data()),
-        1, M, K, stream
-    );
+    XXT(thrust::raw_pointer_cast(d_X.data()), thrust::raw_pointer_cast(d_C.data()), 1, M, K, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Copy back
@@ -444,16 +436,16 @@ TEST_CASE("Spectral scale computation", "[optimizers][normuon]") {
     thrust::device_vector<nv_bfloat16> d_X(X_bf16);
     thrust::device_vector<float> d_scale(1);
 
-    compute_spectral_scale(
-        thrust::raw_pointer_cast(d_X.data()),
-        thrust::raw_pointer_cast(d_scale.data()),
-        1, M, K, stream
-    );
+    compute_spectral_scale(thrust::raw_pointer_cast(d_X.data()),
+                           thrust::raw_pointer_cast(d_scale.data()),
+                           1,
+                           M,
+                           K,
+                           stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     float scale_gpu;
-    CUDA_CHECK(cudaMemcpy(&scale_gpu, thrust::raw_pointer_cast(d_scale.data()),
-                          sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&scale_gpu, thrust::raw_pointer_cast(d_scale.data()), sizeof(float), cudaMemcpyDeviceToHost));
 
     INFO("CPU scale: " << scale_ref << ", GPU scale: " << scale_gpu);
     REQUIRE(std::fabs(scale_gpu - scale_ref) / scale_ref < 0.05f);
@@ -489,11 +481,12 @@ TEST_CASE("Cautious weight decay update", "[optimizers][normuon]") {
     thrust::device_vector<nv_bfloat16> d_params(params_bf16);
     thrust::device_vector<nv_bfloat16> d_update(update_bf16);
 
-    cautious_weight_decay_update(
-        thrust::raw_pointer_cast(d_params.data()),
-        thrust::raw_pointer_cast(d_update.data()),
-        N, lr, wd, stream
-    );
+    cautious_weight_decay_update(thrust::raw_pointer_cast(d_params.data()),
+                                 thrust::raw_pointer_cast(d_update.data()),
+                                 N,
+                                 lr,
+                                 wd,
+                                 stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Copy back
@@ -547,22 +540,20 @@ TEST_CASE("NorMuon momentum update 8-bit", "[optimizers][normuon]") {
     thrust::copy(h_quantiles.begin(), h_quantiles.end(), d_quantiles.begin());
 
     // Initialize state
-    init_normuon_momentum_state(
-        thrust::raw_pointer_cast(d_momentum_state.data()),
-        thrust::raw_pointer_cast(d_absmax.data()),
-        N, stream
-    );
+    init_normuon_momentum_state(thrust::raw_pointer_cast(d_momentum_state.data()),
+                                thrust::raw_pointer_cast(d_absmax.data()),
+                                N,
+                                stream);
 
     // Run momentum update
-    normuon_momentum_update_8bit(
-        thrust::raw_pointer_cast(d_gradient.data()),
-        thrust::raw_pointer_cast(d_momentum_state.data()),
-        thrust::raw_pointer_cast(d_momentum_out.data()),
-        N, beta1,
-        thrust::raw_pointer_cast(d_quantiles.data()),
-        thrust::raw_pointer_cast(d_absmax.data()),
-        stream
-    );
+    normuon_momentum_update_8bit(thrust::raw_pointer_cast(d_gradient.data()),
+                                 thrust::raw_pointer_cast(d_momentum_state.data()),
+                                 thrust::raw_pointer_cast(d_momentum_out.data()),
+                                 N,
+                                 beta1,
+                                 thrust::raw_pointer_cast(d_quantiles.data()),
+                                 thrust::raw_pointer_cast(d_absmax.data()),
+                                 stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Copy back
@@ -594,12 +585,12 @@ TEST_CASE("Polar Express benchmark", "[optimizers][normuon][benchmark][!benchmar
 
     // Typical transformer weight sizes
     std::vector<std::pair<int, int>> sizes = {
-        {768, 768},     // Small attention
-        {768, 3072},    // Small MLP up
-        {3072, 768},    // Small MLP down
-        {1024, 1024},   // Medium attention
-        {1024, 4096},   // Medium MLP up
-        {4096, 1024},   // Medium MLP down
+        {768, 768},    // Small attention
+        {768, 3072},   // Small MLP up
+        {3072, 768},   // Small MLP down
+        {1024, 1024},  // Medium attention
+        {1024, 4096},  // Medium MLP up
+        {4096, 1024},  // Medium MLP down
     };
 
     for (auto [M, N] : sizes) {
@@ -613,12 +604,13 @@ TEST_CASE("Polar Express benchmark", "[optimizers][normuon][benchmark][!benchmar
         // Warmup
         for (int i = 0; i < 3; ++i) {
             thrust::copy(X_bf16.begin(), X_bf16.end(), d_X.begin());
-            polar_express(
-                cublas_handle,
-                thrust::raw_pointer_cast(d_X.data()),
-                thrust::raw_pointer_cast(d_workspace.data()),
-                1, M, N, stream
-            );
+            polar_express(cublas_handle,
+                          thrust::raw_pointer_cast(d_X.data()),
+                          thrust::raw_pointer_cast(d_workspace.data()),
+                          1,
+                          M,
+                          N,
+                          stream);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -628,12 +620,13 @@ TEST_CASE("Polar Express benchmark", "[optimizers][normuon][benchmark][!benchmar
 
         for (int i = 0; i < num_iters; ++i) {
             thrust::copy(X_bf16.begin(), X_bf16.end(), d_X.begin());
-            polar_express(
-                cublas_handle,
-                thrust::raw_pointer_cast(d_X.data()),
-                thrust::raw_pointer_cast(d_workspace.data()),
-                1, M, N, stream
-            );
+            polar_express(cublas_handle,
+                          thrust::raw_pointer_cast(d_X.data()),
+                          thrust::raw_pointer_cast(d_workspace.data()),
+                          1,
+                          M,
+                          N,
+                          stream);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 

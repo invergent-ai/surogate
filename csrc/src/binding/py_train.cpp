@@ -86,8 +86,7 @@ void copy_from_float(void* dst, ETensorDType dtype, const float* src, std::size_
             }
             break;
         }
-        default:
-            throw std::runtime_error("set_visual_inputs: unsupported dtype for visual embeds");
+        default: throw std::runtime_error("set_visual_inputs: unsupported dtype for visual embeds");
     }
 }
 
@@ -126,9 +125,23 @@ static void fill_sequential_position_ids(std::int32_t* dst, int planes, int B, i
  *
  * @throws std::runtime_error If requested GPUs exceed available device count.
  */
-MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config, std::optional<modules::QLoRAConfig> qlora_config) :
-    mConfig(config.clone()), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
-{
+MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
+                                     const PretrainedConfig& config,
+                                     RuntimeOptions options,
+                                     int batch_size,
+                                     int seq_len,
+                                     int grad_accum,
+                                     bool memcpy_all_gather,
+                                     bool memcpy_send_recv,
+                                     std::optional<LoRAAdapterConfig> lora_config,
+                                     std::optional<modules::QLoRAConfig> qlora_config)
+    : mConfig(config.clone()),
+      mOptions(options),
+      mLoRAConfig(lora_config),
+      mQLoRAConfig(qlora_config),
+      B(batch_size),
+      T(seq_len),
+      mGradAccumulation(grad_accum) {
     int gpus_available = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
     if (ngpus == 0) {
@@ -139,18 +152,17 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, 
         throw std::runtime_error(fmt::format("Requested {} GPUs, only {} available", ngpus, gpus_available));
     }
     mContexts.resize(ngpus);
-    mThreads = NCCLCommunicator::launch_communicators(
-       ngpus, memcpy_all_gather, memcpy_send_recv,
-       [&](NCCLCommunicator& comm) {
-           try {
-               this->main_loop(comm);
-           } catch (...) {
-               mHasCrashed = true;
-               throw;
-           }
-       });
+    mThreads =
+        NCCLCommunicator::launch_communicators(ngpus, memcpy_all_gather, memcpy_send_recv, [&](NCCLCommunicator& comm) {
+            try {
+                this->main_loop(comm);
+            } catch (...) {
+                mHasCrashed = true;
+                throw;
+            }
+        });
 
-    while(!mIsRunning && !mHasCrashed) {
+    while (!mIsRunning && !mHasCrashed) {
         std::this_thread::yield();
     }
 }
@@ -176,15 +188,26 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, 
  * @param lora_config Optional LoRA configuration.
  * @param qlora_config Optional QLoRA configuration.
  */
-MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
+MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
+                                     int node_rank,
+                                     int num_nodes,
                                      const void* nccl_id,
-                                     const PretrainedConfig& config, RuntimeOptions options,
-                                     int batch_size, int seq_len, int grad_accum,
-                                     bool memcpy_all_gather, bool memcpy_send_recv,
+                                     const PretrainedConfig& config,
+                                     RuntimeOptions options,
+                                     int batch_size,
+                                     int seq_len,
+                                     int grad_accum,
+                                     bool memcpy_all_gather,
+                                     bool memcpy_send_recv,
                                      std::optional<LoRAAdapterConfig> lora_config,
-                                     std::optional<modules::QLoRAConfig> qlora_config) :
-    mConfig(config.clone()), mOptions(options), mLoRAConfig(lora_config), mQLoRAConfig(qlora_config), B(batch_size), T(seq_len), mGradAccumulation(grad_accum)
-{
+                                     std::optional<modules::QLoRAConfig> qlora_config)
+    : mConfig(config.clone()),
+      mOptions(options),
+      mLoRAConfig(lora_config),
+      mQLoRAConfig(qlora_config),
+      B(batch_size),
+      T(seq_len),
+      mGradAccumulation(grad_accum) {
     int gpus_available = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpus_available));
     if (ngpus == 0) {
@@ -201,19 +224,22 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
     std::memcpy(nccl_id_owned.data(), nccl_id, 128);
 
     mContexts.resize(ngpus);
-    mThreads = NCCLCommunicator::launch_communicators_multinode(
-       ngpus, node_rank, num_nodes, nccl_id_owned.data(),
-       memcpy_all_gather, memcpy_send_recv,
-       [&](NCCLCommunicator& comm) {
-           try {
-               this->main_loop(comm);
-           } catch (...) {
-               mHasCrashed = true;
-               throw;
-           }
-       });
+    mThreads = NCCLCommunicator::launch_communicators_multinode(ngpus,
+                                                                node_rank,
+                                                                num_nodes,
+                                                                nccl_id_owned.data(),
+                                                                memcpy_all_gather,
+                                                                memcpy_send_recv,
+                                                                [&](NCCLCommunicator& comm) {
+                                                                    try {
+                                                                        this->main_loop(comm);
+                                                                    } catch (...) {
+                                                                        mHasCrashed = true;
+                                                                        throw;
+                                                                    }
+                                                                });
 
-    while(!mIsRunning && !mHasCrashed) {
+    while (!mIsRunning && !mHasCrashed) {
         std::this_thread::yield();
     }
 }
@@ -229,8 +255,8 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
 
     // make sure all work has finished
     // Use local_rank() for cudaSetDevice, and don't throw from destructor
-    for(auto& ctx : mContexts) {
-        if(ctx.Communicator) {
+    for (auto& ctx : mContexts) {
+        if (ctx.Communicator) {
             cudaError_t err = cudaSetDevice(ctx.Communicator->local_rank());
             if (err == cudaSuccess) {
                 cudaDeviceSynchronize();
@@ -310,7 +336,6 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
     });
 }
 
-
 /**
  * @brief Import weights from external GPU pointers (zero-copy from vLLM).
  *
@@ -320,13 +345,12 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
  * @param safetensors_path Path to HuggingFace SafeTensors (for non-quantized weights).
  * @param per_gpu_weights  Per-GPU external weight descriptors (one vector per local GPU).
  */
-void MultiGPUPyTrainer::import_weights_from_external(
-        std::string safetensors_path,
-        std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights) {
+void MultiGPUPyTrainer::import_weights_from_external(std::string safetensors_path,
+                                                     std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights) {
     if (per_gpu_weights.size() != mContexts.size()) {
-        throw std::runtime_error(fmt::format(
-            "import_weights_from_external: expected {} GPU weight sets, got {}",
-            mContexts.size(), per_gpu_weights.size()));
+        throw std::runtime_error(fmt::format("import_weights_from_external: expected {} GPU weight sets, got {}",
+                                             mContexts.size(),
+                                             per_gpu_weights.size()));
     }
 
     // Distribute per-GPU weights to each context
@@ -342,10 +366,7 @@ void MultiGPUPyTrainer::import_weights_from_external(
         }
 
         const int local_rank = ctx.Communicator->local_rank();
-        dsl_model->import_weights_from_external(
-            safetensors_path,
-            per_gpu_weights[local_rank],
-            *ctx.Communicator);
+        dsl_model->import_weights_from_external(safetensors_path, per_gpu_weights[local_rank], *ctx.Communicator);
 
         // Schedule deferred QLoRA offloading auto-tune
         dsl_model->auto_tune_offloading();
@@ -403,9 +424,7 @@ void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_
  * Executes model initialization as a synchronized work item across worker threads/ranks.
  */
 void MultiGPUPyTrainer::init_weights() {
-    run_work([](sThreadContext& ctx) {
-        ctx.Model->init_weights(*ctx.Communicator);
-    });
+    run_work([](sThreadContext& ctx) { ctx.Model->init_weights(*ctx.Communicator); });
 }
 
 /**
@@ -455,9 +474,11 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
  *
  * @throws std::runtime_error If called more than `grad_accum` times without an update().
  */
-void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
+void MultiGPUPyTrainer::step(const std::int32_t* inputs,
+                             const std::int32_t* targets,
+                             const std::int32_t* position_ids) {
     const int ep_size = std::max(1, mOptions.EPSize);
-    for(int i = 0; i < mContexts.size(); ++i) {
+    for (int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         if (!ctx.Model) {
             throw std::runtime_error(fmt::format("step: ctx[{}].Model is null", i));
@@ -484,8 +505,9 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         }
     }
 
-    if(mTrainMicroStep >= mGradAccumulation) {
-        throw std::runtime_error(fmt::format("step: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(
+            fmt::format("step: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
     }
 
     const bool do_timing = mOptions.TriggerTimingEvents;
@@ -517,7 +539,8 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
                                           const std::vector<const float*>& deepstack_visual_embeds) {
     if (!mConfig || !mConfig->UseVisualInputs) {
         if (visual_pos_masks || visual_embeds || !deepstack_visual_embeds.empty()) {
-            throw std::runtime_error("set_visual_inputs: visual inputs requested but model config has UseVisualInputs=false");
+            throw std::runtime_error(
+                "set_visual_inputs: visual inputs requested but model config has UseVisualInputs=false");
         }
         return;
     }
@@ -535,32 +558,36 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
         for (const float* base_ptr : deepstack_visual_embeds) {
             deepstack_ptrs.push_back(base_ptr ? (base_ptr + src_row * embed_stride) : nullptr);
         }
-        run_work([mask_ptr, embed_ptr, deepstack_ptrs](sThreadContext& ctx) {
-            auto& rs = ctx.Model->get_run_state();
-            if (!rs.VisualPosMasks_CPU.Data || !rs.VisualEmbeds_CPU.Data) {
-                if (mask_ptr || embed_ptr || !deepstack_ptrs.empty()) {
-                    throw std::runtime_error("set_visual_inputs: visual buffers not allocated in run state");
+        run_work(
+            [mask_ptr, embed_ptr, deepstack_ptrs](sThreadContext& ctx) {
+                auto& rs = ctx.Model->get_run_state();
+                if (!rs.VisualPosMasks_CPU.Data || !rs.VisualEmbeds_CPU.Data) {
+                    if (mask_ptr || embed_ptr || !deepstack_ptrs.empty()) {
+                        throw std::runtime_error("set_visual_inputs: visual buffers not allocated in run state");
+                    }
+                    return;
                 }
-                return;
-            }
 
-            if (mask_ptr) {
-                std::memcpy(rs.VisualPosMasks_CPU.Data, mask_ptr, rs.VisualPosMasks_CPU.bytes());
-            } else {
-                zero_tensor(rs.VisualPosMasks_CPU);
-            }
-
-            copy_from_float(rs.VisualEmbeds_CPU.Data, rs.VisualEmbeds_CPU.DType, embed_ptr,
-                            rs.VisualEmbeds_CPU.nelem());
-
-            if (!rs.DeepstackVisualEmbeds_CPU.empty()) {
-                for (std::size_t j = 0; j < rs.DeepstackVisualEmbeds_CPU.size(); ++j) {
-                    Tensor& dst = rs.DeepstackVisualEmbeds_CPU[j];
-                    const float* src = (j < deepstack_ptrs.size()) ? deepstack_ptrs[j] : nullptr;
-                    copy_from_float(dst.Data, dst.DType, src, dst.nelem());
+                if (mask_ptr) {
+                    std::memcpy(rs.VisualPosMasks_CPU.Data, mask_ptr, rs.VisualPosMasks_CPU.bytes());
+                } else {
+                    zero_tensor(rs.VisualPosMasks_CPU);
                 }
-            }
-        }, i);
+
+                copy_from_float(rs.VisualEmbeds_CPU.Data,
+                                rs.VisualEmbeds_CPU.DType,
+                                embed_ptr,
+                                rs.VisualEmbeds_CPU.nelem());
+
+                if (!rs.DeepstackVisualEmbeds_CPU.empty()) {
+                    for (std::size_t j = 0; j < rs.DeepstackVisualEmbeds_CPU.size(); ++j) {
+                        Tensor& dst = rs.DeepstackVisualEmbeds_CPU[j];
+                        const float* src = (j < deepstack_ptrs.size()) ? deepstack_ptrs[j] : nullptr;
+                        copy_from_float(dst.Data, dst.DType, src, dst.nelem());
+                    }
+                }
+            },
+            i);
     }
 }
 
@@ -574,9 +601,11 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
  * @param targets Pointer to host int32 target token IDs for all ranks.
  * @return Loss value computed on rank 0 for this validation micro-step.
  */
-float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
+float MultiGPUPyTrainer::validate(const std::int32_t* inputs,
+                                  const std::int32_t* targets,
+                                  const std::int32_t* position_ids) {
     const int ep_size = std::max(1, mOptions.EPSize);
-    for(int i = 0; i < mContexts.size(); ++i) {
+    for (int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
         auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
@@ -667,10 +696,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
     const int micro_steps = mGradAccumulation;
     const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
     const int pos_planes = (mContexts.empty() || !mContexts.front().Model)
-        ? 1
-        : ((mContexts.front().Model->get_position_ids_buffer().Rank == 3)
-              ? static_cast<int>(mContexts.front().Model->get_position_ids_buffer().Sizes[0])
-              : 1);
+                               ? 1
+                               : ((mContexts.front().Model->get_position_ids_buffer().Rank == 3)
+                                      ? static_cast<int>(mContexts.front().Model->get_position_ids_buffer().Sizes[0])
+                                      : 1);
 
     run_work([&](sThreadContext& ctx) {
         auto& rs = ctx.Model->get_run_state();
@@ -698,8 +727,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         // Allocate per-micro-step pinned buffers if needed.
         if (gs.inputs.size() != static_cast<size_t>(micro_steps) ||
             gs.targets.size() != static_cast<size_t>(micro_steps) ||
-            gs.position_ids.size() != static_cast<size_t>(micro_steps) ||
-            gs.captured_B != B || gs.captured_T != T) {
+            gs.position_ids.size() != static_cast<size_t>(micro_steps) || gs.captured_B != B || gs.captured_T != T) {
             gs.inputs.clear();
             gs.targets.clear();
             gs.position_ids.clear();
@@ -712,12 +740,18 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 auto in_name = fmt::format("graph_inputs_cpu_ms{}_rank{}", j, rank);
                 auto tgt_name = fmt::format("graph_targets_cpu_ms{}_rank{}", j, rank);
                 auto pos_name = fmt::format("graph_pos_ids_cpu_ms{}_rank{}", j, rank);
-                gs.inputs.push_back(rs.Allocator->allocate(ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T}));
-                gs.targets.push_back(rs.Allocator->allocate(ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.inputs.push_back(
+                    rs.Allocator->allocate(ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.targets.push_back(
+                    rs.Allocator->allocate(ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T}));
                 if (pos_planes > 1) {
-                    gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {pos_planes, B, T}));
+                    gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32,
+                                                                     pos_name.c_str(),
+                                                                     EAllocationType::PINNED,
+                                                                     {pos_planes, B, T}));
                 } else {
-                    gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
+                    gs.position_ids.push_back(
+                        rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
                 }
             }
 
@@ -728,12 +762,12 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
 
         // Allocate device-side optimizer parameter buffers if needed.
         // Use the maximum size to support both AdamW and NorMuon
-        constexpr int max_opt_params = std::max(optimizers::ADAMW_GRAPH_PARAM_COUNT,
-                                                 optimizers::NORMUON_GRAPH_PARAM_COUNT);
+        constexpr int max_opt_params =
+            std::max(optimizers::ADAMW_GRAPH_PARAM_COUNT, optimizers::NORMUON_GRAPH_PARAM_COUNT);
         if (!gs.opt_params.Data) {
             auto name = fmt::format("graph_opt_params_rank{}", ctx.Communicator->local_rank());
-            gs.opt_params = rs.Allocator->allocate(ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE,
-                                                  {max_opt_params});
+            gs.opt_params =
+                rs.Allocator->allocate(ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE, {max_opt_params});
         }
         if (!gs.opt_step.Data) {
             auto name = fmt::format("graph_opt_step_rank{}", ctx.Communicator->local_rank());
@@ -745,12 +779,12 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         const int ep_size = std::max(1, mOptions.EPSize);
         const int src_row = host_batch_row_for_local_rank(rank, ep_size);
         for (int j = 0; j < micro_steps; ++j) {
-            const std::size_t offset =
-                (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
-                 static_cast<std::size_t>(src_row)) * stride;
-            const std::size_t pos_row_offset =
-                (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
-                 static_cast<std::size_t>(src_row)) * stride;
+            const std::size_t offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
+                                        static_cast<std::size_t>(src_row)) *
+                                       stride;
+            const std::size_t pos_row_offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
+                                                static_cast<std::size_t>(src_row)) *
+                                               stride;
             std::memcpy(gs.inputs[j].Data, inputs + offset, stride * sizeof(std::int32_t));
             std::memcpy(gs.targets[j].Data, targets + offset, stride * sizeof(std::int32_t));
             if (position_ids) {
@@ -761,14 +795,16 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     // Expand to [planes, B, T] by replicating the same packed IDs
                     // across planes (required to preserve doc-boundary resets).
                     for (int p = 0; p < pos_planes; ++p) {
-                        std::memcpy(dst + static_cast<std::size_t>(p) * stride, src,
-                                    stride * sizeof(std::int32_t));
+                        std::memcpy(dst + static_cast<std::size_t>(p) * stride, src, stride * sizeof(std::int32_t));
                     }
                 } else {
                     std::memcpy(dst, src, stride * sizeof(std::int32_t));
                 }
             } else {
-                fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data), pos_planes, B, T);
+                fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data),
+                                             pos_planes,
+                                             B,
+                                             T);
             }
         }
 
@@ -786,19 +822,29 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 config.learning_rate,
                 config.adamw_beta1,
                 config.adamw_beta2,
-                config.adamw_epsilon
-            };
-            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
-                                       sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+                config.adamw_epsilon};
+            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data,
+                                       opt_params_host,
+                                       sizeof(opt_params_host),
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         } else {
-            float opt_params_host[optimizers::ADAMW_GRAPH_PARAM_COUNT] = {
-                config.learning_rate, config.adamw_beta1, config.adamw_beta2, config.adamw_epsilon, config.weight_decay
-            };
-            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data, opt_params_host,
-                                       sizeof(opt_params_host), cudaMemcpyHostToDevice, rs.MainStream));
+            float opt_params_host[optimizers::ADAMW_GRAPH_PARAM_COUNT] = {config.learning_rate,
+                                                                          config.adamw_beta1,
+                                                                          config.adamw_beta2,
+                                                                          config.adamw_epsilon,
+                                                                          config.weight_decay};
+            CUDA_CHECK(cudaMemcpyAsync(gs.opt_params.Data,
+                                       opt_params_host,
+                                       sizeof(opt_params_host),
+                                       cudaMemcpyHostToDevice,
+                                       rs.MainStream));
         }
-        CUDA_CHECK(cudaMemcpyAsync(gs.opt_step.Data, &opt_step_host,
-                                   sizeof(opt_step_host), cudaMemcpyHostToDevice, rs.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(gs.opt_step.Data,
+                                   &opt_step_host,
+                                   sizeof(opt_step_host),
+                                   cudaMemcpyHostToDevice,
+                                   rs.MainStream));
 
         // Detect packed sequences with document boundaries in any micro-step.
         // When present, fall back to eager execution because CUDA graph replay
@@ -845,14 +891,17 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         if (!dsl_model) {
             throw std::runtime_error("train_step_graphed: only supported for DSL models");
         }
-        if (config.type != optimizers::OptimizerType::ADAMW &&
-            config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+        if (config.type != optimizers::OptimizerType::ADAMW && config.type != optimizers::OptimizerType::ADAMW_8BIT &&
             config.type != optimizers::OptimizerType::NORMUON) {
             throw std::runtime_error("train_step_graphed: only supports AdamW, AdamW 8-bit or NorMuon optimizer");
         }
 
         // CUDA graph capture path (both AdamW and NorMuon support graph capture)
-        enum class FullStepGraphMode { Full, ForwardBackward, ForwardOnly };
+        enum class FullStepGraphMode {
+            Full,
+            ForwardBackward,
+            ForwardOnly
+        };
         const char* graph_mode_env = std::getenv("SUROGATE_FULLSTEP_GRAPH_MODE");
         FullStepGraphMode graph_mode = FullStepGraphMode::Full;
         if (graph_mode_env) {
@@ -874,8 +923,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             }
         }
 
-        const bool warmup_full_graph = !gs.captured
-                                       && !env_enabled("SUROGATE_DSL_GRAPH_SKIP_WARMUP");
+        const bool warmup_full_graph = !gs.captured && !env_enabled("SUROGATE_DSL_GRAPH_SKIP_WARMUP");
         const bool warmup_skip_bwd = env_enabled("SUROGATE_DSL_GRAPH_WARMUP_SKIP_BWD");
         const bool prev_internal_graphs = dsl_model->internal_graphs_enabled();
         if (prev_internal_graphs) {
@@ -931,9 +979,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 }
             }
             if (do_graph_update) {
-                dsl_model->update_with_graph_params(*ctx.Communicator, config,
-                                                   gs.opt_params.template get<float>(),
-                                                   gs.opt_step.template get<int>());
+                dsl_model->update_with_graph_params(*ctx.Communicator,
+                                                    config,
+                                                    gs.opt_params.template get<float>(),
+                                                    gs.opt_step.template get<int>());
             }
             CUDA_CHECK(cudaStreamEndCapture(rs.MainStream, &graph));
             CUDA_CHECK(cudaGraphInstantiate(&gs.graph_exec, graph, nullptr, nullptr, 0));
@@ -956,11 +1005,15 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         auto& dsl_rs = dynamic_cast<dsl::DslRunState&>(dsl_model->get_run_state());
         if (dsl_model->lora_enabled()) {
             auto& lora_rs = dsl_model->lora_run_state();
-            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost, lora_rs.norm_buffer.template get<float>(),
-                                  sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost,
+                                  lora_rs.norm_buffer.template get<float>(),
+                                  sizeof(float),
+                                  cudaMemcpyDeviceToHost));
         } else {
-            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost, dsl_rs.scratch().norm_buffer.template get<float>(),
-                                  sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(dsl_rs.NormHost,
+                                  dsl_rs.scratch().norm_buffer.template get<float>(),
+                                  sizeof(float),
+                                  cudaMemcpyDeviceToHost));
         }
     });
 
@@ -1006,7 +1059,6 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
     return {step_loss, step_norm};
 }
 
-
 /**
  * @brief Print a per-phase timing breakdown for the last training step.
  *
@@ -1038,8 +1090,13 @@ void MultiGPUPyTrainer::print_timing_breakdown(int step, int micro_steps) {
     }
 
     float total_ms = total_fwd_ms + total_bwd_ms + opt_ms;
-    fprintf(stderr, "[Time Breakdown] step=%d  fwd: %.1fms  bwd: %.1fms  opt: %.1fms  total: %.1fms",
-            step, total_fwd_ms, total_bwd_ms, opt_ms, total_ms);
+    fprintf(stderr,
+            "[Time Breakdown] step=%d  fwd: %.1fms  bwd: %.1fms  opt: %.1fms  total: %.1fms",
+            step,
+            total_fwd_ms,
+            total_bwd_ms,
+            opt_ms,
+            total_ms);
 
     if (n > 1) {
         fprintf(stderr, "\n");
@@ -1061,9 +1118,7 @@ void MultiGPUPyTrainer::print_timing_breakdown(int step, int micro_steps) {
  */
 std::vector<GPUUtilInfo> MultiGPUPyTrainer::get_gpu_info() {
     std::vector<GPUUtilInfo> infos(mContexts.size());
-    run_work([&](sThreadContext& ctx) {
-         infos[ctx.Communicator->rank()] = ctx.GPUUtil->update();
-    });
+    run_work([&](sThreadContext& ctx) { infos[ctx.Communicator->rank()] = ctx.GPUUtil->update(); });
     return infos;
 }
 
@@ -1100,7 +1155,7 @@ void MultiGPUPyTrainer::stop() {
  * @param ctx The calling worker's thread context.
  * @return A callable work item to execute, or an empty function if none is pending.
  */
-auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sThreadContext & ctx)> {
+auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sThreadContext& ctx)> {
     std::lock_guard<std::mutex> lock(mGlobalMutex);
     if (!ctx.Work) {
         return {};
@@ -1124,7 +1179,7 @@ auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sT
  *
  * @throws Rethrows any exception encountered in worker threads.
  */
-void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext & ctx)> work, int idx) {
+void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, int idx) {
     static int work_id = 0;
     int current_work_id = work_id++;
     {
@@ -1135,16 +1190,16 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext & ctx)> work,
             mContexts.at(idx).Work = work;
         } else {
             mWorkDone = 0;
-            for (auto& ctx: mContexts) {
+            for (auto& ctx : mContexts) {
                 ctx.Work = work;
             }
         }
     }
 
-    while(mWorkDone.load() < mContexts.size()) {
-        if(mThreads->has_exception()) {
+    while (mWorkDone.load() < mContexts.size()) {
+        if (mThreads->has_exception()) {
             stop();
-            mThreads->join(); // will throw, ending the loop
+            mThreads->join();  // will throw, ending the loop
         }
         std::this_thread::yield();
     }
@@ -1188,14 +1243,22 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
             mod_lora.with_all();
         } else {
             for (const auto& name : mLoRAConfig->TargetModules) {
-                if (name == "q_proj") mod_lora.targets.insert(modules::LoRATarget::Q_PROJ);
-                else if (name == "k_proj") mod_lora.targets.insert(modules::LoRATarget::K_PROJ);
-                else if (name == "v_proj") mod_lora.targets.insert(modules::LoRATarget::V_PROJ);
-                else if (name == "o_proj") mod_lora.targets.insert(modules::LoRATarget::O_PROJ);
-                else if (name == "gate_proj") mod_lora.targets.insert(modules::LoRATarget::GATE_PROJ);
-                else if (name == "gate_up_proj") mod_lora.targets.insert(modules::LoRATarget::GATE_UP_PROJ);
-                else if (name == "up_proj") mod_lora.targets.insert(modules::LoRATarget::UP_PROJ);
-                else if (name == "down_proj") mod_lora.targets.insert(modules::LoRATarget::DOWN_PROJ);
+                if (name == "q_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::Q_PROJ);
+                else if (name == "k_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::K_PROJ);
+                else if (name == "v_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::V_PROJ);
+                else if (name == "o_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::O_PROJ);
+                else if (name == "gate_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::GATE_PROJ);
+                else if (name == "gate_up_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::GATE_UP_PROJ);
+                else if (name == "up_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::UP_PROJ);
+                else if (name == "down_proj")
+                    mod_lora.targets.insert(modules::LoRATarget::DOWN_PROJ);
             }
         }
 
@@ -1206,22 +1269,28 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         }
 
         // Use factory to create LoRA model with proper architecture dispatch
-        ctx.Model = modules::ModelFactory::create_lora_from_pretrained_config(
-            *mConfig, mod_lora, mOptions, comm, allocator, qlora_config);
+        ctx.Model = modules::ModelFactory::create_lora_from_pretrained_config(*mConfig,
+                                                                              mod_lora,
+                                                                              mOptions,
+                                                                              comm,
+                                                                              allocator,
+                                                                              qlora_config);
     } else {
         // Use factory to create base model with proper architecture dispatch
-        ctx.Model = modules::ModelFactory::create_from_pretrained_config(
-            *mConfig, mOptions, comm.rank(), comm.world_size(), allocator);
+        ctx.Model = modules::ModelFactory::create_from_pretrained_config(*mConfig,
+                                                                         mOptions,
+                                                                         comm.rank(),
+                                                                         comm.world_size(),
+                                                                         allocator);
     }
 
     // DEBUG: GPU memory after model creation (before run state)
     if (mOptions.DebugMemoryBreakdown && comm.rank() == 0) {
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[DEBUG-MEM] After model creation: GPU used="
-                  << (total_mem - free_mem) / (1024*1024) << " MiB, free="
-                  << free_mem / (1024*1024) << " MiB, total="
-                  << total_mem / (1024*1024) << " MiB" << std::endl;
+        std::cerr << "[DEBUG-MEM] After model creation: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
+                  << " MiB, free=" << free_mem / (1024 * 1024) << " MiB, total=" << total_mem / (1024 * 1024) << " MiB"
+                  << std::endl;
     }
 
     ctx.Model->allocate_run_state(mOptions, comm, B, T, /*allocate_optimizer=*/true);
@@ -1230,9 +1299,8 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
     if (mOptions.DebugMemoryBreakdown && comm.rank() == 0) {
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[DEBUG-MEM] After run state alloc: GPU used="
-                  << (total_mem - free_mem) / (1024*1024) << " MiB, free="
-                  << free_mem / (1024*1024) << " MiB" << std::endl;
+        std::cerr << "[DEBUG-MEM] After run state alloc: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
+                  << " MiB, free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }
 
     // Default position IDs: [0..T-1] for each sequence in the batch.
@@ -1258,7 +1326,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
 
     while (!mIsRunning.load()) {
         std::this_thread::yield();
-        if(mHasCrashed.load()) throw std::runtime_error("Another worker has crashed, exiting.");
+        if (mHasCrashed.load()) throw std::runtime_error("Another worker has crashed, exiting.");
     }
 
     int loop_iteration = 0;
@@ -1311,12 +1379,14 @@ int MultiGPUPyTrainer::world_size() const {
  */
 std::vector<std::pair<std::string, sSegmentMemory>> MultiGPUPyTrainer::get_allocations(int gpu_id) {
     std::vector<std::pair<std::string, sSegmentMemory>> result;
-    run_work([&result](sThreadContext& ctx) {
-        auto& rs = ctx.Model->get_run_state();
-        if (rs.Allocator) {
-            result = rs.Allocator->get_allocation_segments();
-        }
-    }, gpu_id);
+    run_work(
+        [&result](sThreadContext& ctx) {
+            auto& rs = ctx.Model->get_run_state();
+            if (rs.Allocator) {
+                result = rs.Allocator->get_allocation_segments();
+            }
+        },
+        gpu_id);
     return result;
 }
 
@@ -1330,9 +1400,8 @@ std::vector<std::pair<std::string, sSegmentMemory>> MultiGPUPyTrainer::get_alloc
  */
 std::vector<std::pair<std::string, long>> MultiGPUPyTrainer::get_stack_info(int gpu_id) {
     std::vector<std::pair<std::string, long>> result;
-    run_work([&result](sThreadContext& ctx) {
-        result = ctx.Model->get_run_state().Stack.get_allocation_stats();
-    }, gpu_id);
+    run_work([&result](sThreadContext& ctx) { result = ctx.Model->get_run_state().Stack.get_allocation_stats(); },
+             gpu_id);
     return result;
 }
 
@@ -1348,254 +1417,266 @@ std::vector<std::pair<std::string, long>> MultiGPUPyTrainer::get_stack_info(int 
  */
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_gradients(int gpu_id) {
     std::vector<std::pair<std::string, Tensor>> result;
-    run_work([&result](sThreadContext& ctx) {
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("get_gradients: DSL model required");
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        const auto& grads = dsl_model->grads();
-        const auto& grad_map = grads.grads();
-        result.reserve(grads.param_names().size());
-        for (const auto& name : grads.param_names()) {
-            auto it = grad_map.find(name);
-            if (it == grad_map.end()) {
-                continue;
+    run_work(
+        [&result](sThreadContext& ctx) {
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) {
+                throw std::runtime_error("get_gradients: DSL model required");
             }
-            result.emplace_back(name, it->second);
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }, gpu_id);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const auto& grads = dsl_model->grads();
+            const auto& grad_map = grads.grads();
+            result.reserve(grads.param_names().size());
+            for (const auto& name : grads.param_names()) {
+                auto it = grad_map.find(name);
+                if (it == grad_map.end()) {
+                    continue;
+                }
+                result.emplace_back(name, it->second);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+        },
+        gpu_id);
     return result;
 }
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradients(int gpu_id) {
     std::vector<std::pair<std::string, Tensor>> result;
-    run_work([&result](sThreadContext& ctx) {
-        // Helper to add LoRA layer gradients
-        auto add_layer = [&](const std::string& module_prefix,
-                             const std::optional<modules::LoRALayerWeights<Tensor>>& layer) {
-            if (!layer.has_value()) return;
-            if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
-            if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
-        };
-        auto add_grouped_layer = [&](const std::string& module_prefix,
-                                     const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& layer) {
-            if (!layer.has_value()) return;
-            if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
-            if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
-        };
-        auto contains_ci = [](std::string_view haystack, std::string_view needle) {
-            auto to_lower = [](std::string_view in) {
-                std::string out(in);
-                for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                return out;
+    run_work(
+        [&result](sThreadContext& ctx) {
+            // Helper to add LoRA layer gradients
+            auto add_layer = [&](const std::string& module_prefix,
+                                 const std::optional<modules::LoRALayerWeights<Tensor>>& layer) {
+                if (!layer.has_value()) return;
+                if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
+                if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
             };
-            const std::string h = to_lower(haystack);
-            const std::string n = to_lower(needle);
-            return h.find(n) != std::string::npos;
-        };
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("get_lora_gradients: DSL model required");
-        }
-        if (!dsl_model->lora_enabled()) {
-            throw std::runtime_error("get_lora_gradients: DSL model is not configured for LoRA");
-        }
-        const auto& config = *ctx.Model->get_run_state().Config;
-        const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
-                                 contains_ci(config.ArchitectureName, "nemotron") ||
-                                 contains_ci(config.ModelTypeName, "nemotron");
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        for (int l = 0; l < config.NumLayers; ++l) {
-            bool unused_accumulate = false;
-            auto& block = dsl_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
-            std::string prefix;
-            if (is_nemotron) {
-                prefix = fmt::format("base_model.model.backbone.layers.{}", l);
-            } else {
-                prefix = fmt::format("base_model.model.model.layers.{}", l);
+            auto add_grouped_layer = [&](const std::string& module_prefix,
+                                         const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& layer) {
+                if (!layer.has_value()) return;
+                if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
+                if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
+            };
+            auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+                auto to_lower = [](std::string_view in) {
+                    std::string out(in);
+                    for (auto& c : out)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    return out;
+                };
+                const std::string h = to_lower(haystack);
+                const std::string n = to_lower(needle);
+                return h.find(n) != std::string::npos;
+            };
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) {
+                throw std::runtime_error("get_lora_gradients: DSL model required");
             }
-
-            // Attention LoRA (same for dense and MoE)
-            if (is_nemotron) {
-                const std::string mixer_prefix = prefix + ".mixer";
-                add_layer(mixer_prefix + ".q_proj", block.attention.q);
-                add_layer(mixer_prefix + ".k_proj", block.attention.k);
-                add_layer(mixer_prefix + ".v_proj", block.attention.v);
-                add_layer(mixer_prefix + ".o_proj", block.attention.o);
-            } else {
-                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+            if (!dsl_model->lora_enabled()) {
+                throw std::runtime_error("get_lora_gradients: DSL model is not configured for LoRA");
             }
+            const auto& config = *ctx.Model->get_run_state().Config;
+            const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
+                                     contains_ci(config.ArchitectureName, "nemotron") ||
+                                     contains_ci(config.ModelTypeName, "nemotron");
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-            // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
-            if (is_nemotron) {
-                const std::string mixer_prefix = prefix + ".mixer";
-                add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
-                add_layer(mixer_prefix + ".up_proj", block.mlp.up);
-                add_layer(mixer_prefix + ".down_proj", block.mlp.down);
-            } else {
-                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
-            }
-
-            // MoE LoRA (if this layer is an MoE block).
-            if (block.moe.use_grouped) {
-                std::string expert_prefix;
+            for (int l = 0; l < config.NumLayers; ++l) {
+                bool unused_accumulate = false;
+                auto& block =
+                    dsl_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
+                std::string prefix;
                 if (is_nemotron) {
-                    expert_prefix = fmt::format("{}.mixer.experts", prefix);
+                    prefix = fmt::format("base_model.model.backbone.layers.{}", l);
                 } else {
-                    expert_prefix = fmt::format("{}.mlp.experts", prefix);
+                    prefix = fmt::format("base_model.model.model.layers.{}", l);
                 }
-                add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
-                add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
-                add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
-                add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
-            } else {
-                for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
-                    auto& expert = block.moe.experts[e];
+
+                // Attention LoRA (same for dense and MoE)
+                if (is_nemotron) {
+                    const std::string mixer_prefix = prefix + ".mixer";
+                    add_layer(mixer_prefix + ".q_proj", block.attention.q);
+                    add_layer(mixer_prefix + ".k_proj", block.attention.k);
+                    add_layer(mixer_prefix + ".v_proj", block.attention.v);
+                    add_layer(mixer_prefix + ".o_proj", block.attention.o);
+                } else {
+                    add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+                    add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+                    add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+                    add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+                }
+
+                // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
+                if (is_nemotron) {
+                    const std::string mixer_prefix = prefix + ".mixer";
+                    add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
+                    add_layer(mixer_prefix + ".up_proj", block.mlp.up);
+                    add_layer(mixer_prefix + ".down_proj", block.mlp.down);
+                } else {
+                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                }
+
+                // MoE LoRA (if this layer is an MoE block).
+                if (block.moe.use_grouped) {
                     std::string expert_prefix;
                     if (is_nemotron) {
-                        expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
+                        expert_prefix = fmt::format("{}.mixer.experts", prefix);
                     } else {
-                        expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                        expert_prefix = fmt::format("{}.mlp.experts", prefix);
                     }
-                    add_layer(expert_prefix + ".gate_proj", expert.gate);
-                    add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
-                    add_layer(expert_prefix + ".up_proj", expert.up);
-                    add_layer(expert_prefix + ".down_proj", expert.down);
+                    add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
+                    add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
+                    add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
+                    add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
+                } else {
+                    for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                        auto& expert = block.moe.experts[e];
+                        std::string expert_prefix;
+                        if (is_nemotron) {
+                            expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
+                        } else {
+                            expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                        }
+                        add_layer(expert_prefix + ".gate_proj", expert.gate);
+                        add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
+                        add_layer(expert_prefix + ".up_proj", expert.up);
+                        add_layer(expert_prefix + ".down_proj", expert.down);
+                    }
                 }
             }
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }, gpu_id);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        },
+        gpu_id);
     return result;
 }
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(int gpu_id) {
     std::vector<std::pair<std::string, Tensor>> result;
-    run_work([&result](sThreadContext& ctx) {
-        auto add_layer = [&](const std::string& module_prefix,
-                             const std::optional<modules::LoRALayerWeights<Tensor>>& layer) {
-            if (!layer.has_value()) return;
-            if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
-            if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
-        };
-        auto add_grouped_layer = [&](const std::string& module_prefix,
-                                     const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& layer) {
-            if (!layer.has_value()) return;
-            if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
-            if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
-        };
-        auto contains_ci = [](std::string_view haystack, std::string_view needle) {
-            auto to_lower = [](std::string_view in) {
-                std::string out(in);
-                for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                return out;
+    run_work(
+        [&result](sThreadContext& ctx) {
+            auto add_layer = [&](const std::string& module_prefix,
+                                 const std::optional<modules::LoRALayerWeights<Tensor>>& layer) {
+                if (!layer.has_value()) return;
+                if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
+                if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
             };
-            const std::string h = to_lower(haystack);
-            const std::string n = to_lower(needle);
-            return h.find(n) != std::string::npos;
-        };
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("get_lora_weights: DSL model required");
-        }
-        if (!dsl_model->lora_enabled()) {
-            throw std::runtime_error("get_lora_weights: DSL model is not configured for LoRA");
-        }
-        const auto& config = *ctx.Model->get_run_state().Config;
-        const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
-                                 contains_ci(config.ArchitectureName, "nemotron") ||
-                                 contains_ci(config.ModelTypeName, "nemotron");
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        for (int l = 0; l < config.NumLayers; ++l) {
-            auto& block = dsl_model->lora_weights().get_block(l, /*stream=*/nullptr);
-            std::string prefix;
-            if (is_nemotron) {
-                prefix = fmt::format("base_model.model.backbone.layers.{}", l);
-            } else {
-                prefix = fmt::format("base_model.model.model.layers.{}", l);
+            auto add_grouped_layer = [&](const std::string& module_prefix,
+                                         const std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& layer) {
+                if (!layer.has_value()) return;
+                if (layer->A.Data) result.emplace_back(module_prefix + ".lora_A.weight", layer->A);
+                if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
+            };
+            auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+                auto to_lower = [](std::string_view in) {
+                    std::string out(in);
+                    for (auto& c : out)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    return out;
+                };
+                const std::string h = to_lower(haystack);
+                const std::string n = to_lower(needle);
+                return h.find(n) != std::string::npos;
+            };
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) {
+                throw std::runtime_error("get_lora_weights: DSL model required");
             }
-
-            // Attention LoRA
-            if (is_nemotron) {
-                const std::string mixer_prefix = prefix + ".mixer";
-                add_layer(mixer_prefix + ".q_proj", block.attention.q);
-                add_layer(mixer_prefix + ".k_proj", block.attention.k);
-                add_layer(mixer_prefix + ".v_proj", block.attention.v);
-                add_layer(mixer_prefix + ".o_proj", block.attention.o);
-            } else {
-                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+            if (!dsl_model->lora_enabled()) {
+                throw std::runtime_error("get_lora_weights: DSL model is not configured for LoRA");
             }
+            const auto& config = *ctx.Model->get_run_state().Config;
+            const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
+                                     contains_ci(config.ArchitectureName, "nemotron") ||
+                                     contains_ci(config.ModelTypeName, "nemotron");
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-            // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
-            if (is_nemotron) {
-                const std::string mixer_prefix = prefix + ".mixer";
-                add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
-                add_layer(mixer_prefix + ".up_proj", block.mlp.up);
-                add_layer(mixer_prefix + ".down_proj", block.mlp.down);
-            } else {
-                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
-            }
-
-            // MoE LoRA (if this layer is an MoE block).
-            if (block.moe.use_grouped) {
-                std::string expert_prefix;
+            for (int l = 0; l < config.NumLayers; ++l) {
+                auto& block = dsl_model->lora_weights().get_block(l, /*stream=*/nullptr);
+                std::string prefix;
                 if (is_nemotron) {
-                    expert_prefix = fmt::format("{}.mixer.experts", prefix);
+                    prefix = fmt::format("base_model.model.backbone.layers.{}", l);
                 } else {
-                    expert_prefix = fmt::format("{}.mlp.experts", prefix);
+                    prefix = fmt::format("base_model.model.model.layers.{}", l);
                 }
-                add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
-                add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
-                add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
-                add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
-            } else {
-                for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
-                    auto& expert = block.moe.experts[e];
+
+                // Attention LoRA
+                if (is_nemotron) {
+                    const std::string mixer_prefix = prefix + ".mixer";
+                    add_layer(mixer_prefix + ".q_proj", block.attention.q);
+                    add_layer(mixer_prefix + ".k_proj", block.attention.k);
+                    add_layer(mixer_prefix + ".v_proj", block.attention.v);
+                    add_layer(mixer_prefix + ".o_proj", block.attention.o);
+                } else {
+                    add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+                    add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+                    add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+                    add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+                }
+
+                // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
+                if (is_nemotron) {
+                    const std::string mixer_prefix = prefix + ".mixer";
+                    add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
+                    add_layer(mixer_prefix + ".up_proj", block.mlp.up);
+                    add_layer(mixer_prefix + ".down_proj", block.mlp.down);
+                } else {
+                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                }
+
+                // MoE LoRA (if this layer is an MoE block).
+                if (block.moe.use_grouped) {
                     std::string expert_prefix;
                     if (is_nemotron) {
-                        expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
+                        expert_prefix = fmt::format("{}.mixer.experts", prefix);
                     } else {
-                        expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                        expert_prefix = fmt::format("{}.mlp.experts", prefix);
                     }
-                    add_layer(expert_prefix + ".gate_proj", expert.gate);
-                    add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
-                    add_layer(expert_prefix + ".up_proj", expert.up);
-                    add_layer(expert_prefix + ".down_proj", expert.down);
+                    add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
+                    add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
+                    add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
+                    add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
+                } else {
+                    for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                        auto& expert = block.moe.experts[e];
+                        std::string expert_prefix;
+                        if (is_nemotron) {
+                            expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
+                        } else {
+                            expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                        }
+                        add_layer(expert_prefix + ".gate_proj", expert.gate);
+                        add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
+                        add_layer(expert_prefix + ".up_proj", expert.up);
+                        add_layer(expert_prefix + ".down_proj", expert.down);
+                    }
                 }
             }
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }, gpu_id);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        },
+        gpu_id);
     return result;
 }
 
 std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
-                                                        const std::int32_t* targets,
-                                                        int B, int T, bool use_lora,
-                                                        const std::int32_t* position_ids,
-                                                        const float* temperatures) {
+                                                       const std::int32_t* targets,
+                                                       int B,
+                                                       int T,
+                                                       bool use_lora,
+                                                       const std::int32_t* position_ids,
+                                                       const float* temperatures) {
     std::vector<float> result;
     run_work([&result, input_ids, targets, B, T, use_lora, position_ids, temperatures](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("compute_logprobs: model is not a DslModel");
         }
-        auto logprobs = dsl_model->compute_logprobs(input_ids, targets, B, T, use_lora,
-                                                    *ctx.Communicator, position_ids, temperatures);
+        auto logprobs =
+            dsl_model
+                ->compute_logprobs(input_ids, targets, B, T, use_lora, *ctx.Communicator, position_ids, temperatures);
         if (ctx.Communicator->local_rank() == 0) {
             result = std::move(logprobs);
         }
@@ -1603,12 +1684,11 @@ std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input
     return result;
 }
 
-void MultiGPUPyTrainer::step_with_custom_loss(
-        const std::int32_t* inputs,
-        const std::int32_t* targets,
-        const float* per_token_grads,
-        const std::int32_t* position_ids,
-        const float* temperatures) {
+void MultiGPUPyTrainer::step_with_custom_loss(const std::int32_t* inputs,
+                                              const std::int32_t* targets,
+                                              const float* per_token_grads,
+                                              const std::int32_t* position_ids,
+                                              const float* temperatures) {
     // Distribute inputs, targets, and position_ids to each GPU's CPU-side buffers.
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
@@ -1621,8 +1701,8 @@ void MultiGPUPyTrainer::step_with_custom_loss(
         Tensor pos_buf = ctx.Model->get_position_ids_buffer();
         auto* pb = pos_buf.get<std::int32_t>();
         const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
-        const std::size_t pos_stride = static_cast<std::size_t>(pos_planes) *
-                                       static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const std::size_t pos_stride =
+            static_cast<std::size_t>(pos_planes) * static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
         const int src_row = host_batch_row_for_local_rank(i, ep_size);
 
         std::memcpy(ib, inputs + src_row * B * T, B * T * sizeof(std::int32_t));
@@ -1642,11 +1722,16 @@ void MultiGPUPyTrainer::step_with_custom_loss(
 
     if (mTrainMicroStep >= mGradAccumulation) {
         throw std::runtime_error(fmt::format("step_with_custom_loss: micro_step {} >= grad_accumulation {}",
-                                             mTrainMicroStep, mGradAccumulation));
+                                             mTrainMicroStep,
+                                             mGradAccumulation));
     }
 
-    run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
-              per_token_grads, temperatures, B = this->B, T = this->T](sThreadContext& ctx) {
+    run_work([micro_idx = mTrainMicroStep,
+              micro_batches = mGradAccumulation,
+              per_token_grads,
+              temperatures,
+              B = this->B,
+              T = this->T](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("step_with_custom_loss: model is not a DslModel");
@@ -1660,26 +1745,29 @@ void MultiGPUPyTrainer::step_with_custom_loss(
         const int gpu_rank = ctx.Communicator->local_rank();
         const int gpu_ep_size = ctx.Communicator->ep_size();
         const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
-        const float* grads_for_this_gpu = per_token_grads +
-                                          static_cast<std::ptrdiff_t>(src_row) * B * T;
+        const float* grads_for_this_gpu = per_token_grads + static_cast<std::ptrdiff_t>(src_row) * B * T;
         const float* temps_for_this_gpu = nullptr;
         if (temperatures) {
             temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(src_row) * B * T;
         }
 
-        dsl_model->step_with_custom_loss(inputs_tensor, position_ids_tensor, targets_tensor,
-                                          grads_for_this_gpu, micro_batches, micro_idx,
-                                          *ctx.Communicator, temps_for_this_gpu);
+        dsl_model->step_with_custom_loss(inputs_tensor,
+                                         position_ids_tensor,
+                                         targets_tensor,
+                                         grads_for_this_gpu,
+                                         micro_batches,
+                                         micro_idx,
+                                         *ctx.Communicator,
+                                         temps_for_this_gpu);
     });
 
     ++mTrainMicroStep;
 }
 
-std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
-        const std::int32_t* inputs,
-        const std::int32_t* targets,
-        const std::int32_t* position_ids,
-        const float* temperatures) {
+std::vector<float> MultiGPUPyTrainer::forward_for_grpo(const std::int32_t* inputs,
+                                                       const std::int32_t* targets,
+                                                       const std::int32_t* position_ids,
+                                                       const float* temperatures) {
     // Distribute inputs, targets, and position_ids to each GPU's CPU-side buffers.
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
@@ -1708,13 +1796,17 @@ std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
     }
 
     if (mTrainMicroStep >= mGradAccumulation) {
-        throw std::runtime_error(fmt::format("forward_for_grpo: micro_step {} >= grad_accumulation {}",
-                                             mTrainMicroStep, mGradAccumulation));
+        throw std::runtime_error(
+            fmt::format("forward_for_grpo: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
     }
 
     std::vector<float> result;
-    run_work([&result, micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
-              temperatures, B = this->B, T = this->T](sThreadContext& ctx) {
+    run_work([&result,
+              micro_idx = mTrainMicroStep,
+              micro_batches = mGradAccumulation,
+              temperatures,
+              B = this->B,
+              T = this->T](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("forward_for_grpo: model is not a DslModel");
@@ -1732,9 +1824,13 @@ std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
             temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(src_row) * B * T;
         }
 
-        auto logprobs = dsl_model->forward_for_grpo(inputs_tensor, position_ids_tensor, targets_tensor,
-                                                      micro_batches, micro_idx,
-                                                      *ctx.Communicator, temps_for_this_gpu);
+        auto logprobs = dsl_model->forward_for_grpo(inputs_tensor,
+                                                    position_ids_tensor,
+                                                    targets_tensor,
+                                                    micro_batches,
+                                                    micro_idx,
+                                                    *ctx.Communicator,
+                                                    temps_for_this_gpu);
         if (ctx.Communicator->local_rank() == 0) {
             result = std::move(logprobs);
         }
@@ -1745,44 +1841,50 @@ std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
 
 void MultiGPUPyTrainer::backward_grpo(const float* per_token_grads) {
     if (mTrainMicroStep >= mGradAccumulation) {
-        throw std::runtime_error(fmt::format("backward_grpo: micro_step {} >= grad_accumulation {}",
-                                             mTrainMicroStep, mGradAccumulation));
+        throw std::runtime_error(
+            fmt::format("backward_grpo: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
     }
 
-    run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
-              per_token_grads, B = this->B, T = this->T](sThreadContext& ctx) {
-        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-        if (!dsl_model) {
-            throw std::runtime_error("backward_grpo: model is not a DslModel");
-        }
+    run_work(
+        [micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation, per_token_grads, B = this->B, T = this->T](
+            sThreadContext& ctx) {
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) {
+                throw std::runtime_error("backward_grpo: model is not a DslModel");
+            }
 
-        Tensor inputs_tensor = ctx.Model->get_input_buffer();
-        Tensor targets_tensor = ctx.Model->get_target_buffer();
+            Tensor inputs_tensor = ctx.Model->get_input_buffer();
+            Tensor targets_tensor = ctx.Model->get_target_buffer();
 
-        const int gpu_rank = ctx.Communicator->local_rank();
-        const int gpu_ep_size = ctx.Communicator->ep_size();
-        const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
-        const float* grads_for_this_gpu = per_token_grads +
-                                          static_cast<std::ptrdiff_t>(src_row) * B * T;
+            const int gpu_rank = ctx.Communicator->local_rank();
+            const int gpu_ep_size = ctx.Communicator->ep_size();
+            const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
+            const float* grads_for_this_gpu = per_token_grads + static_cast<std::ptrdiff_t>(src_row) * B * T;
 
-        dsl_model->backward_grpo(inputs_tensor, targets_tensor, grads_for_this_gpu,
-                                  micro_batches, micro_idx, *ctx.Communicator);
-    });
+            dsl_model->backward_grpo(inputs_tensor,
+                                     targets_tensor,
+                                     grads_for_this_gpu,
+                                     micro_batches,
+                                     micro_idx,
+                                     *ctx.Communicator);
+        });
 
     ++mTrainMicroStep;
 }
 
 int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {
     int result = 0;
-    run_work([&result](sThreadContext& ctx) {
-        auto& rs = ctx.Model->get_run_state();
-        if (!rs.ValidTokenCount.Data) {
-            result = 0;
-            return;
-        }
-        CUDA_CHECK(cudaMemcpyAsync(&result, rs.ValidTokenCount.Data, sizeof(int),
-                                   cudaMemcpyDeviceToHost, rs.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-    }, gpu_id);
+    run_work(
+        [&result](sThreadContext& ctx) {
+            auto& rs = ctx.Model->get_run_state();
+            if (!rs.ValidTokenCount.Data) {
+                result = 0;
+                return;
+            }
+            CUDA_CHECK(
+                cudaMemcpyAsync(&result, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost, rs.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        },
+        gpu_id);
     return result;
 }

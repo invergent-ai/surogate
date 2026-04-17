@@ -39,7 +39,11 @@ class Tensor;
 class DataLoader {
 public:
     DataLoader(const std::string& file_pattern, int seq_len, int rank, int world_size, unsigned long seed = 42);
-    DataLoader(const std::vector<std::string>& file_list, int seq_len, int rank, int world_size, unsigned long seed = 42);
+    DataLoader(const std::vector<std::string>& file_list,
+               int seq_len,
+               int rank,
+               int world_size,
+               unsigned long seed = 42);
 
     static std::vector<std::string> match_files(const std::string& pattern);
 
@@ -54,22 +58,44 @@ public:
     //! Check if there is enough data left in the current epoch for `n` calls to `load_batch`
     bool has_next(int n) const;
 
-    const std::string& file_name(int i) const { return mFileInfos.at(i).FileName; }
-    std::int32_t file_tokens(int i) const { return mFileInfos.at(i).NumTokens; }
-    int seq_len() const { return mSeqLen; }
+    const std::string& file_name(int i) const {
+        return mFileInfos.at(i).FileName;
+    }
+    std::int32_t file_tokens(int i) const {
+        return mFileInfos.at(i).NumTokens;
+    }
+    int seq_len() const {
+        return mSeqLen;
+    }
 
-    std::int32_t file_index() const { return mFileIndex; }
+    std::int32_t file_index() const {
+        return mFileIndex;
+    }
     std::int32_t chunk_index() const;
-    std::int32_t epoch() const { return mEpoch; }
-    std::uint64_t seed() const { return mSeed; }
+    std::int32_t epoch() const {
+        return mEpoch;
+    }
+    std::uint64_t seed() const {
+        return mSeed;
+    }
 
-    std::size_t num_chunks_in_file() const { return mChunkOffsets.size(); }
+    std::size_t num_chunks_in_file() const {
+        return mChunkOffsets.size();
+    }
 
-    std::size_t num_files() const { return mShuffledFiles.size(); }
-    std::int64_t num_chunks() const { return mTotalChunks; }
-    std::int64_t num_tokens() const { return mTotalTokens; }
+    std::size_t num_files() const {
+        return mShuffledFiles.size();
+    }
+    std::int64_t num_chunks() const {
+        return mTotalChunks;
+    }
+    std::int64_t num_tokens() const {
+        return mTotalTokens;
+    }
 
-    std::int32_t vocab_size() const { return mVocabSize; }
+    std::int32_t vocab_size() const {
+        return mVocabSize;
+    }
     float progress() const;
 
     void set_state(std::uint64_t seed, std::int32_t epoch, std::int32_t file_index, std::int32_t chunk_index);
@@ -116,4 +142,4 @@ private:
     std::vector<std::uint8_t> mMaskBuffer;
 };
 
-#endif //SUROGATE_TRAINING_DATALOADER_H
+#endif  //SUROGATE_TRAINING_DATALOADER_H

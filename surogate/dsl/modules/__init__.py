@@ -1,12 +1,12 @@
 """Standard Modules for Python DSL"""
 
-from .linear import Linear
-from .rmsnorm import RMSNorm, FusedResidualRMSNorm
-from .mlp import SwiGLUMLP, GatedMLP
-from .attention import GQAAttention, Qwen3Attention, GptOssAttention
-from .mamba import Mamba2Mixer, SimpleMLP
-from .moe import MoEExpertsGated, MoEExpertsSimple, MoESharedExpert, GptOssMoE
+from .attention import GptOssAttention, GQAAttention, Qwen3Attention
 from .gated_delta_rule import ChunkGatedDeltaRule
+from .linear import Linear
+from .mamba import Mamba2Mixer, SimpleMLP
+from .mlp import GatedMLP, SwiGLUMLP
+from .moe import GptOssMoE, MoEExpertsGated, MoEExpertsSimple, MoESharedExpert
+from .rmsnorm import FusedResidualRMSNorm, RMSNorm
 
 __all__ = [
     "Linear",

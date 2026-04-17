@@ -16,10 +16,11 @@ DEFAULT_API_KEY_VAR = "PRIME_API_KEY"
 DEFAULT_API_BASE_URL = "https://api.pinference.ai/api/v1"
 DEFAULT_CLIENT_TYPE = "openai_chat_completions"
 
+
 def prepare_command_parser(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
-        
+
     parser.add_argument(
         "env_id_or_config",
         type=str,
@@ -71,20 +72,14 @@ def prepare_command_parser(parser=None):
         "-k",
         type=str,
         default=None,
-        help=(
-            "Environment variable name for API key "
-            "(defaults to PRIME_API_KEY when not set and not in registry)"
-        ),
+        help=("Environment variable name for API key (defaults to PRIME_API_KEY when not set and not in registry)"),
     )
     parser.add_argument(
         "--api-base-url",
         "-b",
         type=str,
         default=None,
-        help=(
-            "Base URL for API. "
-            "(defaults to https://api.pinference.ai/api/v1 when not set and not in registry)"
-        ),
+        help=("Base URL for API. (defaults to https://api.pinference.ai/api/v1 when not set and not in registry)"),
     )
     parser.add_argument(
         "--header",
@@ -120,9 +115,7 @@ def prepare_command_parser(parser=None):
         default=None,
         help="Maximum number of tokens to generate (unset to use model default)",
     )
-    parser.add_argument(
-        "--temperature", "-T", type=float, default=None, help="Temperature for sampling"
-    )
+    parser.add_argument("--temperature", "-T", type=float, default=None, help="Temperature for sampling")
     parser.add_argument(
         "--sampling-args",
         "-S",
@@ -133,9 +126,7 @@ def prepare_command_parser(parser=None):
             'Example: \'{"enable_thinking": false, "max_tokens": 256}\''
         ),
     )
-    parser.add_argument(
-        "--verbose", "-v", default=False, action="store_true", help="Verbose output"
-    )
+    parser.add_argument("--verbose", "-v", default=False, action="store_true", help="Verbose output")
     parser.add_argument(
         "--no-interleave-scoring",
         "-N",
@@ -223,14 +214,20 @@ def prepare_command_parser(parser=None):
         default=None,
         help="Heartbeat URL for uptime monitoring",
     )
-    
+
     return parser
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     import asyncio
     from pathlib import Path
     from typing import cast
 
+    from verifiers.scripts.eval import (
+        find_latest_incomplete_eval_results_path,
+        get_env_eval_defaults,
+        is_valid_eval_results_path,
+    )
     from verifiers.types import (
         ClientConfig,
         ClientType,
@@ -246,7 +243,6 @@ if __name__ == '__main__':
         run_evaluations_tui,
     )
     from verifiers.utils.install_utils import check_hub_env_installed
-    from verifiers.scripts.eval import find_latest_incomplete_eval_results_path, get_env_eval_defaults, is_valid_eval_results_path
 
     args = prepare_command_parser().parse_args(sys.argv[1:])
 
@@ -254,9 +250,7 @@ if __name__ == '__main__':
     if args.env_id_or_config.endswith(".toml"):
         path = Path(args.env_id_or_config)
         if not path.is_file():
-            raise FileNotFoundError(
-                f"TOML config file not found: {path}\nPlease check the path is correct."
-            )
+            raise FileNotFoundError(f"TOML config file not found: {path}\nPlease check the path is correct.")
         raw_eval_configs = load_toml_config(path)
     else:
         # CLI path: convert args to dict
@@ -274,9 +268,7 @@ if __name__ == '__main__':
         raw_rollouts = raw.get("rollouts_per_example")
 
         num_examples = (
-            raw_num_examples
-            if raw_num_examples is not None
-            else env_defaults.get("num_examples", DEFAULT_NUM_EXAMPLES)
+            raw_num_examples if raw_num_examples is not None else env_defaults.get("num_examples", DEFAULT_NUM_EXAMPLES)
         )
         rollouts_per_example = (
             raw_rollouts
@@ -285,19 +277,11 @@ if __name__ == '__main__':
         )
 
         if raw_num_examples is None:
-            source = (
-                "pyproject.toml" if "num_examples" in env_defaults else "global default"
-            )
+            source = "pyproject.toml" if "num_examples" in env_defaults else "global default"
             logger.debug(f"Using num_examples={num_examples} from {source}")
         if raw_rollouts is None:
-            source = (
-                "pyproject.toml"
-                if "rollouts_per_example" in env_defaults
-                else "global default"
-            )
-            logger.debug(
-                f"Using rollouts_per_example={rollouts_per_example} from {source}"
-            )
+            source = "pyproject.toml" if "rollouts_per_example" in env_defaults else "global default"
+            logger.debug(f"Using rollouts_per_example={rollouts_per_example} from {source}")
 
         # Resolve model and endpoint config
         endpoints_path = raw.get("endpoints_path", DEFAULT_ENDPOINTS_PATH)
@@ -306,9 +290,7 @@ if __name__ == '__main__':
         raw_endpoint_id = raw.get("endpoint_id")
         raw_model_field = raw.get("model")
         if raw_endpoint_id is not None and raw_model_field is not None:
-            raise ValueError(
-                "Cannot set both 'endpoint_id' and 'model' in eval config; choose one."
-            )
+            raise ValueError("Cannot set both 'endpoint_id' and 'model' in eval config; choose one.")
         if raw_endpoint_id is not None and not isinstance(raw_endpoint_id, str):
             raise ValueError("'endpoint_id' must be a string when provided.")
         if isinstance(raw_endpoint_id, str) and not raw_endpoint_id:
@@ -323,9 +305,7 @@ if __name__ == '__main__':
             )
 
         raw_model = raw_model_field if raw_model_field is not None else DEFAULT_MODEL
-        endpoint_lookup_id = (
-            raw_endpoint_id if raw_endpoint_id is not None else raw_model
-        )
+        endpoint_lookup_id = raw_endpoint_id if raw_endpoint_id is not None else raw_model
         raw_client_type = raw.get("api_client_type")
         raw_api_key_var = raw.get("api_key_var")
         raw_api_base_url = raw.get("api_base_url")
@@ -364,9 +344,7 @@ if __name__ == '__main__':
                 )
             model = endpoint["model"]
             client_type = (
-                raw_client_type
-                if client_type_override
-                else endpoint.get("api_client_type", DEFAULT_CLIENT_TYPE)
+                raw_client_type if client_type_override else endpoint.get("api_client_type", DEFAULT_CLIENT_TYPE)
             )
             if api_key_override or api_base_url_override or client_type_override:
                 logger.debug(
@@ -384,21 +362,15 @@ if __name__ == '__main__':
                 )
         else:
             if raw_endpoint_id is not None:
-                raise ValueError(
-                    f"Endpoint id '{raw_endpoint_id}' not found in endpoint registry at {endpoints_path}"
-                )
+                raise ValueError(f"Endpoint id '{raw_endpoint_id}' not found in endpoint registry at {endpoints_path}")
             logger.debug(
                 "Model '%s' not found in endpoint registry, using defaults",
                 raw_model,
             )
             model = raw_model
             api_key_var = raw_api_key_var if api_key_override else DEFAULT_API_KEY_VAR
-            api_base_url = (
-                raw_api_base_url if api_base_url_override else DEFAULT_API_BASE_URL
-            )
-            client_type = (
-                raw_client_type if client_type_override else DEFAULT_CLIENT_TYPE
-            )
+            api_base_url = raw_api_base_url if api_base_url_override else DEFAULT_API_BASE_URL
+            client_type = raw_client_type if client_type_override else DEFAULT_CLIENT_TYPE
 
         # Merge sampling args
         merged_sampling_args: dict = {}
@@ -427,16 +399,10 @@ if __name__ == '__main__':
         resolved_api_key_var = api_key_var
 
         endpoint_configs: list[EndpointClientConfig] = []
-        if (
-            endpoint_group is not None
-            and not api_base_url_override
-            and len(endpoint_group) > 1
-        ):
+        if endpoint_group is not None and not api_base_url_override and len(endpoint_group) > 1:
             endpoint_configs = [
                 EndpointClientConfig(
-                    api_key_var=(
-                        resolved_api_key_var if api_key_override else endpoint["key"]
-                    ),
+                    api_key_var=(resolved_api_key_var if api_key_override else endpoint["key"]),
                     api_base_url=endpoint["url"],
                     extra_headers=merged_headers,
                 )
@@ -462,9 +428,7 @@ if __name__ == '__main__':
         if isinstance(resume_arg, str):
             resume_path = Path(resume_arg)
             if not is_valid_eval_results_path(resume_path):
-                raise ValueError(
-                    f"Resume path {resume_path} is not a valid evaluation results path"
-                )
+                raise ValueError(f"Resume path {resume_path} is not a valid evaluation results path")
             logger.info(f"Resuming from explicit path: {resume_path}")
         elif resume_arg is True:
             auto_resume_path = find_latest_incomplete_eval_results_path(
@@ -478,9 +442,7 @@ if __name__ == '__main__':
                 resume_path = auto_resume_path
                 logger.info(f"Auto-resuming from: {resume_path}")
             else:
-                logger.info(
-                    "No matching incomplete run found for --resume; starting a new run"
-                )
+                logger.info("No matching incomplete run found for --resume; starting a new run")
         elif resume_arg in (None, False):
             pass
         else:
@@ -526,9 +488,7 @@ if __name__ == '__main__':
     for config in eval_configs:
         logger.debug(f"Evaluation config: {config.model_dump_json(indent=2)}")
 
-    eval_run_config = EvalRunConfig(
-        evals=eval_configs, heartbeat_url=args.heartbeat_url
-    )
+    eval_run_config = EvalRunConfig(evals=eval_configs, heartbeat_url=args.heartbeat_url)
     if args.debug:
         asyncio.run(run_evaluations(eval_run_config))
     else:

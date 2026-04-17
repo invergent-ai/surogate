@@ -22,16 +22,16 @@ namespace modules {
  * Each strategy has different trade-offs between memory savings and accuracy.
  */
 enum class QLoRAQuantStrategy {
-    None,           ///< No quantization (regular LoRA with BF16 base model)
-    FP8,            ///< FP8 E4M3 with per-block scales (online quantization)
-    NVFP4,          ///< FP4 E2M1 with two-level block scales for SM 100+ (online quantization)
-    BitsAndBytes,   ///< BitsAndBytes-style NF4 with per-block absmax and double quantization
+    None,          ///< No quantization (regular LoRA with BF16 base model)
+    FP8,           ///< FP8 E4M3 with per-block scales (online quantization)
+    NVFP4,         ///< FP4 E2M1 with two-level block scales for SM 100+ (online quantization)
+    BitsAndBytes,  ///< BitsAndBytes-style NF4 with per-block absmax and double quantization
 
     // Pre-quantized HF model loading (no online quantization, weights already quantized)
-    PrequantFP8,    ///< HF fine-grained FP8: per-block (128x128) FP8 E4M3 + FP32 inverse scales
-    PrequantNVFP4,  ///< HF NVFP4 (ModelOpt): packed FP4 + FP8 block scales + FP32 global scale
-    PrequantMXFP4,  ///< HF MXFP4: packed FP4 + E8M0 shared exponents per 32-element block
-    PrequantBnBNF4, ///< HF BitsAndBytes NF4: packed NF4 + per-block absmax (± double quant)
+    PrequantFP8,     ///< HF fine-grained FP8: per-block (128x128) FP8 E4M3 + FP32 inverse scales
+    PrequantNVFP4,   ///< HF NVFP4 (ModelOpt): packed FP4 + FP8 block scales + FP32 global scale
+    PrequantMXFP4,   ///< HF MXFP4: packed FP4 + E8M0 shared exponents per 32-element block
+    PrequantBnBNF4,  ///< HF BitsAndBytes NF4: packed NF4 + per-block absmax (± double quant)
 };
 
 /**
@@ -164,12 +164,16 @@ struct QLoRAConfig {
     /**
      * @brief Check if this is an MoE model
      */
-    [[nodiscard]] bool is_moe() const { return num_experts > 0; }
+    [[nodiscard]] bool is_moe() const {
+        return num_experts > 0;
+    }
 
     /**
      * @brief Check if shared expert is enabled
      */
-    [[nodiscard]] bool use_shared_expert() const { return num_shared_experts > 0; }
+    [[nodiscard]] bool use_shared_expert() const {
+        return num_shared_experts > 0;
+    }
 
     /**
      * @brief Check if quantization is active
@@ -210,10 +214,8 @@ struct QLoRAConfig {
      * @brief Check if loading a pre-quantized HF model (no online quantization)
      */
     [[nodiscard]] bool is_prequantized() const {
-        return strategy == QLoRAQuantStrategy::PrequantFP8 ||
-               strategy == QLoRAQuantStrategy::PrequantNVFP4 ||
-               strategy == QLoRAQuantStrategy::PrequantMXFP4 ||
-               strategy == QLoRAQuantStrategy::PrequantBnBNF4;
+        return strategy == QLoRAQuantStrategy::PrequantFP8 || strategy == QLoRAQuantStrategy::PrequantNVFP4 ||
+               strategy == QLoRAQuantStrategy::PrequantMXFP4 || strategy == QLoRAQuantStrategy::PrequantBnBNF4;
     }
 
     /**
@@ -345,7 +347,7 @@ struct QLoRAConfig {
         QLoRAConfig cfg;
         cfg.enabled = true;
         cfg.strategy = QLoRAQuantStrategy::PrequantBnBNF4;
-        cfg.scale_config.block_size = 64;  // BnB default block size
+        cfg.scale_config.block_size = 64;     // BnB default block size
         cfg.base_dtype = ETensorDType::BYTE;  // Packed NF4 stored as uint8
         cfg.adapter_dtype = ETensorDType::BF16;
         cfg.bnb_double_quant = source_double_quant;
@@ -377,6 +379,6 @@ inline const char* to_string(QLoRAQuantStrategy strategy) {
     }
 }
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_QLORA_QLORA_CONFIG_H
+#endif  // SUROGATE_SRC_MODULES_QLORA_QLORA_CONFIG_H

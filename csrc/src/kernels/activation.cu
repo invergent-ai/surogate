@@ -10,30 +10,30 @@
 
 namespace {
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ float to_float(T v) {
     return static_cast<float>(v);
 }
 
-template<>
+template <>
 __device__ __forceinline__ float to_float<nv_bfloat16>(nv_bfloat16 v) {
     return __bfloat162float(v);
 }
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ T from_float(float v);
 
-template<>
+template <>
 __device__ __forceinline__ float from_float<float>(float v) {
     return v;
 }
 
-template<>
+template <>
 __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
 
-template<typename T>
+template <typename T>
 __global__ void relu2_forward_kernel(T* out, const T* inp, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -42,7 +42,7 @@ __global__ void relu2_forward_kernel(T* out, const T* inp, long n) {
     out[idx] = from_float<T>(y);
 }
 
-template<typename T>
+template <typename T>
 __global__ void relu2_backward_kernel(T* dinp, const T* inp, const T* dout, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -52,7 +52,7 @@ __global__ void relu2_backward_kernel(T* dinp, const T* inp, const T* dout, long
     dinp[idx] = from_float<T>(dx);
 }
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ float sigmoid(float x) {
     // Numerically stable sigmoid that avoids overflow in expf().
     if (x >= 0.0f) {
@@ -74,7 +74,7 @@ __device__ __forceinline__ float silu_grad(float x) {
     return fmaf(x, ds, s);  // s + x * ds
 }
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ float gelu_tanh(float x) {
     // GeLU tanh approximation (HF gelu_pytorch_tanh)
     constexpr float k0 = 0.7978845608f;  // sqrt(2/pi)
@@ -84,7 +84,7 @@ __device__ __forceinline__ float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanh_out);
 }
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ float gelu_tanh_grad(float x) {
     // Derivative of tanh-approx GeLU.
     constexpr float k0 = 0.7978845608f;  // sqrt(2/pi)
@@ -97,7 +97,7 @@ __device__ __forceinline__ float gelu_tanh_grad(float x) {
     return 0.5f * (1.0f + t) + 0.5f * x * dt;
 }
 
-template<typename T>
+template <typename T>
 __global__ void silu_forward_kernel(T* out, const T* inp, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -113,7 +113,7 @@ __global__ void silu_forward_kernel(T* out, const T* inp, long n) {
     out[idx] = from_float<T>(y);
 }
 
-template<typename T>
+template <typename T>
 __global__ void gelu_forward_kernel(T* out, const T* inp, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -121,7 +121,7 @@ __global__ void gelu_forward_kernel(T* out, const T* inp, long n) {
     out[idx] = from_float<T>(gelu_tanh<T>(x));
 }
 
-template<typename T>
+template <typename T>
 __global__ void silu_backward_kernel(T* dinp, const T* inp, const T* dout, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -132,7 +132,7 @@ __global__ void silu_backward_kernel(T* dinp, const T* inp, const T* dout, long 
     dinp[idx] = from_float<T>(dx);
 }
 
-template<typename T>
+template <typename T>
 __global__ void gelu_backward_kernel(T* dinp, const T* inp, const T* dout, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -142,7 +142,7 @@ __global__ void gelu_backward_kernel(T* dinp, const T* inp, const T* dout, long 
     dinp[idx] = from_float<T>(dx);
 }
 
-template<typename T>
+template <typename T>
 void launch_relu2_forward(T* out, const T* inp, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -151,7 +151,7 @@ void launch_relu2_forward(T* out, const T* inp, long n, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename T>
+template <typename T>
 void launch_relu2_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -160,7 +160,7 @@ void launch_relu2_backward(T* dinp, const T* inp, const T* dout, long n, cudaStr
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename T>
+template <typename T>
 void launch_silu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -169,7 +169,7 @@ void launch_silu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename T>
+template <typename T>
 void launch_gelu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -178,7 +178,7 @@ void launch_gelu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename T>
+template <typename T>
 void launch_silu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -187,7 +187,7 @@ void launch_silu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename T>
+template <typename T>
 void launch_gelu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -196,7 +196,7 @@ void launch_gelu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace
+}  // namespace
 
 void relu2_forward(float* out, const float* inp, long n, cudaStream_t stream) {
     launch_relu2_forward(out, inp, n, stream);

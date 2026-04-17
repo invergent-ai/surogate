@@ -1,5 +1,5 @@
 from collections.abc import AsyncGenerator
-from typing import ClassVar, Optional, Union
+from typing import ClassVar
 
 from fastapi import Request
 from pydantic import Field
@@ -8,17 +8,17 @@ from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, RequestResponseMetadata
 from vllm.entrypoints.openai.engine.serving import GenerationError
 from vllm.entrypoints.utils import get_max_tokens
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import BeamSearchParams, SamplingParams
-from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
-from vllm.exceptions import VLLMValidationError
 
 logger = init_logger(__name__)
 
+
 class ChatCompletionRequestWithTokens(ChatCompletionRequest):
-    field_names: ClassVar[Optional[set[str]]] = None
+    field_names: ClassVar[set[str] | None] = None
     tokens: list[int] = Field(description=("Prompt tokens to use for the request."))
 
 
@@ -28,8 +28,8 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
     async def create_chat_completion_with_tokens(
         self,
         request: ChatCompletionRequestWithTokens,
-        raw_request: Optional[Request] = None,
-    ) -> Union[AsyncGenerator[str, None], ChatCompletionResponse, ErrorResponse]:
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         """
         Chat Completion API similar to OpenAI's API.
 
@@ -60,7 +60,7 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
             return result
 
         conversation, engine_prompts = result
-        
+
         # We override prompt tokens directly.
         # VLM conversations use MITO (message-based) instead of TITO, so
         # multi_modal_data is not expected here.
@@ -93,7 +93,7 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 # If we are creating sub requests for multiple prompts, ensure that they
                 # have unique request ids.
                 sub_request_id = request_id if len(engine_prompts) == 1 else f"{request_id}_{i}"
-                
+
                 prompt_len = self._extract_prompt_len(engine_prompt)
                 if prompt_len >= max_model_len:
                     raise VLLMValidationError(
@@ -143,7 +143,7 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                     reasoning_ended = (
                         reasoning_parser.is_reasoning_end(prompt_token_ids or []) if reasoning_parser else None
                     )
-                    
+
                     generator = self.engine_client.generate(
                         engine_prompt,
                         sampling_params,

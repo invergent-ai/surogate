@@ -40,11 +40,11 @@ struct MatmulParams {
  * @brief FP8/FP4 format specification.
  */
 enum class Format {
-    BF16,    ///< BFloat16 (no quantization)
-    E4M3,    ///< FP8 E4M3 (max = 448)
-    E5M2,    ///< FP8 E5M2 (max = 57344)
-    E2M1,    ///< FP4 E2M1 (max = 6.0)
-    HYBRID   ///< E4M3 for forward, E5M2 for backward
+    BF16,   ///< BFloat16 (no quantization)
+    E4M3,   ///< FP8 E4M3 (max = 448)
+    E5M2,   ///< FP8 E5M2 (max = 57344)
+    E2M1,   ///< FP4 E2M1 (max = 6.0)
+    HYBRID  ///< E4M3 for forward, E5M2 for backward
 };
 
 /**
@@ -67,10 +67,18 @@ public:
     // Type checking methods (TransformerEngine pattern)
     // =========================================================================
 
-    [[nodiscard]] virtual bool is_bf16() const { return false; }
-    [[nodiscard]] virtual bool is_fp8_hybrid() const { return false; }
-    [[nodiscard]] virtual bool is_nvfp4() const { return false; }
-    [[nodiscard]] virtual bool is_nvfp4_cutlass() const { return false; }
+    [[nodiscard]] virtual bool is_bf16() const {
+        return false;
+    }
+    [[nodiscard]] virtual bool is_fp8_hybrid() const {
+        return false;
+    }
+    [[nodiscard]] virtual bool is_nvfp4() const {
+        return false;
+    }
+    [[nodiscard]] virtual bool is_nvfp4_cutlass() const {
+        return false;
+    }
 
     // =========================================================================
     // Format specification
@@ -113,26 +121,38 @@ public:
     // =========================================================================
 
     /// @brief Whether this recipe requires amax history for delayed scaling
-    [[nodiscard]] virtual bool requires_amax_history() const { return false; }
+    [[nodiscard]] virtual bool requires_amax_history() const {
+        return false;
+    }
 
     /// @brief Length of amax history buffer (if requires_amax_history() is true)
-    [[nodiscard]] virtual int amax_history_len() const { return 0; }
+    [[nodiscard]] virtual int amax_history_len() const {
+        return 0;
+    }
 
     /// @brief Whether this recipe requires per-block scales
-    [[nodiscard]] virtual bool requires_block_scales() const { return false; }
+    [[nodiscard]] virtual bool requires_block_scales() const {
+        return false;
+    }
 
     /// @brief Whether this recipe requires Hadamard workspace
-    [[nodiscard]] virtual bool requires_hadamard_workspace() const { return false; }
+    [[nodiscard]] virtual bool requires_hadamard_workspace() const {
+        return false;
+    }
 
     /// @brief Whether this recipe skips quantization for embedding and lm_head layers
-    [[nodiscard]] virtual bool skip_embedding_lmhead_quant() const { return false; }
+    [[nodiscard]] virtual bool skip_embedding_lmhead_quant() const {
+        return false;
+    }
 
     // =========================================================================
     // Backend selection
     // =========================================================================
 
     /// @brief Which matmul backend this recipe uses (AUTO, CUBLASLT, CUTLASS)
-    [[nodiscard]] virtual EMatmulBackend matmul_backend() const { return EMatmulBackend::AUTO; }
+    [[nodiscard]] virtual EMatmulBackend matmul_backend() const {
+        return EMatmulBackend::AUTO;
+    }
 
     // =========================================================================
     // Recipe metadata
@@ -184,7 +204,9 @@ public:
      *
      * Default: false (use code path for backward compatibility)
      */
-    [[nodiscard]] virtual bool handles_forward_matmul() const { return false; }
+    [[nodiscard]] virtual bool handles_forward_matmul() const {
+        return false;
+    }
 
     // =========================================================================
     // Active matmul dispatch (new recipe-driven approach)
@@ -289,8 +311,8 @@ public:
      * @param skip_first Number of first layers to skip
      * @param skip_last Number of last layers to skip
      */
-    [[nodiscard]] virtual bool should_skip_layer_quant(
-        int layer_idx, int num_layers, int skip_first, int skip_last) const {
+    [[nodiscard]] virtual bool
+    should_skip_layer_quant(int layer_idx, int num_layers, int skip_first, int skip_last) const {
         return (layer_idx < skip_first) || (layer_idx >= num_layers - skip_last);
     }
 };

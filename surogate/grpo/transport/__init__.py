@@ -1,7 +1,12 @@
 from pathlib import Path
 
-from surogate.grpo.transport.base import MicroBatchReceiver, MicroBatchSender, TrainingBatchReceiver, TrainingBatchSender
 from surogate.core.config.grpo_orch_config import TransportConfigType
+from surogate.grpo.transport.base import (
+    MicroBatchReceiver,
+    MicroBatchSender,
+    TrainingBatchReceiver,
+    TrainingBatchSender,
+)
 from surogate.grpo.transport.filesystem import (
     FileSystemMicroBatchReceiver,
     FileSystemMicroBatchSender,

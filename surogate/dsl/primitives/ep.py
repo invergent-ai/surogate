@@ -7,20 +7,20 @@ ep_combine reverses the all-to-all to collect expert outputs.
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
 from ..decorators import primitive
+from ..tensor_type import Tensor
 
 
 @primitive(impl="kernels.ep_dispatch")
 def ep_dispatch(
-    permuted_input: Tensor["TotalTokens", "C"],
-    routing_indices: Tensor["BT", "K", "int32"],
-    scatter_indices: Tensor["TotalTokens", "int32"],
+    permuted_input: Tensor[TotalTokens, C],
+    routing_indices: Tensor[BT, K, int32],
+    scatter_indices: Tensor[TotalTokens, int32],
     *,
     num_experts: int,
     ep_size: int,
     top_k: int,
-) -> tuple[Tensor["RecvTokens", "C"], Tensor["RecvTokens", "int32"]]:
+) -> tuple[Tensor[RecvTokens, C], Tensor[RecvTokens, int32]]:
     """EP dispatch: route permuted tokens to expert-owning GPUs via all-to-all.
 
     After moe_permute, tokens are sorted by expert. ep_dispatch splits them
@@ -33,12 +33,12 @@ def ep_dispatch(
 
 @primitive(impl="kernels.ep_combine")
 def ep_combine(
-    expert_output: Tensor["RecvTokens", "C"],
+    expert_output: Tensor[RecvTokens, C],
     *,
     num_experts: int,
     ep_size: int,
     top_k: int,
-) -> Tensor["TotalTokens", "C"]:
+) -> Tensor[TotalTokens, C]:
     """EP combine: reverse all-to-all to collect expert outputs.
 
     After local expert computation, sends results back to source GPUs

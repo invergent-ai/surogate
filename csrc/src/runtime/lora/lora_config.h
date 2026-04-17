@@ -18,14 +18,14 @@ namespace modules {
  * @brief Target modules for LoRA adaptation
  */
 enum class LoRATarget {
-    Q_PROJ,      ///< Query projection
-    K_PROJ,      ///< Key projection
-    V_PROJ,      ///< Value projection
-    O_PROJ,      ///< Output projection
-    GATE_PROJ,   ///< MLP gate projection
-    GATE_UP_PROJ,///< Fused MLP gate+up projection (GPT-OSS style)
-    UP_PROJ,     ///< MLP up projection
-    DOWN_PROJ    ///< MLP down projection
+    Q_PROJ,        ///< Query projection
+    K_PROJ,        ///< Key projection
+    V_PROJ,        ///< Value projection
+    O_PROJ,        ///< Output projection
+    GATE_PROJ,     ///< MLP gate projection
+    GATE_UP_PROJ,  ///< Fused MLP gate+up projection (GPT-OSS style)
+    UP_PROJ,       ///< MLP up projection
+    DOWN_PROJ      ///< MLP down projection
 };
 
 /**
@@ -62,12 +62,7 @@ struct ModularLoRAConfig {
     bool train_router = false;
 
     /// Target modules for LoRA adaptation
-    std::set<LoRATarget> targets = {
-        LoRATarget::Q_PROJ,
-        LoRATarget::K_PROJ,
-        LoRATarget::V_PROJ,
-        LoRATarget::O_PROJ
-    };
+    std::set<LoRATarget> targets = {LoRATarget::Q_PROJ, LoRATarget::K_PROJ, LoRATarget::V_PROJ, LoRATarget::O_PROJ};
 
     /**
      * @brief Get the LoRA scaling factor
@@ -87,14 +82,30 @@ struct ModularLoRAConfig {
     }
 
     // Convenience accessors
-    [[nodiscard]] bool applies_to_q() const { return applies_to(LoRATarget::Q_PROJ); }
-    [[nodiscard]] bool applies_to_k() const { return applies_to(LoRATarget::K_PROJ); }
-    [[nodiscard]] bool applies_to_v() const { return applies_to(LoRATarget::V_PROJ); }
-    [[nodiscard]] bool applies_to_o() const { return applies_to(LoRATarget::O_PROJ); }
-    [[nodiscard]] bool applies_to_gate() const { return applies_to(LoRATarget::GATE_PROJ); }
-    [[nodiscard]] bool applies_to_gate_up() const { return applies_to(LoRATarget::GATE_UP_PROJ); }
-    [[nodiscard]] bool applies_to_up() const { return applies_to(LoRATarget::UP_PROJ); }
-    [[nodiscard]] bool applies_to_down() const { return applies_to(LoRATarget::DOWN_PROJ); }
+    [[nodiscard]] bool applies_to_q() const {
+        return applies_to(LoRATarget::Q_PROJ);
+    }
+    [[nodiscard]] bool applies_to_k() const {
+        return applies_to(LoRATarget::K_PROJ);
+    }
+    [[nodiscard]] bool applies_to_v() const {
+        return applies_to(LoRATarget::V_PROJ);
+    }
+    [[nodiscard]] bool applies_to_o() const {
+        return applies_to(LoRATarget::O_PROJ);
+    }
+    [[nodiscard]] bool applies_to_gate() const {
+        return applies_to(LoRATarget::GATE_PROJ);
+    }
+    [[nodiscard]] bool applies_to_gate_up() const {
+        return applies_to(LoRATarget::GATE_UP_PROJ);
+    }
+    [[nodiscard]] bool applies_to_up() const {
+        return applies_to(LoRATarget::UP_PROJ);
+    }
+    [[nodiscard]] bool applies_to_down() const {
+        return applies_to(LoRATarget::DOWN_PROJ);
+    }
 
     [[nodiscard]] bool applies_to_attention() const {
         return applies_to_q() || applies_to_k() || applies_to_v() || applies_to_o();
@@ -107,7 +118,9 @@ struct ModularLoRAConfig {
     /**
      * @brief Check if LoRA is enabled (rank > 0)
      */
-    [[nodiscard]] bool enabled() const { return rank > 0; }
+    [[nodiscard]] bool enabled() const {
+        return rank > 0;
+    }
 
     /**
      * @brief Enable all attention targets
@@ -151,33 +164,62 @@ class LoRAConfigBuilder {
 public:
     LoRAConfigBuilder() = default;
 
-    LoRAConfigBuilder& rank(int r) { mConfig.rank = r; return *this; }
-    LoRAConfigBuilder& alpha(float a) { mConfig.alpha = a; return *this; }
-    LoRAConfigBuilder& dropout(float d) { mConfig.dropout = d; return *this; }
-    LoRAConfigBuilder& dtype(ETensorDType dt) { mConfig.dtype = dt; return *this; }
-    LoRAConfigBuilder& init_a_kaiming(bool v) { mConfig.init_a_kaiming = v; return *this; }
-    LoRAConfigBuilder& use_rs_lora(bool v) { mConfig.use_rs_lora = v; return *this; }
+    LoRAConfigBuilder& rank(int r) {
+        mConfig.rank = r;
+        return *this;
+    }
+    LoRAConfigBuilder& alpha(float a) {
+        mConfig.alpha = a;
+        return *this;
+    }
+    LoRAConfigBuilder& dropout(float d) {
+        mConfig.dropout = d;
+        return *this;
+    }
+    LoRAConfigBuilder& dtype(ETensorDType dt) {
+        mConfig.dtype = dt;
+        return *this;
+    }
+    LoRAConfigBuilder& init_a_kaiming(bool v) {
+        mConfig.init_a_kaiming = v;
+        return *this;
+    }
+    LoRAConfigBuilder& use_rs_lora(bool v) {
+        mConfig.use_rs_lora = v;
+        return *this;
+    }
 
     LoRAConfigBuilder& target(LoRATarget t) {
         mConfig.targets.insert(t);
         return *this;
     }
 
-    LoRAConfigBuilder& attention() { mConfig.with_attention(); return *this; }
-    LoRAConfigBuilder& mlp() { mConfig.with_mlp(); return *this; }
-    LoRAConfigBuilder& all() { mConfig.with_all(); return *this; }
+    LoRAConfigBuilder& attention() {
+        mConfig.with_attention();
+        return *this;
+    }
+    LoRAConfigBuilder& mlp() {
+        mConfig.with_mlp();
+        return *this;
+    }
+    LoRAConfigBuilder& all() {
+        mConfig.with_all();
+        return *this;
+    }
 
     LoRAConfigBuilder& clear_targets() {
         mConfig.targets.clear();
         return *this;
     }
 
-    ModularLoRAConfig build() const { return mConfig; }
+    ModularLoRAConfig build() const {
+        return mConfig;
+    }
 
 private:
     ModularLoRAConfig mConfig;
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_CONFIG_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_CONFIG_H

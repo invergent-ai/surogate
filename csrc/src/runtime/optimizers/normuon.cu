@@ -87,12 +87,10 @@ void create_normuon_quantiles(float* code) {
 // ----------------------------------------------------------------------------
 // Momentum state initialization
 
-__global__ void kInitNormuonState(
-    unsigned char* __restrict__ momentum_state,
-    float* __restrict__ momentum_absmax,
-    size_t n,
-    size_t num_blocks
-) {
+__global__ void kInitNormuonState(unsigned char* __restrict__ momentum_state,
+                                  float* __restrict__ momentum_absmax,
+                                  size_t n,
+                                  size_t num_blocks) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Initialize momentum state to middle value (representing 0)
@@ -106,37 +104,27 @@ __global__ void kInitNormuonState(
     }
 }
 
-void init_normuon_momentum_state(
-    unsigned char* momentum_state,
-    float* momentum_absmax,
-    size_t n,
-    cudaStream_t stream
-) {
+void init_normuon_momentum_state(unsigned char* momentum_state, float* momentum_absmax, size_t n, cudaStream_t stream) {
     constexpr size_t BLOCK_SIZE = NORMUON_BLOCK_SIZE;
     size_t num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     int threads = NORMUON_THREADS;
     int blocks = (max(n, num_blocks) + threads - 1) / threads;
 
-    kInitNormuonState<<<blocks, threads, 0, stream>>>(
-        momentum_state, momentum_absmax, n, num_blocks
-    );
+    kInitNormuonState<<<blocks, threads, 0, stream>>>(momentum_state, momentum_absmax, n, num_blocks);
 }
 
 // ----------------------------------------------------------------------------
 // 8-bit Momentum Update Kernel
 
 template <typename T, int BLOCK_SIZE, int N_PER_TH>
-__launch_bounds__(256, 3)
-__global__ void kNormuonMomentum8bit(
-    const T* __restrict__ gradient,
-    unsigned char* __restrict__ momentum_state,
-    T* __restrict__ momentum_out,
-    const float beta1,
-    const float* __restrict__ quantiles,
-    float* __restrict__ absmax,
-    const size_t n
-) {
+__launch_bounds__(256, 3) __global__ void kNormuonMomentum8bit(const T* __restrict__ gradient,
+                                                               unsigned char* __restrict__ momentum_state,
+                                                               T* __restrict__ momentum_out,
+                                                               const float beta1,
+                                                               const float* __restrict__ quantiles,
+                                                               float* __restrict__ absmax,
+                                                               const size_t n) {
     const int block_idx = blockIdx.x;
     const int base = block_idx * BLOCK_SIZE;
     const int thread_offset = threadIdx.x * N_PER_TH;
@@ -164,7 +152,7 @@ __global__ void kNormuonMomentum8bit(
     float m_vals[N_PER_TH];
     float g_vals[N_PER_TH];
 
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < N_PER_TH; ++j) {
         size_t idx = base + thread_offset + j;
         if (idx < n) {
@@ -180,8 +168,8 @@ __global__ void kNormuonMomentum8bit(
         }
     }
 
-    // Update momentum: m = beta1 * m + (1 - beta1) * g
-    #pragma unroll
+// Update momentum: m = beta1 * m + (1 - beta1) * g
+#pragma unroll
     for (int j = 0; j < N_PER_TH; ++j) {
         m_vals[j] = beta1 * m_vals[j] + (1.0f - beta1) * g_vals[j];
         local_absmax = fmaxf(local_absmax, fabsf(m_vals[j]));
@@ -200,8 +188,8 @@ __global__ void kNormuonMomentum8bit(
 
     float new_absmax = fmaxf(smem_absmax_new, 1e-7f);
 
-    // Quantize and store
-    #pragma unroll
+// Quantize and store
+#pragma unroll
     for (int j = 0; j < N_PER_TH; ++j) {
         size_t idx = base + thread_offset + j;
         if (idx < n) {
@@ -221,44 +209,47 @@ __global__ void kNormuonMomentum8bit(
     }
 }
 
-void normuon_momentum_update_8bit(
-    const nv_bfloat16* gradient,
-    unsigned char* momentum_state,
-    nv_bfloat16* momentum_out,
-    size_t n,
-    float beta1,
-    const float* quantiles,
-    float* absmax,
-    cudaStream_t stream
-) {
+void normuon_momentum_update_8bit(const nv_bfloat16* gradient,
+                                  unsigned char* momentum_state,
+                                  nv_bfloat16* momentum_out,
+                                  size_t n,
+                                  float beta1,
+                                  const float* quantiles,
+                                  float* absmax,
+                                  cudaStream_t stream) {
     constexpr int BLOCK_SIZE = NORMUON_BLOCK_SIZE;
     constexpr int N_PER_TH = NORMUON_NUM_PER_THREAD;
     int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     kNormuonMomentum8bit<nv_bfloat16, BLOCK_SIZE, N_PER_TH>
-        <<<num_blocks, BLOCK_SIZE / N_PER_TH, 0, stream>>>(
-            gradient, momentum_state, momentum_out, beta1, quantiles, absmax, n
-        );
+        <<<num_blocks, BLOCK_SIZE / N_PER_TH, 0, stream>>>(gradient,
+                                                           momentum_state,
+                                                           momentum_out,
+                                                           beta1,
+                                                           quantiles,
+                                                           absmax,
+                                                           n);
 }
 
-void normuon_momentum_update_8bit(
-    const float* gradient,
-    unsigned char* momentum_state,
-    float* momentum_out,
-    size_t n,
-    float beta1,
-    const float* quantiles,
-    float* absmax,
-    cudaStream_t stream
-) {
+void normuon_momentum_update_8bit(const float* gradient,
+                                  unsigned char* momentum_state,
+                                  float* momentum_out,
+                                  size_t n,
+                                  float beta1,
+                                  const float* quantiles,
+                                  float* absmax,
+                                  cudaStream_t stream) {
     constexpr int BLOCK_SIZE = NORMUON_BLOCK_SIZE;
     constexpr int N_PER_TH = NORMUON_NUM_PER_THREAD;
     int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    kNormuonMomentum8bit<float, BLOCK_SIZE, N_PER_TH>
-        <<<num_blocks, BLOCK_SIZE / N_PER_TH, 0, stream>>>(
-            gradient, momentum_state, momentum_out, beta1, quantiles, absmax, n
-        );
+    kNormuonMomentum8bit<float, BLOCK_SIZE, N_PER_TH><<<num_blocks, BLOCK_SIZE / N_PER_TH, 0, stream>>>(gradient,
+                                                                                                        momentum_state,
+                                                                                                        momentum_out,
+                                                                                                        beta1,
+                                                                                                        quantiles,
+                                                                                                        absmax,
+                                                                                                        n);
 }
 
 // ----------------------------------------------------------------------------
@@ -268,12 +259,7 @@ void normuon_momentum_update_8bit(
  * @brief Compute row means of squared values
  * Output shape: (batch, M, 1)
  */
-__global__ void kVarianceMeanRows(
-    const nv_bfloat16* __restrict__ v,
-    float* __restrict__ v_mean,
-    int M,
-    int N
-) {
+__global__ void kVarianceMeanRows(const nv_bfloat16* __restrict__ v, float* __restrict__ v_mean, int M, int N) {
     const int batch_idx = blockIdx.z;
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -294,12 +280,7 @@ __global__ void kVarianceMeanRows(
  * @brief Compute column means of squared values
  * Output shape: (batch, 1, N)
  */
-__global__ void kVarianceMeanCols(
-    const nv_bfloat16* __restrict__ v,
-    float* __restrict__ v_mean,
-    int M,
-    int N
-) {
+__global__ void kVarianceMeanCols(const nv_bfloat16* __restrict__ v, float* __restrict__ v_mean, int M, int N) {
     const int batch_idx = blockIdx.z;
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -316,15 +297,13 @@ __global__ void kVarianceMeanCols(
     }
 }
 
-void compute_variance_mean(
-    const nv_bfloat16* v,
-    float* v_mean,
-    int batch,
-    int M,
-    int N,
-    bool reduce_over_cols,
-    cudaStream_t stream
-) {
+void compute_variance_mean(const nv_bfloat16* v,
+                           float* v_mean,
+                           int batch,
+                           int M,
+                           int N,
+                           bool reduce_over_cols,
+                           cudaStream_t stream) {
     if (reduce_over_cols) {
         // Reduce over columns -> output (batch, M, 1)
         int blocks = (M + NORMUON_THREADS - 1) / NORMUON_THREADS;
@@ -346,14 +325,12 @@ void compute_variance_mean(
  * 2. Compute per-element scale
  * 3. Apply to v
  */
-__global__ void kApplyVarianceReductionRows(
-    nv_bfloat16* __restrict__ v,
-    float* __restrict__ variance_buffer,
-    const float* __restrict__ v_mean,
-    int M,
-    int N,
-    float beta2
-) {
+__global__ void kApplyVarianceReductionRows(nv_bfloat16* __restrict__ v,
+                                            float* __restrict__ variance_buffer,
+                                            const float* __restrict__ v_mean,
+                                            int M,
+                                            int N,
+                                            float beta2) {
     const int batch_idx = blockIdx.z;
     const int row = blockIdx.y;
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -385,14 +362,12 @@ __global__ void kApplyVarianceReductionRows(
     v_batch[row * N + col] = __float2bfloat16(val * row_scale);
 }
 
-__global__ void kApplyVarianceReductionCols(
-    nv_bfloat16* __restrict__ v,
-    float* __restrict__ variance_buffer,
-    const float* __restrict__ v_mean,
-    int M,
-    int N,
-    float beta2
-) {
+__global__ void kApplyVarianceReductionCols(nv_bfloat16* __restrict__ v,
+                                            float* __restrict__ variance_buffer,
+                                            const float* __restrict__ v_mean,
+                                            int M,
+                                            int N,
+                                            float beta2) {
     const int batch_idx = blockIdx.z;
     const int row = blockIdx.y;
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -421,16 +396,14 @@ __global__ void kApplyVarianceReductionCols(
     v_batch[row * N + col] = __float2bfloat16(val * col_scale);
 }
 
-void apply_variance_reduction(
-    nv_bfloat16* v,
-    float* variance_buffer,
-    int batch,
-    int M,
-    int N,
-    float beta2,
-    bool reduce_over_cols,
-    cudaStream_t stream
-) {
+void apply_variance_reduction(nv_bfloat16* v,
+                              float* variance_buffer,
+                              int batch,
+                              int M,
+                              int N,
+                              float beta2,
+                              bool reduce_over_cols,
+                              cudaStream_t stream) {
     // First compute means
     // Allocate temporary buffer for means (reuse variance_buffer space or separate)
     // For simplicity, we'll compute means in a separate kernel then apply
@@ -447,17 +420,23 @@ void apply_variance_reduction(
         // Apply with EMA update
         int blocks_x = (N + NORMUON_THREADS - 1) / NORMUON_THREADS;
         dim3 grid(blocks_x, M, batch);
-        kApplyVarianceReductionRows<<<grid, NORMUON_THREADS, 0, stream>>>(
-            v, variance_buffer, variance_buffer, M, N, beta2
-        );
+        kApplyVarianceReductionRows<<<grid, NORMUON_THREADS, 0, stream>>>(v,
+                                                                          variance_buffer,
+                                                                          variance_buffer,
+                                                                          M,
+                                                                          N,
+                                                                          beta2);
     } else {
         compute_variance_mean(v, variance_buffer, batch, M, N, false, stream);
 
         int blocks_x = (N + NORMUON_THREADS - 1) / NORMUON_THREADS;
         dim3 grid(blocks_x, M, batch);
-        kApplyVarianceReductionCols<<<grid, NORMUON_THREADS, 0, stream>>>(
-            v, variance_buffer, variance_buffer, M, N, beta2
-        );
+        kApplyVarianceReductionCols<<<grid, NORMUON_THREADS, 0, stream>>>(v,
+                                                                          variance_buffer,
+                                                                          variance_buffer,
+                                                                          M,
+                                                                          N,
+                                                                          beta2);
     }
 }
 
@@ -465,13 +444,11 @@ void apply_variance_reduction(
 // Cautious Weight Decay Update
 
 template <typename TParam, typename TUpdate>
-__global__ void kCautiousWeightDecayUpdate(
-    TParam* __restrict__ p,
-    const TUpdate* __restrict__ v,
-    size_t n,
-    float lr,
-    float weight_decay
-) {
+__global__ void kCautiousWeightDecayUpdate(TParam* __restrict__ p,
+                                           const TUpdate* __restrict__ v,
+                                           size_t n,
+                                           float lr,
+                                           float weight_decay) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
@@ -487,126 +464,97 @@ __global__ void kCautiousWeightDecayUpdate(
     p[idx] = static_cast<TParam>(new_p);
 }
 
-void cautious_weight_decay_update(
-    nv_bfloat16* p,
-    const nv_bfloat16* v,
-    size_t n,
-    float lr,
-    float weight_decay,
-    cudaStream_t stream
-) {
+void cautious_weight_decay_update(nv_bfloat16* p,
+                                  const nv_bfloat16* v,
+                                  size_t n,
+                                  float lr,
+                                  float weight_decay,
+                                  cudaStream_t stream) {
     int blocks = (n + NORMUON_THREADS - 1) / NORMUON_THREADS;
     kCautiousWeightDecayUpdate<nv_bfloat16, nv_bfloat16>
         <<<blocks, NORMUON_THREADS, 0, stream>>>(p, v, n, lr, weight_decay);
 }
 
-void cautious_weight_decay_update(
-    float* p,
-    const nv_bfloat16* v,
-    size_t n,
-    float lr,
-    float weight_decay,
-    cudaStream_t stream
-) {
+void cautious_weight_decay_update(float* p,
+                                  const nv_bfloat16* v,
+                                  size_t n,
+                                  float lr,
+                                  float weight_decay,
+                                  cudaStream_t stream) {
     int blocks = (n + NORMUON_THREADS - 1) / NORMUON_THREADS;
-    kCautiousWeightDecayUpdate<float, nv_bfloat16>
-        <<<blocks, NORMUON_THREADS, 0, stream>>>(p, v, n, lr, weight_decay);
+    kCautiousWeightDecayUpdate<float, nv_bfloat16><<<blocks, NORMUON_THREADS, 0, stream>>>(p, v, n, lr, weight_decay);
 }
 
 // ----------------------------------------------------------------------------
 // Full NorMuon Update for 2D Weights
 
-void normuon_update_2d(
-    cublasHandle_t handle,
-    nv_bfloat16* param,
-    const nv_bfloat16* gradient,
-    unsigned char* momentum_state,
-    float* variance_buffer,
-    nv_bfloat16* polar_workspace,
-    int M,
-    int N,
-    float lr,
-    float beta1,
-    float beta2,
-    float weight_decay,
-    const float* quantiles,
-    float* absmax,
-    cudaStream_t stream
-) {
+void normuon_update_2d(cublasHandle_t handle,
+                       nv_bfloat16* param,
+                       const nv_bfloat16* gradient,
+                       unsigned char* momentum_state,
+                       float* variance_buffer,
+                       nv_bfloat16* polar_workspace,
+                       int M,
+                       int N,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       float weight_decay,
+                       const float* quantiles,
+                       float* absmax,
+                       cudaStream_t stream) {
     size_t n = static_cast<size_t>(M) * N;
 
     // Step 1: Momentum update (gradient -> momentum smoothed)
     // Use polar_workspace as temporary for momentum output
     nv_bfloat16* momentum_out = polar_workspace;
 
-    normuon_momentum_update_8bit(
-        gradient,
-        momentum_state,
-        momentum_out,
-        n,
-        beta1,
-        quantiles,
-        absmax,
-        stream
-    );
+    normuon_momentum_update_8bit(gradient, momentum_state, momentum_out, n, beta1, quantiles, absmax, stream);
 
     // Step 2: Polar Express orthogonalization (in-place on momentum_out)
     // Need additional workspace beyond momentum_out
     size_t ws_size = polar_express_workspace_size(1, M, N);
     nv_bfloat16* pe_workspace = momentum_out + n;
 
-    polar_express(
-        handle,
-        momentum_out,
-        pe_workspace,
-        1,  // batch = 1
-        M,
-        N,
-        stream
-    );
+    polar_express(handle,
+                  momentum_out,
+                  pe_workspace,
+                  1,  // batch = 1
+                  M,
+                  N,
+                  stream);
 
     // Step 3: Variance reduction
     bool reduce_over_cols = (M >= N);
-    apply_variance_reduction(
-        momentum_out,
-        variance_buffer,
-        1,  // batch = 1
-        M,
-        N,
-        beta2,
-        reduce_over_cols,
-        stream
-    );
+    apply_variance_reduction(momentum_out,
+                             variance_buffer,
+                             1,  // batch = 1
+                             M,
+                             N,
+                             beta2,
+                             reduce_over_cols,
+                             stream);
 
     // Step 4: Cautious weight decay + parameter update
     // Apply learning rate multiplier based on weight shape
     float lr_mult = normuon_lr_multiplier(M, N);
     float effective_lr = lr * lr_mult;
 
-    cautious_weight_decay_update(
-        param,
-        momentum_out,
-        n,
-        effective_lr,
-        weight_decay,
-        stream
-    );
+    cautious_weight_decay_update(param, momentum_out, n, effective_lr, weight_decay, stream);
 }
 
 // ----------------------------------------------------------------------------
 // Graph-compatible kernels (read hyperparameters from device memory)
 
 template <typename T, int BLOCK_SIZE, int N_PER_TH>
-__launch_bounds__(256, 3)
-__global__ void kNormuonMomentum8bitGraph(
-    const T* __restrict__ gradient,
-    unsigned char* __restrict__ momentum_state,
-    T* __restrict__ momentum_out,
-    const float* __restrict__ opt_params,  // [0] = unused, [1] = beta1
-    const float* __restrict__ quantiles,
-    float* __restrict__ absmax,
-    const size_t n
-) {
+__launch_bounds__(256, 3) __global__
+    void kNormuonMomentum8bitGraph(const T* __restrict__ gradient,
+                                   unsigned char* __restrict__ momentum_state,
+                                   T* __restrict__ momentum_out,
+                                   const float* __restrict__ opt_params,  // [0] = unused, [1] = beta1
+                                   const float* __restrict__ quantiles,
+                                   float* __restrict__ absmax,
+                                   const size_t n) {
     const float beta1 = opt_params[1];  // normuon_momentum
     const int block_idx = blockIdx.x;
     const int base = block_idx * BLOCK_SIZE;
@@ -633,7 +581,7 @@ __global__ void kNormuonMomentum8bitGraph(
     float m_vals[N_PER_TH];
     float g_vals[N_PER_TH];
 
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < N_PER_TH; ++j) {
         size_t idx = base + thread_offset + j;
         if (idx < n) {
@@ -646,7 +594,7 @@ __global__ void kNormuonMomentum8bitGraph(
         }
     }
 
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < N_PER_TH; ++j) {
         m_vals[j] = beta1 * m_vals[j] + (1.0f - beta1) * g_vals[j];
         local_absmax = fmaxf(local_absmax, fabsf(m_vals[j]));
@@ -663,7 +611,7 @@ __global__ void kNormuonMomentum8bitGraph(
 
     float new_absmax = fmaxf(smem_absmax_new, 1e-7f);
 
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < N_PER_TH; ++j) {
         size_t idx = base + thread_offset + j;
         if (idx < n) {
@@ -679,13 +627,12 @@ __global__ void kNormuonMomentum8bitGraph(
     }
 }
 
-__global__ void kApplyVarianceReductionRowsGraph(
-    nv_bfloat16* __restrict__ v,
-    float* __restrict__ variance_buffer,
-    const float* __restrict__ v_mean,
-    int M,
-    int N,
-    const float* __restrict__ opt_params  // [2] = beta2
+__global__ void kApplyVarianceReductionRowsGraph(nv_bfloat16* __restrict__ v,
+                                                 float* __restrict__ variance_buffer,
+                                                 const float* __restrict__ v_mean,
+                                                 int M,
+                                                 int N,
+                                                 const float* __restrict__ opt_params  // [2] = beta2
 ) {
     const float beta2 = opt_params[2];
     const int batch_idx = blockIdx.z;
@@ -712,14 +659,12 @@ __global__ void kApplyVarianceReductionRowsGraph(
     v_batch[row * N + col] = __float2bfloat16(val * row_scale);
 }
 
-__global__ void kApplyVarianceReductionColsGraph(
-    nv_bfloat16* __restrict__ v,
-    float* __restrict__ variance_buffer,
-    const float* __restrict__ v_mean,
-    int M,
-    int N,
-    const float* __restrict__ opt_params
-) {
+__global__ void kApplyVarianceReductionColsGraph(nv_bfloat16* __restrict__ v,
+                                                 float* __restrict__ variance_buffer,
+                                                 const float* __restrict__ v_mean,
+                                                 int M,
+                                                 int N,
+                                                 const float* __restrict__ opt_params) {
     const float beta2 = opt_params[2];
     const int batch_idx = blockIdx.z;
     const int row = blockIdx.y;
@@ -746,13 +691,12 @@ __global__ void kApplyVarianceReductionColsGraph(
 }
 
 template <typename TParam, typename TUpdate>
-__global__ void kCautiousWeightDecayUpdateGraph(
-    TParam* __restrict__ p,
-    const TUpdate* __restrict__ v,
-    size_t n,
-    float lr_multiplier,
-    float wd_scale,
-    const float* __restrict__ opt_params  // [0] = lr, [3] = weight_decay
+__global__ void kCautiousWeightDecayUpdateGraph(TParam* __restrict__ p,
+                                                const TUpdate* __restrict__ v,
+                                                size_t n,
+                                                float lr_multiplier,
+                                                float wd_scale,
+                                                const float* __restrict__ opt_params  // [0] = lr, [3] = weight_decay
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -769,22 +713,20 @@ __global__ void kCautiousWeightDecayUpdateGraph(
     p[idx] = static_cast<TParam>(new_p);
 }
 
-void normuon_update_2d_graph(
-    cublasHandle_t handle,
-    nv_bfloat16* param,
-    const nv_bfloat16* gradient,
-    unsigned char* momentum_state,
-    float* variance_buffer,
-    nv_bfloat16* polar_workspace,
-    int M,
-    int N,
-    float lr_multiplier,
-    float wd_scale,
-    const float* quantiles,
-    float* absmax,
-    const float* opt_params,
-    cudaStream_t stream
-) {
+void normuon_update_2d_graph(cublasHandle_t handle,
+                             nv_bfloat16* param,
+                             const nv_bfloat16* gradient,
+                             unsigned char* momentum_state,
+                             float* variance_buffer,
+                             nv_bfloat16* polar_workspace,
+                             int M,
+                             int N,
+                             float lr_multiplier,
+                             float wd_scale,
+                             const float* quantiles,
+                             float* absmax,
+                             const float* opt_params,
+                             cudaStream_t stream) {
     size_t n = static_cast<size_t>(M) * N;
     nv_bfloat16* momentum_out = polar_workspace;
 
@@ -794,23 +736,19 @@ void normuon_update_2d_graph(
     int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     kNormuonMomentum8bitGraph<nv_bfloat16, BLOCK_SIZE, N_PER_TH>
-        <<<num_blocks, BLOCK_SIZE / N_PER_TH, 0, stream>>>(
-            gradient, momentum_state, momentum_out, opt_params, quantiles, absmax, n
-        );
+        <<<num_blocks, BLOCK_SIZE / N_PER_TH, 0, stream>>>(gradient,
+                                                           momentum_state,
+                                                           momentum_out,
+                                                           opt_params,
+                                                           quantiles,
+                                                           absmax,
+                                                           n);
 
     // Step 2: Polar Express orthogonalization (cuBLAS is graph-capturable)
     size_t ws_size = polar_express_workspace_size(1, M, N);
     nv_bfloat16* pe_workspace = momentum_out + n;
 
-    polar_express(
-        handle,
-        momentum_out,
-        pe_workspace,
-        1,
-        M,
-        N,
-        stream
-    );
+    polar_express(handle, momentum_out, pe_workspace, 1, M, N, stream);
 
     // Step 3: Variance reduction (graph-compatible)
     bool reduce_over_cols = (M >= N);
@@ -819,23 +757,27 @@ void normuon_update_2d_graph(
     if (reduce_over_cols) {
         int blocks_x = (N + NORMUON_THREADS - 1) / NORMUON_THREADS;
         dim3 grid(blocks_x, M, 1);
-        kApplyVarianceReductionRowsGraph<<<grid, NORMUON_THREADS, 0, stream>>>(
-            momentum_out, variance_buffer, variance_buffer, M, N, opt_params
-        );
+        kApplyVarianceReductionRowsGraph<<<grid, NORMUON_THREADS, 0, stream>>>(momentum_out,
+                                                                               variance_buffer,
+                                                                               variance_buffer,
+                                                                               M,
+                                                                               N,
+                                                                               opt_params);
     } else {
         int blocks_x = (N + NORMUON_THREADS - 1) / NORMUON_THREADS;
         dim3 grid(blocks_x, M, 1);
-        kApplyVarianceReductionColsGraph<<<grid, NORMUON_THREADS, 0, stream>>>(
-            momentum_out, variance_buffer, variance_buffer, M, N, opt_params
-        );
+        kApplyVarianceReductionColsGraph<<<grid, NORMUON_THREADS, 0, stream>>>(momentum_out,
+                                                                               variance_buffer,
+                                                                               variance_buffer,
+                                                                               M,
+                                                                               N,
+                                                                               opt_params);
     }
 
     // Step 4: Cautious weight decay + parameter update (graph-compatible)
     int blocks = (n + NORMUON_THREADS - 1) / NORMUON_THREADS;
     kCautiousWeightDecayUpdateGraph<nv_bfloat16, nv_bfloat16>
-        <<<blocks, NORMUON_THREADS, 0, stream>>>(
-            param, momentum_out, n, lr_multiplier, wd_scale, opt_params
-        );
+        <<<blocks, NORMUON_THREADS, 0, stream>>>(param, momentum_out, n, lr_multiplier, wd_scale, opt_params);
 }
 
-} // namespace optimizers
+}  // namespace optimizers

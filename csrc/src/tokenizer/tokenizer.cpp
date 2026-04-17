@@ -28,8 +28,8 @@
 // minja uses nlohmann::ordered_json as its 'json' type. We only use it for
 // template rendering (small objects). For parsing the large tokenizer.json
 // (10+ MB, 150k+ vocab entries) we use unordered nlohmann::json which is ~100x faster.
-using json = nlohmann::ordered_json;       // for minja interop
-using fast_json = nlohmann::json;          // for tokenizer.json parsing
+using json = nlohmann::ordered_json;  // for minja interop
+using fast_json = nlohmann::json;     // for tokenizer.json parsing
 
 namespace tokenizer {
 
@@ -101,9 +101,9 @@ static std::string byte_level_encode(const std::string& text) {
 
 struct Tokenizer::Impl {
     // BPE model
-    Encoder encoder;                                             // byte_seq -> rank
-    std::unordered_map<Rank, std::vector<uint8_t>> decoder;      // rank -> byte_seq
-    EncoderLookup* encoder_lookup = nullptr;                     // fast lookup (no alloc)
+    Encoder encoder;                                         // byte_seq -> rank
+    std::unordered_map<Rank, std::vector<uint8_t>> decoder;  // rank -> byte_seq
+    EncoderLookup* encoder_lookup = nullptr;                 // fast lookup (no alloc)
 
     // Added tokens (ALL added tokens — matched before pre-tokenization during encode)
     std::unordered_map<std::string, Rank> added_tokens_encoder;  // text -> id
@@ -119,7 +119,13 @@ struct Tokenizer::Impl {
     bool byte_level = false;
 
     // Normalizer type
-    enum class Normalizer { NONE, NFC, NFD, NFKC, NFKD } normalizer = Normalizer::NONE;
+    enum class Normalizer {
+        NONE,
+        NFC,
+        NFD,
+        NFKC,
+        NFKD
+    } normalizer = Normalizer::NONE;
 
     // Well-known token IDs
     int32_t bos_id = -1;
@@ -142,12 +148,12 @@ struct Tokenizer::Impl {
     std::string bos_token_str;
     std::string eos_token_str;
 
-    ~Impl() { delete encoder_lookup; }
+    ~Impl() {
+        delete encoder_lookup;
+    }
 
     // Render the chat template with the given messages and options.
-    std::string render_chat_template(
-            const nlohmann::ordered_json& messages,
-            bool add_generation_prompt) const {
+    std::string render_chat_template(const nlohmann::ordered_json& messages, bool add_generation_prompt) const {
         if (!chat_tmpl_root) {
             throw std::runtime_error("No chat template loaded.");
         }
@@ -159,16 +165,16 @@ struct Tokenizer::Impl {
         context->set("eos_token", eos_token_str);
 
         auto now = std::chrono::system_clock::now();
-        context->set("strftime_now", minja::Value::callable(
-            [now](const std::shared_ptr<minja::Context>&, minja::ArgumentsValue& args) {
-                args.expectArgs("strftime_now", {1, 1}, {0, 0});
-                auto fmt = args.args[0].get<std::string>();
-                auto t = std::chrono::system_clock::to_time_t(now);
-                auto lt = *std::localtime(&t);
-                std::ostringstream ss;
-                ss << std::put_time(&lt, fmt.c_str());
-                return ss.str();
-            }));
+        context->set("strftime_now",
+                     minja::Value::callable([now](const std::shared_ptr<minja::Context>&, minja::ArgumentsValue& args) {
+                         args.expectArgs("strftime_now", {1, 1}, {0, 0});
+                         auto fmt = args.args[0].get<std::string>();
+                         auto t = std::chrono::system_clock::to_time_t(now);
+                         auto lt = *std::localtime(&t);
+                         std::ostringstream ss;
+                         ss << std::put_time(&lt, fmt.c_str());
+                         return ss.str();
+                     }));
 
         return chat_tmpl_root->render(context);
     }
@@ -188,8 +194,7 @@ struct Tokenizer::Impl {
             return;
         }
         // BPE merge
-        auto ranks = byte_pair_encode(
-            reinterpret_cast<const uint8_t*>(piece.data()), piece.size(), *encoder_lookup);
+        auto ranks = byte_pair_encode(reinterpret_cast<const uint8_t*>(piece.data()), piece.size(), *encoder_lookup);
         for (Rank r : ranks) {
             out.push_back(static_cast<int32_t>(r));
         }
@@ -232,7 +237,8 @@ struct Tokenizer::Impl {
 
             for (const auto& [token, id] : added_tokens_encoder) {
                 size_t found = text.find(token, pos);
-                if (found != std::string::npos && (found < best_pos || (found == best_pos && token.size() > best_token.size()))) {
+                if (found != std::string::npos &&
+                    (found < best_pos || (found == best_pos && token.size() > best_token.size()))) {
                     best_pos = found;
                     best_token = token;
                     best_id = id;
@@ -265,7 +271,9 @@ struct Tokenizer::Impl {
 // Public API
 // ============================================================================
 
-Tokenizer::Tokenizer() : impl_(std::make_unique<Impl>()) {}
+Tokenizer::Tokenizer()
+    : impl_(std::make_unique<Impl>()) {
+}
 Tokenizer::~Tokenizer() = default;
 Tokenizer::Tokenizer(Tokenizer&&) noexcept = default;
 Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
@@ -316,7 +324,7 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     // We do verify merge count for sanity.
     if (model.contains("merges") && model["merges"].is_array()) {
         size_t num_merges = model["merges"].size();
-        (void)num_merges; // Used only for sanity check if needed
+        (void)num_merges;  // Used only for sanity check if needed
     }
 
     impl.vocab_size_ = static_cast<int32_t>(impl.encoder.size());
@@ -325,10 +333,14 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     if (data.contains("normalizer") && !data["normalizer"].is_null()) {
         auto& norm = data["normalizer"];
         std::string norm_type = norm.at("type");
-        if (norm_type == "NFC") impl.normalizer = Impl::Normalizer::NFC;
-        else if (norm_type == "NFD") impl.normalizer = Impl::Normalizer::NFD;
-        else if (norm_type == "NFKC") impl.normalizer = Impl::Normalizer::NFKC;
-        else if (norm_type == "NFKD") impl.normalizer = Impl::Normalizer::NFKD;
+        if (norm_type == "NFC")
+            impl.normalizer = Impl::Normalizer::NFC;
+        else if (norm_type == "NFD")
+            impl.normalizer = Impl::Normalizer::NFD;
+        else if (norm_type == "NFKC")
+            impl.normalizer = Impl::Normalizer::NFKC;
+        else if (norm_type == "NFKD")
+            impl.normalizer = Impl::Normalizer::NFKD;
     }
 
     // ---- Detect ByteLevel from tokenizer.json ----
@@ -360,33 +372,41 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     auto model_config_path = dir / "config.json";
     if (fs::exists(model_config_path)) {
         fast_json model_config;
-        { std::ifstream f(model_config_path); model_config = fast_json::parse(f); }
+        {
+            std::ifstream f(model_config_path);
+            model_config = fast_json::parse(f);
+        }
         architecture = model_config.value("model_type", "");
     }
 
-    if (architecture == "qwen2" || architecture == "qwen3" ||
-        architecture == "qwen3_moe" || architecture == "qwen3_vl" || architecture == "qwen3_vl_moe") {
+    if (architecture == "qwen2" || architecture == "qwen3" || architecture == "qwen3_moe" ||
+        architecture == "qwen3_vl" || architecture == "qwen3_vl_moe") {
         // Qwen2/3 family: single-digit number matching
         impl.pre_tokenizer_regex = {
-            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| "
+            "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         };
     } else if (architecture == "qwen3_5" || architecture == "qwen3_5_moe") {
         // Qwen3.5: includes \p{M} (accent marks) in letter matching
         impl.pre_tokenizer_regex = {
-            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| "
+            "?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         };
     } else if (architecture == "llama" || architecture == "smollm" || architecture == "smollm3" ||
                architecture == "mistral" || architecture == "gemma" || architecture == "gemma2" ||
                architecture == "phi3" || architecture == "chatglm") {
         // Llama3 family: 1-3 digit number matching
         impl.pre_tokenizer_regex = {
-            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| "
+            "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         };
     } else if (architecture == "gpt_oss" || architecture == "gpt-oss") {
         // GPT-OSS family: case-aware OpenAI word splitting with 1-3 digit groups.
         impl.pre_tokenizer_regex = {
-            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
-            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'"
+            "ve|'m|'ll|'d)?|"
+            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'"
+            "ve|'m|'ll|'d)?|"
             "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         };
     } else if (architecture == "gpt2" || architecture == "gpt_bigcode") {
@@ -502,13 +522,16 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         // Load chat template (Jinja2 string) — parse directly, skip capability probing
         if (config.contains("chat_template") && config["chat_template"].is_string()) {
             std::string tmpl_str = config["chat_template"].get<std::string>();
-            impl.chat_tmpl_root = minja::Parser::parse(tmpl_str, {
-                /* .trim_blocks = */ true,
-                /* .lstrip_blocks = */ true,
-                /* .keep_trailing_newline = */ false,
-            });
-            impl.bos_token_str = impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
-            impl.eos_token_str = impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
+            impl.chat_tmpl_root = minja::Parser::parse(tmpl_str,
+                                                       {
+                                                           /* .trim_blocks = */ true,
+                                                           /* .lstrip_blocks = */ true,
+                                                           /* .keep_trailing_newline = */ false,
+                                                       });
+            impl.bos_token_str =
+                impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
+            impl.eos_token_str =
+                impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
         }
     }
 
@@ -518,13 +541,16 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         if (fs::exists(jinja_path)) {
             std::ifstream f(jinja_path);
             std::string tmpl_str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            impl.chat_tmpl_root = minja::Parser::parse(tmpl_str, {
-                /* .trim_blocks = */ true,
-                /* .lstrip_blocks = */ true,
-                /* .keep_trailing_newline = */ false,
-            });
-            impl.bos_token_str = impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
-            impl.eos_token_str = impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
+            impl.chat_tmpl_root = minja::Parser::parse(tmpl_str,
+                                                       {
+                                                           /* .trim_blocks = */ true,
+                                                           /* .lstrip_blocks = */ true,
+                                                           /* .keep_trailing_newline = */ false,
+                                                       });
+            impl.bos_token_str =
+                impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
+            impl.eos_token_str =
+                impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
         }
     }
 
@@ -534,24 +560,26 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         std::string fallback_tmpl;
 
         if (architecture == "llama" || architecture == "smollm" || architecture == "smollm3") {
-            fallback_tmpl =
-                "{% for message in messages %}"
-                "<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n"
-                "{{ message['content'] | trim }}<|eot_id|>"
-                "{% endfor %}"
-                "{% if add_generation_prompt %}"
-                "<|start_header_id|>assistant<|end_header_id|>\n\n"
-                "{% endif %}";
+            fallback_tmpl = "{% for message in messages %}"
+                            "<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n"
+                            "{{ message['content'] | trim }}<|eot_id|>"
+                            "{% endfor %}"
+                            "{% if add_generation_prompt %}"
+                            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                            "{% endif %}";
         }
 
         if (!fallback_tmpl.empty()) {
-            impl.chat_tmpl_root = minja::Parser::parse(fallback_tmpl, {
-                /* .trim_blocks = */ true,
-                /* .lstrip_blocks = */ true,
-                /* .keep_trailing_newline = */ false,
-            });
-            impl.bos_token_str = impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
-            impl.eos_token_str = impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
+            impl.chat_tmpl_root = minja::Parser::parse(fallback_tmpl,
+                                                       {
+                                                           /* .trim_blocks = */ true,
+                                                           /* .lstrip_blocks = */ true,
+                                                           /* .keep_trailing_newline = */ false,
+                                                       });
+            impl.bos_token_str =
+                impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
+            impl.eos_token_str =
+                impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
         }
     }
 
@@ -582,14 +610,13 @@ std::vector<int32_t> Tokenizer::encode_ordinary(const std::string& text) const {
     return impl_->encode_ordinary_impl(text);
 }
 
-std::vector<std::vector<int32_t>> Tokenizer::encode_batch(
-        const std::vector<std::string>& texts, bool add_special_tokens) const {
+std::vector<std::vector<int32_t>> Tokenizer::encode_batch(const std::vector<std::string>& texts,
+                                                          bool add_special_tokens) const {
     std::vector<std::vector<int32_t>> results(texts.size());
 
     // Parallel encode using std::thread for batches > 1
     if (texts.size() > 1) {
-        unsigned num_threads = std::min(static_cast<unsigned>(texts.size()),
-                                        std::thread::hardware_concurrency());
+        unsigned num_threads = std::min(static_cast<unsigned>(texts.size()), std::thread::hardware_concurrency());
         if (num_threads < 2) num_threads = 1;
 
         if (num_threads > 1) {
@@ -606,7 +633,8 @@ std::vector<std::vector<int32_t>> Tokenizer::encode_batch(
                     }
                 });
             }
-            for (auto& th : threads) th.join();
+            for (auto& th : threads)
+                th.join();
             return results;
         }
     }
@@ -690,10 +718,18 @@ std::string Tokenizer::decode_single_token(int32_t id) const {
     throw std::runtime_error(fmt::format("Token ID {} not found in vocabulary", id));
 }
 
-int32_t Tokenizer::vocab_size() const { return impl_->vocab_size_; }
-int32_t Tokenizer::bos_token_id() const { return impl_->bos_id; }
-int32_t Tokenizer::eos_token_id() const { return impl_->eos_id; }
-int32_t Tokenizer::pad_token_id() const { return impl_->pad_id; }
+int32_t Tokenizer::vocab_size() const {
+    return impl_->vocab_size_;
+}
+int32_t Tokenizer::bos_token_id() const {
+    return impl_->bos_id;
+}
+int32_t Tokenizer::eos_token_id() const {
+    return impl_->eos_id;
+}
+int32_t Tokenizer::pad_token_id() const {
+    return impl_->pad_id;
+}
 
 bool Tokenizer::is_special_token(int32_t id) const {
     return impl_->special_token_ids.count(static_cast<Rank>(id)) > 0;
@@ -707,9 +743,7 @@ std::string Tokenizer::special_token(const std::string& name) const {
     return "";
 }
 
-std::string Tokenizer::apply_chat_template(
-        const std::vector<ChatMessage>& messages,
-        bool add_generation_prompt) const {
+std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages, bool add_generation_prompt) const {
     // Convert ChatMessage to nlohmann::ordered_json array
     nlohmann::ordered_json json_messages = nlohmann::ordered_json::array();
     for (const auto& msg : messages) {
@@ -719,9 +753,8 @@ std::string Tokenizer::apply_chat_template(
     return impl_->render_chat_template(json_messages, add_generation_prompt);
 }
 
-std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(
-        const std::vector<ChatMessage>& messages,
-        bool add_generation_prompt) const {
+std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,
+                                                               bool add_generation_prompt) const {
     std::string text = apply_chat_template(messages, add_generation_prompt);
     return encode_with_special_tokens(text);
 }
@@ -730,9 +763,7 @@ std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(
 // Training-aware encoding with loss masking
 // ============================================================================
 
-TrainingEncoded Tokenizer::encode_for_training(
-        const std::vector<ChatMessage>& messages,
-        LossStrategy strategy) const {
+TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& messages, LossStrategy strategy) const {
     TrainingEncoded result;
     if (messages.empty()) return result;
 
@@ -792,12 +823,8 @@ TrainingEncoded Tokenizer::encode_for_training(
             bool trainable = false;
             switch (strategy) {
                 case LossStrategy::ALL:
-                case LossStrategy::DEFAULT:
-                    trainable = true;
-                    break;
-                case LossStrategy::LAST_ROUND:
-                    trainable = is_last_round;
-                    break;
+                case LossStrategy::DEFAULT: trainable = true; break;
+                case LossStrategy::LAST_ROUND: trainable = is_last_round; break;
             }
             segments.push_back({std::move(response), trainable});
         }
@@ -825,10 +852,8 @@ TrainingEncoded Tokenizer::encode_for_training(
 }
 
 // Thread-safe wrapper that catches exceptions per-example.
-static TrainingEncoded encode_for_training_safe(
-        const Tokenizer& tok,
-        const std::vector<ChatMessage>& messages,
-        LossStrategy strategy) {
+static TrainingEncoded
+encode_for_training_safe(const Tokenizer& tok, const std::vector<ChatMessage>& messages, LossStrategy strategy) {
     try {
         return tok.encode_for_training(messages, strategy);
     } catch (...) {
@@ -836,14 +861,12 @@ static TrainingEncoded encode_for_training_safe(
     }
 }
 
-std::vector<TrainingEncoded> Tokenizer::encode_for_training_batch(
-        const std::vector<std::vector<ChatMessage>>& batch,
-        LossStrategy strategy) const {
+std::vector<TrainingEncoded> Tokenizer::encode_for_training_batch(const std::vector<std::vector<ChatMessage>>& batch,
+                                                                  LossStrategy strategy) const {
     std::vector<TrainingEncoded> results(batch.size());
 
     if (batch.size() > 1) {
-        unsigned num_threads = std::min(static_cast<unsigned>(batch.size()),
-                                        std::thread::hardware_concurrency());
+        unsigned num_threads = std::min(static_cast<unsigned>(batch.size()), std::thread::hardware_concurrency());
         if (num_threads < 2) num_threads = 1;
 
         if (num_threads > 1) {
@@ -860,7 +883,8 @@ std::vector<TrainingEncoded> Tokenizer::encode_for_training_batch(
                     }
                 });
             }
-            for (auto& th : threads) th.join();
+            for (auto& th : threads)
+                th.join();
             return results;
         }
     }
@@ -871,4 +895,4 @@ std::vector<TrainingEncoded> Tokenizer::encode_for_training_batch(
     return results;
 }
 
-} // namespace tokenizer
+}  // namespace tokenizer

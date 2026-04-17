@@ -31,116 +31,116 @@ Key components:
 - IR: Graph IR representation for C++ runtime
 """
 
-from .types import (
-    Dtype,
-    SymbolicDim,
-    ConcreteDim,
-    ComputedDim,
-    VariadicDim,
-    Shape,
-    TensorTypeSpec,
-    MemoryMode,
-    HookPoint,
-    HookMode,
-    ShardStrategy,
+# Import subpackages to ensure registration
+from . import blocks, models, modules, primitives
+from .decorators import (
+    Activation,
+    Gradient,
+    Param,
+    abstract,
+    backward,
+    block,
+    extends,
+    forward,
+    hf_config,
+    hf_export,
+    hf_mapping,
+    model,
+    module,
+    param,
+    primitive,
+    recompute,
+    save,
+    tied_to,
 )
 
 # First-class dimension types
 from .dim import (
+    B,
+    ConcreteDimValue,
     Dim,
     DimExpr,
-    ConcreteDimValue,
-    B,
     T,
     dim_to_ir,
 )
-
-from .ir import (
-    GraphIR,
-    ModuleIR,
-    ScheduleIR,
-    OpNode,
-    TensorRef,
-    KernelType,
-)
-
 from .errors import (
+    DSLConstraintError,
     DSLError,
+    DSLResolutionError,
+    DSLShapeError,
     DSLSyntaxError,
     DSLTypeError,
-    DSLShapeError,
-    DSLResolutionError,
     DSLUndefinedError,
-    DSLConstraintError,
     WarningCollector,
 )
-
-# Python DSL (decorator-based)
-from .tensor_type import Tensor, TensorType, Array
-from .decorators import (
-    module,
-    block,
-    model,
-    primitive,
-    param,
-    Param,
-    Activation,
-    Gradient,
-    forward,
-    backward,
-    save,
-    recompute,
-    hf_config,
-    hf_mapping,
-    hf_export,
-    abstract,
-    extends,
-    tied_to,
-)
-from .graph_builder import graph, GraphBuilder, GraphRef
+from .graph_builder import GraphBuilder, GraphRef, graph
 from .hf import fuse, split, transform
 from .hf import tied_to as hf_tied_to
-from .specs import (
-    ModuleSpec,
-    BlockSpec,
-    ModelSpec,
-    PrimitiveSpec,
-    ParamSpec,
-    ForwardSpec,
-    BackwardSpec,
-    ActivationSlotSpec,
-    ActivationLayoutSpec,
-    ActivationScope,
-    ActivationMemoryHint,
-)
-from .py_registry import (
-    registry,
-    get_module as py_get_module,
-    get_primitive as py_get_primitive,
-    list_modules as py_list_modules,
-)
-from .py_lowering import (
-    lower_module_spec,
-    lower_block_spec,
-    lower_model_spec,
-    lower_graph_builder,
+from .ir import (
+    GraphIR,
+    KernelType,
+    ModuleIR,
+    OpNode,
+    ScheduleIR,
+    TensorRef,
 )
 from .py_compiler import (
     compile_model,
     compile_model_for_hf,
-    get_model_spec,
     get_block_spec,
+    get_model_spec,
     get_module_spec,
-    list_registered_models,
     list_registered_blocks,
+    list_registered_models,
     list_registered_modules,
 )
+from .py_lowering import (
+    lower_block_spec,
+    lower_graph_builder,
+    lower_model_spec,
+    lower_module_spec,
+)
+from .py_registry import (
+    get_module as py_get_module,
+)
+from .py_registry import (
+    get_primitive as py_get_primitive,
+)
+from .py_registry import (
+    list_modules as py_list_modules,
+)
+from .py_registry import (
+    registry,
+)
+from .specs import (
+    ActivationLayoutSpec,
+    ActivationMemoryHint,
+    ActivationScope,
+    ActivationSlotSpec,
+    BackwardSpec,
+    BlockSpec,
+    ForwardSpec,
+    ModelSpec,
+    ModuleSpec,
+    ParamSpec,
+    PrimitiveSpec,
+)
 
-# Import subpackages to ensure registration
-from . import primitives
-from . import modules
-from . import blocks
-from . import models
+# Python DSL (decorator-based)
+from .tensor_type import Array, Tensor, TensorType
+from .types import (
+    ComputedDim,
+    ConcreteDim,
+    Dtype,
+    HookMode,
+    HookPoint,
+    MemoryMode,
+    Shape,
+    ShardStrategy,
+    SymbolicDim,
+    TensorTypeSpec,
+    VariadicDim,
+)
 
 __version__ = "0.1.0"
 

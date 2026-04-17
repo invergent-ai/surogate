@@ -57,23 +57,20 @@ __device__ __forceinline__ half from_float<half>(float v) {
 // Single-tensor kernel
 
 template <typename TParam, typename TGrad>
-__launch_bounds__(ADAMW_BLOCK_THREADS, 4)
-__global__ void kAdamWKernel(
-    TParam* p,
-    const TGrad* __restrict__ g,
-    float* m,
-    float* v,
-    const float beta1,
-    const float beta2,
-    const float eps,
-    const int step,
-    const float lr,
-    float weight_decay,
-    const float* __restrict__ opt_params,
-    const int* __restrict__ opt_step,
-    const float* __restrict__ gnorm_scale_ptr,
-    const int n
-) {
+__launch_bounds__(ADAMW_BLOCK_THREADS, 4) __global__ void kAdamWKernel(TParam* p,
+                                                                       const TGrad* __restrict__ g,
+                                                                       float* m,
+                                                                       float* v,
+                                                                       const float beta1,
+                                                                       const float beta2,
+                                                                       const float eps,
+                                                                       const int step,
+                                                                       const float lr,
+                                                                       float weight_decay,
+                                                                       const float* __restrict__ opt_params,
+                                                                       const int* __restrict__ opt_step,
+                                                                       const float* __restrict__ gnorm_scale_ptr,
+                                                                       const int n) {
     // Read hyperparams from device memory if available (CUDA graph capture)
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
@@ -104,7 +101,7 @@ __global__ void kAdamWKernel(
         const int base_idx = block_idx * ADAMW_BLOCK_SIZE_N;
         const int thread_offset = base_idx + threadIdx.x * ADAMW_N_PER_THREAD;
 
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < ADAMW_N_PER_THREAD; j++) {
             const int idx = thread_offset + j;
             if (idx >= n) continue;
@@ -143,81 +140,235 @@ __global__ void kAdamWKernel(
 // Single-tensor launch
 
 template <typename TParam, typename TGrad>
-static void launch_adamw_update(
-    TParam* param, const TGrad* grad, float* m, float* v, std::size_t n,
-    float lr, float beta1, float beta2, int step,
-    float epsilon, float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step,
-    cudaStream_t stream
-) {
+static void launch_adamw_update(TParam* param,
+                                const TGrad* grad,
+                                float* m,
+                                float* v,
+                                std::size_t n,
+                                float lr,
+                                float beta1,
+                                float beta2,
+                                int step,
+                                float epsilon,
+                                float weight_decay,
+                                const float* gnorm_scale,
+                                const float* opt_params,
+                                const int* opt_step,
+                                cudaStream_t stream) {
     if (n == 0) return;
 
     int total_blocks = (int)div_ceil(n, (size_t)ADAMW_BLOCK_SIZE_N);
     int grid_size = std::min(total_blocks, 1024);
 
-    kAdamWKernel<TParam, TGrad>
-        <<<grid_size, ADAMW_BLOCK_THREADS, 0, stream>>>(
-            param, grad, m, v,
-            beta1, beta2, epsilon, step, lr, weight_decay,
-            opt_params, opt_step, gnorm_scale, (int)n
-        );
+    kAdamWKernel<TParam, TGrad><<<grid_size, ADAMW_BLOCK_THREADS, 0, stream>>>(param,
+                                                                               grad,
+                                                                               m,
+                                                                               v,
+                                                                               beta1,
+                                                                               beta2,
+                                                                               epsilon,
+                                                                               step,
+                                                                               lr,
+                                                                               weight_decay,
+                                                                               opt_params,
+                                                                               opt_step,
+                                                                               gnorm_scale,
+                                                                               (int)n);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // Explicit overloads
 
-void adamw_update(float* param, const float* grad, float* m, float* v, std::size_t n,
-                  float lr, float beta1, float beta2, int step,
-                  float epsilon, float weight_decay, const float* gnorm_scale,
-                  const float* opt_params, const int* opt_step,
+void adamw_update(float* param,
+                  const float* grad,
+                  float* m,
+                  float* v,
+                  std::size_t n,
+                  float lr,
+                  float beta1,
+                  float beta2,
+                  int step,
+                  float epsilon,
+                  float weight_decay,
+                  const float* gnorm_scale,
+                  const float* opt_params,
+                  const int* opt_step,
                   cudaStream_t stream) {
-    launch_adamw_update(param, grad, m, v, n, lr, beta1, beta2, step,
-                        epsilon, weight_decay, gnorm_scale, opt_params, opt_step, stream);
+    launch_adamw_update(param,
+                        grad,
+                        m,
+                        v,
+                        n,
+                        lr,
+                        beta1,
+                        beta2,
+                        step,
+                        epsilon,
+                        weight_decay,
+                        gnorm_scale,
+                        opt_params,
+                        opt_step,
+                        stream);
 }
 
-void adamw_update(float* param, const nv_bfloat16* grad, float* m, float* v, std::size_t n,
-                  float lr, float beta1, float beta2, int step,
-                  float epsilon, float weight_decay, const float* gnorm_scale,
-                  const float* opt_params, const int* opt_step,
+void adamw_update(float* param,
+                  const nv_bfloat16* grad,
+                  float* m,
+                  float* v,
+                  std::size_t n,
+                  float lr,
+                  float beta1,
+                  float beta2,
+                  int step,
+                  float epsilon,
+                  float weight_decay,
+                  const float* gnorm_scale,
+                  const float* opt_params,
+                  const int* opt_step,
                   cudaStream_t stream) {
-    launch_adamw_update(param, grad, m, v, n, lr, beta1, beta2, step,
-                        epsilon, weight_decay, gnorm_scale, opt_params, opt_step, stream);
+    launch_adamw_update(param,
+                        grad,
+                        m,
+                        v,
+                        n,
+                        lr,
+                        beta1,
+                        beta2,
+                        step,
+                        epsilon,
+                        weight_decay,
+                        gnorm_scale,
+                        opt_params,
+                        opt_step,
+                        stream);
 }
 
-void adamw_update(nv_bfloat16* param, const nv_bfloat16* grad, float* m, float* v, std::size_t n,
-                  float lr, float beta1, float beta2, int step,
-                  float epsilon, float weight_decay, const float* gnorm_scale,
-                  const float* opt_params, const int* opt_step,
+void adamw_update(nv_bfloat16* param,
+                  const nv_bfloat16* grad,
+                  float* m,
+                  float* v,
+                  std::size_t n,
+                  float lr,
+                  float beta1,
+                  float beta2,
+                  int step,
+                  float epsilon,
+                  float weight_decay,
+                  const float* gnorm_scale,
+                  const float* opt_params,
+                  const int* opt_step,
                   cudaStream_t stream) {
-    launch_adamw_update(param, grad, m, v, n, lr, beta1, beta2, step,
-                        epsilon, weight_decay, gnorm_scale, opt_params, opt_step, stream);
+    launch_adamw_update(param,
+                        grad,
+                        m,
+                        v,
+                        n,
+                        lr,
+                        beta1,
+                        beta2,
+                        step,
+                        epsilon,
+                        weight_decay,
+                        gnorm_scale,
+                        opt_params,
+                        opt_step,
+                        stream);
 }
 
-void adamw_update(nv_bfloat16* param, const float* grad, float* m, float* v, std::size_t n,
-                  float lr, float beta1, float beta2, int step,
-                  float epsilon, float weight_decay, const float* gnorm_scale,
-                  const float* opt_params, const int* opt_step,
+void adamw_update(nv_bfloat16* param,
+                  const float* grad,
+                  float* m,
+                  float* v,
+                  std::size_t n,
+                  float lr,
+                  float beta1,
+                  float beta2,
+                  int step,
+                  float epsilon,
+                  float weight_decay,
+                  const float* gnorm_scale,
+                  const float* opt_params,
+                  const int* opt_step,
                   cudaStream_t stream) {
-    launch_adamw_update(param, grad, m, v, n, lr, beta1, beta2, step,
-                        epsilon, weight_decay, gnorm_scale, opt_params, opt_step, stream);
+    launch_adamw_update(param,
+                        grad,
+                        m,
+                        v,
+                        n,
+                        lr,
+                        beta1,
+                        beta2,
+                        step,
+                        epsilon,
+                        weight_decay,
+                        gnorm_scale,
+                        opt_params,
+                        opt_step,
+                        stream);
 }
 
-void adamw_update(half* param, const half* grad, float* m, float* v, std::size_t n,
-                  float lr, float beta1, float beta2, int step,
-                  float epsilon, float weight_decay, const float* gnorm_scale,
-                  const float* opt_params, const int* opt_step,
+void adamw_update(half* param,
+                  const half* grad,
+                  float* m,
+                  float* v,
+                  std::size_t n,
+                  float lr,
+                  float beta1,
+                  float beta2,
+                  int step,
+                  float epsilon,
+                  float weight_decay,
+                  const float* gnorm_scale,
+                  const float* opt_params,
+                  const int* opt_step,
                   cudaStream_t stream) {
-    launch_adamw_update(param, grad, m, v, n, lr, beta1, beta2, step,
-                        epsilon, weight_decay, gnorm_scale, opt_params, opt_step, stream);
+    launch_adamw_update(param,
+                        grad,
+                        m,
+                        v,
+                        n,
+                        lr,
+                        beta1,
+                        beta2,
+                        step,
+                        epsilon,
+                        weight_decay,
+                        gnorm_scale,
+                        opt_params,
+                        opt_step,
+                        stream);
 }
 
-void adamw_update(half* param, const float* grad, float* m, float* v, std::size_t n,
-                  float lr, float beta1, float beta2, int step,
-                  float epsilon, float weight_decay, const float* gnorm_scale,
-                  const float* opt_params, const int* opt_step,
+void adamw_update(half* param,
+                  const float* grad,
+                  float* m,
+                  float* v,
+                  std::size_t n,
+                  float lr,
+                  float beta1,
+                  float beta2,
+                  int step,
+                  float epsilon,
+                  float weight_decay,
+                  const float* gnorm_scale,
+                  const float* opt_params,
+                  const int* opt_step,
                   cudaStream_t stream) {
-    launch_adamw_update(param, grad, m, v, n, lr, beta1, beta2, step,
-                        epsilon, weight_decay, gnorm_scale, opt_params, opt_step, stream);
+    launch_adamw_update(param,
+                        grad,
+                        m,
+                        v,
+                        n,
+                        lr,
+                        beta1,
+                        beta2,
+                        step,
+                        epsilon,
+                        weight_decay,
+                        gnorm_scale,
+                        opt_params,
+                        opt_step,
+                        stream);
 }
 
 // ----------------------------------------------------------------------------
@@ -227,25 +378,23 @@ void adamw_update(half* param, const float* grad, float* m, float* v, std::size_
 // state_offsets[i] gives the element offset into the contiguous m/v buffers.
 
 template <typename T>
-__launch_bounds__(ADAMW_BLOCK_THREADS, 4)
-__global__ void kAdamWMultiTensorKernel(
-    T** params,
-    T** __restrict__ const grads,
-    const int* sizes,
-    int num_tensors,
-    float* m_buf,
-    float* v_buf,
-    const int* state_offsets,
-    const float beta1,
-    const float beta2,
-    const float eps,
-    const int step,
-    const float lr,
-    float weight_decay,
-    const float* __restrict__ opt_params,
-    const int* __restrict__ opt_step,
-    const float* __restrict__ gnorm_scale_ptr
-) {
+__launch_bounds__(ADAMW_BLOCK_THREADS, 4) __global__
+    void kAdamWMultiTensorKernel(T** params,
+                                 T** __restrict__ const grads,
+                                 const int* sizes,
+                                 int num_tensors,
+                                 float* m_buf,
+                                 float* v_buf,
+                                 const int* state_offsets,
+                                 const float beta1,
+                                 const float beta2,
+                                 const float eps,
+                                 const int step,
+                                 const float lr,
+                                 float weight_decay,
+                                 const float* __restrict__ opt_params,
+                                 const int* __restrict__ opt_step,
+                                 const float* __restrict__ gnorm_scale_ptr) {
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
     float beta2_val = beta2;
@@ -283,7 +432,7 @@ __global__ void kAdamWMultiTensorKernel(
             const int base_idx = block_idx * ADAMW_BLOCK_SIZE_N;
             const int thread_offset = base_idx + threadIdx.x * ADAMW_N_PER_THREAD;
 
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < ADAMW_N_PER_THREAD; j++) {
                 const int idx = thread_offset + j;
                 if (idx >= n) continue;
@@ -319,53 +468,122 @@ __global__ void kAdamWMultiTensorKernel(
 // Multi-tensor launch
 
 template <typename T>
-static void launch_adamw_update_multi_tensor(
-    T** params, T** grads, const int* sizes, int num_tensors,
-    float* m, float* v, const int* state_offsets, size_t total_params,
-    float lr, float beta1, float beta2, int step, float eps,
-    float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step,
-    cudaStream_t stream
-) {
+static void launch_adamw_update_multi_tensor(T** params,
+                                             T** grads,
+                                             const int* sizes,
+                                             int num_tensors,
+                                             float* m,
+                                             float* v,
+                                             const int* state_offsets,
+                                             size_t total_params,
+                                             float lr,
+                                             float beta1,
+                                             float beta2,
+                                             int step,
+                                             float eps,
+                                             float weight_decay,
+                                             const float* gnorm_scale,
+                                             const float* opt_params,
+                                             const int* opt_step,
+                                             cudaStream_t stream) {
     if (num_tensors == 0 || total_params == 0) return;
 
     int total_blocks = (int)div_ceil(total_params, (size_t)ADAMW_BLOCK_SIZE_N);
     int grid_size = std::min(total_blocks, 256);
 
-    kAdamWMultiTensorKernel<T>
-        <<<grid_size, ADAMW_BLOCK_THREADS, 0, stream>>>(
-            params, const_cast<T**>(grads), sizes, num_tensors,
-            m, v, state_offsets,
-            beta1, beta2, eps, step, lr, weight_decay,
-            opt_params, opt_step, gnorm_scale
-        );
+    kAdamWMultiTensorKernel<T><<<grid_size, ADAMW_BLOCK_THREADS, 0, stream>>>(params,
+                                                                              const_cast<T**>(grads),
+                                                                              sizes,
+                                                                              num_tensors,
+                                                                              m,
+                                                                              v,
+                                                                              state_offsets,
+                                                                              beta1,
+                                                                              beta2,
+                                                                              eps,
+                                                                              step,
+                                                                              lr,
+                                                                              weight_decay,
+                                                                              opt_params,
+                                                                              opt_step,
+                                                                              gnorm_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void adamw_update_multi_tensor(
-    float** params, float** grads, const int* sizes, int num_tensors,
-    float* m, float* v, const int* state_offsets, size_t total_params,
-    float lr, float beta1, float beta2, int step, float eps,
-    float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step, cudaStream_t stream
-) {
-    launch_adamw_update_multi_tensor(params, grads, sizes, num_tensors,
-        m, v, state_offsets, total_params,
-        lr, beta1, beta2, step, eps, weight_decay, gnorm_scale,
-        opt_params, opt_step, stream);
+void adamw_update_multi_tensor(float** params,
+                               float** grads,
+                               const int* sizes,
+                               int num_tensors,
+                               float* m,
+                               float* v,
+                               const int* state_offsets,
+                               size_t total_params,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               int step,
+                               float eps,
+                               float weight_decay,
+                               const float* gnorm_scale,
+                               const float* opt_params,
+                               const int* opt_step,
+                               cudaStream_t stream) {
+    launch_adamw_update_multi_tensor(params,
+                                     grads,
+                                     sizes,
+                                     num_tensors,
+                                     m,
+                                     v,
+                                     state_offsets,
+                                     total_params,
+                                     lr,
+                                     beta1,
+                                     beta2,
+                                     step,
+                                     eps,
+                                     weight_decay,
+                                     gnorm_scale,
+                                     opt_params,
+                                     opt_step,
+                                     stream);
 }
 
-void adamw_update_multi_tensor(
-    nv_bfloat16** params, nv_bfloat16** grads, const int* sizes, int num_tensors,
-    float* m, float* v, const int* state_offsets, size_t total_params,
-    float lr, float beta1, float beta2, int step, float eps,
-    float weight_decay, const float* gnorm_scale,
-    const float* opt_params, const int* opt_step, cudaStream_t stream
-) {
-    launch_adamw_update_multi_tensor(params, grads, sizes, num_tensors,
-        m, v, state_offsets, total_params,
-        lr, beta1, beta2, step, eps, weight_decay, gnorm_scale,
-        opt_params, opt_step, stream);
+void adamw_update_multi_tensor(nv_bfloat16** params,
+                               nv_bfloat16** grads,
+                               const int* sizes,
+                               int num_tensors,
+                               float* m,
+                               float* v,
+                               const int* state_offsets,
+                               size_t total_params,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               int step,
+                               float eps,
+                               float weight_decay,
+                               const float* gnorm_scale,
+                               const float* opt_params,
+                               const int* opt_step,
+                               cudaStream_t stream) {
+    launch_adamw_update_multi_tensor(params,
+                                     grads,
+                                     sizes,
+                                     num_tensors,
+                                     m,
+                                     v,
+                                     state_offsets,
+                                     total_params,
+                                     lr,
+                                     beta1,
+                                     beta2,
+                                     step,
+                                     eps,
+                                     weight_decay,
+                                     gnorm_scale,
+                                     opt_params,
+                                     opt_step,
+                                     stream);
 }
 
 // ----------------------------------------------------------------------------
@@ -373,7 +591,8 @@ void adamw_update_multi_tensor(
 
 __global__ void kInitAdamWState(float* m, float* v, size_t n) {
     const size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-    for (size_t idx = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
+    for (size_t idx =
+             static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
          idx < n;
          idx += stride) {
         m[idx] = 0.0f;

@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import field
 import time
 from collections import Counter, defaultdict
-from pathlib import Path
+from dataclasses import field
 from typing import NamedTuple
 
 import verifiers as vf
 from aiolimiter import AsyncLimiter
 
+from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.orchestrator.advantage import dataclass
 from surogate.grpo.orchestrator.buffer import Buffer
-from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.orchestrator.utils import get_sampling_args
-from surogate.grpo.orchestrator.vf_utils import run_group, get_seq_len, run_rollout
+from surogate.grpo.orchestrator.vf_utils import get_seq_len, run_rollout
 from surogate.grpo.utils.asynyc_utils import safe_cancel, safe_cancel_all
-
 from surogate.grpo.utils.client import InferencePool
 from surogate.grpo.utils.logger import ProgressTracker, get_logger
 from surogate.grpo.utils.temp_scheduling import compute_temperature
@@ -26,6 +24,7 @@ from surogate.grpo.utils.utils import (
     get_step_path,
     wait_for_path,
 )
+
 
 class InflightRolloutInfo(NamedTuple):
     """Metadata for an in-flight request."""
@@ -94,7 +93,7 @@ class Scheduler:
 
         # Inference pool - used for admin operations (adapter sync) and metrics
         self.inference_pool = inference_pool
-        
+
         self.max_retries_by_task = {env.resolved_name: env.max_retries for env in config.env}
 
         self.deferred_group_scoring_tasks = set(deferred_group_scoring_tasks or ())

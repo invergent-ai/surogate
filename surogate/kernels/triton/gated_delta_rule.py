@@ -30,7 +30,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import torch
 import triton
@@ -46,15 +45,16 @@ _SM = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0
 _IS_TMA_SUPPORTED = _SM[0] >= 9
 _IS_BLACKWELL = _SM[0] >= 10
 
-if hasattr(tl, 'make_tensor_descriptor'):
+if hasattr(tl, "make_tensor_descriptor"):
     _make_td = tl.make_tensor_descriptor
-elif hasattr(tl, '_experimental_make_tensor_descriptor'):
+elif hasattr(tl, "_experimental_make_tensor_descriptor"):
     _make_td = tl._experimental_make_tensor_descriptor
 else:
     _make_td = None
 
 # Blackwell safe_dot workaround (triton-lang/triton#8695)
 if _IS_BLACKWELL:
+
     @triton.jit
     def safe_dot(a, b):
         return tl.inline_asm_elementwise(
@@ -66,6 +66,7 @@ if _IS_BLACKWELL:
             pack=1,
         )
 else:
+
     @triton.jit
     def safe_dot(a, b):
         return tl.dot(a, b)
@@ -75,9 +76,13 @@ else:
 # Kernel 0: L2 normalization (per-head, last dim)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def l2norm_fwd_kernel(
-    x, y, rstd, T,
+    x,
+    y,
+    rstd,
+    T,
     H: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
@@ -94,8 +99,7 @@ def l2norm_fwd_kernel(
     # Compute squared norm
     acc = tl.zeros([BT], dtype=tl.float32)
     for i_d in range(tl.cdiv(D, 64)):
-        p_x = tl.make_block_ptr(x + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                (i_t * BT, i_d * 64), (BT, 64), (1, 0))
+        p_x = tl.make_block_ptr(x + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0))
         b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
         acc += tl.sum(b_x * b_x, axis=1)
 
@@ -106,18 +110,20 @@ def l2norm_fwd_kernel(
 
     # Normalize and store
     for i_d in range(tl.cdiv(D, 64)):
-        p_x = tl.make_block_ptr(x + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                (i_t * BT, i_d * 64), (BT, 64), (1, 0))
-        p_y = tl.make_block_ptr(y + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                (i_t * BT, i_d * 64), (BT, 64), (1, 0))
+        p_x = tl.make_block_ptr(x + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0))
+        p_y = tl.make_block_ptr(y + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0))
         b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
         b_y = (b_x * b_rstd[:, None]).to(p_y.dtype.element_ty)
         tl.store(p_y, b_y, boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def l2norm_bwd_kernel(
-    x_norm, rstd, dout, dx, T,
+    x_norm,
+    rstd,
+    dout,
+    dx,
+    T,
     H: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
@@ -134,22 +140,21 @@ def l2norm_bwd_kernel(
     # Compute dot(dout, x_norm) per token
     dot_sum = tl.zeros([BT], dtype=tl.float32)
     for i_d in range(tl.cdiv(D, 64)):
-        p_xn = tl.make_block_ptr(x_norm + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                 (i_t * BT, i_d * 64), (BT, 64), (1, 0))
-        p_do = tl.make_block_ptr(dout + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                 (i_t * BT, i_d * 64), (BT, 64), (1, 0))
+        p_xn = tl.make_block_ptr(
+            x_norm + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0)
+        )
+        p_do = tl.make_block_ptr(dout + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0))
         b_xn = tl.load(p_xn, boundary_check=(0, 1)).to(tl.float32)
         b_do = tl.load(p_do, boundary_check=(0, 1)).to(tl.float32)
         dot_sum += tl.sum(b_xn * b_do, axis=1)
 
     # dx = rstd * (dout - x_norm * dot_sum)
     for i_d in range(tl.cdiv(D, 64)):
-        p_xn = tl.make_block_ptr(x_norm + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                 (i_t * BT, i_d * 64), (BT, 64), (1, 0))
-        p_do = tl.make_block_ptr(dout + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                 (i_t * BT, i_d * 64), (BT, 64), (1, 0))
-        p_dx = tl.make_block_ptr(dx + (bos * H + i_h) * D, (T, D), (H * D, 1),
-                                 (i_t * BT, i_d * 64), (BT, 64), (1, 0))
+        p_xn = tl.make_block_ptr(
+            x_norm + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0)
+        )
+        p_do = tl.make_block_ptr(dout + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0))
+        p_dx = tl.make_block_ptr(dx + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_t * BT, i_d * 64), (BT, 64), (1, 0))
         b_xn = tl.load(p_xn, boundary_check=(0, 1)).to(tl.float32)
         b_do = tl.load(p_do, boundary_check=(0, 1)).to(tl.float32)
         b_dx = b_rstd[:, None] * (b_do - b_xn * dot_sum[:, None])
@@ -160,9 +165,12 @@ def l2norm_bwd_kernel(
 # Kernel 1: chunk_local_cumsum
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_kernel(
-    s, o, T,
+    s,
+    o,
+    T,
     H: tl.constexpr,
     BT: tl.constexpr,
     REVERSE: tl.constexpr,
@@ -186,9 +194,14 @@ def chunk_local_cumsum_kernel(
 # Kernel 2: chunk_scaled_dot_kkt_fwd
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def chunk_scaled_dot_kkt_fwd_kernel(
-    k, g, beta, A, T,
+    k,
+    g,
+    beta,
+    A,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
@@ -206,8 +219,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_A += tl.dot(b_k, tl.trans(b_k))
 
@@ -219,8 +231,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
 
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1),
-                            (i_t * BT, 0), (BT, BT), (1, 0))
+    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -228,9 +239,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 # Kernel 3: solve_tril (merge 16x16 → 64x64 inverse) — TMA support
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def solve_tril_64x64_kernel(
-    A, Ai, T,
+    A,
+    Ai,
+    T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
@@ -273,22 +287,22 @@ def solve_tril_64x64_kernel(
     # Scalar solve for each 16x16 diagonal block
     for i in range(2, min(16, T - i_t * BT)):
         b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
-        b_a_11 = tl.where(o_i < i, b_a_11, 0.)
+        b_a_11 = tl.where(o_i < i, b_a_11, 0.0)
         b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
         b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
     for i in range(16 + 2, min(32, T - i_t * BT)):
         b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
-        b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.)
+        b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.0)
         b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
         b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
     for i in range(32 + 2, min(48, T - i_t * BT)):
         b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
-        b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.)
+        b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.0)
         b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
         b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
     for i in range(48 + 2, min(64, T - i_t * BT)):
         b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
-        b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.)
+        b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.0)
         b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
         b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
 
@@ -320,30 +334,25 @@ def solve_tril_64x64_kernel(
         b_A_43 = desc.load([i_t * BT + 48, 32]).to(tl.float32)
 
     # Compose off-diagonal inverse blocks
-    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, input_precision=DOT_PRECISION),
-                       b_Ai_11, input_precision=DOT_PRECISION)
-    b_Ai_32 = -tl.dot(tl.dot(b_Ai_33, b_A_32, input_precision=DOT_PRECISION),
-                       b_Ai_22, input_precision=DOT_PRECISION)
-    b_Ai_43 = -tl.dot(tl.dot(b_Ai_44, b_A_43, input_precision=DOT_PRECISION),
-                       b_Ai_33, input_precision=DOT_PRECISION)
+    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, input_precision=DOT_PRECISION), b_Ai_11, input_precision=DOT_PRECISION)
+    b_Ai_32 = -tl.dot(tl.dot(b_Ai_33, b_A_32, input_precision=DOT_PRECISION), b_Ai_22, input_precision=DOT_PRECISION)
+    b_Ai_43 = -tl.dot(tl.dot(b_Ai_44, b_A_43, input_precision=DOT_PRECISION), b_Ai_33, input_precision=DOT_PRECISION)
 
     b_Ai_31 = -tl.dot(
         b_Ai_33,
-        tl.dot(b_A_31, b_Ai_11, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_32, b_Ai_21, input_precision=DOT_PRECISION),
+        tl.dot(b_A_31, b_Ai_11, input_precision=DOT_PRECISION) + tl.dot(b_A_32, b_Ai_21, input_precision=DOT_PRECISION),
         input_precision=DOT_PRECISION,
     )
     b_Ai_42 = -tl.dot(
         b_Ai_44,
-        tl.dot(b_A_42, b_Ai_22, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_43, b_Ai_32, input_precision=DOT_PRECISION),
+        tl.dot(b_A_42, b_Ai_22, input_precision=DOT_PRECISION) + tl.dot(b_A_43, b_Ai_32, input_precision=DOT_PRECISION),
         input_precision=DOT_PRECISION,
     )
     b_Ai_41 = -tl.dot(
         b_Ai_44,
-        tl.dot(b_A_41, b_Ai_11, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_42, b_Ai_21, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_43, b_Ai_31, input_precision=DOT_PRECISION),
+        tl.dot(b_A_41, b_Ai_11, input_precision=DOT_PRECISION)
+        + tl.dot(b_A_42, b_Ai_21, input_precision=DOT_PRECISION)
+        + tl.dot(b_A_43, b_Ai_31, input_precision=DOT_PRECISION),
         input_precision=DOT_PRECISION,
     )
 
@@ -386,9 +395,17 @@ def solve_tril_64x64_kernel(
 # Kernel 4: recompute_w_u_fwd  (WY representation forward)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
-    k, v, beta, w, u, A, g, T,
+    k,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    g,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -403,16 +420,13 @@ def recompute_w_u_fwd_kernel(
     p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_b = tl.load(p_b, boundary_check=(0,))
 
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-                            (i_t * BT, 0), (BT, BT), (1, 0))
+    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     b_A = tl.load(p_A, boundary_check=(0, 1))
 
     # u = A_inv @ (v * beta)
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1),
-                                (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_u = tl.make_block_ptr(u + (bos * H + i_h) * V, (T, V), (H * V, 1),
-                                (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_u = tl.make_block_ptr(u + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb, allow_tf32=False)
@@ -423,10 +437,8 @@ def recompute_w_u_fwd_kernel(
     b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_w = tl.make_block_ptr(w + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_w = tl.make_block_ptr(w + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = (b_k * b_b[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_A, b_kb)
@@ -437,9 +449,18 @@ def recompute_w_u_fwd_kernel(
 # Kernel 5: chunk_fwd_h  (state recurrence, multi-block K up to 256)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def chunk_fwd_h_kernel(
-    k, v, w, v_new, g, h, h0, ht, T,
+    k,
+    v,
+    w,
+    v_new,
+    g,
+    h,
+    h0,
+    ht,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -573,9 +594,17 @@ def chunk_fwd_h_kernel(
 # Kernel 6: chunk_fwd_o  (output computation)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def chunk_fwd_o_kernel(
-    q, k, v, h, g, o, scale, T,
+    q,
+    k,
+    v,
+    h,
+    g,
+    o,
+    scale,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -632,9 +661,16 @@ def chunk_fwd_o_kernel(
 # Kernel 7: chunk_bwd_dv_local  (local dv computation)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def chunk_bwd_dv_local_kernel(
-    q, k, g, do, dv, scale, T,
+    q,
+    k,
+    g,
+    do,
+    dv,
+    scale,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -685,9 +721,21 @@ def chunk_bwd_dv_local_kernel(
 # Kernel 8: chunk_bwd_dhu  (backward state recurrence)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def chunk_bwd_dhu_kernel(
-    q, k, w, g, dht, dh0, do, dh, dv, dv2, scale, T,
+    q,
+    k,
+    w,
+    g,
+    dht,
+    dh0,
+    do,
+    dh,
+    dv,
+    dv2,
+    scale,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -833,10 +881,24 @@ def chunk_bwd_dhu_kernel(
 # Kernel 9: chunk_bwd_dqkwg  (backward for dq, dk, dw, dg)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def chunk_bwd_dqkwg_kernel(
-    q, k, v, g, h, do, dh, dq, dk, dw, dv, dg,
-    scale, B, T,
+    q,
+    k,
+    v,
+    g,
+    h,
+    do,
+    dh,
+    dq,
+    dk,
+    dw,
+    dv,
+    dg,
+    scale,
+    B,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -941,9 +1003,21 @@ def chunk_bwd_dqkwg_kernel(
 # Kernel 10: prepare_wy_repr_bwd  (backward through WY representation)
 # =========================================================================
 
-@triton.jit(do_not_specialize=['T'])
+
+@triton.jit(do_not_specialize=["T"])
 def prepare_wy_repr_bwd_kernel(
-    k, v, beta, g, A, dw, du, dk, dv, db, dg, T,
+    k,
+    v,
+    beta,
+    g,
+    A,
+    dw,
+    du,
+    dk,
+    dv,
+    db,
+    dg,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -958,8 +1032,7 @@ def prepare_wy_repr_bwd_kernel(
     p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     p_db = tl.make_block_ptr(db + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     # A loaded transposed
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H * BT),
-                            (0, i_t * BT), (BT, BT), (0, 1))
+    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1))
 
     b_b = tl.load(p_b, boundary_check=(0,))
     b_db = tl.zeros([BT], dtype=tl.float32)
@@ -973,12 +1046,9 @@ def prepare_wy_repr_bwd_kernel(
 
     # Phase 1: accumulate dA from dw and du, compute dk (first pass)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                 (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dw = tl.make_block_ptr(dw + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                 (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dw = tl.make_block_ptr(dw + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kbg = b_k * (b_b * b_g_exp)[:, None]
         b_dw = tl.load(p_dw, boundary_check=(0, 1))
@@ -993,12 +1063,9 @@ def prepare_wy_repr_bwd_kernel(
         tl.store(p_dk, b_dk_val.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1),
-                                (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_dv = tl.make_block_ptr(dv + (bos * H + i_h) * V, (T, V), (H * V, 1),
-                                 (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_du = tl.make_block_ptr(du + (bos * H + i_h) * V, (T, V), (H * V, 1),
-                                 (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_dv = tl.make_block_ptr(dv + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_du = tl.make_block_ptr(du + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
         b_du = tl.load(p_du, boundary_check=(0, 1))
@@ -1025,10 +1092,8 @@ def prepare_wy_repr_bwd_kernel(
 
     # Phase 3: gradient through kkt
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                                 (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kt = tl.trans(b_k)
         b_ktb = b_kt * b_b[None, :]
@@ -1052,6 +1117,7 @@ def prepare_wy_repr_bwd_kernel(
 # =========================================================================
 # Compilation
 # =========================================================================
+
 
 def compile_gated_delta_rule(
     H: int,
@@ -1091,9 +1157,15 @@ def compile_gated_delta_rule(
     def _compile(name, fn, signature, constants, configs, bench_args, grid):
         logger.info("Autotuning %s (H=%d K=%d V=%d)...", name, H, K, V)
         path = autotune_triton_kernel(
-            fn=fn, signature=signature, constants=constants,
-            configs=configs, bench_args=bench_args, grid=grid,
-            output_dir=output_dir, kernel_name=name, sm=sm,
+            fn=fn,
+            signature=signature,
+            constants=constants,
+            configs=configs,
+            bench_args=bench_args,
+            grid=grid,
+            output_dir=output_dir,
+            kernel_name=name,
+            sm=sm,
         )
         manifests[name] = path
 
@@ -1101,92 +1173,141 @@ def compile_gated_delta_rule(
     q_in = torch.randn(B, T, H, K, dtype=torch.bfloat16, device="cuda")
     q_out = torch.empty_like(q_in)
     q_rstd = torch.empty(B, T, H, dtype=torch.float32, device="cuda")
-    _compile("gdr_l2norm_fwd_q", l2norm_fwd_kernel,
-             signature={"x": "*bf16", "y": "*bf16", "rstd": "*fp32", "T": "i32"},
-             constants={"H": H, "D": K, "BT": BT, "EPS": 1e-12},
-             configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
-             bench_args=(q_in, q_out, q_rstd, T), grid=(NT, B * H))
+    _compile(
+        "gdr_l2norm_fwd_q",
+        l2norm_fwd_kernel,
+        signature={"x": "*bf16", "y": "*bf16", "rstd": "*fp32", "T": "i32"},
+        constants={"H": H, "D": K, "BT": BT, "EPS": 1e-12},
+        configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
+        bench_args=(q_in, q_out, q_rstd, T),
+        grid=(NT, B * H),
+    )
 
     # --- 0b. L2 norm backward (for Q) ---
     dq = torch.randn_like(q_in)
-    _compile("gdr_l2norm_bwd_q", l2norm_bwd_kernel,
-             signature={"x_norm": "*bf16", "rstd": "*fp32", "dout": "*bf16", "dx": "*bf16", "T": "i32"},
-             constants={"H": H, "D": K, "BT": BT},
-             configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
-             bench_args=(q_out, q_rstd, dq, torch.empty_like(dq), T), grid=(NT, B * H))
+    _compile(
+        "gdr_l2norm_bwd_q",
+        l2norm_bwd_kernel,
+        signature={"x_norm": "*bf16", "rstd": "*fp32", "dout": "*bf16", "dx": "*bf16", "T": "i32"},
+        constants={"H": H, "D": K, "BT": BT},
+        configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
+        bench_args=(q_out, q_rstd, dq, torch.empty_like(dq), T),
+        grid=(NT, B * H),
+    )
 
     # --- 0c. L2 norm forward (for V-dim, if V != K) ---
     if V != K:
         v_in = torch.randn(B, T, H, V, dtype=torch.bfloat16, device="cuda")
         v_out = torch.empty_like(v_in)
         v_rstd = torch.empty(B, T, H, dtype=torch.float32, device="cuda")
-        _compile("gdr_l2norm_fwd_v", l2norm_fwd_kernel,
-                 signature={"x": "*bf16", "y": "*bf16", "rstd": "*fp32", "T": "i32"},
-                 constants={"H": H, "D": V, "BT": BT, "EPS": 1e-12},
-                 configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
-                 bench_args=(v_in, v_out, v_rstd, T), grid=(NT, B * H))
-        _compile("gdr_l2norm_bwd_v", l2norm_bwd_kernel,
-                 signature={"x_norm": "*bf16", "rstd": "*fp32", "dout": "*bf16", "dx": "*bf16", "T": "i32"},
-                 constants={"H": H, "D": V, "BT": BT},
-                 configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
-                 bench_args=(v_out, v_rstd, torch.randn_like(v_in), torch.empty_like(v_in), T),
-                 grid=(NT, B * H))
+        _compile(
+            "gdr_l2norm_fwd_v",
+            l2norm_fwd_kernel,
+            signature={"x": "*bf16", "y": "*bf16", "rstd": "*fp32", "T": "i32"},
+            constants={"H": H, "D": V, "BT": BT, "EPS": 1e-12},
+            configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
+            bench_args=(v_in, v_out, v_rstd, T),
+            grid=(NT, B * H),
+        )
+        _compile(
+            "gdr_l2norm_bwd_v",
+            l2norm_bwd_kernel,
+            signature={"x_norm": "*bf16", "rstd": "*fp32", "dout": "*bf16", "dx": "*bf16", "T": "i32"},
+            constants={"H": H, "D": V, "BT": BT},
+            configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
+            bench_args=(v_out, v_rstd, torch.randn_like(v_in), torch.empty_like(v_in), T),
+            grid=(NT, B * H),
+        )
 
     # --- 1. Cumsum forward ---
     # g_input is FP32 at runtime (output of log_sigmoid)
     s = torch.randn(B, T, H, dtype=torch.float32, device="cuda")
     o = torch.empty(B, T, H, dtype=torch.float32, device="cuda")
-    _compile("gdr_cumsum_fwd", chunk_local_cumsum_kernel,
-             signature={"s": "*fp32", "o": "*fp32", "T": "i32"},
-             constants={"H": H, "BT": BT, "REVERSE": 0},
-             configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
-             bench_args=(s, o, T), grid=(NT, B * H))
+    _compile(
+        "gdr_cumsum_fwd",
+        chunk_local_cumsum_kernel,
+        signature={"s": "*fp32", "o": "*fp32", "T": "i32"},
+        constants={"H": H, "BT": BT, "REVERSE": 0},
+        configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
+        bench_args=(s, o, T),
+        grid=(NT, B * H),
+    )
 
     # --- 2. Cumsum reverse (for backward dg) ---
-    _compile("gdr_cumsum_rev", chunk_local_cumsum_kernel,
-             signature={"s": "*fp32", "o": "*fp32", "T": "i32"},
-             constants={"H": H, "BT": BT, "REVERSE": 1},
-             configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
-             bench_args=(o, torch.empty_like(o), T), grid=(NT, B * H))
+    _compile(
+        "gdr_cumsum_rev",
+        chunk_local_cumsum_kernel,
+        signature={"s": "*fp32", "o": "*fp32", "T": "i32"},
+        constants={"H": H, "BT": BT, "REVERSE": 1},
+        configs=[{"num_warps": w} for w in [1, 2, 4, 8]],
+        bench_args=(o, torch.empty_like(o), T),
+        grid=(NT, B * H),
+    )
 
     # --- 3. KKT forward ---
     k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device="cuda")
     g = torch.randn(B, T, H, dtype=torch.float32, device="cuda")
     beta = torch.randn(B, T, H, dtype=torch.bfloat16, device="cuda")
     A_fp32 = torch.empty(B, T, H, BT, dtype=torch.float32, device="cuda")
-    _compile("gdr_kkt_fwd", chunk_scaled_dot_kkt_fwd_kernel,
-             signature={"k": "*bf16", "g": "*fp32", "beta": "*bf16", "A": "*fp32", "T": "i32"},
-             constants={"H": H, "K": K, "BT": BT},
-             configs=[{"BK": bk, "num_warps": w, "num_stages": ns}
-                      for bk in [32, 64, 128] if bk <= max(K, 32)
-                      for w in [2, 4, 8] for ns in [2, 3, 4]],
-             bench_args=(k, g, beta, A_fp32, T), grid=(NT, B * H))
+    _compile(
+        "gdr_kkt_fwd",
+        chunk_scaled_dot_kkt_fwd_kernel,
+        signature={"k": "*bf16", "g": "*fp32", "beta": "*bf16", "A": "*fp32", "T": "i32"},
+        constants={"H": H, "K": K, "BT": BT},
+        configs=[
+            {"BK": bk, "num_warps": w, "num_stages": ns}
+            for bk in [32, 64, 128]
+            if bk <= max(K, 32)
+            for w in [2, 4, 8]
+            for ns in [2, 3, 4]
+        ],
+        bench_args=(k, g, beta, A_fp32, T),
+        grid=(NT, B * H),
+    )
 
     # --- 4. Solve tril ---
     Ai = torch.zeros(B, T, H, BT, dtype=torch.bfloat16, device="cuda")
     dot_precisions = ["ieee"]
     if use_tma:
         dot_precisions.append("tf32")
-    _compile("gdr_solve_tril", solve_tril_64x64_kernel,
-             signature={"A": "*fp32", "Ai": "*bf16", "T": "i32"},
-             constants={"H": H, "BT": BT, "USE_TMA": int(use_tma)},
-             configs=[{"DOT_PRECISION": dp, "num_warps": w, "num_stages": ns}
-                      for dp in dot_precisions
-                      for w in [2, 4, 8] for ns in [2, 3, 4, 5]],
-             bench_args=(A_fp32, Ai, T), grid=(NT, B * H))
+    _compile(
+        "gdr_solve_tril",
+        solve_tril_64x64_kernel,
+        signature={"A": "*fp32", "Ai": "*bf16", "T": "i32"},
+        constants={"H": H, "BT": BT, "USE_TMA": int(use_tma)},
+        configs=[
+            {"DOT_PRECISION": dp, "num_warps": w, "num_stages": ns}
+            for dp in dot_precisions
+            for w in [2, 4, 8]
+            for ns in [2, 3, 4, 5]
+        ],
+        bench_args=(A_fp32, Ai, T),
+        grid=(NT, B * H),
+    )
 
     # --- 5. WY forward ---
     v = torch.randn(B, T, H, V, dtype=torch.bfloat16, device="cuda")
     w_t = torch.empty(B, T, H, K, dtype=torch.bfloat16, device="cuda")
     u = torch.empty(B, T, H, V, dtype=torch.bfloat16, device="cuda")
     A_bf16 = Ai  # solve_tril output
-    _compile("gdr_wy_fwd", recompute_w_u_fwd_kernel,
-             signature={"k": "*bf16", "v": "*bf16", "beta": "*bf16",
-                        "w": "*bf16", "u": "*bf16", "A": "*bf16", "g": "*fp32", "T": "i32"},
-             constants={"H": H, "K": K, "V": V, "BT": BT, "BK": 64, "BV": 64},
-             configs=[{"num_warps": w, "num_stages": ns}
-                      for w in [2, 4, 8] for ns in [2, 3, 4]],
-             bench_args=(k, v, beta, w_t, u, A_bf16, g, T), grid=(NT, B * H))
+    _compile(
+        "gdr_wy_fwd",
+        recompute_w_u_fwd_kernel,
+        signature={
+            "k": "*bf16",
+            "v": "*bf16",
+            "beta": "*bf16",
+            "w": "*bf16",
+            "u": "*bf16",
+            "A": "*bf16",
+            "g": "*fp32",
+            "T": "i32",
+        },
+        constants={"H": H, "K": K, "V": V, "BT": BT, "BK": 64, "BV": 64},
+        configs=[{"num_warps": w, "num_stages": ns} for w in [2, 4, 8] for ns in [2, 3, 4]],
+        bench_args=(k, v, beta, w_t, u, A_bf16, g, T),
+        grid=(NT, B * H),
+    )
 
     # --- 6. Forward h (state recurrence) ---
     h = torch.empty(B, NT, H, K, V, dtype=torch.bfloat16, device="cuda")
@@ -1195,19 +1316,30 @@ def compile_gated_delta_rule(
     v_new = torch.empty(B, T, H, V, dtype=torch.bfloat16, device="cuda")
     bv_configs = [bv for bv in [32, 64] if bv <= max(V, 32)]
     min_bv = min(bv_configs)
-    _compile("gdr_fwd_h", chunk_fwd_h_kernel,
-             signature={"k": "*bf16", "v": "*bf16", "w": "*bf16", "v_new": "*bf16",
-                        "g": "*fp32", "h": "*bf16", "h0": "*bf16", "ht": "*fp32", "T": "i32"},
-             constants={"H": H, "K": K, "V": V, "BT": BT},
-             configs=[{"BV": bv, "num_warps": w, "num_stages": ns}
-                      for bv in bv_configs for w in [2, 4] for ns in [2, 3, 4]],
-             bench_args=(k, u, w_t, v_new, g, h, h0, ht, T),
-             grid=(triton.cdiv(V, min_bv), B * H))
+    _compile(
+        "gdr_fwd_h",
+        chunk_fwd_h_kernel,
+        signature={
+            "k": "*bf16",
+            "v": "*bf16",
+            "w": "*bf16",
+            "v_new": "*bf16",
+            "g": "*fp32",
+            "h": "*bf16",
+            "h0": "*bf16",
+            "ht": "*fp32",
+            "T": "i32",
+        },
+        constants={"H": H, "K": K, "V": V, "BT": BT},
+        configs=[{"BV": bv, "num_warps": w, "num_stages": ns} for bv in bv_configs for w in [2, 4] for ns in [2, 3, 4]],
+        bench_args=(k, u, w_t, v_new, g, h, h0, ht, T),
+        grid=(triton.cdiv(V, min_bv), B * H),
+    )
 
     # --- 7. Forward o (output) ---
     q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device="cuda")
     o_out = torch.empty(B, T, H, V, dtype=torch.bfloat16, device="cuda")
-    scale = K ** -0.5
+    scale = K**-0.5
     fwd_o_configs = [
         {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 3},
         {"BK": 64, "BV": 64, "num_warps": 4, "num_stages": 3},
@@ -1215,13 +1347,24 @@ def compile_gated_delta_rule(
     ]
     fwd_o_configs = [c for c in fwd_o_configs if c["BK"] <= max(K, 32) and c["BV"] <= max(V, 32)]
     min_bv_o = min(c["BV"] for c in fwd_o_configs)
-    _compile("gdr_fwd_o", chunk_fwd_o_kernel,
-             signature={"q": "*bf16", "k": "*bf16", "v": "*bf16", "h": "*bf16",
-                        "g": "*fp32", "o": "*bf16", "scale": "fp32", "T": "i32"},
-             constants={"H": H, "K": K, "V": V, "BT": BT},
-             configs=fwd_o_configs,
-             bench_args=(q, k, v_new, h, g, o_out, scale, T),
-             grid=(triton.cdiv(V, min_bv_o), NT, B * H))
+    _compile(
+        "gdr_fwd_o",
+        chunk_fwd_o_kernel,
+        signature={
+            "q": "*bf16",
+            "k": "*bf16",
+            "v": "*bf16",
+            "h": "*bf16",
+            "g": "*fp32",
+            "o": "*bf16",
+            "scale": "fp32",
+            "T": "i32",
+        },
+        constants={"H": H, "K": K, "V": V, "BT": BT},
+        configs=fwd_o_configs,
+        bench_args=(q, k, v_new, h, g, o_out, scale, T),
+        grid=(triton.cdiv(V, min_bv_o), NT, B * H),
+    )
 
     # --- 8. Backward dv_local ---
     do_t = torch.randn(B, T, H, V, dtype=torch.bfloat16, device="cuda")
@@ -1229,29 +1372,43 @@ def compile_gated_delta_rule(
     CONST_TILING = 64
     BK_bwd = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV_bwd = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-    _compile("gdr_bwd_dv_local", chunk_bwd_dv_local_kernel,
-             signature={"q": "*bf16", "k": "*bf16", "g": "*fp32",
-                        "do": "*bf16", "dv": "*bf16", "scale": "fp32", "T": "i32"},
-             constants={"H": H, "K": K, "V": V, "BT": BT, "BK": BK_bwd, "BV": BV_bwd},
-             configs=[{"num_warps": w, "num_stages": ns}
-                      for w in [2, 4, 8] for ns in [2, 3, 4]],
-             bench_args=(q, k, g, do_t, dv_out, scale, T), grid=(NT, B * H))
+    _compile(
+        "gdr_bwd_dv_local",
+        chunk_bwd_dv_local_kernel,
+        signature={"q": "*bf16", "k": "*bf16", "g": "*fp32", "do": "*bf16", "dv": "*bf16", "scale": "fp32", "T": "i32"},
+        constants={"H": H, "K": K, "V": V, "BT": BT, "BK": BK_bwd, "BV": BV_bwd},
+        configs=[{"num_warps": w, "num_stages": ns} for w in [2, 4, 8] for ns in [2, 3, 4]],
+        bench_args=(q, k, g, do_t, dv_out, scale, T),
+        grid=(NT, B * H),
+    )
 
     # --- 9. Backward dhu (state recurrence) ---
     dh = torch.empty(B, NT, H, K, V, dtype=torch.bfloat16, device="cuda")
     dh0 = torch.empty(B, H, K, V, dtype=torch.float32, device="cuda")
     dht = torch.randn(B, H, K, V, dtype=torch.float32, device="cuda")
     dv2 = torch.empty(B, T, H, V, dtype=torch.bfloat16, device="cuda")
-    _compile("gdr_bwd_dhu", chunk_bwd_dhu_kernel,
-             signature={"q": "*bf16", "k": "*bf16", "w": "*bf16", "g": "*fp32",
-                        "dht": "*fp32", "dh0": "*fp32", "do": "*bf16",
-                        "dh": "*bf16", "dv": "*bf16", "dv2": "*bf16",
-                        "scale": "fp32", "T": "i32"},
-             constants={"H": H, "K": K, "V": V, "BT": BT},
-             configs=[{"BV": bv, "num_warps": w, "num_stages": ns}
-                      for bv in bv_configs for w in [2, 4] for ns in [2, 3, 4]],
-             bench_args=(q, k, w_t, g, dht, dh0, do_t, dh, dv_out, dv2, scale, T),
-             grid=(triton.cdiv(V, min_bv), B * H))
+    _compile(
+        "gdr_bwd_dhu",
+        chunk_bwd_dhu_kernel,
+        signature={
+            "q": "*bf16",
+            "k": "*bf16",
+            "w": "*bf16",
+            "g": "*fp32",
+            "dht": "*fp32",
+            "dh0": "*fp32",
+            "do": "*bf16",
+            "dh": "*bf16",
+            "dv": "*bf16",
+            "dv2": "*bf16",
+            "scale": "fp32",
+            "T": "i32",
+        },
+        constants={"H": H, "K": K, "V": V, "BT": BT},
+        configs=[{"BV": bv, "num_warps": w, "num_stages": ns} for bv in bv_configs for w in [2, 4] for ns in [2, 3, 4]],
+        bench_args=(q, k, w_t, g, dht, dh0, do_t, dh, dv_out, dv2, scale, T),
+        grid=(triton.cdiv(V, min_bv), B * H),
+    )
 
     # --- 10. Backward dqkwg ---
     NK = triton.cdiv(K, BK_bwd)
@@ -1259,30 +1416,57 @@ def compile_gated_delta_rule(
     dk = torch.empty(B, T, H, K, dtype=torch.bfloat16, device="cuda")
     dw = torch.empty(B, T, H, K, dtype=torch.bfloat16, device="cuda")
     dg_nk = torch.empty(NK, B, T, H, dtype=torch.float32, device="cuda")
-    _compile("gdr_bwd_dqkwg", chunk_bwd_dqkwg_kernel,
-             signature={"q": "*bf16", "k": "*bf16", "v": "*bf16", "g": "*fp32",
-                        "h": "*bf16", "do": "*bf16", "dh": "*bf16",
-                        "dq": "*bf16", "dk": "*bf16", "dw": "*bf16",
-                        "dv": "*bf16", "dg": "*fp32",
-                        "scale": "fp32", "B": "i32", "T": "i32"},
-             constants={"H": H, "K": K, "V": V, "BT": BT, "BK": BK_bwd, "BV": BV_bwd},
-             configs=[{"num_warps": w, "num_stages": ns}
-                      for w in [2, 4, 8] for ns in [2, 3, 4]],
-             bench_args=(q, k, v_new, g, h, do_t, dh, dq, dk, dw, dv2, dg_nk, scale, B, T),
-             grid=(NK, NT, B * H))
+    _compile(
+        "gdr_bwd_dqkwg",
+        chunk_bwd_dqkwg_kernel,
+        signature={
+            "q": "*bf16",
+            "k": "*bf16",
+            "v": "*bf16",
+            "g": "*fp32",
+            "h": "*bf16",
+            "do": "*bf16",
+            "dh": "*bf16",
+            "dq": "*bf16",
+            "dk": "*bf16",
+            "dw": "*bf16",
+            "dv": "*bf16",
+            "dg": "*fp32",
+            "scale": "fp32",
+            "B": "i32",
+            "T": "i32",
+        },
+        constants={"H": H, "K": K, "V": V, "BT": BT, "BK": BK_bwd, "BV": BV_bwd},
+        configs=[{"num_warps": w, "num_stages": ns} for w in [2, 4, 8] for ns in [2, 3, 4]],
+        bench_args=(q, k, v_new, g, h, do_t, dh, dq, dk, dw, dv2, dg_nk, scale, B, T),
+        grid=(NK, NT, B * H),
+    )
 
     # --- 11. Backward WY repr ---
     db = torch.empty(B, T, H, dtype=torch.bfloat16, device="cuda")
     dg_wy = torch.empty(B, T, H, dtype=torch.float32, device="cuda")
-    _compile("gdr_bwd_wy", prepare_wy_repr_bwd_kernel,
-             signature={"k": "*bf16", "v": "*bf16", "beta": "*bf16", "g": "*fp32",
-                        "A": "*bf16", "dw": "*bf16", "du": "*bf16",
-                        "dk": "*bf16", "dv": "*bf16", "db": "*bf16", "dg": "*fp32", "T": "i32"},
-             constants={"H": H, "K": K, "V": V, "BT": BT, "BK": BK_bwd, "BV": BV_bwd},
-             configs=[{"num_warps": w, "num_stages": ns}
-                      for w in [2, 4] for ns in [2, 3, 4]],
-             bench_args=(k, v, beta, g, A_bf16, dw, dv2, dk, dv_out, db, dg_wy, T),
-             grid=(NT, B * H))
+    _compile(
+        "gdr_bwd_wy",
+        prepare_wy_repr_bwd_kernel,
+        signature={
+            "k": "*bf16",
+            "v": "*bf16",
+            "beta": "*bf16",
+            "g": "*fp32",
+            "A": "*bf16",
+            "dw": "*bf16",
+            "du": "*bf16",
+            "dk": "*bf16",
+            "dv": "*bf16",
+            "db": "*bf16",
+            "dg": "*fp32",
+            "T": "i32",
+        },
+        constants={"H": H, "K": K, "V": V, "BT": BT, "BK": BK_bwd, "BV": BV_bwd},
+        configs=[{"num_warps": w, "num_stages": ns} for w in [2, 4] for ns in [2, 3, 4]],
+        bench_args=(k, v, beta, g, A_bf16, dw, dv2, dk, dv_out, db, dg_wy, T),
+        grid=(NT, B * H),
+    )
 
     logger.info("Compiled %d gated delta rule kernels to %s", len(manifests), output_dir)
     return manifests

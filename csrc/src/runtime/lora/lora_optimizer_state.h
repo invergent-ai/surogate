@@ -45,8 +45,10 @@ public:
         EAllocationType offload_alloc = EAllocationType::PINNED;
     };
 
-    ModularLoRAOptimizerState(const Config& config, cudaStream_t stream,
-                               NCCLCommunicator& comm, TensorAllocator& allocator);
+    ModularLoRAOptimizerState(const Config& config,
+                              cudaStream_t stream,
+                              NCCLCommunicator& comm,
+                              TensorAllocator& allocator);
     ~ModularLoRAOptimizerState();
 
     /**
@@ -77,26 +79,41 @@ public:
     ITensorContainer& full_m_scales();
     ITensorContainer& full_v_scales();
 
-    [[nodiscard]] const Config& config() const { return mConfig; }
-    [[nodiscard]] Tensor& staging_m() { return mStagingM; }
-    [[nodiscard]] Tensor& staging_v() { return mStagingV; }
-    [[nodiscard]] Tensor& staging_m_scales() { return mStagingMScales; }
-    [[nodiscard]] Tensor& staging_v_scales() { return mStagingVScales; }
+    [[nodiscard]] const Config& config() const {
+        return mConfig;
+    }
+    [[nodiscard]] Tensor& staging_m() {
+        return mStagingM;
+    }
+    [[nodiscard]] Tensor& staging_v() {
+        return mStagingV;
+    }
+    [[nodiscard]] Tensor& staging_m_scales() {
+        return mStagingMScales;
+    }
+    [[nodiscard]] Tensor& staging_v_scales() {
+        return mStagingVScales;
+    }
 
 private:
     Config mConfig;
     TensorAllocator* mAllocator;
 
-    LoRAWeightsSet<TensorShard> mMomentum;   // First moment (m)
-    LoRAWeightsSet<TensorShard> mVariance;   // Second moment (v)
-    LoRAWeightsSet<TensorShard> mMomentumScales;   // FP8 scales for m (FP32)
-    LoRAWeightsSet<TensorShard> mVarianceScales;   // FP8 scales for v (FP32)
+    LoRAWeightsSet<TensorShard> mMomentum;        // First moment (m)
+    LoRAWeightsSet<TensorShard> mVariance;        // Second moment (v)
+    LoRAWeightsSet<TensorShard> mMomentumScales;  // FP8 scales for m (FP32)
+    LoRAWeightsSet<TensorShard> mVarianceScales;  // FP8 scales for v (FP32)
 
     class StateContainer final : public ITensorContainer {
     public:
-        explicit StateContainer(LoRAWeightsSet<TensorShard>* set) : mSet(set) {}
-        void set(LoRAWeightsSet<TensorShard>* set) { mSet = set; }
+        explicit StateContainer(LoRAWeightsSet<TensorShard>* set)
+            : mSet(set) {
+        }
+        void set(LoRAWeightsSet<TensorShard>* set) {
+            mSet = set;
+        }
         void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
+
     private:
         LoRAWeightsSet<TensorShard>* mSet = nullptr;
     };
@@ -119,7 +136,7 @@ private:
 // 8-bit AdamW optimizer state for LoRA weights (flash softsign/sqrt quantization)
 struct LoRAAdamW8BitState {
     bool initialized = false;
-    bool values_restored = false;  // Set when state values loaded from checkpoint
+    bool values_restored = false;        // Set when state values loaded from checkpoint
     bool grad_ptrs_initialized = false;  // Set after grad pointer array is populated
     size_t total_params = 0;
     size_t num_groups = 0;
@@ -129,35 +146,35 @@ struct LoRAAdamW8BitState {
     bool offload_state = false;  // If true, state tensors are in pinned host memory
     bool use_zero_copy = false;  // If true, use zero-copy access instead of transfers
 
-    Tensor state1;       // signed char (int8) - softsign-quantized momentum
-    Tensor state2;       // unsigned char (uint8) - sqrt-quantized variance
-    Tensor scales1;      // FP16 per-group scales for momentum
-    Tensor scales2;      // FP16 per-group scales for variance
+    Tensor state1;   // signed char (int8) - softsign-quantized momentum
+    Tensor state2;   // unsigned char (uint8) - sqrt-quantized variance
+    Tensor scales1;  // FP16 per-group scales for momentum
+    Tensor scales2;  // FP16 per-group scales for variance
 
     // Multi-tensor optimizer buffers (device memory)
     // Pre-allocated arrays of pointers/sizes to avoid per-step CPU work
-    Tensor param_ptrs;      // float** or nv_bfloat16** - array of param pointers
-    Tensor grad_ptrs;       // float** or nv_bfloat16** - array of grad pointers
-    Tensor tensor_sizes;    // int* - array of tensor sizes
-    Tensor state_offsets;   // int* - element offset for each tensor in state buffers (GROUP_SIZE-aligned)
+    Tensor param_ptrs;     // float** or nv_bfloat16** - array of param pointers
+    Tensor grad_ptrs;      // float** or nv_bfloat16** - array of grad pointers
+    Tensor tensor_sizes;   // int* - array of tensor sizes
+    Tensor state_offsets;  // int* - element offset for each tensor in state buffers (GROUP_SIZE-aligned)
 };
 
 // Full-precision AdamW optimizer state for LoRA weights (FP32 m and v)
 struct LoRAAdamWState {
     bool initialized = false;
-    bool values_restored = false;  // Set when state values loaded from checkpoint
+    bool values_restored = false;        // Set when state values loaded from checkpoint
     bool grad_ptrs_initialized = false;  // Set after grad pointer array is populated
     size_t total_params = 0;
     int num_tensors = 0;
 
-    Tensor state1;       // FP32 momentum
-    Tensor state2;       // FP32 variance
+    Tensor state1;  // FP32 momentum
+    Tensor state2;  // FP32 variance
 
     // Multi-tensor optimizer buffers (device memory)
-    Tensor param_ptrs;      // float** or nv_bfloat16** - array of param pointers
-    Tensor grad_ptrs;       // float** or nv_bfloat16** - array of grad pointers
-    Tensor tensor_sizes;    // int* - array of tensor sizes
-    Tensor state_offsets;   // int* - element offset for each tensor in state buffers
+    Tensor param_ptrs;     // float** or nv_bfloat16** - array of param pointers
+    Tensor grad_ptrs;      // float** or nv_bfloat16** - array of grad pointers
+    Tensor tensor_sizes;   // int* - array of tensor sizes
+    Tensor state_offsets;  // int* - element offset for each tensor in state buffers
 };
 
 // NorMuon optimizer state for LoRA weights
@@ -198,6 +215,6 @@ struct LoRANorMuonState {
     }
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_OPTIMIZER_STATE_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_OPTIMIZER_STATE_H

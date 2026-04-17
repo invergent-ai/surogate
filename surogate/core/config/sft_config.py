@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Literal
+from typing import Literal
 
 from namer import generate as generate_unique_name
 
@@ -13,6 +13,7 @@ from surogate.utils.fs import to_abspath
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
+
 
 @dataclass
 class DistributedConfig:
@@ -34,10 +35,12 @@ class DistributedConfig:
             If None, uses /tmp/surogate-{run_name}/ on each worker.
             This path must be accessible by all worker nodes.
     """
+
     ray_address: str = "auto"
     num_nodes: int = 1
     gpus_per_node: int = 0  # 0 = use config.gpus
-    worker_output_dir: Optional[str] = None  # None = use /tmp/surogate-{run_name}/
+    worker_output_dir: str | None = None  # None = use /tmp/surogate-{run_name}/
+
 
 @dataclass
 class SFTConfig(ModelConfig, TrainDatasetConfig):
@@ -255,7 +258,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             If True, run the vision encoder during training to process images/videos.
             If False, train on text only (even for multimodal models).
             If None and the model is multimodal, defaults to True.
-            
+
         wandb_project (Optional[str], defaults to "Surogate"):
             WandB project name for logging.
         wandb_name (Optional[str], defaults to run_name):
@@ -270,257 +273,270 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Path for surogate metrics JSONL file. If None, uses SUROGATE_METRICS_PATH env var
             or defaults to /tmp/surogate_metrics.jsonl.
     """
-    run_name: Optional[str] = None
-    apply_recommended_values: Optional[bool] = False
-    num_epochs: Optional[int] = 3
-    output_dir: Optional[str] = 'output'
-    checkpoint_dir: Optional[str] = None  # Defaults to output_dir if not specified
-    resume_from_checkpoint: Optional[bool] = True
-    save_steps: Optional[int] = 50
-    save_total_limit: Optional[int] = 5
 
-    recompute: Optional[bool] = True
+    run_name: str | None = None
+    apply_recommended_values: bool | None = False
+    num_epochs: int | None = 3
+    output_dir: str | None = "output"
+    checkpoint_dir: str | None = None  # Defaults to output_dir if not specified
+    resume_from_checkpoint: bool | None = True
+    save_steps: int | None = 50
+    save_total_limit: int | None = 5
 
-    offload_residual: Optional[bool] = False
+    recompute: bool | None = True
+
+    offload_residual: bool | None = False
 
     # CPU-RAM centric training: stream weights & gradients per-layer, run optimizer on CPU.
     # Replaces offload_master/offload_optimizer/offload_grads/use_zero_copy/use_write_combined.
-    cpu_training: Optional[bool] = False
+    cpu_training: bool | None = False
 
     # Legacy offload flags (internal — driven by cpu_training when set)
-    offload_master: Optional[bool] = False
-    offload_quants: Optional[bool] = False
-    persistent_quants: Optional[bool] = False
-    offload_optimizer: Optional[bool] = False
-    offload_grads: Optional[bool] = False
-    use_zero_copy: Optional[bool] = False
-    use_write_combined: Optional[bool] = False
-    zero_level: Optional[int] = 1
-    shard_weights: Optional[bool] = False
-    shard_gradients: Optional[bool] = False
-    use_all_to_all_reduce: Optional[bool] = False
-    memcpy_all_gather: Optional[bool] = False
-    memcpy_send_recv: Optional[bool] = False
-    init_projections_to_zero: Optional[bool] = False
-    from_scratch: Optional[bool] = False
-    lmhead_chunks: Optional[int] = 1
-    attn_bwd_chunks: Optional[int] = 1
-    gradient_dtype: Optional[str] = None
-    master_dtype: Optional[str] = None
-    recipe: Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4', 'nvfp4_quartet']] = 'bf16'
-    use_fused_rope: Optional[bool] = False
-    fp8_amax_history: Optional[int] = 16
-    fp4_backend: Optional[Literal['cutlass', 'cudnn']] = 'cutlass'
-    skip_quant_first_layers: Optional[int] = 0
-    skip_quant_last_layers: Optional[int] = 0
-    long_context: Optional[bool] = False
+    offload_master: bool | None = False
+    offload_quants: bool | None = False
+    persistent_quants: bool | None = False
+    offload_optimizer: bool | None = False
+    offload_grads: bool | None = False
+    use_zero_copy: bool | None = False
+    use_write_combined: bool | None = False
+    zero_level: int | None = 1
+    shard_weights: bool | None = False
+    shard_gradients: bool | None = False
+    use_all_to_all_reduce: bool | None = False
+    memcpy_all_gather: bool | None = False
+    memcpy_send_recv: bool | None = False
+    init_projections_to_zero: bool | None = False
+    from_scratch: bool | None = False
+    lmhead_chunks: int | None = 1
+    attn_bwd_chunks: int | None = 1
+    gradient_dtype: str | None = None
+    master_dtype: str | None = None
+    recipe: Literal["bf16", "fp8_hybrid", "nvfp4", "nvfp4_quartet"] | None = "bf16"
+    use_fused_rope: bool | None = False
+    fp8_amax_history: int | None = 16
+    fp4_backend: Literal["cutlass", "cudnn"] | None = "cutlass"
+    skip_quant_first_layers: int | None = 0
+    skip_quant_last_layers: int | None = 0
+    long_context: bool | None = False
 
-    gpus: Optional[int] = 1
-    use_cuda_graphs: Optional[bool] = True
-    optimizer: Optional[Literal['adamw', 'adamw_8bit', 'normuon']] = 'adamw_8bit'
-    learning_rate: Optional[float] = 2e-4
-    lr_scheduler_type: Optional[Literal['constant', 'linear', 'cosine', 'wsd']] = 'linear'
-    cooldown_steps: Optional[int] = 0
-    wsd_decay_steps_fraction: Optional[float] = 0.1
-    final_lr_fraction: Optional[float] = 0.0
-    gradient_accumulation_steps: Optional[int] = 4
-    max_grad_norm: Optional[float] = 1.0
-    weight_decay: Optional[float] = 0.01
-    max_steps: Optional[int] = -1
-    adamw_beta1: Optional[float] = 0.9
-    adamw_beta2: Optional[float] = 0.999
-    adamw_epsilon: Optional[float] = 1e-8
+    gpus: int | None = 1
+    use_cuda_graphs: bool | None = True
+    optimizer: Literal["adamw", "adamw_8bit", "normuon"] | None = "adamw_8bit"
+    learning_rate: float | None = 2e-4
+    lr_scheduler_type: Literal["constant", "linear", "cosine", "wsd"] | None = "linear"
+    cooldown_steps: int | None = 0
+    wsd_decay_steps_fraction: float | None = 0.1
+    final_lr_fraction: float | None = 0.0
+    gradient_accumulation_steps: int | None = 4
+    max_grad_norm: float | None = 1.0
+    weight_decay: float | None = 0.01
+    max_steps: int | None = -1
+    adamw_beta1: float | None = 0.9
+    adamw_beta2: float | None = 0.999
+    adamw_epsilon: float | None = 1e-8
     # NorMuon optimizer parameters (used when optimizer='normuon')
     # NorMuon uses a hybrid approach: AdamW for embeddings/norms/lm_head,
     # orthogonalized momentum for 2D weight matrices
-    normuon_momentum: Optional[float] = 0.95
-    normuon_beta2: Optional[float] = 0.95
-    normuon_cautious_wd: Optional[bool] = True
-    eval_steps: Optional[int] = 100
-    logging_steps: Optional[int] = 1
-    per_device_train_batch_size: Optional[int] = 2
-    report_to: Optional[List[Literal['wandb', 'aim', 'surogate']]] = None
-    warmup_ratio: Optional[float] = 0
-    warmup_steps: Optional[int] = 0
-    log_file: Optional[str] = None
+    normuon_momentum: float | None = 0.95
+    normuon_beta2: float | None = 0.95
+    normuon_cautious_wd: bool | None = True
+    eval_steps: int | None = 100
+    logging_steps: int | None = 1
+    per_device_train_batch_size: int | None = 2
+    report_to: list[Literal["wandb", "aim", "surogate"]] | None = None
+    warmup_ratio: float | None = 0
+    warmup_steps: int | None = 0
+    log_file: str | None = None
 
-    lora: Optional[bool] = True
-    lora_rank: Optional[int] = 16
-    lora_alpha: Optional[int] = 32
-    lora_dropout: Optional[float] = 0.05
-    lora_dtype: Optional[Literal['bf16','fp32']] = 'fp32'
-    lora_target_modules: Optional[List[str]] = None
-    train_router: Optional[bool] = False
-    router_aux_loss_coef: Optional[float] = None
-    router_z_loss_coef: Optional[float] = None
-    qlora_fp4: Optional[bool] = False
-    qlora_fp8: Optional[bool] = False
-    qlora_bnb: Optional[bool] = False
-    qlora_block_size: Optional[int] = 128
-    qlora_bnb_block_size: Optional[int] = 64
-    qlora_bnb_double_quant: Optional[bool] = True
-    qlora_four_over_six: Optional[bool] = True
-    qlora_selective_expert_dequant: Optional[bool] = False
-    qlora_offload_experts: Optional[bool] = False
+    lora: bool | None = True
+    lora_rank: int | None = 16
+    lora_alpha: int | None = 32
+    lora_dropout: float | None = 0.05
+    lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
+    lora_target_modules: list[str] | None = None
+    train_router: bool | None = False
+    router_aux_loss_coef: float | None = None
+    router_z_loss_coef: float | None = None
+    qlora_fp4: bool | None = False
+    qlora_fp8: bool | None = False
+    qlora_bnb: bool | None = False
+    qlora_block_size: int | None = 128
+    qlora_bnb_block_size: int | None = 64
+    qlora_bnb_double_quant: bool | None = True
+    qlora_four_over_six: bool | None = True
+    qlora_selective_expert_dequant: bool | None = False
+    qlora_offload_experts: bool | None = False
 
     # Expert Parallelism (EP): distribute MoE experts across GPUs
-    ep_size: Optional[int] = 1  # 1 = no EP (all experts replicated on every GPU)
-    ep_load_balance_threshold: Optional[float] = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
+    ep_size: int | None = 1  # 1 = no EP (all experts replicated on every GPU)
+    ep_load_balance_threshold: float | None = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
 
-    adapter_path: Optional[str] = None  # PEFT adapter dir to merge into base weights before training
-    merge_adapter: Optional[bool] = False
+    adapter_path: str | None = None  # PEFT adapter dir to merge into base weights before training
+    merge_adapter: bool | None = False
 
-    debug_time_breakdown: Optional[bool] = False
-    debug_memory_breakdown: Optional[bool] = False
-    train_vision: Optional[bool] = None
-    log_gpu_util: Optional[int] = 100
-    auto_lr_reduction: Optional[bool] = False
-    early_stop: Optional[bool] = False
-    epoch_adjustment: Optional[bool] = False
+    debug_time_breakdown: bool | None = False
+    debug_memory_breakdown: bool | None = False
+    train_vision: bool | None = None
+    log_gpu_util: int | None = 100
+    auto_lr_reduction: bool | None = False
+    early_stop: bool | None = False
+    epoch_adjustment: bool | None = False
 
-    wandb_project: Optional[str] = None
-    wandb_name: Optional[str] = None
-    aim_experiment: Optional[str] = None
-    aim_repo: Optional[str] = None
-    aim_name: Optional[str] = None
-    surogate_metrics_path: Optional[str] = '/tmp/surogate_metrics.jsonl'
+    wandb_project: str | None = None
+    wandb_name: str | None = None
+    aim_experiment: str | None = None
+    aim_repo: str | None = None
+    aim_name: str | None = None
+    surogate_metrics_path: str | None = "/tmp/surogate_metrics.jsonl"
 
     # Multi-node distributed training config (optional)
-    distributed: Optional[DistributedConfig] = None
+    distributed: DistributedConfig | None = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
 
-        self.loss_scale = cfg.get('loss_scale', 'default')
-        self.padding_free = cfg.get('padding_free', False)
+        self.loss_scale = cfg.get("loss_scale", "default")
+        self.padding_free = cfg.get("padding_free", False)
 
-        self.run_name = cfg['run_name'] or self.generate_run_name()
-        self.apply_recommended_values = cfg.get('apply_recommended_values', self.apply_recommended_values)
-        self.num_epochs = cfg.get('num_epochs', self.num_epochs)
-        self.output_dir = cfg.get('output_dir', self.output_dir)
-        self.resume_from_checkpoint = cfg.get('resume_from_checkpoint', self.resume_from_checkpoint)
-        self.save_steps = cfg.get('save_steps', self.save_steps)
-        self.save_total_limit = cfg.get('save_total_limit', self.save_total_limit)
+        self.run_name = cfg["run_name"] or self.generate_run_name()
+        self.apply_recommended_values = cfg.get("apply_recommended_values", self.apply_recommended_values)
+        self.num_epochs = cfg.get("num_epochs", self.num_epochs)
+        self.output_dir = cfg.get("output_dir", self.output_dir)
+        self.resume_from_checkpoint = cfg.get("resume_from_checkpoint", self.resume_from_checkpoint)
+        self.save_steps = cfg.get("save_steps", self.save_steps)
+        self.save_total_limit = cfg.get("save_total_limit", self.save_total_limit)
 
         # Parse recompute setting (accepts bool or legacy string values)
-        recompute_raw = cfg.get('recompute', self.recompute)
+        recompute_raw = cfg.get("recompute", self.recompute)
         if isinstance(recompute_raw, bool):
             self.recompute = recompute_raw
         elif isinstance(recompute_raw, str):
-            if recompute_raw.lower() in ('false', 'none', '0'):
+            if recompute_raw.lower() in ("false", "none", "0"):
                 self.recompute = False
             else:
                 raise ValueError(f"recompute must be true or false, got '{recompute_raw}'")
         else:
             self.recompute = bool(recompute_raw)
 
-        self.offload_residual = cfg.get('offload_residual', self.offload_residual)
-        self.cpu_training = cfg.get('cpu_training', self.cpu_training)
-        self.offload_master = cfg.get('offload_master', self.offload_master)
-        self.offload_quants = cfg.get('offload_quants', self.offload_quants)
-        self.persistent_quants = cfg.get('persistent_quants', self.persistent_quants)
-        self.offload_optimizer = cfg.get('offload_optimizer', self.offload_optimizer)
-        self.offload_grads = cfg.get('offload_grads', self.offload_grads)
-        self.use_zero_copy = cfg.get('use_zero_copy', self.use_zero_copy)
-        self.use_write_combined = cfg.get('use_write_combined', self.use_write_combined)
-        self.zero_level = cfg.get('zero_level', self.zero_level)
-        self.shard_weights = cfg.get('shard_weights', self.shard_weights)
-        self.shard_gradients = cfg.get('shard_gradients', self.shard_gradients)
-        self.use_all_to_all_reduce = cfg.get('use_all_to_all_reduce', self.use_all_to_all_reduce)
-        self.memcpy_all_gather = cfg.get('memcpy_all_gather', self.memcpy_all_gather)
-        self.memcpy_send_recv = cfg.get('memcpy_send_recv', self.memcpy_send_recv)
-        self.init_projections_to_zero = cfg.get('init_projections_to_zero', self.init_projections_to_zero)
-        self.from_scratch = cfg.get('from_scratch', self.from_scratch)
-        self.lmhead_chunks = cfg.get('lmhead_chunks', self.lmhead_chunks)
-        self.attn_bwd_chunks = cfg.get('attn_bwd_chunks', self.attn_bwd_chunks)
-        self.gradient_dtype = cfg.get('gradient_dtype', self.gradient_dtype)
-        self.master_dtype = cfg.get('master_dtype', self.master_dtype)
-        self.recipe = cfg.get('recipe', self.recipe)
-        self.use_fused_rope = cfg.get('use_fused_rope', self.use_fused_rope)
-        self.fp8_amax_history = cfg.get('fp8_amax_history', self.fp8_amax_history)
-        self.fp4_backend = cfg.get('fp4_backend', self.fp4_backend)
-        self.skip_quant_first_layers = cfg['skip_quant_first_layers'] if 'skip_quant_first_layers' in cfg else self.skip_quant_first_layers
-        self.skip_quant_last_layers = cfg['skip_quant_last_layers'] if 'skip_quant_last_layers' in cfg else self.skip_quant_last_layers
-        self.long_context = cfg.get('long_context', self.long_context)
+        self.offload_residual = cfg.get("offload_residual", self.offload_residual)
+        self.cpu_training = cfg.get("cpu_training", self.cpu_training)
+        self.offload_master = cfg.get("offload_master", self.offload_master)
+        self.offload_quants = cfg.get("offload_quants", self.offload_quants)
+        self.persistent_quants = cfg.get("persistent_quants", self.persistent_quants)
+        self.offload_optimizer = cfg.get("offload_optimizer", self.offload_optimizer)
+        self.offload_grads = cfg.get("offload_grads", self.offload_grads)
+        self.use_zero_copy = cfg.get("use_zero_copy", self.use_zero_copy)
+        self.use_write_combined = cfg.get("use_write_combined", self.use_write_combined)
+        self.zero_level = cfg.get("zero_level", self.zero_level)
+        self.shard_weights = cfg.get("shard_weights", self.shard_weights)
+        self.shard_gradients = cfg.get("shard_gradients", self.shard_gradients)
+        self.use_all_to_all_reduce = cfg.get("use_all_to_all_reduce", self.use_all_to_all_reduce)
+        self.memcpy_all_gather = cfg.get("memcpy_all_gather", self.memcpy_all_gather)
+        self.memcpy_send_recv = cfg.get("memcpy_send_recv", self.memcpy_send_recv)
+        self.init_projections_to_zero = cfg.get("init_projections_to_zero", self.init_projections_to_zero)
+        self.from_scratch = cfg.get("from_scratch", self.from_scratch)
+        self.lmhead_chunks = cfg.get("lmhead_chunks", self.lmhead_chunks)
+        self.attn_bwd_chunks = cfg.get("attn_bwd_chunks", self.attn_bwd_chunks)
+        self.gradient_dtype = cfg.get("gradient_dtype", self.gradient_dtype)
+        self.master_dtype = cfg.get("master_dtype", self.master_dtype)
+        self.recipe = cfg.get("recipe", self.recipe)
+        self.use_fused_rope = cfg.get("use_fused_rope", self.use_fused_rope)
+        self.fp8_amax_history = cfg.get("fp8_amax_history", self.fp8_amax_history)
+        self.fp4_backend = cfg.get("fp4_backend", self.fp4_backend)
+        self.skip_quant_first_layers = (
+            cfg["skip_quant_first_layers"] if "skip_quant_first_layers" in cfg else self.skip_quant_first_layers
+        )
+        self.skip_quant_last_layers = (
+            cfg["skip_quant_last_layers"] if "skip_quant_last_layers" in cfg else self.skip_quant_last_layers
+        )
+        self.long_context = cfg.get("long_context", self.long_context)
 
-        self.gpus = cfg.get('gpus', self.gpus)
-        self.use_cuda_graphs = cfg.get('use_cuda_graphs', self.use_cuda_graphs)
-        self.optimizer = cfg.get('optimizer', self.optimizer)
-        self.learning_rate = float(cfg.get('learning_rate', self.learning_rate))
-        self.lr_scheduler_type = cfg.get('lr_scheduler_type', self.lr_scheduler_type)
-        self.cooldown_steps = cfg['cooldown_steps'] if 'cooldown_steps' in cfg else self.cooldown_steps
-        self.wsd_decay_steps_fraction = float(cfg['wsd_decay_steps_fraction']) if 'wsd_decay_steps_fraction' in cfg else self.wsd_decay_steps_fraction
-        self.final_lr_fraction = float(cfg['final_lr_fraction']) if 'final_lr_fraction' in cfg else self.final_lr_fraction
-        self.gradient_accumulation_steps = cfg.get('gradient_accumulation_steps', self.gradient_accumulation_steps)
-        self.max_grad_norm = float(cfg['max_grad_norm']) if 'max_grad_norm' in cfg else self.max_grad_norm
-        self.weight_decay = float(cfg['weight_decay']) if 'weight_decay' in cfg else self.weight_decay
-        self.max_steps = cfg.get('max_steps', self.max_steps)
-        self.adamw_beta1 = float(cfg.get('adamw_beta1', self.adamw_beta1))
-        self.adamw_beta2 = float(cfg.get('adamw_beta2', self.adamw_beta2))
-        self.adamw_epsilon = float(cfg.get('adamw_epsilon', self.adamw_epsilon))
-        self.normuon_momentum = float(cfg.get('normuon_momentum', self.normuon_momentum))
-        self.normuon_beta2 = float(cfg.get('normuon_beta2', self.normuon_beta2))
-        self.normuon_cautious_wd = cfg.get('normuon_cautious_wd', self.normuon_cautious_wd)
-        self.eval_steps = cfg.get('eval_steps', self.eval_steps)
-        self.logging_steps = cfg.get('logging_steps', self.logging_steps)
-        self.per_device_train_batch_size = cfg.get('per_device_train_batch_size', self.per_device_train_batch_size)
-        self.report_to = cfg.get('report_to', self.report_to)
-        self.warmup_ratio = float(cfg['warmup_ratio']) if 'warmup_ratio' in cfg else self.warmup_ratio
-        self.warmup_steps = cfg['warmup_steps'] if 'warmup_steps' in cfg else self.warmup_steps
-        self.log_file = cfg.get('log_file', self.log_file)
+        self.gpus = cfg.get("gpus", self.gpus)
+        self.use_cuda_graphs = cfg.get("use_cuda_graphs", self.use_cuda_graphs)
+        self.optimizer = cfg.get("optimizer", self.optimizer)
+        self.learning_rate = float(cfg.get("learning_rate", self.learning_rate))
+        self.lr_scheduler_type = cfg.get("lr_scheduler_type", self.lr_scheduler_type)
+        self.cooldown_steps = cfg["cooldown_steps"] if "cooldown_steps" in cfg else self.cooldown_steps
+        self.wsd_decay_steps_fraction = (
+            float(cfg["wsd_decay_steps_fraction"])
+            if "wsd_decay_steps_fraction" in cfg
+            else self.wsd_decay_steps_fraction
+        )
+        self.final_lr_fraction = (
+            float(cfg["final_lr_fraction"]) if "final_lr_fraction" in cfg else self.final_lr_fraction
+        )
+        self.gradient_accumulation_steps = cfg.get("gradient_accumulation_steps", self.gradient_accumulation_steps)
+        self.max_grad_norm = float(cfg["max_grad_norm"]) if "max_grad_norm" in cfg else self.max_grad_norm
+        self.weight_decay = float(cfg["weight_decay"]) if "weight_decay" in cfg else self.weight_decay
+        self.max_steps = cfg.get("max_steps", self.max_steps)
+        self.adamw_beta1 = float(cfg.get("adamw_beta1", self.adamw_beta1))
+        self.adamw_beta2 = float(cfg.get("adamw_beta2", self.adamw_beta2))
+        self.adamw_epsilon = float(cfg.get("adamw_epsilon", self.adamw_epsilon))
+        self.normuon_momentum = float(cfg.get("normuon_momentum", self.normuon_momentum))
+        self.normuon_beta2 = float(cfg.get("normuon_beta2", self.normuon_beta2))
+        self.normuon_cautious_wd = cfg.get("normuon_cautious_wd", self.normuon_cautious_wd)
+        self.eval_steps = cfg.get("eval_steps", self.eval_steps)
+        self.logging_steps = cfg.get("logging_steps", self.logging_steps)
+        self.per_device_train_batch_size = cfg.get("per_device_train_batch_size", self.per_device_train_batch_size)
+        self.report_to = cfg.get("report_to", self.report_to)
+        self.warmup_ratio = float(cfg["warmup_ratio"]) if "warmup_ratio" in cfg else self.warmup_ratio
+        self.warmup_steps = cfg["warmup_steps"] if "warmup_steps" in cfg else self.warmup_steps
+        self.log_file = cfg.get("log_file", self.log_file)
 
-        self.lora = cfg.get('lora', self.lora)
-        self.lora_rank = cfg.get('lora_rank', self.lora_rank)
-        self.lora_alpha = cfg.get('lora_alpha', self.lora_alpha)
-        self.lora_dropout = float(cfg['lora_dropout']) if 'lora_dropout' in cfg else self.lora_dropout
-        self.lora_dtype = cfg.get('lora_dtype', self.lora_dtype)
-        self.lora_target_modules = cfg.get('lora_target_modules', ['all'])
-        self.train_router = cfg.get('train_router', self.train_router)
-        self.router_aux_loss_coef = cfg.get('router_aux_loss_coef', self.router_aux_loss_coef)
-        self.router_z_loss_coef = cfg.get('router_z_loss_coef', self.router_z_loss_coef)
-        self.qlora_fp4 = cfg.get('qlora_fp4', self.qlora_fp4)
-        self.qlora_fp8 = cfg.get('qlora_fp8', self.qlora_fp8)
-        self.qlora_bnb = cfg.get('qlora_bnb', self.qlora_bnb)
-        self.qlora_block_size = cfg.get('qlora_block_size', self.qlora_block_size)
-        self.qlora_bnb_block_size = cfg.get('qlora_bnb_block_size', self.qlora_bnb_block_size)
-        self.qlora_bnb_double_quant = cfg.get('qlora_bnb_double_quant', self.qlora_bnb_double_quant)
-        self.qlora_four_over_six = cfg.get('qlora_four_over_six', self.qlora_four_over_six)
-        self.qlora_selective_expert_dequant = cfg.get('qlora_selective_expert_dequant', self.qlora_selective_expert_dequant)
-        self.qlora_offload_experts = cfg.get('qlora_offload_experts', self.qlora_offload_experts)
+        self.lora = cfg.get("lora", self.lora)
+        self.lora_rank = cfg.get("lora_rank", self.lora_rank)
+        self.lora_alpha = cfg.get("lora_alpha", self.lora_alpha)
+        self.lora_dropout = float(cfg["lora_dropout"]) if "lora_dropout" in cfg else self.lora_dropout
+        self.lora_dtype = cfg.get("lora_dtype", self.lora_dtype)
+        self.lora_target_modules = cfg.get("lora_target_modules", ["all"])
+        self.train_router = cfg.get("train_router", self.train_router)
+        self.router_aux_loss_coef = cfg.get("router_aux_loss_coef", self.router_aux_loss_coef)
+        self.router_z_loss_coef = cfg.get("router_z_loss_coef", self.router_z_loss_coef)
+        self.qlora_fp4 = cfg.get("qlora_fp4", self.qlora_fp4)
+        self.qlora_fp8 = cfg.get("qlora_fp8", self.qlora_fp8)
+        self.qlora_bnb = cfg.get("qlora_bnb", self.qlora_bnb)
+        self.qlora_block_size = cfg.get("qlora_block_size", self.qlora_block_size)
+        self.qlora_bnb_block_size = cfg.get("qlora_bnb_block_size", self.qlora_bnb_block_size)
+        self.qlora_bnb_double_quant = cfg.get("qlora_bnb_double_quant", self.qlora_bnb_double_quant)
+        self.qlora_four_over_six = cfg.get("qlora_four_over_six", self.qlora_four_over_six)
+        self.qlora_selective_expert_dequant = cfg.get(
+            "qlora_selective_expert_dequant", self.qlora_selective_expert_dequant
+        )
+        self.qlora_offload_experts = cfg.get("qlora_offload_experts", self.qlora_offload_experts)
 
-        self.ep_size = cfg.get('ep_size', self.ep_size)
-        self.ep_load_balance_threshold = float(cfg.get('ep_load_balance_threshold', self.ep_load_balance_threshold))
+        self.ep_size = cfg.get("ep_size", self.ep_size)
+        self.ep_load_balance_threshold = float(cfg.get("ep_load_balance_threshold", self.ep_load_balance_threshold))
 
-        self.adapter_path = cfg.get('adapter_path', self.adapter_path)
-        self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
+        self.adapter_path = cfg.get("adapter_path", self.adapter_path)
+        self.merge_adapter = cfg.get("merge_adapter", self.merge_adapter)
         # use_chat_template removed — native tokenizer always applies chat template
-        self.debug_time_breakdown = cfg.get('debug_time_breakdown', self.debug_time_breakdown)
-        self.debug_memory_breakdown = cfg.get('debug_memory_breakdown', self.debug_memory_breakdown)
-        self.train_vision = cfg.get('train_vision', cfg.get('train_vision', self.train_vision))
-        self.auto_lr_reduction = cfg.get('auto_lr_reduction', self.auto_lr_reduction)
-        self.early_stop = cfg.get('early_stop', self.early_stop)
-        self.epoch_adjustment = cfg.get('epoch_adjustment', self.epoch_adjustment)
+        self.debug_time_breakdown = cfg.get("debug_time_breakdown", self.debug_time_breakdown)
+        self.debug_memory_breakdown = cfg.get("debug_memory_breakdown", self.debug_memory_breakdown)
+        self.train_vision = cfg.get("train_vision", cfg.get("train_vision", self.train_vision))
+        self.auto_lr_reduction = cfg.get("auto_lr_reduction", self.auto_lr_reduction)
+        self.early_stop = cfg.get("early_stop", self.early_stop)
+        self.epoch_adjustment = cfg.get("epoch_adjustment", self.epoch_adjustment)
 
-        self.wandb_project = cfg.get('wandb_project', self.wandb_project)
-        self.wandb_name = cfg.get('wandb_name', self.wandb_name or self.run_name)
-        self.aim_experiment = cfg.get('aim_experiment', self.aim_experiment)
-        self.aim_repo = cfg.get('aim_repo', self.aim_repo)
-        self.aim_name = cfg.get('aim_name', self.aim_name or self.run_name)
-        self.surogate_metrics_path = cfg.get('surogate_metrics_path', self.surogate_metrics_path)
-        
+        self.wandb_project = cfg.get("wandb_project", self.wandb_project)
+        self.wandb_name = cfg.get("wandb_name", self.wandb_name or self.run_name)
+        self.aim_experiment = cfg.get("aim_experiment", self.aim_experiment)
+        self.aim_repo = cfg.get("aim_repo", self.aim_repo)
+        self.aim_name = cfg.get("aim_name", self.aim_name or self.run_name)
+        self.surogate_metrics_path = cfg.get("surogate_metrics_path", self.surogate_metrics_path)
+
         # Validate recompute is boolean
         if not isinstance(self.recompute, bool):
             raise ValueError(f"recompute must be true or false, got '{self.recompute}'")
 
         # Parse distributed config
-        distributed_cfg = cfg.get('distributed', None)
+        distributed_cfg = cfg.get("distributed", None)
         if distributed_cfg:
             if isinstance(distributed_cfg, dict):
                 self.distributed = DistributedConfig(
-                    ray_address=distributed_cfg.get('ray_address', 'auto'),
-                    num_nodes=distributed_cfg.get('num_nodes', 1),
-                    gpus_per_node=distributed_cfg.get('gpus_per_node', 0),
-                    worker_output_dir=distributed_cfg.get('worker_output_dir', None),
+                    ray_address=distributed_cfg.get("ray_address", "auto"),
+                    num_nodes=distributed_cfg.get("num_nodes", 1),
+                    gpus_per_node=distributed_cfg.get("gpus_per_node", 0),
+                    worker_output_dir=distributed_cfg.get("worker_output_dir", None),
                 )
             elif isinstance(distributed_cfg, DistributedConfig):
                 self.distributed = distributed_cfg
@@ -529,7 +545,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
     def __post_init__(self):
         logger = get_logger()
-        
+
         ModelConfig.__post_init__(self)
         TrainDatasetConfig.__post_init__(self)
 
@@ -541,8 +557,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             self.sequence_len = self.model_info.max_model_len
 
         if self.sample_packing and self.sequence_len == self.model_info.max_model_len:
-            logger.warning(
-                f"Setting sequence_len to model's max_model_len {self.model_info.max_model_len}.")
+            logger.warning(f"Setting sequence_len to model's max_model_len {self.model_info.max_model_len}.")
 
         if self.learning_rate is None:
             logger.info(f"Learning rate is not set. Setting learning rate to {self.learning_rate}.")
@@ -550,10 +565,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
         if self.learning_rate < 1e-7:
             logger.warning(
-                f"Your learning rate {self.learning_rate} is set to a very low value. Consider increasing it to avoid vanishing gradients!")
+                f"Your learning rate {self.learning_rate} is set to a very low value. Consider increasing it to avoid vanishing gradients!"
+            )
         elif self.learning_rate > 1:
             logger.warning(
-                f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!")
+                f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!"
+            )
 
         # Auto-tune lmhead_chunks for LoRA + recompute to reduce logit buffer memory.
         # The output buffer is {B*T/chunks, V} in bf16 which can be >1 GiB with chunks=1.
@@ -584,14 +601,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         if self.offload_optimizer and not self.use_zero_copy:
             logger.warning(
                 "offload_optimizer is enabled but use_zero_copy is false; "
-                "optimizer state will remain on device. Set use_zero_copy=true to offload.")
+                "optimizer state will remain on device. Set use_zero_copy=true to offload."
+            )
         # Validate offload_grads requires gradient sharding or cpu_training
         if self.offload_grads and not self.cpu_training:
             shard_gradients = self.shard_gradients or self.zero_level >= 2
             if not shard_gradients:
-                raise ValueError(
-                    "offload_grads requires cpu_training=true, shard_gradients=true, or zero_level >= 2."
-                )
+                raise ValueError("offload_grads requires cpu_training=true, shard_gradients=true, or zero_level >= 2.")
 
         self._validate_ep_config()
         self.create_runtime_config()
@@ -607,7 +623,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             if self.is_multimodal:
                 logger.info(
                     "train_vision is not set; defaulting to False for multimodal models. "
-                    "Set train_vision=true to enable on-the-fly vision training.")
+                    "Set train_vision=true to enable on-the-fly vision training."
+                )
             self.train_vision = False
         if self.train_vision and not self.is_multimodal:
             logger.warning("train_vision=True but model is not multimodal; disabling vision training.")
@@ -634,7 +651,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"Either adjust batch size or sequence length, or reduce lmhead_chunks."
             )
 
-
     def _validate_ep_config(self):
         """Validate Expert Parallelism configuration."""
         if self.ep_size is None or self.ep_size <= 1:
@@ -658,10 +674,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # Get num_experts from model config.
         # Nemotron-H exposes this as n_routed_experts instead of num_experts.
         from surogate.core.model.hf_config import HfConfigFactory
+
         config = self.model_info.config
         num_experts = (
-            HfConfigFactory.get_config_attr(config, 'num_experts')
-            or HfConfigFactory.get_config_attr(config, 'n_routed_experts')
+            HfConfigFactory.get_config_attr(config, "num_experts")
+            or HfConfigFactory.get_config_attr(config, "n_routed_experts")
             or 0
         )
         if num_experts > 0 and num_experts % self.ep_size != 0:
@@ -671,8 +688,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             )
 
         dp_size = self.gpus // self.ep_size
-        logger.info(f"[EP] Expert Parallelism: ep_size={self.ep_size}, dp_size={dp_size}, "
-                     f"num_local_experts={num_experts // self.ep_size if num_experts > 0 else '?'}")
+        logger.info(
+            f"[EP] Expert Parallelism: ep_size={self.ep_size}, dp_size={dp_size}, "
+            f"num_local_experts={num_experts // self.ep_size if num_experts > 0 else '?'}"
+        )
 
     def ensure_directories(self):
         # Always resolve paths (needed by all workers, including Ray)
@@ -680,13 +699,14 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.checkpoint_dir = str(Path(self.checkpoint_dir or self.output_dir).resolve())
 
         if self.log_file is None:
-            date_time = "{:%Y%m%d-%H%M%S}".format(datetime.now())
+            date_time = f"{datetime.now():%Y%m%d-%H%M%S}"
             self.log_file = f"{self.output_dir}/log-{self.run_name}-{date_time}.json"
             self.log_file = to_abspath(self.log_file)
 
         # Skip directory creation if running inside a Ray worker
         # Only the head node should create directories
         from surogate.utils.dist import is_ray_worker
+
         if is_ray_worker():
             return
 
@@ -709,7 +729,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             log_dir = Path(log_path).parent
             if not log_dir.exists():
                 log_dir.mkdir(parents=True, exist_ok=True)
-  
+
     def create_runtime_config(self):
         shard_gradients = self.shard_gradients
         shard_weights = self.shard_weights
@@ -720,7 +740,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             shard_weights = True
 
         # Check if model is pre-quantized (same runtime constraints as QLoRA)
-        _is_prequantized = (self.model_info.quant_info or {}).get('quant_method', '').startswith('prequant_')
+        _is_prequantized = (self.model_info.quant_info or {}).get("quant_method", "").startswith("prequant_")
 
         if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4 or _is_prequantized:
             # QLoRA / pre-quantized requires recompute enabled
@@ -730,19 +750,24 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             logger.info("[QLoRA]: disabling CUDA graphs.")
 
-
         if self.lora and self.recompute and self.offload_residual:
             self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
-            logger.info("[LoRA]: disabling CUDA graphs because recompute with offloaded residuals is not compatible with CUDA graphs.")
+            logger.info(
+                "[LoRA]: disabling CUDA graphs because recompute with offloaded residuals is not compatible with CUDA graphs."
+            )
 
         if self.offload_master and self.use_cuda_graphs:
             self.use_cuda_graphs = False
-            logger.info("[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture).")
+            logger.info(
+                "[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture)."
+            )
 
         if self.long_context and self.use_cuda_graphs:
             # long_context uses split-attention mode: MLP tile groups run eagerly
             # while the rest of each layer (norms, attention, projections) stays graphed.
-            logger.info("[long_context]: CUDA graphs enabled with split-attention mode (tiled MLP runs eagerly per-segment, non-MLP ops graphed).")
+            logger.info(
+                "[long_context]: CUDA graphs enabled with split-attention mode (tiled MLP runs eagerly per-segment, non-MLP ops graphed)."
+            )
 
         if self.debug_time_breakdown and self.use_cuda_graphs:
             self.use_cuda_graphs = False
@@ -803,7 +828,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             dtype=self.lora_dtype,
             target_modules=self.lora_target_modules,
             use_rslora=False,
-            train_router=self.train_router
+            train_router=self.train_router,
         )
 
     def create_qlora_config(self):
@@ -814,8 +839,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         is_prequantized = False
         prequant_method = None
         if self.model_info.quant_info:
-            qm = self.model_info.quant_info.get('quant_method', '')
-            if qm.startswith('prequant_'):
+            qm = self.model_info.quant_info.get("quant_method", "")
+            if qm.startswith("prequant_"):
                 is_prequantized = True
                 prequant_method = qm
 
@@ -860,17 +885,17 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
         # Create config for pre-quantized models
         if is_prequantized:
-            if prequant_method == 'prequant_fp8':
+            if prequant_method == "prequant_fp8":
                 self.qlora_config = _surogate.QLoRAConfig.prequant_fp8()
-            elif prequant_method == 'prequant_nvfp4':
+            elif prequant_method == "prequant_nvfp4":
                 self.qlora_config = _surogate.QLoRAConfig.prequant_nvfp4()
-            elif prequant_method == 'prequant_mxfp4':
+            elif prequant_method == "prequant_mxfp4":
                 self.qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
-            elif prequant_method == 'prequant_bnb_nf4':
-                bnb_dq = self.model_info.quant_info.get('bnb_double_quant', False)
+            elif prequant_method == "prequant_bnb_nf4":
+                bnb_dq = self.model_info.quant_info.get("bnb_double_quant", False)
                 self.qlora_config = _surogate.QLoRAConfig.prequant_bnb(double_quant=bnb_dq)
             # Populate modules_to_not_convert from HF config
-            ignore_list = self.model_info.quant_info.get('modules_to_not_convert', [])
+            ignore_list = self.model_info.quant_info.get("modules_to_not_convert", [])
             if ignore_list:
                 self.qlora_config.modules_to_not_convert = ignore_list
             logger.info(f"Detected pre-quantized model: {prequant_method}")
@@ -882,21 +907,21 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             self.qlora_config.enable_four_over_six = self.qlora_four_over_six
         elif self.qlora_bnb:
             self.qlora_config = _surogate.QLoRAConfig.bnb(
-                block_size=self.qlora_bnb_block_size,
-                double_quant=self.qlora_bnb_double_quant
+                block_size=self.qlora_bnb_block_size, double_quant=self.qlora_bnb_double_quant
             )
 
         # Populate MoE fields from model config for QLoRA quantization
         if self.qlora_config is not None and self.model_info.is_moe_model:
             from surogate.core.model.hf_config import HfConfigFactory
+
             config = self.model_info.config
             num_experts = (
-                HfConfigFactory.get_config_attr(config, 'num_experts')
-                or HfConfigFactory.get_config_attr(config, 'n_routed_experts')
+                HfConfigFactory.get_config_attr(config, "num_experts")
+                or HfConfigFactory.get_config_attr(config, "n_routed_experts")
                 or 0
             )
-            num_experts_per_tok = HfConfigFactory.get_config_attr(config, 'num_experts_per_tok') or 8
-            moe_intermediate_size = HfConfigFactory.get_config_attr(config, 'moe_intermediate_size') or 0
+            num_experts_per_tok = HfConfigFactory.get_config_attr(config, "num_experts_per_tok") or 8
+            moe_intermediate_size = HfConfigFactory.get_config_attr(config, "moe_intermediate_size") or 0
             if num_experts > 0:
                 self.qlora_config.num_experts = num_experts
                 self.qlora_config.num_experts_per_tok = num_experts_per_tok
@@ -906,16 +931,17 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         """Extract MoE expert counts from model config for monitoring."""
         if self.model_info.is_moe_model:
             from surogate.core.model.hf_config import HfConfigFactory
+
             config = self.model_info.config
             self.moe_num_experts = (
-                HfConfigFactory.get_config_attr(config, 'num_experts')
-                or HfConfigFactory.get_config_attr(config, 'n_routed_experts')
+                HfConfigFactory.get_config_attr(config, "num_experts")
+                or HfConfigFactory.get_config_attr(config, "n_routed_experts")
                 or 0
             )
-            self.moe_num_experts_per_tok = HfConfigFactory.get_config_attr(config, 'num_experts_per_tok') or 1
+            self.moe_num_experts_per_tok = HfConfigFactory.get_config_attr(config, "num_experts_per_tok") or 1
         else:
             self.moe_num_experts = 0
             self.moe_num_experts_per_tok = 1
 
     def generate_run_name(self):
-        return generate_unique_name(category='science')
+        return generate_unique_name(category="science")

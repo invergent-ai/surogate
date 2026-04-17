@@ -11,7 +11,6 @@ import glob
 import json
 import os
 import shutil
-from typing import Dict, List, Optional, Tuple
 
 import torch
 from safetensors import safe_open
@@ -22,7 +21,7 @@ from surogate.utils.logger import get_logger
 logger = get_logger()
 
 
-def load_adapter_weights(adapter_path: str) -> Dict[str, torch.Tensor]:
+def load_adapter_weights(adapter_path: str) -> dict[str, torch.Tensor]:
     """Load LoRA adapter weights from safetensors."""
     adapter_file = os.path.join(adapter_path, "adapter_model.safetensors")
     if not os.path.exists(adapter_file):
@@ -41,16 +40,16 @@ def _strip_adapter_key(key: str) -> str:
     Output: model.layers.0.self_attn.q_proj.lora_A
     """
     if key.startswith("base_model.model."):
-        key = key[len("base_model.model."):]
+        key = key[len("base_model.model.") :]
     if key.endswith(".weight"):
-        key = key[:-len(".weight")]
+        key = key[: -len(".weight")]
     return key
 
 
 def _build_lora_lookup(
-    adapter_weights: Dict[str, torch.Tensor],
-    safetensor_keys: List[str],
-) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    adapter_weights: dict[str, torch.Tensor],
+    safetensor_keys: list[str],
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     """Build a mapping from base weight safetensor key -> (lora_A, lora_B).
 
     The adapter keys (PEFT format) are mapped to match the actual safetensor
@@ -63,10 +62,10 @@ def _build_lora_lookup(
         stripped[_strip_adapter_key(key)] = tensor
 
     # Collect lora pairs: module_name -> (lora_A, lora_B)
-    pairs: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for key in stripped:
         if key.endswith(".lora_A"):
-            module = key[:-len(".lora_A")]
+            module = key[: -len(".lora_A")]
             lora_b_key = module + ".lora_B"
             if lora_b_key in stripped:
                 pairs[module] = (stripped[key], stripped[lora_b_key])
@@ -86,32 +85,32 @@ def _build_lora_lookup(
         suffix = expected_st_key.split(".", 1)[1] if "." in expected_st_key else expected_st_key
         for st_key in safetensor_keys:
             if st_key.endswith(suffix):
-                actual_prefix = st_key[:len(st_key) - len(suffix)]
-                expected_prefix = expected_st_key[:len(expected_st_key) - len(suffix)]
+                actual_prefix = st_key[: len(st_key) - len(suffix)]
+                expected_prefix = expected_st_key[: len(expected_st_key) - len(suffix)]
                 if actual_prefix != expected_prefix:
                     prefix_remap = (expected_prefix, actual_prefix)
                 break
 
     # Step 3: build final lookup keyed by safetensor key (with .weight suffix)
     from_pfx, to_pfx = prefix_remap
-    lookup: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    lookup: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for module, (lora_a, lora_b) in pairs.items():
         st_key = module + ".weight"
         if from_pfx and st_key.startswith(from_pfx):
-            st_key = to_pfx + st_key[len(from_pfx):]
+            st_key = to_pfx + st_key[len(from_pfx) :]
         lookup[st_key] = (lora_a, lora_b)
 
     return lookup
 
 
 def _build_router_lookup(
-    adapter_weights: Dict[str, torch.Tensor],
-    safetensor_keys: List[str],
-    prefix_remap: Tuple[str, str],
-) -> Dict[str, torch.Tensor]:
+    adapter_weights: dict[str, torch.Tensor],
+    safetensor_keys: list[str],
+    prefix_remap: tuple[str, str],
+) -> dict[str, torch.Tensor]:
     """Build lookup for trained MoE router weights (direct replacement, not LoRA)."""
     from_pfx, to_pfx = prefix_remap
-    lookup: Dict[str, torch.Tensor] = {}
+    lookup: dict[str, torch.Tensor] = {}
 
     for key, tensor in adapter_weights.items():
         stripped = _strip_adapter_key(key)
@@ -119,7 +118,7 @@ def _build_router_lookup(
             continue
         st_key = stripped + ".weight"
         if from_pfx and st_key.startswith(from_pfx):
-            st_key = to_pfx + st_key[len(from_pfx):]
+            st_key = to_pfx + st_key[len(from_pfx) :]
         lookup[st_key] = tensor
 
     return lookup
@@ -131,7 +130,7 @@ def merge_lora_into_linear(
     lora_B: torch.Tensor,
     lora_alpha: float,
     lora_rank: int,
-    scaling: Optional[float] = None
+    scaling: float | None = None,
 ) -> torch.Tensor:
     """Merge LoRA weights into base linear layer: W' = W + (B @ A) * scaling."""
     if scaling is None:
@@ -146,11 +145,7 @@ def merge_lora_into_linear(
 
 
 def merge_adapter(
-    base_model_path: str,
-    adapter_path: str,
-    output_path: str,
-    max_shard_size: str = "5GB",
-    cpu_offload: bool = True
+    base_model_path: str, adapter_path: str, output_path: str, max_shard_size: str = "5GB", cpu_offload: bool = True
 ) -> None:
     """
     Merge LoRA adapter into base model by operating directly on safetensors files.
@@ -168,7 +163,7 @@ def merge_adapter(
     """
     # Load adapter config
     adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
-    with open(adapter_config_path, "r") as f:
+    with open(adapter_config_path) as f:
         adapter_config = json.load(f)
 
     lora_alpha = adapter_config["lora_alpha"]
@@ -184,7 +179,7 @@ def merge_adapter(
         raise FileNotFoundError(f"No safetensors files found in {base_model_path}")
 
     # Collect all base model keys across shards
-    all_base_keys: List[str] = []
+    all_base_keys: list[str] = []
     for st_file in st_files:
         with safe_open(st_file, framework="pt", device="cpu") as f:
             all_base_keys.extend(f.keys())
@@ -226,9 +221,7 @@ def merge_adapter(
             if key in lora_lookup:
                 lora_a, lora_b = lora_lookup[key]
                 base_weight = shard_tensors[key]
-                shard_tensors[key] = merge_lora_into_linear(
-                    base_weight, lora_a, lora_b, lora_alpha, lora_rank
-                )
+                shard_tensors[key] = merge_lora_into_linear(base_weight, lora_a, lora_b, lora_alpha, lora_rank)
                 merged_count += 1
                 shard_modified = True
 
@@ -243,8 +236,7 @@ def merge_adapter(
 
     if merged_count != len(lora_lookup):
         missing = set(lora_lookup.keys()) - {
-            k for st_file in st_files
-            for k in safe_open(st_file, framework="pt", device="cpu").keys()
+            k for st_file in st_files for k in safe_open(st_file, framework="pt", device="cpu").keys()
         }
         for key in missing:
             logger.warning(f"LoRA target not found in base model: {key}")

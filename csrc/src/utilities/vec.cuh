@@ -10,8 +10,7 @@
 
 #include <vector_types.h>
 
-namespace detail
-{
+namespace detail {
 /*! \brief Memory transfer mode used by vectorized copy helpers.
  *  \details Selects which load instruction is used on device. `DEFAULT` is portable
  *  (host/device). Other modes are device-only and may have architecture-specific behavior.
@@ -29,57 +28,56 @@ enum class TransferMode {
 };
 
 /*! \brief Primary template for transfer operation dispatch. */
-template<TransferMode Mode>
+template <TransferMode Mode>
 struct Transfer;
 
-template<>
+template <>
 struct Transfer<TransferMode::DEFAULT> {
-    template<class T>
+    template <class T>
     __host__ __device__ static void call(T* dst, const T* src) {
         *dst = *src;
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::LDG> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         *dst = __ldg(src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::LU> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         *dst = __ldlu(src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::LOAD_CS> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         *dst = __ldcs(src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::STORE_CG> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         __stcg(dst, *src);
     }
 };
 
-template<>
+template <>
 struct Transfer<TransferMode::STORE_CS> {
-    template<class T>
+    template <class T>
     __device__ static void call(T* dst, const T* src) {
         __stcs(dst, *src);
     }
 };
-
 
 /*!
  * \brief Copies `NBytes` from `src` to `dst`, using `CopyType` to perform memory access.
@@ -103,7 +101,7 @@ struct Transfer<TransferMode::STORE_CS> {
  *  \note Source and destination ranges must be non-overlapping.
  *  \note `TrueType` must be trivially copyable.
  */
-template<class CopyType, int NBytes, TransferMode Mode, class TrueType>
+template <class CopyType, int NBytes, TransferMode Mode, class TrueType>
 __host__ __device__ void memcpy_as(TrueType* __restrict__ dst, const TrueType* __restrict__ src) {
     static_assert(NBytes % sizeof(TrueType) == 0, "Number of bytes must be a multiple of the true type size");
     static_assert(NBytes % sizeof(CopyType) == 0, "Number of bytes must be a multiple of the copy type size");
@@ -113,7 +111,7 @@ __host__ __device__ void memcpy_as(TrueType* __restrict__ dst, const TrueType* _
     static_assert(std::is_trivially_copyable_v<TrueType>, "TrueType must be trivially copyable");
     const auto* read_address = reinterpret_cast<const CopyType*>(src);
     auto* write_address = reinterpret_cast<CopyType*>(dst);
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < NBytes; i += sizeof(CopyType)) {
         Transfer<Mode>::call(write_address, read_address);
         ++read_address;
@@ -153,7 +151,7 @@ constexpr __host__ __device__ std::size_t alignment_from_size(std::size_t size) 
  *  \param[in]  src Source pointer (must be suitably aligned for chosen access width).
  *  \param      (unused) Compile-time tag used to pass `Count` explicitly when needed.
  */
-template<std::size_t Count, detail::TransferMode Mode, class T>
+template <std::size_t Count, detail::TransferMode Mode, class T>
 __host__ __device__ void memcpy_aligned(T* dst, const T* src, std::integral_constant<std::size_t, Count> = {}) {
     static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
 
@@ -185,7 +183,7 @@ __host__ __device__ void memcpy_aligned(T* dst, const T* src, std::integral_cons
  *  \tparam ElementType Scalar element type stored in the vector (must be trivial).
  *  \tparam ElementCount Number of elements stored.
  */
-template<class ElementType, std::size_t ElementCount>
+template <class ElementType, std::size_t ElementCount>
 class alignas(detail::alignment_from_size(sizeof(ElementType) * ElementCount)) GenericVector {
     static_assert(std::is_trivial_v<ElementType>, "Only trivial types are supported");
 
@@ -220,7 +218,7 @@ public:
      *  \param other Source vector.
      *  \return New vector with each lane converted via `static_cast<ElementType>`.
      */
-    template<class U>
+    template <class U>
     constexpr static __host__ __device__ GenericVector from(GenericVector<U, ElementCount> other) {
         GenericVector<ElementType, ElementCount> result;
         for (int i = 0; i < ElementCount; ++i) {
@@ -312,4 +310,4 @@ private:
     ElementType values[size];
 };
 
-#endif // SUROGATE_SRC_UTILS_VEC_CUH
+#endif  // SUROGATE_SRC_UTILS_VEC_CUH

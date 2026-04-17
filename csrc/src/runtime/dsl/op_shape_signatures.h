@@ -12,6 +12,7 @@
 
 #include <functional>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,17 +34,16 @@ struct OpShapeSignature {
 
     // Custom validation function
     // Returns nullopt if valid, or error message if invalid
-    using ValidatorFn = std::function<std::optional<ShapeValidationError>(
-        const std::vector<std::vector<long>>& input_shapes,
-        const std::vector<std::vector<long>>& output_shapes,
-        const AttrMap& attrs,
-        const ShapeEnv& env
-    )>;
+    using ValidatorFn =
+        std::function<std::optional<ShapeValidationError>(const std::vector<std::vector<long>>& input_shapes,
+                                                          const std::vector<std::vector<long>>& output_shapes,
+                                                          const AttrMap& attrs,
+                                                          const ShapeEnv& env)>;
 
     ValidatorFn validator;
 
     // Optional: expected input/output counts
-    int min_inputs = -1;   // -1 = any
+    int min_inputs = -1;  // -1 = any
     int max_inputs = -1;
     int min_outputs = -1;
     int max_outputs = -1;
@@ -77,40 +77,35 @@ void register_builtin_shape_signatures();
 namespace validators {
 
 // Check that all input shapes have the same rank
-std::optional<ShapeValidationError> check_same_rank(
-    const std::vector<std::vector<long>>& shapes,
-    const std::string& op_name);
+std::optional<ShapeValidationError> check_same_rank(const std::vector<std::vector<long>>& shapes,
+                                                    const std::string& op_name);
 
 // Check that tensor has expected rank
-std::optional<ShapeValidationError> check_rank(
-    const std::vector<long>& shape,
-    int expected_rank,
-    const std::string& tensor_name,
-    const std::string& op_name);
+std::optional<ShapeValidationError> check_rank(const std::vector<long>& shape,
+                                               int expected_rank,
+                                               const std::string& tensor_name,
+                                               const std::string& op_name);
 
 // Check that two shapes have the same number of elements (for reshape/view)
-std::optional<ShapeValidationError> check_same_numel(
-    const std::vector<long>& shape1,
-    const std::vector<long>& shape2,
-    const std::string& name1,
-    const std::string& name2,
-    const std::string& op_name);
+std::optional<ShapeValidationError> check_same_numel(const std::vector<long>& shape1,
+                                                     const std::vector<long>& shape2,
+                                                     const std::string& name1,
+                                                     const std::string& name2,
+                                                     const std::string& op_name);
 
 // Check that dimensions are compatible for matmul
-std::optional<ShapeValidationError> check_matmul_dims(
-    const std::vector<long>& a_shape,
-    const std::vector<long>& b_shape,
-    const std::vector<long>& out_shape,
-    const AttrMap& attrs);
+std::optional<ShapeValidationError> check_matmul_dims(const std::vector<long>& a_shape,
+                                                      const std::vector<long>& b_shape,
+                                                      const std::vector<long>& out_shape,
+                                                      const AttrMap& attrs);
 
 // Check that batch dimensions are broadcastable
-std::optional<ShapeValidationError> check_broadcastable(
-    const std::vector<long>& shape1,
-    const std::vector<long>& shape2,
-    const std::string& op_name);
+std::optional<ShapeValidationError>
+check_broadcastable(const std::vector<long>& shape1, const std::vector<long>& shape2, const std::string& op_name);
 
 }  // namespace validators
 
-}}  // namespace dsl::shape_checker
+}  // namespace shape_checker
+}  // namespace dsl
 
 #endif  // SUROGATE_SRC_DSL_OP_SHAPE_SIGNATURES_H

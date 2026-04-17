@@ -49,8 +49,7 @@ float compute_mae(const std::vector<float>& a, const std::vector<float>& b) {
     return total_err / static_cast<float>(a.size());
 }
 
-} // anonymous namespace
-
+}  // anonymous namespace
 
 TEST_CASE("per-block quantization roundtrip", "[quantization][qlora]") {
     // Test parameters
@@ -73,19 +72,25 @@ TEST_CASE("per-block quantization roundtrip", "[quantization][qlora]") {
     thrust::device_vector<nv_bfloat16> d_output(M * K);
 
     // Run quantization kernel
-    quantize_per_block(
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        M, K, block_size, props, nullptr);
+    quantize_per_block(thrust::raw_pointer_cast(d_fp8.data()),
+                       thrust::raw_pointer_cast(d_scales.data()),
+                       thrust::raw_pointer_cast(d_input.data()),
+                       M,
+                       K,
+                       block_size,
+                       props,
+                       nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Run dequantization kernel
-    dequantize_per_block(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        M, K, block_size, props, nullptr);
+    dequantize_per_block(thrust::raw_pointer_cast(d_output.data()),
+                         thrust::raw_pointer_cast(d_fp8.data()),
+                         thrust::raw_pointer_cast(d_scales.data()),
+                         M,
+                         K,
+                         block_size,
+                         props,
+                         nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy results back to host
@@ -110,7 +115,6 @@ TEST_CASE("per-block quantization roundtrip", "[quantization][qlora]") {
     REQUIRE(mae < 0.05f);      // MAE should be small for normalized input
 }
 
-
 TEST_CASE("per-block quantization handles large values", "[quantization][qlora]") {
     // Test with values that require scaling
     const int M = 128;
@@ -130,11 +134,14 @@ TEST_CASE("per-block quantization handles large values", "[quantization][qlora]"
     thrust::device_vector<nv_bfloat16> d_output(M * K);
 
     // Quantize
-    quantize_per_block(
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        M, K, block_size, props, nullptr);
+    quantize_per_block(thrust::raw_pointer_cast(d_fp8.data()),
+                       thrust::raw_pointer_cast(d_scales.data()),
+                       thrust::raw_pointer_cast(d_input.data()),
+                       M,
+                       K,
+                       block_size,
+                       props,
+                       nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Check that scale is reasonable
@@ -146,11 +153,14 @@ TEST_CASE("per-block quantization handles large values", "[quantization][qlora]"
     REQUIRE(h_scales[0] > 1.0f);  // Should be > 1 for large input values
 
     // Dequantize
-    dequantize_per_block(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        M, K, block_size, props, nullptr);
+    dequantize_per_block(thrust::raw_pointer_cast(d_output.data()),
+                         thrust::raw_pointer_cast(d_fp8.data()),
+                         thrust::raw_pointer_cast(d_scales.data()),
+                         M,
+                         K,
+                         block_size,
+                         props,
+                         nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy output
@@ -166,7 +176,6 @@ TEST_CASE("per-block quantization handles large values", "[quantization][qlora]"
     INFO("Large values roundtrip relative error: " << rel_err);
     REQUIRE(rel_err < 0.15f);
 }
-
 
 TEST_CASE("per-block quantization with multiple blocks", "[quantization][qlora]") {
     // Test with multiple blocks
@@ -200,11 +209,14 @@ TEST_CASE("per-block quantization with multiple blocks", "[quantization][qlora]"
     thrust::device_vector<nv_bfloat16> d_output(M * K);
 
     // Quantize
-    quantize_per_block(
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        M, K, block_size, props, nullptr);
+    quantize_per_block(thrust::raw_pointer_cast(d_fp8.data()),
+                       thrust::raw_pointer_cast(d_scales.data()),
+                       thrust::raw_pointer_cast(d_input.data()),
+                       M,
+                       K,
+                       block_size,
+                       props,
+                       nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Verify scales increase with block index
@@ -216,11 +228,14 @@ TEST_CASE("per-block quantization with multiple blocks", "[quantization][qlora]"
     REQUIRE(h_scales.back() > h_scales[0]);  // Later blocks should have larger scales
 
     // Dequantize
-    dequantize_per_block(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        M, K, block_size, props, nullptr);
+    dequantize_per_block(thrust::raw_pointer_cast(d_output.data()),
+                         thrust::raw_pointer_cast(d_fp8.data()),
+                         thrust::raw_pointer_cast(d_scales.data()),
+                         M,
+                         K,
+                         block_size,
+                         props,
+                         nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy output
@@ -236,7 +251,6 @@ TEST_CASE("per-block quantization with multiple blocks", "[quantization][qlora]"
     INFO("Multi-block roundtrip relative error: " << rel_err);
     REQUIRE(rel_err < 0.15f);
 }
-
 
 TEST_CASE("per-block quantization with non-aligned dimensions", "[quantization][qlora]") {
     // Test with dimensions not evenly divisible by block size
@@ -258,19 +272,25 @@ TEST_CASE("per-block quantization with non-aligned dimensions", "[quantization][
     thrust::device_vector<nv_bfloat16> d_output(M * K);
 
     // Quantize
-    quantize_per_block(
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        M, K, block_size, props, nullptr);
+    quantize_per_block(thrust::raw_pointer_cast(d_fp8.data()),
+                       thrust::raw_pointer_cast(d_scales.data()),
+                       thrust::raw_pointer_cast(d_input.data()),
+                       M,
+                       K,
+                       block_size,
+                       props,
+                       nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Dequantize
-    dequantize_per_block(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        M, K, block_size, props, nullptr);
+    dequantize_per_block(thrust::raw_pointer_cast(d_output.data()),
+                         thrust::raw_pointer_cast(d_fp8.data()),
+                         thrust::raw_pointer_cast(d_scales.data()),
+                         M,
+                         K,
+                         block_size,
+                         props,
+                         nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy output
@@ -286,7 +306,6 @@ TEST_CASE("per-block quantization with non-aligned dimensions", "[quantization][
     INFO("Non-aligned dimensions roundtrip relative error: " << rel_err);
     REQUIRE(rel_err < 0.15f);
 }
-
 
 TEST_CASE("per-block quantization different block sizes", "[quantization][qlora]") {
     const int M = 256;
@@ -309,19 +328,25 @@ TEST_CASE("per-block quantization different block sizes", "[quantization][qlora]
             thrust::device_vector<nv_bfloat16> d_output(M * K);
 
             // Quantize
-            quantize_per_block(
-                thrust::raw_pointer_cast(d_fp8.data()),
-                thrust::raw_pointer_cast(d_scales.data()),
-                thrust::raw_pointer_cast(d_input.data()),
-                M, K, block_size, props, nullptr);
+            quantize_per_block(thrust::raw_pointer_cast(d_fp8.data()),
+                               thrust::raw_pointer_cast(d_scales.data()),
+                               thrust::raw_pointer_cast(d_input.data()),
+                               M,
+                               K,
+                               block_size,
+                               props,
+                               nullptr);
             CUDA_CHECK(cudaDeviceSynchronize());
 
             // Dequantize
-            dequantize_per_block(
-                thrust::raw_pointer_cast(d_output.data()),
-                thrust::raw_pointer_cast(d_fp8.data()),
-                thrust::raw_pointer_cast(d_scales.data()),
-                M, K, block_size, props, nullptr);
+            dequantize_per_block(thrust::raw_pointer_cast(d_output.data()),
+                                 thrust::raw_pointer_cast(d_fp8.data()),
+                                 thrust::raw_pointer_cast(d_scales.data()),
+                                 M,
+                                 K,
+                                 block_size,
+                                 props,
+                                 nullptr);
             CUDA_CHECK(cudaDeviceSynchronize());
 
             // Copy output
@@ -339,7 +364,6 @@ TEST_CASE("per-block quantization different block sizes", "[quantization][qlora]
         }
     }
 }
-
 
 TEST_CASE("per-block quantization preserves zero", "[quantization][qlora]") {
     // Test that zeros are preserved
@@ -359,19 +383,25 @@ TEST_CASE("per-block quantization preserves zero", "[quantization][qlora]") {
     thrust::device_vector<nv_bfloat16> d_output(M * K);
 
     // Quantize
-    quantize_per_block(
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        M, K, block_size, props, nullptr);
+    quantize_per_block(thrust::raw_pointer_cast(d_fp8.data()),
+                       thrust::raw_pointer_cast(d_scales.data()),
+                       thrust::raw_pointer_cast(d_input.data()),
+                       M,
+                       K,
+                       block_size,
+                       props,
+                       nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Dequantize
-    dequantize_per_block(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_fp8.data()),
-        thrust::raw_pointer_cast(d_scales.data()),
-        M, K, block_size, props, nullptr);
+    dequantize_per_block(thrust::raw_pointer_cast(d_output.data()),
+                         thrust::raw_pointer_cast(d_fp8.data()),
+                         thrust::raw_pointer_cast(d_scales.data()),
+                         M,
+                         K,
+                         block_size,
+                         props,
+                         nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy output

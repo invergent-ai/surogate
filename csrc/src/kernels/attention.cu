@@ -45,12 +45,16 @@ namespace cg = cooperative_groups;
  * @param Hq Number of query heads.
  * @param Hkv Number of key/value heads.
  */
-template<int E, class scalar_t>
-__global__ void __launch_bounds__(512) attention_forward_gpu_kernel(
-    scalar_t* out, float* stats, float scale,
-    const scalar_t* qkv,
-    int B, int T, int Hq, int Hkv,
-    int window_size) {
+template <int E, class scalar_t>
+__global__ void __launch_bounds__(512) attention_forward_gpu_kernel(scalar_t* out,
+                                                                    float* stats,
+                                                                    float scale,
+                                                                    const scalar_t* qkv,
+                                                                    int B,
+                                                                    int T,
+                                                                    int Hq,
+                                                                    int Hkv,
+                                                                    int window_size) {
     constexpr const int SubWarpSize = 16;
 
     auto block = cg::this_thread_block();
@@ -64,7 +68,7 @@ __global__ void __launch_bounds__(512) attention_forward_gpu_kernel(
     int t = blockIdx.z;
 
     int hkv = h * Hkv / Hq;
-    int TH = Hq + 2*Hkv;
+    int TH = Hq + 2 * Hkv;
     ptrdiff_t batch_offset = b * T * TH * E;
     qkv += batch_offset;
     const scalar_t* query = qkv + t * TH * E + h * E;
@@ -150,7 +154,7 @@ __global__ void __launch_bounds__(512) attention_forward_gpu_kernel(
     for (int j = 0; j < v_cache_t::size; ++j) {
         v_cache[j] *= rescale;
     }
-    if(threadIdx.x == 0) {
+    if (threadIdx.x == 0) {
         stats[b * Hq * T + h * T + t] = scale * maximum + std::log(lse);
     }
     __syncthreads();
@@ -206,18 +210,24 @@ __global__ void __launch_bounds__(512) attention_forward_gpu_kernel(
  * @param Hq Number of query heads.
  * @param Hkv Number of key/value heads.
  */
-template<int E, class scalar_t>
-__global__ void __launch_bounds__(512) attention_backward_gpu_kernel(
-        scalar_t* dqkv, const float* stats, float scale,
-        const scalar_t* out, const scalar_t* dout, const scalar_t* qkv,
-        int B, int T, int Hq, int Hkv,
-        int window_size) {
+template <int E, class scalar_t>
+__global__ void __launch_bounds__(512) attention_backward_gpu_kernel(scalar_t* dqkv,
+                                                                     const float* stats,
+                                                                     float scale,
+                                                                     const scalar_t* out,
+                                                                     const scalar_t* dout,
+                                                                     const scalar_t* qkv,
+                                                                     int B,
+                                                                     int T,
+                                                                     int Hq,
+                                                                     int Hkv,
+                                                                     int window_size) {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
     const int t = blockIdx.z;
 
     const int hkv = h * Hkv / Hq;
-    const int TH = Hq + 2*Hkv;
+    const int TH = Hq + 2 * Hkv;
 
     qkv += b * T * TH * E;
     dqkv += b * T * TH * E;
@@ -234,7 +244,7 @@ __global__ void __launch_bounds__(512) attention_backward_gpu_kernel(
 
     float lse = stats[b * Hq * T + h * T + t];
     float D = 0.0;
-    for(int i = 0; i < E; ++i) {
+    for (int i = 0; i < E; ++i) {
         D += dout[t * Hq * E + i] * out[t * Hq * E + i];
     }
 
@@ -290,28 +300,34 @@ __global__ void __launch_bounds__(512) attention_backward_gpu_kernel(
  * @param stream CUDA stream for asynchronous execution.
  * @return cudaError_t CUDA error status.
  */
-template<class floatX>
-cudaError_t attention_gpu_forward(floatX* out, float* stats, float scale,
-                          const floatX* qkv,
-                          int B, int T, int Hq, int Hkv, int Hs,
-                          int window_size,
-                          cudaStream_t stream) {
+template <class floatX>
+cudaError_t attention_gpu_forward(floatX* out,
+                                  float* stats,
+                                  float scale,
+                                  const floatX* qkv,
+                                  int B,
+                                  int T,
+                                  int Hq,
+                                  int Hkv,
+                                  int Hs,
+                                  int window_size,
+                                  cudaStream_t stream) {
     dim3 grid_dim{(unsigned)Hq, (unsigned)B, (unsigned)T};
     dim3 block_dim{512, 1, 1};
     size_t smem = Hs * sizeof(float) * block_dim.x / 16;
 
     if (Hs == 512) {
-        attention_forward_gpu_kernel<512><<<grid_dim, block_dim, smem, stream>>>(
-            out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
+        attention_forward_gpu_kernel<512>
+            <<<grid_dim, block_dim, smem, stream>>>(out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
     } else if (Hs == 256) {
-        attention_forward_gpu_kernel<256><<<grid_dim, block_dim, smem, stream>>>(
-            out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
+        attention_forward_gpu_kernel<256>
+            <<<grid_dim, block_dim, smem, stream>>>(out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
     } else if (Hs == 128) {
-        attention_forward_gpu_kernel<128><<<grid_dim, block_dim, smem, stream>>>(
-            out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
+        attention_forward_gpu_kernel<128>
+            <<<grid_dim, block_dim, smem, stream>>>(out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
     } else if (Hs == 64) {
-        attention_forward_gpu_kernel<64><<<grid_dim, block_dim, smem, stream>>>(
-            out, stats, scale, qkv,  B, T, Hq, Hkv, window_size);
+        attention_forward_gpu_kernel<64>
+            <<<grid_dim, block_dim, smem, stream>>>(out, stats, scale, qkv, B, T, Hq, Hkv, window_size);
     } else {
         printf("Unsupported head dimension %d\n", Hs);
         return cudaErrorInvalidValue;
@@ -338,11 +354,17 @@ cudaError_t attention_gpu_forward(floatX* out, float* stats, float scale,
  * @param HS Head size.
  * @param stream CUDA stream for asynchronous execution.
  */
-void attention_forward_cudnn(float* out,  // output: (B, T, Nq, HS)
-                             float* stats, // output for backward pass: (B, Hq, T)
+void attention_forward_cudnn(float* out,        // output: (B, T, Nq, HS)
+                             float* stats,      // output for backward pass: (B, Hq, T)
                              const float* inp,  // input: (B, T, Hq + 2Hkv, HS) QKV
-                             std::byte* workspace, cudnnHandle_t handle,
-                             int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+                             std::byte* workspace,
+                             cudnnHandle_t handle,
+                             int B,
+                             int T,
+                             int Hq,
+                             int Hkv,
+                             int HS,
+                             cudaStream_t stream) {
     attention_gpu_forward(out, stats, 1.f / sqrtf(HS), inp, B, T, Hq, Hkv, HS, /*window_size=*/0, stream);
 }
 
@@ -367,28 +389,35 @@ void attention_forward_cudnn(float* out,  // output: (B, T, Nq, HS)
  * @param stream CUDA stream for asynchronous execution.
  * @return cudaError_t CUDA error status.
  */
-template<class floatX>
-cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale,
-                                   const floatX* out, const floatX* dout, const floatX* qkv,
-                                   int B, int T, int Hq, int Hkv, int Hs,
+template <class floatX>
+cudaError_t attention_gpu_backward(floatX* dqkv,
+                                   const float* stats,
+                                   float scale,
+                                   const floatX* out,
+                                   const floatX* dout,
+                                   const floatX* qkv,
+                                   int B,
+                                   int T,
+                                   int Hq,
+                                   int Hkv,
+                                   int Hs,
                                    int window_size,
                                    cudaStream_t stream) {
     dim3 grid_dim{(unsigned)Hq, (unsigned)B, (unsigned)T};
     dim3 block_dim{512, 1, 1};
     size_t smem = Hs * sizeof(float) * block_dim.x / 16;
-    const size_t dqkv_bytes =
-        static_cast<size_t>(B) * static_cast<size_t>(T) *
-        static_cast<size_t>(Hq + 2 * Hkv) * static_cast<size_t>(Hs) * sizeof(floatX);
+    const size_t dqkv_bytes = static_cast<size_t>(B) * static_cast<size_t>(T) * static_cast<size_t>(Hq + 2 * Hkv) *
+                              static_cast<size_t>(Hs) * sizeof(floatX);
     cudaMemsetAsync(dqkv, 0, dqkv_bytes, stream);
     if (Hs == 128) {
-        attention_backward_gpu_kernel<128><<<grid_dim, block_dim, smem, stream>>>(
-            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
+        attention_backward_gpu_kernel<128>
+            <<<grid_dim, block_dim, smem, stream>>>(dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
     } else if (Hs == 64) {
-        attention_backward_gpu_kernel<64><<<grid_dim, block_dim, smem, stream>>>(
-            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
+        attention_backward_gpu_kernel<64>
+            <<<grid_dim, block_dim, smem, stream>>>(dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
     } else if (Hs == 256) {
-        attention_backward_gpu_kernel<256><<<grid_dim, block_dim, smem, stream>>>(
-            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
+        attention_backward_gpu_kernel<256>
+            <<<grid_dim, block_dim, smem, stream>>>(dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
     } else {
         printf("Unsupported head dimension %d\n", Hs);
         return cudaErrorInvalidValue;
@@ -416,9 +445,18 @@ cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale
  * @param HS Head size.
  * @param stream CUDA stream for asynchronous execution.
  */
-void attention_backward_cudnn(float* dqkv, const float* stats,
-                              const float* out, const float* dout, const float* qkv, std::byte* workspace,
-                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+void attention_backward_cudnn(float* dqkv,
+                              const float* stats,
+                              const float* out,
+                              const float* dout,
+                              const float* qkv,
+                              std::byte* workspace,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hkv,
+                              int HS,
+                              cudaStream_t stream) {
     attention_gpu_backward(dqkv, stats, 1.f / sqrtf(HS), out, dout, qkv, B, T, Hq, Hkv, HS, /*window_size=*/0, stream);
 }
 
@@ -441,55 +479,116 @@ void attention_backward_cudnn(float* dqkv, const float* stats,
  * @param stream CUDA stream for asynchronous execution.
  * @throws std::logic_error If tensor dtype is not FP32 or BF16.
  */
-void attention_forward_cudnn(Tensor& out,  // output: (B, T, Hq, HS)
-                             Tensor& stats, // output for backward pass: (B, Hq, T)
+void attention_forward_cudnn(Tensor& out,        // output: (B, T, Hq, HS)
+                             Tensor& stats,      // output for backward pass: (B, Hq, T)
                              const Tensor& inp,  // input: (B, T, Hq + Hk + Hv, HS) QKV
-                             Tensor& workspace, cudnnHandle_t handle,
-                             int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+                             Tensor& workspace,
+                             cudnnHandle_t handle,
+                             int B,
+                             int T,
+                             int Hq,
+                             int Hkv,
+                             int HS,
+                             cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
-    if(out.DType == ETensorDType::FP32) {
-        attention_forward_cudnn(out.get<float>(), stats.get<float>(), inp.get<float>(), ws, handle, B, T, Hq, Hkv, HS, stream);
-    } else if(out.DType == ETensorDType::BF16) {
-        attention_forward_cudnn(out.get<nv_bfloat16>(), stats.get<float>(), inp.get<nv_bfloat16>(), ws, handle, B, T, Hq, Hkv, HS, stream);
+    if (out.DType == ETensorDType::FP32) {
+        attention_forward_cudnn(out.get<float>(),
+                                stats.get<float>(),
+                                inp.get<float>(),
+                                ws,
+                                handle,
+                                B,
+                                T,
+                                Hq,
+                                Hkv,
+                                HS,
+                                stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        attention_forward_cudnn(out.get<nv_bfloat16>(),
+                                stats.get<float>(),
+                                inp.get<nv_bfloat16>(),
+                                ws,
+                                handle,
+                                B,
+                                T,
+                                Hq,
+                                Hkv,
+                                HS,
+                                stream);
     } else {
         throw std::logic_error("attention_forward: unsupported dtype");
     }
 }
 
-void attention_forward_custom(Tensor& out,  // output: (B, T, Hq, HS)
-                              Tensor& stats, // output for backward pass: (B, Hq, T)
+void attention_forward_custom(Tensor& out,        // output: (B, T, Hq, HS)
+                              Tensor& stats,      // output for backward pass: (B, Hq, T)
                               const Tensor& inp,  // input: (B, T, Hq + Hk + Hv, HS) QKV
-                              int B, int T, int Hq, int Hkv, int HS,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hkv,
+                              int HS,
                               int window_size,
                               cudaStream_t stream,
                               float scale_override) {
-    const float scale = (scale_override != 0.0f)
-                            ? scale_override
-                            : 1.f / sqrtf(static_cast<float>(HS));
+    const float scale = (scale_override != 0.0f) ? scale_override : 1.f / sqrtf(static_cast<float>(HS));
     if (out.DType == ETensorDType::FP32) {
-        attention_gpu_forward(out.get<float>(), stats.get<float>(), scale,
-                              inp.get<float>(), B, T, Hq, Hkv, HS, window_size, stream);
+        attention_gpu_forward(out.get<float>(),
+                              stats.get<float>(),
+                              scale,
+                              inp.get<float>(),
+                              B,
+                              T,
+                              Hq,
+                              Hkv,
+                              HS,
+                              window_size,
+                              stream);
     } else if (out.DType == ETensorDType::BF16) {
-        attention_gpu_forward(out.get<nv_bfloat16>(), stats.get<float>(), scale,
-                              inp.get<nv_bfloat16>(), B, T, Hq, Hkv, HS, window_size, stream);
+        attention_gpu_forward(out.get<nv_bfloat16>(),
+                              stats.get<float>(),
+                              scale,
+                              inp.get<nv_bfloat16>(),
+                              B,
+                              T,
+                              Hq,
+                              Hkv,
+                              HS,
+                              window_size,
+                              stream);
     } else {
         throw std::logic_error("attention_forward_custom: unsupported dtype");
     }
 }
 
-void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
-                               const Tensor& out, const Tensor& dout, const Tensor& qkv,
-                               int B, int T, int Hq, int Hkv, int HS,
+void attention_backward_custom(Tensor& dqkv,
+                               const Tensor& stats,
+                               const Tensor& out,
+                               const Tensor& dout,
+                               const Tensor& qkv,
+                               int B,
+                               int T,
+                               int Hq,
+                               int Hkv,
+                               int HS,
                                int window_size,
                                cudaStream_t stream,
                                float scale_override) {
-    const float scale = (scale_override != 0.0f)
-                            ? scale_override
-                            : 1.f / sqrtf(static_cast<float>(HS));
+    const float scale = (scale_override != 0.0f) ? scale_override : 1.f / sqrtf(static_cast<float>(HS));
     if (out.DType == ETensorDType::FP32) {
-        attention_gpu_backward(dqkv.get<float>(), stats.get<float>(), scale,
-                               out.get<float>(), dout.get<float>(), qkv.get<float>(),
-                               B, T, Hq, Hkv, HS, window_size, stream);
+        attention_gpu_backward(dqkv.get<float>(),
+                               stats.get<float>(),
+                               scale,
+                               out.get<float>(),
+                               dout.get<float>(),
+                               qkv.get<float>(),
+                               B,
+                               T,
+                               Hq,
+                               Hkv,
+                               HS,
+                               window_size,
+                               stream);
     } else {
         throw std::logic_error("attention_backward_custom: unsupported dtype");
     }
@@ -516,16 +615,48 @@ void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
  * @param stream CUDA stream for asynchronous execution.
  * @throws std::logic_error If tensor dtype is not FP32 or BF16.
  */
-void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
-                              const Tensor& out, const Tensor& dout, const Tensor& qkv,
-                              Tensor& workspace, cudnnHandle_t handle,
-                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+void attention_backward_cudnn(Tensor& dqkv,
+                              const Tensor& stats,
+                              const Tensor& out,
+                              const Tensor& dout,
+                              const Tensor& qkv,
+                              Tensor& workspace,
+                              cudnnHandle_t handle,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hkv,
+                              int HS,
+                              cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
-    if(out.DType == ETensorDType::FP32) {
-        attention_backward_cudnn(dqkv.get<float>(), stats.get<float>(), out.get<float>(), dout.get<float>(), qkv.get<float>(), ws, B, T, Hq, Hkv, HS, stream);
-    } else if(out.DType == ETensorDType::BF16) {
+    if (out.DType == ETensorDType::FP32) {
+        attention_backward_cudnn(dqkv.get<float>(),
+                                 stats.get<float>(),
+                                 out.get<float>(),
+                                 dout.get<float>(),
+                                 qkv.get<float>(),
+                                 ws,
+                                 B,
+                                 T,
+                                 Hq,
+                                 Hkv,
+                                 HS,
+                                 stream);
+    } else if (out.DType == ETensorDType::BF16) {
         // Argument order is now consistent: out, dout, qkv (matching header declaration)
-        attention_backward_cudnn(dqkv.get<nv_bfloat16>(), stats.get<float>(), out.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), qkv.get<nv_bfloat16>(), ws, handle, B, T, Hq, Hkv, HS, stream);
+        attention_backward_cudnn(dqkv.get<nv_bfloat16>(),
+                                 stats.get<float>(),
+                                 out.get<nv_bfloat16>(),
+                                 dout.get<nv_bfloat16>(),
+                                 qkv.get<nv_bfloat16>(),
+                                 ws,
+                                 handle,
+                                 B,
+                                 T,
+                                 Hq,
+                                 Hkv,
+                                 HS,
+                                 stream);
     } else {
         throw std::logic_error("attention_backward: unsupported dtype");
     }
@@ -534,13 +665,14 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
 // ============================================================================
 // Attention sinks (GPT-OSS): adjust output + LSE after forward, and compute sink grads.
 // ============================================================================
-template<typename T>
-__global__ void attention_apply_sinks_kernel(
-    T* __restrict__ out,
-    float* __restrict__ lse,
-    const T* __restrict__ sinks,
-    int B, int Tseq, int Hq, int Hs
-) {
+template <typename T>
+__global__ void attention_apply_sinks_kernel(T* __restrict__ out,
+                                             float* __restrict__ lse,
+                                             const T* __restrict__ sinks,
+                                             int B,
+                                             int Tseq,
+                                             int Hq,
+                                             int Hs) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = B * Tseq * Hq;
     if (idx >= total) return;
@@ -564,15 +696,16 @@ __global__ void attention_apply_sinks_kernel(
     }
 }
 
-template<typename T>
-__global__ void attention_sinks_backward_kernel(
-    float* __restrict__ d_sinks,
-    const T* __restrict__ out,
-    const T* __restrict__ dout,
-    const float* __restrict__ lse,
-    const T* __restrict__ sinks,
-    int B, int Tseq, int Hq, int Hs
-) {
+template <typename T>
+__global__ void attention_sinks_backward_kernel(float* __restrict__ d_sinks,
+                                                const T* __restrict__ out,
+                                                const T* __restrict__ dout,
+                                                const float* __restrict__ lse,
+                                                const T* __restrict__ sinks,
+                                                int B,
+                                                int Tseq,
+                                                int Hq,
+                                                int Hs) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = B * Tseq * Hq;
     if (idx >= total) return;
@@ -595,44 +728,64 @@ __global__ void attention_sinks_backward_kernel(
     atomicAdd(&d_sinks[h], grad);
 }
 
-void attention_apply_sinks(nv_bfloat16* out, float* lse, const nv_bfloat16* sinks,
-                           int B, int T, int Hq, int Hs, cudaStream_t stream) {
+void attention_apply_sinks(nv_bfloat16* out,
+                           float* lse,
+                           const nv_bfloat16* sinks,
+                           int B,
+                           int T,
+                           int Hq,
+                           int Hs,
+                           cudaStream_t stream) {
     int total = B * T * Hq;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    attention_apply_sinks_kernel<<<grid_size, block_size, 0, stream>>>(
-        out, lse, sinks, B, T, Hq, Hs
-    );
+    attention_apply_sinks_kernel<<<grid_size, block_size, 0, stream>>>(out, lse, sinks, B, T, Hq, Hs);
 }
 
-void attention_apply_sinks(float* out, float* lse, const float* sinks,
-                           int B, int T, int Hq, int Hs, cudaStream_t stream) {
+void attention_apply_sinks(float* out,
+                           float* lse,
+                           const float* sinks,
+                           int B,
+                           int T,
+                           int Hq,
+                           int Hs,
+                           cudaStream_t stream) {
     int total = B * T * Hq;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    attention_apply_sinks_kernel<<<grid_size, block_size, 0, stream>>>(
-        out, lse, sinks, B, T, Hq, Hs
-    );
+    attention_apply_sinks_kernel<<<grid_size, block_size, 0, stream>>>(out, lse, sinks, B, T, Hq, Hs);
 }
 
-void attention_sinks_backward(float* d_sinks, const nv_bfloat16* out, const nv_bfloat16* dout, const float* lse,
-                              const nv_bfloat16* sinks, int B, int T, int Hq, int Hs, cudaStream_t stream) {
+void attention_sinks_backward(float* d_sinks,
+                              const nv_bfloat16* out,
+                              const nv_bfloat16* dout,
+                              const float* lse,
+                              const nv_bfloat16* sinks,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hs,
+                              cudaStream_t stream) {
     int total = B * T * Hq;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    attention_sinks_backward_kernel<<<grid_size, block_size, 0, stream>>>(
-        d_sinks, out, dout, lse, sinks, B, T, Hq, Hs
-    );
+    attention_sinks_backward_kernel<<<grid_size, block_size, 0, stream>>>(d_sinks, out, dout, lse, sinks, B, T, Hq, Hs);
 }
 
-void attention_sinks_backward(float* d_sinks, const float* out, const float* dout, const float* lse,
-                              const float* sinks, int B, int T, int Hq, int Hs, cudaStream_t stream) {
+void attention_sinks_backward(float* d_sinks,
+                              const float* out,
+                              const float* dout,
+                              const float* lse,
+                              const float* sinks,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hs,
+                              cudaStream_t stream) {
     int total = B * T * Hq;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
-    attention_sinks_backward_kernel<<<grid_size, block_size, 0, stream>>>(
-        d_sinks, out, dout, lse, sinks, B, T, Hq, Hs
-    );
+    attention_sinks_backward_kernel<<<grid_size, block_size, 0, stream>>>(d_sinks, out, dout, lse, sinks, B, T, Hq, Hs);
 }
 
 // ============================================================================
@@ -640,63 +793,71 @@ void attention_sinks_backward(float* d_sinks, const float* out, const float* dou
 // No head_dim limit. Used for head_dim > 256 where FA2/cuDNN are unsupported.
 // ============================================================================
 
-__global__ void causal_softmax_lse_kernel(float* scores, float* lse_out,
-                                           int T, float scale) {
+__global__ void causal_softmax_lse_kernel(float* scores, float* lse_out, int T, float scale) {
     int bh = blockIdx.x, t = blockIdx.y;
     float* row = scores + (static_cast<long long>(bh) * T + t) * T;
     __shared__ float sdata[32];
     // Scale + max
     float mx = -1e30f;
     for (int j = threadIdx.x; j <= t; j += blockDim.x) {
-        row[j] *= scale; mx = fmaxf(mx, row[j]);
+        row[j] *= scale;
+        mx = fmaxf(mx, row[j]);
     }
-    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
-    if (threadIdx.x % 32 == 0) sdata[threadIdx.x/32] = mx;
+    for (int o = 16; o > 0; o >>= 1)
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
+    if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = mx;
     __syncthreads();
-    if (threadIdx.x < blockDim.x/32) {
+    if (threadIdx.x < blockDim.x / 32) {
         mx = sdata[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
+        for (int o = 16; o > 0; o >>= 1)
+            mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
         if (threadIdx.x == 0) sdata[0] = mx;
     }
-    __syncthreads(); mx = sdata[0];
+    __syncthreads();
+    mx = sdata[0];
     // Exp + sum
     float se = 0.0f;
-    for (int j = threadIdx.x; j <= t; j += blockDim.x) { float v = expf(row[j]-mx); row[j] = v; se += v; }
-    for (int j = t+1+threadIdx.x; j < T; j += blockDim.x) row[j] = 0.0f;
-    for (int o = 16; o > 0; o >>= 1) se += __shfl_down_sync(0xffffffff, se, o);
-    if (threadIdx.x % 32 == 0) sdata[threadIdx.x/32] = se;
+    for (int j = threadIdx.x; j <= t; j += blockDim.x) {
+        float v = expf(row[j] - mx);
+        row[j] = v;
+        se += v;
+    }
+    for (int j = t + 1 + threadIdx.x; j < T; j += blockDim.x)
+        row[j] = 0.0f;
+    for (int o = 16; o > 0; o >>= 1)
+        se += __shfl_down_sync(0xffffffff, se, o);
+    if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = se;
     __syncthreads();
-    if (threadIdx.x < blockDim.x/32) {
+    if (threadIdx.x < blockDim.x / 32) {
         se = sdata[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1) se += __shfl_down_sync(0xffffffff, se, o);
+        for (int o = 16; o > 0; o >>= 1)
+            se += __shfl_down_sync(0xffffffff, se, o);
         if (threadIdx.x == 0) sdata[0] = se;
     }
-    __syncthreads(); se = sdata[0];
-    float inv = (se > 0.f) ? 1.f/se : 0.f;
-    for (int j = threadIdx.x; j < T; j += blockDim.x) row[j] *= inv;
-    if (threadIdx.x == 0 && lse_out)
-        lse_out[static_cast<long long>(bh)*T + t] = mx + logf(fmaxf(se, 1e-20f));
+    __syncthreads();
+    se = sdata[0];
+    float inv = (se > 0.f) ? 1.f / se : 0.f;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+        row[j] *= inv;
+    if (threadIdx.x == 0 && lse_out) lse_out[static_cast<long long>(bh) * T + t] = mx + logf(fmaxf(se, 1e-20f));
 }
 
 // Gather BF16 rows with stride into contiguous BF16 buffer (no dtype conversion).
-__global__ void bf16_gather_rows_k(nv_bfloat16* dst, const nv_bfloat16* src,
-                                    int T, int HS, int stride) {
+__global__ void bf16_gather_rows_k(nv_bfloat16* dst, const nv_bfloat16* src, int T, int HS, int stride) {
     int t = blockIdx.x, e = blockIdx.y * blockDim.x + threadIdx.x;
-    if (t < T && e < HS) dst[t*HS+e] = src[static_cast<long long>(t)*stride+e];
+    if (t < T && e < HS) dst[t * HS + e] = src[static_cast<long long>(t) * stride + e];
 }
 
 // Scatter BF16 rows from contiguous buffer back into strided layout.
-__global__ void bf16_scatter_rows_k(nv_bfloat16* dst, const nv_bfloat16* src,
-                                     int T, int HS, int stride) {
+__global__ void bf16_scatter_rows_k(nv_bfloat16* dst, const nv_bfloat16* src, int T, int HS, int stride) {
     int t = blockIdx.x, e = blockIdx.y * blockDim.x + threadIdx.x;
-    if (t < T && e < HS) dst[static_cast<long long>(t)*stride+e] = src[t*HS+e];
+    if (t < T && e < HS) dst[static_cast<long long>(t) * stride + e] = src[t * HS + e];
 }
 
 // Causal softmax matching HF eager precision:
 //   BF16 scores * BF16 scale → BF16 (truncated), then FP32 softmax → BF16 output
 // HF: `scores = matmul(Q,K^T) * scaling` in BF16, then `softmax(scores, dtype=float32).to(bf16)`
-__global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_out,
-                                            int T, nv_bfloat16 scale_bf16) {
+__global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_out, int T, nv_bfloat16 scale_bf16) {
     int bh = blockIdx.x, t = blockIdx.y;
     nv_bfloat16* row = scores_bf16 + (static_cast<long long>(bh) * T + t) * T;
     __shared__ float sdata[32];
@@ -704,7 +865,7 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
     // Apply BF16 scaling in-place (matches HF's `* scaling` in BF16 space)
     for (int j = threadIdx.x; j <= t; j += blockDim.x)
         row[j] = __float2bfloat16(__bfloat162float(row[j]) * __bfloat162float(scale_bf16));
-    for (int j = t+1+threadIdx.x; j < T; j += blockDim.x)
+    for (int j = t + 1 + threadIdx.x; j < T; j += blockDim.x)
         row[j] = __float2bfloat16(-1e30f);  // causal mask: -inf for future positions
     __syncthreads();
 
@@ -719,14 +880,14 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
     float mx = -1e30f;
     for (int j = threadIdx.x; j < T; j += blockDim.x)
         mx = fmaxf(mx, __bfloat162float(row[j]));
-    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
-    if (threadIdx.x % 32 == 0) sdata[threadIdx.x/32] = mx;
+    for (int o = 16; o > 0; o >>= 1)
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
+    if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = mx;
     __syncthreads();
     if (num_warps_local > 1) {
         if (threadIdx.x < num_warps_local) {
             mx = sdata[threadIdx.x];
-            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu
-                                                          : ((1u << num_warps_local) - 1u);
+            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu : ((1u << num_warps_local) - 1u);
             for (int o = num_warps_local >> 1; o > 0; o >>= 1)
                 mx = fmaxf(mx, __shfl_down_sync(mask, mx, o));
             if (threadIdx.x == 0) sdata[0] = mx;
@@ -742,14 +903,14 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
         row[j] = __float2bfloat16(v);
         se += v;
     }
-    for (int o = 16; o > 0; o >>= 1) se += __shfl_down_sync(0xffffffff, se, o);
-    if (threadIdx.x % 32 == 0) sdata[threadIdx.x/32] = se;
+    for (int o = 16; o > 0; o >>= 1)
+        se += __shfl_down_sync(0xffffffff, se, o);
+    if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = se;
     __syncthreads();
     if (num_warps_local > 1) {
         if (threadIdx.x < num_warps_local) {
             se = sdata[threadIdx.x];
-            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu
-                                                          : ((1u << num_warps_local) - 1u);
+            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu : ((1u << num_warps_local) - 1u);
             for (int o = num_warps_local >> 1; o > 0; o >>= 1)
                 se += __shfl_down_sync(mask, se, o);
             if (threadIdx.x == 0) sdata[0] = se;
@@ -759,71 +920,106 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
     se = sdata[0];
 
     // Normalize → BF16 (matches HF's `.to(query.dtype)`)
-    float inv = (se > 0.f) ? 1.f/se : 0.f;
+    float inv = (se > 0.f) ? 1.f / se : 0.f;
     for (int j = threadIdx.x; j < T; j += blockDim.x)
         row[j] = __float2bfloat16(__bfloat162float(row[j]) * inv);
 
     // LSE for backward
-    if (threadIdx.x == 0 && lse_out)
-        lse_out[static_cast<long long>(bh)*T + t] = mx + logf(fmaxf(se, 1e-20f));
+    if (threadIdx.x == 0 && lse_out) lse_out[static_cast<long long>(bh) * T + t] = mx + logf(fmaxf(se, 1e-20f));
 }
 
-void attention_forward_matmul(Tensor& out, Tensor& stats, const Tensor& qkv,
-                              int B, int T, int Hq, int Hkv, int HS,
-                              cublasHandle_t cublas, cudaStream_t stream,
+void attention_forward_matmul(Tensor& out,
+                              Tensor& stats,
+                              const Tensor& qkv,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hkv,
+                              int HS,
+                              cublasHandle_t cublas,
+                              cudaStream_t stream,
                               float scale_override) {
-    const int H = Hq + 2*Hkv;
-    const float scale = (scale_override != 0.0f)
-                            ? scale_override
-                            : 1.f / sqrtf(static_cast<float>(HS));
+    const int H = Hq + 2 * Hkv;
+    const float scale = (scale_override != 0.0f) ? scale_override : 1.f / sqrtf(static_cast<float>(HS));
     cublasSetStream(cublas, stream);
 
     nv_bfloat16 *d_scores, *d_q, *d_k, *d_v;
-    CUDA_CHECK(cudaMallocAsync(&d_scores, sizeof(nv_bfloat16)*B*Hq*T*T, stream));
-    CUDA_CHECK(cudaMallocAsync(&d_q, sizeof(nv_bfloat16)*T*HS, stream));
-    CUDA_CHECK(cudaMallocAsync(&d_k, sizeof(nv_bfloat16)*T*HS, stream));
-    CUDA_CHECK(cudaMallocAsync(&d_v, sizeof(nv_bfloat16)*T*HS, stream));
+    CUDA_CHECK(cudaMallocAsync(&d_scores, sizeof(nv_bfloat16) * B * Hq * T * T, stream));
+    CUDA_CHECK(cudaMallocAsync(&d_q, sizeof(nv_bfloat16) * T * HS, stream));
+    CUDA_CHECK(cudaMallocAsync(&d_k, sizeof(nv_bfloat16) * T * HS, stream));
+    CUDA_CHECK(cudaMallocAsync(&d_v, sizeof(nv_bfloat16) * T * HS, stream));
 
     const auto* p = qkv.get<nv_bfloat16>();
     const int st = H * HS;
-    dim3 gg(T, (HS+255)/256);
+    dim3 gg(T, (HS + 255) / 256);
     float alpha = 1.f, beta = 0.f;
 
     // Phase 1: Q@K^T → BF16 scores (per head, per batch)
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < Hq; ++h) {
             int hkv = h * Hkv / Hq;
-            bf16_gather_rows_k<<<gg,256,0,stream>>>(d_q, p + (long)b*T*st + h*HS, T, HS, st);
-            bf16_gather_rows_k<<<gg,256,0,stream>>>(d_k, p + (long)b*T*st + (Hq+hkv)*HS, T, HS, st);
-            nv_bfloat16* s = d_scores + ((long)b*Hq+h)*T*T;
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(d_q, p + (long)b * T * st + h * HS, T, HS, st);
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(d_k, p + (long)b * T * st + (Hq + hkv) * HS, T, HS, st);
+            nv_bfloat16* s = d_scores + ((long)b * Hq + h) * T * T;
             // BF16 GEMM: scores = K^T @ Q, BF16 in/out with FP32 accumulation
-            cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS,
-                         &alpha, d_k, CUDA_R_16BF, HS, d_q, CUDA_R_16BF, HS,
-                         &beta, s, CUDA_R_16BF, T,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            cublasGemmEx(cublas,
+                         CUBLAS_OP_T,
+                         CUBLAS_OP_N,
+                         T,
+                         T,
+                         HS,
+                         &alpha,
+                         d_k,
+                         CUDA_R_16BF,
+                         HS,
+                         d_q,
+                         CUDA_R_16BF,
+                         HS,
+                         &beta,
+                         s,
+                         CUDA_R_16BF,
+                         T,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT);
         }
     }
 
     // Phase 2: Causal softmax (BF16 scale → FP32 softmax → BF16, matching HF eager)
     nv_bfloat16 scale_bf16 = __float2bfloat16(scale);
-    causal_softmax_bf16_kernel<<<dim3(B*Hq,T), std::min(256,T), 0, stream>>>(
-        d_scores, stats.get<float>(), T, scale_bf16);
+    causal_softmax_bf16_kernel<<<dim3(B * Hq, T), std::min(256, T), 0, stream>>>(d_scores,
+                                                                                 stats.get<float>(),
+                                                                                 T,
+                                                                                 scale_bf16);
 
     // Phase 3: attn@V → BF16 output (per head, per batch)
     auto* out_p = out.get<nv_bfloat16>();
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < Hq; ++h) {
             int hkv = h * Hkv / Hq;
-            bf16_gather_rows_k<<<gg,256,0,stream>>>(d_v, p + (long)b*T*st + (Hq+Hkv+hkv)*HS, T, HS, st);
-            nv_bfloat16* s = d_scores + ((long)b*Hq+h)*T*T;
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(d_v, p + (long)b * T * st + (Hq + Hkv + hkv) * HS, T, HS, st);
+            nv_bfloat16* s = d_scores + ((long)b * Hq + h) * T * T;
             // BF16 GEMM: output = V @ softmax_weights
             // Output goes to a temp buffer (d_q reused), then scattered to strided layout.
-            cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T,
-                         &alpha, d_v, CUDA_R_16BF, HS, s, CUDA_R_16BF, T,
-                         &beta, d_q, CUDA_R_16BF, HS,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-            bf16_scatter_rows_k<<<gg,256,0,stream>>>(
-                out_p + (long)b*T*Hq*HS + h*HS, d_q, T, HS, Hq*HS);
+            cublasGemmEx(cublas,
+                         CUBLAS_OP_N,
+                         CUBLAS_OP_N,
+                         HS,
+                         T,
+                         T,
+                         &alpha,
+                         d_v,
+                         CUDA_R_16BF,
+                         HS,
+                         s,
+                         CUDA_R_16BF,
+                         T,
+                         &beta,
+                         d_q,
+                         CUDA_R_16BF,
+                         HS,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT);
+            bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(out_p + (long)b * T * Hq * HS + h * HS, d_q, T, HS, Hq * HS);
         }
     }
 
@@ -838,11 +1034,11 @@ void attention_forward_matmul(Tensor& out, Tensor& stats, const Tensor& qkv,
 // This kernel takes pre-computed d_P (in BF16) and P (in BF16),
 // produces d_S in BF16 with FP32 intermediates.
 // Also applies the 1/sqrt(d) scaling to d_S for dQ/dK computation.
-__global__ void causal_softmax_backward_bf16_kernel(
-        nv_bfloat16* d_scores,  // [BH, T, T] output: d_S * scale
-        const nv_bfloat16* d_P, // [BH, T, T] input: d_out @ V^T
-        const nv_bfloat16* P,   // [BH, T, T] input: softmax output
-        int T, float scale) {
+__global__ void causal_softmax_backward_bf16_kernel(nv_bfloat16* d_scores,   // [BH, T, T] output: d_S * scale
+                                                    const nv_bfloat16* d_P,  // [BH, T, T] input: d_out @ V^T
+                                                    const nv_bfloat16* P,    // [BH, T, T] input: softmax output
+                                                    int T,
+                                                    float scale) {
     int bh = blockIdx.x, t = blockIdx.y;
     const nv_bfloat16* dp_row = d_P + (static_cast<long long>(bh) * T + t) * T;
     const nv_bfloat16* p_row = P + (static_cast<long long>(bh) * T + t) * T;
@@ -861,15 +1057,15 @@ __global__ void causal_softmax_backward_bf16_kernel(
     float dot = 0.f;
     for (int j = threadIdx.x; j <= t; j += blockDim.x)
         dot += __bfloat162float(dp_row[j]) * __bfloat162float(p_row[j]);
-    for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffff, dot, o);
+    for (int o = 16; o > 0; o >>= 1)
+        dot += __shfl_down_sync(0xffffffff, dot, o);
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = dot;
     __syncthreads();
     const int num_warps = (blockDim.x + 31) / 32;
     if (num_warps > 1) {
         if (threadIdx.x < num_warps) {
             dot = sdata[threadIdx.x];
-            const unsigned active_mask = (num_warps == 32) ? 0xffffffffu
-                                                           : ((1u << num_warps) - 1u);
+            const unsigned active_mask = (num_warps == 32) ? 0xffffffffu : ((1u << num_warps) - 1u);
             for (int o = num_warps >> 1; o > 0; o >>= 1)
                 dot += __shfl_down_sync(active_mask, dot, o);
             if (threadIdx.x == 0) sdata[0] = dot;
@@ -891,11 +1087,18 @@ __global__ void causal_softmax_backward_bf16_kernel(
         ds_row[j] = __float2bfloat16(0.f);
 }
 
-void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
-                               const Tensor& out, const Tensor& d_out,
+void attention_backward_matmul(Tensor& d_qkv,
+                               const Tensor& lse,
+                               const Tensor& out,
+                               const Tensor& d_out,
                                const Tensor& qkv,
-                               int B, int T, int Hq, int Hkv, int HS,
-                               cublasHandle_t cublas, cudaStream_t stream,
+                               int B,
+                               int T,
+                               int Hq,
+                               int Hkv,
+                               int HS,
+                               cublasHandle_t cublas,
+                               cudaStream_t stream,
                                float scale_override) {
     // SDPA backward using cuBLAS GEMMs, matching the forward's BF16 precision.
     //
@@ -914,9 +1117,7 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
     // expanded buffers [B, T, Hq, HS] and finalize with reduce_scatter_dkv,
     // mirroring the Flash-Attn varlen backward path.
     const int H = Hq + 2 * Hkv;
-    const float scale = (scale_override != 0.0f)
-                            ? scale_override
-                            : 1.f / sqrtf(static_cast<float>(HS));
+    const float scale = (scale_override != 0.0f) ? scale_override : 1.f / sqrtf(static_cast<float>(HS));
     cublasSetStream(cublas, stream);
 
     const bool is_gqa = (Hq != Hkv);
@@ -930,13 +1131,12 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
     CUDA_CHECK(cudaMallocAsync(&w_dp, sizeof(nv_bfloat16) * T * T, stream));
 
     // Expanded per-Q-head dK/dV buffers (GQA only). For MHA they're unused.
-    nv_bfloat16 *dk_expanded = nullptr;
-    nv_bfloat16 *dv_expanded = nullptr;
+    nv_bfloat16* dk_expanded = nullptr;
+    nv_bfloat16* dv_expanded = nullptr;
     if (is_gqa) {
-        const std::size_t expanded_bytes =
-            sizeof(nv_bfloat16) * static_cast<std::size_t>(B) *
-            static_cast<std::size_t>(T) * static_cast<std::size_t>(Hq) *
-            static_cast<std::size_t>(HS);
+        const std::size_t expanded_bytes = sizeof(nv_bfloat16) * static_cast<std::size_t>(B) *
+                                           static_cast<std::size_t>(T) * static_cast<std::size_t>(Hq) *
+                                           static_cast<std::size_t>(HS);
         CUDA_CHECK(cudaMallocAsync(&dk_expanded, expanded_bytes, stream));
         CUDA_CHECK(cudaMallocAsync(&dv_expanded, expanded_bytes, stream));
     }
@@ -945,7 +1145,7 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
     const auto* p_do = d_out.get<nv_bfloat16>();
     auto* p_dqkv = d_qkv.get<nv_bfloat16>();
     const int st = H * HS;
-    const int st_exp = Hq * HS;           // stride for expanded dK/dV buffers
+    const int st_exp = Hq * HS;  // stride for expanded dK/dV buffers
     dim3 gg(T, (HS + 255) / 256);
     float alpha = 1.f, beta = 0.f;
     nv_bfloat16 scale_bf16 = __float2bfloat16(scale);
@@ -959,82 +1159,164 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
             const int hkv = h * Hkv / Hq;
 
             // Gather Q, K, V, d_out for this head
-            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_q, p_qkv + (long)b * T * st + h * HS, T, HS, st);
-            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_k, p_qkv + (long)b * T * st + (Hq + hkv) * HS, T, HS, st);
-            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_v, p_qkv + (long)b * T * st + (Hq + Hkv + hkv) * HS, T, HS, st);
-            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_do, p_do + (long)b * T * Hq * HS + h * HS, T, HS, Hq * HS);
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_q, p_qkv + (long)b * T * st + h * HS, T, HS, st);
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_k, p_qkv + (long)b * T * st + (Hq + hkv) * HS, T, HS, st);
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_v,
+                                                       p_qkv + (long)b * T * st + (Hq + Hkv + hkv) * HS,
+                                                       T,
+                                                       HS,
+                                                       st);
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_do, p_do + (long)b * T * Hq * HS + h * HS, T, HS, Hq * HS);
 
             // 1. Recompute scores: S = K^T @ Q   [T, T] col-major
-            cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS,
-                         &alpha, w_k, CUDA_R_16BF, HS, w_q, CUDA_R_16BF, HS,
-                         &beta, w_scores, CUDA_R_16BF, T,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            cublasGemmEx(cublas,
+                         CUBLAS_OP_T,
+                         CUBLAS_OP_N,
+                         T,
+                         T,
+                         HS,
+                         &alpha,
+                         w_k,
+                         CUDA_R_16BF,
+                         HS,
+                         w_q,
+                         CUDA_R_16BF,
+                         HS,
+                         &beta,
+                         w_scores,
+                         CUDA_R_16BF,
+                         T,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT);
 
             // 2. Recompute softmax: P = causal_softmax(S * scale). w_scores := P.
-            causal_softmax_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(
-                w_scores, nullptr, T, scale_bf16);
+            causal_softmax_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(w_scores, nullptr, T, scale_bf16);
 
             // 3. dV_h = dO @ P^T   (col-major HS×T = dO(HS,T) @ P(T,T)^T).
             //    Write into w_k (K_h is no longer needed until step 6,
             //    where we re-gather it).
-            cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T,
-                         &alpha, w_do, CUDA_R_16BF, HS, w_scores, CUDA_R_16BF, T,
-                         &beta, w_k, CUDA_R_16BF, HS,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            cublasGemmEx(cublas,
+                         CUBLAS_OP_N,
+                         CUBLAS_OP_T,
+                         HS,
+                         T,
+                         T,
+                         &alpha,
+                         w_do,
+                         CUDA_R_16BF,
+                         HS,
+                         w_scores,
+                         CUDA_R_16BF,
+                         T,
+                         &beta,
+                         w_k,
+                         CUDA_R_16BF,
+                         HS,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT);
             if (is_gqa) {
                 // Scatter per-Q-head into expanded dV buffer at stride Hq*HS.
-                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
-                    dv_expanded + (long)b * T * st_exp + h * HS,
-                    w_k, T, HS, st_exp);
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(dv_expanded + (long)b * T * st_exp + h * HS,
+                                                            w_k,
+                                                            T,
+                                                            HS,
+                                                            st_exp);
             } else {
                 // MHA: single K/V slot per Q head — direct write is correct.
-                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
-                    p_dqkv + (long)b * T * st + (Hq + Hkv + hkv) * HS,
-                    w_k, T, HS, st);
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(p_dqkv + (long)b * T * st + (Hq + Hkv + hkv) * HS,
+                                                            w_k,
+                                                            T,
+                                                            HS,
+                                                            st);
             }
 
             // 4. dP = dO @ V^T   [T, T]. w_v still holds V_h.
-            cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS,
-                         &alpha, w_v, CUDA_R_16BF, HS, w_do, CUDA_R_16BF, HS,
-                         &beta, w_dp, CUDA_R_16BF, T,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            cublasGemmEx(cublas,
+                         CUBLAS_OP_T,
+                         CUBLAS_OP_N,
+                         T,
+                         T,
+                         HS,
+                         &alpha,
+                         w_v,
+                         CUDA_R_16BF,
+                         HS,
+                         w_do,
+                         CUDA_R_16BF,
+                         HS,
+                         &beta,
+                         w_dp,
+                         CUDA_R_16BF,
+                         T,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT);
 
             // 5. dS = P * (dP - rowsum(dP * P)) * scale. w_dp := dS.
-            causal_softmax_backward_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(
-                w_dp, w_dp, w_scores, T, scale);
+            causal_softmax_backward_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(w_dp,
+                                                                                             w_dp,
+                                                                                             w_scores,
+                                                                                             T,
+                                                                                             scale);
 
             // 6. dQ_h = K @ dS^T   (col-major HS×T = K(HS,T) @ dS(T,T)^T).
             //    Re-gather K because w_k was reused for dV_h in step 3.
-            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_k, p_qkv + (long)b * T * st + (Hq + hkv) * HS, T, HS, st);
-            cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T,
-                         &alpha, w_k, CUDA_R_16BF, HS, w_dp, CUDA_R_16BF, T,
-                         &beta, w_q, CUDA_R_16BF, HS,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_k, p_qkv + (long)b * T * st + (Hq + hkv) * HS, T, HS, st);
+            cublasGemmEx(cublas,
+                         CUBLAS_OP_N,
+                         CUBLAS_OP_T,
+                         HS,
+                         T,
+                         T,
+                         &alpha,
+                         w_k,
+                         CUDA_R_16BF,
+                         HS,
+                         w_dp,
+                         CUDA_R_16BF,
+                         T,
+                         &beta,
+                         w_q,
+                         CUDA_R_16BF,
+                         HS,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT);
             // dQ is unique per Q head — direct write into d_qkv.
-            bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
-                p_dqkv + (long)b * T * st + h * HS, w_q, T, HS, st);
+            bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(p_dqkv + (long)b * T * st + h * HS, w_q, T, HS, st);
 
             // 7. dK_h = Q @ dS   (col-major HS×T = Q(HS,T) @ dS(T,T)).
             //    Re-gather Q because w_q was reused for dQ_h in step 6.
-            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_q, p_qkv + (long)b * T * st + h * HS, T, HS, st);
-            cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T,
-                         &alpha, w_q, CUDA_R_16BF, HS, w_dp, CUDA_R_16BF, T,
-                         &beta, w_v, CUDA_R_16BF, HS,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_q, p_qkv + (long)b * T * st + h * HS, T, HS, st);
+            cublasGemmEx(cublas,
+                         CUBLAS_OP_N,
+                         CUBLAS_OP_N,
+                         HS,
+                         T,
+                         T,
+                         &alpha,
+                         w_q,
+                         CUDA_R_16BF,
+                         HS,
+                         w_dp,
+                         CUDA_R_16BF,
+                         T,
+                         &beta,
+                         w_v,
+                         CUDA_R_16BF,
+                         HS,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT);
             if (is_gqa) {
-                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
-                    dk_expanded + (long)b * T * st_exp + h * HS,
-                    w_v, T, HS, st_exp);
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(dk_expanded + (long)b * T * st_exp + h * HS,
+                                                            w_v,
+                                                            T,
+                                                            HS,
+                                                            st_exp);
             } else {
-                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
-                    p_dqkv + (long)b * T * st + (Hq + hkv) * HS,
-                    w_v, T, HS, st);
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(p_dqkv + (long)b * T * st + (Hq + hkv) * HS,
+                                                            w_v,
+                                                            T,
+                                                            HS,
+                                                            st);
             }
         }
     }
@@ -1043,8 +1325,7 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
     // reduce_scatter_dkv treats the first B*T rows as total_q and sums
     // h_ratio = Hq/Hkv expanded heads into each KV slot.
     if (is_gqa) {
-        reduce_scatter_dkv(p_dqkv, dk_expanded, dv_expanded,
-                           B * T, Hq, Hkv, HS, stream);
+        reduce_scatter_dkv(p_dqkv, dk_expanded, dv_expanded, B * T, Hq, Hkv, HS, stream);
         CUDA_CHECK(cudaFreeAsync(dk_expanded, stream));
         CUDA_CHECK(cudaFreeAsync(dv_expanded, stream));
     }
@@ -1056,4 +1337,3 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
     CUDA_CHECK(cudaFreeAsync(w_scores, stream));
     CUDA_CHECK(cudaFreeAsync(w_dp, stream));
 }
-

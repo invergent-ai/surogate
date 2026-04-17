@@ -48,7 +48,10 @@ def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float) -
     sampling_args["logprobs"] = True
     # Convert extra_body to plain dicts (DictDefault/addict breaks Pydantic serialization)
     import json
-    plain_extra_body = json.loads(json.dumps(dict(sampling_config.extra_body), default=str)) if sampling_config.extra_body else {}
+
+    plain_extra_body = (
+        json.loads(json.dumps(dict(sampling_config.extra_body), default=str)) if sampling_config.extra_body else {}
+    )
     sampling_args["extra_body"] = {
         **plain_extra_body,
         "return_token_ids": True,  # Always return token IDs

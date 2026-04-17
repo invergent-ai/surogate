@@ -17,8 +17,9 @@ import json
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +54,7 @@ class KernelCache:
     """
 
     def __init__(self, cache_dir: str | Path | None = None):
-        self.cache_dir = Path(
-            cache_dir
-            or os.environ.get("SUROGATE_KERNEL_CACHE")
-            or _DEFAULT_CACHE_DIR
-        )
+        self.cache_dir = Path(cache_dir or os.environ.get("SUROGATE_KERNEL_CACHE") or _DEFAULT_CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def get_or_compile(
@@ -94,9 +91,7 @@ class KernelCache:
                 manifests = index["manifests"]
                 # Verify all manifest files still exist
                 if all(Path(p).exists() for p in manifests.values()):
-                    logger.info(
-                        "Kernel cache hit: %s (%d kernels)", cache_key, len(manifests)
-                    )
+                    logger.info("Kernel cache hit: %s (%d kernels)", cache_key, len(manifests))
                     return manifests
                 logger.warning("Cache entry %s has missing files, recompiling", cache_key)
             except (json.JSONDecodeError, KeyError):
@@ -112,17 +107,20 @@ class KernelCache:
         manifests = {k: str(Path(v).resolve()) for k, v in manifests.items()}
 
         # Write index
-        index_file.write_text(json.dumps({
-            "name": name,
-            "src_hash": src_hash,
-            "sm": sm,
-            "dims": dims,
-            "manifests": manifests,
-        }, indent=2))
-
-        logger.info(
-            "Compiled and cached %d kernels to %s", len(manifests), cache_entry
+        index_file.write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "src_hash": src_hash,
+                    "sm": sm,
+                    "dims": dims,
+                    "manifests": manifests,
+                },
+                indent=2,
+            )
         )
+
+        logger.info("Compiled and cached %d kernels to %s", len(manifests), cache_entry)
         return manifests
 
     def clear(self):

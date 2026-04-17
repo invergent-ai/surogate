@@ -42,16 +42,14 @@ public:
     virtual Tensor& resolve_param(std::string_view name, cudaStream_t stream) = 0;
 
     /// Import weights from checkpoint and quantize base weights.
-    virtual void import_and_quantize(const std::string& file_name, NCCLCommunicator& comm,
-                                     cudaStream_t stream) = 0;
+    virtual void import_and_quantize(const std::string& file_name, NCCLCommunicator& comm, cudaStream_t stream) = 0;
 
     /// Invalidate any cached dequantized weights (call per-step).
     virtual void invalidate_cache() = 0;
 
     /// Refresh MoE expert buffers for selective dequant (returns true if handled).
-    virtual bool refresh_moe_experts(int layer_idx,
-                                     const modules::SelectiveExpertInfo& selection,
-                                     cudaStream_t stream) {
+    virtual bool
+    refresh_moe_experts(int layer_idx, const modules::SelectiveExpertInfo& selection, cudaStream_t stream) {
         (void)layer_idx;
         (void)selection;
         (void)stream;
@@ -59,7 +57,9 @@ public:
     }
 
     /// Returns true if provider supports selective MoE expert refresh.
-    [[nodiscard]] virtual bool supports_selective_moe() const { return false; }
+    [[nodiscard]] virtual bool supports_selective_moe() const {
+        return false;
+    }
 
     /// Prefetch offloaded weights for a given layer to GPU.
     ///
@@ -77,7 +77,9 @@ public:
 
     /// Returns true if this provider uses weight offloading (CPU↔GPU).
     /// Used by the graph executor to enable prefetch scheduling.
-    [[nodiscard]] virtual bool has_offloading() const { return false; }
+    [[nodiscard]] virtual bool has_offloading() const {
+        return false;
+    }
 
     /// Total bytes used by quantized weights (for memory stats).
     virtual std::size_t quantized_weights_bytes() const = 0;
@@ -94,13 +96,16 @@ public:
 
     /// Get the quantizer used by this provider (for remote dequantization).
     /// Returns nullptr if no quantizer is available.
-    virtual qlora::IQuantizer* get_quantizer() const { return nullptr; }
+    virtual qlora::IQuantizer* get_quantizer() const {
+        return nullptr;
+    }
 
     /// Auto-tune offloading parameters based on current GPU memory state.
     /// Called after import_and_quantize() to maximize resident groups.
-    virtual void auto_tune_offloading() {}
+    virtual void auto_tune_offloading() {
+    }
 };
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_QLORA_PROVIDER_H
+#endif  // SUROGATE_SRC_DSL_QLORA_PROVIDER_H

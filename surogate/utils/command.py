@@ -23,5 +23,5 @@ class SurogateCommand(abc.ABC):
         logging.getLogger("transformers").setLevel(logging.ERROR)
         logging.getLogger("datasets").setLevel(logging.ERROR)
 
-        if hasattr(self.config, 'seed') and self.config.seed:
+        if hasattr(self.config, "seed") and self.config.seed:
             seed_everything(self.config.seed)

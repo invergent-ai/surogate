@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -69,5 +71,34 @@ void CompiledExecutor::dispatch_relu2_backward(const CompiledOp& op) {
     store_tensor(op.outputs[0], *d_inp_ptr);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// ReLU² backward rule
+// Forward: y = relu2(x) = x * relu(x) = x * max(0, x)
+// For x <= 0: y = 0
+// For x > 0:  y = x²
+// Backward: dx = dy * 2 * relu(x)
+// -----------------------------------------------------------------------------
+std::vector<Operation> relu2_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string x = fwd.inputs[0];
+
+        ops.push_back(make_operation("relu2_backward_" + std::to_string(ctx.op_counter++),
+                                     "relu2_backward",
+                                     "relu2_backward",
+                                     {ctx.d_output, saved_ref(x)},
+                                     {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+}  // namespace
 
 }  // namespace dsl
+
+REGISTER_AUTODIFF("relu2", ::dsl::relu2_backward);

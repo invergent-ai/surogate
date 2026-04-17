@@ -17,12 +17,18 @@ class IModel;
 std::string get_checkpoint_path(std::string checkpoint_directory, int step);
 
 //! Saves distributed model state and training metadata
-std::string save_checkpoint(std::string checkpoint_directory, int step, IModel& model,
-                            const DataLoader* loader, NCCLCommunicator& comm);
+std::string save_checkpoint(std::string checkpoint_directory,
+                            int step,
+                            IModel& model,
+                            const DataLoader* loader,
+                            NCCLCommunicator& comm);
 
 //! Restores model and training state from checkpoint.
-void load_checkpoint(std::string checkpoint_directory, int step, IModel& model,
-                     DataLoader* loader, NCCLCommunicator& comm);
+void load_checkpoint(std::string checkpoint_directory,
+                     int step,
+                     IModel& model,
+                     DataLoader* loader,
+                     NCCLCommunicator& comm);
 
 //! Gets the world size for which a checkpoint was created
 int get_checkpoint_world_size(std::string checkpoint_directory, int step);
@@ -38,5 +44,4 @@ int find_latest_checkpoint(const std::string& checkpoint_directory);
 //! in units of steps, not in units of minor checkpoints.
 std::vector<std::string> clean_old_checkpoints(const std::string& checkpoint_directory, int n_to_keep, int major_every);
 
-
-#endif //SUROGATE_TRAINING_CHECKPOINT_H
+#endif  //SUROGATE_TRAINING_CHECKPOINT_H

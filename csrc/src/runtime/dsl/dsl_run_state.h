@@ -22,7 +22,9 @@
 #include "runtime/training/model.h"
 #include "runtime/training/runtime_options.h"
 #include "utilities/allocator.h"
-namespace modules { class FP8ScalingState; }
+namespace modules {
+class FP8ScalingState;
+}  // namespace modules
 
 namespace dsl {
 
@@ -34,7 +36,8 @@ public:
     DslRunState(const PretrainedConfig& config,
                 const DslRuntimeConfig& runtime_config,
                 const RuntimeOptions& options,
-                int B, int T,
+                int B,
+                int T,
                 const std::shared_ptr<TensorAllocator>& allocator,
                 bool lora_only_mode = false,
                 bool prequantized = false,
@@ -45,28 +48,43 @@ public:
 
     void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
 
-    modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) { return mSimplifiedActivations[layer_idx]; }
-    modules::SimplifiedLayerGradients& simplified_grads(int layer_idx) { return mSimplifiedGradients[layer_idx]; }
-    modules::SimplifiedQuantGradients& simplified_quant_grads() { return mSimplifiedQuantGrads; }
-    modules::FP8ForwardQuantActivations& fp8_forward_quants() { return mFP8ForwardQuants; }
+    modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) {
+        return mSimplifiedActivations[layer_idx];
+    }
+    modules::SimplifiedLayerGradients& simplified_grads(int layer_idx) {
+        return mSimplifiedGradients[layer_idx];
+    }
+    modules::SimplifiedQuantGradients& simplified_quant_grads() {
+        return mSimplifiedQuantGrads;
+    }
+    modules::FP8ForwardQuantActivations& fp8_forward_quants() {
+        return mFP8ForwardQuants;
+    }
 
     /// @brief FP8 forward buffer freshness tracking.
     /// When an activation dispatch (swiglu, rmsnorm) pre-quantizes its output
     /// into the FP8 buffer, it sets the corresponding bit. The matmul dispatch
     /// checks and clears the bit to skip redundant quantization.
     enum FP8BufferReady : uint8_t {
-        FP8Ready_None    = 0,
-        FP8Ready_LN1     = 1 << 0,  ///< fp8_forward_quants().ln1 is pre-quantized
-        FP8Ready_LN2     = 1 << 1,  ///< fp8_forward_quants().ln2 is pre-quantized
-        FP8Ready_Att     = 1 << 2,  ///< fp8_forward_quants().att is pre-quantized
-        FP8Ready_SwiGLU  = 1 << 3,  ///< fp8_forward_quants().swiglu is pre-quantized
+        FP8Ready_None = 0,
+        FP8Ready_LN1 = 1 << 0,     ///< fp8_forward_quants().ln1 is pre-quantized
+        FP8Ready_LN2 = 1 << 1,     ///< fp8_forward_quants().ln2 is pre-quantized
+        FP8Ready_Att = 1 << 2,     ///< fp8_forward_quants().att is pre-quantized
+        FP8Ready_SwiGLU = 1 << 3,  ///< fp8_forward_quants().swiglu is pre-quantized
     };
-    void set_fp8_buffer_ready(FP8BufferReady flag) { mFP8BufferReadyFlags |= flag; }
+    void set_fp8_buffer_ready(FP8BufferReady flag) {
+        mFP8BufferReadyFlags |= flag;
+    }
     bool consume_fp8_buffer_ready(FP8BufferReady flag) {
-        if (mFP8BufferReadyFlags & flag) { mFP8BufferReadyFlags &= ~flag; return true; }
+        if (mFP8BufferReadyFlags & flag) {
+            mFP8BufferReadyFlags &= ~flag;
+            return true;
+        }
         return false;
     }
-    void reset_fp8_buffer_ready() { mFP8BufferReadyFlags = FP8Ready_None; }
+    void reset_fp8_buffer_ready() {
+        mFP8BufferReadyFlags = FP8Ready_None;
+    }
 
     void reset_simplified_gradients();
 
@@ -75,11 +93,19 @@ public:
     void zero_activation_gradients(cudaStream_t stream);
 
     /// @brief Get the number of layers for gradient iteration
-    std::size_t num_gradient_layers() const { return mSimplifiedGradients.size(); }
+    std::size_t num_gradient_layers() const {
+        return mSimplifiedGradients.size();
+    }
 
-    modules::NonBlockActivations& non_block_activations() { return mNonBlockActivations; }
-    modules::NonBlockGradientBuffers& non_block_gradients() { return mNonBlockGradients; }
-    modules::ScratchBuffers& scratch() { return mScratch; }
+    modules::NonBlockActivations& non_block_activations() {
+        return mNonBlockActivations;
+    }
+    modules::NonBlockGradientBuffers& non_block_gradients() {
+        return mNonBlockGradients;
+    }
+    modules::ScratchBuffers& scratch() {
+        return mScratch;
+    }
 
     Tensor& get_residual(int layer_idx, cudaStream_t stream);
     Tensor& get_final_residual();
@@ -89,30 +115,58 @@ public:
     void put_residual(int layer_idx, cudaStream_t stream);
     void mark_residual_ready(int layer_idx, cudaStream_t stream);
     void release_residual(int layer_idx, cudaStream_t stream);
-    bool has_residual_offloading() const { return mOffloadResiduals; }
+    bool has_residual_offloading() const {
+        return mOffloadResiduals;
+    }
 
-    bool ffn_temps_on_stack() const { return mFfnTempsOnStack; }
-    bool large_bwd_temps_on_stack() const { return mRecomputeLevel >= RecomputeLevel::Enabled; }
-    bool is_lora_only_mode() const { return mLoraOnlyMode; }
-    bool has_hybrid_blocks() const { return mRuntimeConfig.has_per_layer_dims(); }
-    bool is_prequantized() const { return mPrequantized; }
+    bool ffn_temps_on_stack() const {
+        return mFfnTempsOnStack;
+    }
+    bool large_bwd_temps_on_stack() const {
+        return mRecomputeLevel >= RecomputeLevel::Enabled;
+    }
+    bool is_lora_only_mode() const {
+        return mLoraOnlyMode;
+    }
+    bool has_hybrid_blocks() const {
+        return mRuntimeConfig.has_per_layer_dims();
+    }
+    bool is_prequantized() const {
+        return mPrequantized;
+    }
 
     /// @brief Get the recompute level
-    RecomputeLevel recompute_level() const { return mRecomputeLevel; }
+    RecomputeLevel recompute_level() const {
+        return mRecomputeLevel;
+    }
 
     /// @brief Check if any recomputation is enabled
-    bool recompute_enabled() const { return mRecomputeLevel != RecomputeLevel::None; }
+    bool recompute_enabled() const {
+        return mRecomputeLevel != RecomputeLevel::None;
+    }
 
     /// @brief Get temporary rstd buffer for recomputation (avoids overwriting saved values)
-    Tensor& recompute_rstd() { return mRecomputeRstd; }
+    Tensor& recompute_rstd() {
+        return mRecomputeRstd;
+    }
 
     /// @brief Get temporary LSE buffer for recomputation (avoids overwriting saved values)
-    Tensor& recompute_lse() { return mRecomputeLSE; }
+    Tensor& recompute_lse() {
+        return mRecomputeLSE;
+    }
 
-    cudaStream_t side_stream() const { return mSideStream; }
-    cudaEvent_t side_stream_event() const { return mSideStreamEvent; }
-    cudaEvent_t all_reduce_done_event() const { return mAllReduceDone; }
-    cublasHandle_t cublas_handle() const { return mCublasHandle; }
+    cudaStream_t side_stream() const {
+        return mSideStream;
+    }
+    cudaEvent_t side_stream_event() const {
+        return mSideStreamEvent;
+    }
+    cudaEvent_t all_reduce_done_event() const {
+        return mAllReduceDone;
+    }
+    cublasHandle_t cublas_handle() const {
+        return mCublasHandle;
+    }
 
     // ========================================================================
     // Per-layer CUDA graphs (for efficient layer-by-layer execution)
@@ -151,41 +205,69 @@ public:
     void reset_cuda_graphs();
 
     /// @brief Check if per-layer CUDA graphs are enabled
-    bool per_layer_graphs_enabled() const { return mPerLayerGraphsEnabled; }
+    bool per_layer_graphs_enabled() const {
+        return mPerLayerGraphsEnabled;
+    }
 
     /// @brief Enable/disable per-layer CUDA graphs
-    void set_per_layer_graphs_enabled(bool enabled) { mPerLayerGraphsEnabled = enabled; }
+    void set_per_layer_graphs_enabled(bool enabled) {
+        mPerLayerGraphsEnabled = enabled;
+    }
 
     /// @brief Get number of layers (for graph array sizing)
-    int num_layers() const { return mNumLayers; }
+    int num_layers() const {
+        return mNumLayers;
+    }
 
     // IRunState overrides (quantization unsupported in DSL runtime for now).
-    [[nodiscard]] bool has_activation_quants() const override { return mMatmulDtype != mActivationDtype; }
-    [[nodiscard]] bool has_grad_quants() const override { return mGradQuantDtype != mGradDtype; }
-    [[nodiscard]] bool has_fp8_forward() const override { return mEnableFp8Forward; }
+    [[nodiscard]] bool has_activation_quants() const override {
+        return mMatmulDtype != mActivationDtype;
+    }
+    [[nodiscard]] bool has_grad_quants() const override {
+        return mGradQuantDtype != mGradDtype;
+    }
+    [[nodiscard]] bool has_fp8_forward() const override {
+        return mEnableFp8Forward;
+    }
     [[nodiscard]] bool has_fp8_hybrid_backward() const override {
         return mEnableFp8Forward && mGradQuantDtype == ETensorDType::FP8_E5M2;
     }
-    [[nodiscard]] bool has_fp8_delayed_scaling() const override { return mFP8ScalingState != nullptr; }
-    [[nodiscard]] bool has_fp4_forward() const override { return false; }
-    [[nodiscard]] bool has_fp4_backward() const override { return false; }
+    [[nodiscard]] bool has_fp8_delayed_scaling() const override {
+        return mFP8ScalingState != nullptr;
+    }
+    [[nodiscard]] bool has_fp4_forward() const override {
+        return false;
+    }
+    [[nodiscard]] bool has_fp4_backward() const override {
+        return false;
+    }
     [[nodiscard]] Tensor* get_fp8_forward_buffer(int op) override;
     [[nodiscard]] Tensor* get_gradient_quant_buffer(int op) override;
-    [[nodiscard]] modules::FP8ScalingState* get_fp8_scaling_state() override { return mFP8ScalingState.get(); }
+    [[nodiscard]] modules::FP8ScalingState* get_fp8_scaling_state() override {
+        return mFP8ScalingState.get();
+    }
 
     // MoE stats overrides
     [[nodiscard]] MoEStats get_moe_stats() const override;
     void reset_moe_stats() override;
-    [[nodiscard]] bool is_moe_model() const override { return mNumMoEExperts > 0; }
+    [[nodiscard]] bool is_moe_model() const override {
+        return mNumMoEExperts > 0;
+    }
 
     /// @brief Get device pointer to MoE stats buffer for kernel accumulation.
     /// Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
-    float* moe_stats_device() { return mMoEStatsDevice; }
+    float* moe_stats_device() {
+        return mMoEStatsDevice;
+    }
 
     /// @brief Set MoE config and allocate stats buffers (call once after construction)
     void set_moe_config(int num_experts, float aux_loss_coef);
-    [[nodiscard]] int moe_num_experts() const { return mNumMoEExperts; }
-    [[nodiscard]] float moe_aux_loss_coef() const { return mMoEAuxLossCoef; }
+    [[nodiscard]] int moe_num_experts() const {
+        return mNumMoEExperts;
+    }
+    [[nodiscard]] float moe_aux_loss_coef() const {
+        return mMoEAuxLossCoef;
+    }
 
 private:
     void allocate_non_block_state(const PretrainedConfig& cfg);
@@ -232,8 +314,8 @@ private:
     int mActGradZeroCount = 0;
 
     // Shared gradient buffers (when recompute_block=true)
-    std::array<Tensor, 2> mSharedDResFFN{};  ///< Alternating buffers for d_res_ffn
-    std::array<Tensor, 2> mSharedDMlpDown{}; ///< Alternating buffers for d_mlp_down
+    std::array<Tensor, 2> mSharedDResFFN{};   ///< Alternating buffers for d_res_ffn
+    std::array<Tensor, 2> mSharedDMlpDown{};  ///< Alternating buffers for d_mlp_down
     Tensor mSharedDResAtt{};
     Tensor mSharedDAttOut{};
     Tensor mSharedDLn2{};
@@ -255,7 +337,7 @@ private:
     // CUDA resources
     cudaStream_t mSideStream = nullptr;
     cudaEvent_t mSideStreamEvent = nullptr;
-    cudaEvent_t mAllReduceDone = nullptr;  ///< Recorded after async all-reduce completes
+    cudaEvent_t mAllReduceDone = nullptr;    ///< Recorded after async all-reduce completes
     cublasHandle_t mCublasHandle = nullptr;  ///< cuBLAS handle for MoE grouped GEMM
 
     // Per-layer CUDA graph support
@@ -283,12 +365,12 @@ private:
     // MoE routing stats accumulation buffer (GPU)
     // Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
     static constexpr int kMoEStatsSize = 5;
-    float* mMoEStatsDevice = nullptr;   ///< Device buffer for kernel accumulation
-    float* mMoEStatsHost = nullptr;     ///< Pinned host buffer for readback
-    int mNumMoEExperts = 0;             ///< 0 = not MoE
+    float* mMoEStatsDevice = nullptr;  ///< Device buffer for kernel accumulation
+    float* mMoEStatsHost = nullptr;    ///< Pinned host buffer for readback
+    int mNumMoEExperts = 0;            ///< 0 = not MoE
     float mMoEAuxLossCoef = 0.01f;     ///< Auxiliary loss coefficient
 };
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_DSL_RUN_STATE_H
+#endif  // SUROGATE_SRC_DSL_DSL_RUN_STATE_H

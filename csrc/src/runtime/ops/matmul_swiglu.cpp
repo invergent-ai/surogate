@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -34,8 +35,8 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
     bool used_recipe = false;
     modules::MatmulContext ctx{};
     modules::MatmulContext* ctx_ptr = nullptr;
-    if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT &&
-        op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
+    if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT && op.attrs.allow_quant &&
+        op.attrs.matmul_op.has_value()) {
         ctx.out = &up_out;
         ctx.inp = &a;
         ctx.weight = &b;
@@ -59,13 +60,12 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
             // the LN2 output into the FP8 buffer.
             DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
             switch (*op.attrs.matmul_op) {
-                case modules::MatmulOp::QKV:     ready_flag = DslRunState::FP8Ready_LN1; break;
-                case modules::MatmulOp::MLPUp:   ready_flag = DslRunState::FP8Ready_LN2; break;
+                case modules::MatmulOp::QKV: ready_flag = DslRunState::FP8Ready_LN1; break;
+                case modules::MatmulOp::MLPUp: ready_flag = DslRunState::FP8Ready_LN2; break;
                 case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
                 default: break;
             }
-            if (ready_flag != DslRunState::FP8Ready_None &&
-                mRunState.consume_fp8_buffer_ready(ready_flag)) {
+            if (ready_flag != DslRunState::FP8Ready_None && mRunState.consume_fp8_buffer_ready(ready_flag)) {
                 ctx.inp_quant_ready = true;
             }
 
@@ -80,8 +80,8 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
         }
         if (ctx.allow_fp4 && mFP4Cache) {
             auto it = mFP4Cache->find(weight_name);
-            if (it != mFP4Cache->end() && it->second.initialized &&
-                it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+            if (it != mFP4Cache->end() && it->second.initialized && it->second.data.Data && it->second.scales.Data &&
+                it->second.amax.Data) {
                 ctx.cached_fp4_data = &it->second.data;
                 ctx.cached_fp4_scales = &it->second.scales;
                 ctx.cached_fp4_amax = it->second.amax.get<float>();
@@ -94,9 +94,20 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
     }
 
     if (!used_recipe) {
-        matmul(up_out, b, a, std::nullopt, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               N, M, K, swap_transpose(op.attrs.transpose), false, mRunState.MainStream);
+        matmul(up_out,
+               b,
+               a,
+               std::nullopt,
+               nullptr,
+               nullptr,
+               mRunState.CublasLtHandle,
+               mRunState.CuBlasWorkspace,
+               N,
+               M,
+               K,
+               swap_transpose(op.attrs.transpose),
+               false,
+               mRunState.MainStream);
     }
 
     // Hook invocation (AfterMLPUpProjection should observe the projection output before activation).
@@ -113,20 +124,29 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
 
     Tensor up_3d = view_tensor(up_out, {mB, mT, static_cast<long>(N)});
     Tensor out_3d = view_tensor(out, {mB, mT, D});
-    swiglu_forward(out_3d, up_3d, nullptr, static_cast<int>(mB),
-                   static_cast<int>(mT), static_cast<int>(D), mRunState.MainStream);
+    swiglu_forward(out_3d,
+                   up_3d,
+                   nullptr,
+                   static_cast<int>(mB),
+                   static_cast<int>(mT),
+                   static_cast<int>(D),
+                   mRunState.MainStream);
 
     // Pre-quantize swiglu output into FP8 buffer for the downstream MLPDown matmul.
     // This co-locates quantization with the data producer (better L2 locality)
     // and allows the matmul recipe to skip its own quantization pass.
-    if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() &&
-        !mRunState.has_fp8_delayed_scaling()) {
+    if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() && !mRunState.has_fp8_delayed_scaling()) {
         auto& fp8_buf = mRunState.fp8_forward_quants().swiglu;
         if (fp8_buf.Data && fp8_buf.abs_max() && fp8_buf.scale()) {
             const long num_elements = mB * mT * D;
             Tensor swiglu_flat = view_tensor(out_3d, {mB * mT, D});
-            quantize_with_abs_max(fp8_buf, fp8_buf.scale(), swiglu_flat, fp8_buf.abs_max(),
-                                  num_elements, mRunState.DeviceProp, mRunState.MainStream);
+            quantize_with_abs_max(fp8_buf,
+                                  fp8_buf.scale(),
+                                  swiglu_flat,
+                                  fp8_buf.abs_max(),
+                                  num_elements,
+                                  mRunState.DeviceProp,
+                                  mRunState.MainStream);
             mRunState.set_fp8_buffer_ready(DslRunState::FP8Ready_SwiGLU);
         }
     }
@@ -161,7 +181,7 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     const int layer_idx = op.attrs.layer_idx;
     const bool allow_quant = op.attrs.allow_quant;
     const std::string& weight_name = op.inputs.size() > 2 ? op.inputs[2].name : "";
-    
+
     // Recompute mlp_up if the saved tensor was stack-allocated and freed
     bool recomputed_mlp_up = false;
     if (!mlp_up.Data || (mRunState.Stack.owns(mlp_up.Data) && !mRunState.Stack.is_live(mlp_up.Data))) {
@@ -173,9 +193,20 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         mTemps.push_back(mlp_up_flat);
 
         EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
-        matmul(mlp_up_flat, weight, inp_flat, std::nullopt, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               N, M, K, mode_col, false, mRunState.MainStream);
+        matmul(mlp_up_flat,
+               weight,
+               inp_flat,
+               std::nullopt,
+               nullptr,
+               nullptr,
+               mRunState.CublasLtHandle,
+               mRunState.CuBlasWorkspace,
+               N,
+               M,
+               K,
+               mode_col,
+               false,
+               mRunState.MainStream);
 
         mlp_up = view_tensor(mlp_up_flat, {mB, mT, D2});
         if (layer_idx >= 0) {
@@ -196,22 +227,27 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         }
     }
     Tensor d_mlp_up = d_mlp_up_ptr ? *d_mlp_up_ptr
-                                   : mRunState.temp_alloc(mlp_up.DType, {mlp_up.Sizes[0], mlp_up.Sizes[1], mlp_up.Sizes[2]}, "matmul_swiglu_backward_d_mlp_up");
+                                   : mRunState.temp_alloc(mlp_up.DType,
+                                                          {mlp_up.Sizes[0], mlp_up.Sizes[1], mlp_up.Sizes[2]},
+                                                          "matmul_swiglu_backward_d_mlp_up");
     if (!d_mlp_up_ptr) {
         mTemps.push_back(d_mlp_up);
     }
 
     // For FP8 hybrid backward, record abs_max of d_mlp_up for subsequent quantization
-    float* abs_max_ptr = mRunState.has_fp8_hybrid_backward()
-        ? mRunState.simplified_quant_grads().d_mlp_up.abs_max()
-        : nullptr;
+    float* abs_max_ptr =
+        mRunState.has_fp8_hybrid_backward() ? mRunState.simplified_quant_grads().d_mlp_up.abs_max() : nullptr;
 
     const long D = d_out.Sizes[2];
-    swiglu_backward(d_mlp_up, d_out, mlp_up, abs_max_ptr,
+    swiglu_backward(d_mlp_up,
+                    d_out,
+                    mlp_up,
+                    abs_max_ptr,
                     static_cast<int>(d_out.Sizes[0]),
                     static_cast<int>(d_out.Sizes[1]),
-                    static_cast<int>(D), mRunState.MainStream);
-                    
+                    static_cast<int>(D),
+                    mRunState.MainStream);
+
     // Then: matmul backward
     Tensor d_mlp_up_flat = view_tensor(d_mlp_up, {mB * mT, 2 * D});
 
@@ -252,8 +288,8 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     }
 
     bool used_recipe = false;
-    if (mRecipe && op.attrs.transpose == EMMTranspose::NT && d_mlp_up_flat.Sizes[0] == mB * mT &&
-        allow_quant && op.attrs.matmul_op.has_value()) {
+    if (mRecipe && op.attrs.transpose == EMMTranspose::NT && d_mlp_up_flat.Sizes[0] == mB * mT && allow_quant &&
+        op.attrs.matmul_op.has_value()) {
         Tensor inp_flat = (inp.Rank == 2) ? inp : view_tensor(inp, {mB * mT, inp.Sizes[inp.Rank - 1]});
 
         Tensor dA_tmp{};
@@ -262,12 +298,15 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         Tensor* dB_use = d_weight_ptr;
 
         if (!dA_use) {
-            dA_tmp = mRunState.temp_alloc(inp.DType, {inp_flat.Sizes[0], inp_flat.Sizes[1]}, "matmul_swiglu_backward_dA_tmp");
+            dA_tmp = mRunState.temp_alloc(inp.DType,
+                                          {inp_flat.Sizes[0], inp_flat.Sizes[1]},
+                                          "matmul_swiglu_backward_dA_tmp");
             mTemps.push_back(dA_tmp);
             dA_use = &dA_tmp;
         }
         if (!dB_use && !skip_weight_grad) {
-            dB_tmp = mRunState.temp_alloc(weight.DType, {weight.Sizes[0], weight.Sizes[1]}, "matmul_swiglu_backward_dB_tmp");
+            dB_tmp =
+                mRunState.temp_alloc(weight.DType, {weight.Sizes[0], weight.Sizes[1]}, "matmul_swiglu_backward_dB_tmp");
             mTemps.push_back(dB_tmp);
             dB_use = &dB_tmp;
         }
@@ -312,8 +351,8 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
             auto* cache = is_quartet ? mFP4Cache : mFP4CacheT;
             if (cache) {
                 auto it = cache->find(weight_name);
-                if (it != cache->end() && it->second.initialized &&
-                    it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                if (it != cache->end() && it->second.initialized && it->second.data.Data && it->second.scales.Data &&
+                    it->second.amax.Data) {
                     ctx.cached_fp4_data = &it->second.data;
                     ctx.cached_fp4_scales = &it->second.scales;
                     ctx.cached_fp4_amax = it->second.amax.get<float>();
@@ -329,26 +368,29 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         if (d_inp_ptr) {
             EMMTranspose mode_dA = EMMTranspose::NN;
             switch (op.attrs.transpose) {
-                case EMMTranspose::NN:
-                    mode_dA = EMMTranspose::NT;
-                    break;
-                case EMMTranspose::NT:
-                    mode_dA = EMMTranspose::NN;
-                    break;
-                case EMMTranspose::TN:
-                    mode_dA = EMMTranspose::NT;
-                    break;
-                case EMMTranspose::TT:
-                    mode_dA = EMMTranspose::TT;
-                    break;
+                case EMMTranspose::NN: mode_dA = EMMTranspose::NT; break;
+                case EMMTranspose::NT: mode_dA = EMMTranspose::NN; break;
+                case EMMTranspose::TN: mode_dA = EMMTranspose::NT; break;
+                case EMMTranspose::TT: mode_dA = EMMTranspose::TT; break;
             }
 
             int M = 0, N = 0, K = 0;
             matmul_dims(d_mlp_up_flat, weight, mode_dA, M, N, K);
             EMMTranspose mode_col = swap_transpose(mode_dA);
-            matmul(*d_inp_ptr, weight, d_mlp_up_flat, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   N, M, K, mode_col, false, mRunState.MainStream);
+            matmul(*d_inp_ptr,
+                   weight,
+                   d_mlp_up_flat,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   mode_col,
+                   false,
+                   mRunState.MainStream);
         }
         if (d_weight_ptr && !skip_weight_grad) {
             Tensor inp_flat = (inp.Rank == 2) ? inp : view_tensor(inp, {mB * mT, inp.Sizes[inp.Rank - 1]});
@@ -382,9 +424,20 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
             int M = 0, N = 0, K = 0;
             matmul_dims(*lhs, *rhs, mode_rm, M, N, K);
             EMMTranspose mode_col = swap_transpose(mode_rm);
-            matmul(*d_weight_ptr, *rhs, *lhs, std::nullopt, nullptr, nullptr,
-                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-                   N, M, K, mode_col, do_accumulate, mRunState.MainStream);
+            matmul(*d_weight_ptr,
+                   *rhs,
+                   *lhs,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   mode_col,
+                   do_accumulate,
+                   mRunState.MainStream);
         }
     }
 
@@ -401,4 +454,122 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     }
 }
 
+}  // namespace dsl
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// MatmulSwiGLU
+// ------------------------------------------------------------------------
+const int _matmul_swiglu_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "matmul_swiglu";
+    sig.min_inputs = 2;
+    sig.max_inputs = 2;
+    sig.min_outputs = 2;
+    sig.max_outputs = 2;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& a = inputs[0];
+        const auto& b = inputs[1];
+        const auto& out = outputs[0];
+        const auto& up_out = outputs[1];
+
+        // Check matmul dims
+        if (auto err = validators::check_matmul_dims(a, b, up_out, attrs)) {
+            return err;
+        }
+
+        // up_out should have N=2*D where out has N=D
+        if (!up_out.empty() && !out.empty()) {
+            long up_N = up_out.back();
+            long out_N = out.back();
+            if (up_N != 2 * out_N) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "matmul_swiglu: up_out last dim (" << up_N << ") must be 2x out last dim (" << out_N << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+        }
+
+        // Check batch dimensions match
+        if (a.size() > 2 && out.size() > 2) {
+            for (size_t i = 0; i < a.size() - 2 && i < out.size() - 2; ++i) {
+                if (a[i] != out[i]) {
+                    ShapeValidationError err;
+                    std::ostringstream oss;
+                    oss << "matmul_swiglu: batch dim mismatch at [" << i << "]: " << a[i] << " != " << out[i];
+                    err.message = oss.str();
+                    return std::make_optional(err);
+                }
+            }
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// MatmulSwiGLUBackward
+// ------------------------------------------------------------------------
+const int _matmul_swiglu_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "matmul_swiglu_backward";
+    sig.min_inputs = 3;
+    sig.max_inputs = 4;
+    sig.min_outputs = 2;
+    sig.max_outputs = 2;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& d_out = inputs[0];
+        const auto& ln2 = inputs[1];
+        const auto& weight = inputs[2];
+        const auto& mlp_up = inputs[3];
+        const auto& d_inp = outputs[0];
+        const auto& d_weight = outputs[1];
+
+        // Check mlp_up last dim is 2x d_out last dim
+        if (!mlp_up.empty() && !d_out.empty()) {
+            long mlp_up_dim = mlp_up.back();
+            long d_out_dim = d_out.back();
+            if (mlp_up_dim != 2 * d_out_dim) {
+                ShapeValidationError err;
+                std::ostringstream oss;
+                oss << "matmul_swiglu_backward: mlp_up last dim (" << mlp_up_dim << ") must be 2x d_out last dim ("
+                    << d_out_dim << ")";
+                err.message = oss.str();
+                return std::make_optional(err);
+            }
+        }
+
+        // d_inp should match ln2 (activation input)
+        if (auto err = validators::check_same_numel(d_inp, ln2, "d_inp", "ln2", "matmul_swiglu_backward")) {
+            return err;
+        }
+
+        // d_weight should match weight shape
+        if (auto err = validators::check_same_numel(d_weight, weight, "d_weight", "weight", "matmul_swiglu_backward")) {
+            return err;
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

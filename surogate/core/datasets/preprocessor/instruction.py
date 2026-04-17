@@ -1,10 +1,10 @@
-from typing import Dict, Any, Optional, List
+from typing import Any
 
 from surogate.core.config.dataset_config import InstructionDatasetConfig
 from surogate.core.config.enums import InstructionDatasetSystemPromptType
 from surogate.core.datasets.preprocessor.row import RowPreprocessor
-from surogate.utils.messages import history_to_messages
 from surogate.utils.logger import get_logger
+from surogate.utils.messages import history_to_messages
 
 logger = get_logger()
 
@@ -21,18 +21,14 @@ class InstructionPreprocessor(RowPreprocessor):
         self.turn_format = dataset_config.prompt_format or self.default_prompt_format
         self.turn_no_input_format = dataset_config.prompt_format_no_input or self.default_prompt_no_input_format
 
-    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def preprocess(self, row: dict[str, Any]) -> dict[str, Any] | None:
         instruction = row.get(self.ds_cfg.instruction_field, None)
         if instruction is None:
-            raise ValueError(
-                f"Instruction field '{self.ds_cfg.instruction_field}' is missing from the dataset."
-            )
+            raise ValueError(f"Instruction field '{self.ds_cfg.instruction_field}' is missing from the dataset.")
         input = row.get(self.ds_cfg.input_field, None)
         output = row.get(self.ds_cfg.output_field, None)
         if output is None:
-            raise ValueError(
-                f"Output field '{self.ds_cfg.output_field}' is missing from the dataset."
-            )
+            raise ValueError(f"Output field '{self.ds_cfg.output_field}' is missing from the dataset.")
 
         if self.ds_cfg.system_prompt_type == InstructionDatasetSystemPromptType.field:
             system_prompt = row.get(self.ds_cfg.system_prompt_field, None)
@@ -45,10 +41,10 @@ class InstructionPreprocessor(RowPreprocessor):
             query = self.turn_no_input_format.format(instruction=instruction)
 
         history = [query, output]
-        row.update({'messages': history_to_messages([history], system_prompt)})
+        row.update({"messages": history_to_messages([history], system_prompt)})
         return row
 
-    def preprocess_batch(self, rows: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
+    def preprocess_batch(self, rows: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
         """Process a batch of instruction dataset rows efficiently.
 
         1. Batches field extraction operations
@@ -73,16 +69,12 @@ class InstructionPreprocessor(RowPreprocessor):
         for row in rows:
             instruction = row.get(self.ds_cfg.instruction_field)
             if instruction is None:
-                raise ValueError(
-                    f"Instruction field '{self.ds_cfg.instruction_field}' is missing from the dataset."
-                )
+                raise ValueError(f"Instruction field '{self.ds_cfg.instruction_field}' is missing from the dataset.")
 
             input_val = row.get(self.ds_cfg.input_field)
             output = row.get(self.ds_cfg.output_field)
             if output is None:
-                raise ValueError(
-                    f"Output field '{self.ds_cfg.output_field}' is missing from the dataset."
-                )
+                raise ValueError(f"Output field '{self.ds_cfg.output_field}' is missing from the dataset.")
 
             if self.ds_cfg.system_prompt_type == InstructionDatasetSystemPromptType.field:
                 system_prompt = row.get(self.ds_cfg.system_prompt_field)
@@ -95,11 +87,7 @@ class InstructionPreprocessor(RowPreprocessor):
             system_prompts.append(system_prompt)
 
             # Collect remaining fields (excluding extracted ones)
-            extracted_fields = {
-                self.ds_cfg.instruction_field,
-                self.ds_cfg.input_field,
-                self.ds_cfg.output_field
-            }
+            extracted_fields = {self.ds_cfg.instruction_field, self.ds_cfg.input_field, self.ds_cfg.output_field}
             if self.ds_cfg.system_prompt_type == InstructionDatasetSystemPromptType.field:
                 extracted_fields.add(self.ds_cfg.system_prompt_field)
 
@@ -118,7 +106,7 @@ class InstructionPreprocessor(RowPreprocessor):
         # Batch create messages
         for query, output, system_prompt, remaining in zip(queries, outputs, system_prompts, remaining_fields):
             history = [query, output]
-            result = {'messages': history_to_messages([history], system_prompt)}
+            result = {"messages": history_to_messages([history], system_prompt)}
             result.update(remaining)
             results.append(result)
 

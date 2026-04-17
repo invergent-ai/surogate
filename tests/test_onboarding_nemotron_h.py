@@ -53,8 +53,8 @@ BATCH = 1
 SEQ_LEN = 16
 # Nemotron-H has MoE blocks; MoE routing introduces extra numerical variation,
 # and RMSNorm amplifies small residual-stream differences.
-RMS_TOL = 5e-2           # per-layer residual tolerance
-FINAL_NORM_TOL = 2e-1    # post-norm tolerance (RMSNorm amplifies diffs)
+RMS_TOL = 5e-2  # per-layer residual tolerance
+FINAL_NORM_TOL = 2e-1  # post-norm tolerance (RMSNorm amplifies diffs)
 
 MINI_MODEL_DIR = Path("tmp/onboarding_nemotron_h_mini")
 DUMP_DIR = Path("tmp/onboarding_nemotron_h_dumps")
@@ -77,6 +77,7 @@ def residual_name_for_block_type(block_type: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_model_path() -> Path:
     """Resolve the path to Nemotron-H weights."""
@@ -115,9 +116,7 @@ def prepare_mini_model(snapshot_dir: Path) -> Path:
     if pattern is not None:
         config["hybrid_override_pattern"] = pattern[:NUM_LAYERS]
 
-    (MINI_MODEL_DIR / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n"
-    )
+    (MINI_MODEL_DIR / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     # Copy custom modeling code (Nemotron-H requires trust_remote_code)
     for code_file in snapshot_dir.glob("*.py"):
@@ -180,14 +179,14 @@ def load_dump(name: str) -> np.ndarray:
     return data.reshape(shape)
 
 
-def diff_stats(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+def diff_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     diff = a.astype(np.float32) - b.astype(np.float32)
     rms = float(np.sqrt(np.mean(diff * diff)))
     max_abs = float(np.max(np.abs(diff)))
     return rms, max_abs
 
 
-def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
+def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     inputs = rng.integers(0, vocab_size, size=(BATCH, SEQ_LEN), dtype=np.int32)
     targets = inputs.copy()
@@ -200,7 +199,8 @@ def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
 # HuggingFace forward — uses hooks for reliable per-layer capture
 # ---------------------------------------------------------------------------
 
-def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]:
+
+def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]:
     """Run HF forward and capture per-layer block inputs via hooks.
 
     Captures per-layer block inputs (= residual stream) via pre-hooks on
@@ -218,9 +218,9 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     )
     model.eval()
 
-    result: Dict[str, np.ndarray] = {}
-    layer_inputs: Dict[int, torch.Tensor] = {}
-    layer_outputs: Dict[int, torch.Tensor] = {}
+    result: dict[str, np.ndarray] = {}
+    layer_inputs: dict[int, torch.Tensor] = {}
+    layer_outputs: dict[int, torch.Tensor] = {}
     hooks = []
 
     for i in range(NUM_LAYERS):
@@ -229,7 +229,9 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
                 layer_inputs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(model.backbone.layers[i].register_forward_pre_hook(make_pre_hook(i)))
 
         # Post-hook: captures block output
@@ -237,7 +239,9 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
             def hook_fn(module, args, output):
                 hs = output if isinstance(output, torch.Tensor) else output[0]
                 layer_outputs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(model.backbone.layers[i].register_forward_hook(make_post_hook(i)))
 
     with torch.no_grad():
@@ -271,8 +275,8 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
 # Surogate forward
 # ---------------------------------------------------------------------------
 
-def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
-                         targets: np.ndarray, block_types: List[str]) -> None:
+
+def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarray, block_types: list[str]) -> None:
     """Run Surogate forward pass and dump tensors to DUMP_DIR."""
     DUMP_DIR.mkdir(parents=True, exist_ok=True)
     for p in DUMP_DIR.glob("*"):
@@ -319,6 +323,7 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def model_dir():
     snapshot = resolve_model_path()
@@ -350,6 +355,7 @@ def forward_results(model_dir, block_types):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestNemotronHOnboarding:
     """Per-layer forward comparison: Surogate vs HuggingFace."""
@@ -408,9 +414,7 @@ class TestNemotronHOnboarding:
             pytest.skip("residual_final dump not available")
 
         rms, max_abs = diff_stats(rt_residual_final, hf["pre_norm"])
-        assert rms < RMS_TOL, (
-            f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-        )
+        assert rms < RMS_TOL, f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_summary(self, forward_results, block_types, model_dir):
         """Print a summary table of all comparisons (informational)."""
@@ -418,7 +422,7 @@ class TestNemotronHOnboarding:
         config = json.loads((model_dir / "config.json").read_text())
         pattern = config.get("hybrid_override_pattern", "")
 
-        rows: List[Tuple[str, str, float, float]] = []
+        rows: list[tuple[str, str, float, float]] = []
 
         for i in range(NUM_LAYERS - 1):
             btype = block_types[i]

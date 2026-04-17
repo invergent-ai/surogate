@@ -38,11 +38,17 @@ struct DslRuntimeConfig {
     /// kv_source for shared-KV attention.
     std::unordered_set<int> kv_source_layers;
 
-    [[nodiscard]] bool is_moe() const { return num_experts > 0; }
-    [[nodiscard]] bool has_per_layer_dims() const { return !per_layer_dims.empty(); }
-    [[nodiscard]] bool is_kv_source(int layer_idx) const { return kv_source_layers.count(layer_idx) > 0; }
+    [[nodiscard]] bool is_moe() const {
+        return num_experts > 0;
+    }
+    [[nodiscard]] bool has_per_layer_dims() const {
+        return !per_layer_dims.empty();
+    }
+    [[nodiscard]] bool is_kv_source(int layer_idx) const {
+        return kv_source_layers.count(layer_idx) > 0;
+    }
 };
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
+#endif  // SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H

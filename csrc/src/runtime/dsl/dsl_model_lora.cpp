@@ -36,7 +36,9 @@ namespace dsl {
 
 // LoRA adapter export/import
 
-void DslModel::export_adapter(const std::string& directory, NCCLCommunicator& comm, const std::string& base_model_path) {
+void DslModel::export_adapter(const std::string& directory,
+                              NCCLCommunicator& comm,
+                              const std::string& base_model_path) {
     if (!lora_enabled()) return;
     namespace fs = std::filesystem;
     fs::path dir(directory);
@@ -142,10 +144,18 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
         state.num_tensors = opt_meta["num_tensors"].get<int>();
 
         if (!state.state1.Data) {
-            state.state1 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state1", {static_cast<long>(state.total_params)});
-            state.state2 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state2", {static_cast<long>(state.total_params)});
-            state.scales1 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales1", {static_cast<long>(state.num_groups)});
-            state.scales2 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales2", {static_cast<long>(state.num_groups)});
+            state.state1 = mAllocator->allocate(ETensorDType::BYTE,
+                                                "lora_adamw8bit_state1",
+                                                {static_cast<long>(state.total_params)});
+            state.state2 = mAllocator->allocate(ETensorDType::BYTE,
+                                                "lora_adamw8bit_state2",
+                                                {static_cast<long>(state.total_params)});
+            state.scales1 = mAllocator->allocate(ETensorDType::FP16,
+                                                 "lora_adamw8bit_scales1",
+                                                 {static_cast<long>(state.num_groups)});
+            state.scales2 = mAllocator->allocate(ETensorDType::FP16,
+                                                 "lora_adamw8bit_scales2",
+                                                 {static_cast<long>(state.num_groups)});
         }
 
         internal::LoRAAdamW8BitStateContainer container(&state);
@@ -170,16 +180,22 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
             state.momentum_quantiles = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_quantiles", {256});
             std::vector<float> h_quantiles(256);
             optimizers::create_normuon_quantiles(h_quantiles.data());
-            CUDA_CHECK(cudaMemcpy(state.momentum_quantiles.Data, h_quantiles.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(state.momentum_quantiles.Data,
+                                  h_quantiles.data(),
+                                  256 * sizeof(float),
+                                  cudaMemcpyHostToDevice));
 
-            state.momentum_state = mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_state", {static_cast<long>(state.state_elems)});
-            state.momentum_absmax = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax", {static_cast<long>(state.num_blocks)});
+            state.momentum_state =
+                mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_state", {static_cast<long>(state.state_elems)});
+            state.momentum_absmax =
+                mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax", {static_cast<long>(state.num_blocks)});
 
             state.variance_buffers.clear();
             for (size_t i = 0; i < state.variance_shapes.size(); ++i) {
                 const auto& shape = state.variance_shapes[i];
-                state.variance_buffers.push_back(
-                    mAllocator->allocate(ETensorDType::FP32, fmt::format("lora_normuon_var_{}", i).c_str(), {shape.first, shape.second}));
+                state.variance_buffers.push_back(mAllocator->allocate(ETensorDType::FP32,
+                                                                      fmt::format("lora_normuon_var_{}", i).c_str(),
+                                                                      {shape.first, shape.second}));
             }
         }
 
@@ -208,53 +224,58 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
     const int qkv_features = std::max(0, mModelConfig.qkv_channels());
     int max_features = std::max({mModelConfig.HiddenSize, mModelConfig.IntermediateSize, qkv_features});
     if (mModelConfig.moe_config.has_value() && mModelConfig.moe_config->use_shared_expert) {
-        const int shared_D = mModelConfig.moe_config->shared_expert_size > 0
-                                 ? mModelConfig.moe_config->shared_expert_size
-                                 : (mModelConfig.moe_config->moe_intermediate_size > 0
-                                        ? mModelConfig.moe_config->moe_intermediate_size
-                                        : mModelConfig.IntermediateSize);
+        const int shared_D =
+            mModelConfig.moe_config->shared_expert_size > 0
+                ? mModelConfig.moe_config->shared_expert_size
+                : (mModelConfig.moe_config->moe_intermediate_size > 0 ? mModelConfig.moe_config->moe_intermediate_size
+                                                                      : mModelConfig.IntermediateSize);
         max_features = std::max(max_features, shared_D);
     }
     const ETensorDType work_dtype = mModelConfig.DType;
 
-    mLoRARunState->intermediate = mAllocator->allocate(
-        work_dtype, "lora_intermediate", EAllocationType::ON_DEVICE, {BT, rank});
-    mLoRARunState->intermediate2 = mAllocator->allocate(
-        work_dtype, "lora_intermediate2", EAllocationType::ON_DEVICE, {BT, rank});
-    mLoRARunState->slice = mAllocator->allocate(
-        work_dtype, "lora_slice", EAllocationType::ON_DEVICE, {BT, max_features});
+    mLoRARunState->intermediate =
+        mAllocator->allocate(work_dtype, "lora_intermediate", EAllocationType::ON_DEVICE, {BT, rank});
+    mLoRARunState->intermediate2 =
+        mAllocator->allocate(work_dtype, "lora_intermediate2", EAllocationType::ON_DEVICE, {BT, rank});
+    mLoRARunState->slice =
+        mAllocator->allocate(work_dtype, "lora_slice", EAllocationType::ON_DEVICE, {BT, max_features});
 
     auto& rs = *mRunState;
     const long num_block_sums = std::max<long>(2, static_cast<long>(get_max_num_block_sums(rs.DeviceProp)));
     // +4: [0..N-1] block sums, [N] norm, [N+1] scale, [N+2] amax, [N+3] prescale
-    mLoRARunState->norm_buffer = mAllocator->allocate(
-        ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 4});
+    mLoRARunState->norm_buffer =
+        mAllocator->allocate(ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 4});
 
     if (mOptions.recompute_enabled()) {
         const int C = mModelConfig.HiddenSize;
-        mLoRARunState->recompute_ln = mAllocator->allocate(
-            work_dtype, "lora_recompute_ln", EAllocationType::ON_DEVICE, {B, T, C});
-        mLoRARunState->recompute_rstd = mAllocator->allocate(
-            ETensorDType::FP32, "lora_recompute_rstd", EAllocationType::ON_DEVICE, {B, T});
+        mLoRARunState->recompute_ln =
+            mAllocator->allocate(work_dtype, "lora_recompute_ln", EAllocationType::ON_DEVICE, {B, T, C});
+        mLoRARunState->recompute_rstd =
+            mAllocator->allocate(ETensorDType::FP32, "lora_recompute_rstd", EAllocationType::ON_DEVICE, {B, T});
     }
 
     if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
         const auto& moe_cfg = *mModelConfig.moe_config;
         const int top_k = moe_cfg.top_k;
         const int total_tokens = BT * top_k;
-        const int expert_D = moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : mModelConfig.IntermediateSize;
+        const int expert_D =
+            moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : mModelConfig.IntermediateSize;
         const int moe_M = (is_gated_activation(mModelConfig.activation_type) ? 2 : 1) * expert_D;
 
-        mLoRARunState->moe_lora_intermediate1 = mAllocator->allocate(
-            work_dtype, "moe_lora_intermediate1", EAllocationType::ON_DEVICE, {total_tokens, rank});
-        mLoRARunState->moe_lora_intermediate2 = mAllocator->allocate(
-            work_dtype, "moe_lora_intermediate2", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
-        mLoRARunState->moe_lora_gate = mAllocator->allocate(
-            work_dtype, "moe_lora_gate", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
-        mLoRARunState->moe_lora_up = mAllocator->allocate(
-            work_dtype, "moe_lora_up", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
-        mLoRARunState->moe_lora_gate_up = mAllocator->allocate(
-            work_dtype, "moe_lora_gate_up", EAllocationType::ON_DEVICE, {total_tokens, moe_M});
+        mLoRARunState->moe_lora_intermediate1 = mAllocator->allocate(work_dtype,
+                                                                     "moe_lora_intermediate1",
+                                                                     EAllocationType::ON_DEVICE,
+                                                                     {total_tokens, rank});
+        mLoRARunState->moe_lora_intermediate2 = mAllocator->allocate(work_dtype,
+                                                                     "moe_lora_intermediate2",
+                                                                     EAllocationType::ON_DEVICE,
+                                                                     {total_tokens, expert_D});
+        mLoRARunState->moe_lora_gate =
+            mAllocator->allocate(work_dtype, "moe_lora_gate", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
+        mLoRARunState->moe_lora_up =
+            mAllocator->allocate(work_dtype, "moe_lora_up", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
+        mLoRARunState->moe_lora_gate_up =
+            mAllocator->allocate(work_dtype, "moe_lora_gate_up", EAllocationType::ON_DEVICE, {total_tokens, moe_M});
     }
 }
 
@@ -334,19 +355,34 @@ void DslModel::populate_lora_norm_pointers(NCCLCommunicator& comm, cudaStream_t 
         return;
     }
 
-    lrs.norm_data_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_norm_data_ptrs",
-        EAllocationType::ON_DEVICE, {(long)(lrs.norm_num_tensors * sizeof(void*))});
-    lrs.norm_sizes = mAllocator->allocate(ETensorDType::BYTE, "lora_norm_sizes",
-        EAllocationType::ON_DEVICE, {(long)(lrs.norm_num_tensors * sizeof(size_t))});
-    lrs.norm_dtype_flags = mAllocator->allocate(ETensorDType::INT32, "lora_norm_dtype_flags",
-        EAllocationType::ON_DEVICE, {(long)lrs.norm_num_tensors});
+    lrs.norm_data_ptrs = mAllocator->allocate(ETensorDType::BYTE,
+                                              "lora_norm_data_ptrs",
+                                              EAllocationType::ON_DEVICE,
+                                              {(long)(lrs.norm_num_tensors * sizeof(void*))});
+    lrs.norm_sizes = mAllocator->allocate(ETensorDType::BYTE,
+                                          "lora_norm_sizes",
+                                          EAllocationType::ON_DEVICE,
+                                          {(long)(lrs.norm_num_tensors * sizeof(size_t))});
+    lrs.norm_dtype_flags = mAllocator->allocate(ETensorDType::INT32,
+                                                "lora_norm_dtype_flags",
+                                                EAllocationType::ON_DEVICE,
+                                                {(long)lrs.norm_num_tensors});
 
-    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_data_ptrs.Data, h_data_ptrs.data(),
-        h_data_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_sizes.Data, h_sizes.data(),
-        h_sizes.size() * sizeof(size_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_dtype_flags.Data, h_dtype_flags.data(),
-        h_dtype_flags.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_data_ptrs.Data,
+                               h_data_ptrs.data(),
+                               h_data_ptrs.size() * sizeof(void*),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_sizes.Data,
+                               h_sizes.data(),
+                               h_sizes.size() * sizeof(size_t),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(lrs.norm_dtype_flags.Data,
+                               h_dtype_flags.data(),
+                               h_dtype_flags.size() * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               stream));
 
     lrs.norm_ptrs_initialized = true;
 }
@@ -380,28 +416,39 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     const auto* dtype_flags = lrs.norm_dtype_flags.template get<int>();
 
     // Pass 1: fused amax across all LoRA gradients (1 kernel)
-    global_amax_multi_tensor(amax_ptr, data_ptrs, sizes, dtype_flags,
-                              lrs.norm_num_tensors, rs.DeviceProp, stream);
+    global_amax_multi_tensor(amax_ptr, data_ptrs, sizes, dtype_flags, lrs.norm_num_tensors, rs.DeviceProp, stream);
 
     // Compute prescale = 1/amax on device (no host sync needed)
     compute_prescale(prescale_ptr, amax_ptr, stream);
 
     // Pass 2: fused prescaled norm² across all LoRA gradients (1 kernel)
-    global_norm_squared_prescaled_multi_tensor(buf.template get<float>(), data_ptrs, sizes, dtype_flags,
-                                               lrs.norm_num_tensors, prescale_ptr, rs.DeviceProp, stream);
+    global_norm_squared_prescaled_multi_tensor(buf.template get<float>(),
+                                               data_ptrs,
+                                               sizes,
+                                               dtype_flags,
+                                               lrs.norm_num_tensors,
+                                               prescale_ptr,
+                                               rs.DeviceProp,
+                                               stream);
 
     // Reduce partial block sums
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), num_block_sums, stream);
 
-    float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T)
-                       * static_cast<float>(std::max(1, rs.GradAccumSteps))
-                       * static_cast<float>(std::max(1, comm.world_size()));
+    float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T) *
+                         static_cast<float>(std::max(1, rs.GradAccumSteps)) *
+                         static_cast<float>(std::max(1, comm.world_size()));
 
     // Final: norm = amax * sqrt(prescaled_sum), with token scaling and clipping
     const bool capturing = internal::stream_is_capturing(stream);
     const int* token_count = mUseTokenScale ? rs.ValidTokenCount.template get<int>() : nullptr;
-    global_norm_sqrt_prescaled(buf.template get<float>(), capturing ? nullptr : rs.NormHost, grad_clip,
-                                token_count, total_tokens, amax_ptr, rs.DeviceProp, stream);
+    global_norm_sqrt_prescaled(buf.template get<float>(),
+                               capturing ? nullptr : rs.NormHost,
+                               grad_clip,
+                               token_count,
+                               total_tokens,
+                               amax_ptr,
+                               rs.DeviceProp,
+                               stream);
     internal::record_event_if_not_capturing(rs.NormDone, stream);
 }
 
@@ -429,32 +476,86 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
 
-        if (lora_w.attention.q.has_value()) { collect_tensor(lora_w.attention.q->A); collect_tensor(lora_w.attention.q->B); }
-        if (lora_w.attention.k.has_value()) { collect_tensor(lora_w.attention.k->A); collect_tensor(lora_w.attention.k->B); }
-        if (lora_w.attention.v.has_value()) { collect_tensor(lora_w.attention.v->A); collect_tensor(lora_w.attention.v->B); }
-        if (lora_w.attention.o.has_value()) { collect_tensor(lora_w.attention.o->A); collect_tensor(lora_w.attention.o->B); }
-        if (lora_w.mlp.gate.has_value()) { collect_tensor(lora_w.mlp.gate->A); collect_tensor(lora_w.mlp.gate->B); }
-        if (lora_w.mlp.gate_up.has_value()) { collect_tensor(lora_w.mlp.gate_up->A); collect_tensor(lora_w.mlp.gate_up->B); }
-        if (lora_w.mlp.up.has_value()) { collect_tensor(lora_w.mlp.up->A); collect_tensor(lora_w.mlp.up->B); }
-        if (lora_w.mlp.down.has_value()) { collect_tensor(lora_w.mlp.down->A); collect_tensor(lora_w.mlp.down->B); }
+        if (lora_w.attention.q.has_value()) {
+            collect_tensor(lora_w.attention.q->A);
+            collect_tensor(lora_w.attention.q->B);
+        }
+        if (lora_w.attention.k.has_value()) {
+            collect_tensor(lora_w.attention.k->A);
+            collect_tensor(lora_w.attention.k->B);
+        }
+        if (lora_w.attention.v.has_value()) {
+            collect_tensor(lora_w.attention.v->A);
+            collect_tensor(lora_w.attention.v->B);
+        }
+        if (lora_w.attention.o.has_value()) {
+            collect_tensor(lora_w.attention.o->A);
+            collect_tensor(lora_w.attention.o->B);
+        }
+        if (lora_w.mlp.gate.has_value()) {
+            collect_tensor(lora_w.mlp.gate->A);
+            collect_tensor(lora_w.mlp.gate->B);
+        }
+        if (lora_w.mlp.gate_up.has_value()) {
+            collect_tensor(lora_w.mlp.gate_up->A);
+            collect_tensor(lora_w.mlp.gate_up->B);
+        }
+        if (lora_w.mlp.up.has_value()) {
+            collect_tensor(lora_w.mlp.up->A);
+            collect_tensor(lora_w.mlp.up->B);
+        }
+        if (lora_w.mlp.down.has_value()) {
+            collect_tensor(lora_w.mlp.down->A);
+            collect_tensor(lora_w.mlp.down->B);
+        }
 
         if (lora_w.moe.use_grouped) {
-            if (lora_w.moe.grouped.gate.has_value()) { collect_tensor(lora_w.moe.grouped.gate->A); collect_tensor(lora_w.moe.grouped.gate->B); }
-            if (lora_w.moe.grouped.gate_up.has_value()) { collect_tensor(lora_w.moe.grouped.gate_up->A); collect_tensor(lora_w.moe.grouped.gate_up->B); }
-            if (lora_w.moe.grouped.up.has_value()) { collect_tensor(lora_w.moe.grouped.up->A); collect_tensor(lora_w.moe.grouped.up->B); }
-            if (lora_w.moe.grouped.down.has_value()) { collect_tensor(lora_w.moe.grouped.down->A); collect_tensor(lora_w.moe.grouped.down->B); }
+            if (lora_w.moe.grouped.gate.has_value()) {
+                collect_tensor(lora_w.moe.grouped.gate->A);
+                collect_tensor(lora_w.moe.grouped.gate->B);
+            }
+            if (lora_w.moe.grouped.gate_up.has_value()) {
+                collect_tensor(lora_w.moe.grouped.gate_up->A);
+                collect_tensor(lora_w.moe.grouped.gate_up->B);
+            }
+            if (lora_w.moe.grouped.up.has_value()) {
+                collect_tensor(lora_w.moe.grouped.up->A);
+                collect_tensor(lora_w.moe.grouped.up->B);
+            }
+            if (lora_w.moe.grouped.down.has_value()) {
+                collect_tensor(lora_w.moe.grouped.down->A);
+                collect_tensor(lora_w.moe.grouped.down->B);
+            }
         } else {
             for (auto& expert : lora_w.moe.experts) {
-                if (expert.gate.has_value()) { collect_tensor(expert.gate->A); collect_tensor(expert.gate->B); }
-                if (expert.gate_up.has_value()) { collect_tensor(expert.gate_up->A); collect_tensor(expert.gate_up->B); }
-                if (expert.up.has_value()) { collect_tensor(expert.up->A); collect_tensor(expert.up->B); }
-                if (expert.down.has_value()) { collect_tensor(expert.down->A); collect_tensor(expert.down->B); }
+                if (expert.gate.has_value()) {
+                    collect_tensor(expert.gate->A);
+                    collect_tensor(expert.gate->B);
+                }
+                if (expert.gate_up.has_value()) {
+                    collect_tensor(expert.gate_up->A);
+                    collect_tensor(expert.gate_up->B);
+                }
+                if (expert.up.has_value()) {
+                    collect_tensor(expert.up->A);
+                    collect_tensor(expert.up->B);
+                }
+                if (expert.down.has_value()) {
+                    collect_tensor(expert.down->A);
+                    collect_tensor(expert.down->B);
+                }
             }
         }
 
         if (lora_w.moe.shared.has_value()) {
-            if (lora_w.moe.shared->up.has_value()) { collect_tensor(lora_w.moe.shared->up->A); collect_tensor(lora_w.moe.shared->up->B); }
-            if (lora_w.moe.shared->down.has_value()) { collect_tensor(lora_w.moe.shared->down->A); collect_tensor(lora_w.moe.shared->down->B); }
+            if (lora_w.moe.shared->up.has_value()) {
+                collect_tensor(lora_w.moe.shared->up->A);
+                collect_tensor(lora_w.moe.shared->up->B);
+            }
+            if (lora_w.moe.shared->down.has_value()) {
+                collect_tensor(lora_w.moe.shared->down->A);
+                collect_tensor(lora_w.moe.shared->down->B);
+            }
         }
 
         if (lora_w.router.has_value() && lora_w.router->has_value()) {
@@ -467,33 +568,71 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
     state.total_params = total_params;
     state.num_groups = optimizers::flash_adamw8bit_num_scales(total_params);
 
-    state.param_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_mt_param_ptrs", EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
-    state.grad_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_mt_grad_ptrs", EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
-    state.tensor_sizes = mAllocator->allocate(ETensorDType::INT32, "lora_mt_sizes", EAllocationType::ON_DEVICE, {(long)state.num_tensors});
-    state.state_offsets = mAllocator->allocate(ETensorDType::INT32, "lora_mt_offsets", EAllocationType::ON_DEVICE, {(long)state.num_tensors});
+    state.param_ptrs = mAllocator->allocate(ETensorDType::BYTE,
+                                            "lora_mt_param_ptrs",
+                                            EAllocationType::ON_DEVICE,
+                                            {(long)(state.num_tensors * sizeof(void*))});
+    state.grad_ptrs = mAllocator->allocate(ETensorDType::BYTE,
+                                           "lora_mt_grad_ptrs",
+                                           EAllocationType::ON_DEVICE,
+                                           {(long)(state.num_tensors * sizeof(void*))});
+    state.tensor_sizes = mAllocator->allocate(ETensorDType::INT32,
+                                              "lora_mt_sizes",
+                                              EAllocationType::ON_DEVICE,
+                                              {(long)state.num_tensors});
+    state.state_offsets = mAllocator->allocate(ETensorDType::INT32,
+                                               "lora_mt_offsets",
+                                               EAllocationType::ON_DEVICE,
+                                               {(long)state.num_tensors});
 
-    CUDA_CHECK(cudaMemcpyAsync(state.param_ptrs.Data, h_param_ptrs.data(), h_param_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(state.tensor_sizes.Data, h_sizes.data(), h_sizes.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(state.state_offsets.Data, h_state_offsets.data(), h_state_offsets.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.param_ptrs.Data,
+                               h_param_ptrs.data(),
+                               h_param_ptrs.size() * sizeof(void*),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.tensor_sizes.Data,
+                               h_sizes.data(),
+                               h_sizes.size() * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.state_offsets.Data,
+                               h_state_offsets.data(),
+                               h_state_offsets.size() * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               stream));
 
     if (!state.state1.Data) {
-        state.state1 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state1", EAllocationType::ON_DEVICE, {(long)total_params});
-        state.state2 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state2", EAllocationType::ON_DEVICE, {(long)total_params});
-        state.scales1 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales1", EAllocationType::ON_DEVICE, {(long)state.num_groups});
-        state.scales2 = mAllocator->allocate(ETensorDType::FP16, "lora_adamw8bit_scales2", EAllocationType::ON_DEVICE, {(long)state.num_groups});
+        state.state1 = mAllocator->allocate(ETensorDType::BYTE,
+                                            "lora_adamw8bit_state1",
+                                            EAllocationType::ON_DEVICE,
+                                            {(long)total_params});
+        state.state2 = mAllocator->allocate(ETensorDType::BYTE,
+                                            "lora_adamw8bit_state2",
+                                            EAllocationType::ON_DEVICE,
+                                            {(long)total_params});
+        state.scales1 = mAllocator->allocate(ETensorDType::FP16,
+                                             "lora_adamw8bit_scales1",
+                                             EAllocationType::ON_DEVICE,
+                                             {(long)state.num_groups});
+        state.scales2 = mAllocator->allocate(ETensorDType::FP16,
+                                             "lora_adamw8bit_scales2",
+                                             EAllocationType::ON_DEVICE,
+                                             {(long)state.num_groups});
     }
 
     if (!state.values_restored) {
-        optimizers::init_flash_adamw8bit_state(
-            reinterpret_cast<signed char*>(state.state1.Data),
-            reinterpret_cast<unsigned char*>(state.state2.Data),
-            state.scales1.template get<half>(),
-            state.scales2.template get<half>(),
-            total_params, stream);
+        optimizers::init_flash_adamw8bit_state(reinterpret_cast<signed char*>(state.state1.Data),
+                                               reinterpret_cast<unsigned char*>(state.state2.Data),
+                                               state.scales1.template get<half>(),
+                                               state.scales2.template get<half>(),
+                                               total_params,
+                                               stream);
     }
 
-    fprintf(stderr, "[LoRA] Flash AdamW 8-bit optimizer: %d tensors, %zu params, %.1f MB state (int8 m+v + FP16 scales)\n",
-            state.num_tensors, total_params,
+    fprintf(stderr,
+            "[LoRA] Flash AdamW 8-bit optimizer: %d tensors, %zu params, %.1f MB state (int8 m+v + FP16 scales)\n",
+            state.num_tensors,
+            total_params,
             (total_params * 2 + state.num_groups * 2 * sizeof(half)) / 1e6);
 
     state.initialized = true;
@@ -550,12 +689,17 @@ void DslModel::update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t st
     }
 
     if (h_grad_ptrs.size() != static_cast<std::size_t>(state.num_tensors)) {
-        throw std::runtime_error(fmt::format(
-            "DslModel::update_lora_grad_pointers: grad ptr count mismatch (expected {}, got {})",
-            state.num_tensors, h_grad_ptrs.size()));
+        throw std::runtime_error(
+            fmt::format("DslModel::update_lora_grad_pointers: grad ptr count mismatch (expected {}, got {})",
+                        state.num_tensors,
+                        h_grad_ptrs.size()));
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(state.grad_ptrs.Data, h_grad_ptrs.data(), h_grad_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.grad_ptrs.Data,
+                               h_grad_ptrs.data(),
+                               h_grad_ptrs.size() * sizeof(void*),
+                               cudaMemcpyHostToDevice,
+                               stream));
 }
 
 // ----------------------------------------------------------------------------
@@ -584,32 +728,86 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
 
-        if (lora_w.attention.q.has_value()) { collect_tensor(lora_w.attention.q->A); collect_tensor(lora_w.attention.q->B); }
-        if (lora_w.attention.k.has_value()) { collect_tensor(lora_w.attention.k->A); collect_tensor(lora_w.attention.k->B); }
-        if (lora_w.attention.v.has_value()) { collect_tensor(lora_w.attention.v->A); collect_tensor(lora_w.attention.v->B); }
-        if (lora_w.attention.o.has_value()) { collect_tensor(lora_w.attention.o->A); collect_tensor(lora_w.attention.o->B); }
-        if (lora_w.mlp.gate.has_value()) { collect_tensor(lora_w.mlp.gate->A); collect_tensor(lora_w.mlp.gate->B); }
-        if (lora_w.mlp.gate_up.has_value()) { collect_tensor(lora_w.mlp.gate_up->A); collect_tensor(lora_w.mlp.gate_up->B); }
-        if (lora_w.mlp.up.has_value()) { collect_tensor(lora_w.mlp.up->A); collect_tensor(lora_w.mlp.up->B); }
-        if (lora_w.mlp.down.has_value()) { collect_tensor(lora_w.mlp.down->A); collect_tensor(lora_w.mlp.down->B); }
+        if (lora_w.attention.q.has_value()) {
+            collect_tensor(lora_w.attention.q->A);
+            collect_tensor(lora_w.attention.q->B);
+        }
+        if (lora_w.attention.k.has_value()) {
+            collect_tensor(lora_w.attention.k->A);
+            collect_tensor(lora_w.attention.k->B);
+        }
+        if (lora_w.attention.v.has_value()) {
+            collect_tensor(lora_w.attention.v->A);
+            collect_tensor(lora_w.attention.v->B);
+        }
+        if (lora_w.attention.o.has_value()) {
+            collect_tensor(lora_w.attention.o->A);
+            collect_tensor(lora_w.attention.o->B);
+        }
+        if (lora_w.mlp.gate.has_value()) {
+            collect_tensor(lora_w.mlp.gate->A);
+            collect_tensor(lora_w.mlp.gate->B);
+        }
+        if (lora_w.mlp.gate_up.has_value()) {
+            collect_tensor(lora_w.mlp.gate_up->A);
+            collect_tensor(lora_w.mlp.gate_up->B);
+        }
+        if (lora_w.mlp.up.has_value()) {
+            collect_tensor(lora_w.mlp.up->A);
+            collect_tensor(lora_w.mlp.up->B);
+        }
+        if (lora_w.mlp.down.has_value()) {
+            collect_tensor(lora_w.mlp.down->A);
+            collect_tensor(lora_w.mlp.down->B);
+        }
 
         if (lora_w.moe.use_grouped) {
-            if (lora_w.moe.grouped.gate.has_value()) { collect_tensor(lora_w.moe.grouped.gate->A); collect_tensor(lora_w.moe.grouped.gate->B); }
-            if (lora_w.moe.grouped.gate_up.has_value()) { collect_tensor(lora_w.moe.grouped.gate_up->A); collect_tensor(lora_w.moe.grouped.gate_up->B); }
-            if (lora_w.moe.grouped.up.has_value()) { collect_tensor(lora_w.moe.grouped.up->A); collect_tensor(lora_w.moe.grouped.up->B); }
-            if (lora_w.moe.grouped.down.has_value()) { collect_tensor(lora_w.moe.grouped.down->A); collect_tensor(lora_w.moe.grouped.down->B); }
+            if (lora_w.moe.grouped.gate.has_value()) {
+                collect_tensor(lora_w.moe.grouped.gate->A);
+                collect_tensor(lora_w.moe.grouped.gate->B);
+            }
+            if (lora_w.moe.grouped.gate_up.has_value()) {
+                collect_tensor(lora_w.moe.grouped.gate_up->A);
+                collect_tensor(lora_w.moe.grouped.gate_up->B);
+            }
+            if (lora_w.moe.grouped.up.has_value()) {
+                collect_tensor(lora_w.moe.grouped.up->A);
+                collect_tensor(lora_w.moe.grouped.up->B);
+            }
+            if (lora_w.moe.grouped.down.has_value()) {
+                collect_tensor(lora_w.moe.grouped.down->A);
+                collect_tensor(lora_w.moe.grouped.down->B);
+            }
         } else {
             for (auto& expert : lora_w.moe.experts) {
-                if (expert.gate.has_value()) { collect_tensor(expert.gate->A); collect_tensor(expert.gate->B); }
-                if (expert.gate_up.has_value()) { collect_tensor(expert.gate_up->A); collect_tensor(expert.gate_up->B); }
-                if (expert.up.has_value()) { collect_tensor(expert.up->A); collect_tensor(expert.up->B); }
-                if (expert.down.has_value()) { collect_tensor(expert.down->A); collect_tensor(expert.down->B); }
+                if (expert.gate.has_value()) {
+                    collect_tensor(expert.gate->A);
+                    collect_tensor(expert.gate->B);
+                }
+                if (expert.gate_up.has_value()) {
+                    collect_tensor(expert.gate_up->A);
+                    collect_tensor(expert.gate_up->B);
+                }
+                if (expert.up.has_value()) {
+                    collect_tensor(expert.up->A);
+                    collect_tensor(expert.up->B);
+                }
+                if (expert.down.has_value()) {
+                    collect_tensor(expert.down->A);
+                    collect_tensor(expert.down->B);
+                }
             }
         }
 
         if (lora_w.moe.shared.has_value()) {
-            if (lora_w.moe.shared->up.has_value()) { collect_tensor(lora_w.moe.shared->up->A); collect_tensor(lora_w.moe.shared->up->B); }
-            if (lora_w.moe.shared->down.has_value()) { collect_tensor(lora_w.moe.shared->down->A); collect_tensor(lora_w.moe.shared->down->B); }
+            if (lora_w.moe.shared->up.has_value()) {
+                collect_tensor(lora_w.moe.shared->up->A);
+                collect_tensor(lora_w.moe.shared->up->B);
+            }
+            if (lora_w.moe.shared->down.has_value()) {
+                collect_tensor(lora_w.moe.shared->down->A);
+                collect_tensor(lora_w.moe.shared->down->B);
+            }
         }
 
         if (lora_w.router.has_value() && lora_w.router->has_value()) {
@@ -621,18 +819,44 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
     state.num_tensors = static_cast<int>(h_param_ptrs.size());
     state.total_params = total_params;
 
-    state.param_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw_param_ptrs", EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
-    state.grad_ptrs = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw_grad_ptrs", EAllocationType::ON_DEVICE, {(long)(state.num_tensors * sizeof(void*))});
-    state.tensor_sizes = mAllocator->allocate(ETensorDType::INT32, "lora_adamw_sizes", EAllocationType::ON_DEVICE, {(long)state.num_tensors});
-    state.state_offsets = mAllocator->allocate(ETensorDType::INT32, "lora_adamw_offsets", EAllocationType::ON_DEVICE, {(long)state.num_tensors});
+    state.param_ptrs = mAllocator->allocate(ETensorDType::BYTE,
+                                            "lora_adamw_param_ptrs",
+                                            EAllocationType::ON_DEVICE,
+                                            {(long)(state.num_tensors * sizeof(void*))});
+    state.grad_ptrs = mAllocator->allocate(ETensorDType::BYTE,
+                                           "lora_adamw_grad_ptrs",
+                                           EAllocationType::ON_DEVICE,
+                                           {(long)(state.num_tensors * sizeof(void*))});
+    state.tensor_sizes = mAllocator->allocate(ETensorDType::INT32,
+                                              "lora_adamw_sizes",
+                                              EAllocationType::ON_DEVICE,
+                                              {(long)state.num_tensors});
+    state.state_offsets = mAllocator->allocate(ETensorDType::INT32,
+                                               "lora_adamw_offsets",
+                                               EAllocationType::ON_DEVICE,
+                                               {(long)state.num_tensors});
 
-    CUDA_CHECK(cudaMemcpyAsync(state.param_ptrs.Data, h_param_ptrs.data(), h_param_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(state.tensor_sizes.Data, h_sizes.data(), h_sizes.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(state.state_offsets.Data, h_state_offsets.data(), h_state_offsets.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.param_ptrs.Data,
+                               h_param_ptrs.data(),
+                               h_param_ptrs.size() * sizeof(void*),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.tensor_sizes.Data,
+                               h_sizes.data(),
+                               h_sizes.size() * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.state_offsets.Data,
+                               h_state_offsets.data(),
+                               h_state_offsets.size() * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               stream));
 
     if (!state.state1.Data) {
-        state.state1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw_m", EAllocationType::ON_DEVICE, {(long)total_params});
-        state.state2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw_v", EAllocationType::ON_DEVICE, {(long)total_params});
+        state.state1 =
+            mAllocator->allocate(ETensorDType::FP32, "lora_adamw_m", EAllocationType::ON_DEVICE, {(long)total_params});
+        state.state2 =
+            mAllocator->allocate(ETensorDType::FP32, "lora_adamw_v", EAllocationType::ON_DEVICE, {(long)total_params});
     }
 
     if (!state.values_restored) {
@@ -640,8 +864,11 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
         CUDA_CHECK(cudaMemsetAsync(state.state2.Data, 0, total_params * sizeof(float), stream));
     }
 
-    fprintf(stderr, "[LoRA] Full-precision AdamW optimizer: %d tensors, %zu params, %.1f MB state (FP32 m+v)\n",
-            state.num_tensors, total_params, total_params * 2 * sizeof(float) / 1e6);
+    fprintf(stderr,
+            "[LoRA] Full-precision AdamW optimizer: %d tensors, %zu params, %.1f MB state (FP32 m+v)\n",
+            state.num_tensors,
+            total_params,
+            total_params * 2 * sizeof(float) / 1e6);
 
     state.initialized = true;
 }
@@ -697,16 +924,27 @@ void DslModel::update_lora_adamw_grad_pointers(NCCLCommunicator& comm, cudaStrea
     }
 
     if (h_grad_ptrs.size() != static_cast<std::size_t>(state.num_tensors)) {
-        throw std::runtime_error(fmt::format(
-            "DslModel::update_lora_adamw_grad_pointers: grad ptr count mismatch (expected {}, got {})",
-            state.num_tensors, h_grad_ptrs.size()));
+        throw std::runtime_error(
+            fmt::format("DslModel::update_lora_adamw_grad_pointers: grad ptr count mismatch (expected {}, got {})",
+                        state.num_tensors,
+                        h_grad_ptrs.size()));
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(state.grad_ptrs.Data, h_grad_ptrs.data(), h_grad_ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(state.grad_ptrs.Data,
+                               h_grad_ptrs.data(),
+                               h_grad_ptrs.size() * sizeof(void*),
+                               cudaMemcpyHostToDevice,
+                               stream));
 }
 
-void DslModel::update_lora_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
-                                 int t, float epsilon, float weight_decay, float grad_clip) {
+void DslModel::update_lora_adamw(NCCLCommunicator& comm,
+                                 float learning_rate,
+                                 float beta_1,
+                                 float beta_2,
+                                 int t,
+                                 float epsilon,
+                                 float weight_decay,
+                                 float grad_clip) {
     if (!mLoRAAdamWState) {
         mLoRAAdamWState = std::make_unique<modules::LoRAAdamWState>();
     }
@@ -736,31 +974,43 @@ void DslModel::update_lora_adamw(NCCLCommunicator& comm, float learning_rate, fl
     auto& state = *mLoRAAdamWState;
     const ETensorDType lora_dtype = mLoRAConfig->dtype;
     if (lora_dtype == ETensorDType::FP32) {
-        optimizers::adamw_update_multi_tensor(
-            reinterpret_cast<float**>(state.param_ptrs.Data),
-            reinterpret_cast<float**>(state.grad_ptrs.Data),
-            state.tensor_sizes.template get<int>(),
-            state.num_tensors,
-            state.state1.template get<float>(),
-            state.state2.template get<float>(),
-            state.state_offsets.template get<int>(),
-            state.total_params,
-            learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
-            nullptr, nullptr, stream
-        );
+        optimizers::adamw_update_multi_tensor(reinterpret_cast<float**>(state.param_ptrs.Data),
+                                              reinterpret_cast<float**>(state.grad_ptrs.Data),
+                                              state.tensor_sizes.template get<int>(),
+                                              state.num_tensors,
+                                              state.state1.template get<float>(),
+                                              state.state2.template get<float>(),
+                                              state.state_offsets.template get<int>(),
+                                              state.total_params,
+                                              learning_rate,
+                                              beta_1,
+                                              beta_2,
+                                              t,
+                                              epsilon,
+                                              weight_decay,
+                                              grad_scale,
+                                              nullptr,
+                                              nullptr,
+                                              stream);
     } else if (lora_dtype == ETensorDType::BF16) {
-        optimizers::adamw_update_multi_tensor(
-            reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
-            reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
-            state.tensor_sizes.template get<int>(),
-            state.num_tensors,
-            state.state1.template get<float>(),
-            state.state2.template get<float>(),
-            state.state_offsets.template get<int>(),
-            state.total_params,
-            learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
-            nullptr, nullptr, stream
-        );
+        optimizers::adamw_update_multi_tensor(reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
+                                              reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
+                                              state.tensor_sizes.template get<int>(),
+                                              state.num_tensors,
+                                              state.state1.template get<float>(),
+                                              state.state2.template get<float>(),
+                                              state.state_offsets.template get<int>(),
+                                              state.total_params,
+                                              learning_rate,
+                                              beta_1,
+                                              beta_2,
+                                              t,
+                                              epsilon,
+                                              weight_decay,
+                                              grad_scale,
+                                              nullptr,
+                                              nullptr,
+                                              stream);
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for full-precision AdamW");
     }
@@ -774,8 +1024,10 @@ void DslModel::update_lora_adamw(NCCLCommunicator& comm, float learning_rate, fl
     internal::record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
-void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip,
-                                       const float* opt_params, const int* opt_step) {
+void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm,
+                                       float grad_clip,
+                                       const float* opt_params,
+                                       const int* opt_step) {
     if (!mLoRAAdamWState) {
         throw std::logic_error("DslModel::update_lora_adamw_graph: optimizer state not allocated");
     }
@@ -784,7 +1036,8 @@ void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip,
 
     if (!mLoRARunState->norm_ptrs_initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_graph: norm pointers must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_graph: norm pointers must be initialized before capture");
         }
         populate_lora_norm_pointers(comm, stream);
     }
@@ -793,13 +1046,15 @@ void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip,
 
     if (!mLoRAAdamWState->initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_graph: optimizer state must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_graph: optimizer state must be initialized before capture");
         }
         initialize_lora_adamw_state(comm, stream);
     }
     if (!mLoRAAdamWState->grad_ptrs_initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_graph: grad pointers must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_graph: grad pointers must be initialized before capture");
         }
         update_lora_adamw_grad_pointers(comm, stream);
         mLoRAAdamWState->grad_ptrs_initialized = true;
@@ -809,31 +1064,43 @@ void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip,
     const ETensorDType lora_dtype = mLoRAConfig->dtype;
 
     if (lora_dtype == ETensorDType::FP32) {
-        optimizers::adamw_update_multi_tensor(
-            reinterpret_cast<float**>(state.param_ptrs.Data),
-            reinterpret_cast<float**>(state.grad_ptrs.Data),
-            state.tensor_sizes.template get<int>(),
-            state.num_tensors,
-            state.state1.template get<float>(),
-            state.state2.template get<float>(),
-            state.state_offsets.template get<int>(),
-            state.total_params,
-            /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, /*weight_decay=*/1.f,
-            grad_scale, opt_params, opt_step, stream
-        );
+        optimizers::adamw_update_multi_tensor(reinterpret_cast<float**>(state.param_ptrs.Data),
+                                              reinterpret_cast<float**>(state.grad_ptrs.Data),
+                                              state.tensor_sizes.template get<int>(),
+                                              state.num_tensors,
+                                              state.state1.template get<float>(),
+                                              state.state2.template get<float>(),
+                                              state.state_offsets.template get<int>(),
+                                              state.total_params,
+                                              /*lr=*/0.f,
+                                              /*beta1=*/0.f,
+                                              /*beta2=*/0.f,
+                                              /*step=*/1,
+                                              /*eps=*/0.f,
+                                              /*weight_decay=*/1.f,
+                                              grad_scale,
+                                              opt_params,
+                                              opt_step,
+                                              stream);
     } else if (lora_dtype == ETensorDType::BF16) {
-        optimizers::adamw_update_multi_tensor(
-            reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
-            reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
-            state.tensor_sizes.template get<int>(),
-            state.num_tensors,
-            state.state1.template get<float>(),
-            state.state2.template get<float>(),
-            state.state_offsets.template get<int>(),
-            state.total_params,
-            /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, /*weight_decay=*/1.f,
-            grad_scale, opt_params, opt_step, stream
-        );
+        optimizers::adamw_update_multi_tensor(reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
+                                              reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
+                                              state.tensor_sizes.template get<int>(),
+                                              state.num_tensors,
+                                              state.state1.template get<float>(),
+                                              state.state2.template get<float>(),
+                                              state.state_offsets.template get<int>(),
+                                              state.total_params,
+                                              /*lr=*/0.f,
+                                              /*beta1=*/0.f,
+                                              /*beta2=*/0.f,
+                                              /*step=*/1,
+                                              /*eps=*/0.f,
+                                              /*weight_decay=*/1.f,
+                                              grad_scale,
+                                              opt_params,
+                                              opt_step,
+                                              stream);
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for full-precision AdamW");
     }
@@ -847,8 +1114,14 @@ void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip,
     internal::record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
-void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
-                                      int t, float epsilon, float weight_decay, float grad_clip) {
+void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm,
+                                      float learning_rate,
+                                      float beta_1,
+                                      float beta_2,
+                                      int t,
+                                      float epsilon,
+                                      float weight_decay,
+                                      float grad_clip) {
     if (!mLoRAAdamW8BitState) {
         throw std::logic_error("DslModel::update_lora_adamw_8bit: optimizer state not allocated");
     }
@@ -863,13 +1136,15 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
 
     if (!mLoRAAdamW8BitState->initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_8bit_graph: optimizer state must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_8bit_graph: optimizer state must be initialized before capture");
         }
         initialize_lora_multi_tensor_state(comm, stream);
     }
     if (!mLoRAAdamW8BitState->grad_ptrs_initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_8bit_graph: grad pointers must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_8bit_graph: grad pointers must be initialized before capture");
         }
         update_lora_grad_pointers(comm, stream);
         mLoRAAdamW8BitState->grad_ptrs_initialized = true;
@@ -888,9 +1163,16 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
             mLoRAAdamW8BitState->scales2.template get<half>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
-            learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
-            nullptr, nullptr, stream
-        );
+            learning_rate,
+            beta_1,
+            beta_2,
+            t,
+            epsilon,
+            weight_decay,
+            grad_scale,
+            nullptr,
+            nullptr,
+            stream);
     } else if (lora_dtype == ETensorDType::BF16) {
         optimizers::flash_adamw_update_8bit_multi_tensor(
             reinterpret_cast<nv_bfloat16**>(mLoRAAdamW8BitState->param_ptrs.Data),
@@ -903,9 +1185,16 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
             mLoRAAdamW8BitState->scales2.template get<half>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
-            learning_rate, beta_1, beta_2, t, epsilon, weight_decay, grad_scale,
-            nullptr, nullptr, stream
-        );
+            learning_rate,
+            beta_1,
+            beta_2,
+            t,
+            epsilon,
+            weight_decay,
+            grad_scale,
+            nullptr,
+            nullptr,
+            stream);
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
     }
@@ -919,8 +1208,10 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rat
     internal::record_event_if_not_capturing(rs.OptimizerDone, stream);
 }
 
-void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
-                                           const float* opt_params, const int* opt_step) {
+void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
+                                            float grad_clip,
+                                            const float* opt_params,
+                                            const int* opt_step) {
     if (!mLoRAAdamW8BitState) {
         throw std::logic_error("DslModel::update_lora_adamw_8bit_graph: optimizer state not allocated");
     }
@@ -929,7 +1220,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_c
 
     if (!mLoRARunState->norm_ptrs_initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_8bit_graph: norm pointers must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_8bit_graph: norm pointers must be initialized before capture");
         }
         populate_lora_norm_pointers(comm, stream);
     }
@@ -938,13 +1230,15 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_c
 
     if (!mLoRAAdamW8BitState->initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_8bit_graph: optimizer state must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_8bit_graph: optimizer state must be initialized before capture");
         }
         initialize_lora_multi_tensor_state(comm, stream);
     }
     if (!mLoRAAdamW8BitState->grad_ptrs_initialized) {
         if (internal::stream_is_capturing(stream)) {
-            throw std::runtime_error("DslModel::update_lora_adamw_8bit_graph: grad pointers must be initialized before capture");
+            throw std::runtime_error(
+                "DslModel::update_lora_adamw_8bit_graph: grad pointers must be initialized before capture");
         }
         update_lora_grad_pointers(comm, stream);
         mLoRAAdamW8BitState->grad_ptrs_initialized = true;
@@ -954,35 +1248,47 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_c
     const ETensorDType lora_dtype = mLoRAConfig->dtype;
 
     if (lora_dtype == ETensorDType::FP32) {
-        optimizers::flash_adamw_update_8bit_multi_tensor(
-            reinterpret_cast<float**>(state.param_ptrs.Data),
-            reinterpret_cast<float**>(state.grad_ptrs.Data),
-            state.tensor_sizes.template get<int>(),
-            state.num_tensors,
-            reinterpret_cast<signed char*>(state.state1.Data),
-            reinterpret_cast<unsigned char*>(state.state2.Data),
-            state.scales1.template get<half>(),
-            state.scales2.template get<half>(),
-            state.state_offsets.template get<int>(),
-            state.total_params,
-            /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, /*weight_decay=*/1.f,
-            grad_scale, opt_params, opt_step, stream
-        );
+        optimizers::flash_adamw_update_8bit_multi_tensor(reinterpret_cast<float**>(state.param_ptrs.Data),
+                                                         reinterpret_cast<float**>(state.grad_ptrs.Data),
+                                                         state.tensor_sizes.template get<int>(),
+                                                         state.num_tensors,
+                                                         reinterpret_cast<signed char*>(state.state1.Data),
+                                                         reinterpret_cast<unsigned char*>(state.state2.Data),
+                                                         state.scales1.template get<half>(),
+                                                         state.scales2.template get<half>(),
+                                                         state.state_offsets.template get<int>(),
+                                                         state.total_params,
+                                                         /*lr=*/0.f,
+                                                         /*beta1=*/0.f,
+                                                         /*beta2=*/0.f,
+                                                         /*step=*/1,
+                                                         /*eps=*/0.f,
+                                                         /*weight_decay=*/1.f,
+                                                         grad_scale,
+                                                         opt_params,
+                                                         opt_step,
+                                                         stream);
     } else if (lora_dtype == ETensorDType::BF16) {
-        optimizers::flash_adamw_update_8bit_multi_tensor(
-            reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
-            reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
-            state.tensor_sizes.template get<int>(),
-            state.num_tensors,
-            reinterpret_cast<signed char*>(state.state1.Data),
-            reinterpret_cast<unsigned char*>(state.state2.Data),
-            state.scales1.template get<half>(),
-            state.scales2.template get<half>(),
-            state.state_offsets.template get<int>(),
-            state.total_params,
-            /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1, /*eps=*/0.f, /*weight_decay=*/1.f,
-            grad_scale, opt_params, opt_step, stream
-        );
+        optimizers::flash_adamw_update_8bit_multi_tensor(reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
+                                                         reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
+                                                         state.tensor_sizes.template get<int>(),
+                                                         state.num_tensors,
+                                                         reinterpret_cast<signed char*>(state.state1.Data),
+                                                         reinterpret_cast<unsigned char*>(state.state2.Data),
+                                                         state.scales1.template get<half>(),
+                                                         state.scales2.template get<half>(),
+                                                         state.state_offsets.template get<int>(),
+                                                         state.total_params,
+                                                         /*lr=*/0.f,
+                                                         /*beta1=*/0.f,
+                                                         /*beta2=*/0.f,
+                                                         /*step=*/1,
+                                                         /*eps=*/0.f,
+                                                         /*weight_decay=*/1.f,
+                                                         grad_scale,
+                                                         opt_params,
+                                                         opt_step,
+                                                         stream);
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
     }
@@ -1047,32 +1353,86 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
 
         for (int l = 0; l < L; ++l) {
             auto& lora_w = mLoRAWeights->get_master_block(l, main_stream);
-            if (lora_w.attention.q.has_value()) { add_param(lora_w.attention.q->A); add_param(lora_w.attention.q->B); }
-            if (lora_w.attention.k.has_value()) { add_param(lora_w.attention.k->A); add_param(lora_w.attention.k->B); }
-            if (lora_w.attention.v.has_value()) { add_param(lora_w.attention.v->A); add_param(lora_w.attention.v->B); }
-            if (lora_w.attention.o.has_value()) { add_param(lora_w.attention.o->A); add_param(lora_w.attention.o->B); }
-            if (lora_w.mlp.gate.has_value()) { add_param(lora_w.mlp.gate->A); add_param(lora_w.mlp.gate->B); }
-            if (lora_w.mlp.gate_up.has_value()) { add_param(lora_w.mlp.gate_up->A); add_param(lora_w.mlp.gate_up->B); }
-            if (lora_w.mlp.up.has_value()) { add_param(lora_w.mlp.up->A); add_param(lora_w.mlp.up->B); }
-            if (lora_w.mlp.down.has_value()) { add_param(lora_w.mlp.down->A); add_param(lora_w.mlp.down->B); }
+            if (lora_w.attention.q.has_value()) {
+                add_param(lora_w.attention.q->A);
+                add_param(lora_w.attention.q->B);
+            }
+            if (lora_w.attention.k.has_value()) {
+                add_param(lora_w.attention.k->A);
+                add_param(lora_w.attention.k->B);
+            }
+            if (lora_w.attention.v.has_value()) {
+                add_param(lora_w.attention.v->A);
+                add_param(lora_w.attention.v->B);
+            }
+            if (lora_w.attention.o.has_value()) {
+                add_param(lora_w.attention.o->A);
+                add_param(lora_w.attention.o->B);
+            }
+            if (lora_w.mlp.gate.has_value()) {
+                add_param(lora_w.mlp.gate->A);
+                add_param(lora_w.mlp.gate->B);
+            }
+            if (lora_w.mlp.gate_up.has_value()) {
+                add_param(lora_w.mlp.gate_up->A);
+                add_param(lora_w.mlp.gate_up->B);
+            }
+            if (lora_w.mlp.up.has_value()) {
+                add_param(lora_w.mlp.up->A);
+                add_param(lora_w.mlp.up->B);
+            }
+            if (lora_w.mlp.down.has_value()) {
+                add_param(lora_w.mlp.down->A);
+                add_param(lora_w.mlp.down->B);
+            }
 
             if (lora_w.moe.use_grouped) {
-                if (lora_w.moe.grouped.gate.has_value()) { add_param(lora_w.moe.grouped.gate->A); add_param(lora_w.moe.grouped.gate->B); }
-                if (lora_w.moe.grouped.gate_up.has_value()) { add_param(lora_w.moe.grouped.gate_up->A); add_param(lora_w.moe.grouped.gate_up->B); }
-                if (lora_w.moe.grouped.up.has_value()) { add_param(lora_w.moe.grouped.up->A); add_param(lora_w.moe.grouped.up->B); }
-                if (lora_w.moe.grouped.down.has_value()) { add_param(lora_w.moe.grouped.down->A); add_param(lora_w.moe.grouped.down->B); }
+                if (lora_w.moe.grouped.gate.has_value()) {
+                    add_param(lora_w.moe.grouped.gate->A);
+                    add_param(lora_w.moe.grouped.gate->B);
+                }
+                if (lora_w.moe.grouped.gate_up.has_value()) {
+                    add_param(lora_w.moe.grouped.gate_up->A);
+                    add_param(lora_w.moe.grouped.gate_up->B);
+                }
+                if (lora_w.moe.grouped.up.has_value()) {
+                    add_param(lora_w.moe.grouped.up->A);
+                    add_param(lora_w.moe.grouped.up->B);
+                }
+                if (lora_w.moe.grouped.down.has_value()) {
+                    add_param(lora_w.moe.grouped.down->A);
+                    add_param(lora_w.moe.grouped.down->B);
+                }
             } else {
                 for (auto& expert : lora_w.moe.experts) {
-                    if (expert.gate.has_value()) { add_param(expert.gate->A); add_param(expert.gate->B); }
-                    if (expert.gate_up.has_value()) { add_param(expert.gate_up->A); add_param(expert.gate_up->B); }
-                    if (expert.up.has_value()) { add_param(expert.up->A); add_param(expert.up->B); }
-                    if (expert.down.has_value()) { add_param(expert.down->A); add_param(expert.down->B); }
+                    if (expert.gate.has_value()) {
+                        add_param(expert.gate->A);
+                        add_param(expert.gate->B);
+                    }
+                    if (expert.gate_up.has_value()) {
+                        add_param(expert.gate_up->A);
+                        add_param(expert.gate_up->B);
+                    }
+                    if (expert.up.has_value()) {
+                        add_param(expert.up->A);
+                        add_param(expert.up->B);
+                    }
+                    if (expert.down.has_value()) {
+                        add_param(expert.down->A);
+                        add_param(expert.down->B);
+                    }
                 }
             }
 
             if (lora_w.moe.shared.has_value()) {
-                if (lora_w.moe.shared->up.has_value()) { add_param(lora_w.moe.shared->up->A); add_param(lora_w.moe.shared->up->B); }
-                if (lora_w.moe.shared->down.has_value()) { add_param(lora_w.moe.shared->down->A); add_param(lora_w.moe.shared->down->B); }
+                if (lora_w.moe.shared->up.has_value()) {
+                    add_param(lora_w.moe.shared->up->A);
+                    add_param(lora_w.moe.shared->up->B);
+                }
+                if (lora_w.moe.shared->down.has_value()) {
+                    add_param(lora_w.moe.shared->down->A);
+                    add_param(lora_w.moe.shared->down->B);
+                }
             }
 
             if (lora_w.router.has_value() && lora_w.router->has_value()) {
@@ -1086,26 +1446,32 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         state.momentum_quantiles = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_quantiles", {256});
         std::vector<float> h_quantiles(256);
         optimizers::create_normuon_quantiles(h_quantiles.data());
-        CUDA_CHECK(cudaMemcpy(state.momentum_quantiles.Data, h_quantiles.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(state.momentum_quantiles.Data, h_quantiles.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
 
-        state.momentum_state = mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_momentum", {static_cast<long>(state.state_elems)});
-        state.momentum_absmax = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax", {static_cast<long>(state.num_blocks)});
+        state.momentum_state =
+            mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_momentum", {static_cast<long>(state.state_elems)});
+        state.momentum_absmax =
+            mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax", {static_cast<long>(state.num_blocks)});
 
-        optimizers::init_normuon_momentum_state(
-            reinterpret_cast<unsigned char*>(state.momentum_state.Data),
-            state.momentum_absmax.template get<float>(),
-            state.state_elems,
-            main_stream
-        );
+        optimizers::init_normuon_momentum_state(reinterpret_cast<unsigned char*>(state.momentum_state.Data),
+                                                state.momentum_absmax.template get<float>(),
+                                                state.state_elems,
+                                                main_stream);
 
         state.variance_buffers.clear();
         for (const auto& shape : state.variance_shapes) {
             int M = shape.first;
             int N = shape.second;
             size_t var_size = optimizers::normuon_variance_buffer_size(M, N);
-            Tensor var_buf = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_variance", {static_cast<long>(var_size)});
+            Tensor var_buf =
+                mAllocator->allocate(ETensorDType::FP32, "lora_normuon_variance", {static_cast<long>(var_size)});
             std::vector<float> ones(var_size, 1.0f);
-            CUDA_CHECK(cudaMemcpyAsync(var_buf.Data, ones.data(), var_size * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+            CUDA_CHECK(cudaMemcpyAsync(var_buf.Data,
+                                       ones.data(),
+                                       var_size * sizeof(float),
+                                       cudaMemcpyHostToDevice,
+                                       main_stream));
             state.variance_buffers.push_back(std::move(var_buf));
         }
 
@@ -1113,10 +1479,12 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         size_t max_weight_elems = state.max_weight_M * state.max_weight_N;
         size_t polar_workspace_elems = 4 * max_dim * max_dim + 1;
         size_t polar_size = max_weight_elems + polar_workspace_elems;
-        state.polar_workspace = mAllocator->allocate(ETensorDType::BF16, "lora_normuon_polar", {static_cast<long>(polar_size)});
+        state.polar_workspace =
+            mAllocator->allocate(ETensorDType::BF16, "lora_normuon_polar", {static_cast<long>(polar_size)});
 
         size_t max_weight_size = state.max_weight_M * state.max_weight_N;
-        state.momentum_temp = mAllocator->allocate(ETensorDType::BF16, "lora_normuon_temp", {static_cast<long>(max_weight_size)});
+        state.momentum_temp =
+            mAllocator->allocate(ETensorDType::BF16, "lora_normuon_temp", {static_cast<long>(max_weight_size)});
 
         CUBLAS_CHECK(cublasCreate(&state.cublas_handle));
         CUBLAS_CHECK(cublasSetStream(state.cublas_handle, main_stream));
@@ -1143,22 +1511,21 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         float* variance_ptr = state.variance_buffers[var_idx].template get<float>();
 
         if (lora_dtype == ETensorDType::BF16) {
-            optimizers::normuon_update_2d(
-                state.cublas_handle,
-                param.template get<nv_bfloat16>(),
-                grad.template get<nv_bfloat16>(),
-                momentum_ptr,
-                variance_ptr,
-                state.polar_workspace.template get<nv_bfloat16>(),
-                M, N,
-                lr,
-                momentum,
-                beta2,
-                cautious_wd ? weight_decay : 0.0f,
-                state.momentum_quantiles.template get<float>(),
-                absmax_ptr,
-                main_stream
-            );
+            optimizers::normuon_update_2d(state.cublas_handle,
+                                          param.template get<nv_bfloat16>(),
+                                          grad.template get<nv_bfloat16>(),
+                                          momentum_ptr,
+                                          variance_ptr,
+                                          state.polar_workspace.template get<nv_bfloat16>(),
+                                          M,
+                                          N,
+                                          lr,
+                                          momentum,
+                                          beta2,
+                                          cautious_wd ? weight_decay : 0.0f,
+                                          state.momentum_quantiles.template get<float>(),
+                                          absmax_ptr,
+                                          main_stream);
         } else {
             throw std::runtime_error("DSL LoRA NorMuon optimizer only supports BF16 LoRA weights");
         }
@@ -1171,14 +1538,38 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         auto& lora_w = mLoRAWeights->get_master_block(l, main_stream);
         auto& lora_g = mLoRAGrads->get_block_full(l, main_stream, comm, unused_acc);
 
-        if (lora_w.attention.q.has_value() && lora_g.attention.q.has_value()) { update_param(lora_w.attention.q->A, lora_g.attention.q->A); update_param(lora_w.attention.q->B, lora_g.attention.q->B); }
-        if (lora_w.attention.k.has_value() && lora_g.attention.k.has_value()) { update_param(lora_w.attention.k->A, lora_g.attention.k->A); update_param(lora_w.attention.k->B, lora_g.attention.k->B); }
-        if (lora_w.attention.v.has_value() && lora_g.attention.v.has_value()) { update_param(lora_w.attention.v->A, lora_g.attention.v->A); update_param(lora_w.attention.v->B, lora_g.attention.v->B); }
-        if (lora_w.attention.o.has_value() && lora_g.attention.o.has_value()) { update_param(lora_w.attention.o->A, lora_g.attention.o->A); update_param(lora_w.attention.o->B, lora_g.attention.o->B); }
-        if (lora_w.mlp.gate.has_value() && lora_g.mlp.gate.has_value()) { update_param(lora_w.mlp.gate->A, lora_g.mlp.gate->A); update_param(lora_w.mlp.gate->B, lora_g.mlp.gate->B); }
-        if (lora_w.mlp.gate_up.has_value() && lora_g.mlp.gate_up.has_value()) { update_param(lora_w.mlp.gate_up->A, lora_g.mlp.gate_up->A); update_param(lora_w.mlp.gate_up->B, lora_g.mlp.gate_up->B); }
-        if (lora_w.mlp.up.has_value() && lora_g.mlp.up.has_value()) { update_param(lora_w.mlp.up->A, lora_g.mlp.up->A); update_param(lora_w.mlp.up->B, lora_g.mlp.up->B); }
-        if (lora_w.mlp.down.has_value() && lora_g.mlp.down.has_value()) { update_param(lora_w.mlp.down->A, lora_g.mlp.down->A); update_param(lora_w.mlp.down->B, lora_g.mlp.down->B); }
+        if (lora_w.attention.q.has_value() && lora_g.attention.q.has_value()) {
+            update_param(lora_w.attention.q->A, lora_g.attention.q->A);
+            update_param(lora_w.attention.q->B, lora_g.attention.q->B);
+        }
+        if (lora_w.attention.k.has_value() && lora_g.attention.k.has_value()) {
+            update_param(lora_w.attention.k->A, lora_g.attention.k->A);
+            update_param(lora_w.attention.k->B, lora_g.attention.k->B);
+        }
+        if (lora_w.attention.v.has_value() && lora_g.attention.v.has_value()) {
+            update_param(lora_w.attention.v->A, lora_g.attention.v->A);
+            update_param(lora_w.attention.v->B, lora_g.attention.v->B);
+        }
+        if (lora_w.attention.o.has_value() && lora_g.attention.o.has_value()) {
+            update_param(lora_w.attention.o->A, lora_g.attention.o->A);
+            update_param(lora_w.attention.o->B, lora_g.attention.o->B);
+        }
+        if (lora_w.mlp.gate.has_value() && lora_g.mlp.gate.has_value()) {
+            update_param(lora_w.mlp.gate->A, lora_g.mlp.gate->A);
+            update_param(lora_w.mlp.gate->B, lora_g.mlp.gate->B);
+        }
+        if (lora_w.mlp.gate_up.has_value() && lora_g.mlp.gate_up.has_value()) {
+            update_param(lora_w.mlp.gate_up->A, lora_g.mlp.gate_up->A);
+            update_param(lora_w.mlp.gate_up->B, lora_g.mlp.gate_up->B);
+        }
+        if (lora_w.mlp.up.has_value() && lora_g.mlp.up.has_value()) {
+            update_param(lora_w.mlp.up->A, lora_g.mlp.up->A);
+            update_param(lora_w.mlp.up->B, lora_g.mlp.up->B);
+        }
+        if (lora_w.mlp.down.has_value() && lora_g.mlp.down.has_value()) {
+            update_param(lora_w.mlp.down->A, lora_g.mlp.down->A);
+            update_param(lora_w.mlp.down->B, lora_g.mlp.down->B);
+        }
 
         if (lora_w.moe.use_grouped) {
             if (lora_w.moe.grouped.gate.has_value() && lora_g.moe.grouped.gate.has_value()) {
@@ -1201,10 +1592,22 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
             for (std::size_t e = 0; e < lora_w.moe.experts.size() && e < lora_g.moe.experts.size(); ++e) {
                 auto& w_exp = lora_w.moe.experts[e];
                 auto& g_exp = lora_g.moe.experts[e];
-                if (w_exp.gate.has_value() && g_exp.gate.has_value()) { update_param(w_exp.gate->A, g_exp.gate->A); update_param(w_exp.gate->B, g_exp.gate->B); }
-                if (w_exp.gate_up.has_value() && g_exp.gate_up.has_value()) { update_param(w_exp.gate_up->A, g_exp.gate_up->A); update_param(w_exp.gate_up->B, g_exp.gate_up->B); }
-                if (w_exp.up.has_value() && g_exp.up.has_value()) { update_param(w_exp.up->A, g_exp.up->A); update_param(w_exp.up->B, g_exp.up->B); }
-                if (w_exp.down.has_value() && g_exp.down.has_value()) { update_param(w_exp.down->A, g_exp.down->A); update_param(w_exp.down->B, g_exp.down->B); }
+                if (w_exp.gate.has_value() && g_exp.gate.has_value()) {
+                    update_param(w_exp.gate->A, g_exp.gate->A);
+                    update_param(w_exp.gate->B, g_exp.gate->B);
+                }
+                if (w_exp.gate_up.has_value() && g_exp.gate_up.has_value()) {
+                    update_param(w_exp.gate_up->A, g_exp.gate_up->A);
+                    update_param(w_exp.gate_up->B, g_exp.gate_up->B);
+                }
+                if (w_exp.up.has_value() && g_exp.up.has_value()) {
+                    update_param(w_exp.up->A, g_exp.up->A);
+                    update_param(w_exp.up->B, g_exp.up->B);
+                }
+                if (w_exp.down.has_value() && g_exp.down.has_value()) {
+                    update_param(w_exp.down->A, g_exp.down->A);
+                    update_param(w_exp.down->B, g_exp.down->B);
+                }
             }
         }
 

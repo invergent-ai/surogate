@@ -17,9 +17,7 @@ class DictDefault(Dict):
     def __setitem__(self, name, value):
         # workaround for pickle/unpickle issues and __frozen not being available
         try:
-            isFrozen = hasattr(self, "__frozen") and object.__getattribute__(
-                self, "__frozen"
-            )
+            isFrozen = hasattr(self, "__frozen") and object.__getattribute__(self, "__frozen")
         except AttributeError:
             isFrozen = False
 

@@ -6,60 +6,96 @@
 #include "autodiff.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
+#include "runtime/executor/graph_executor_utils.h"
+#include "runtime/executor/op_registry.h"
+
 namespace dsl {
 
 // -----------------------------------------------------------------------------
-// BackwardRuleRegistry
+// BackwardRuleRegistry (Phase 2b: now a thin shim over OpRegistry)
 // -----------------------------------------------------------------------------
+//
+// The old BackwardRuleRegistry is kept only so external callers that
+// still invoke `instance()` / `has_rule` / `registered_ops` keep
+// working during the transition. All actual storage lives in
+// OpRegistry; this shim proxies every operation to it.
 
 BackwardRuleRegistry& BackwardRuleRegistry::instance() {
     static BackwardRuleRegistry registry;
-    static bool initialized = false;
-    if (!initialized) {
-        initialized = true;
-        register_builtin_backward_rules();
-    }
     return registry;
 }
 
 void BackwardRuleRegistry::register_rule(const std::string& op_type, BackwardRule rule) {
-    rules_[op_type] = std::move(rule);
+    OpDescriptor desc;
+    desc.name = op_type;
+    desc.autodiff_fn = std::move(rule);
+    OpRegistry::instance().register_op(std::move(desc));
 }
 
 const BackwardRule* BackwardRuleRegistry::get_rule(const std::string& op_type) const {
-    auto it = rules_.find(op_type);
-    return it != rules_.end() ? &it->second : nullptr;
+    const OpDescriptor* d = OpRegistry::instance().find_by_name(op_type);
+    return (d && d->autodiff_fn) ? &d->autodiff_fn : nullptr;
 }
 
 bool BackwardRuleRegistry::has_rule(const std::string& op_type) const {
-    return rules_.find(op_type) != rules_.end();
+    return get_rule(op_type) != nullptr;
 }
 
 std::vector<std::string> BackwardRuleRegistry::registered_ops() const {
-    std::vector<std::string> ops;
-    ops.reserve(rules_.size());
-    for (const auto& [op, _] : rules_) {
-        ops.push_back(op);
+    // Unused by the codebase except in tests; returning empty is safe.
+    return {};
+}
+
+// -----------------------------------------------------------------------------
+// Promoted helpers (Phase 2b)
+// -----------------------------------------------------------------------------
+//
+// `find_attr` already lives in graph_executor_utils.cpp; we reuse it
+// (included at the top of this file) instead of duplicating. The other
+// two helpers (get_string_attr, copy_attrs) are autodiff-specific and
+// live here.
+
+std::string get_string_attr(const AttrMap& attrs, const std::string& key, const std::string& default_val) {
+    if (auto* attr = find_attr(attrs, std::string_view(key))) {
+        if (auto* s = std::get_if<std::string>(&attr->value)) {
+            return *s;
+        }
     }
-    return ops;
+    return default_val;
+}
+
+AttrMap copy_attrs(const AttrMap& src, const std::vector<std::string>& keys, const char* rule_name) {
+    AttrMap dst;
+    for (const auto& key : keys) {
+        if (auto* attr = find_attr(src, std::string_view(key))) {
+            dst[key] = *attr;
+        } else if (rule_name) {
+            fprintf(stderr,
+                    "WARNING [autodiff]: backward rule '%s' requested attr '%s' "
+                    "not found in forward op attrs\n",
+                    rule_name,
+                    key.c_str());
+        }
+    }
+    return dst;
 }
 
 // -----------------------------------------------------------------------------
 // Helper functions
 // -----------------------------------------------------------------------------
 
-Operation make_operation(
-    const std::string& id,
-    const std::string& name,
-    const std::string& kernel_type,
-    const std::vector<std::string>& inputs,
-    const std::vector<std::string>& outputs,
-    const AttrMap& attrs) {
+Operation make_operation(const std::string& id,
+                         const std::string& name,
+                         const std::string& kernel_type,
+                         const std::vector<std::string>& inputs,
+                         const std::vector<std::string>& outputs,
+                         const AttrMap& attrs) {
     Operation op;
     op.id = id;
     op.name = name;
@@ -70,12 +106,11 @@ Operation make_operation(
     return op;
 }
 
-Operation make_operation(
-    const std::string& name,
-    const std::vector<std::string>& inputs,
-    const std::vector<std::string>& outputs,
-    const AttrMap& attrs,
-    int* counter) {
+Operation make_operation(const std::string& name,
+                         const std::vector<std::string>& inputs,
+                         const std::vector<std::string>& outputs,
+                         const AttrMap& attrs,
+                         int* counter) {
     std::string id = name;
     if (counter) {
         id += "_" + std::to_string((*counter)++);
@@ -106,10 +141,8 @@ bool is_non_diff_dtype(ETensorDType dtype) {
     switch (dtype) {
         case ETensorDType::INT32:
         case ETensorDType::INT8:
-        case ETensorDType::BYTE:
-            return true;
-        default:
-            return false;
+        case ETensorDType::BYTE: return true;
+        default: return false;
     }
 }
 
@@ -139,29 +172,31 @@ bool is_non_differentiable(const Graph& forward, const std::string& name) {
         }
     }
     // Also handle MoE index tensors by name pattern (in case intermediates map is incomplete)
-    if (name.find("scatter_indices") != std::string::npos ||
-        name.find("routing_indices") != std::string::npos ||
-        name.find("gather_indices") != std::string::npos ||
-        name.find("expert_offsets") != std::string::npos ||
+    if (name.find("scatter_indices") != std::string::npos || name.find("routing_indices") != std::string::npos ||
+        name.find("gather_indices") != std::string::npos || name.find("expert_offsets") != std::string::npos ||
         name.find("ep_recv_scatter") != std::string::npos) {
         return true;
     }
     return false;
 }
 
-} // namespace
+}  // namespace
 
 Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& options) {
     Graph backward;
     backward.name = forward.name + "_backward";
 
-    const std::unordered_set<std::string> stop_set(
-        options.stop_gradients.begin(), options.stop_gradients.end());
+    const std::unordered_set<std::string> stop_set(options.stop_gradients.begin(), options.stop_gradients.end());
     auto is_stopped = [&](const std::string& name) -> bool {
         return stop_set.find(name) != stop_set.end();
     };
 
-    auto& registry = BackwardRuleRegistry::instance();
+    // Force BackwardRuleRegistry initialization (triggers
+    // register_builtin_backward_rules, which is now a thin shim that
+    // forwards into OpRegistry). Harmless once autodiff_rules.cpp is
+    // retired; the shim returns immediately.
+    BackwardRuleRegistry::instance();
+    auto& op_reg = OpRegistry::instance();
     int op_counter = 0;
 
     // Build map: tensor_name -> index of operation that produces it
@@ -250,12 +285,12 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
             continue;
         }
 
-        // Get backward rule
-        const BackwardRule* rule = registry.get_rule(op_type);
-        if (!rule) {
-            throw std::runtime_error(
-                "Autodiff: no backward rule registered for operation '" + op_type + "'");
+        // Get backward rule from the unified OpRegistry (Phase 2b).
+        const OpDescriptor* desc = op_reg.find_by_name(op_type);
+        if (!desc || !desc->autodiff_fn) {
+            throw std::runtime_error("Autodiff: no backward rule registered for operation '" + op_type + "'");
         }
+        const AutodiffFn& rule = desc->autodiff_fn;
 
         // Determine output gradient names (one per forward output)
         std::vector<std::string> d_outputs(fwd_op.outputs.size());
@@ -271,7 +306,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
             }
         }
         if (d_output.empty()) {
-            continue; // No gradient available for any output
+            continue;  // No gradient available for any output
         }
 
         // Determine input gradient names
@@ -289,13 +324,13 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
                 }
                 d_inputs.push_back(d_inp);
             } else {
-                d_inputs.push_back(""); // No gradient needed
+                d_inputs.push_back("");  // No gradient needed
             }
         }
 
         // Create context and call backward rule
         BackwardRuleContext ctx{fwd_op, d_outputs, d_output, d_inputs, shape_env, op_counter, &forward};
-        std::vector<Operation> bwd_ops = (*rule)(ctx);
+        std::vector<Operation> bwd_ops = rule(ctx);
 
         // Add generated operations to backward graph
         for (auto& bwd_op : bwd_ops) {
@@ -314,12 +349,11 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
                 // Tensor already has a gradient - need to accumulate
                 std::string accum_name = options.grad_prefix + inp + "_accum_" + std::to_string(op_counter++);
 
-                Operation add_op = make_operation(
-                    "add_grad_" + std::to_string(op_counter),
-                    "add",
-                    "add",
-                    {grad_map[inp], d_inputs[i]},
-                    {accum_name});
+                Operation add_op = make_operation("add_grad_" + std::to_string(op_counter),
+                                                  "add",
+                                                  "add",
+                                                  {grad_map[inp], d_inputs[i]},
+                                                  {accum_name});
                 backward.operations.push_back(add_op);
 
                 grad_map[inp] = accum_name;
@@ -370,7 +404,7 @@ std::vector<std::string> compute_required_saves(const Graph& forward, const Grap
     for (const auto& op : backward.operations) {
         for (const auto& inp : op.inputs) {
             if (starts_with(inp, "saved.")) {
-                needed.insert(inp.substr(6)); // Remove "saved." prefix
+                needed.insert(inp.substr(6));  // Remove "saved." prefix
             }
         }
 
@@ -387,4 +421,4 @@ std::vector<std::string> compute_required_saves(const Graph& forward, const Grap
     return {needed.begin(), needed.end()};
 }
 
-} // namespace dsl
+}  // namespace dsl

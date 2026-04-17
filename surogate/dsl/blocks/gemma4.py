@@ -18,13 +18,13 @@ Block variants:
 from __future__ import annotations
 
 from .. import nn
-from ..nn import GEMMA4_BLOCK_NAME_REMAP
 from ..dim import B, T
-
+from ..nn import GEMMA4_BLOCK_NAME_REMAP
 
 # ============================================================================
 # Helpers shared across block types
 # ============================================================================
+
 
 def _sandwich_attn_phase(block, x, residual, position_ids):
     """Sandwich norm attention phase: input_ln → attn → post_attn_ln → residual add.
@@ -54,14 +54,10 @@ def _per_layer_input_phase(block, residual, per_layer_input):
     # Register activation slots for PLI intermediates so backward replay can
     # allocate output buffers when recomputing the forward pass.
     pli_d = block.PLI_D
-    block._register_activation(
-        "pli_gate_out", ("B * T", pli_d), share_policy="always_recompute")
-    block._register_activation(
-        "pli_gate_act", ("B * T", pli_d), share_policy="always_recompute")
-    block._register_activation(
-        "pli_gated", ("B * T", pli_d), share_policy="always_recompute")
-    block._register_activation(
-        "pli_proj_out", ("B * T", "C"), share_policy="always_recompute")
+    block._register_activation("pli_gate_out", ("B * T", pli_d), share_policy="always_recompute")
+    block._register_activation("pli_gate_act", ("B * T", pli_d), share_policy="always_recompute")
+    block._register_activation("pli_gated", ("B * T", pli_d), share_policy="always_recompute")
+    block._register_activation("pli_proj_out", ("B * T", "C"), share_policy="always_recompute")
 
     h_flat = block._view(residual, [B * T, block.C], name="pli_h_flat")
     gate_out = block._matmul(h_flat, "pli_gate_weight", name="pli_gate_out")
@@ -107,8 +103,9 @@ def _register_frozen_and_pli_params(block):
         block._register_param("pli_proj_weight", ("C", "PLI_D"), quantizable=False)
 
 
-def _make_dims(block, d_model, head_size, num_query_heads, num_kv_heads,
-               d_ff, max_seq, d_per_layer_input, rotary_dim=None):
+def _make_dims(
+    block, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq, d_per_layer_input, rotary_dim=None
+):
     """Set common derived dimension attributes on a block."""
     block.C = d_model
     block.D = head_size
@@ -128,21 +125,37 @@ def _make_dims(block, d_model, head_size, num_query_heads, num_kv_heads,
 # Standard blocks (non-shared, own K/V projections)
 # ============================================================================
 
+
 class Gemma4SlidingBlock(nn.Block):
     """Sliding-window attention + GeLU-gated MLP. Optional per-layer input gating."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
 
-    def __init__(self, d_model, num_query_heads, num_kv_heads, head_size,
-                 d_ff, max_seq, sliding_window=512, d_per_layer_input=0, eps=1e-6):
+    def __init__(
+        self,
+        d_model,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        d_ff,
+        max_seq,
+        sliding_window=512,
+        d_per_layer_input=0,
+        eps=1e-6,
+    ):
         super().__init__()
-        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads,
-                   d_ff, max_seq, d_per_layer_input)
+        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq, d_per_layer_input)
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
         self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Gemma4Attention(
-            d_model, num_query_heads, num_kv_heads, head_size, max_seq,
-            sliding_window=sliding_window, partial_rotary_factor=1.0, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            sliding_window=sliding_window,
+            partial_rotary_factor=1.0,
+            eps=eps,
         )
         self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
@@ -163,6 +176,7 @@ class Gemma4SlidingBlock(nn.Block):
 # ============================================================================
 # MoE block variants (MLP + experts in parallel)
 # ============================================================================
+
 
 def _sandwich_moe_mlp_phase(block, residual):
     """MLP + MoE parallel phase for Gemma4 MoE blocks.
@@ -194,21 +208,37 @@ class Gemma4SlidingMoEBlock(nn.Block):
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
 
-    def __init__(self, d_model, num_query_heads, num_kv_heads, head_size,
-                 d_ff, max_seq, sliding_window=1024,
-                 num_experts=128, num_experts_per_tok=8,
-                 moe_intermediate_size=704, eps=1e-6, ep_size=1):
+    def __init__(
+        self,
+        d_model,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        d_ff,
+        max_seq,
+        sliding_window=1024,
+        num_experts=128,
+        num_experts_per_tok=8,
+        moe_intermediate_size=704,
+        eps=1e-6,
+        ep_size=1,
+    ):
         super().__init__()
-        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads,
-                   d_ff, max_seq, 0)
+        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq, 0)
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
         self.E = num_experts
         self.K_exp = num_experts_per_tok
 
         self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Gemma4Attention(
-            d_model, num_query_heads, num_kv_heads, head_size, max_seq,
-            sliding_window=sliding_window, partial_rotary_factor=1.0, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            sliding_window=sliding_window,
+            partial_rotary_factor=1.0,
+            eps=eps,
         )
         self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
@@ -218,8 +248,12 @@ class Gemma4SlidingMoEBlock(nn.Block):
         self.pre_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
         self.post_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
         self.moe = nn.Gemma4MoEExperts(
-            d_model, moe_intermediate_size, num_experts, num_experts_per_tok,
-            eps=eps, ep_size=ep_size,
+            d_model,
+            moe_intermediate_size,
+            num_experts,
+            num_experts_per_tok,
+            eps=eps,
+            ep_size=ep_size,
         )
 
     def forward(self, x, residual, position_ids, per_layer_input):
@@ -234,14 +268,25 @@ class Gemma4FullMoEBlock(nn.Block):
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
 
-    def __init__(self, d_model, num_query_heads, num_kv_heads, head_size,
-                 d_ff, max_seq, partial_rotary_factor=0.25, k_eq_v=True,
-                 num_experts=128, num_experts_per_tok=8,
-                 moe_intermediate_size=704, eps=1e-6, ep_size=1):
+    def __init__(
+        self,
+        d_model,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        d_ff,
+        max_seq,
+        partial_rotary_factor=0.25,
+        k_eq_v=True,
+        num_experts=128,
+        num_experts_per_tok=8,
+        moe_intermediate_size=704,
+        eps=1e-6,
+        ep_size=1,
+    ):
         super().__init__()
         rotary_dim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
-        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads,
-                   d_ff, max_seq, 0, rotary_dim=rotary_dim)
+        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq, 0, rotary_dim=rotary_dim)
         if k_eq_v:
             self.QKV = (num_query_heads + num_kv_heads) * head_size
         else:
@@ -251,8 +296,14 @@ class Gemma4FullMoEBlock(nn.Block):
 
         self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Gemma4Attention(
-            d_model, num_query_heads, num_kv_heads, head_size, max_seq,
-            partial_rotary_factor=partial_rotary_factor, k_eq_v=k_eq_v, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            partial_rotary_factor=partial_rotary_factor,
+            k_eq_v=k_eq_v,
+            eps=eps,
         )
         self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
@@ -262,8 +313,12 @@ class Gemma4FullMoEBlock(nn.Block):
         self.pre_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
         self.post_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
         self.moe = nn.Gemma4MoEExperts(
-            d_model, moe_intermediate_size, num_experts, num_experts_per_tok,
-            eps=eps, ep_size=ep_size,
+            d_model,
+            moe_intermediate_size,
+            num_experts,
+            num_experts_per_tok,
+            eps=eps,
+            ep_size=ep_size,
         )
 
     def forward(self, x, residual, position_ids, per_layer_input):
@@ -278,13 +333,32 @@ class Gemma4FullBlock(nn.Block):
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
 
-    def __init__(self, d_model, num_query_heads, num_kv_heads, head_size,
-                 d_ff, max_seq, partial_rotary_factor=0.25,
-                 k_eq_v=False, d_per_layer_input=0, eps=1e-6):
+    def __init__(
+        self,
+        d_model,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        d_ff,
+        max_seq,
+        partial_rotary_factor=0.25,
+        k_eq_v=False,
+        d_per_layer_input=0,
+        eps=1e-6,
+    ):
         super().__init__()
         rotary_dim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
-        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads,
-                   d_ff, max_seq, d_per_layer_input, rotary_dim=rotary_dim)
+        _make_dims(
+            self,
+            d_model,
+            head_size,
+            num_query_heads,
+            num_kv_heads,
+            d_ff,
+            max_seq,
+            d_per_layer_input,
+            rotary_dim=rotary_dim,
+        )
         self.k_eq_v = k_eq_v
         if k_eq_v:
             self.QKV = (num_query_heads + num_kv_heads) * head_size
@@ -292,8 +366,14 @@ class Gemma4FullBlock(nn.Block):
             self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
         self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Gemma4Attention(
-            d_model, num_query_heads, num_kv_heads, head_size, max_seq,
-            partial_rotary_factor=partial_rotary_factor, k_eq_v=k_eq_v, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            partial_rotary_factor=partial_rotary_factor,
+            k_eq_v=k_eq_v,
+            eps=eps,
         )
         self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
@@ -315,6 +395,7 @@ class Gemma4FullBlock(nn.Block):
 # Shared-KV blocks (Q-only attention, reads K/V from source layer)
 # ============================================================================
 
+
 def _sandwich_shared_attn_phase(block, x, residual, position_ids, kv_source):
     """Shared-KV attention: input_ln -> Q-only attn(kv_source) -> post_attn_ln -> residual."""
     fresh_zeros = block._zeros(["B", "T", "d_model"], name="fresh_zero")
@@ -335,20 +416,44 @@ class Gemma4SharedKVBlock(nn.Block):
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
 
-    def __init__(self, d_model, num_query_heads, num_kv_heads, head_size,
-                 d_ff, max_seq, partial_rotary_factor=0.25,
-                 d_per_layer_input=256, use_double_wide_mlp=False, eps=1e-6):
+    def __init__(
+        self,
+        d_model,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        d_ff,
+        max_seq,
+        partial_rotary_factor=0.25,
+        d_per_layer_input=256,
+        use_double_wide_mlp=False,
+        eps=1e-6,
+    ):
         super().__init__()
         rotary_dim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
         effective_d_ff = d_ff * 2 if use_double_wide_mlp else d_ff
-        _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads,
-                   effective_d_ff, max_seq, d_per_layer_input, rotary_dim=rotary_dim)
+        _make_dims(
+            self,
+            d_model,
+            head_size,
+            num_query_heads,
+            num_kv_heads,
+            effective_d_ff,
+            max_seq,
+            d_per_layer_input,
+            rotary_dim=rotary_dim,
+        )
         self.QDim = num_query_heads * head_size
 
         self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Gemma4SharedKVAttention(
-            d_model, num_query_heads, num_kv_heads, head_size, max_seq,
-            partial_rotary_factor=partial_rotary_factor, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            partial_rotary_factor=partial_rotary_factor,
+            eps=eps,
         )
         self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
         self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
@@ -360,7 +465,11 @@ class Gemma4SharedKVBlock(nn.Block):
     def forward(self, x, residual, position_ids, per_layer_input, kv_source):
         _register_frozen_and_pli_params(self)
         residual = _sandwich_shared_attn_phase(
-            self, x, residual, position_ids, kv_source,
+            self,
+            x,
+            residual,
+            position_ids,
+            kv_source,
         )
         residual = _sandwich_mlp_phase(self, residual)
         if self.PLI_D > 0:

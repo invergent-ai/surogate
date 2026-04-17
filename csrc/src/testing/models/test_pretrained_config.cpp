@@ -22,7 +22,7 @@ std::filesystem::path write_temp_json(const nlohmann::json& j, const std::string
     return path;
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("load_pretrained_config: parses architecture/model_type strings", "[models][config]") {
     nlohmann::json j;

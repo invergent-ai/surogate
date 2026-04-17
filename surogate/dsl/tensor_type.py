@@ -39,27 +39,36 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Union
 
-from .dim import Dim, DimExpr, ConcreteDimValue
+from .dim import ConcreteDimValue, Dim, DimExpr
 from .types import (
+    ComputedDim,
+    ConcreteDim,
     Dtype,
     Shape,
-    TensorTypeSpec,
     SymbolicDim,
-    ConcreteDim,
-    ComputedDim,
+    TensorTypeSpec,
     VariadicDim,
 )
 
 if TYPE_CHECKING:
-    from .types import Dim as TypeDim
+    pass
 
 
 # Known dtype strings
-_DTYPE_STRINGS = frozenset({
-    "bf16", "fp32", "fp16", "fp8_e4m3", "fp8_e5m2", "fp4_e2m1", "int8", "int32",
-})
+_DTYPE_STRINGS = frozenset(
+    {
+        "bf16",
+        "fp32",
+        "fp16",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "fp4_e2m1",
+        "int8",
+        "int32",
+    }
+)
 
 # Type for dimension in TensorAnnotation
 # Supports: strings, Dim, DimExpr, ConcreteDimValue, or int
@@ -153,10 +162,7 @@ class _TensorMeta(type):
             elif isinstance(d, int):
                 processed_dims.append(ConcreteDimValue(d))
             else:
-                raise TypeError(
-                    f"Tensor dimensions must be str, Dim, DimExpr, or int, "
-                    f"got {type(d).__name__}: {d!r}"
-                )
+                raise TypeError(f"Tensor dimensions must be str, Dim, DimExpr, or int, got {type(d).__name__}: {d!r}")
 
         return TensorAnnotation(dims=tuple(processed_dims), dtype=dtype)
 

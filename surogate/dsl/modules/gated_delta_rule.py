@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..decorators import module, forward
+from ..decorators import forward, module
 from ..graph_builder import graph
 from ..tensor_type import Tensor
 
@@ -24,13 +24,13 @@ class ChunkGatedDeltaRule:
     @forward
     def forward(
         self,
-        query: Tensor["B", "T", "H", "K"],
-        key: Tensor["B", "T", "H", "K"],
-        value: Tensor["B", "T", "H", "V"],
-        g: Tensor["B", "T", "H"],
-        beta: Tensor["B", "T", "H"],
-        initial_state: Tensor["B", "H", "K", "V"] | None = None,
-    ) -> tuple[Tensor["B", "T", "H", "V"], Tensor["B", "H", "K", "V"] | None]:
+        query: Tensor[B, T, H, K],
+        key: Tensor[B, T, H, K],
+        value: Tensor[B, T, H, V],
+        g: Tensor[B, T, H],
+        beta: Tensor[B, T, H],
+        initial_state: Tensor[B, H, K, V] | None = None,
+    ) -> tuple[Tensor[B, T, H, V], Tensor[B, H, K, V] | None]:
         with graph() as gb:
             inputs = [query, key, value, g, beta]
             if initial_state is not None:

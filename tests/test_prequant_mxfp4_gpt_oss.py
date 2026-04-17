@@ -55,6 +55,7 @@ MINI_MODEL_DIR = Path("tmp/prequant_mxfp4_gpt_oss_mini")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def resolve_model_path() -> Path | None:
     """Resolve the path to GPT-OSS MXFP4 weights."""
     env = os.environ.get(ENV_VAR)
@@ -122,9 +123,7 @@ def prepare_mini_model(snapshot_dir: Path) -> Path:
     config.setdefault("attention_bias", True)
     if isinstance(config.get("layer_types"), list):
         config["layer_types"] = ["full_attention"] * NUM_LAYERS
-    (MINI_MODEL_DIR / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n"
-    )
+    (MINI_MODEL_DIR / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     for tok_file in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
         src = snapshot_dir / tok_file
@@ -177,6 +176,7 @@ def make_inputs(vocab_size: int):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def model_dir():
     snapshot = resolve_model_path()
@@ -189,6 +189,7 @@ def model_dir():
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestPrequantMXFP4GptOss:
     """Pre-quantized MXFP4 loading + LoRA smoke tests."""
@@ -224,8 +225,7 @@ class TestPrequantMXFP4GptOss:
             alpha=32,
             dropout=0.0,
             dtype="bf16",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_up_proj", "down_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"],
             use_rslora=False,
         )
 
@@ -233,8 +233,7 @@ class TestPrequantMXFP4GptOss:
         qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
         # Set modules_to_not_convert from HF quantization_config
         qcfg = config.get("quantization_config", {})
-        modules_to_not_convert = qcfg.get(
-            "modules_to_not_convert", qcfg.get("ignore", []))
+        modules_to_not_convert = qcfg.get("modules_to_not_convert", qcfg.get("ignore", []))
         if modules_to_not_convert:
             qlora_config.modules_to_not_convert = modules_to_not_convert
 
@@ -306,15 +305,13 @@ class TestPrequantMXFP4GptOss:
             alpha=32,
             dropout=0.0,
             dtype="bf16",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_up_proj", "down_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"],
             use_rslora=False,
         )
 
         qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
         qcfg = config.get("quantization_config", {})
-        modules_to_not_convert = qcfg.get(
-            "modules_to_not_convert", qcfg.get("ignore", []))
+        modules_to_not_convert = qcfg.get("modules_to_not_convert", qcfg.get("ignore", []))
         if modules_to_not_convert:
             qlora_config.modules_to_not_convert = modules_to_not_convert
 
@@ -355,5 +352,4 @@ class TestPrequantMXFP4GptOss:
             assert np.isfinite(loss), f"Step {i} loss is not finite: {loss}"
 
         # Loss should decrease (or at least not diverge) over 3 steps
-        assert losses[-1] < losses[0] * 1.5, (
-            f"Loss didn't decrease: {losses[0]:.4f} -> {losses[-1]:.4f}")
+        assert losses[-1] < losses[0] * 1.5, f"Loss didn't decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"

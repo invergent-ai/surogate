@@ -1,12 +1,34 @@
 from __future__ import annotations
+
 import collections.abc
-import nanobind
 import enum
 import typing
+
+import nanobind
 import numpy as np
 import numpy.typing as npt
 
-__all__: list[str] = ['DataLoader', 'GPUInfo', 'GPUUtilInfo', 'LoRAAdapterConfig', 'LogVerbosity', 'OptimizerConfig', 'OptimizerType', 'PretrainedConfig', 'QLoRAConfig', 'QLoRAQuantStrategy', 'RuntimeOptions', 'SurogateTrainer', 'SystemInfo', 'TrainingRunLogger', 'clean_old_checkpoints', 'find_latest_checkpoint', 'get_all_checkpoints', 'get_checkpoint_path', 'get_num_gpus']
+__all__: list[str] = [
+    "DataLoader",
+    "GPUInfo",
+    "GPUUtilInfo",
+    "LoRAAdapterConfig",
+    "LogVerbosity",
+    "OptimizerConfig",
+    "OptimizerType",
+    "PretrainedConfig",
+    "QLoRAConfig",
+    "QLoRAQuantStrategy",
+    "RuntimeOptions",
+    "SurogateTrainer",
+    "SystemInfo",
+    "TrainingRunLogger",
+    "clean_old_checkpoints",
+    "find_latest_checkpoint",
+    "get_all_checkpoints",
+    "get_checkpoint_path",
+    "get_num_gpus",
+]
 
 class OptimizerType(enum.Enum):
     """
@@ -17,6 +39,7 @@ class OptimizerType(enum.Enum):
     - ADAMW_8BIT: 8-bit AdamW with blockwise quantization.
     - NORMUON: NorMuon hybrid optimizer (orthogonalized momentum for 2D weights, AdamW for others).
     """
+
     ADAMW: typing.ClassVar[OptimizerType]  # value = OptimizerType.ADAMW
     ADAMW_8BIT: typing.ClassVar[OptimizerType]  # value = OptimizerType.ADAMW_8BIT
     NORMUON: typing.ClassVar[OptimizerType]  # value = OptimizerType.NORMUON
@@ -33,7 +56,21 @@ class OptimizerConfig:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, *, optimizer: str = 'adamw_8bit', learning_rate: float = 2e-4, weight_decay: float = 0.1, grad_clip: float = 0.0, adamw_beta1: float = 0.9, adamw_beta2: float = 0.999, adamw_epsilon: float = 1e-8, normuon_momentum: float = 0.95, normuon_beta2: float = 0.95, normuon_lr: float = 0.02, normuon_cautious_wd: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        optimizer: str = "adamw_8bit",
+        learning_rate: float = 2e-4,
+        weight_decay: float = 0.1,
+        grad_clip: float = 0.0,
+        adamw_beta1: float = 0.9,
+        adamw_beta2: float = 0.999,
+        adamw_epsilon: float = 1e-8,
+        normuon_momentum: float = 0.95,
+        normuon_beta2: float = 0.95,
+        normuon_lr: float = 0.02,
+        normuon_cautious_wd: bool = True,
+    ) -> None:
         """
         Create an optimizer configuration.
 
@@ -50,17 +87,38 @@ class OptimizerConfig:
         Return a debug string representation.
         """
     @staticmethod
-    def adamw(lr: float = 2e-4, beta1: float = 0.9, beta2: float = 0.999, epsilon: float = 1e-8, weight_decay: float = 0.1, grad_clip: float = 0.0) -> OptimizerConfig:
+    def adamw(
+        lr: float = 2e-4,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        epsilon: float = 1e-8,
+        weight_decay: float = 0.1,
+        grad_clip: float = 0.0,
+    ) -> OptimizerConfig:
         """
         Create AdamW (full-precision) configuration.
         """
     @staticmethod
-    def adamw_8bit(lr: float = 2e-4, beta1: float = 0.9, beta2: float = 0.999, epsilon: float = 1e-8, weight_decay: float = 0.1, grad_clip: float = 0.0) -> OptimizerConfig:
+    def adamw_8bit(
+        lr: float = 2e-4,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        epsilon: float = 1e-8,
+        weight_decay: float = 0.1,
+        grad_clip: float = 0.0,
+    ) -> OptimizerConfig:
         """
         Create AdamW 8-bit configuration.
         """
     @staticmethod
-    def normuon(lr: float = 0.02, momentum: float = 0.95, beta2: float = 0.95, weight_decay: float = 0.01, grad_clip: float = 0.0, cautious_wd: bool = True) -> OptimizerConfig:
+    def normuon(
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        beta2: float = 0.95,
+        weight_decay: float = 0.01,
+        grad_clip: float = 0.0,
+        cautious_wd: bool = True,
+    ) -> OptimizerConfig:
         """
         Create NorMuon configuration.
 
@@ -132,10 +190,11 @@ class OptimizerConfig:
     @type.setter
     def type(self, arg: str) -> None:
         """Optimizer type as string."""
+
 class DataLoader:
     """
     Streaming token dataset loader.
-    
+
     Loads fixed-size chunks from a list of token files and fills preallocated arrays.
     """
     @staticmethod
@@ -146,7 +205,7 @@ class DataLoader:
     def __init__(self, file_list: collections.abc.Sequence[str], chunk_size: int, seed: int = 42) -> None:
         """
         Create a DataLoader.
-        
+
         Parameters:
         - file_list: List of dataset file paths.
         - chunk_size: Chunk size in tokens.
@@ -167,7 +226,7 @@ class DataLoader:
     def load_batch(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32]) -> None:
         """
         Fill `inputs` and `targets` with the next batch.
-        
+
         Parameters:
         - inputs: Preallocated int32 array [batch, seq_len].
         - targets: Preallocated int32 array [batch, seq_len].
@@ -179,7 +238,7 @@ class DataLoader:
     def set_state(self, seed: int, epoch: int, file_index: int, chunk_index: int) -> None:
         """
         Set the internal iteration state.
-        
+
         Parameters:
         - seed: RNG seed.
         - epoch: Epoch number.
@@ -216,6 +275,7 @@ class DataLoader:
         """
         Vocabulary size declared by the dataset.
         """
+
 class GPUInfo:
     """
     Information about a single GPU device.
@@ -279,10 +339,11 @@ class GPUInfo:
         """
         Total device memory (bytes).
         """
+
 class GPUUtilInfo:
     """
     Snapshot of GPU utilization/telemetry.
-    
+
     All fields are read/write and represent the most recently sampled values.
     Units are implementation-defined; typically MHz for clocks, W for power, C for temperatures, and bytes for memory counters.
     """
@@ -445,12 +506,13 @@ class GPUUtilInfo:
         """
         Vendor-specific throttling reason bitmask/string code.
         """
+
 class LoRAAdapterConfig:
     """
     LoRA (Low-Rank Adaptation) adapter configuration.
-    
+
     Controls which modules receive LoRA adapters and with which rank/scaling/dtype.
-    
+
     Backwards-compatibility: `LoRAConfig` is an alias of this class.
     """
     @staticmethod
@@ -458,10 +520,19 @@ class LoRAAdapterConfig:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, *, rank: int = 8, alpha: float = 16.0, dropout: float = 0.0, target_modules: collections.abc.Sequence[str] = ['q_proj', 'k_proj', 'v_proj', 'o_proj'], dtype: str = 'bf16', use_rslora: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+        target_modules: collections.abc.Sequence[str] = ["q_proj", "k_proj", "v_proj", "o_proj"],
+        dtype: str = "bf16",
+        use_rslora: bool = False,
+    ) -> None:
         """
         Create a LoRA configuration.
-        
+
         Parameters:
         - rank: LoRA rank.
         - alpha: LoRA alpha (scaling numerator).
@@ -543,24 +614,28 @@ class LoRAAdapterConfig:
         """
         Whether to use RS-LoRA variant.
         """
+
 class LogVerbosity(enum.Enum):
     """
     Logger verbosity level.
     """
+
     DEFAULT: typing.ClassVar[LogVerbosity]  # value = LogVerbosity.DEFAULT
     QUIET: typing.ClassVar[LogVerbosity]  # value = LogVerbosity.QUIET
     SILENT: typing.ClassVar[LogVerbosity]  # value = LogVerbosity.SILENT
     VERBOSE: typing.ClassVar[LogVerbosity]  # value = LogVerbosity.VERBOSE
+
 class PretrainedConfig:
     """
     Model configuration used to build/initialize a transformer.
-    
+
     Notes:
     - Some defaults depend on `architecture`.
     - `dtype` controls the model's compute/storage type where applicable.
-    
+
     Backwards-compatibility: `LLamaConfig` is an alias of this class.
     """
+
     from_name: typing.ClassVar[nanobind.nb_func]  # value = <nanobind.nb_func object>
     from_pretrained: typing.ClassVar[nanobind.nb_func]  # value = <nanobind.nb_func object>
     @staticmethod
@@ -568,10 +643,28 @@ class PretrainedConfig:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, *, architecture: str, bos_token_id: int | None = None, eos_token_id: int | None = None, hidden_size: int, intermediate_size: int, vocab_size: int | None = None, num_attention_heads: int, num_key_value_heads: int, num_hidden_layers: int, max_position_embeddings: int | None = None, rope_theta: float | None = None, rms_norm_eps: float, tie_word_embeddings: bool, use_qkv_bias: bool | None = None, dtype: str = 'bf16') -> None:
+    def __init__(
+        self,
+        *,
+        architecture: str,
+        bos_token_id: int | None = None,
+        eos_token_id: int | None = None,
+        hidden_size: int,
+        intermediate_size: int,
+        vocab_size: int | None = None,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        num_hidden_layers: int,
+        max_position_embeddings: int | None = None,
+        rope_theta: float | None = None,
+        rms_norm_eps: float,
+        tie_word_embeddings: bool,
+        use_qkv_bias: bool | None = None,
+        dtype: str = "bf16",
+    ) -> None:
         """
         Create a model configuration.
-        
+
         Parameters:
         - architecture: Model family identifier (currently: qwen2).
         - bos_token_id/eos_token_id: Token IDs; if None, architecture defaults are used.
@@ -751,15 +844,17 @@ class PretrainedConfig:
         """
         Vocabulary size.
         """
+
 class QLoRAConfig:
     """
     QLoRA (Quantized LoRA) configuration for memory-efficient adapter training.
-    
+
     Configures quantization of base model weights. The base model is stored in a
     quantized format (FP8 or FP4) while LoRA adapters remain in full precision.
-    
+
     Use QLoRAConfig.fp8() or QLoRAConfig.nvfp4() factory methods to create configs.
     """
+
     fp8: typing.ClassVar[nanobind.nb_func]  # value = <nanobind.nb_func object>
     none: typing.ClassVar[nanobind.nb_func]  # value = <nanobind.nb_func object>
     nvfp4: typing.ClassVar[nanobind.nb_func]  # value = <nanobind.nb_func object>
@@ -768,10 +863,18 @@ class QLoRAConfig:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, *, enabled: bool = False, strategy: str = 'none', block_size: int = 128, base_dtype: str = '', adapter_dtype: str = 'bf16') -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        strategy: str = "none",
+        block_size: int = 128,
+        base_dtype: str = "",
+        adapter_dtype: str = "bf16",
+    ) -> None:
         """
         Create a QLoRA configuration.
-        
+
         Parameters:
         - enabled: Whether QLoRA is enabled.
         - strategy: Quantization strategy ('none', 'fp8', 'nvfp4').
@@ -883,19 +986,22 @@ class QLoRAConfig:
         """
         Per-expert MLP intermediate size (0 = use regular intermediate_size).
         """
+
 class QLoRAQuantStrategy(enum.Enum):
     """
     Quantization strategy for QLoRA base weights.
     """
+
     FP8: typing.ClassVar[QLoRAQuantStrategy]  # value = QLoRAQuantStrategy.FP8
     NONE: typing.ClassVar[QLoRAQuantStrategy]  # value = QLoRAQuantStrategy.NONE
     NVFP4: typing.ClassVar[QLoRAQuantStrategy]  # value = QLoRAQuantStrategy.NVFP4
+
 class RuntimeOptions:
     """
     Execution/training options controlling recomputation, offloading, sharding, and dtypes.
-    
+
     Many flags trade compute for memory (recompute) or host/device transfers (offload).
-    
+
     Backwards-compatibility: `LLamaOptions` is an alias of this class.
     """
     @staticmethod
@@ -903,10 +1009,47 @@ class RuntimeOptions:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, *, recompute_swiglu: bool = False, recompute_rmsnorm: bool = False, recompute_ffn: bool = False, recompute_qkv: bool = False, recompute_att: bool = False, recompute_block: bool = False, offload_residual: bool = False, use_cuda_graphs: bool = True, trigger_timing_events: bool = False, offload_master: bool = False, offload_quants: bool = False, offload_optimizer: bool = False, offload_grads: bool = False, use_zero_copy: bool = False, use_write_combined: bool = False, shard_weights: bool = False, persistent_quants: bool = False, shard_gradients: bool = False, use_all_to_all_reduce: bool = False, init_projections_to_zero: bool = False, lmhead_chunks: int = 1, attn_bwd_chunks: int = 1, matmul_type: str = '', gradient_type: str = '', master_dtype: str = '', recipe: str = 'bf16', matmul_backend: str = '', use_fused_rope: bool = False, doc_masking: bool = True, fp8_amax_history: int = 1024, fp4_backend: str = 'cutlass', no_fp4_stochastic_rounding: bool = False, skip_quant_first_layers: int = 0, skip_quant_last_layers: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        recompute_swiglu: bool = False,
+        recompute_rmsnorm: bool = False,
+        recompute_ffn: bool = False,
+        recompute_qkv: bool = False,
+        recompute_att: bool = False,
+        recompute_block: bool = False,
+        offload_residual: bool = False,
+        use_cuda_graphs: bool = True,
+        trigger_timing_events: bool = False,
+        offload_master: bool = False,
+        offload_quants: bool = False,
+        offload_optimizer: bool = False,
+        offload_grads: bool = False,
+        use_zero_copy: bool = False,
+        use_write_combined: bool = False,
+        shard_weights: bool = False,
+        persistent_quants: bool = False,
+        shard_gradients: bool = False,
+        use_all_to_all_reduce: bool = False,
+        init_projections_to_zero: bool = False,
+        lmhead_chunks: int = 1,
+        attn_bwd_chunks: int = 1,
+        matmul_type: str = "",
+        gradient_type: str = "",
+        master_dtype: str = "",
+        recipe: str = "bf16",
+        matmul_backend: str = "",
+        use_fused_rope: bool = False,
+        doc_masking: bool = True,
+        fp8_amax_history: int = 1024,
+        fp4_backend: str = "cutlass",
+        no_fp4_stochastic_rounding: bool = False,
+        skip_quant_first_layers: int = 0,
+        skip_quant_last_layers: int = 0,
+    ) -> None:
         """
         Create runtime/training options.
-        
+
         Parameters:
         - recompute_*: Enable recomputation for submodules to reduce activation memory.
         - offload_*: Offload specific buffers/states; may reduce VRAM at performance cost.
@@ -1224,23 +1367,37 @@ class RuntimeOptions:
         """
         Use zero-copy buffers where supported.
         """
+
 class SurogateTrainer:
     """
     Multi-GPU trainer wrapper.
-    
+
     Provides training/evaluation steps and checkpoint/weight import/export.
     Some operations may run asynchronously (see method docs).
     """
+
     from_pretrained: typing.ClassVar[nanobind.nb_func]  # value = <nanobind.nb_func object>
     @staticmethod
     def __new__(type, *args, **kwargs):
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, ngpu: int, config: PretrainedConfig, options: RuntimeOptions, batch_size: int, seq_len: int, grad_accum: int, memcpy_all_gather: bool = True, memcpy_send_recv: bool = True, lora_config: surogate._surogate.LoRAAdapterConfig | None = None, qlora_config: surogate._surogate.QLoRAConfig | None = None) -> None:
+    def __init__(
+        self,
+        ngpu: int,
+        config: PretrainedConfig,
+        options: RuntimeOptions,
+        batch_size: int,
+        seq_len: int,
+        grad_accum: int,
+        memcpy_all_gather: bool = True,
+        memcpy_send_recv: bool = True,
+        lora_config: surogate._surogate.LoRAAdapterConfig | None = None,
+        qlora_config: surogate._surogate.QLoRAConfig | None = None,
+    ) -> None:
         """
         Create a trainer instance.
-        
+
         Parameters:
         - ngpu: Number of GPUs to use.
         - config: Model configuration.
@@ -1252,13 +1409,13 @@ class SurogateTrainer:
         - lora_config: Optional LoRA configuration for adapter training (freezes base model).
         - qlora_config: Optional QLoRA configuration for quantized base weights (FP8/FP4).
         """
-    def export_adapter(self, path: str, base_model_path: str = '') -> None:
+    def export_adapter(self, path: str, base_model_path: str = "") -> None:
         """
         Export LoRA adapter weights to a directory (PEFT-compatible format).
-        
+
         Only works if the model was created with a LoRA configuration.
         Creates adapter_model.safetensors and adapter_config.json.
-        
+
         Parameters:
         - path: Output directory path.
         - base_model_path: Optional path/name of base model for adapter_config.json.
@@ -1268,8 +1425,8 @@ class SurogateTrainer:
         input_ids: npt.NDArray[np.int32],
         targets: npt.NDArray[np.int32],
         use_lora: bool = True,
-        position_ids: typing.Optional[npt.NDArray[np.int32]] = None,
-        temperatures: typing.Optional[npt.NDArray[np.float32]] = None,
+        position_ids: npt.NDArray[np.int32] | None = None,
+        temperatures: npt.NDArray[np.float32] | None = None,
     ) -> npt.NDArray[np.float32]:
         """
         Compute per-token log-probabilities for a batch.
@@ -1291,8 +1448,8 @@ class SurogateTrainer:
         input_ids: npt.NDArray[np.int32],
         targets: npt.NDArray[np.int32],
         per_token_grads: npt.NDArray[np.float32],
-        position_ids: typing.Optional[npt.NDArray[np.int32]] = None,
-        temperatures: typing.Optional[npt.NDArray[np.float32]] = None,
+        position_ids: npt.NDArray[np.int32] | None = None,
+        temperatures: npt.NDArray[np.float32] | None = None,
     ) -> None:
         """
         Run one training micro-step with externally-computed per-token gradient multipliers.
@@ -1321,10 +1478,10 @@ class SurogateTrainer:
     def get_allocator_info(self, gpu_id: int = 0) -> dict:
         """
         Get current memory allocator statistics.
-        
+
         Parameters:
         - gpu_id: Which GPU to query.
-        
+
         Returns: dict[str, dict] with per-segment counters; stack entries include {'stack': bytes}.
         """
     def get_gpu_info(self) -> list[GPUUtilInfo]:
@@ -1334,29 +1491,29 @@ class SurogateTrainer:
     def get_gradients(self, gpu_id: int) -> dict:
         """
         Return gradient shards for debugging.
-        
+
         Parameters:
         - gpu_id: Which GPU's shard to return.
-        
+
         Returns: dict[str, ndarray] mapping parameter name -> gradient view.
         Note: blocking; intended for debugging only.
         """
     def get_lora_gradients(self, gpu_id: int) -> dict:
         """
         Return LoRA adapter gradients for debugging.
-        
+
         Only works if the trainer was constructed with a LoRA configuration.
-        
+
         Parameters:
         - gpu_id: Which GPU's gradients to return.
-        
+
         Returns: dict[str, ndarray] mapping adapter parameter name -> gradient view.
         Note: blocking; intended for debugging only.
         """
     def import_weights(self, path: str) -> None:
         """
         Import weights from a HuggingFace model file.
-        
+
         Parameters:
         - path: Path to model.safetensors or model.safetensors.index.json.
         """
@@ -1367,7 +1524,7 @@ class SurogateTrainer:
     def load_checkpoint(self, path: str, step: int) -> None:
         """
         Load a checkpoint.
-        
+
         Parameters:
         - path: Checkpoint directory.
         - step: Step number to load.
@@ -1375,7 +1532,7 @@ class SurogateTrainer:
     def save_checkpoint(self, path: str, step: int) -> None:
         """
         Save a checkpoint.
-        
+
         Parameters:
         - path: Checkpoint directory.
         - step: Step number to save.
@@ -1383,9 +1540,9 @@ class SurogateTrainer:
     def step(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32]) -> None:
         """
         Perform one training step (forward + backward).
-        
+
         This call is asynchronous; the loss becomes available on the next `update()`.
-        
+
         Parameters:
         - inputs: int32 token ids shaped [batch_size * world_size, seq_length].
         - targets: int32 token ids shaped [batch_size * world_size, seq_length].
@@ -1403,8 +1560,9 @@ class SurogateTrainer:
 
         Returns: dict with keys {loss: float, norm: float}.
         """
-    def train_step_graphed(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32],
-                           config: OptimizerConfig, step: int) -> dict:
+    def train_step_graphed(
+        self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32], config: OptimizerConfig, step: int
+    ) -> dict:
         """
         Run a full training step with CUDA graph capture (forward+backward+optimizer).
 
@@ -1416,8 +1574,14 @@ class SurogateTrainer:
 
         Returns: dict with keys {loss: float, norm: float}.
         """
-    def train_step_graphed(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32],
-                           position_ids: npt.NDArray[np.int32], config: OptimizerConfig, step: int) -> dict:
+    def train_step_graphed(
+        self,
+        inputs: npt.NDArray[np.int32],
+        targets: npt.NDArray[np.int32],
+        position_ids: npt.NDArray[np.int32],
+        config: OptimizerConfig,
+        step: int,
+    ) -> dict:
         """
         Run a full training step with CUDA graph capture and explicit position ids.
 
@@ -1440,8 +1604,9 @@ class SurogateTrainer:
 
         Returns: loss (float).
         """
-    def validate(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32],
-                 position_ids: npt.NDArray[np.int32]) -> float:
+    def validate(
+        self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32], position_ids: npt.NDArray[np.int32]
+    ) -> float:
         """
         Compute validation loss for one batch (forward only) with explicit position ids.
 
@@ -1467,6 +1632,7 @@ class SurogateTrainer:
         """
         Number of participating GPUs.
         """
+
 class SystemInfo:
     """
     System information utility class.
@@ -1508,10 +1674,11 @@ class SystemInfo:
 
         Returns: List of GPUInfo objects, one per device.
         """
+
 class TrainingRunLogger:
     """
     Training run logger.
-    
+
     Writes a structured log to `file_name` and optionally forwards messages to a Python callback.
     """
     @staticmethod
@@ -1519,7 +1686,9 @@ class TrainingRunLogger:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, file_name: str, callback: object | None = None, verbosity: LogVerbosity = LogVerbosity.DEFAULT) -> None:
+    def __init__(
+        self, file_name: str, callback: object | None = None, verbosity: LogVerbosity = LogVerbosity.DEFAULT
+    ) -> None:
         """
         Create a logger.
 
@@ -1531,21 +1700,21 @@ class TrainingRunLogger:
     def log_allocator(self, stats: dict) -> None:
         """
         Log memory allocator statistics.
-        
+
         Parameters:
         - stats: dict[str, dict]. For segments: keys {device, managed, pinned, pageable}. For stacks: key {'stack': bytes}.
         """
     def log_cmd(self, args: collections.abc.Sequence[str]) -> None:
         """
         Log command line arguments.
-        
+
         Parameters:
         - args: List of argv-style strings.
         """
     def log_dataset(self, train_loader: DataLoader, eval_loader: DataLoader) -> None:
         """
         Log dataset information.
-        
+
         Parameters:
         - train_loader: Training DataLoader.
         - eval_loader: Evaluation DataLoader.
@@ -1553,7 +1722,7 @@ class TrainingRunLogger:
     def log_eval(self, step: int, epoch: float, eval_tokens: int, duration_ms: int, loss: float) -> None:
         """
         Log an evaluation step.
-        
+
         Parameters:
         - step: Global step index.
         - epoch: Current epoch.
@@ -1564,7 +1733,7 @@ class TrainingRunLogger:
     def log_gpu_state(self, step: int, gpu_id: int, gpu_util: GPUUtilInfo) -> None:
         """
         Log GPU utilization state.
-        
+
         Parameters:
         - step: Global step.
         - gpu_id: GPU index.
@@ -1573,14 +1742,16 @@ class TrainingRunLogger:
     def log_options(self, options: dict) -> None:
         """
         Log training options.
-        
+
         Parameters:
         - options: dict[str, (bool|int|float|str)]. Unsupported value types raise.
         """
-    def log_step(self, step: int, epoch: float, step_tokens: int, duration_ms: int, norm: float, loss: float, lr: float) -> None:
+    def log_step(
+        self, step: int, epoch: float, step_tokens: int, duration_ms: int, norm: float, loss: float, lr: float
+    ) -> None:
         """
         Log a training step.
-        
+
         Parameters:
         - step: Global step index.
         - epoch: Current epoch.
@@ -1593,10 +1764,11 @@ class TrainingRunLogger:
     def set_expected_time_per_token(self, trainer: SurogateTrainer) -> None:
         """
         Log a compute/throughput estimate based on the current model/trainer configuration.
-        
+
         Parameters:
         - trainer: SurogateTrainer instance to read config/options/shape from.
         """
+
 clean_old_checkpoints: nanobind.nb_func  # value = <nanobind.nb_func object>
 find_latest_checkpoint: nanobind.nb_func  # value = <nanobind.nb_func object>
 get_all_checkpoints: nanobind.nb_func  # value = <nanobind.nb_func object>

@@ -75,11 +75,22 @@ sSafeTensorsHeader read_safetensors_header(const std::string& file_name) {
  * @param data_begin Absolute byte offset in file where tensor data begins.
  * @param data_end Absolute byte offset in file where tensor data ends (exclusive).
  */
-SafeTensorEntry::SafeTensorEntry(const std::string& name, const std::vector<long>& shape, ETensorDType dtype,
-                                 std::string file_name, std::shared_ptr<cuFileRef> handle, SafeTensorsReader* reader,
-                                 std::ptrdiff_t data_begin, std::ptrdiff_t data_end)
-    : mName(name), mShape(shape), mDType(dtype), mFileName(std::move(file_name)), mHandle(handle), mReader(reader),
-      mDataBegin(data_begin), mDataEnd(data_end) {
+SafeTensorEntry::SafeTensorEntry(const std::string& name,
+                                 const std::vector<long>& shape,
+                                 ETensorDType dtype,
+                                 std::string file_name,
+                                 std::shared_ptr<cuFileRef> handle,
+                                 SafeTensorsReader* reader,
+                                 std::ptrdiff_t data_begin,
+                                 std::ptrdiff_t data_end)
+    : mName(name),
+      mShape(shape),
+      mDType(dtype),
+      mFileName(std::move(file_name)),
+      mHandle(handle),
+      mReader(reader),
+      mDataBegin(data_begin),
+      mDataEnd(data_end) {
 }
 
 /**
@@ -95,17 +106,20 @@ SafeTensorEntry::SafeTensorEntry(const std::string& name, const std::vector<long
  *
  * @throws std::runtime_error On invalid range, size mismatch, or dtype mismatch (if allow_cast is false).
  */
-void SafeTensorEntry::read_raw(Tensor& target, std::ptrdiff_t offset,
-                               std::ptrdiff_t elements, bool allow_cast) const {
+void SafeTensorEntry::read_raw(Tensor& target, std::ptrdiff_t offset, std::ptrdiff_t elements, bool allow_cast) const {
     long nelem = (mDataEnd - mDataBegin) / get_dtype_size(mDType);
     if (offset < 0 || offset + elements > nelem)
-        throw std::runtime_error(fmt::format("Invalid read range: offset={}, elements={}, size={}",
-                                             offset, elements, nelem));
+        throw std::runtime_error(
+            fmt::format("Invalid read range: offset={}, elements={}, size={}", offset, elements, nelem));
 
     // Check if target has enough space (in bytes)
     if (target.bytes() != elements * get_dtype_size(target.DType))
-        throw std::runtime_error(fmt::format("Target tensor size mismatch for `{}`: has {} bytes, needs {} elements of {} bytes",
-                                                 mName, target.bytes(), elements, get_dtype_size(target.DType)));
+        throw std::runtime_error(
+            fmt::format("Target tensor size mismatch for `{}`: has {} bytes, needs {} elements of {} bytes",
+                        mName,
+                        target.bytes(),
+                        elements,
+                        get_dtype_size(target.DType)));
 
     std::ptrdiff_t start = mDataBegin + offset * get_dtype_size(mDType);
     std::ptrdiff_t end = start + elements * get_dtype_size(mDType);
@@ -113,7 +127,8 @@ void SafeTensorEntry::read_raw(Tensor& target, std::ptrdiff_t offset,
     // Validate dtype
     if (mDType != target.DType && !allow_cast)
         throw std::runtime_error(fmt::format("DType mismatch: tensor has {}, file has {}",
-                                             dtype_to_str(target.DType), dtype_to_str(mDType)));
+                                             dtype_to_str(target.DType),
+                                             dtype_to_str(mDType)));
 
     if (mDType == target.DType) {
         mHandle->read_bytes(target.Data, start, end);
@@ -124,8 +139,12 @@ void SafeTensorEntry::read_raw(Tensor& target, std::ptrdiff_t offset,
             mReader->mConversionBufferSize = std::min(end - start, 256 * 1024 * 1024L);
             CUDA_CHECK(cudaMalloc((void**)&mReader->mConversionBuffer, mReader->mConversionBufferSize));
         }
-        mHandle->read_and_convert(target.Data, start, end, mFileName,
-                                  target.DType, mDType,
+        mHandle->read_and_convert(target.Data,
+                                  start,
+                                  end,
+                                  mFileName,
+                                  target.DType,
+                                  mDType,
                                   mReader->mConversionBuffer,
                                   mReader->mConversionBufferSize);
     }
@@ -141,13 +160,16 @@ void SafeTensorEntry::read_raw(Tensor& target, std::ptrdiff_t offset,
  */
 void SafeTensorEntry::read_tensor(Tensor& target, bool allow_cast) const {
     if (target.Rank != static_cast<int>(mShape.size()))
-        throw std::runtime_error(fmt::format("Rank mismatch for tensor `{}`: expected {}, got {}",
-                                             mName, mShape.size(), target.Rank));
+        throw std::runtime_error(
+            fmt::format("Rank mismatch for tensor `{}`: expected {}, got {}", mName, mShape.size(), target.Rank));
 
     for (int i = 0; i < target.Rank; ++i)
         if (mShape[i] != target.Sizes[i])
             throw std::runtime_error(fmt::format("Shape mismatch for tensor `{}` at dim {}: expected {}, got {}",
-                                                 mName, i, mShape[i], target.Sizes[i]));
+                                                 mName,
+                                                 i,
+                                                 mShape[i],
+                                                 target.Sizes[i]));
     read_raw(target, 0, target.nelem(), allow_cast);
 }
 
@@ -212,8 +234,8 @@ void SafeTensorsReader::parse_single_file(const std::string& file_path) {
         auto begin = el.value()["data_offsets"][0].get<std::ptrdiff_t>();
         auto end = el.value()["data_offsets"][1].get<std::ptrdiff_t>();
 
-        mEntries.emplace_back(SafeTensorEntry{name, shape, dtype, file_path, cu_file, this,
-                                              begin + offset, end + offset});
+        mEntries.emplace_back(
+            SafeTensorEntry{name, shape, dtype, file_path, cu_file, this, begin + offset, end + offset});
     }
 }
 
@@ -237,8 +259,7 @@ void SafeTensorsReader::parse_index_file(const std::string& index_file) {
 
     for (const auto& el : weight_map.items()) {
         auto f_name = el.value().get<std::string>();
-        if (processed_files.contains(f_name))
-            continue;
+        if (processed_files.contains(f_name)) continue;
         processed_files.insert(f_name);
 
         std::filesystem::path full_path = index_path.parent_path() / f_name;
@@ -259,9 +280,8 @@ void SafeTensorsReader::parse_index_file(const std::string& index_file) {
  */
 void SafeTensorsReader::load_tensors(ITensorContainer& container, bool allow_cast) const {
     std::unordered_map<std::string, Tensor> named_tensors;
-    container.iterate_tensors([&named_tensors](std::string name, const Tensor& tensor) {
-        named_tensors.emplace(std::move(name), tensor);
-    });
+    container.iterate_tensors(
+        [&named_tensors](std::string name, const Tensor& tensor) { named_tensors.emplace(std::move(name), tensor); });
 
     for (const auto& entry : mEntries)
         if (auto found = named_tensors.find(entry.name()); found != named_tensors.end())
@@ -278,7 +298,8 @@ SafeTensorsReader::~SafeTensorsReader() {
         auto err = cudaFree(mConversionBuffer);
         if (err != cudaSuccess) {
             // Never throw from a destructor — it causes std::terminate during stack unwinding.
-            fprintf(stderr, "[SafeTensorsReader] WARNING: cudaFree(mConversionBuffer) failed: %s\n",
+            fprintf(stderr,
+                    "[SafeTensorsReader] WARNING: cudaFree(mConversionBuffer) failed: %s\n",
                     cudaGetErrorString(err));
             cudaGetLastError();  // Clear the error
         }
@@ -295,8 +316,7 @@ SafeTensorsReader::~SafeTensorsReader() {
  */
 const SafeTensorEntry& SafeTensorsReader::find_entry(std::string_view name) const {
     for (auto& entry : mEntries)
-        if (entry.name() == name)
-            return entry;
+        if (entry.name() == name) return entry;
     throw std::out_of_range(fmt::format("Entry not found: {}", name));
 }
 
@@ -323,7 +343,8 @@ void load_safetensors(const std::string& file_name, ITensorContainer& tensors, b
  *
  * @param file_name Output file path for the final `.safetensors`.
  */
-SafeTensorWriter::SafeTensorWriter(std::string file_name) : mFileName(file_name) {
+SafeTensorWriter::SafeTensorWriter(std::string file_name)
+    : mFileName(file_name) {
 }
 
 /**
@@ -355,9 +376,12 @@ SafeTensorWriter::~SafeTensorWriter() {
  * @throws std::logic_error If metadata has already been finalized.
  */
 void SafeTensorWriter::register_tensor(const std::string& name, const TensorShard& tensor) {
-    if (mMetaFinalized)
-        throw std::logic_error("Cannot register tensor after metadata has been finalized");
-    mRegisteredTensors.insert({name, {tensor.DType, std::vector<long>(tensor.GlobalShape.begin(), tensor.GlobalShape.begin() + tensor.Rank), 0, (long)tensor.global_nelem() * get_dtype_size(tensor.DType)}});
+    if (mMetaFinalized) throw std::logic_error("Cannot register tensor after metadata has been finalized");
+    mRegisteredTensors.insert({name,
+                               {tensor.DType,
+                                std::vector<long>(tensor.GlobalShape.begin(), tensor.GlobalShape.begin() + tensor.Rank),
+                                0,
+                                (long)tensor.global_nelem() * get_dtype_size(tensor.DType)}});
 }
 
 /**
@@ -373,8 +397,7 @@ void SafeTensorWriter::register_tensor(const std::string& name, const TensorShar
  */
 void SafeTensorWriter::prepare_metadata(NCCLCommunicator* comm) {
     nlohmann::json meta_data;
-    meta_data["__metadata__"] = nlohmann::json::object({{"format", "pt"},
-                                                        {"writer", "surogate"}});
+    meta_data["__metadata__"] = nlohmann::json::object({{"format", "pt"}, {"writer", "surogate"}});
 
     long offset = 0;
     for (auto& [name, tensor] : mRegisteredTensors) {
@@ -411,13 +434,14 @@ void SafeTensorWriter::prepare_metadata(NCCLCommunicator* comm) {
 
         mFileDescriptor = open(temp_name.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
         if (mFileDescriptor == -1)
-            throw std::system_error(errno, std::system_category(), "Error opening file '" + temp_name + "' for writing");
+            throw std::system_error(errno,
+                                    std::system_category(),
+                                    "Error opening file '" + temp_name + "' for writing");
         mTotalSize = sizeof(header_size) + header_size + offset;
         if (ftruncate(mFileDescriptor, mTotalSize) < 0)
             throw std::system_error(errno, std::system_category(), "Error truncating file " + temp_name);
 
-        std::byte* host_ptr = (std::byte*)mmap(nullptr, mTotalSize, PROT_WRITE,
-                                               MAP_SHARED, mFileDescriptor, 0);
+        std::byte* host_ptr = (std::byte*)mmap(nullptr, mTotalSize, PROT_WRITE, MAP_SHARED, mFileDescriptor, 0);
         if (host_ptr == MAP_FAILED)
             throw std::system_error(errno, std::system_category(), "Error memory-mapping file " + temp_name);
 
@@ -441,8 +465,7 @@ void SafeTensorWriter::prepare_metadata(NCCLCommunicator* comm) {
         mMetaFinalized = true;
     }
 
-    if (comm)
-        comm->barrier();
+    if (comm) comm->barrier();
 }
 
 /**
@@ -460,15 +483,12 @@ void SafeTensorWriter::prepare_metadata(NCCLCommunicator* comm) {
  * @throws std::out_of_range If @p name was not registered.
  */
 void SafeTensorWriter::write_tensor(const std::string& name, const TensorShard& tensor, NCCLCommunicator* comm) {
-    if (!mMetaFinalized)
-        throw std::logic_error("Cannot write tensor before metadata has been finalized");
+    if (!mMetaFinalized) throw std::logic_error("Cannot write tensor before metadata has been finalized");
 
     auto found = mRegisteredTensors.find(name);
-    if (found == mRegisteredTensors.end())
-        throw std::out_of_range("Invalid tensor " + name);
+    if (found == mRegisteredTensors.end()) throw std::out_of_range("Invalid tensor " + name);
 
-    if (found->second.Done)
-        throw std::logic_error("Tensor " + name + " has already been written");
+    if (found->second.Done) throw std::logic_error("Tensor " + name + " has already been written");
 
     if (!comm && tensor.NumShards > 1)
         throw std::logic_error("Cannot write tensor " + name + " with multiple shards without a communicator");
@@ -508,24 +528,29 @@ void SafeTensorWriter::write_tensor(const std::string& name, const TensorShard& 
  * @throws std::logic_error If metadata is not finalized, range is invalid, or dtype mismatches registration.
  * @throws std::out_of_range If @p name was not registered.
  */
-void SafeTensorWriter::write_raw(const std::string& name, std::ptrdiff_t offset,
-                                 std::ptrdiff_t elements, const TensorShard& tensor) {
-    if (!mMetaFinalized)
-        throw std::logic_error("Cannot write tensor before metadata has been finalized");
+void SafeTensorWriter::write_raw(const std::string& name,
+                                 std::ptrdiff_t offset,
+                                 std::ptrdiff_t elements,
+                                 const TensorShard& tensor) {
+    if (!mMetaFinalized) throw std::logic_error("Cannot write tensor before metadata has been finalized");
 
     auto found = mRegisteredTensors.find(name);
-    if (found == mRegisteredTensors.end())
-        throw std::out_of_range("Invalid tensor " + name);
+    if (found == mRegisteredTensors.end()) throw std::out_of_range("Invalid tensor " + name);
 
     ETensorDType dtype = tensor.DType;
     long nelem = found->second.Size / get_dtype_size(dtype);
     if (offset < 0 || offset + elements > nelem)
         throw std::logic_error(fmt::format("Invalid write range for tensor `{}`: offset={}, elements={}, size={}",
-                                           name, offset, elements, nelem));
+                                           name,
+                                           offset,
+                                           elements,
+                                           nelem));
 
     if (found->second.DType != dtype)
         throw std::logic_error(fmt::format("DType mismatch for tensor `{}`: registered as {}, writing as {}",
-                                           name, dtype_to_str(found->second.DType), dtype_to_str(dtype)));
+                                           name,
+                                           dtype_to_str(found->second.DType),
+                                           dtype_to_str(dtype)));
 
     std::ptrdiff_t write_start = found->second.Begin + mHeaderSize + offset * get_dtype_size(dtype);
     std::ptrdiff_t write_size = elements * get_dtype_size(dtype);
@@ -547,8 +572,7 @@ void SafeTensorWriter::write_raw(const std::string& name, std::ptrdiff_t offset,
  */
 void SafeTensorWriter::mark_done(const std::string& name) {
     auto found = mRegisteredTensors.find(name);
-    if (found == mRegisteredTensors.end())
-        throw std::out_of_range("Invalid tensor " + name);
+    if (found == mRegisteredTensors.end()) throw std::out_of_range("Invalid tensor " + name);
     found->second.Done = true;
 }
 
@@ -564,15 +588,12 @@ void SafeTensorWriter::mark_done(const std::string& name) {
  * @throws std::system_error On unmap failures.
  */
 void SafeTensorWriter::finalize(NCCLCommunicator* comm) {
-    if (comm)
-        comm->barrier();
+    if (comm) comm->barrier();
 
     for (auto& [name, tensor] : mRegisteredTensors)
-        if (!tensor.Done)
-            throw std::logic_error("Tensor " + name + " has not been written");
+        if (!tensor.Done) throw std::logic_error("Tensor " + name + " has not been written");
 
-    if (comm)
-        comm->barrier();
+    if (comm) comm->barrier();
 
     if (!comm || comm->rank() == 0) {
         if (mMappedFile) {
@@ -599,13 +620,11 @@ void SafeTensorWriter::finalize(NCCLCommunicator* comm) {
  */
 void write_safetensors(const std::string& file_name, ITensorContainer& tensors) {
     SafeTensorWriter writer(file_name);
-    tensors.iterate_tensors([&writer](std::string name, const Tensor& tensor) {
-        writer.register_tensor(name, tensor);
-    });
+    tensors.iterate_tensors(
+        [&writer](std::string name, const Tensor& tensor) { writer.register_tensor(name, tensor); });
     writer.prepare_metadata(nullptr);
-    tensors.iterate_tensors([&writer](std::string name, const Tensor& tensor) {
-        writer.write_tensor(name, tensor, nullptr);
-    });
+    tensors.iterate_tensors(
+        [&writer](std::string name, const Tensor& tensor) { writer.write_tensor(name, tensor, nullptr); });
     writer.finalize(nullptr);
 }
 
@@ -621,13 +640,11 @@ void write_safetensors(const std::string& file_name, ITensorContainer& tensors) 
  */
 void write_safetensors(const std::string& file_name, ITensorContainer& tensors, NCCLCommunicator& comm) {
     SafeTensorWriter writer(file_name);
-    tensors.iterate_tensors([&writer](std::string name, const Tensor& tensor) {
-        writer.register_tensor(name, tensor);
-    });
+    tensors.iterate_tensors(
+        [&writer](std::string name, const Tensor& tensor) { writer.register_tensor(name, tensor); });
     writer.prepare_metadata(&comm);
-    tensors.iterate_tensors([&writer, &comm](std::string name, const Tensor& tensor) {
-        writer.write_tensor(name, tensor, &comm);
-    });
+    tensors.iterate_tensors(
+        [&writer, &comm](std::string name, const Tensor& tensor) { writer.write_tensor(name, tensor, &comm); });
     writer.finalize(&comm);
 }
 
@@ -665,7 +682,7 @@ std::string get_hf_hub() {
  */
 std::string get_hf_model_path(std::string model_name) {
     auto slash = model_name.find_last_of('/');
-    if(slash == std::string::npos) {
+    if (slash == std::string::npos) {
         throw std::runtime_error("HF model name must be of the form org/name");
     }
     model_name = "/models--" + model_name.replace(slash, 1, "--");
@@ -695,21 +712,17 @@ std::string get_hf_model_files(std::string model_name, std::string revision) {
 
     // Otherwise, try to resolve as a HuggingFace model name
     auto base_path = get_hf_model_path(model_name);
-    if (!std::filesystem::exists(base_path))
-        return "";
+    if (!std::filesystem::exists(base_path)) return "";
 
     if (revision.empty()) {
         std::string snapshot_path = base_path + "/snapshots/";
         for (auto& p : std::filesystem::directory_iterator(snapshot_path)) {
-            if (!revision.empty())
-                throw std::runtime_error("Found multiple snapshots, please specify a revision");
-            if (p.is_directory())
-                revision = p.path().filename();
+            if (!revision.empty()) throw std::runtime_error("Found multiple snapshots, please specify a revision");
+            if (p.is_directory()) revision = p.path().filename();
         }
     }
 
     std::string revision_path = base_path + "/snapshots/" + revision;
-    if (!std::filesystem::exists(revision_path))
-        return "";
+    if (!std::filesystem::exists(revision_path)) return "";
     return revision_path;
 }

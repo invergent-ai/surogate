@@ -1,7 +1,8 @@
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
 import torch
 import yaml
@@ -24,6 +25,7 @@ logger = get_logger()
 @dataclass
 class LoRAConfig:
     """Minimal LoRA configuration for multi-run validation."""
+
     rank: int = 16
     alpha: float = 32.0
 
@@ -127,14 +129,14 @@ class MultiRunManager:
         self.unused_idxs = {i for i in range(self.max_runs)}
 
         self.progress: dict[int, Progress] = {}
-        self.config: dict[int, "OrchestratorConfig"] = {}
+        self.config: dict[int, OrchestratorConfig] = {}
         self.ready_to_update = [False] * max_runs
 
         self._creation_hooks: list[Callable[[int, str], None]] = []
         self._deletion_hooks: list[Callable[[int, str], None]] = []
-        self._discovered_hooks: list[Callable[[int, str, "OrchestratorConfig"], None]] = []
+        self._discovered_hooks: list[Callable[[int, str, OrchestratorConfig], None]] = []
         self._forgotten_hooks: list[Callable[[int, str], None]] = []
-        self._config_validation_hooks: list[Callable[["OrchestratorConfig"], tuple[bool, str]]] = []
+        self._config_validation_hooks: list[Callable[[OrchestratorConfig], tuple[bool, str]]] = []
 
         self.world = get_world()
 
@@ -292,7 +294,7 @@ class MultiRunManager:
             return None
 
         try:
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 config_dict = yaml.safe_load(f)
 
             from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig

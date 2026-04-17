@@ -34,21 +34,21 @@ class NCCLCommunicator;
 namespace dsl {
 struct ShardConfig;
 struct MoEWeightConfig;
-}
+}  // namespace dsl
 
 namespace qlora {
 
 /// Describes an externally-owned quantized weight (e.g., from vLLM's GPU memory).
 /// The pointers are borrowed — the caller must keep the source alive.
 struct ExternalWeight {
-    std::string name;              ///< HF weight name (e.g., "model.layers.0.self_attn.q_proj.weight")
-    QuantFormat format;            ///< Quantization format
-    int M = 0;                     ///< Original matrix rows
-    int K = 0;                     ///< Original matrix cols
-    int block_size = 64;           ///< Quantization block size
-    bool double_quant = false;     ///< BnB NF4: double quantization enabled
+    std::string name;           ///< HF weight name (e.g., "model.layers.0.self_attn.q_proj.weight")
+    QuantFormat format;         ///< Quantization format
+    int M = 0;                  ///< Original matrix rows
+    int K = 0;                  ///< Original matrix cols
+    int block_size = 64;        ///< Quantization block size
+    bool double_quant = false;  ///< BnB NF4: double quantization enabled
     int double_quant_group_size = 256;
-    float global_scale = 1.0f;     ///< FP4: global decode scale
+    float global_scale = 1.0f;  ///< FP4: global decode scale
 
     // GPU tensor descriptors: pointer + shape + dtype
     std::byte* data_ptr = nullptr;
@@ -67,7 +67,7 @@ struct ExternalWeight {
     std::vector<long> meta2_shape;
     ETensorDType meta2_dtype = ETensorDType::FP32;
 
-    int device = 0;                ///< CUDA device ID
+    int device = 0;  ///< CUDA device ID
 
     /// When true, the fused weight has swapped partition order compared to what
     /// surogate expects (e.g., vLLM stores [gate, up] but SwiGLU expects [up, gate]).
@@ -123,8 +123,8 @@ struct DslQLoRAPipelineConfig {
     int moe_intermediate_size = 0;
 
     /// Expert Parallelism: each GPU loads only local experts.
-    int ep_rank = 0;   ///< This GPU's rank within the EP group
-    int ep_size = 1;   ///< Number of GPUs in the EP group (1 = no EP)
+    int ep_rank = 0;  ///< This GPU's rank within the EP group
+    int ep_size = 1;  ///< Number of GPUs in the EP group (1 = no EP)
 
     /// List of weight parameters to load and their properties.
     std::vector<WeightLoadSpec> weight_specs;
@@ -192,12 +192,11 @@ struct DslQLoRAPipelineConfig {
 /// @param stream      CUDA stream for async operations.
 ///
 /// @return Fully initialized GenericWeightManager with all weights loaded and quantized.
-std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
-    const std::string& file_name,
-    const DslQLoRAPipelineConfig& config,
-    const PretrainedConfig& pt_config,
-    std::shared_ptr<TensorAllocator> allocator,
-    cudaStream_t stream);
+std::unique_ptr<GenericWeightManager> import_and_quantize_weights(const std::string& file_name,
+                                                                  const DslQLoRAPipelineConfig& config,
+                                                                  const PretrainedConfig& pt_config,
+                                                                  std::shared_ptr<TensorAllocator> allocator,
+                                                                  cudaStream_t stream);
 
 /// Import pre-quantized weights from HuggingFace SafeTensors into a GenericWeightManager.
 ///
@@ -212,12 +211,11 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(
 /// @param stream      CUDA stream for async operations.
 ///
 /// @return Fully initialized GenericWeightManager with all weights loaded.
-std::unique_ptr<GenericWeightManager> import_prequantized_weights(
-    const std::string& file_name,
-    const DslQLoRAPipelineConfig& config,
-    const PretrainedConfig& pt_config,
-    std::shared_ptr<TensorAllocator> allocator,
-    cudaStream_t stream);
+std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::string& file_name,
+                                                                  const DslQLoRAPipelineConfig& config,
+                                                                  const PretrainedConfig& pt_config,
+                                                                  std::shared_ptr<TensorAllocator> allocator,
+                                                                  cudaStream_t stream);
 
 /// Import externally-owned quantized weights (e.g., from vLLM) into a GenericWeightManager.
 ///
@@ -237,13 +235,12 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(
 /// @param stream           CUDA stream for operations.
 ///
 /// @return Fully initialized GenericWeightManager with all weights loaded.
-std::unique_ptr<GenericWeightManager> import_external_weights(
-    const std::string& file_name,
-    const std::vector<ExternalWeight>& external_weights,
-    const DslQLoRAPipelineConfig& config,
-    const PretrainedConfig& pt_config,
-    std::shared_ptr<TensorAllocator> allocator,
-    cudaStream_t stream);
+std::unique_ptr<GenericWeightManager> import_external_weights(const std::string& file_name,
+                                                              const std::vector<ExternalWeight>& external_weights,
+                                                              const DslQLoRAPipelineConfig& config,
+                                                              const PretrainedConfig& pt_config,
+                                                              std::shared_ptr<TensorAllocator> allocator,
+                                                              cudaStream_t stream);
 
 /// Build a DslQLoRAPipelineConfig from the DSL IR.
 ///
@@ -257,12 +254,11 @@ std::unique_ptr<GenericWeightManager> import_external_weights(
 /// @param num_shards        Total number of GPUs.
 ///
 /// @return Pipeline configuration ready for import_and_quantize_weights().
-DslQLoRAPipelineConfig build_pipeline_config(
-    const dsl::MappingTable& mapping,
-    const std::vector<WeightLoadSpec>& weight_specs,
-    const QuantizerConfig& quantizer_config,
-    int shard_idx = 0,
-    int num_shards = 1);
+DslQLoRAPipelineConfig build_pipeline_config(const dsl::MappingTable& mapping,
+                                             const std::vector<WeightLoadSpec>& weight_specs,
+                                             const QuantizerConfig& quantizer_config,
+                                             int shard_idx = 0,
+                                             int num_shards = 1);
 
 }  // namespace qlora
 

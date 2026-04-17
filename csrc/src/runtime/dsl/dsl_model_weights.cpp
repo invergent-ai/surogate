@@ -69,7 +69,8 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
 
         // Check if this is a projection weight that should be zeroed
         const bool is_out_proj = internal::contains_ci(name, "out_weight") || internal::contains_ci(name, "o_proj");
-        const bool is_mlp_down = internal::contains_ci(name, "mlp_down_weight") || internal::contains_ci(name, "down_proj");
+        const bool is_mlp_down =
+            internal::contains_ci(name, "mlp_down_weight") || internal::contains_ci(name, "down_proj");
         if (mOptions.InitProjectionsToZero && (is_out_proj || is_mlp_down)) {
             fill_zero(param, nullptr);
             continue;
@@ -79,8 +80,8 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
         if (is_out_proj || is_mlp_down) {
             stddev *= residual_scale;
         }
-        const bool param_sharded = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1) &&
-                                   mWeightManager->is_sharded(name);
+        const bool param_sharded =
+            use_weight_manager && mOptions.ShardWeights && (mNumShards > 1) && mWeightManager->is_sharded(name);
         const unsigned long long param_subseq = param_sharded ? (shard_base + subseq) : subseq;
         fill_normal(param, param.nelem(), 0.f, stddev, seed, param_subseq, nullptr);
         ++subseq;
@@ -142,10 +143,17 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
         }
 
-        mQLoRAProvider = internal::create_dsl_qlora_provider(
-            *mModule, mModelConfig, *mConfig, mOptions,
-            *mLoRAConfig, mQLoRAConfig, mAllocator,
-            mHfMapping, mShardIdx, mNumShards, mAdapterPath);
+        mQLoRAProvider = internal::create_dsl_qlora_provider(*mModule,
+                                                             mModelConfig,
+                                                             *mConfig,
+                                                             mOptions,
+                                                             *mLoRAConfig,
+                                                             mQLoRAConfig,
+                                                             mAllocator,
+                                                             mHfMapping,
+                                                             mShardIdx,
+                                                             mNumShards,
+                                                             mAdapterPath);
         cudaStream_t quant_stream = nullptr;
         CUDA_CHECK(cudaStreamCreate(&quant_stream));
         mQLoRAProvider->import_and_quantize(file_name, comm, quant_stream);
@@ -186,8 +194,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         ShardConfig shard_config;
         shard_config.shard_idx = mShardIdx;
         shard_config.num_shards = mNumShards;
-        adapter_merger = std::make_unique<qlora::AdapterMerger>(
-            mAdapterPath, mHfMapping, reader, shard_config);
+        adapter_merger = std::make_unique<qlora::AdapterMerger>(mAdapterPath, mHfMapping, reader, shard_config);
     }
 
     for (const auto& name : mParams->param_names()) {
@@ -211,8 +218,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         }
 
         if (spec->kind == MappingSpec::Kind::Direct) {
-            const std::string hf_name = internal::format_hf_name(
-                spec->source.empty() ? name : spec->source, layer_idx);
+            const std::string hf_name = internal::format_hf_name(spec->source.empty() ? name : spec->source, layer_idx);
 
             // Handle tied embeddings: if lm_head.weight is not found and embeddings are tied,
             // fall back to model.embed_tokens.weight
@@ -244,8 +250,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                     }
 
                     if (!entry_ptr) {
-                        throw std::runtime_error("DSL model: missing HF tensor '" + hf_name
-                                                 + "' (and tied fallback) for param '" + name + "'");
+                        throw std::runtime_error("DSL model: missing HF tensor '" + hf_name +
+                                                 "' (and tied fallback) for param '" + name + "'");
                     }
                 } else {
                     throw std::runtime_error("DSL model: missing HF tensor '" + hf_name + "' for param '" + name + "'");
@@ -267,9 +273,9 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                         if (squeezed[i] != param.Sizes[i]) match = false;
                     }
                     if (!match) {
-                        throw std::runtime_error("DSL model: shape mismatch for '" + hf_name
-                                                 + "': file shape cannot be squeezed to target shape for param '"
-                                                 + name + "'");
+                        throw std::runtime_error("DSL model: shape mismatch for '" + hf_name +
+                                                 "': file shape cannot be squeezed to target shape for param '" + name +
+                                                 "'");
                     }
                     entry.read_raw(param, 0, param.nelem(), allow_cast);
                 } else {
@@ -294,8 +300,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             if (spec->dim != 0) {
                 throw std::runtime_error("DSL model: fuse mapping only supports dim=0 for " + name);
             }
-            std::vector<long> slice_sizes = internal::infer_fuse_slices(name, *mConfig,
-                                                                        static_cast<int>(spec->sources.size()));
+            std::vector<long> slice_sizes =
+                internal::infer_fuse_slices(name, *mConfig, static_cast<int>(spec->sources.size()));
 
             // Validate static slices against target. For hybrid models with
             // per-block-type dimensions, the static inference may produce wrong
@@ -304,7 +310,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             const long global_rows = global.Sizes[0];
             if (!slice_sizes.empty()) {
                 long sum = 0;
-                for (long s : slice_sizes) sum += s;
+                for (long s : slice_sizes)
+                    sum += s;
                 if (sum != global_rows) {
                     slice_sizes.clear();  // Invalidate — try file-based fallback
                 }
@@ -321,7 +328,9 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                         if (!entry.shape().empty()) {
                             file_sizes.push_back(entry.shape()[0]);
                         }
-                    } catch (...) { break; }
+                    } catch (...) {
+                        break;
+                    }
                 }
                 if (file_sizes.size() == spec->sources.size()) {
                     slice_sizes = std::move(file_sizes);
@@ -372,8 +381,10 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                     const long src_row_offset = overlap_begin - src_begin;
                     Tensor slice = internal::slice_dim0(param, dst_row_offset, rows);
                     const long stride = row_stride(entry.shape());
-                    entry.read_raw(slice, static_cast<std::ptrdiff_t>(src_row_offset) * stride,
-                                   slice.nelem(), allow_cast);
+                    entry.read_raw(slice,
+                                   static_cast<std::ptrdiff_t>(src_row_offset) * stride,
+                                   slice.nelem(),
+                                   allow_cast);
                 }
                 offset += slice_len;
             }
@@ -436,12 +447,16 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
             if (entry.shape().size() == 2 && param.Rank == 2) {
                 if (!param_sharded) {
-                    Tensor tmp = mAllocator->allocate(param.DType, ("hf_tmp_" + name).c_str(),
+                    Tensor tmp = mAllocator->allocate(param.DType,
+                                                      ("hf_tmp_" + name).c_str(),
                                                       EAllocationType::ON_DEVICE,
                                                       {entry.shape().at(0), entry.shape().at(1)});
                     entry.read_tensor(tmp, allow_cast);
-                    transpose(param, tmp, static_cast<int>(entry.shape().at(0)),
-                              static_cast<int>(entry.shape().at(1)), stream);
+                    transpose(param,
+                              tmp,
+                              static_cast<int>(entry.shape().at(0)),
+                              static_cast<int>(entry.shape().at(1)),
+                              stream);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                 } else {
                     const Tensor& global = mParams->template_tensor(name);
@@ -450,18 +465,23 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                     if (param.Sizes[0] != (end - start)) {
                         throw std::runtime_error("DSL model: transpose shard size mismatch for " + name);
                     }
-                    Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_src_" + name).c_str(),
+                    Tensor tmp_src = mAllocator->allocate(param.DType,
+                                                          ("hf_tmp_src_" + name).c_str(),
                                                           EAllocationType::ON_DEVICE,
                                                           {entry.shape().at(0), entry.shape().at(1)});
                     entry.read_tensor(tmp_src, allow_cast);
-                    Tensor tmp_full = mAllocator->allocate(param.DType, ("hf_tmp_full_" + name).c_str(),
+                    Tensor tmp_full = mAllocator->allocate(param.DType,
+                                                           ("hf_tmp_full_" + name).c_str(),
                                                            EAllocationType::ON_DEVICE,
                                                            {global.Sizes[0], global.Sizes[1]});
-                    transpose(tmp_full, tmp_src, static_cast<int>(entry.shape().at(0)),
-                              static_cast<int>(entry.shape().at(1)), stream);
+                    transpose(tmp_full,
+                              tmp_src,
+                              static_cast<int>(entry.shape().at(0)),
+                              static_cast<int>(entry.shape().at(1)),
+                              stream);
                     Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
-                    CUDA_CHECK(cudaMemcpyAsync(param.Data, slice.Data, param.bytes(),
-                                               cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(
+                        cudaMemcpyAsync(param.Data, slice.Data, param.bytes(), cudaMemcpyDeviceToDevice, stream));
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                 }
             } else if (entry.shape().size() == 3 && param.Rank == 3) {
@@ -472,7 +492,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                     if (param.Sizes[0] != E || param.Sizes[1] != B || param.Sizes[2] != A) {
                         throw std::runtime_error("DSL model: transpose (3D) shape mismatch for " + name);
                     }
-                    Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_" + name).c_str(),
+                    Tensor tmp_src = mAllocator->allocate(param.DType,
+                                                          ("hf_tmp_" + name).c_str(),
                                                           EAllocationType::ON_DEVICE,
                                                           {E, A, B});
                     entry.read_tensor(tmp_src, allow_cast);
@@ -482,15 +503,15 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                         src_view.Rank = 2;
                         src_view.Sizes[0] = A;
                         src_view.Sizes[1] = B;
-                        src_view.Data = static_cast<std::byte*>(tmp_src.Data)
-                                        + static_cast<std::size_t>(e) * A * B * elem_size;
+                        src_view.Data =
+                            static_cast<std::byte*>(tmp_src.Data) + static_cast<std::size_t>(e) * A * B * elem_size;
 
                         Tensor dst_view = param;
                         dst_view.Rank = 2;
                         dst_view.Sizes[0] = B;
                         dst_view.Sizes[1] = A;
-                        dst_view.Data = static_cast<std::byte*>(param.Data)
-                                        + static_cast<std::size_t>(e) * B * A * elem_size;
+                        dst_view.Data =
+                            static_cast<std::byte*>(param.Data) + static_cast<std::size_t>(e) * B * A * elem_size;
 
                         transpose(dst_view, src_view, static_cast<int>(A), static_cast<int>(B), stream);
                     }
@@ -499,15 +520,16 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                     const Tensor& global = mParams->template_tensor(name);
                     const long global_rows = global.Sizes[0];
                     auto [start, end] = shard_range(global_rows, param_sharded);
-                    if (param.Sizes[0] != (end - start) ||
-                        global.Sizes[1] != B || global.Sizes[2] != A) {
+                    if (param.Sizes[0] != (end - start) || global.Sizes[1] != B || global.Sizes[2] != A) {
                         throw std::runtime_error("DSL model: transpose (3D) shard size mismatch for " + name);
                     }
-                    Tensor tmp_src = mAllocator->allocate(param.DType, ("hf_tmp_src_" + name).c_str(),
+                    Tensor tmp_src = mAllocator->allocate(param.DType,
+                                                          ("hf_tmp_src_" + name).c_str(),
                                                           EAllocationType::ON_DEVICE,
                                                           {E, A, B});
                     entry.read_tensor(tmp_src, allow_cast);
-                    Tensor tmp_full = mAllocator->allocate(param.DType, ("hf_tmp_full_" + name).c_str(),
+                    Tensor tmp_full = mAllocator->allocate(param.DType,
+                                                           ("hf_tmp_full_" + name).c_str(),
                                                            EAllocationType::ON_DEVICE,
                                                            {global.Sizes[0], global.Sizes[1], global.Sizes[2]});
                     const std::size_t elem_size = get_dtype_size(param.DType);
@@ -516,21 +538,21 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                         src_view.Rank = 2;
                         src_view.Sizes[0] = A;
                         src_view.Sizes[1] = B;
-                        src_view.Data = static_cast<std::byte*>(tmp_src.Data)
-                                        + static_cast<std::size_t>(e) * A * B * elem_size;
+                        src_view.Data =
+                            static_cast<std::byte*>(tmp_src.Data) + static_cast<std::size_t>(e) * A * B * elem_size;
 
                         Tensor dst_view = tmp_full;
                         dst_view.Rank = 2;
                         dst_view.Sizes[0] = B;
                         dst_view.Sizes[1] = A;
-                        dst_view.Data = static_cast<std::byte*>(tmp_full.Data)
-                                        + static_cast<std::size_t>(e) * B * A * elem_size;
+                        dst_view.Data =
+                            static_cast<std::byte*>(tmp_full.Data) + static_cast<std::size_t>(e) * B * A * elem_size;
 
                         transpose(dst_view, src_view, static_cast<int>(A), static_cast<int>(B), stream);
                     }
                     Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
-                    CUDA_CHECK(cudaMemcpyAsync(param.Data, slice.Data, param.bytes(),
-                                               cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(
+                        cudaMemcpyAsync(param.Data, slice.Data, param.bytes(), cudaMemcpyDeviceToDevice, stream));
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                 }
             } else {
@@ -743,8 +765,7 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
         }
 
         if (spec->kind == MappingSpec::Kind::Direct) {
-            const std::string hf_name = internal::format_hf_name(
-                spec->source.empty() ? name : spec->source, layer_idx);
+            const std::string hf_name = internal::format_hf_name(spec->source.empty() ? name : spec->source, layer_idx);
             exports.push_back({hf_name, param, false, {}});
             continue;
         }
@@ -753,7 +774,8 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
             if (spec->dim != 0) {
                 throw std::runtime_error("DSL model: fuse export only supports dim=0 for " + name);
             }
-            std::vector<long> slice_sizes = internal::infer_fuse_slices(name, *mConfig, static_cast<int>(spec->sources.size()));
+            std::vector<long> slice_sizes =
+                internal::infer_fuse_slices(name, *mConfig, static_cast<int>(spec->sources.size()));
             if (slice_sizes.empty()) {
                 if (param.Sizes[0] % static_cast<long>(spec->sources.size()) == 0) {
                     const long chunk = param.Sizes[0] / static_cast<long>(spec->sources.size());
@@ -790,7 +812,8 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
                 throw std::runtime_error("DSL model: transpose export expects 2D tensor for " + name);
             }
             const std::string hf_name = internal::format_hf_name(spec->source, layer_idx);
-            Tensor tmp = mAllocator->allocate(param.DType, ("export_" + name).c_str(),
+            Tensor tmp = mAllocator->allocate(param.DType,
+                                              ("export_" + name).c_str(),
                                               EAllocationType::ON_DEVICE,
                                               {param.Sizes[1], param.Sizes[0]});
             exports.push_back({hf_name, tmp, true, param});
@@ -885,7 +908,8 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
     cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
     for (auto& entry : exports) {
         if (entry.needs_transpose) {
-            transpose(entry.tensor, entry.source,
+            transpose(entry.tensor,
+                      entry.source,
                       static_cast<int>(entry.source.Sizes[0]),
                       static_cast<int>(entry.source.Sizes[1]),
                       stream);
@@ -930,11 +954,9 @@ bool DslModel::is_weight_streaming_enabled() const {
     return mWeightManager && mWeightManager->is_streaming_enabled();
 }
 
-void DslModel::import_weights_from_external(
-    const std::string& safetensors_path,
-    const std::vector<qlora::ExternalWeight>& external_weights,
-    NCCLCommunicator& comm) {
-
+void DslModel::import_weights_from_external(const std::string& safetensors_path,
+                                            const std::vector<qlora::ExternalWeight>& external_weights,
+                                            NCCLCommunicator& comm) {
     if (!mParams) {
         throw std::logic_error("DslModel::import_weights_from_external called before parameters are initialized");
     }
@@ -954,14 +976,22 @@ void DslModel::import_weights_from_external(
     } else if (mModelConfig.NumExperts > 0) {
         if (mQLoRAConfig.num_experts == 0) mQLoRAConfig.num_experts = mModelConfig.NumExperts;
         if (mQLoRAConfig.num_experts_per_tok == 0) mQLoRAConfig.num_experts_per_tok = mModelConfig.NumExpertsPerTok;
-        if (mQLoRAConfig.moe_intermediate_size == 0) mQLoRAConfig.moe_intermediate_size = mModelConfig.MoeIntermediateSize;
+        if (mQLoRAConfig.moe_intermediate_size == 0)
+            mQLoRAConfig.moe_intermediate_size = mModelConfig.MoeIntermediateSize;
     }
 
     // Create the QLoRA provider (builds pipeline config from IR)
-    mQLoRAProvider = internal::create_dsl_qlora_provider(
-        *mModule, mModelConfig, *mConfig, mOptions,
-        *mLoRAConfig, mQLoRAConfig, mAllocator,
-        mHfMapping, mShardIdx, mNumShards, mAdapterPath);
+    mQLoRAProvider = internal::create_dsl_qlora_provider(*mModule,
+                                                         mModelConfig,
+                                                         *mConfig,
+                                                         mOptions,
+                                                         *mLoRAConfig,
+                                                         mQLoRAConfig,
+                                                         mAllocator,
+                                                         mHfMapping,
+                                                         mShardIdx,
+                                                         mNumShards,
+                                                         mAdapterPath);
 
     // Use the provider's import_from_external instead of import_and_quantize
     auto* generic_provider = dynamic_cast<qlora::GenericQLoRAProvider*>(mQLoRAProvider.get());

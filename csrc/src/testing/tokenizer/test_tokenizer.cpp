@@ -17,10 +17,10 @@
 // ============================================================================
 
 TEST_CASE("unicode_len_utf8", "[tokenizer][unicode]") {
-    CHECK(unicode_len_utf8('A') == 1);       // ASCII
-    CHECK(unicode_len_utf8('\xC3') == 2);    // 2-byte UTF-8 lead
-    CHECK(unicode_len_utf8('\xE2') == 3);    // 3-byte UTF-8 lead
-    CHECK(unicode_len_utf8('\xF0') == 4);    // 4-byte UTF-8 lead
+    CHECK(unicode_len_utf8('A') == 1);     // ASCII
+    CHECK(unicode_len_utf8('\xC3') == 2);  // 2-byte UTF-8 lead
+    CHECK(unicode_len_utf8('\xE2') == 3);  // 3-byte UTF-8 lead
+    CHECK(unicode_len_utf8('\xF0') == 4);  // 4-byte UTF-8 lead
 }
 
 TEST_CASE("unicode_cpt_to_utf8 roundtrip", "[tokenizer][unicode]") {
@@ -75,7 +75,8 @@ TEST_CASE("unicode_byte_to_utf8 mapping", "[tokenizer][unicode]") {
 TEST_CASE("unicode_regex_split llama3 pattern", "[tokenizer][unicode]") {
     // Use the expanded form (no (?i:) which std::regex doesn't support).
     // This is the form llama.cpp and our tokenizer actually use.
-    std::string pattern = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    std::string pattern = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{"
+                          "N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
     auto pieces = unicode_regex_split("Hello, world! 123", {pattern});
     CHECK(!pieces.empty());
@@ -94,7 +95,8 @@ TEST_CASE("unicode_regex_split llama3 pattern", "[tokenizer][unicode]") {
 
 TEST_CASE("unicode_regex_split qwen pattern", "[tokenizer][unicode]") {
     // Qwen2/3 pattern: single digit matching (\p{N} instead of \p{N}{1,3})
-    std::string pattern = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    std::string pattern = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{"
+                          "N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
     auto pieces = unicode_regex_split("Hello 123", {pattern});
     CHECK(!pieces.empty());
@@ -108,27 +110,28 @@ TEST_CASE("unicode_regex_split qwen pattern", "[tokenizer][unicode]") {
 }
 
 TEST_CASE("unicode_regex_split gpt-oss pattern", "[tokenizer][unicode]") {
-    std::string pattern =
-        "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
-        "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
-        "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    std::string pattern = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?"
+                          "i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                          "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?"
+                          "i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                          "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
     auto pieces = unicode_regex_split(" NASA's GPT-OSS /path/to/file abc/\nfooBAR 123", {pattern});
     CHECK(pieces == std::vector<std::string>{
-        "ĠNASA's",
-        "ĠGPT",
-        "-OSS",
-        "Ġ/",
-        "path",
-        "/to",
-        "/file",
-        "Ġabc",
-        "/Ċ",
-        "foo",
-        "BAR",
-        "Ġ",
-        "123",
-    });
+                        "ĠNASA's",
+                        "ĠGPT",
+                        "-OSS",
+                        "Ġ/",
+                        "path",
+                        "/to",
+                        "/file",
+                        "Ġabc",
+                        "/Ċ",
+                        "foo",
+                        "BAR",
+                        "Ġ",
+                        "123",
+                    });
 }
 
 // ============================================================================
@@ -141,8 +144,8 @@ TEST_CASE("bpe small piece encode", "[tokenizer][bpe]") {
     enc[{'a'}] = 0;
     enc[{'b'}] = 1;
     enc[{'c'}] = 2;
-    enc[{'a', 'b'}] = 3;   // merge a+b -> ab (rank 3)
-    enc[{'a', 'b', 'c'}] = 4; // merge ab+c -> abc (rank 4)
+    enc[{'a', 'b'}] = 3;       // merge a+b -> ab (rank 3)
+    enc[{'a', 'b', 'c'}] = 4;  // merge ab+c -> abc (rank 4)
 
     tokenizer::EncoderLookup lookup(enc);
 
@@ -164,8 +167,8 @@ TEST_CASE("bpe small piece encode", "[tokenizer][bpe]") {
     // "ac" cannot merge -> two tokens
     auto r4 = tokenizer::byte_pair_encode(reinterpret_cast<const uint8_t*>("ac"), 2, lookup);
     CHECK(r4.size() == 2);
-    CHECK(r4[0] == 0); // a
-    CHECK(r4[1] == 2); // c
+    CHECK(r4[0] == 0);  // a
+    CHECK(r4[1] == 2);  // c
 }
 
 // ============================================================================

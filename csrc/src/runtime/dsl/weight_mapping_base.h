@@ -34,11 +34,15 @@ namespace modules {
  * For fusion loads: begin/end specify the slice within the fused tensor
  */
 struct LoadRange {
-    std::ptrdiff_t begin = 0;   ///< Start offset in elements
-    std::ptrdiff_t end = 0;     ///< End offset in elements (exclusive)
+    std::ptrdiff_t begin = 0;  ///< Start offset in elements
+    std::ptrdiff_t end = 0;    ///< End offset in elements (exclusive)
 
-    [[nodiscard]] bool is_full_tensor() const { return begin == 0 && end == 0; }
-    [[nodiscard]] std::ptrdiff_t size() const { return end - begin; }
+    [[nodiscard]] bool is_full_tensor() const {
+        return begin == 0 && end == 0;
+    }
+    [[nodiscard]] std::ptrdiff_t size() const {
+        return end - begin;
+    }
 };
 
 /**
@@ -100,17 +104,20 @@ enum class TensorTarget {
  * @brief Complete pattern entry for weight loading
  */
 struct WeightPattern {
-    std::string hf_regex;           ///< Regex to match HuggingFace tensor name
-    TensorTarget target;            ///< Which internal tensor to target
-    RangeComputeFn range_fn;        ///< Function to compute load range (nullptr = full tensor)
-    bool optional = false;          ///< Whether this tensor is optional
-    int expert_group = -1;          ///< For per-expert patterns: capture group index for expert_idx
+    std::string hf_regex;     ///< Regex to match HuggingFace tensor name
+    TensorTarget target;      ///< Which internal tensor to target
+    RangeComputeFn range_fn;  ///< Function to compute load range (nullptr = full tensor)
+    bool optional = false;    ///< Whether this tensor is optional
+    int expert_group = -1;    ///< For per-expert patterns: capture group index for expert_idx
 
     WeightPattern() = default;
-    WeightPattern(std::string regex, TensorTarget tgt,
-                  RangeComputeFn fn = nullptr, bool opt = false, int exp_grp = -1)
-        : hf_regex(std::move(regex)), target(tgt),
-          range_fn(std::move(fn)), optional(opt), expert_group(exp_grp) {}
+    WeightPattern(std::string regex, TensorTarget tgt, RangeComputeFn fn = nullptr, bool opt = false, int exp_grp = -1)
+        : hf_regex(std::move(regex)),
+          target(tgt),
+          range_fn(std::move(fn)),
+          optional(opt),
+          expert_group(exp_grp) {
+    }
 };
 
 /**
@@ -118,11 +125,13 @@ struct WeightPattern {
  */
 struct PatternMatch {
     const WeightPattern* pattern = nullptr;
-    int layer_idx = -1;             ///< Extracted layer index (-1 for non-block)
-    int expert_idx = -1;            ///< Extracted expert index (-1 if not per-expert)
-    LoadRange range;                ///< Computed load range
+    int layer_idx = -1;   ///< Extracted layer index (-1 for non-block)
+    int expert_idx = -1;  ///< Extracted expert index (-1 if not per-expert)
+    LoadRange range;      ///< Computed load range
 
-    explicit operator bool() const { return pattern != nullptr; }
+    explicit operator bool() const {
+        return pattern != nullptr;
+    }
 };
 
 // ============================================================================
@@ -136,14 +145,16 @@ struct PatternMatch {
  * For split exports: row_begin/row_end specify the row slice
  */
 struct ExportPattern {
-    std::string hf_name_template;   ///< HuggingFace tensor name template ({layer}, {expert})
-    TensorTarget source;            ///< Which internal tensor to export from
-    long row_begin = 0;             ///< Start row for slicing (0 = from start)
-    long row_end = 0;               ///< End row for slicing (0 = to end, meaning full tensor)
-    bool optional = false;          ///< Whether this export is optional (e.g., bias)
-    int expert_idx = -1;            ///< For per-expert: which expert (-1 = not per-expert)
+    std::string hf_name_template;  ///< HuggingFace tensor name template ({layer}, {expert})
+    TensorTarget source;           ///< Which internal tensor to export from
+    long row_begin = 0;            ///< Start row for slicing (0 = from start)
+    long row_end = 0;              ///< End row for slicing (0 = to end, meaning full tensor)
+    bool optional = false;         ///< Whether this export is optional (e.g., bias)
+    int expert_idx = -1;           ///< For per-expert: which expert (-1 = not per-expert)
 
-    [[nodiscard]] bool is_full_tensor() const { return row_begin == 0 && row_end == 0; }
+    [[nodiscard]] bool is_full_tensor() const {
+        return row_begin == 0 && row_end == 0;
+    }
 
     [[nodiscard]] std::string expand_name(int layer_idx, int exp_idx = -1) const {
         std::string result = hf_name_template;
@@ -187,7 +198,8 @@ public:
      * Override in derived classes to add model-specific export patterns.
      * Default implementation provides patterns for base Llama-style models.
      */
-    virtual void register_export_patterns() {}
+    virtual void register_export_patterns() {
+    }
 
     /**
      * @brief Match a tensor name and compute load parameters
@@ -197,9 +209,8 @@ public:
      * @param hidden_size Hidden dimension
      * @return Match result with pattern, indices, and range
      */
-    [[nodiscard]] PatternMatch match(const std::string& tensor_name,
-                                     const PretrainedConfig& cfg,
-                                     long hidden_size) const {
+    [[nodiscard]] PatternMatch
+    match(const std::string& tensor_name, const PretrainedConfig& cfg, long hidden_size) const {
         for (const auto& [regex, pattern] : mCompiledPatterns) {
             std::smatch m;
             if (std::regex_match(tensor_name, m, regex)) {
@@ -232,7 +243,9 @@ public:
     /**
      * @brief Get all registered patterns (for debugging/introspection)
      */
-    [[nodiscard]] const std::vector<WeightPattern>& patterns() const { return mPatterns; }
+    [[nodiscard]] const std::vector<WeightPattern>& patterns() const {
+        return mPatterns;
+    }
 
     /**
      * @brief Get export patterns for non-block tensors
@@ -259,13 +272,17 @@ protected:
     /**
      * @brief Register a pattern for non-block weights (exact match)
      */
-    void add_pattern(const std::string& hf_name, TensorTarget target,
-                     RangeComputeFn range_fn = nullptr, bool optional = false) {
+    void add_pattern(const std::string& hf_name,
+                     TensorTarget target,
+                     RangeComputeFn range_fn = nullptr,
+                     bool optional = false) {
         // Escape dots for regex
         std::string escaped;
         for (char c : hf_name) {
-            if (c == '.') escaped += "\\.";
-            else escaped += c;
+            if (c == '.')
+                escaped += "\\.";
+            else
+                escaped += c;
         }
         WeightPattern p{escaped, target, std::move(range_fn), optional};
         mPatterns.push_back(p);
@@ -277,8 +294,10 @@ protected:
      *
      * Use {layer} as placeholder for layer index.
      */
-    void add_layer_pattern(const std::string& hf_template, TensorTarget target,
-                           RangeComputeFn range_fn = nullptr, bool optional = false) {
+    void add_layer_pattern(const std::string& hf_template,
+                           TensorTarget target,
+                           RangeComputeFn range_fn = nullptr,
+                           bool optional = false) {
         std::string regex_str = escape_and_replace(hf_template, "{layer}", R"((\d+))");
         WeightPattern p{regex_str, target, std::move(range_fn), optional};
         mPatterns.push_back(p);
@@ -290,14 +309,16 @@ protected:
      *
      * Use {layer} for layer index and {expert} for expert index.
      */
-    void add_expert_pattern(const std::string& hf_template, TensorTarget target,
-                            RangeComputeFn range_fn = nullptr, bool optional = false) {
+    void add_expert_pattern(const std::string& hf_template,
+                            TensorTarget target,
+                            RangeComputeFn range_fn = nullptr,
+                            bool optional = false) {
         // First replace {layer}, then {expert}
         std::string regex_str = escape_and_replace(hf_template, "{layer}", R"((\d+))");
         // Find position of {expert} to determine capture group
         size_t expert_pos = regex_str.find("{expert}");
         int expert_group = 2;  // Layer is group 1, expert is group 2
-        (void)expert_pos;  // Suppress unused warning
+        (void)expert_pos;      // Suppress unused warning
         regex_str = replace_placeholder(regex_str, "{expert}", R"((\d+))");
 
         WeightPattern p{regex_str, target, std::move(range_fn), optional, expert_group};
@@ -332,8 +353,11 @@ protected:
      * @param row_end End row (exclusive), 0 means compute at export time
      * @param optional Whether the tensor is optional
      */
-    void add_export_layer_slice(const std::string& hf_template, TensorTarget source,
-                                long row_begin, long row_end, bool optional = false) {
+    void add_export_layer_slice(const std::string& hf_template,
+                                TensorTarget source,
+                                long row_begin,
+                                long row_end,
+                                bool optional = false) {
         mExportLayerPatterns.push_back({hf_template, source, row_begin, row_end, optional, -1});
     }
 
@@ -345,9 +369,8 @@ protected:
     }
 
 private:
-    static std::string escape_and_replace(const std::string& input,
-                                          const std::string& placeholder,
-                                          const std::string& replacement) {
+    static std::string
+    escape_and_replace(const std::string& input, const std::string& placeholder, const std::string& replacement) {
         std::string result;
         size_t i = 0;
         while (i < input.size()) {
@@ -366,9 +389,8 @@ private:
         return result;
     }
 
-    static std::string replace_placeholder(const std::string& input,
-                                           const std::string& placeholder,
-                                           const std::string& replacement) {
+    static std::string
+    replace_placeholder(const std::string& input, const std::string& placeholder, const std::string& replacement) {
         std::string result = input;
         size_t pos = result.find(placeholder);
         if (pos != std::string::npos) {
@@ -454,8 +476,8 @@ inline long mlp_intermediate(const PretrainedConfig& cfg) {
     return cfg.IntermediateSize;
 }
 
-} // namespace ranges
+}  // namespace ranges
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_DSL_WEIGHT_MAPPING_BASE_H
+#endif  // SUROGATE_SRC_DSL_WEIGHT_MAPPING_BASE_H

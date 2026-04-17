@@ -70,20 +70,14 @@ struct AttrValue {
     using ListPtr = std::shared_ptr<AttrList>;
     using MapPtr = std::shared_ptr<AttrMap>;
 
-    std::variant<
-        std::monostate,
-        bool,
-        std::int64_t,
-        double,
-        std::string,
-        ListPtr,
-        MapPtr
-    > value;
+    std::variant<std::monostate, bool, std::int64_t, double, std::string, ListPtr, MapPtr> value;
 
     AttrValue() = default;
 
-    template<typename T>
-    AttrValue(T v) : value(std::move(v)) {}
+    template <typename T>
+    AttrValue(T v)
+        : value(std::move(v)) {
+    }
 };
 
 struct TensorInfo {
@@ -92,8 +86,8 @@ struct TensorInfo {
     bool is_param = false;
     bool is_input = false;
     bool is_output = false;
-    bool quantizable = true;     ///< Whether this param can be quantized (QLoRA)
-    int offload_group = -1;      ///< Offload group ID (-1 = no offloading)
+    bool quantizable = true;  ///< Whether this param can be quantized (QLoRA)
+    int offload_group = -1;   ///< Offload group ID (-1 = no offloading)
 };
 
 // ============================================================================
@@ -110,11 +104,11 @@ enum class ActivationScope : std::uint8_t {
 
 /// @brief Memory management hints for activation slots
 enum class ActivationMemoryHint : std::uint8_t {
-    Persistent,      ///< Keep in memory across forward/backward
-    Save,            ///< Save for backward pass
-    Recompute,       ///< Can be recomputed in backward
-    Temporary,       ///< Stack-allocated, freed after use
-    Shared,          ///< Shares memory with another slot
+    Persistent,  ///< Keep in memory across forward/backward
+    Save,        ///< Save for backward pass
+    Recompute,   ///< Can be recomputed in backward
+    Temporary,   ///< Stack-allocated, freed after use
+    Shared,      ///< Shares memory with another slot
 };
 
 /// @brief Sharing policy for activation slots across layers
@@ -123,37 +117,37 @@ enum class ActivationMemoryHint : std::uint8_t {
 /// to reduce memory usage. The policy determines when sharing is safe based on
 /// the recompute strategy and training mode (FFT vs LoRA).
 enum class SharePolicy : std::uint8_t {
-    PerLayer,          ///< Always allocate per-layer (no sharing)
-    WhenRecomputed,    ///< Share when slot will be recomputed in backward
-    AlwaysShare,       ///< Always share across layers (use with caution)
-    FFTShare,          ///< Share only in FFT mode (not LoRA)
-    LoRAShare,         ///< Share only in LoRA mode (not FFT)
-    AlwaysRecompute,   ///< Share whenever recompute is enabled (regardless of mode)
+    PerLayer,         ///< Always allocate per-layer (no sharing)
+    WhenRecomputed,   ///< Share when slot will be recomputed in backward
+    AlwaysShare,      ///< Always share across layers (use with caution)
+    FFTShare,         ///< Share only in FFT mode (not LoRA)
+    LoRAShare,        ///< Share only in LoRA mode (not FFT)
+    AlwaysRecompute,  ///< Share whenever recompute is enabled (regardless of mode)
 };
 
 /// @brief Specification for a single activation tensor slot
 struct ActivationSlotIR {
-    std::string name;                          ///< Canonical slot name (e.g., "ln1", "qkv")
+    std::string name;  ///< Canonical slot name (e.g., "ln1", "qkv")
     ActivationScope scope = ActivationScope::Block;
-    std::vector<Dim> shape;                    ///< Shape expression using symbolic dims
-    std::optional<ETensorDType> dtype;         ///< Override dtype (nullopt = inherit)
-    std::vector<std::string> aliases;          ///< Alternative names mapping to this slot
+    std::vector<Dim> shape;             ///< Shape expression using symbolic dims
+    std::optional<ETensorDType> dtype;  ///< Override dtype (nullopt = inherit)
+    std::vector<std::string> aliases;   ///< Alternative names mapping to this slot
     ActivationMemoryHint memory_hint = ActivationMemoryHint::Persistent;
-    std::string shares_with;                   ///< If memory_hint == Shared, slot to share with
-    bool save_for_backward = false;            ///< Add to forward save list
+    std::string shares_with;                           ///< If memory_hint == Shared, slot to share with
+    bool save_for_backward = false;                    ///< Add to forward save list
     SharePolicy share_policy = SharePolicy::PerLayer;  ///< Cross-layer sharing policy (default: no sharing)
-    std::string gradient_of;                   ///< For gradient slots: corresponding forward activation
-    std::string alias_of;                      ///< Optional alias target (reuse existing buffer)
-    std::string condition;                     ///< Condition expression (e.g., "use_qk_norm")
-    std::string description;                   ///< Documentation
+    std::string gradient_of;                           ///< For gradient slots: corresponding forward activation
+    std::string alias_of;                              ///< Optional alias target (reuse existing buffer)
+    std::string condition;                             ///< Condition expression (e.g., "use_qk_norm")
+    std::string description;                           ///< Documentation
 };
 
 /// @brief Complete activation layout for a block or model
 struct ActivationLayoutIR {
-    std::string name;                          ///< Layout name (e.g., "Qwen3BlockActivations")
-    std::vector<ActivationSlotIR> slots;       ///< Forward activation slots
+    std::string name;                              ///< Layout name (e.g., "Qwen3BlockActivations")
+    std::vector<ActivationSlotIR> slots;           ///< Forward activation slots
     std::vector<ActivationSlotIR> gradient_slots;  ///< Backward gradient slots
-    std::string extends;                       ///< Base layout to extend (optional)
+    std::string extends;                           ///< Base layout to extend (optional)
 
     /// @brief Get slot by name or alias (returns nullptr if not found)
     const ActivationSlotIR* get_slot(const std::string& name) const;
@@ -221,6 +215,6 @@ ShapeEnv make_shape_env(const Module& module, long B, long T);
 long resolve_dim(const Dim& dim, const ShapeEnv& env);
 std::vector<long> resolve_shape(const std::vector<Dim>& dims, const ShapeEnv& env);
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_IR_H
+#endif  // SUROGATE_SRC_DSL_IR_H

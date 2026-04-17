@@ -8,20 +8,20 @@ replacing the scattered positional arguments those components used to receive.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import dataclass
 
 
 @dataclass(slots=True)
 class MoEMetrics:
     """Per-step Mixture-of-Experts diagnostics."""
+
     aux_loss: float = 0.0
     z_loss: float = 0.0
     load_imbalance: float = 0.0
     expert_utilization: float = 0.0
 
     @staticmethod
-    def from_dict(d: dict) -> Optional[MoEMetrics]:
+    def from_dict(d: dict) -> MoEMetrics | None:
         """Build from the dict returned by ``trainer.get_moe_stats()``.
 
         Returns *None* when the dict has ``valid=False``.
@@ -52,7 +52,7 @@ class StepMetrics:
     elapsed_ms: int = 0
     phase: str = ""
     lr_overridden: bool = False
-    moe: Optional[MoEMetrics] = None
+    moe: MoEMetrics | None = None
 
     # -- derived helpers --
 

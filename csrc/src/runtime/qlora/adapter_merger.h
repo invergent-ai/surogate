@@ -73,9 +73,7 @@ public:
     /// @param dsl_param_name  Internal param name (e.g., "blocks[0].qkv_weight").
     /// @param bf16_weight     BF16 tensor on GPU (modified in-place).
     /// @param stream          CUDA stream for the merge operations.
-    void apply(const std::string& dsl_param_name,
-               Tensor& bf16_weight,
-               cudaStream_t stream);
+    void apply(const std::string& dsl_param_name, Tensor& bf16_weight, cudaStream_t stream);
 
     /// Merge adapter delta for a single expert in per-expert streaming.
     ///
@@ -86,13 +84,12 @@ public:
     /// @param expert_idx      Global expert index (0-based).
     /// @param bf16_expert     BF16 tensor [per_M, K] on GPU (modified in-place).
     /// @param stream          CUDA stream.
-    void apply_expert(const std::string& dsl_param_name,
-                      int expert_idx,
-                      Tensor& bf16_expert,
-                      cudaStream_t stream);
+    void apply_expert(const std::string& dsl_param_name, int expert_idx, Tensor& bf16_expert, cudaStream_t stream);
 
     /// Number of adapter targets that were found in the adapter.
-    [[nodiscard]] int num_targets() const { return static_cast<int>(mAdapterTargets.size()); }
+    [[nodiscard]] int num_targets() const {
+        return static_cast<int>(mAdapterTargets.size());
+    }
 
 private:
     /// Info about one LoRA adapter pair (A and B matrices).
@@ -130,7 +127,7 @@ private:
     SafeTensorsReader& mBaseReader;
     dsl::ShardConfig mShard;
 
-    float mScaling = 0.0f;   ///< alpha / rank (or alpha / sqrt(rank) for RS-LoRA)
+    float mScaling = 0.0f;  ///< alpha / rank (or alpha / sqrt(rank) for RS-LoRA)
     int mRank = 0;
 
     /// Map: HF weight base name (without ".weight") → LoRA pair keys.

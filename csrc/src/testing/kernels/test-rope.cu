@@ -24,9 +24,8 @@ using namespace testing_utils;
 namespace {
 
 // CPU baseline for RoPE forward: rotates queries and keys, copies values
-static void rope_forward_cpu(float* out, const float* in, const float* freqs,
-                             int B, int T, int Nq, int Nkv, int HD) {
-    const int N = Nq + 2 * Nkv; // [q, k, v]
+static void rope_forward_cpu(float* out, const float* in, const float* freqs, int B, int T, int Nq, int Nkv, int HD) {
+    const int N = Nq + 2 * Nkv;  // [q, k, v]
     const int HD2 = HD / 2;
     for (int b = 0; b < B; ++b) {
         for (int t = 0; t < T; ++t) {
@@ -55,8 +54,8 @@ static void rope_forward_cpu(float* out, const float* in, const float* freqs,
 }
 
 // CPU baseline for RoPE backward: inverse rotation on q/k, copy for v
-static void rope_backward_cpu(float* dinp, const float* dout, const float* freqs,
-                              int B, int T, int Nq, int Nkv, int HD) {
+static void
+rope_backward_cpu(float* dinp, const float* dout, const float* freqs, int B, int T, int Nq, int Nkv, int HD) {
     const int N = Nq + 2 * Nkv;
     const int HD2 = HD / 2;
     for (int b = 0; b < B; ++b) {
@@ -73,7 +72,7 @@ static void rope_backward_cpu(float* dinp, const float* dout, const float* freqs
                         float real = base[d];
                         float imag = base[d + HD2];
                         float c = freqt[2 * d + 0];
-                        float s = -freqt[2 * d + 1]; // inverse rotation
+                        float s = -freqt[2 * d + 1];  // inverse rotation
                         outb[d] = real * c - imag * s;
                         outb[d + HD2] = real * s + imag * c;
                     }
@@ -83,13 +82,13 @@ static void rope_backward_cpu(float* dinp, const float* dout, const float* freqs
     }
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("rope forward/backward fp32 matches CPU", "[kernels][rope][fp32]") {
     const auto& cfg = testing_config::get_test_config();
     const int B = cfg.B;
     const int T = cfg.T;
-    const int HD = cfg.C; // reuse C as head_dim
+    const int HD = cfg.C;  // reuse C as head_dim
     const int Nq = cfg.Nq;
     const int Nkv = cfg.Nkv;
     const int N = Nq + 2 * Nkv;
@@ -122,7 +121,13 @@ TEST_CASE("rope forward/backward fp32 matches CPU", "[kernels][rope][fp32]") {
                  thrust::raw_pointer_cast(d_inp.data()),
                  thrust::raw_pointer_cast(d_freqs.data()),
                  /*position_ids=*/nullptr,
-                 nullptr, B, T, Nq, Nkv, HD, 0);
+                 nullptr,
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
 
     std::vector<float> h_out(size_inp);
     thrust::copy(d_out.begin(), d_out.end(), h_out.begin());
@@ -137,18 +142,25 @@ TEST_CASE("rope forward/backward fp32 matches CPU", "[kernels][rope][fp32]") {
                  thrust::raw_pointer_cast(d_inp.data()),
                  thrust::raw_pointer_cast(d_freqs.data()),
                  /*position_ids=*/nullptr,
-                 thrust::raw_pointer_cast(d_absmax_fwd.data()), B, T, Nq, Nkv, HD, 0);
+                 thrust::raw_pointer_cast(d_absmax_fwd.data()),
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
     std::vector<float> h_out2 = from_device(d_out2);
     for (size_t i = 0; i < size_inp; ++i) {
-        REQUIRE(h_out2[i] == h_out[i]); // bit-perfect identical
+        REQUIRE(h_out2[i] == h_out[i]);  // bit-perfect identical
     }
     float h_absmax_fwd = from_device(d_absmax_fwd)[0];
     float expected_absmax_fwd = 0.0f;
-    for (size_t i = 0; i < size_inp; ++i) expected_absmax_fwd = std::max(expected_absmax_fwd, std::fabs(h_out_cpu[i]));
+    for (size_t i = 0; i < size_inp; ++i)
+        expected_absmax_fwd = std::max(expected_absmax_fwd, std::fabs(h_out_cpu[i]));
     REQUIRE(h_absmax_fwd == Catch::Approx(expected_absmax_fwd).margin(1e-6f));
 
     // Backward: generate dout and compare dinp
-    std::vector<float> h_dout = uniform_host(size_inp,  -0.5, 0.5, 424242ull);
+    std::vector<float> h_dout = uniform_host(size_inp, -0.5, 0.5, 424242ull);
     std::vector<float> h_dinp_cpu(size_inp);
     rope_backward_cpu(h_dinp_cpu.data(), h_dout.data(), h_freqs.data(), B, T, Nq, Nkv, HD);
 
@@ -160,7 +172,12 @@ TEST_CASE("rope forward/backward fp32 matches CPU", "[kernels][rope][fp32]") {
                   thrust::raw_pointer_cast(d_freqs.data()),
                   /*position_ids=*/nullptr,
                   nullptr,
-                  B, T, Nq, Nkv, HD, 0);
+                  B,
+                  T,
+                  Nq,
+                  Nkv,
+                  HD,
+                  0);
 
     std::vector<float> h_dinp = from_device(d_dinp);
     for (size_t i = 0; i < size_inp; ++i) {
@@ -175,14 +192,20 @@ TEST_CASE("rope forward/backward fp32 matches CPU", "[kernels][rope][fp32]") {
                   thrust::raw_pointer_cast(d_freqs.data()),
                   /*position_ids=*/nullptr,
                   thrust::raw_pointer_cast(d_absmax_bwd.data()),
-                  B, T, Nq, Nkv, HD, 0);
+                  B,
+                  T,
+                  Nq,
+                  Nkv,
+                  HD,
+                  0);
     std::vector<float> h_dinp2 = from_device(d_dinp2);
     for (size_t i = 0; i < size_inp; ++i) {
-        REQUIRE(h_dinp2[i] == h_dinp[i]); // bit-perfect identical
+        REQUIRE(h_dinp2[i] == h_dinp[i]);  // bit-perfect identical
     }
     float h_absmax_bwd = from_device(d_absmax_bwd)[0];
     float expected_absmax_bwd = 0.0f;
-    for (size_t i = 0; i < size_inp; ++i) expected_absmax_bwd = std::max(expected_absmax_bwd, std::fabs(h_dinp_cpu[i]));
+    for (size_t i = 0; i < size_inp; ++i)
+        expected_absmax_bwd = std::max(expected_absmax_bwd, std::fabs(h_dinp_cpu[i]));
     REQUIRE(h_absmax_bwd == Catch::Approx(expected_absmax_bwd).margin(1e-6f));
 }
 
@@ -232,7 +255,13 @@ TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[kernels][ro
                  thrust::raw_pointer_cast(d_inp.data()),
                  thrust::raw_pointer_cast(d_freqs.data()),
                  /*position_ids=*/nullptr,
-                 nullptr, B, T, Nq, Nkv, HD, 0);
+                 nullptr,
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
 
     std::vector<nv_bfloat16> h_out_bf16 = from_device(d_out);
     for (size_t i = 0; i < size_inp; ++i) {
@@ -243,23 +272,30 @@ TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[kernels][ro
     }
 
     // Forward again with absmax, ensure bit-perfect identical bf16 outputs, check absmax
-    std::vector<nv_bfloat16> h_out_bf16_ref = h_out_bf16; // keep reference for bitwise compare
+    std::vector<nv_bfloat16> h_out_bf16_ref = h_out_bf16;  // keep reference for bitwise compare
     thrust::device_vector<float> d_absmax_fwd_bf16(1);
     rope_forward(thrust::raw_pointer_cast(d_out.data()),
                  thrust::raw_pointer_cast(d_inp.data()),
                  thrust::raw_pointer_cast(d_freqs.data()),
                  /*position_ids=*/nullptr,
-                 thrust::raw_pointer_cast(d_absmax_fwd_bf16.data()), B, T, Nq, Nkv, HD, 0);
+                 thrust::raw_pointer_cast(d_absmax_fwd_bf16.data()),
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
     h_out_bf16 = from_device(d_out);
     for (size_t i = 0; i < size_inp; ++i) {
         uint16_t a, b;
         std::memcpy(&a, &h_out_bf16[i], sizeof(a));
         std::memcpy(&b, &h_out_bf16_ref[i], sizeof(b));
-        REQUIRE(a == b); // bit-perfect identical
+        REQUIRE(a == b);  // bit-perfect identical
     }
     float h_absmax_fwd_bf16 = from_device(d_absmax_fwd_bf16)[0];
     float expected_absmax_fwd_bf16 = 0.0f;
-    for (size_t i = 0; i < size_inp; ++i) expected_absmax_fwd_bf16 = std::max(expected_absmax_fwd_bf16, std::fabs(h_out_cpu[i]));
+    for (size_t i = 0; i < size_inp; ++i)
+        expected_absmax_fwd_bf16 = std::max(expected_absmax_fwd_bf16, std::fabs(h_out_cpu[i]));
     REQUIRE(h_absmax_fwd_bf16 == Catch::Approx(expected_absmax_fwd_bf16).margin(3e-2f));
 
     // Backward bf16
@@ -276,7 +312,13 @@ TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[kernels][ro
                   thrust::raw_pointer_cast(d_dout.data()),
                   thrust::raw_pointer_cast(d_freqs.data()),
                   /*position_ids=*/nullptr,
-                  nullptr, B, T, Nq, Nkv, HD, 0);
+                  nullptr,
+                  B,
+                  T,
+                  Nq,
+                  Nkv,
+                  HD,
+                  0);
 
     std::vector<nv_bfloat16> h_dinp_bf16 = from_device(d_dinp);
     for (size_t i = 0; i < size_inp; ++i) {
@@ -293,7 +335,13 @@ TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[kernels][ro
                   thrust::raw_pointer_cast(d_dout.data()),
                   thrust::raw_pointer_cast(d_freqs.data()),
                   /*position_ids=*/nullptr,
-                  thrust::raw_pointer_cast(d_absmax_bwd_bf16.data()), B, T, Nq, Nkv, HD, 0);
+                  thrust::raw_pointer_cast(d_absmax_bwd_bf16.data()),
+                  B,
+                  T,
+                  Nq,
+                  Nkv,
+                  HD,
+                  0);
     h_dinp_bf16 = from_device(d_dinp);
     for (size_t i = 0; i < size_inp; ++i) {
         uint16_t a, b;
@@ -303,7 +351,8 @@ TEST_CASE("rope forward/backward bfloat16 matches CPU (emulated)", "[kernels][ro
     }
     float h_absmax_bwd_bf16 = from_device(d_absmax_bwd_bf16)[0];
     float expected_absmax_bwd_bf16 = 0.0f;
-    for (size_t i = 0; i < size_inp; ++i) expected_absmax_bwd_bf16 = std::max(expected_absmax_bwd_bf16, std::fabs(h_dinp_cpu[i]));
+    for (size_t i = 0; i < size_inp; ++i)
+        expected_absmax_bwd_bf16 = std::max(expected_absmax_bwd_bf16, std::fabs(h_dinp_cpu[i]));
     REQUIRE(h_absmax_bwd_bf16 == Catch::Approx(expected_absmax_bwd_bf16).margin(3e-2f));
 }
 
@@ -340,7 +389,12 @@ TEST_CASE("rope absmax (fp32)", "[kernels][rope][fp32][absmax]") {
                  thrust::raw_pointer_cast(d_freqs.data()),
                  /*position_ids=*/nullptr,
                  thrust::raw_pointer_cast(d_absmax.data()),
-                 B, T, Nq, Nkv, HD, 0);
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
 
     std::vector<float> h_out = from_device(d_out);
     for (size_t i = 0; i < size_inp; ++i) {
@@ -348,18 +402,23 @@ TEST_CASE("rope absmax (fp32)", "[kernels][rope][fp32][absmax]") {
     }
     float absmax = from_device(d_absmax)[0];
     float expected_abs = 10.f;
-    REQUIRE(absmax == Catch::Approx(expected_abs).margin(1e-6f)); // must include V region too
+    REQUIRE(absmax == Catch::Approx(expected_abs).margin(1e-6f));  // must include V region too
 
     // In-place with absmax should produce identical results
     thrust::device_vector<float> d_absmax_ip(1);
     // Copy input to output buffer to perform in-place
-    thrust::device_vector<float> d_io = d_inp; // start from input
+    thrust::device_vector<float> d_io = d_inp;  // start from input
     rope_forward(thrust::raw_pointer_cast(d_io.data()),
                  thrust::raw_pointer_cast(d_io.data()),
                  thrust::raw_pointer_cast(d_freqs.data()),
                  /*position_ids=*/nullptr,
                  thrust::raw_pointer_cast(d_absmax_ip.data()),
-                 B, T, Nq, Nkv, HD, 0);
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
     std::vector<float> h_io = from_device(d_io);
     for (size_t i = 0; i < size_inp; ++i) {
         REQUIRE(h_io[i] == Catch::Approx(h_out_cpu[i]).margin(1e-6f));
@@ -400,8 +459,14 @@ TEST_CASE("rope_fused forward/backward fp32 matches baseline", "[kernels][rope][
     rope_forward(thrust::raw_pointer_cast(d_out_base.data()),
                  thrust::raw_pointer_cast(d_inp_base.data()),
                  thrust::raw_pointer_cast(d_freqs.data()),
-                 /*position_ids=*/nullptr, nullptr,
-                 B, T, Nq, Nkv, HD, 0);
+                 /*position_ids=*/nullptr,
+                 nullptr,
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
 
     std::vector<float> h_out_base = from_device(d_out_base);
 
@@ -411,8 +476,15 @@ TEST_CASE("rope_fused forward/backward fp32 matches baseline", "[kernels][rope][
 
     rope_fused_forward(thrust::raw_pointer_cast(d_out_fused.data()),
                        thrust::raw_pointer_cast(d_inp_fused.data()),
-                       /*position_ids=*/nullptr, nullptr,
-                       theta, B, T, Nq, Nkv, HD, 0);
+                       /*position_ids=*/nullptr,
+                       nullptr,
+                       theta,
+                       B,
+                       T,
+                       Nq,
+                       Nkv,
+                       HD,
+                       0);
 
     std::vector<float> h_out_fused = from_device(d_out_fused);
 
@@ -430,16 +502,29 @@ TEST_CASE("rope_fused forward/backward fp32 matches baseline", "[kernels][rope][
     rope_backward(thrust::raw_pointer_cast(d_dinp_base.data()),
                   thrust::raw_pointer_cast(d_dout.data()),
                   thrust::raw_pointer_cast(d_freqs.data()),
-                  /*position_ids=*/nullptr, nullptr,
-                  B, T, Nq, Nkv, HD, 0);
+                  /*position_ids=*/nullptr,
+                  nullptr,
+                  B,
+                  T,
+                  Nq,
+                  Nkv,
+                  HD,
+                  0);
     std::vector<float> h_dinp_base = from_device(d_dinp_base);
 
     // Fused backward
     thrust::device_vector<float> d_dinp_fused(size_inp);
     rope_fused_backward(thrust::raw_pointer_cast(d_dinp_fused.data()),
                         thrust::raw_pointer_cast(d_dout.data()),
-                        /*position_ids=*/nullptr, nullptr,
-                        theta, B, T, Nq, Nkv, HD, 0);
+                        /*position_ids=*/nullptr,
+                        nullptr,
+                        theta,
+                        B,
+                        T,
+                        Nq,
+                        Nkv,
+                        HD,
+                        0);
     std::vector<float> h_dinp_fused = from_device(d_dinp_fused);
 
     // Compare fused backward with baseline
@@ -481,8 +566,14 @@ TEST_CASE("rope_fused forward/backward bf16 matches baseline", "[kernels][rope][
     rope_forward(thrust::raw_pointer_cast(d_out_base.data()),
                  thrust::raw_pointer_cast(d_inp_base.data()),
                  thrust::raw_pointer_cast(d_freqs.data()),
-                 /*position_ids=*/nullptr, nullptr,
-                 B, T, Nq, Nkv, HD, 0);
+                 /*position_ids=*/nullptr,
+                 nullptr,
+                 B,
+                 T,
+                 Nq,
+                 Nkv,
+                 HD,
+                 0);
 
     std::vector<nv_bfloat16> h_out_base_bf16 = from_device(d_out_base);
 
@@ -492,8 +583,15 @@ TEST_CASE("rope_fused forward/backward bf16 matches baseline", "[kernels][rope][
 
     rope_fused_forward(thrust::raw_pointer_cast(d_out_fused.data()),
                        thrust::raw_pointer_cast(d_inp_fused.data()),
-                       /*position_ids=*/nullptr, nullptr,
-                       theta, B, T, Nq, Nkv, HD, 0);
+                       /*position_ids=*/nullptr,
+                       nullptr,
+                       theta,
+                       B,
+                       T,
+                       Nq,
+                       Nkv,
+                       HD,
+                       0);
 
     std::vector<nv_bfloat16> h_out_fused_bf16 = from_device(d_out_fused);
 
@@ -517,16 +615,29 @@ TEST_CASE("rope_fused forward/backward bf16 matches baseline", "[kernels][rope][
     rope_backward(thrust::raw_pointer_cast(d_dinp_base.data()),
                   thrust::raw_pointer_cast(d_dout.data()),
                   thrust::raw_pointer_cast(d_freqs.data()),
-                  /*position_ids=*/nullptr, nullptr,
-                  B, T, Nq, Nkv, HD, 0);
+                  /*position_ids=*/nullptr,
+                  nullptr,
+                  B,
+                  T,
+                  Nq,
+                  Nkv,
+                  HD,
+                  0);
     std::vector<nv_bfloat16> h_dinp_base_bf16 = from_device(d_dinp_base);
 
     // Fused backward
     thrust::device_vector<nv_bfloat16> d_dinp_fused(size_inp);
     rope_fused_backward(thrust::raw_pointer_cast(d_dinp_fused.data()),
                         thrust::raw_pointer_cast(d_dout.data()),
-                        /*position_ids=*/nullptr, nullptr,
-                        theta, B, T, Nq, Nkv, HD, 0);
+                        /*position_ids=*/nullptr,
+                        nullptr,
+                        theta,
+                        B,
+                        T,
+                        Nq,
+                        Nkv,
+                        HD,
+                        0);
     std::vector<nv_bfloat16> h_dinp_fused_bf16 = from_device(d_dinp_fused);
 
     // Compare
@@ -559,7 +670,13 @@ TEST_CASE("rope_fused absmax (fp32)", "[kernels][rope][fused][fp32][absmax]") {
                        thrust::raw_pointer_cast(d_inp.data()),
                        /*position_ids=*/nullptr,
                        thrust::raw_pointer_cast(d_absmax.data()),
-                       theta, B, T, Nq, Nkv, HD, 0);
+                       theta,
+                       B,
+                       T,
+                       Nq,
+                       Nkv,
+                       HD,
+                       0);
 
     float absmax = from_device(d_absmax)[0];
     // V values pass through unchanged, so absmax should include the 10.0 outlier
@@ -580,16 +697,30 @@ TEST_CASE("rope_fused in-place operation (fp32)", "[kernels][rope][fused][fp32][
     thrust::device_vector<float> d_out(size_inp);
     rope_fused_forward(thrust::raw_pointer_cast(d_out.data()),
                        thrust::raw_pointer_cast(d_inp.data()),
-                       /*position_ids=*/nullptr, nullptr,
-                       theta, B, T, Nq, Nkv, HD, 0);
+                       /*position_ids=*/nullptr,
+                       nullptr,
+                       theta,
+                       B,
+                       T,
+                       Nq,
+                       Nkv,
+                       HD,
+                       0);
     std::vector<float> h_out_oop = from_device(d_out);
 
     // In-place
     thrust::device_vector<float> d_inplace = to_device(h_inp);
     rope_fused_forward(thrust::raw_pointer_cast(d_inplace.data()),
                        thrust::raw_pointer_cast(d_inplace.data()),
-                       /*position_ids=*/nullptr, nullptr,
-                       theta, B, T, Nq, Nkv, HD, 0);
+                       /*position_ids=*/nullptr,
+                       nullptr,
+                       theta,
+                       B,
+                       T,
+                       Nq,
+                       Nkv,
+                       HD,
+                       0);
     std::vector<float> h_out_ip = from_device(d_inplace);
 
     // Should match

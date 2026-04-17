@@ -17,6 +17,9 @@
 #include <fmt/format.h>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -30,23 +33,18 @@ namespace {
 bool contains_ci(std::string_view haystack, std::string_view needle) {
     std::string h(haystack);
     std::string n(needle);
-    std::transform(h.begin(), h.end(), h.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    std::transform(n.begin(), n.end(), n.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return h.find(n) != std::string::npos;
 }
 
 bool is_nemotron_model(const modules::ModelConfig& cfg) {
-    return contains_ci(cfg.ModelTypeName, "nemotron") ||
-           contains_ci(cfg.ArchitectureName, "nemotron");
+    return contains_ci(cfg.ModelTypeName, "nemotron") || contains_ci(cfg.ArchitectureName, "nemotron");
 }
 
 bool is_qwen3_5_model(const modules::ModelConfig& cfg) {
-    return contains_ci(cfg.ModelTypeName, "qwen3_5") ||
-           contains_ci(cfg.ModelTypeName, "qwen3.5") ||
-           contains_ci(cfg.ArchitectureName, "qwen3_5") ||
-           contains_ci(cfg.ArchitectureName, "qwen3.5");
+    return contains_ci(cfg.ModelTypeName, "qwen3_5") || contains_ci(cfg.ModelTypeName, "qwen3.5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3_5") || contains_ci(cfg.ArchitectureName, "qwen3.5");
 }
 
 bool tensors_overlap(const Tensor& a, const Tensor& b) {
@@ -79,10 +77,9 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     }
 
     const bool is_ln2_fwd = (fwd_layer_idx >= 0 && fwd_field.find("ln2") != std::string::npos);
-    const bool is_hybrid_norm = (fwd_layer_idx >= 0 &&
-        fwd_layer_idx < static_cast<int>(mConfig.NumLayers) &&
-        mConfig.architecture == modules::ArchitectureType::Hybrid &&
-        fwd_field == "norm_weight");
+    const bool is_hybrid_norm =
+        (fwd_layer_idx >= 0 && fwd_layer_idx < static_cast<int>(mConfig.NumLayers) &&
+         mConfig.architecture == modules::ArchitectureType::Hybrid && fwd_field == "norm_weight");
 
     // Bind residual_out directly to canonical buffer when possible, so the kernel
     // writes there without a post-kernel D2D copy.
@@ -124,9 +121,8 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     // Validate dtypes before calling kernel
     if (rstd.DType != ETensorDType::FP32) {
         std::ostringstream oss;
-        oss << "fused_residual_rmsnorm: rstd dtype mismatch. Expected FP32, got "
-            << dtype_to_str(rstd.DType) << ". Output tensor: " << op.outputs[2].name
-            << " (slot=" << static_cast<int>(op.outputs[2].slot) << ")";
+        oss << "fused_residual_rmsnorm: rstd dtype mismatch. Expected FP32, got " << dtype_to_str(rstd.DType)
+            << ". Output tensor: " << op.outputs[2].name << " (slot=" << static_cast<int>(op.outputs[2].slot) << ")";
         throw std::runtime_error(oss.str());
     }
 
@@ -159,30 +155,24 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     };
 
     bool handled_replay_exact = false;
-    const bool qwen_ln1_like =
-        is_qwen3_5_model(mConfig) &&
-        (fwd_field == "ln1_weight" || fwd_field == "norm_weight");
+    const bool qwen_ln1_like = is_qwen3_5_model(mConfig) && (fwd_field == "ln1_weight" || fwd_field == "norm_weight");
     if (mInReplay && fwd_layer_idx >= 0 && qwen_ln1_like) {
         Tensor& stored_res_ffn = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
-        const Tensor* saved_residual =
-            op.outputs.size() > 0 ? find_saved_tensor(op.outputs[0].name) : nullptr;
-        const Tensor* saved_ln1 =
-            op.outputs.size() > 1 ? find_saved_tensor(op.outputs[1].name) : nullptr;
-        const Tensor* saved_ln1_rstd =
-            op.outputs.size() > 2 ? find_saved_tensor(op.outputs[2].name) : nullptr;
-        const Tensor* exact_residual =
-            (saved_residual && saved_residual->Data) ? saved_residual : &stored_res_ffn;
+        const Tensor* saved_residual = op.outputs.size() > 0 ? find_saved_tensor(op.outputs[0].name) : nullptr;
+        const Tensor* saved_ln1 = op.outputs.size() > 1 ? find_saved_tensor(op.outputs[1].name) : nullptr;
+        const Tensor* saved_ln1_rstd = op.outputs.size() > 2 ? find_saved_tensor(op.outputs[2].name) : nullptr;
+        const Tensor* exact_residual = (saved_residual && saved_residual->Data) ? saved_residual : &stored_res_ffn;
         if (exact_residual->Data && saved_ln1 && saved_ln1_rstd) {
             auto copy_saved = [&](Tensor& dst, const Tensor& src, const char* what) {
                 if (!dst.Data || !src.Data || tensors_overlap(dst, src)) {
                     return;
                 }
                 if (dst.bytes() != src.bytes() || dst.DType != src.DType) {
-                    throw std::runtime_error(
-                        std::string("fused_residual_rmsnorm replay exact-copy mismatch for ") + what);
+                    throw std::runtime_error(std::string("fused_residual_rmsnorm replay exact-copy mismatch for ") +
+                                             what);
                 }
-                CUDA_CHECK(cudaMemcpyAsync(dst.Data, src.Data, dst.bytes(),
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(dst.Data, src.Data, dst.bytes(), cudaMemcpyDeviceToDevice, mRunState.MainStream));
             };
             copy_saved(residual_out, *exact_residual, "residual_out");
             copy_saved(y, *saved_ln1, "ln1");
@@ -202,27 +192,45 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
             Tensor& stored_res_ffn = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
             if (stored_res_ffn.Data) {
                 // Use stored residual as residual_in, zero out input
-                Tensor zero_input = mRunState.temp_alloc(input.DType,
-                    std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank), "fused_residual_rmsnorm_zero_input");
+                Tensor zero_input =
+                    mRunState.temp_alloc(input.DType,
+                                         std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank),
+                                         "fused_residual_rmsnorm_zero_input");
                 mTemps.push_back(zero_input);
                 fill_zero(zero_input, mRunState.MainStream);
-                fused_residual_rmsnorm_forward(residual_out, y, rstd, stored_res_ffn, zero_input, weight, nullptr,
-                                               op.attrs.eps, static_cast<int>(mB * mT),
-                                               mConfig.HiddenSize, mRunState.MainStream);
+                fused_residual_rmsnorm_forward(residual_out,
+                                               y,
+                                               rstd,
+                                               stored_res_ffn,
+                                               zero_input,
+                                               weight,
+                                               nullptr,
+                                               op.attrs.eps,
+                                               static_cast<int>(mB * mT),
+                                               mConfig.HiddenSize,
+                                               mRunState.MainStream);
                 return;
             }
         }
 
-        fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
-                                       op.attrs.eps, static_cast<int>(mB * mT),
-                                       mConfig.HiddenSize, mRunState.MainStream);
+        fused_residual_rmsnorm_forward(residual_out,
+                                       y,
+                                       rstd,
+                                       residual_in,
+                                       input,
+                                       weight,
+                                       nullptr,
+                                       op.attrs.eps,
+                                       static_cast<int>(mB * mT),
+                                       mConfig.HiddenSize,
+                                       mRunState.MainStream);
     }
 
     // Pre-quantize normalized output into FP8 buffer for the downstream matmul.
     // LN1 output → QKV matmul input (fp8_quants.ln1)
     // LN2 output → MLPUp matmul input (fp8_quants.ln2)
-    if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() &&
-        !mRunState.has_fp8_delayed_scaling() && fwd_layer_idx >= 0) {
+    if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() && !mRunState.has_fp8_delayed_scaling() &&
+        fwd_layer_idx >= 0) {
         auto& quants = mRunState.fp8_forward_quants();
         Tensor* fp8_buf = nullptr;
         DslRunState::FP8BufferReady flag = DslRunState::FP8Ready_None;
@@ -238,8 +246,13 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
         if (fp8_buf && fp8_buf->Data && fp8_buf->abs_max() && fp8_buf->scale()) {
             const long num_elements = mB * mT * mConfig.HiddenSize;
             Tensor y_flat = view_tensor(y, {mB * mT, static_cast<long>(mConfig.HiddenSize)});
-            quantize_with_abs_max(*fp8_buf, fp8_buf->scale(), y_flat, fp8_buf->abs_max(),
-                                  num_elements, mRunState.DeviceProp, mRunState.MainStream);
+            quantize_with_abs_max(*fp8_buf,
+                                  fp8_buf->scale(),
+                                  y_flat,
+                                  fp8_buf->abs_max(),
+                                  num_elements,
+                                  mRunState.DeviceProp,
+                                  mRunState.MainStream);
             mRunState.set_fp8_buffer_ready(flag);
         }
     }
@@ -251,10 +264,9 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
 
     Tensor& d_y = resolve_tensor(op.inputs[0]);
 
-    const bool is_final_norm =
-        (op.inputs[3].name.find("final_norm") != std::string::npos ||
-         op.inputs[3].name.find("ln_final") != std::string::npos ||
-         op.inputs[3].name.find("ln_f") != std::string::npos);
+    const bool is_final_norm = (op.inputs[3].name.find("final_norm") != std::string::npos ||
+                                op.inputs[3].name.find("ln_final") != std::string::npos ||
+                                op.inputs[3].name.find("ln_f") != std::string::npos);
 
     Tensor* residual_out_ptr = &resolve_tensor(op.inputs[2]);
     Tensor weight_eff_fallback{};
@@ -264,9 +276,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         weight_ptr = &resolve_tensor(op.inputs[3]);
     } catch (const std::exception&) {
         const std::string& eff_name = op.inputs[3].name;
-        const bool has_eff_suffix =
-            eff_name.size() > 4 &&
-            eff_name.compare(eff_name.size() - 4, 4, "_eff") == 0;
+        const bool has_eff_suffix = eff_name.size() > 4 && eff_name.compare(eff_name.size() - 4, 4, "_eff") == 0;
         if (!has_eff_suffix) {
             throw;
         }
@@ -290,14 +300,19 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         }
 
         std::vector<long> shape(base_ptr->Sizes.begin(), base_ptr->Sizes.begin() + base_ptr->Rank);
-        weight_eff_fallback = mRunState.temp_alloc(base_ptr->DType, shape, "fused_residual_rmsnorm_weight_eff_fallback");
+        weight_eff_fallback =
+            mRunState.temp_alloc(base_ptr->DType, shape, "fused_residual_rmsnorm_weight_eff_fallback");
         weight_eff_ones = mRunState.temp_alloc(base_ptr->DType, shape, "fused_residual_rmsnorm_weight_eff_ones");
         mTemps.push_back(weight_eff_fallback);
         mTemps.push_back(weight_eff_ones);
-        fill_constant(weight_eff_ones, 1.0f, static_cast<std::size_t>(weight_eff_ones.nelem()),
+        fill_constant(weight_eff_ones, 1.0f, static_cast<std::size_t>(weight_eff_ones.nelem()), mRunState.MainStream);
+        vector_add_sr(weight_eff_fallback,
+                      *base_ptr,
+                      weight_eff_ones,
+                      1.0f,
+                      static_cast<long>(base_ptr->nelem()),
+                      0,
                       mRunState.MainStream);
-        vector_add_sr(weight_eff_fallback, *base_ptr, weight_eff_ones, 1.0f,
-                      static_cast<long>(base_ptr->nelem()), 0, mRunState.MainStream);
         weight_ptr = &weight_eff_fallback;
     }
     Tensor& weight = *weight_ptr;
@@ -339,7 +354,9 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     if (!op.inputs[1].name.empty()) {
         d_residual_next = &resolve_tensor(op.inputs[1]);
     } else {
-        d_residual_zero = mRunState.temp_alloc(d_y.DType, {mB, mT, static_cast<long>(mConfig.HiddenSize)}, "fused_residual_rmsnorm_d_residual_zero");
+        d_residual_zero = mRunState.temp_alloc(d_y.DType,
+                                               {mB, mT, static_cast<long>(mConfig.HiddenSize)},
+                                               "fused_residual_rmsnorm_d_residual_zero");
         fill_zero(d_residual_zero, mRunState.MainStream);
         mTemps.push_back(d_residual_zero);
         d_residual_next = &d_residual_zero;
@@ -381,35 +398,32 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     // can accidentally carry stale activation gradients forward. Materialize
     // a temporary copy to force a fresh overwrite path inside rmsnorm_backward.
     Tensor d_residual_alias_copy{};
-    if (d_residual_input && d_residual_input->Data != d_input.Data &&
-        tensors_overlap(*d_residual_input, d_input)) {
+    if (d_residual_input && d_residual_input->Data != d_input.Data && tensors_overlap(*d_residual_input, d_input)) {
         // The same logical gradient can arrive as different contiguous views
         // (e.g. [B,T,C] vs [BT,C]). The kernel performs a raw D2D copy whenever
         // source/destination pointers differ, so distinct overlapping buffers must
         // either be staged through a temp or rejected as invalid.
         const bool full_span_match =
-            (d_residual_input->bytes() == d_input.bytes()) &&
-            (d_residual_input->DType == d_input.DType);
+            (d_residual_input->bytes() == d_input.bytes()) && (d_residual_input->DType == d_input.DType);
         if (!full_span_match) {
             std::ostringstream oss;
             oss << "fused_residual_rmsnorm_backward: overlapping d_residual/d_input with "
-                << "mismatched spans or dtypes is unsafe (d_residual bytes="
-                << d_residual_input->bytes() << ", d_input bytes=" << d_input.bytes()
+                << "mismatched spans or dtypes is unsafe (d_residual bytes=" << d_residual_input->bytes()
+                << ", d_input bytes=" << d_input.bytes()
                 << ", d_residual dtype=" << dtype_to_str(d_residual_input->DType)
                 << ", d_input dtype=" << dtype_to_str(d_input.DType) << ")";
             throw std::runtime_error(oss.str());
         }
-        d_residual_alias_copy = mRunState.temp_alloc(
-            d_input.DType,
-            std::vector<long>(d_input.Sizes.begin(), d_input.Sizes.begin() + d_input.Rank),
-            "fused_residual_rmsnorm_d_residual_alias_copy");
+        d_residual_alias_copy =
+            mRunState.temp_alloc(d_input.DType,
+                                 std::vector<long>(d_input.Sizes.begin(), d_input.Sizes.begin() + d_input.Rank),
+                                 "fused_residual_rmsnorm_d_residual_alias_copy");
         mTemps.push_back(d_residual_alias_copy);
-        CUDA_CHECK(cudaMemcpyAsync(
-            d_residual_alias_copy.Data,
-            d_residual_input->Data,
-            d_input.bytes(),
-            cudaMemcpyDeviceToDevice,
-            mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(d_residual_alias_copy.Data,
+                                   d_residual_input->Data,
+                                   d_input.bytes(),
+                                   cudaMemcpyDeviceToDevice,
+                                   mRunState.MainStream));
         d_residual_input = &d_residual_alias_copy;
     }
 
@@ -424,7 +438,9 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             fill_zero(*d_weight_ptr, mRunState.MainStream);
         }
     } else {
-        dummy_weight = mRunState.temp_alloc(weight.DType, {static_cast<long>(mConfig.HiddenSize)}, "fused_residual_rmsnorm_dummy_weight");
+        dummy_weight = mRunState.temp_alloc(weight.DType,
+                                            {static_cast<long>(mConfig.HiddenSize)},
+                                            "fused_residual_rmsnorm_dummy_weight");
         mTemps.push_back(dummy_weight);
         d_weight_ptr = &dummy_weight;
     }
@@ -435,35 +451,57 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     float* abs_max_ptr = nullptr;
     if (mRunState.has_grad_quants()) {
         const bool is_ln2 = (ln_field == "ln2_weight");
-        abs_max_ptr = is_ln2
-            ? mRunState.simplified_quant_grads().d_res_att.abs_max()
-            : mRunState.simplified_quant_grads().d_res_ffn.abs_max();
+        abs_max_ptr = is_ln2 ? mRunState.simplified_quant_grads().d_res_att.abs_max()
+                             : mRunState.simplified_quant_grads().d_res_ffn.abs_max();
     }
 
-    const bool mixed_weight_grad =
-        (!skip_weight_grad && d_weight_ptr &&
-         d_weight_ptr->DType == ETensorDType::FP32 &&
-         d_input.DType == ETensorDType::BF16);
+    const bool mixed_weight_grad = (!skip_weight_grad && d_weight_ptr && d_weight_ptr->DType == ETensorDType::FP32 &&
+                                    d_input.DType == ETensorDType::BF16);
 
     if (mixed_weight_grad) {
         // Compute d_input in BF16 and weight grad separately in FP32.
-        Tensor tmp_dw = mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(C)}, "fused_residual_rmsnorm_tmp_dw");
+        Tensor tmp_dw =
+            mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(C)}, "fused_residual_rmsnorm_tmp_dw");
         mTemps.push_back(tmp_dw);
-        rmsnorm_backward(d_input, tmp_dw, mRunState.scratch().rmsnorm_scratch,
-                         *d_residual_input, d_y, residual_out, weight, *rstd_ptr,
+        rmsnorm_backward(d_input,
+                         tmp_dw,
+                         mRunState.scratch().rmsnorm_scratch,
+                         *d_residual_input,
+                         d_y,
+                         residual_out,
+                         weight,
+                         *rstd_ptr,
                          abs_max_ptr,
-                         static_cast<int>(mB), static_cast<int>(mT), C,
-                         mRunState.DeviceProp, mRunState.MainStream,
+                         static_cast<int>(mB),
+                         static_cast<int>(mT),
+                         C,
+                         mRunState.DeviceProp,
+                         mRunState.MainStream,
                          /*skip_weight_grad=*/true);
-        rmsnorm_backward_dweight_fp32(*d_weight_ptr, d_y, residual_out, *rstd_ptr,
-                                      static_cast<int>(mB), static_cast<int>(mT), C,
+        rmsnorm_backward_dweight_fp32(*d_weight_ptr,
+                                      d_y,
+                                      residual_out,
+                                      *rstd_ptr,
+                                      static_cast<int>(mB),
+                                      static_cast<int>(mT),
+                                      C,
                                       mRunState.MainStream);
     } else {
-        rmsnorm_backward(d_input, *d_weight_ptr, mRunState.scratch().rmsnorm_scratch,
-                         *d_residual_input, d_y, residual_out, weight, *rstd_ptr,
+        rmsnorm_backward(d_input,
+                         *d_weight_ptr,
+                         mRunState.scratch().rmsnorm_scratch,
+                         *d_residual_input,
+                         d_y,
+                         residual_out,
+                         weight,
+                         *rstd_ptr,
                          abs_max_ptr,
-                         static_cast<int>(mB), static_cast<int>(mT), C,
-                         mRunState.DeviceProp, mRunState.MainStream, skip_weight_grad);
+                         static_cast<int>(mB),
+                         static_cast<int>(mT),
+                         C,
+                         mRunState.DeviceProp,
+                         mRunState.MainStream,
+                         skip_weight_grad);
     }
 
     // Register d_input in mTensors for both graph outputs. Both outputs carry the same
@@ -477,8 +515,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     // Safety net: update d_residual_stream if it points to a different buffer.
     // With direct binding above, this is typically a no-op (pointers match).
     if (d_residual_stream && d_residual_stream->Data && d_residual_stream->Data != d_input.Data) {
-        CUDA_CHECK(cudaMemcpyAsync(d_residual_stream->Data, d_input.Data, d_input.bytes(),
-                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(d_residual_stream->Data,
+                                   d_input.Data,
+                                   d_input.bytes(),
+                                   cudaMemcpyDeviceToDevice,
+                                   mRunState.MainStream));
     }
 
     // Alias related gradient buffers so code reading simplified_grads directly
@@ -489,8 +530,8 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             grads.d_res_ffn.Data = d_input.Data;
         }
     }
-    if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight") &&
-        op.outputs.size() > 1 && op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
+    if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight") && op.outputs.size() > 1 &&
+        op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
         const int prev_layer = op.outputs[1].layer_idx;
         if (prev_layer >= 0) {
             auto& prev_grads = mRunState.simplified_grads(prev_layer);
@@ -501,5 +542,175 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
 }
 
+namespace {
 
+// -----------------------------------------------------------------------------
+// Fused residual RMSNorm backward rule
+// Forward: residual_out, y, rstd = fused_residual_rmsnorm(residual_in, x, weight, eps)
+// Backward: d_residual, d_x, d_weight = fused_residual_rmsnorm_backward(...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> fused_residual_rmsnorm_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+
+    // Forward inputs: residual_in, x, weight
+    // Forward outputs: residual_out, y, rstd
+    std::string residual_out = fwd.outputs[0];
+    std::string rstd = fwd.outputs.size() > 2 ? fwd.outputs[2] : fwd.outputs[0] + "_rstd";
+    std::string weight = fwd.inputs[2];
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"eps"});
+
+    // The backward kernel consumes gradients for both outputs:
+    //  - d_y: gradient of normalized output (y)
+    //  - d_residual_next: gradient flowing from residual_out
+    std::string d_residual_next = ctx.d_outputs.size() > 0 ? ctx.d_outputs[0] : "";
+    std::string d_y;
+    if (ctx.d_outputs.size() > 1 && !ctx.d_outputs[1].empty()) {
+        d_y = ctx.d_outputs[1];
+    } else {
+        d_y = ctx.d_output;
+    }
+
+    std::vector<std::string> inputs = {d_y, d_residual_next, saved_ref(residual_out), weight, saved_ref(rstd)};
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // d_residual
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // d_x
+    if (ctx.needs_grad(2)) {
+        outputs.push_back(ctx.d_inputs[2]);  // d_weight
+    }
+
+    ops.push_back(make_operation("fused_residual_rmsnorm_backward_" + std::to_string(ctx.op_counter++),
+                                 "fused_residual_rmsnorm_backward",
+                                 "fused_residual_rmsnorm_backward",
+                                 inputs,
+                                 outputs,
+                                 attrs));
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("fused_residual_rmsnorm", ::dsl::fused_residual_rmsnorm_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// FusedResidualRMSNorm
+// ------------------------------------------------------------------------
+const int _fused_residual_rmsnorm_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "fused_residual_rmsnorm";
+    sig.min_inputs = 3;
+    sig.max_inputs = 3;
+    sig.min_outputs = 3;
+    sig.max_outputs = 3;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& residual_in = inputs[0];
+        const auto& input = inputs[1];
+        const auto& weight = inputs[2];
+        const auto& residual_out = outputs[0];
+        const auto& y = outputs[1];
+        const auto& rstd = outputs[2];
+
+        // Check residual_in == input shape
+        if (auto err =
+                validators::check_same_numel(residual_in, input, "residual_in", "input", "fused_residual_rmsnorm")) {
+            return err;
+        }
+
+        // Check weight is 1D
+        if (auto err = validators::check_rank(weight, 1, "weight", "fused_residual_rmsnorm")) {
+            return err;
+        }
+
+        // Check outputs match inputs (allow unknown/unspecified output shapes)
+        if (!residual_out.empty()) {
+            if (auto err = validators::check_same_numel(residual_out,
+                                                        residual_in,
+                                                        "residual_out",
+                                                        "residual_in",
+                                                        "fused_residual_rmsnorm")) {
+                return err;
+            }
+        }
+        if (!y.empty()) {
+            if (auto err = validators::check_same_numel(y, input, "y", "input", "fused_residual_rmsnorm")) {
+                return err;
+            }
+        }
+
+        // rstd can be flattened [B*T], [B, T], or [B, T, 1] depending on allocation path
+        if (rstd.empty()) {
+            ShapeValidationError err;
+            err.message = "fused_residual_rmsnorm: rstd shape is empty";
+            return std::make_optional(err);
+        }
+        const bool rstd_ok = (rstd.size() == 1) || (rstd.size() == 2) || (rstd.size() == 3 && rstd.back() == 1);
+        if (!rstd_ok) {
+            ShapeValidationError err;
+            err.message = "fused_residual_rmsnorm: rstd must be [B*T], [B,T], or [B,T,1]";
+            return std::make_optional(err);
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// FusedResidualRMSNormBackward
+// ------------------------------------------------------------------------
+const int _fused_residual_rmsnorm_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "fused_residual_rmsnorm_backward";
+    sig.min_inputs = 4;
+    sig.max_inputs = 5;
+    sig.min_outputs = 2;
+    sig.max_outputs = 3;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& d_y = inputs[0];
+        // inputs[1] is d_residual_next (optional), inputs[2] is residual_out, inputs[3] is weight, inputs[4] is rstd
+        const auto& residual_out = inputs[2];
+        const auto& d_residual = outputs[0];
+        const auto& d_input = outputs[1];
+
+        // Check d_residual and d_input match residual_out and d_y
+        if (auto err = validators::check_same_numel(d_residual,
+                                                    residual_out,
+                                                    "d_residual",
+                                                    "residual_out",
+                                                    "fused_residual_rmsnorm_backward")) {
+            return err;
+        }
+        if (auto err =
+                validators::check_same_numel(d_input, d_y, "d_input", "d_y", "fused_residual_rmsnorm_backward")) {
+            return err;
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

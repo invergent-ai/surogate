@@ -39,16 +39,11 @@ Tensor* fp8_forward_buffer(DslRunState& rs, modules::MatmulOp op) {
     if (!rs.has_fp8_forward()) return nullptr;
     auto& q = rs.fp8_forward_quants();
     switch (op) {
-        case modules::MatmulOp::QKV:
-            return &q.ln1;
-        case modules::MatmulOp::MLPUp:
-            return &q.ln2;
-        case modules::MatmulOp::AttnOut:
-            return &q.att;
-        case modules::MatmulOp::MLPDown:
-            return &q.swiglu;
-        default:
-            return nullptr;
+        case modules::MatmulOp::QKV: return &q.ln1;
+        case modules::MatmulOp::MLPUp: return &q.ln2;
+        case modules::MatmulOp::AttnOut: return &q.att;
+        case modules::MatmulOp::MLPDown: return &q.swiglu;
+        default: return nullptr;
     }
 }
 
@@ -56,32 +51,24 @@ Tensor* fp8_grad_buffer(DslRunState& rs, modules::MatmulOp op) {
     if (!rs.has_fp8_hybrid_backward()) return nullptr;
     auto& q = rs.simplified_quant_grads();
     switch (op) {
-        case modules::MatmulOp::QKV:
-            return &q.d_qkv;
-        case modules::MatmulOp::MLPUp:
-            return &q.d_mlp_up;
-        case modules::MatmulOp::AttnOut:
-            return &q.d_res_att;
-        case modules::MatmulOp::MLPDown:
-            return &q.d_res_ffn;
-        default:
-            return nullptr;
+        case modules::MatmulOp::QKV: return &q.d_qkv;
+        case modules::MatmulOp::MLPUp: return &q.d_mlp_up;
+        case modules::MatmulOp::AttnOut: return &q.d_res_att;
+        case modules::MatmulOp::MLPDown: return &q.d_res_ffn;
+        default: return nullptr;
     }
 }
 
 int fp8_quantizer_index(const DslRunState& rs, modules::MatmulOp op, int layer_idx) {
     if (!rs.has_fp8_delayed_scaling()) return -1;
     switch (op) {
-        case modules::MatmulOp::QKV:
-            return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_LN1);
-        case modules::MatmulOp::MLPUp:
-            return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_LN2);
+        case modules::MatmulOp::QKV: return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_LN1);
+        case modules::MatmulOp::MLPUp: return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_LN2);
         case modules::MatmulOp::AttnOut:
             return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_ATT);
         case modules::MatmulOp::MLPDown:
             return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_SWIGLU);
-        default:
-            return -1;
+        default: return -1;
     }
 }
 
@@ -100,8 +87,7 @@ void GraphExecutor::prime_fp8_weight_cache(const std::vector<char>& required) {
             continue;
         }
         const auto& op = mForward->operations[idx];
-        const std::string& op_type =
-            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         if (op_type != "matmul" && op_type != "matmul_bias") {
             continue;
         }
@@ -158,9 +144,13 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
             const long N = static_cast<long>(weight.nelem());
             if (N > 0) {
                 abs_max(it->second.weight.abs_max(), weight, N, mRunState.DeviceProp, stream);
-                quantize_with_abs_max(it->second.weight, it->second.weight.scale(),
-                                      weight, it->second.weight.abs_max(),
-                                      N, mRunState.DeviceProp, stream);
+                quantize_with_abs_max(it->second.weight,
+                                      it->second.weight.scale(),
+                                      weight,
+                                      it->second.weight.abs_max(),
+                                      N,
+                                      mRunState.DeviceProp,
+                                      stream);
             }
         }
         it->second.initialized = true;
@@ -187,8 +177,7 @@ void GraphExecutor::prime_fp8_weight_cache_transposed(const std::vector<char>& r
             continue;
         }
         const auto& op = mBackward->operations[idx];
-        const std::string& op_type =
-            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         if (op_type != "matmul_backward" && op_type != "matmul_swiglu_backward") {
             continue;
         }
@@ -214,9 +203,8 @@ void GraphExecutor::prime_fp8_weight_cache_transposed(const std::vector<char>& r
     }
 }
 
-const Tensor* GraphExecutor::get_fp8_cached_weight_transposed(const std::string& name,
-                                                              Tensor& weight,
-                                                              cudaStream_t stream) {
+const Tensor*
+GraphExecutor::get_fp8_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream) {
     if (!mRunState.has_fp8_hybrid_backward()) {
         return nullptr;
     }
@@ -257,18 +245,25 @@ const Tensor* GraphExecutor::get_fp8_cached_weight_transposed(const std::string&
             const long numel = static_cast<long>(N) * K;
             abs_max(it->second.weight.abs_max(), weight, numel, mRunState.DeviceProp, stream);
             // Quantize+transpose into the cached tensor (K, N).
-            quantize_and_transpose_with_abs_max(it->second.weight, it->second.weight.scale(),
-                                                weight, it->second.weight.abs_max(),
-                                                /*rows=*/N, /*cols=*/K,
-                                                mRunState.DeviceProp, stream);
+            quantize_and_transpose_with_abs_max(it->second.weight,
+                                                it->second.weight.scale(),
+                                                weight,
+                                                it->second.weight.abs_max(),
+                                                /*rows=*/N,
+                                                /*cols=*/K,
+                                                mRunState.DeviceProp,
+                                                stream);
         } else if (weight.DType == ETensorDType::FP8_E4M3) {
             // Weight already FP8: just transpose and keep the same scale.
             transpose(it->second.weight, weight, N, K, stream);
             if (!weight.scale()) {
                 throw std::runtime_error("DSL FP8 cacheT: FP8 weight missing scale Stats");
             }
-            CUDA_CHECK(cudaMemcpyAsync(it->second.weight.scale(), weight.scale(), sizeof(float),
-                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(it->second.weight.scale(),
+                                       weight.scale(),
+                                       sizeof(float),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream));
         } else {
             return nullptr;
         }
@@ -298,8 +293,7 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
             continue;
         }
         const auto& op = mForward->operations[i];
-        const std::string& op_type =
-            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         if (op_type != "matmul" && op_type != "matmul_bias" && op_type != "matmul_swiglu") {
             continue;
         }
@@ -328,8 +322,7 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
             std::cerr << "[FP4 cache] FAILED to prime forward weight: " << weight_name
                       << " (trainable=" << mWeights.is_trainable(weight_name)
                       << ", dtype=" << static_cast<int>(weight.DType)
-                      << ", qlora=" << (mWeights.qlora_provider() != nullptr)
-                      << ")" << std::endl;
+                      << ", qlora=" << (mWeights.qlora_provider() != nullptr) << ")" << std::endl;
         }
     }
 
@@ -368,21 +361,18 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
                 failed_bwd++;
                 std::cerr << "[FP4 cache] FAILED to prime backward weight: " << weight_name
                           << " (trainable=" << mWeights.is_trainable(weight_name)
-                          << ", dtype=" << static_cast<int>(weight.DType)
-                          << ")" << std::endl;
+                          << ", dtype=" << static_cast<int>(weight.DType) << ")" << std::endl;
             }
         }
     }
 
     std::cerr << "[FP4 cache] Primed: " << primed_fwd << " fwd + " << primed_bwd << " bwd"
               << " | Failed: " << failed_fwd << " fwd + " << failed_bwd << " bwd"
-              << " | Cache sizes: fwd=" << mFP4WeightCache.size()
-              << " bwd=" << mFP4WeightCacheT.size() << std::endl;
+              << " | Cache sizes: fwd=" << mFP4WeightCache.size() << " bwd=" << mFP4WeightCacheT.size() << std::endl;
 }
 
-const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
-    const std::string& name, Tensor& weight, cudaStream_t stream) {
-
+const FP4WeightCacheEntry*
+GraphExecutor::get_fp4_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream) {
     // Check if FP4 is enabled
     if (!mOptions.fp4_enabled()) {
         return nullptr;
@@ -423,64 +413,66 @@ const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
     }
 
     if (!uses_4o6) {
-    if (auto* provider = dynamic_cast<qlora::GenericQLoRAProvider*>(mWeights.qlora_provider())) {
-        if (auto* wm = provider->weight_manager()) {
-            if (auto* qt = wm->get_quantized(name)) {
-                if (qt->format == qlora::QuantFormat::FP4_BLOCK_2D &&
-                    !qt->data.is_null() && !qt->scales.is_null() &&
-                    !qt->is_on_host()) {
-                    const int N = qt->M;
-                    const int K = qt->K;
-                    if (N <= 0 || K <= 0 || K % 2 != 0) {
-                        return nullptr;
+        if (auto* provider = dynamic_cast<qlora::GenericQLoRAProvider*>(mWeights.qlora_provider())) {
+            if (auto* wm = provider->weight_manager()) {
+                if (auto* qt = wm->get_quantized(name)) {
+                    if (qt->format == qlora::QuantFormat::FP4_BLOCK_2D && !qt->data.is_null() &&
+                        !qt->scales.is_null() && !qt->is_on_host()) {
+                        const int N = qt->M;
+                        const int K = qt->K;
+                        if (N <= 0 || K <= 0 || K % 2 != 0) {
+                            return nullptr;
+                        }
+
+                        // Allocate cache entry if needed
+                        if (it == mFP4WeightCache.end()) {
+                            FP4WeightCacheEntry entry{};
+                            entry.data =
+                                mRunState.Allocator->allocate(ETensorDType::BYTE,
+                                                              ("fp4_cache_" + name + "_data").c_str(),
+                                                              EAllocationType::ON_DEVICE,
+                                                              {static_cast<long>(N), static_cast<long>(K / 2)});
+                            const std::size_t ss = compute_nvfp4_cutlass_scale_size(N, K);
+                            entry.scales = mRunState.Allocator->allocate(ETensorDType::BYTE,
+                                                                         ("fp4_cache_" + name + "_scales").c_str(),
+                                                                         EAllocationType::ON_DEVICE,
+                                                                         {static_cast<long>(ss)});
+                            entry.amax = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                                       ("fp4_cache_" + name + "_amax").c_str(),
+                                                                       EAllocationType::ON_DEVICE,
+                                                                       {1L});
+                            auto [ins_it, _] = mFP4WeightCache.emplace(name, std::move(entry));
+                            it = ins_it;
+                        }
+
+                        // Copy packed FP4 data directly (identical byte layout)
+                        const size_t data_bytes = static_cast<size_t>(N) * (K / 2);
+                        CUDA_CHECK(cudaMemcpyAsync(it->second.data.Data,
+                                                   qt->data.Data,
+                                                   data_bytes,
+                                                   cudaMemcpyDeviceToDevice,
+                                                   stream));
+
+                        // Copy FP8 scales directly (F8_128x4 == CUTLASS Sm1xxBlkScaled layout)
+                        const std::size_t scale_bytes = compute_nvfp4_cutlass_scale_size(N, K);
+                        CUDA_CHECK(cudaMemcpyAsync(it->second.scales.Data,
+                                                   qt->scales.Data,
+                                                   scale_bytes,
+                                                   cudaMemcpyDeviceToDevice,
+                                                   stream));
+
+                        // Convert global_scale to amax: amax = global_scale * FP8_MAX * FP4_MAX
+                        constexpr float kFP8Max = 448.0f;
+                        constexpr float kFP4Max = 6.0f;
+                        float amax = qt->global_scale * kFP8Max * kFP4Max;
+                        CUDA_CHECK(cudaMemcpy(it->second.amax.Data, &amax, sizeof(float), cudaMemcpyHostToDevice));
+
+                        it->second.initialized = true;
+                        return &it->second;
                     }
-
-                    // Allocate cache entry if needed
-                    if (it == mFP4WeightCache.end()) {
-                        FP4WeightCacheEntry entry{};
-                        entry.data = mRunState.Allocator->allocate(ETensorDType::BYTE,
-                            ("fp4_cache_" + name + "_data").c_str(),
-                            EAllocationType::ON_DEVICE,
-                            {static_cast<long>(N), static_cast<long>(K / 2)});
-                        const std::size_t ss = compute_nvfp4_cutlass_scale_size(N, K);
-                        entry.scales = mRunState.Allocator->allocate(ETensorDType::BYTE,
-                            ("fp4_cache_" + name + "_scales").c_str(),
-                            EAllocationType::ON_DEVICE,
-                            {static_cast<long>(ss)});
-                        entry.amax = mRunState.Allocator->allocate(ETensorDType::FP32,
-                            ("fp4_cache_" + name + "_amax").c_str(),
-                            EAllocationType::ON_DEVICE,
-                            {1L});
-                        auto [ins_it, _] = mFP4WeightCache.emplace(name, std::move(entry));
-                        it = ins_it;
-                    }
-
-                    // Copy packed FP4 data directly (identical byte layout)
-                    const size_t data_bytes = static_cast<size_t>(N) * (K / 2);
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        it->second.data.Data, qt->data.Data,
-                        data_bytes, cudaMemcpyDeviceToDevice, stream));
-
-                    // Copy FP8 scales directly (F8_128x4 == CUTLASS Sm1xxBlkScaled layout)
-                    const std::size_t scale_bytes = compute_nvfp4_cutlass_scale_size(N, K);
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        it->second.scales.Data, qt->scales.Data,
-                        scale_bytes, cudaMemcpyDeviceToDevice, stream));
-
-                    // Convert global_scale to amax: amax = global_scale * FP8_MAX * FP4_MAX
-                    constexpr float kFP8Max = 448.0f;
-                    constexpr float kFP4Max = 6.0f;
-                    float amax = qt->global_scale * kFP8Max * kFP4Max;
-                    CUDA_CHECK(cudaMemcpy(
-                        it->second.amax.Data, &amax,
-                        sizeof(float), cudaMemcpyHostToDevice));
-
-                    it->second.initialized = true;
-                    return &it->second;
                 }
             }
         }
-    }
     }  // !uses_4o6
 
     // -------------------------------------------------------------------------
@@ -546,22 +538,24 @@ const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
         }
 
         if (use_4o6) {
-            quantize_nvfp4_4o6_cutlass_auto_scale(
-                it->second.data.get<uint8_t>(),
-                it->second.scales.get<uint8_t>(),
-                it->second.amax.get<float>(),
-                weight.get<nv_bfloat16>(),
-                N, K,
-                four_over_six_metric,
-                mRunState.DeviceProp, stream);
+            quantize_nvfp4_4o6_cutlass_auto_scale(it->second.data.get<uint8_t>(),
+                                                  it->second.scales.get<uint8_t>(),
+                                                  it->second.amax.get<float>(),
+                                                  weight.get<nv_bfloat16>(),
+                                                  N,
+                                                  K,
+                                                  four_over_six_metric,
+                                                  mRunState.DeviceProp,
+                                                  stream);
         } else {
-            quantize_nvfp4_weight_cutlass_auto_scale(
-                it->second.data.get<uint8_t>(),
-                it->second.scales.get<uint8_t>(),
-                it->second.amax.get<float>(),
-                weight.get<nv_bfloat16>(),
-                N, K,
-                mRunState.DeviceProp, stream);
+            quantize_nvfp4_weight_cutlass_auto_scale(it->second.data.get<uint8_t>(),
+                                                     it->second.scales.get<uint8_t>(),
+                                                     it->second.amax.get<float>(),
+                                                     weight.get<nv_bfloat16>(),
+                                                     N,
+                                                     K,
+                                                     mRunState.DeviceProp,
+                                                     stream);
         }
 
         it->second.initialized = true;
@@ -570,8 +564,8 @@ const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight(
     return &it->second;
 }
 
-const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_transposed(
-    const std::string& name, Tensor& weight, cudaStream_t stream) {
+const FP4WeightCacheEntry*
+GraphExecutor::get_fp4_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream) {
     // Check if FP4 is enabled
     if (!mOptions.fp4_enabled()) {
         return nullptr;
@@ -632,16 +626,17 @@ const FP4WeightCacheEntry* GraphExecutor::get_fp4_cached_weight_transposed(
     if (!it->second.initialized) {
         const int N = static_cast<int>(weight.Sizes[0]);
         const int K = static_cast<int>(weight.Sizes[1]);
-        
+
         // Use transpose quantization for dgrad
         // Note: No 4/6 variant for weight transpose quantization yet
-        quantize_nvfp4_weight_cutlass_transpose_auto_scale(
-            it->second.data.get<uint8_t>(),
-            it->second.scales.get<uint8_t>(),
-            it->second.amax.get<float>(),
-            weight.get<nv_bfloat16>(),
-            N, K,
-            mRunState.DeviceProp, stream);
+        quantize_nvfp4_weight_cutlass_transpose_auto_scale(it->second.data.get<uint8_t>(),
+                                                           it->second.scales.get<uint8_t>(),
+                                                           it->second.amax.get<float>(),
+                                                           weight.get<nv_bfloat16>(),
+                                                           N,
+                                                           K,
+                                                           mRunState.DeviceProp,
+                                                           stream);
 
         it->second.initialized = true;
     }
@@ -659,8 +654,7 @@ void GraphExecutor::build_layer_weight_map() {
 
     // Scan forward graph for matmul operations and map weight names to layers
     for (const auto& op : mForward->operations) {
-        const std::string& op_type =
-            (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
+        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
         if (op_type != "matmul" && op_type != "matmul_bias") {
             continue;
         }
@@ -698,10 +692,8 @@ void GraphExecutor::build_layer_weight_map() {
     // - Multi-layer model (enables overlap of weight access with compute)
     const bool has_weight_streaming = mWeightManager && mWeightManager->is_streaming_enabled();
     const bool has_quantized_forward = mRunState.has_fp8_forward() || mRunState.has_fp4_forward();
-    const bool has_qlora_offloading = mWeights.qlora_provider() &&
-                                      mWeights.qlora_provider()->has_offloading();
-    mPrefetchEnabled = num_layers > 1 &&
-                       (has_quantized_forward || has_weight_streaming || has_qlora_offloading);
+    const bool has_qlora_offloading = mWeights.qlora_provider() && mWeights.qlora_provider()->has_offloading();
+    mPrefetchEnabled = num_layers > 1 && (has_quantized_forward || has_weight_streaming || has_qlora_offloading);
     if (mPrefetchEnabled && !mPrefetchEvent) {
         CUDA_CHECK(cudaEventCreate(&mPrefetchEvent));
     }
@@ -755,10 +747,9 @@ void GraphExecutor::build_layer_boundaries() {
     }
 
     // Sort by start_op_idx for O(1) lookup during execution
-    std::sort(mLayerBoundaries.begin(), mLayerBoundaries.end(),
-              [](const LayerBoundary& a, const LayerBoundary& b) {
-                  return a.start_op_idx < b.start_op_idx;
-              });
+    std::sort(mLayerBoundaries.begin(), mLayerBoundaries.end(), [](const LayerBoundary& a, const LayerBoundary& b) {
+        return a.start_op_idx < b.start_op_idx;
+    });
 }
 
 void GraphExecutor::prefetch_layer_weights(int layer_idx, cudaStream_t stream) {
@@ -811,9 +802,13 @@ void GraphExecutor::prefetch_layer_weights(int layer_idx, cudaStream_t stream) {
                 const long N = static_cast<long>(weight.nelem());
                 if (N > 0) {
                     abs_max(it->second.weight.abs_max(), weight, N, mRunState.DeviceProp, stream);
-                    quantize_with_abs_max(it->second.weight, it->second.weight.scale(),
-                                          weight, it->second.weight.abs_max(),
-                                          N, mRunState.DeviceProp, stream);
+                    quantize_with_abs_max(it->second.weight,
+                                          it->second.weight.scale(),
+                                          weight,
+                                          it->second.weight.abs_max(),
+                                          N,
+                                          mRunState.DeviceProp,
+                                          stream);
                 }
                 it->second.initialized = true;
             }

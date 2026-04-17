@@ -30,7 +30,7 @@ class Monitor(ABC):
     @abstractmethod
     def log_distributions(self, distributions: dict[str, list[float]], step: int) -> None:
         pass
-    
+
     def flush(self, step: int) -> None:
         """Commit all accumulated metrics for the given step."""
         pass

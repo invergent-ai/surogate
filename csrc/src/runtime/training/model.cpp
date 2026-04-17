@@ -29,8 +29,14 @@ float IModel::get_accuracy() const {
 void IModel::update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
     // Default implementation: dispatch to AdamW update
     // Derived classes can override to support NorMuon and other optimizers
-    update(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
-           step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
+    update(comm,
+           config.learning_rate,
+           config.adamw_beta1,
+           config.adamw_beta2,
+           step,
+           config.adamw_epsilon,
+           config.weight_decay,
+           config.grad_clip);
 }
 
 Tensor& IModel::get_input_buffer() {
@@ -61,8 +67,14 @@ Tensor& IModel::get_deepstack_visual_embeds_buffer(int index) {
     return buffers[static_cast<std::size_t>(index)];
 }
 
-
-IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, long seq_len, std::shared_ptr<TensorAllocator> alloc) : Config(std::move(config)), B(batch_size), T(seq_len), Allocator(std::move(alloc)) {
+IRunState::IRunState(std::unique_ptr<PretrainedConfig> config,
+                     long batch_size,
+                     long seq_len,
+                     std::shared_ptr<TensorAllocator> alloc)
+    : Config(std::move(config)),
+      B(batch_size),
+      T(seq_len),
+      Allocator(std::move(alloc)) {
     int did;
     CUDA_CHECK(cudaGetDevice(&did));
     DeviceId = did;
@@ -79,7 +91,8 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
     Targets = Allocator->allocate(ETensorDType::INT32, "targets", {B, T});
     Inputs_CPU = Allocator->allocate(ETensorDType::INT32, "inputs_cpu", EAllocationType::PINNED, {B, T});
     if (pos_planes > 1) {
-        PositionIDs_CPU = Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {pos_planes, B, T});
+        PositionIDs_CPU =
+            Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {pos_planes, B, T});
     } else {
         PositionIDs_CPU = Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {B, T});
     }
@@ -88,9 +101,11 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
         const long C = Config->HiddenSize;
         const long max_visual = B * T;
         VisualPosMasks = Allocator->allocate(ETensorDType::INT32, "visual_pos_masks", {B, T});
-        VisualPosMasks_CPU = Allocator->allocate(ETensorDType::INT32, "visual_pos_masks_cpu", EAllocationType::PINNED, {B, T});
+        VisualPosMasks_CPU =
+            Allocator->allocate(ETensorDType::INT32, "visual_pos_masks_cpu", EAllocationType::PINNED, {B, T});
         VisualEmbeds = Allocator->allocate(Config->DType, "visual_embeds", {max_visual, C});
-        VisualEmbeds_CPU = Allocator->allocate(Config->DType, "visual_embeds_cpu", EAllocationType::PINNED, {max_visual, C});
+        VisualEmbeds_CPU =
+            Allocator->allocate(Config->DType, "visual_embeds_cpu", EAllocationType::PINNED, {max_visual, C});
         std::memset(VisualPosMasks_CPU.Data, 0, static_cast<std::size_t>(VisualPosMasks_CPU.bytes()));
         std::memset(VisualEmbeds_CPU.Data, 0, static_cast<std::size_t>(VisualEmbeds_CPU.bytes()));
         int deepstack_layers = Config->DeepstackVisualLayers;
@@ -108,7 +123,8 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
                     Allocator->allocate(Config->DType, name.c_str(), {max_visual, C});
                 DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)] =
                     Allocator->allocate(Config->DType, cpu_name.c_str(), EAllocationType::PINNED, {max_visual, C});
-                std::memset(DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)].Data, 0,
+                std::memset(DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)].Data,
+                            0,
                             static_cast<std::size_t>(DeepstackVisualEmbeds_CPU[static_cast<std::size_t>(i)].bytes()));
             }
         }
@@ -125,9 +141,9 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, 
     // https://docs.nvidia.com/cuda/cublas/index.html#cublassetworkspace
     // recommended workspace size 32MB for sm_90+
     // SM120+ (Blackwell) FP8 operations may require larger workspace
-    std::size_t cublas_ws_size = 32*1024*1024;  // 32MB default
+    std::size_t cublas_ws_size = 32 * 1024 * 1024;  // 32MB default
     if (DeviceProp.major >= 12) {
-        cublas_ws_size = 128*1024*1024;  // 128MB for Blackwell FP8
+        cublas_ws_size = 128 * 1024 * 1024;  // 128MB for Blackwell FP8
     }
     if (const char* ws_mb_env = std::getenv("SUROGATE_CUBLAS_WS_MB")) {
         const long ws_mb = std::strtol(ws_mb_env, nullptr, 10);
@@ -181,7 +197,7 @@ void destroy_cublaslt_handle(cublasLtHandle_t handle) noexcept;
 IRunState::~IRunState() {
     // Skip cleanup if this was moved-from (MainStream will be null)
     if (!MainStream) return;
-    
+
     auto destroy_event = [](cudaEvent_t& ev) noexcept {
         if (ev) {
             (void)cudaEventDestroy(ev);
@@ -194,11 +210,11 @@ IRunState::~IRunState() {
             stream = nullptr;
         }
     };
-    
+
     if (MainStream) {
         (void)cudaStreamSynchronize(MainStream);
     }
-    
+
     destroy_event(ForwardDone);
     destroy_event(BackwardDone);
     destroy_event(TransferDone);
@@ -206,14 +222,20 @@ IRunState::~IRunState() {
     destroy_event(OptimizerDone);
     destroy_event(TimingOptimizerStart);
     destroy_event(TimingOptimizerEnd);
-    
-    for (auto& ev : TimingForwardStart) destroy_event(ev);
-    for (auto& ev : TimingForwardEnd) destroy_event(ev);
-    for (auto& ev : TimingHeadStart) destroy_event(ev);
-    for (auto& ev : TimingHeadEnd) destroy_event(ev);
-    for (auto& ev : TimingBackwardStart) destroy_event(ev);
-    for (auto& ev : TimingBackwardEnd) destroy_event(ev);
-    
+
+    for (auto& ev : TimingForwardStart)
+        destroy_event(ev);
+    for (auto& ev : TimingForwardEnd)
+        destroy_event(ev);
+    for (auto& ev : TimingHeadStart)
+        destroy_event(ev);
+    for (auto& ev : TimingHeadEnd)
+        destroy_event(ev);
+    for (auto& ev : TimingBackwardStart)
+        destroy_event(ev);
+    for (auto& ev : TimingBackwardEnd)
+        destroy_event(ev);
+
     if (CublasLtHandle) {
         destroy_cublaslt_handle(CublasLtHandle);
         CublasLtHandle = nullptr;
@@ -222,13 +244,14 @@ IRunState::~IRunState() {
         destroy_cudnn_handle(CudnnHandle);
         CudnnHandle = nullptr;
     }
-    
+
     destroy_stream(MainStream);
 }
 
 IRunState::IRunState(IRunState&& other) noexcept
     : Config(std::move(other.Config)),
-      B(other.B), T(other.T),
+      B(other.B),
+      T(other.T),
       GradAccumSteps(other.GradAccumSteps),
       WorldSize(other.WorldSize),
       Allocator(std::move(other.Allocator)),
@@ -270,8 +293,7 @@ IRunState::IRunState(IRunState&& other) noexcept
       Targets_CPU(std::move(other.Targets_CPU)),
       VisualPosMasks_CPU(std::move(other.VisualPosMasks_CPU)),
       VisualEmbeds_CPU(std::move(other.VisualEmbeds_CPU)),
-      DeepstackVisualEmbeds_CPU(std::move(other.DeepstackVisualEmbeds_CPU))
-{
+      DeepstackVisualEmbeds_CPU(std::move(other.DeepstackVisualEmbeds_CPU)) {
     // Null out the source's CUDA handles so its destructor doesn't free them
     other.MainStream = nullptr;
     other.ForwardDone = nullptr;
@@ -295,7 +317,7 @@ IRunState& IRunState::operator=(IRunState&& other) noexcept {
     if (this != &other) {
         // First destroy our existing resources
         this->~IRunState();
-        
+
         // Then move from other
         new (this) IRunState(std::move(other));
     }
@@ -305,7 +327,7 @@ IRunState& IRunState::operator=(IRunState&& other) noexcept {
 void IRunState::setup_timing_events(int micro_steps) {
     TimingOptimizerStart = create_named_event("timing_opt_start", true);
     TimingOptimizerEnd = create_named_event("timing_opt_done", true);
-    for(int i = TimingForwardStart.size(); i < micro_steps + 1; ++i) {
+    for (int i = TimingForwardStart.size(); i < micro_steps + 1; ++i) {
         TimingForwardStart.push_back(create_named_event(("timing_fwd_" + std::to_string(i) + "_start").c_str(), true));
         TimingForwardEnd.push_back(create_named_event(("timing_fwd_" + std::to_string(i) + "_end").c_str(), true));
         TimingHeadStart.push_back(create_named_event(("timing_head_" + std::to_string(i) + "_start").c_str(), true));
@@ -337,14 +359,14 @@ Tensor IRunState::temp_alloc(ETensorDType dtype, const std::vector<long>& shape,
 void IRunState::temp_acquire(Tensor& target) {
     if (target.Data) {
         if (Stack.owns(target.Data) && !Stack.is_live(target.Data)) {
-            if(target.Device != Stack.device_id()) {
+            if (target.Device != Stack.device_id()) {
                 throw std::logic_error("device mismatch");
             }
             target.Data = Stack.allocate(target.bytes());
         }
         return;
     }
-    if(target.Device != Stack.device_id()) {
+    if (target.Device != Stack.device_id()) {
         throw std::logic_error("device mismatch");
     }
 
@@ -362,7 +384,6 @@ void IRunState::temp_free(Tensor& tensor) {
     tensor.Data = nullptr;
 }
 
-
 std::pair<float, float> IRunState::record_step(float loss, float norm) {
     LossOutliers.record(loss);
     NormOutliers.record(norm);
@@ -370,8 +391,8 @@ std::pair<float, float> IRunState::record_step(float loss, float norm) {
     return {LossOutliers.eval(loss), NormOutliers.eval(norm)};
 }
 
-
-IRunState::OutlierDetector::OutlierDetector(int window_size) : mWindowSize(window_size){
+IRunState::OutlierDetector::OutlierDetector(int window_size)
+    : mWindowSize(window_size) {
     mValues.reserve(window_size);
 }
 

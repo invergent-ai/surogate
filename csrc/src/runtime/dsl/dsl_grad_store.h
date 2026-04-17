@@ -22,7 +22,7 @@ namespace dsl {
 
 class DslParamStore;
 
-}
+}  // namespace dsl
 
 class NCCLCommunicator;
 
@@ -30,11 +30,11 @@ namespace dsl {
 
 /// Configuration for gradient management (mirrors ModularGradientManager::Config)
 struct DslGradStoreConfig {
-    int num_shards = 1;              ///< Number of ZeRO shards (world_size)
-    int shard_idx = 0;               ///< This rank's shard index
-    bool shard_gradients = false;    ///< ZeRO-2: shard gradients across ranks
-    bool use_all_to_all_reduce = false; ///< Use all-to-all instead of reduce-scatter
-    int num_layers = 0;              ///< Number of transformer layers
+    int num_shards = 1;                  ///< Number of ZeRO shards (world_size)
+    int shard_idx = 0;                   ///< This rank's shard index
+    bool shard_gradients = false;        ///< ZeRO-2: shard gradients across ranks
+    bool use_all_to_all_reduce = false;  ///< Use all-to-all instead of reduce-scatter
+    int num_layers = 0;                  ///< Number of transformer layers
 };
 
 // Stores parameter gradients for DSL execution.
@@ -73,18 +73,32 @@ public:
     void wait_for_block_reduce(int layer_idx, cudaStream_t stream);
 
     /// Check if async reduce has been started (for avoiding redundant reduce in update)
-    bool is_reduce_pending() const { return mReducePending; }
-    void clear_reduce_pending() { mReducePending = false; }
+    bool is_reduce_pending() const {
+        return mReducePending;
+    }
+    void clear_reduce_pending() {
+        mReducePending = false;
+    }
 
     /// Check if per-layer overlapped reduction is enabled
     /// Returns true only if multi-GPU AND we have layer gradients to reduce
-    bool is_overlapped_enabled() const { return mConfig.num_shards > 1 && mHasLayerGrads; }
+    bool is_overlapped_enabled() const {
+        return mConfig.num_shards > 1 && mHasLayerGrads;
+    }
 
-    [[nodiscard]] bool is_first_micro_step() const { return mMicroStep == 0; }
-    [[nodiscard]] bool is_last_micro_step() const { return mIsLastMicroStep; }
+    [[nodiscard]] bool is_first_micro_step() const {
+        return mMicroStep == 0;
+    }
+    [[nodiscard]] bool is_last_micro_step() const {
+        return mIsLastMicroStep;
+    }
 
-    const std::vector<std::string>& param_names() const { return mParamOrder; }
-    const std::unordered_map<std::string, Tensor>& grads() const { return mGrads; }
+    const std::vector<std::string>& param_names() const {
+        return mParamOrder;
+    }
+    const std::unordered_map<std::string, Tensor>& grads() const {
+        return mGrads;
+    }
 
     /// Get sharded gradients for optimizer (returns mShardedGrads if ZeRO-2 offload, else mGrads)
     const std::unordered_map<std::string, Tensor>& sharded_grads() const {
@@ -92,7 +106,9 @@ public:
     }
 
     /// Check if gradient offloading is active (ZeRO-2 with offload_grads=true)
-    [[nodiscard]] bool is_offloading() const { return !mShardedGrads.empty(); }
+    [[nodiscard]] bool is_offloading() const {
+        return !mShardedGrads.empty();
+    }
 
     /// Get gradients for a specific layer (for per-layer operations)
     std::vector<Tensor*> get_layer_grads(int layer_idx);
@@ -127,16 +143,22 @@ public:
     const Tensor& get_cpu_grad(const std::string& name) const;
 
     /// Get the full CPU gradient map (for norm computation).
-    const std::unordered_map<std::string, Tensor>& get_cpu_grads_map() const { return mCpuGrads; }
+    const std::unordered_map<std::string, Tensor>& get_cpu_grads_map() const {
+        return mCpuGrads;
+    }
 
     /// Layer gradient names (for rebinding in compiled executor).
     const std::vector<std::string>& layer_grad_names(int layer_idx) const;
 
     /// Is per-layer streaming active?
-    [[nodiscard]] bool is_streaming_grads() const { return mStreamGrads; }
+    [[nodiscard]] bool is_streaming_grads() const {
+        return mStreamGrads;
+    }
 
     /// GPU-side accumulated gradient norm (sum of squares). Updated during offload.
-    Tensor& layer_norm_accum() { return mLayerNormAccum; }
+    Tensor& layer_norm_accum() {
+        return mLayerNormAccum;
+    }
 
 private:
     void build_layer_grad_map();
@@ -148,8 +170,8 @@ private:
     void accumulate_to_sharded(int layer_idx, cudaStream_t stream);
 
     std::shared_ptr<TensorAllocator> mAllocator;
-    std::unordered_map<std::string, Tensor> mGrads;          ///< Full gradients (always on device for NCCL)
-    std::unordered_map<std::string, Tensor> mShardedGrads;   ///< ZeRO-2: sharded gradient storage (may be on host)
+    std::unordered_map<std::string, Tensor> mGrads;         ///< Full gradients (always on device for NCCL)
+    std::unordered_map<std::string, Tensor> mShardedGrads;  ///< ZeRO-2: sharded gradient storage (may be on host)
     std::vector<std::string> mParamOrder;
     std::optional<ETensorDType> mGradDtypeOverride;
     bool mAccumulate = false;
@@ -194,9 +216,9 @@ private:
     struct GradBufferSlot {
         std::unordered_map<std::string, Tensor> buffers;  ///< base_name → GPU tensor
         int layer_idx = -1;
-        cudaEvent_t d2h_done = nullptr;     ///< D2H copy complete (safe to reuse)
-        cudaEvent_t compute_done = nullptr; ///< backward + reduce done (safe to D2H)
-        cudaEvent_t reduce_done = nullptr;  ///< NCCL reduce done (safe to D2H, multi-GPU)
+        cudaEvent_t d2h_done = nullptr;      ///< D2H copy complete (safe to reuse)
+        cudaEvent_t compute_done = nullptr;  ///< backward + reduce done (safe to D2H)
+        cudaEvent_t reduce_done = nullptr;   ///< NCCL reduce done (safe to D2H, multi-GPU)
     };
     std::array<GradBufferSlot, kNumGradSlots> mGradSlots;
     int mActiveGradSlot = 0;
@@ -219,6 +241,6 @@ private:
     static std::string base_grad_name(const std::string& name);
 };
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_DSL_GRAD_STORE_H
+#endif  // SUROGATE_SRC_DSL_DSL_GRAD_STORE_H

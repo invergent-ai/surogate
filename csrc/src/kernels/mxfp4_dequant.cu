@@ -40,8 +40,22 @@
 /// FP4 E2M1 decode lookup table.
 /// Index 0..7 = positive values, 8..15 = negative values (sign bit = bit 3).
 __constant__ float kFP4E2M1DecodeLUT[16] = {
-     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,   // 0..7
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f    // 8..15
+    0.0f,
+    0.5f,
+    1.0f,
+    1.5f,
+    2.0f,
+    3.0f,
+    4.0f,
+    6.0f,  // 0..7
+    -0.0f,
+    -0.5f,
+    -1.0f,
+    -1.5f,
+    -2.0f,
+    -3.0f,
+    -4.0f,
+    -6.0f  // 8..15
 };
 
 // ============================================================================
@@ -61,22 +75,18 @@ __constant__ float kFP4E2M1DecodeLUT[16] = {
  *                        Scale for block b = 2^(e8m0_scales[b] - 127).
  * @param total_elements Total number of output BF16 elements (M*K).
  */
-__global__ void dequantize_mxfp4_kernel(
-    nv_bfloat16* __restrict__ out,
-    const uint8_t* __restrict__ in_fp4,
-    const uint8_t* __restrict__ e8m0_scales,
-    long total_elements)
-{
+__global__ void dequantize_mxfp4_kernel(nv_bfloat16* __restrict__ out,
+                                        const uint8_t* __restrict__ in_fp4,
+                                        const uint8_t* __restrict__ e8m0_scales,
+                                        long total_elements) {
     // Each thread processes one packed byte = 2 FP4 values
     const long total_bytes = total_elements / 2;
 
-    for (long byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
-         byte_idx < total_bytes;
+    for (long byte_idx = blockIdx.x * blockDim.x + threadIdx.x; byte_idx < total_bytes;
          byte_idx += gridDim.x * (long)blockDim.x) {
-
         // Unpack two 4-bit values from one byte
         const uint8_t packed = in_fp4[byte_idx];
-        const int lo_nibble = packed & 0xF;        // Even element (2*byte_idx)
+        const int lo_nibble = packed & 0xF;         // Even element (2*byte_idx)
         const int hi_nibble = (packed >> 4) & 0xF;  // Odd element (2*byte_idx + 1)
 
         // Decode FP4 E2M1 to float via LUT
@@ -120,22 +130,18 @@ __global__ void dequantize_mxfp4_kernel(
  * @param[in] e8m0_scales Input E8M0 exponents, shape (M*K/32).
  * @param total_elements Total number of output BF16 elements (M*K).
  */
-__global__ void dequantize_mxfp4_vec_kernel(
-    nv_bfloat16* __restrict__ out,
-    const uint8_t* __restrict__ in_fp4,
-    const uint8_t* __restrict__ e8m0_scales,
-    long total_elements)
-{
+__global__ void dequantize_mxfp4_vec_kernel(nv_bfloat16* __restrict__ out,
+                                            const uint8_t* __restrict__ in_fp4,
+                                            const uint8_t* __restrict__ e8m0_scales,
+                                            long total_elements) {
     // Process 4 bytes (8 elements) per thread
     constexpr int BYTES_PER_THREAD = 4;
     const long total_bytes = total_elements / 2;
     const long vec_bytes = total_bytes / BYTES_PER_THREAD * BYTES_PER_THREAD;
 
     // Vectorized path: process 4 bytes at a time
-    for (long base_byte = (blockIdx.x * blockDim.x + threadIdx.x) * BYTES_PER_THREAD;
-         base_byte < vec_bytes;
+    for (long base_byte = (blockIdx.x * blockDim.x + threadIdx.x) * BYTES_PER_THREAD; base_byte < vec_bytes;
          base_byte += gridDim.x * (long)blockDim.x * BYTES_PER_THREAD) {
-
         // Load 4 bytes of packed FP4 data as uint32
         const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(in_fp4 + base_byte);
 
@@ -147,7 +153,7 @@ __global__ void dequantize_mxfp4_vec_kernel(
         float current_scale = exp2f((float)e8m0_scales[first_block] - 127.0f);
         long current_block = first_block;
 
-        #pragma unroll
+#pragma unroll
         for (int b = 0; b < BYTES_PER_THREAD; ++b) {
             const uint8_t packed = (packed4 >> (b * 8)) & 0xFF;
             const int lo_nibble = packed & 0xF;
@@ -179,10 +185,8 @@ __global__ void dequantize_mxfp4_vec_kernel(
     }
 
     // Scalar tail: handle remaining bytes not covered by vectorized loop
-    for (long byte_idx = vec_bytes + blockIdx.x * blockDim.x + threadIdx.x;
-         byte_idx < total_bytes;
+    for (long byte_idx = vec_bytes + blockIdx.x * blockDim.x + threadIdx.x; byte_idx < total_bytes;
          byte_idx += gridDim.x * (long)blockDim.x) {
-
         const uint8_t packed = in_fp4[byte_idx];
         const int lo_nibble = packed & 0xF;
         const int hi_nibble = (packed >> 4) & 0xF;
@@ -224,14 +228,13 @@ __global__ void dequantize_mxfp4_vec_kernel(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void dequantize_mxfp4(
-    nv_bfloat16* out,
-    const uint8_t* in_fp4,
-    const uint8_t* e8m0_scales,
-    int M, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_mxfp4(nv_bfloat16* out,
+                      const uint8_t* in_fp4,
+                      const uint8_t* e8m0_scales,
+                      int M,
+                      int K,
+                      const cudaDeviceProp& dp,
+                      cudaStream_t stream) {
     const long total_elements = (long)M * K;
 
     if (total_elements == 0) return;
@@ -243,12 +246,10 @@ void dequantize_mxfp4(
     const int threads_per_block = 256;
     // Each thread in the vec kernel processes 4 bytes = 8 elements
     const long total_bytes = total_elements / 2;
-    const int num_blocks = std::min(
-        (long)std::max(2 * dp.multiProcessorCount, 1),
-        (total_bytes + threads_per_block * 4 - 1) / (threads_per_block * 4));
+    const int num_blocks = std::min((long)std::max(2 * dp.multiProcessorCount, 1),
+                                    (total_bytes + threads_per_block * 4 - 1) / (threads_per_block * 4));
 
-    dequantize_mxfp4_vec_kernel<<<num_blocks, threads_per_block, 0, stream>>>(
-        out, in_fp4, e8m0_scales, total_elements);
+    dequantize_mxfp4_vec_kernel<<<num_blocks, threads_per_block, 0, stream>>>(out, in_fp4, e8m0_scales, total_elements);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -263,14 +264,13 @@ void dequantize_mxfp4(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void dequantize_mxfp4(
-    Tensor& out,
-    const Tensor& in_fp4,
-    const Tensor& e8m0_scales,
-    int M, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void dequantize_mxfp4(Tensor& out,
+                      const Tensor& in_fp4,
+                      const Tensor& e8m0_scales,
+                      int M,
+                      int K,
+                      const cudaDeviceProp& dp,
+                      cudaStream_t stream) {
     if (out.DType != ETensorDType::BF16) {
         throw std::runtime_error("dequantize_mxfp4: output must be BF16");
     }
@@ -281,11 +281,7 @@ void dequantize_mxfp4(
         throw std::runtime_error("dequantize_mxfp4: E8M0 scales must be BYTE (uint8 exponents)");
     }
 
-    dequantize_mxfp4(
-        out.get<nv_bfloat16>(),
-        in_fp4.get<uint8_t>(),
-        e8m0_scales.get<uint8_t>(),
-        M, K, dp, stream);
+    dequantize_mxfp4(out.get<nv_bfloat16>(), in_fp4.get<uint8_t>(), e8m0_scales.get<uint8_t>(), M, K, dp, stream);
 }
 
 // ============================================================================
@@ -304,11 +300,11 @@ void dequantize_mxfp4(
  * @param rows    Rows per matrix before transpose.
  * @param cols    Columns per matrix before transpose.
  */
-__global__ void batched_transpose_2d_bf16_kernel(
-    nv_bfloat16* __restrict__ dst,
-    const nv_bfloat16* __restrict__ src,
-    int batches, int rows, int cols)
-{
+__global__ void batched_transpose_2d_bf16_kernel(nv_bfloat16* __restrict__ dst,
+                                                 const nv_bfloat16* __restrict__ src,
+                                                 int batches,
+                                                 int rows,
+                                                 int cols) {
     constexpr int TILE_DIM = 32;
     constexpr int BLOCK_ROWS = 8;
     __shared__ nv_bfloat16 tile[TILE_DIM][TILE_DIM + 1];  // +1 to avoid bank conflicts
@@ -346,24 +342,21 @@ __global__ void batched_transpose_2d_bf16_kernel(
     }
 }
 
-void batched_transpose_2d_bf16(
-    nv_bfloat16* dst, const nv_bfloat16* src,
-    int batches, int rows, int cols,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void batched_transpose_2d_bf16(nv_bfloat16* dst,
+                               const nv_bfloat16* src,
+                               int batches,
+                               int rows,
+                               int cols,
+                               const cudaDeviceProp& dp,
+                               cudaStream_t stream) {
     if (batches == 0 || rows == 0 || cols == 0) return;
 
     constexpr int TILE_DIM = 32;
     constexpr int BLOCK_ROWS = 8;
     dim3 threads(TILE_DIM, BLOCK_ROWS);
-    dim3 blocks(
-        (cols + TILE_DIM - 1) / TILE_DIM,
-        (rows + TILE_DIM - 1) / TILE_DIM,
-        batches);
+    dim3 blocks((cols + TILE_DIM - 1) / TILE_DIM, (rows + TILE_DIM - 1) / TILE_DIM, batches);
 
-    batched_transpose_2d_bf16_kernel<<<blocks, threads, 0, stream>>>(
-        dst, src, batches, rows, cols);
+    batched_transpose_2d_bf16_kernel<<<blocks, threads, 0, stream>>>(dst, src, batches, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 

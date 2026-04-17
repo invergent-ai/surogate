@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-
-
 // Fused classifier kernel tests (forward loss + in-place backward dlogits)
 
 #include <vector>
@@ -31,10 +29,14 @@ namespace {
 
 // CPU reference: per-row softmax + cross-entropy with optional ignore_index (-100)
 // Also computes in-place dlogits = (softmax - one_hot) * dloss for first V entries of each row
-static void classifier_cpu(float* losses, float* dlogits,
-                           const float* logits, const int* targets,
-                           int BT, int V, int P, float dloss)
-{
+static void classifier_cpu(float* losses,
+                           float* dlogits,
+                           const float* logits,
+                           const int* targets,
+                           int BT,
+                           int V,
+                           int P,
+                           float dloss) {
     for (int r = 0; r < BT; ++r) {
         const int ix = targets[r];
         const float* row = logits + r * P;
@@ -42,16 +44,19 @@ static void classifier_cpu(float* losses, float* dlogits,
 
         if (ix == -100) {
             // masked token: zero grads (first V entries) and zero loss
-            for (int i = 0; i < V; ++i) gout[i] = 0.0f;
+            for (int i = 0; i < V; ++i)
+                gout[i] = 0.0f;
             losses[r] = 0.0f;
             continue;
         }
 
         // compute logsumexp and probs for first V entries
         float maxv = -INFINITY;
-        for (int i = 0; i < V; ++i) maxv = std::max(maxv, row[i]);
+        for (int i = 0; i < V; ++i)
+            maxv = std::max(maxv, row[i]);
         float sumexp = 0.0f;
-        for (int i = 0; i < V; ++i) sumexp += std::exp(row[i] - maxv);
+        for (int i = 0; i < V; ++i)
+            sumexp += std::exp(row[i] - maxv);
         float invsum = 1.0f / sumexp;
         // loss
         float prob_ix = std::exp(row[ix] - maxv) * invsum;
@@ -75,7 +80,7 @@ static int count_valid_tokens(const std::vector<int>& targets) {
     return count;
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("fused classifier fp32 forward/backward matches CPU", "[kernels][classifier][fp32]") {
     const auto& cfg = testing_config::get_test_config();
@@ -85,8 +90,8 @@ TEST_CASE("fused classifier fp32 forward/backward matches CPU", "[kernels][class
 
     // Choose V as multiple of 8 to avoid edge cases with vector tails in masked rows
     const int V = 151936;
-    const int P = V; // stride equal to vocab for test simplicity
-    const float dloss = 0.7f; // arbitrary upstream gradient scale
+    const int P = V;           // stride equal to vocab for test simplicity
+    const float dloss = 0.7f;  // arbitrary upstream gradient scale
 
     // Host buffers
     std::vector<float> h_logits((size_t)BT * P);
@@ -96,11 +101,12 @@ TEST_CASE("fused classifier fp32 forward/backward matches CPU", "[kernels][class
     {
         std::mt19937 gen(1337);
         std::uniform_int_distribution<int> dist(0, V - 1);
-        for (int i = 0; i < BT; ++i) h_targets[i] = dist(gen);
+        for (int i = 0; i < BT; ++i)
+            h_targets[i] = dist(gen);
         // set a few to ignore_index = -100
         if (BT >= 3) {
             h_targets[1] = -100;
-            h_targets[BT/2] = -100;
+            h_targets[BT / 2] = -100;
         }
     }
 
@@ -121,7 +127,11 @@ TEST_CASE("fused classifier fp32 forward/backward matches CPU", "[kernels][class
                      dloss,
                      thrust::raw_pointer_cast(d_targets.data()),
                      thrust::raw_pointer_cast(d_valid_token_count.data()),
-                     BT, V, P, /*write_dlogits*/ true, /*stream*/ 0);
+                     BT,
+                     V,
+                     P,
+                     /*write_dlogits*/ true,
+                     /*stream*/ 0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy back
@@ -163,7 +173,8 @@ TEST_CASE("fused classifier bf16 forward/backward matches CPU (tolerant)", "[ker
     {
         std::mt19937 gen(2025);
         std::uniform_int_distribution<int> dist(0, V - 1);
-        for (int i = 0; i < BT; ++i) h_targets[i] = dist(gen);
+        for (int i = 0; i < BT; ++i)
+            h_targets[i] = dist(gen);
         if (BT >= 2) h_targets[BT - 1] = -100;
     }
 
@@ -185,7 +196,11 @@ TEST_CASE("fused classifier bf16 forward/backward matches CPU (tolerant)", "[ker
                      dloss,
                      thrust::raw_pointer_cast(d_targets.data()),
                      thrust::raw_pointer_cast(d_valid_token_count.data()),
-                     BT, V, P, /*write_dlogits*/ true, /*stream*/ 0);
+                     BT,
+                     V,
+                     P,
+                     /*write_dlogits*/ true,
+                     /*stream*/ 0);
 
     // Copy back
     std::vector<float> h_losses = from_device(d_losses);
@@ -229,7 +244,8 @@ TEST_CASE("chunked cross-entropy fp32 large vocab (V=128K)", "[kernels][classifi
     {
         std::mt19937 gen(4242);
         std::uniform_int_distribution<int> dist(0, V - 1);
-        for (int i = 0; i < BT; ++i) h_targets[i] = dist(gen);
+        for (int i = 0; i < BT; ++i)
+            h_targets[i] = dist(gen);
         h_targets[0] = -100;
     }
 
@@ -253,14 +269,21 @@ TEST_CASE("chunked cross-entropy fp32 large vocab (V=128K)", "[kernels][classifi
                                   thrust::raw_pointer_cast(d_targets.data()),
                                   thrust::raw_pointer_cast(d_valid_token_count.data()),
                                   /*correct_count=*/nullptr,
-                                  BT, V, P, n_chunks, /*stream=*/0);
+                                  BT,
+                                  V,
+                                  P,
+                                  n_chunks,
+                                  /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits.data()),
                                    thrust::raw_pointer_cast(d_logits.data()),
                                    thrust::raw_pointer_cast(d_logsumexp.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                                                      BT, V, P, /*stream=*/0);
+                                   BT,
+                                   V,
+                                   P,
+                                   /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses = from_device(d_losses);
@@ -292,7 +315,8 @@ TEST_CASE("chunked cross-entropy fp32 very large vocab (V=256K)", "[kernels][cla
     {
         std::mt19937 gen(31415);
         std::uniform_int_distribution<int> dist(0, V - 1);
-        for (int i = 0; i < BT; ++i) h_targets[i] = dist(gen);
+        for (int i = 0; i < BT; ++i)
+            h_targets[i] = dist(gen);
         h_targets[BT - 1] = -100;
     }
 
@@ -316,14 +340,21 @@ TEST_CASE("chunked cross-entropy fp32 very large vocab (V=256K)", "[kernels][cla
                                   thrust::raw_pointer_cast(d_targets.data()),
                                   thrust::raw_pointer_cast(d_valid_token_count.data()),
                                   /*correct_count=*/nullptr,
-                                  BT, V, P, n_chunks, /*stream=*/0);
+                                  BT,
+                                  V,
+                                  P,
+                                  n_chunks,
+                                  /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits.data()),
                                    thrust::raw_pointer_cast(d_logits.data()),
                                    thrust::raw_pointer_cast(d_logsumexp.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                                                      BT, V, P, /*stream=*/0);
+                                   BT,
+                                   V,
+                                   P,
+                                   /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses = from_device(d_losses);
@@ -356,7 +387,8 @@ TEST_CASE("chunked cross-entropy bf16 large vocab", "[kernels][classifier][chunk
     {
         std::mt19937 gen(9876);
         std::uniform_int_distribution<int> dist(0, V - 1);
-        for (int i = 0; i < BT; ++i) h_targets[i] = dist(gen);
+        for (int i = 0; i < BT; ++i)
+            h_targets[i] = dist(gen);
         h_targets[0] = -100;
     }
 
@@ -381,14 +413,21 @@ TEST_CASE("chunked cross-entropy bf16 large vocab", "[kernels][classifier][chunk
                                   thrust::raw_pointer_cast(d_targets.data()),
                                   thrust::raw_pointer_cast(d_valid_token_count.data()),
                                   /*correct_count=*/nullptr,
-                                  BT, V, P, n_chunks, /*stream=*/0);
+                                  BT,
+                                  V,
+                                  P,
+                                  n_chunks,
+                                  /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits.data()),
                                    thrust::raw_pointer_cast(d_logits.data()),
                                    thrust::raw_pointer_cast(d_logsumexp.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                                                      BT, V, P, /*stream=*/0);
+                                   BT,
+                                   V,
+                                   P,
+                                   /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses = from_device(d_losses);
@@ -428,7 +467,8 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
     {
         std::mt19937 gen(2026);
         std::uniform_int_distribution<int> dist(0, V - 1);
-        for (int i = 0; i < BT; ++i) h_targets[i] = dist(gen);
+        for (int i = 0; i < BT; ++i)
+            h_targets[i] = dist(gen);
         h_targets[0] = -100;
     }
 
@@ -447,14 +487,20 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                 thrust::raw_pointer_cast(d_targets.data()),
                                 thrust::raw_pointer_cast(d_valid_fused.data()),
                                 /*correct_count=*/nullptr,
-                                BT, V, P, /*stream=*/0);
+                                BT,
+                                V,
+                                P,
+                                /*stream=*/0);
 
     fused_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits_fused.data()),
                                  thrust::raw_pointer_cast(d_logits_fused.data()),
                                  thrust::raw_pointer_cast(d_logsumexp_fused.data()),
                                  thrust::raw_pointer_cast(d_dloss.data()),
                                  thrust::raw_pointer_cast(d_targets.data()),
-                                                                  BT, V, P, /*stream=*/0);
+                                 BT,
+                                 V,
+                                 P,
+                                 /*stream=*/0);
 
     thrust::device_vector<float> d_logits_chunked = to_device(h_logits);
     thrust::device_vector<float> d_losses_chunked(BT, 0.0f);
@@ -470,14 +516,21 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                   thrust::raw_pointer_cast(d_targets.data()),
                                   thrust::raw_pointer_cast(d_valid_chunked.data()),
                                   /*correct_count=*/nullptr,
-                                  BT, V, P, n_chunks, /*stream=*/0);
+                                  BT,
+                                  V,
+                                  P,
+                                  n_chunks,
+                                  /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits_chunked.data()),
                                    thrust::raw_pointer_cast(d_logits_chunked.data()),
                                    thrust::raw_pointer_cast(d_logsumexp_chunked.data()),
                                    thrust::raw_pointer_cast(d_dloss.data()),
                                    thrust::raw_pointer_cast(d_targets.data()),
-                                                                      BT, V, P, /*stream=*/0);
+                                   BT,
+                                   V,
+                                   P,
+                                   /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_losses_fused = from_device(d_losses_fused);

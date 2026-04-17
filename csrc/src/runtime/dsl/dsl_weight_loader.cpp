@@ -35,12 +35,13 @@ DslWeightLoader::DslWeightLoader(SafeTensorsReader& reader,
                                  TensorAllocator& allocator,
                                  ShardConfig shard,
                                  MoEWeightConfig moe_config)
-    : mReader(reader)
-    , mMapping(mapping)
-    , mConfig(config)
-    , mAllocator(allocator)
-    , mShard(shard)
-    , mMoEConfig(moe_config) {}
+    : mReader(reader),
+      mMapping(mapping),
+      mConfig(config),
+      mAllocator(allocator),
+      mShard(shard),
+      mMoEConfig(moe_config) {
+}
 
 DslWeightLoader::~DslWeightLoader() = default;
 
@@ -66,9 +67,7 @@ bool DslWeightLoader::load_param(const std::string& name,
     }
 
     switch (spec->kind) {
-        case MappingSpec::Kind::TiedTo:
-            mTiedParams.emplace_back(name, spec->target);
-            return true;
+        case MappingSpec::Kind::TiedTo: mTiedParams.emplace_back(name, spec->target); return true;
 
         case MappingSpec::Kind::Direct:
             return load_direct(*spec, name, target, layer_idx, allow_cast, param_sharded, global_template);
@@ -123,16 +122,14 @@ bool DslWeightLoader::try_multiple(const std::vector<std::pair<std::string, Mapp
                 success = load_split(trial, name, target, layer_idx, allow_cast, param_sharded, global_template);
                 break;
             case MappingSpec::Kind::Transform:
-                success = load_transform(trial, name, target, layer_idx, allow_cast, param_sharded, global_template, stream);
+                success =
+                    load_transform(trial, name, target, layer_idx, allow_cast, param_sharded, global_template, stream);
                 break;
             case MappingSpec::Kind::StackExperts:
                 success = load_stack_experts(trial, name, target, layer_idx, allow_cast, param_sharded, stream);
                 break;
-            case MappingSpec::Kind::TiedTo:
-                mTiedParams.emplace_back(name, trial.target);
-                return true;
-            case MappingSpec::Kind::Unknown:
-                break;
+            case MappingSpec::Kind::TiedTo: mTiedParams.emplace_back(name, trial.target); return true;
+            case MappingSpec::Kind::Unknown: break;
         }
 
         if (success) {
@@ -146,8 +143,11 @@ bool DslWeightLoader::try_multiple(const std::vector<std::pair<std::string, Mapp
     return false;
 }
 
-bool DslWeightLoader::load_expert(const std::string& name, int expert_idx,
-                                   Tensor& target, bool allow_cast, cudaStream_t stream) {
+bool DslWeightLoader::load_expert(const std::string& name,
+                                  int expert_idx,
+                                  Tensor& target,
+                                  bool allow_cast,
+                                  cudaStream_t stream) {
     int layer_idx = -1;
     const MappingSpec* spec = find_mapping_spec(name, layer_idx);
 
@@ -166,8 +166,7 @@ bool DslWeightLoader::load_expert(const std::string& name, int expert_idx,
         }
         const std::size_t bytes = elems * get_dtype_size(dtype);
         if (!mExpertScratch.Data || mExpertScratchBytes < bytes || mExpertScratch.DType != dtype) {
-            mExpertScratch = mAllocator.allocate(dtype, "wl_tmp_expert",
-                                                 EAllocationType::ON_DEVICE, shape);
+            mExpertScratch = mAllocator.allocate(dtype, "wl_tmp_expert", EAllocationType::ON_DEVICE, shape);
             mExpertScratchBytes = mExpertScratch.bytes();
         }
         Tensor scratch = mExpertScratch;
@@ -233,20 +232,16 @@ bool DslWeightLoader::load_expert(const std::string& name, int expert_idx,
     }
 
     if (spec->kind != MappingSpec::Kind::Direct && spec->kind != MappingSpec::Kind::Transform) {
-        throw std::runtime_error(
-            "DslWeightLoader: load_expert unsupported mapping kind for '" + name + "'");
+        throw std::runtime_error("DslWeightLoader: load_expert unsupported mapping kind for '" + name + "'");
     }
     if (spec->kind == MappingSpec::Kind::Transform && spec->fn != "transpose") {
-        throw std::runtime_error("DslWeightLoader: load_expert unsupported transform '" + spec->fn
-                                 + "' for '" + name + "'");
+        throw std::runtime_error("DslWeightLoader: load_expert unsupported transform '" + spec->fn + "' for '" + name +
+                                 "'");
     }
 
-    const bool has_expert_placeholder =
-        spec->source.find("{expert}") != std::string::npos;
-    std::string hf_name = format_hf_name(
-        spec->source.empty() ? name : spec->source,
-        layer_idx,
-        has_expert_placeholder ? expert_idx : -1);
+    const bool has_expert_placeholder = spec->source.find("{expert}") != std::string::npos;
+    std::string hf_name =
+        format_hf_name(spec->source.empty() ? name : spec->source, layer_idx, has_expert_placeholder ? expert_idx : -1);
 
     const SafeTensorEntry* entry_ptr = nullptr;
     try {
@@ -276,8 +271,7 @@ bool DslWeightLoader::load_expert(const std::string& name, int expert_idx,
             }
             Tensor tmp = get_expert_scratch(target.DType, {shape.at(0), shape.at(1)});
             entry.read_tensor(tmp, allow_cast);
-            transpose(target, tmp, static_cast<int>(shape.at(0)),
-                      static_cast<int>(shape.at(1)), stream);
+            transpose(target, tmp, static_cast<int>(shape.at(0)), static_cast<int>(shape.at(1)), stream);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         return true;
@@ -327,8 +321,8 @@ void DslWeightLoader::resolve_tied_params(const std::function<Tensor&(const std:
         Tensor& dst = get_tensor(dst_name);
         Tensor& src = get_tensor(src_name);
         if (dst.bytes() != src.bytes()) {
-            throw std::runtime_error("DslWeightLoader: tied param size mismatch: '"
-                                     + dst_name + "' vs '" + src_name + "'");
+            throw std::runtime_error("DslWeightLoader: tied param size mismatch: '" + dst_name + "' vs '" + src_name +
+                                     "'");
         }
         CUDA_CHECK(cudaMemcpy(dst.Data, src.Data, src.bytes(), cudaMemcpyDeviceToDevice));
     }
@@ -347,11 +341,14 @@ bool DslWeightLoader::has_entry(const std::string& hf_name) const {
 // Direct Loading
 // ============================================================================
 
-bool DslWeightLoader::load_direct(const MappingSpec& spec, const std::string& name,
-                                  Tensor& target, int layer_idx, bool allow_cast,
-                                  bool param_sharded, const Tensor* global_template) {
-    const std::string hf_name = format_hf_name(
-        spec.source.empty() ? name : spec.source, layer_idx);
+bool DslWeightLoader::load_direct(const MappingSpec& spec,
+                                  const std::string& name,
+                                  Tensor& target,
+                                  int layer_idx,
+                                  bool allow_cast,
+                                  bool param_sharded,
+                                  const Tensor* global_template) {
+    const std::string hf_name = format_hf_name(spec.source.empty() ? name : spec.source, layer_idx);
 
     // Look up the HF tensor entry.
     const SafeTensorEntry* entry_ptr = nullptr;
@@ -384,13 +381,12 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec, const std::string& na
 
             if (!entry_ptr) {
                 if (spec.optional) return false;
-                throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name
-                                         + "' (and tied fallback) for param '" + name + "'");
+                throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name +
+                                         "' (and tied fallback) for param '" + name + "'");
             }
         } else {
             if (spec.optional) return false;
-            throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name
-                                     + "' for param '" + name + "'");
+            throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name + "' for param '" + name + "'");
         }
     }
     const auto& entry = *entry_ptr;
@@ -411,8 +407,8 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec, const std::string& na
                 if (squeezed[i] != target.Sizes[i]) match = false;
             }
             if (!match) {
-                throw std::runtime_error("DslWeightLoader: shape mismatch for '" + hf_name
-                    + "': file shape cannot be squeezed to target shape for param '" + name + "'");
+                throw std::runtime_error("DslWeightLoader: shape mismatch for '" + hf_name +
+                                         "': file shape cannot be squeezed to target shape for param '" + name + "'");
             }
             entry.read_raw(target, 0, target.nelem(), allow_cast);
         } else {
@@ -420,8 +416,7 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec, const std::string& na
         }
     } else {
         if (!global_template) {
-            throw std::runtime_error("DslWeightLoader: sharded param '" + name
-                                     + "' requires global_template");
+            throw std::runtime_error("DslWeightLoader: sharded param '" + name + "' requires global_template");
         }
         const long global_rows = global_template->Sizes[0];
         auto [start, end] = shard_range(global_rows, true);
@@ -436,9 +431,13 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec, const std::string& na
 // Fuse Loading (concatenate multiple HF tensors along dim0)
 // ============================================================================
 
-bool DslWeightLoader::load_fused(const MappingSpec& spec, const std::string& name,
-                                 Tensor& target, int layer_idx, bool allow_cast,
-                                 bool param_sharded, const Tensor* global_template) {
+bool DslWeightLoader::load_fused(const MappingSpec& spec,
+                                 const std::string& name,
+                                 Tensor& target,
+                                 int layer_idx,
+                                 bool allow_cast,
+                                 bool param_sharded,
+                                 const Tensor* global_template) {
     if (spec.dim != 0) {
         throw std::runtime_error("DslWeightLoader: fuse mapping only supports dim=0 for '" + name + "'");
     }
@@ -451,7 +450,8 @@ bool DslWeightLoader::load_fused(const MappingSpec& spec, const std::string& nam
     // Validate static slices against target (hybrid models may have per-block-type dims)
     if (!slice_sizes.empty()) {
         long sum = 0;
-        for (long s : slice_sizes) sum += s;
+        for (long s : slice_sizes)
+            sum += s;
         if (sum != target_rows) slice_sizes.clear();
     }
 
@@ -466,7 +466,9 @@ bool DslWeightLoader::load_fused(const MappingSpec& spec, const std::string& nam
                 if (!entry.shape().empty()) {
                     file_sizes.push_back(entry.shape()[0]);
                 }
-            } else { break; }
+            } else {
+                break;
+            }
         }
         if (file_sizes.size() == spec.sources.size()) {
             slice_sizes = std::move(file_sizes);
@@ -530,16 +532,14 @@ bool DslWeightLoader::load_fused(const MappingSpec& spec, const std::string& nam
             const long src_row_offset = overlap_begin - src_begin;
             Tensor slice = slice_dim0(target, dst_row_offset, rows);
             const long stride = row_stride(entry.shape());
-            entry.read_raw(slice, static_cast<std::ptrdiff_t>(src_row_offset) * stride,
-                           slice.nelem(), allow_cast);
+            entry.read_raw(slice, static_cast<std::ptrdiff_t>(src_row_offset) * stride, slice.nelem(), allow_cast);
         }
         offset += slice_len;
     }
 
     if (offset != global_rows) {
-        throw std::runtime_error("DslWeightLoader: fuse mapping size mismatch for '" + name
-                                 + "' (got " + std::to_string(offset) + " rows, expected "
-                                 + std::to_string(global_rows) + ")");
+        throw std::runtime_error("DslWeightLoader: fuse mapping size mismatch for '" + name + "' (got " +
+                                 std::to_string(offset) + " rows, expected " + std::to_string(global_rows) + ")");
     }
     return true;
 }
@@ -548,9 +548,13 @@ bool DslWeightLoader::load_fused(const MappingSpec& spec, const std::string& nam
 // Split Loading (extract sub-range from one HF tensor)
 // ============================================================================
 
-bool DslWeightLoader::load_split(const MappingSpec& spec, const std::string& name,
-                                 Tensor& target, int layer_idx, bool allow_cast,
-                                 bool param_sharded, const Tensor* global_template) {
+bool DslWeightLoader::load_split(const MappingSpec& spec,
+                                 const std::string& name,
+                                 Tensor& target,
+                                 int layer_idx,
+                                 bool allow_cast,
+                                 bool param_sharded,
+                                 const Tensor* global_template) {
     if (spec.dim != 0) {
         throw std::runtime_error("DslWeightLoader: split mapping only supports dim=0 for '" + name + "'");
     }
@@ -571,8 +575,7 @@ bool DslWeightLoader::load_split(const MappingSpec& spec, const std::string& nam
         entry_ptr = &mReader.find_entry(hf_name);
     } catch (const std::out_of_range&) {
         if (spec.optional) return false;
-        throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name
-                                 + "' for split param '" + name + "'");
+        throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name + "' for split param '" + name + "'");
     }
     const auto& entry = *entry_ptr;
 
@@ -593,8 +596,7 @@ bool DslWeightLoader::load_split(const MappingSpec& spec, const std::string& nam
         }
         const long local_start = start + shard_rows * mShard.shard_idx;
         const long stride = row_stride(entry.shape());
-        entry.read_raw(target, static_cast<std::ptrdiff_t>(local_start) * stride,
-                       target.nelem(), allow_cast);
+        entry.read_raw(target, static_cast<std::ptrdiff_t>(local_start) * stride, target.nelem(), allow_cast);
     }
     return true;
 }
@@ -603,13 +605,16 @@ bool DslWeightLoader::load_split(const MappingSpec& spec, const std::string& nam
 // Transform Loading (load + apply function, e.g. transpose)
 // ============================================================================
 
-bool DslWeightLoader::load_transform(const MappingSpec& spec, const std::string& name,
-                                     Tensor& target, int layer_idx, bool allow_cast,
-                                     bool param_sharded, const Tensor* global_template,
+bool DslWeightLoader::load_transform(const MappingSpec& spec,
+                                     const std::string& name,
+                                     Tensor& target,
+                                     int layer_idx,
+                                     bool allow_cast,
+                                     bool param_sharded,
+                                     const Tensor* global_template,
                                      cudaStream_t stream) {
     if (spec.fn != "transpose") {
-        throw std::runtime_error("DslWeightLoader: unsupported transform '" + spec.fn
-                                 + "' for '" + name + "'");
+        throw std::runtime_error("DslWeightLoader: unsupported transform '" + spec.fn + "' for '" + name + "'");
     }
 
     const std::string hf_name = format_hf_name(spec.source, layer_idx);
@@ -619,8 +624,8 @@ bool DslWeightLoader::load_transform(const MappingSpec& spec, const std::string&
         entry_ptr = &mReader.find_entry(hf_name);
     } catch (const std::out_of_range&) {
         if (spec.optional) return false;
-        throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name
-                                 + "' for transform param '" + name + "'");
+        throw std::runtime_error("DslWeightLoader: missing HF tensor '" + hf_name + "' for transform param '" + name +
+                                 "'");
     }
     const auto& entry = *entry_ptr;
 
@@ -634,17 +639,17 @@ bool DslWeightLoader::load_transform(const MappingSpec& spec, const std::string&
 
     if (!param_sharded) {
         // Allocate temporary for the untransposed data.
-        Tensor tmp = mAllocator.allocate(target.DType, ("wl_tmp_" + name).c_str(),
+        Tensor tmp = mAllocator.allocate(target.DType,
+                                         ("wl_tmp_" + name).c_str(),
                                          EAllocationType::ON_DEVICE,
                                          {entry.shape().at(0), entry.shape().at(1)});
         entry.read_tensor(tmp, allow_cast);
-        transpose(target, tmp, static_cast<int>(entry.shape().at(0)),
-                  static_cast<int>(entry.shape().at(1)), stream);
+        transpose(target, tmp, static_cast<int>(entry.shape().at(0)), static_cast<int>(entry.shape().at(1)), stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } else {
         if (!global_template) {
-            throw std::runtime_error("DslWeightLoader: sharded transform param '" + name
-                                     + "' requires global_template");
+            throw std::runtime_error("DslWeightLoader: sharded transform param '" + name +
+                                     "' requires global_template");
         }
         const long global_rows = global_template->Sizes[0];
         auto [shard_start, shard_end] = shard_range(global_rows, true);
@@ -654,20 +659,24 @@ bool DslWeightLoader::load_transform(const MappingSpec& spec, const std::string&
         }
 
         // Allocate temporary for source (untransposed) and full transposed result.
-        Tensor tmp_src = mAllocator.allocate(target.DType, ("wl_tmp_src_" + name).c_str(),
+        Tensor tmp_src = mAllocator.allocate(target.DType,
+                                             ("wl_tmp_src_" + name).c_str(),
                                              EAllocationType::ON_DEVICE,
                                              {entry.shape().at(0), entry.shape().at(1)});
-        Tensor tmp_full = mAllocator.allocate(target.DType, ("wl_tmp_full_" + name).c_str(),
+        Tensor tmp_full = mAllocator.allocate(target.DType,
+                                              ("wl_tmp_full_" + name).c_str(),
                                               EAllocationType::ON_DEVICE,
                                               {global_template->Sizes[0], global_template->Sizes[1]});
         entry.read_tensor(tmp_src, allow_cast);
-        transpose(tmp_full, tmp_src, static_cast<int>(entry.shape().at(0)),
-                  static_cast<int>(entry.shape().at(1)), stream);
+        transpose(tmp_full,
+                  tmp_src,
+                  static_cast<int>(entry.shape().at(0)),
+                  static_cast<int>(entry.shape().at(1)),
+                  stream);
 
         // Copy our shard slice from the full transposed result.
         Tensor full_slice = slice_dim0(tmp_full, shard_start, shard_end - shard_start);
-        CUDA_CHECK(cudaMemcpyAsync(target.Data, full_slice.Data, target.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(target.Data, full_slice.Data, target.bytes(), cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     return true;
@@ -677,9 +686,13 @@ bool DslWeightLoader::load_transform(const MappingSpec& spec, const std::string&
 // StackExperts Loading (per-expert HF tensors -> batched [E, ...])
 // ============================================================================
 
-bool DslWeightLoader::load_stack_experts(const MappingSpec& spec, const std::string& name,
-                                         Tensor& target, int layer_idx, bool allow_cast,
-                                         bool param_sharded, cudaStream_t stream) {
+bool DslWeightLoader::load_stack_experts(const MappingSpec& spec,
+                                         const std::string& name,
+                                         Tensor& target,
+                                         int layer_idx,
+                                         bool allow_cast,
+                                         bool param_sharded,
+                                         cudaStream_t stream) {
     if (spec.source.empty()) {
         throw std::runtime_error("DslWeightLoader: stack_experts missing pattern for '" + name + "'");
     }
@@ -773,8 +786,8 @@ bool DslWeightLoader::load_stack_experts(const MappingSpec& spec, const std::str
             for (int d = 0; d < slice.Rank; ++d) {
                 slice.Sizes[d] = target.Sizes[d + 1];
             }
-            slice.Data = static_cast<std::byte*>(target.Data)
-                       + static_cast<std::size_t>(local_e) * expert_size * elem_size;
+            slice.Data =
+                static_cast<std::byte*>(target.Data) + static_cast<std::size_t>(local_e) * expert_size * elem_size;
             entry.read_tensor(slice, allow_cast);
         }
     }
@@ -792,9 +805,8 @@ std::pair<long, long> DslWeightLoader::shard_range(long global_rows, bool param_
         return {0, global_rows};
     }
     if (global_rows % mShard.num_shards != 0) {
-        throw std::runtime_error("DslWeightLoader: sharded load requires dim0 ("
-                                 + std::to_string(global_rows) + ") divisible by num_shards ("
-                                 + std::to_string(mShard.num_shards) + ")");
+        throw std::runtime_error("DslWeightLoader: sharded load requires dim0 (" + std::to_string(global_rows) +
+                                 ") divisible by num_shards (" + std::to_string(mShard.num_shards) + ")");
     }
     const long shard_rows = global_rows / mShard.num_shards;
     const long start = shard_rows * mShard.shard_idx;
@@ -819,8 +831,7 @@ Tensor DslWeightLoader::slice_dim0(const Tensor& base, long offset, long length)
         stride *= slice.Sizes[i];
     }
     const std::size_t elem_size = get_dtype_size(slice.DType);
-    const std::size_t byte_offset = static_cast<std::size_t>(offset)
-                                  * static_cast<std::size_t>(stride) * elem_size;
+    const std::size_t byte_offset = static_cast<std::size_t>(offset) * static_cast<std::size_t>(stride) * elem_size;
     slice.Data = static_cast<std::byte*>(slice.Data) + byte_offset;
     slice.Sizes[0] = length;
     return slice;
@@ -830,7 +841,8 @@ std::vector<long> DslWeightLoader::infer_fuse_slices(const std::string& name, in
     // Case-insensitive name matching for common fuse patterns.
     auto lower = [](const std::string& s) {
         std::string r = s;
-        for (char& c : r) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (char& c : r)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return r;
     };
     const std::string lname = lower(name);
@@ -932,8 +944,7 @@ bool DslWeightLoader::parse_block_param(std::string_view name, int& layer_idx, s
     return false;
 }
 
-const MappingSpec* DslWeightLoader::find_mapping_spec(const std::string& internal_name,
-                                                      int& layer_idx) const {
+const MappingSpec* DslWeightLoader::find_mapping_spec(const std::string& internal_name, int& layer_idx) const {
     layer_idx = -1;
 
     // Try exact match first.

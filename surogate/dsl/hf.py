@@ -24,8 +24,9 @@ Example:
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Callable, Any
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class FuseMapping:
             dim=0
         )
     """
+
     sources: tuple[str, ...]
     dim: int = 0
 
@@ -59,6 +61,7 @@ class SplitMapping:
             dim=0
         )
     """
+
     source: str
     ranges: tuple[tuple[int, int], ...]
     dim: int = 0
@@ -75,6 +78,7 @@ class TransformMapping:
     Example:
         transform("model.embed_tokens.weight", fn="transpose")
     """
+
     source: str
     fn: str
 
@@ -89,6 +93,7 @@ class TiedToMapping:
     Example:
         tied_to("embedding")
     """
+
     target: str
 
     def __repr__(self) -> str:
@@ -117,6 +122,7 @@ class StackExpertsMapping:
             "model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
         )
     """
+
     pattern: str  # Pattern with {expert} placeholder
     num_experts: int = 0  # 0 = auto-detect from model config
     fuse_gate_up: bool = False  # If True, fuse gate_proj and up_proj into gate_up
@@ -348,16 +354,20 @@ def build_norm_mappings(
     from .modules.rmsnorm import RMSNorm
 
     mappings: dict[str, Any] = {}
-    mappings.update(expand_module_mapping(
-        RMSNorm._hf_mapping_defaults_,
-        hf_prefix=f"{layer_prefix}.{ln1_suffix}",
-        param_prefix="ln1_",
-    ))
-    mappings.update(expand_module_mapping(
-        RMSNorm._hf_mapping_defaults_,
-        hf_prefix=f"{layer_prefix}.{ln2_suffix}",
-        param_prefix="ln2_",
-    ))
+    mappings.update(
+        expand_module_mapping(
+            RMSNorm._hf_mapping_defaults_,
+            hf_prefix=f"{layer_prefix}.{ln1_suffix}",
+            param_prefix="ln1_",
+        )
+    )
+    mappings.update(
+        expand_module_mapping(
+            RMSNorm._hf_mapping_defaults_,
+            hf_prefix=f"{layer_prefix}.{ln2_suffix}",
+            param_prefix="ln2_",
+        )
+    )
     return mappings
 
 
@@ -377,6 +387,7 @@ def build_attn_mappings(
     """
     if attn_module is None:
         from .modules.attention import GQAAttention
+
         attn_module = GQAAttention
 
     return expand_module_mapping(
@@ -403,6 +414,7 @@ def build_mlp_mappings(
     """
     if mlp_module is None:
         from .modules.mlp import SwiGLUMLP
+
         mlp_module = SwiGLUMLP
 
     return expand_module_mapping(
@@ -428,6 +440,7 @@ def build_mamba_mappings(
     """
     if mamba_module is None:
         from .modules.mamba import Mamba2Mixer
+
         mamba_module = Mamba2Mixer
 
     return expand_module_mapping(
@@ -454,6 +467,7 @@ def build_simple_mlp_mappings(
     """
     if mlp_module is None:
         from .modules.mamba import SimpleMLP
+
         mlp_module = SimpleMLP
 
     return expand_module_mapping(
@@ -486,6 +500,7 @@ def build_moe_mappings(
     """
     if moe_module is None:
         from .modules.moe import MoEExpertsGated
+
         moe_module = MoEExpertsGated
 
     mappings = expand_module_mapping(
@@ -496,11 +511,14 @@ def build_moe_mappings(
     if include_shared:
         if shared_module is None:
             from .modules.moe import MoESharedExpert
+
             shared_module = MoESharedExpert
-        mappings.update(expand_module_mapping(
-            shared_module._hf_mapping_defaults_,
-            hf_prefix=f"{layer_prefix}.{moe_suffix}",
-        ))
+        mappings.update(
+            expand_module_mapping(
+                shared_module._hf_mapping_defaults_,
+                hf_prefix=f"{layer_prefix}.{moe_suffix}",
+            )
+        )
 
     return mappings
 

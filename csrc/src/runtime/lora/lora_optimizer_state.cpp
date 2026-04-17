@@ -14,9 +14,12 @@
 
 namespace modules {
 
-ModularLoRAOptimizerState::ModularLoRAOptimizerState(const Config& config, cudaStream_t stream,
-                                                            NCCLCommunicator& comm, TensorAllocator& allocator)
-    : mConfig(config), mAllocator(&allocator) {
+ModularLoRAOptimizerState::ModularLoRAOptimizerState(const Config& config,
+                                                     cudaStream_t stream,
+                                                     NCCLCommunicator& comm,
+                                                     TensorAllocator& allocator)
+    : mConfig(config),
+      mAllocator(&allocator) {
     mMomentum.config = config.lora_config;
     mVariance.config = config.lora_config;
     mMomentumScales.config = config.lora_config;
@@ -87,14 +90,17 @@ void ModularLoRAOptimizerState::allocate_state() {
     const EAllocationType kind_m = mConfig.offload_m ? mConfig.offload_alloc : EAllocationType::ON_DEVICE;
     const EAllocationType kind_v = mConfig.offload_v ? mConfig.offload_alloc : EAllocationType::ON_DEVICE;
 
-    auto alloc_state = [&](ETensorDType dtype, EAllocationType kind, int in_f, int out_f, const std::string& name) -> LoRALayerWeights<TensorShard> {
+    auto alloc_state = [&](ETensorDType dtype, EAllocationType kind, int in_f, int out_f, const std::string& name)
+        -> LoRALayerWeights<TensorShard> {
         LoRALayerWeights<TensorShard> w;
         w.A = TensorShard(mAllocator->allocate(dtype, (name + "_A").c_str(), kind, {r, in_f}));
-        w.B = mAllocator->allocate_shard(dtype, /*shard_idx=*/0, /*num_shards=*/1, (name + "_B").c_str(), {out_f, r}, kind);
+        w.B = mAllocator
+                  ->allocate_shard(dtype, /*shard_idx=*/0, /*num_shards=*/1, (name + "_B").c_str(), {out_f, r}, kind);
         return w;
     };
 
-    auto alloc_scales = [&](EAllocationType kind, int in_f, int out_f, const std::string& name) -> LoRALayerWeights<TensorShard> {
+    auto alloc_scales =
+        [&](EAllocationType kind, int in_f, int out_f, const std::string& name) -> LoRALayerWeights<TensorShard> {
         LoRALayerWeights<TensorShard> w;
         const long a_elems = static_cast<long>(r) * static_cast<long>(in_f);
         const long b_elems = static_cast<long>(out_f) * static_cast<long>(r);
@@ -195,10 +201,16 @@ void ModularLoRAOptimizerState::allocate_state() {
         mStagingV = mAllocator->allocate(mConfig.v_dtype, "lora_opt_v_stage", EAllocationType::ON_DEVICE, {max_elems});
     }
     if (mConfig.offload_m && is_fp8_dtype(mConfig.m_dtype) && !mStagingMScales.Data) {
-        mStagingMScales = mAllocator->allocate(ETensorDType::FP32, "lora_opt_m_scales_stage", EAllocationType::ON_DEVICE, {max_scale_elems});
+        mStagingMScales = mAllocator->allocate(ETensorDType::FP32,
+                                               "lora_opt_m_scales_stage",
+                                               EAllocationType::ON_DEVICE,
+                                               {max_scale_elems});
     }
     if (mConfig.offload_v && is_fp8_dtype(mConfig.v_dtype) && !mStagingVScales.Data) {
-        mStagingVScales = mAllocator->allocate(ETensorDType::FP32, "lora_opt_v_scales_stage", EAllocationType::ON_DEVICE, {max_scale_elems});
+        mStagingVScales = mAllocator->allocate(ETensorDType::FP32,
+                                               "lora_opt_v_scales_stage",
+                                               EAllocationType::ON_DEVICE,
+                                               {max_scale_elems});
     }
 }
 
@@ -306,4 +318,4 @@ void ModularLoRAOptimizerState::StateContainer::iterate_tensors(
     }
 }
 
-} // namespace modules
+}  // namespace modules

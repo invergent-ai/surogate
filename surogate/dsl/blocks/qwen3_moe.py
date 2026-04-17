@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from .. import nn
+from ..dim import B, Dim, T
 from ..nn import MOE_BLOCK_NAME_REMAP
-from ..dim import B, T, Dim
 
 
 class Qwen3MoEBlock(nn.Block):
@@ -33,25 +33,33 @@ class Qwen3MoEBlock(nn.Block):
         super().__init__()
         self.d_model = d_model
         self.use_shared_expert = use_shared_expert
-        self.shared_expert_intermediate = (
-            shared_expert_intermediate if shared_expert_intermediate > 0 else d_ff
-        )
+        self.shared_expert_intermediate = shared_expert_intermediate if shared_expert_intermediate > 0 else d_ff
         self.C = Dim("C")
 
         self.attn_norm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Qwen3Attention(
-            d_model, num_query_heads, num_kv_heads, head_size,
-            max_seq, use_qkv_bias=use_qkv_bias,
-            use_qk_norm=use_qk_norm, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            use_qkv_bias=use_qkv_bias,
+            use_qk_norm=use_qk_norm,
+            eps=eps,
         )
         self.mlp_norm = nn.RMSNorm(d_model, eps=eps)
         self.moe = nn.MoEExpertsGated(
-            d_model, d_ff, num_experts, num_experts_per_tok,
-            norm_topk_prob=norm_topk_prob, ep_size=ep_size,
+            d_model,
+            d_ff,
+            num_experts,
+            num_experts_per_tok,
+            norm_topk_prob=norm_topk_prob,
+            ep_size=ep_size,
         )
         if use_shared_expert:
             self.shared_expert = nn.MoESharedExpert(
-                d_model, self.shared_expert_intermediate,
+                d_model,
+                self.shared_expert_intermediate,
             )
 
     def forward(self, x, residual, position_ids):
@@ -71,7 +79,8 @@ class Qwen3MoEBlock(nn.Block):
             moe_out = self._add(moe_out, shared_out, name="moe_combined")
         # Register output slot and reshape back
         self._register_activation(
-            "mlp_down", ("B", "T", "C"),
+            "mlp_down",
+            ("B", "T", "C"),
             aliases=["mlp_down_flat"],
             share_policy="per_layer",
             description="MoE output (block output)",

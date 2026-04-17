@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.core.config.grpo_orch_config import GRPOCheckpointConfig
+from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.grpo.utils.logger import get_logger
 from surogate.grpo.utils.utils import get_ckpt_dir, get_step_path
 
@@ -17,7 +17,9 @@ class Progress:
     total_samples: int = 0
     total_problems: int = 0
 
+
 logger = get_logger()
+
 
 class CheckpointManager:
     """Utility class to save and load orchestrator checkpoints to resume orchestrator."""

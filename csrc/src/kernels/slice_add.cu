@@ -53,7 +53,8 @@ __device__ inline nv_bfloat16 add_cast<nv_bfloat16>(float v) {
  * @param dst_col_offset Starting column offset in destination.
  */
 template <typename T>
-__global__ void add_2d_slice_kernel(T* dst, const T* src, long rows, long dst_cols, long src_cols, long dst_col_offset) {
+__global__ void
+add_2d_slice_kernel(T* dst, const T* src, long rows, long dst_cols, long src_cols, long dst_col_offset) {
     long idx = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
     long total = rows * src_cols;
     if (idx >= total) return;
@@ -82,7 +83,13 @@ __global__ void add_2d_slice_kernel(T* dst, const T* src, long rows, long dst_co
  * @throws std::logic_error If dst_col_offset is out of bounds.
  */
 template <typename T>
-static void add_2d_slice_imp(T* dst, const T* src, long rows, long dst_cols, long src_cols, long dst_col_offset, cudaStream_t stream) {
+static void add_2d_slice_imp(T* dst,
+                             const T* src,
+                             long rows,
+                             long dst_cols,
+                             long src_cols,
+                             long dst_col_offset,
+                             cudaStream_t stream) {
     if (rows <= 0 || dst_cols <= 0 || src_cols <= 0) return;
     if (dst_col_offset < 0 || dst_col_offset + src_cols > dst_cols) {
         throw std::logic_error("add_2d_slice: dst_col_offset out of bounds");
@@ -108,7 +115,13 @@ static void add_2d_slice_imp(T* dst, const T* src, long rows, long dst_cols, lon
  * @param dst_col_offset Starting column offset in destination.
  * @param stream CUDA stream.
  */
-void add_2d_slice(float* dst, const float* src, long rows, long dst_cols, long src_cols, long dst_col_offset, cudaStream_t stream) {
+void add_2d_slice(float* dst,
+                  const float* src,
+                  long rows,
+                  long dst_cols,
+                  long src_cols,
+                  long dst_col_offset,
+                  cudaStream_t stream) {
     add_2d_slice_imp(dst, src, rows, dst_cols, src_cols, dst_col_offset, stream);
 }
 
@@ -125,7 +138,12 @@ void add_2d_slice(float* dst, const float* src, long rows, long dst_cols, long s
  * @param dst_col_offset Starting column offset in destination.
  * @param stream CUDA stream.
  */
-void add_2d_slice(nv_bfloat16* dst, const nv_bfloat16* src, long rows, long dst_cols, long src_cols, long dst_col_offset, cudaStream_t stream) {
+void add_2d_slice(nv_bfloat16* dst,
+                  const nv_bfloat16* src,
+                  long rows,
+                  long dst_cols,
+                  long src_cols,
+                  long dst_col_offset,
+                  cudaStream_t stream) {
     add_2d_slice_imp(dst, src, rows, dst_cols, src_cols, dst_col_offset, stream);
 }
-

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from .. import nn
+from ..blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
+from ..hf import build_norm_mappings, expand_module_mapping
+from ..models.qwen3_5 import _parse_qwen3_5_layer_types
 from ..nn import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
-from ..hf import build_norm_mappings, build_moe_mappings, expand_module_mapping
-from ..blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
-from ..models.qwen3_5 import _parse_qwen3_5_layer_types
 
 
 def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
@@ -19,6 +19,7 @@ def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
     Unlike Qwen3 MoE which stores per-expert separate weights.
     """
     from ..modules.moe import MoESharedExpert
+
     moe_prefix = f"{layer_prefix}.mlp"
     return {
         # Router
@@ -168,9 +169,11 @@ class Qwen3_5MoECausalModel(nn.Model):
             n_layers=n_layers,
             full_attention_interval=full_attention_interval,
         )
-        self.layer_types = layer_types if layer_types is not None else [
-            "linear_attention" if t == "mamba" else "full_attention" for t in self.block_types
-        ]
+        self.layer_types = (
+            layer_types
+            if layer_types is not None
+            else ["linear_attention" if t == "mamba" else "full_attention" for t in self.block_types]
+        )
         self.n_linear_blocks = sum(1 for t in self.block_types if t == "mamba")
         self.n_attn_blocks = sum(1 for t in self.block_types if t == "attention")
         self.has_linear_blocks = self.n_linear_blocks > 0
@@ -183,44 +186,52 @@ class Qwen3_5MoECausalModel(nn.Model):
         # Build block configs for HybridBlockStack
         block_configs = []
         if self.n_linear_blocks > 0:
-            block_configs.append((
-                "mamba_blocks", Qwen3_5MoELinearBlock, self.n_linear_blocks,
-                dict(
-                    d_model=d_model,
-                    d_ff=d_ff,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    shared_expert_intermediate=shared_expert_intermediate,
-                    linear_conv_kernel_dim=linear_conv_kernel_dim,
-                    linear_key_head_dim=linear_key_head_dim,
-                    linear_value_head_dim=linear_value_head_dim,
-                    linear_num_key_heads=linear_num_key_heads,
-                    linear_num_value_heads=linear_num_value_heads,
-                    chunk_size=chunk_size,
-                    eps=eps,
-                    ep_size=ep_size,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "mamba_blocks",
+                    Qwen3_5MoELinearBlock,
+                    self.n_linear_blocks,
+                    dict(
+                        d_model=d_model,
+                        d_ff=d_ff,
+                        num_experts=num_experts,
+                        num_experts_per_tok=num_experts_per_tok,
+                        shared_expert_intermediate=shared_expert_intermediate,
+                        linear_conv_kernel_dim=linear_conv_kernel_dim,
+                        linear_key_head_dim=linear_key_head_dim,
+                        linear_value_head_dim=linear_value_head_dim,
+                        linear_num_key_heads=linear_num_key_heads,
+                        linear_num_value_heads=linear_num_value_heads,
+                        chunk_size=chunk_size,
+                        eps=eps,
+                        ep_size=ep_size,
+                    ),
+                )
+            )
         if self.n_attn_blocks > 0:
-            block_configs.append((
-                "attn_blocks", Qwen3_5MoEAttentionBlock, self.n_attn_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    shared_expert_intermediate=shared_expert_intermediate,
-                    eps=eps,
-                    use_qkv_bias=use_qkv_bias,
-                    partial_rotary_factor=partial_rotary_factor,
-                    mrope_section=mrope_section,
-                    ep_size=ep_size,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "attn_blocks",
+                    Qwen3_5MoEAttentionBlock,
+                    self.n_attn_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        num_experts=num_experts,
+                        num_experts_per_tok=num_experts_per_tok,
+                        shared_expert_intermediate=shared_expert_intermediate,
+                        eps=eps,
+                        use_qkv_bias=use_qkv_bias,
+                        partial_rotary_factor=partial_rotary_factor,
+                        mrope_section=mrope_section,
+                        ep_size=ep_size,
+                    ),
+                )
+            )
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
@@ -237,10 +248,10 @@ class Qwen3_5MoECausalModel(nn.Model):
         # IO slots
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
-        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                                  aliases=["labels"])
-        self._register_activation("freq_cis", ("max_seq", "rotary_dim // 2", 2),
-                                  dtype="fp32", scope=G, aliases=["rope_freqs"])
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
+        self._register_activation(
+            "freq_cis", ("max_seq", "rotary_dim // 2", 2), dtype="fp32", scope=G, aliases=["rope_freqs"]
+        )
 
         # Global intermediate slots
         _h = ("B", "T", "d_model")
@@ -251,10 +262,8 @@ class Qwen3_5MoECausalModel(nn.Model):
         self._register_activation("residual_final", _h, scope=G)
         self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
         self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                                  save=True, scope=G)
-        self._register_activation("loss", ("B * T",), dtype="fp32",
-                                  aliases=["losses"], scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
         x = self.embedding(token_ids)
         residual = self._zeros(["B", "T", "d_model"])
@@ -400,9 +409,11 @@ class Qwen3_5MoEConditionalModel(nn.Model):
             n_layers=n_layers,
             full_attention_interval=full_attention_interval,
         )
-        self.layer_types = layer_types if layer_types is not None else [
-            "linear_attention" if t == "mamba" else "full_attention" for t in self.block_types
-        ]
+        self.layer_types = (
+            layer_types
+            if layer_types is not None
+            else ["linear_attention" if t == "mamba" else "full_attention" for t in self.block_types]
+        )
         self.n_linear_blocks = sum(1 for t in self.block_types if t == "mamba")
         self.n_attn_blocks = sum(1 for t in self.block_types if t == "attention")
         self.has_linear_blocks = self.n_linear_blocks > 0
@@ -413,44 +424,52 @@ class Qwen3_5MoEConditionalModel(nn.Model):
 
         block_configs = []
         if self.n_linear_blocks > 0:
-            block_configs.append((
-                "mamba_blocks", Qwen3_5MoELinearBlock, self.n_linear_blocks,
-                dict(
-                    d_model=d_model,
-                    d_ff=d_ff,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    shared_expert_intermediate=shared_expert_intermediate,
-                    linear_conv_kernel_dim=linear_conv_kernel_dim,
-                    linear_key_head_dim=linear_key_head_dim,
-                    linear_value_head_dim=linear_value_head_dim,
-                    linear_num_key_heads=linear_num_key_heads,
-                    linear_num_value_heads=linear_num_value_heads,
-                    chunk_size=chunk_size,
-                    eps=eps,
-                    ep_size=ep_size,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "mamba_blocks",
+                    Qwen3_5MoELinearBlock,
+                    self.n_linear_blocks,
+                    dict(
+                        d_model=d_model,
+                        d_ff=d_ff,
+                        num_experts=num_experts,
+                        num_experts_per_tok=num_experts_per_tok,
+                        shared_expert_intermediate=shared_expert_intermediate,
+                        linear_conv_kernel_dim=linear_conv_kernel_dim,
+                        linear_key_head_dim=linear_key_head_dim,
+                        linear_value_head_dim=linear_value_head_dim,
+                        linear_num_key_heads=linear_num_key_heads,
+                        linear_num_value_heads=linear_num_value_heads,
+                        chunk_size=chunk_size,
+                        eps=eps,
+                        ep_size=ep_size,
+                    ),
+                )
+            )
         if self.n_attn_blocks > 0:
-            block_configs.append((
-                "attn_blocks", Qwen3_5MoEAttentionBlock, self.n_attn_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    shared_expert_intermediate=shared_expert_intermediate,
-                    eps=eps,
-                    use_qkv_bias=use_qkv_bias,
-                    partial_rotary_factor=partial_rotary_factor,
-                    mrope_section=mrope_section,
-                    ep_size=ep_size,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "attn_blocks",
+                    Qwen3_5MoEAttentionBlock,
+                    self.n_attn_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        num_experts=num_experts,
+                        num_experts_per_tok=num_experts_per_tok,
+                        shared_expert_intermediate=shared_expert_intermediate,
+                        eps=eps,
+                        use_qkv_bias=use_qkv_bias,
+                        partial_rotary_factor=partial_rotary_factor,
+                        mrope_section=mrope_section,
+                        ep_size=ep_size,
+                    ),
+                )
+            )
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
@@ -474,14 +493,16 @@ class Qwen3_5MoEConditionalModel(nn.Model):
         # IO slots
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
-        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                                  aliases=["labels"])
-        self._register_activation("visual_pos_masks", ("B", "T"), dtype="int32", scope=G,
-                                  description="Mask for visual token positions")
-        self._register_activation("visual_embeds", ("B * T", "d_model"), scope=G,
-                                  description="Visual embeddings (packed by mask)")
-        self._register_activation("freq_cis", ("max_seq", "rotary_dim // 2", 2),
-                                  dtype="fp32", scope=G, aliases=["rope_freqs"])
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
+        self._register_activation(
+            "visual_pos_masks", ("B", "T"), dtype="int32", scope=G, description="Mask for visual token positions"
+        )
+        self._register_activation(
+            "visual_embeds", ("B * T", "d_model"), scope=G, description="Visual embeddings (packed by mask)"
+        )
+        self._register_activation(
+            "freq_cis", ("max_seq", "rotary_dim // 2", 2), dtype="fp32", scope=G, aliases=["rope_freqs"]
+        )
 
         # Global intermediate slots
         _h = ("B", "T", "d_model")
@@ -492,10 +513,8 @@ class Qwen3_5MoEConditionalModel(nn.Model):
         self._register_activation("residual_final", _h, scope=G)
         self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
         self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                                  save=True, scope=G)
-        self._register_activation("loss", ("B * T",), dtype="fp32",
-                                  aliases=["losses"], scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
         # Embedding + visual injection
         x = self.embedding(token_ids)

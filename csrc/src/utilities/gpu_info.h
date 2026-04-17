@@ -30,7 +30,7 @@ struct GPUUtilInfo {
     float mem_utilization = 0.0f;
     const char* throttle_reason = "";
 
-    std::size_t pcie_rx = 0;    // in bytes/µs
+    std::size_t pcie_rx = 0;  // in bytes/µs
     std::size_t pcie_tx = 0;
 };
 
@@ -66,4 +66,4 @@ public:
     static std::vector<GPUInfo> get_gpu_info();
 };
 
-#endif //SUROGATE_SRC_UTILITIES_NVML_H
+#endif  //SUROGATE_SRC_UTILITIES_NVML_H

@@ -1,14 +1,18 @@
+import os
+
 import numpy as np
 import torch
-import os
-from typing import Optional, List
 
 from surogate.core.datasets.datasets import disable_datasets_caching
-from surogate.core.datasets.loader import load_dataset_with_config, pre_process, post_process, concat_datasets, \
-    shuffle_dataset
+from surogate.core.datasets.loader import (
+    concat_datasets,
+    load_dataset_with_config,
+    post_process,
+    pre_process,
+    shuffle_dataset,
+)
 from surogate.utils.logger import get_logger
 from surogate.utils.np_utils import get_seed
-
 
 logger = get_logger()
 
@@ -50,10 +54,10 @@ def _extract_mm_feature_outputs(mm_out):
 
 def _find_visual(hf_model):
     """Find the visual encoder module, checking common attribute paths."""
-    for path in ['visual', 'model.visual', 'vision_tower', 'model.vision_tower']:
+    for path in ["visual", "model.visual", "vision_tower", "model.vision_tower"]:
         obj = hf_model
         try:
-            for attr in path.split('.'):
+            for attr in path.split("."):
                 obj = getattr(obj, attr)
             return obj
         except AttributeError:
@@ -69,7 +73,7 @@ class MultimodalEncoder:
     itself for image/video tokenization.
     """
 
-    def __init__(self, processor, loss_scale: str = 'default'):
+    def __init__(self, processor, loss_scale: str = "default"):
         self.processor = processor
         self.loss_scale = loss_scale
 
@@ -81,17 +85,17 @@ class MultimodalEncoder:
         return_assistant_tokens_mask (different lengths). Instead, find the
         last assistant turn boundary via text markers.
         """
-        if self.loss_scale == 'all':
+        if self.loss_scale == "all":
             return list(input_ids)
 
-        tokenizer = self.processor if not hasattr(self.processor, 'tokenizer') else self.processor.tokenizer
+        tokenizer = self.processor if not hasattr(self.processor, "tokenizer") else self.processor.tokenizer
 
         # Strategy: find where the last assistant response starts by tokenizing
         # just the prompt (all messages except the last assistant turn).
         # Everything before that is masked (-100), everything after is trained.
         prompt_messages = []
         for msg in messages:
-            if msg.get('role') == 'assistant':
+            if msg.get("role") == "assistant":
                 break
             prompt_messages.append(msg)
 
@@ -100,8 +104,7 @@ class MultimodalEncoder:
             return list(input_ids)
 
         try:
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_messages, tokenize=False, add_generation_prompt=True)
+            prompt_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
             prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
             prompt_len = len(prompt_ids)
         except Exception:
@@ -112,15 +115,18 @@ class MultimodalEncoder:
         # image tokens. Count image placeholders in the prompt portion.
         n_images_in_prompt = 0
         for msg in prompt_messages:
-            content = msg.get('content', '')
+            content = msg.get("content", "")
             if isinstance(content, list):
-                n_images_in_prompt += sum(1 for p in content if isinstance(p, dict) and p.get('type') == 'image')
+                n_images_in_prompt += sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image")
 
         # Each image placeholder expands to many visual tokens. Estimate
         # the expansion from the total input length vs text-only length.
-        text_only_len = len(tokenizer.encode(
-            tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False),
-            add_special_tokens=False))
+        text_only_len = len(
+            tokenizer.encode(
+                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False),
+                add_special_tokens=False,
+            )
+        )
         visual_expansion = len(input_ids) - text_only_len  # total visual tokens added
 
         # Approximate: all visual tokens are in the prompt region
@@ -133,11 +139,11 @@ class MultimodalEncoder:
 
     def _ensure_user_turn(self, messages, row):
         """If messages lack a user turn but the row has images, synthesize one."""
-        has_user = any(m.get('role') == 'user' for m in messages)
+        has_user = any(m.get("role") == "user" for m in messages)
         if has_user:
             return messages
 
-        images = row.get('images')
+        images = row.get("images")
         if not images:
             return messages
 
@@ -148,66 +154,68 @@ class MultimodalEncoder:
         user_content = [{"type": "image"}] * len(images) + [{"type": "text", "text": ""}]
         return [{"role": "user", "content": user_content}] + list(messages)
 
-    def encode(self, row: dict, return_length: bool = False) -> Optional[dict]:
+    def encode(self, row: dict, return_length: bool = False) -> dict | None:
         """Encode a single conversation row into input_ids, labels, and visual features."""
-        messages = row.get('messages')
+        messages = row.get("messages")
         if not messages:
             logger.warning_once(f"Row has no 'messages' field. Keys: {list(row.keys())}")
             return None
 
         messages = self._ensure_user_turn(messages, row)
-        tokenizer = self.processor if not hasattr(self.processor, 'tokenizer') else self.processor.tokenizer
+        tokenizer = self.processor if not hasattr(self.processor, "tokenizer") else self.processor.tokenizer
 
         try:
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         except Exception as e:
-            roles = [m.get('role') for m in messages]
+            roles = [m.get("role") for m in messages]
             logger.warning_once(f"apply_chat_template failed: {e} | roles={roles}")
             return None
 
         # Collect images/videos — check top-level row fields first, then message content
-        images = row.get('images', []) or []
-        videos = row.get('videos', []) or []
+        images = row.get("images", []) or []
+        videos = row.get("videos", []) or []
         if not images and not videos:
             for msg in messages:
-                content = msg.get('content', '')
+                content = msg.get("content", "")
                 if isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict):
-                            if part.get('type') == 'image':
-                                img = part.get('image')
+                            if part.get("type") == "image":
+                                img = part.get("image")
                                 if img is not None:
                                     images.append(img)
-                            elif part.get('type') == 'video':
-                                vid = part.get('video')
+                            elif part.get("type") == "video":
+                                vid = part.get("video")
                                 if vid is not None:
                                     videos.append(vid)
 
         # Call processor with text + media
-        proc_kwargs = {'text': text, 'return_tensors': 'pt'}
+        proc_kwargs = {"text": text, "return_tensors": "pt"}
         if images:
-            proc_kwargs['images'] = images
+            proc_kwargs["images"] = images
         if videos:
-            proc_kwargs['videos'] = videos
+            proc_kwargs["videos"] = videos
 
         # Ensure images are PIL objects (HF datasets may store them as dicts)
         if images:
             from PIL import Image
+
             loaded = []
             for img in images:
                 if isinstance(img, Image.Image):
                     loaded.append(img)
-                elif isinstance(img, dict) and 'bytes' in img:
+                elif isinstance(img, dict) and "bytes" in img:
                     from io import BytesIO
-                    loaded.append(Image.open(BytesIO(img['bytes'])))
-                elif isinstance(img, dict) and 'path' in img:
-                    loaded.append(Image.open(img['path']))
+
+                    loaded.append(Image.open(BytesIO(img["bytes"])))
+                elif isinstance(img, dict) and "path" in img:
+                    loaded.append(Image.open(img["path"]))
                 elif isinstance(img, str):
                     loaded.append(Image.open(img))
                 else:
                     logger.warning_once(f"Unsupported image type: {type(img)}")
                     return None
-            proc_kwargs['images'] = loaded
+            proc_kwargs["images"] = loaded
 
         try:
             encoded = self.processor(**proc_kwargs)
@@ -215,27 +223,27 @@ class MultimodalEncoder:
             logger.warning_once(f"Processor call failed: {e}")
             return None
 
-        input_ids = encoded['input_ids'].flatten()
-        if hasattr(input_ids, 'tolist'):
+        input_ids = encoded["input_ids"].flatten()
+        if hasattr(input_ids, "tolist"):
             input_ids = input_ids.tolist()
         labels = self._build_labels(input_ids, messages)
 
         result = {
-            'input_ids': input_ids,
-            'labels': labels,
+            "input_ids": input_ids,
+            "labels": labels,
         }
 
         # Pass through visual features and metadata from the processor
-        for key in ('pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw', 'mm_token_type_ids'):
+        for key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw", "mm_token_type_ids"):
             if key in encoded:
                 result[key] = encoded[key]
 
         if return_length:
-            result['length'] = len(input_ids)
+            result["length"] = len(input_ids)
 
         return result
 
-    def encode_batch(self, rows: list[dict], return_length: bool = False) -> list[Optional[dict]]:
+    def encode_batch(self, rows: list[dict], return_length: bool = False) -> list[dict | None]:
         """Encode a batch of rows."""
         return [self.encode(row, return_length=return_length) for row in rows]
 
@@ -248,14 +256,15 @@ def init_mm_helpers(config):
 
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
 
-    model_kwargs = {'trust_remote_code': True}
-    if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
-        model_kwargs['torch_dtype'] = config.torch_dtype
+    model_kwargs = {"trust_remote_code": True}
+    if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
+        model_kwargs["torch_dtype"] = config.torch_dtype
 
     # Use the right Auto class: VL models need AutoModelForImageTextToText
     auto_cls = AutoModelForCausalLM
     if config.is_multimodal:
         from transformers import AutoModelForImageTextToText
+
         auto_cls = AutoModelForImageTextToText
 
     hf_model = auto_cls.from_pretrained(model_dir, config=hf_config, **model_kwargs)
@@ -263,7 +272,7 @@ def init_mm_helpers(config):
     hf_model.requires_grad_(False)
 
     # Load processor (includes tokenizer + image processor)
-    if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')):
+    if os.path.exists(os.path.join(model_dir, "preprocessor_config.json")):
         processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
     else:
         processor = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -272,7 +281,8 @@ def init_mm_helpers(config):
     if visual is None:
         raise ValueError(
             f"train_vision=True but model '{type(hf_model).__name__}' has no visual encoder. "
-            f"Use train_vision=False for text-only models, or use a VL model variant.")
+            f"Use train_vision=False for text-only models, or use a VL model variant."
+        )
 
     vision_device = torch.device("cuda:0") if torch.cuda.is_available() and config.gpus > 0 else torch.device("cpu")
     try:
@@ -289,7 +299,7 @@ def init_mm_helpers(config):
     except Exception:
         pass
 
-    loss_scale = getattr(config, 'loss_scale', 'default')
+    loss_scale = getattr(config, "loss_scale", "default")
     encoder = MultimodalEncoder(processor, loss_scale=loss_scale)
 
     rope_fn = hf_model.get_rope_index if hasattr(hf_model, "get_rope_index") else hf_model.model.get_rope_index
@@ -334,14 +344,12 @@ def load_multimodal_datasets(config, *, node_rank=None, num_nodes=None):
             val_datasets.append(val_dataset)
 
         train_dataset = concat_datasets(train_datasets)
-        train_dataset = shuffle_dataset(
-            train_dataset, seed=get_seed(train_seed), buffer_size=1000)
+        train_dataset = shuffle_dataset(train_dataset, seed=get_seed(train_seed), buffer_size=1000)
 
         val_dataset = None
         if len(val_datasets) > 0:
             val_dataset = concat_datasets(val_datasets)
-            val_dataset = shuffle_dataset(
-                val_dataset, seed=get_seed(eval_seed), buffer_size=1000)
+            val_dataset = shuffle_dataset(val_dataset, seed=get_seed(eval_seed), buffer_size=1000)
 
     return train_dataset, val_dataset
 
@@ -455,7 +463,8 @@ class OnTheFlyMultimodalBatcher:
         if n_none > 0 and not usable:
             logger.warning_once(
                 f"All {len(rows)} rows failed encoding ({n_none} returned None, "
-                f"{len(encoded_list)} encoded but {len(encoded_list) - len(usable)} unusable)")
+                f"{len(encoded_list)} encoded but {len(encoded_list) - len(usable)} unusable)"
+            )
         return usable
 
     def _is_row_usable(self, row: dict) -> bool:
@@ -465,7 +474,7 @@ class OnTheFlyMultimodalBatcher:
         tokens_np = self._to_numpy_int(tokens)
         if tokens_np.size <= self.seq_len:
             return self._visual_tokens_aligned(row, tokens_np)
-        tail = tokens_np[self.seq_len:]
+        tail = tokens_np[self.seq_len :]
         if np.any(tail == self.image_token_id) or np.any(tail == self.video_token_id):
             return False
         return self._visual_tokens_aligned(row, tokens_np)
@@ -548,10 +557,11 @@ class OnTheFlyMultimodalBatcher:
                 raise RuntimeError(
                     f"Failed to build a batch after {attempts} attempts "
                     f"(buffer={len(self._encoded_buffer)}/{self.batch_size}). "
-                    f"Check warnings above for encoding errors.")
+                    f"Check warnings above for encoding errors."
+                )
 
-        batch_rows = self._encoded_buffer[:self.batch_size]
-        self._encoded_buffer = self._encoded_buffer[self.batch_size:]
+        batch_rows = self._encoded_buffer[: self.batch_size]
+        self._encoded_buffer = self._encoded_buffer[self.batch_size :]
         return self._build_batch(batch_rows)
 
     def _build_batch(self, rows: list[dict]) -> dict:
@@ -638,9 +648,10 @@ class OnTheFlyMultimodalBatcher:
         )
         # Pass mm_token_type_ids if the rope function accepts it
         import inspect
+
         rope_params = inspect.signature(self.rope_fn).parameters
-        if 'mm_token_type_ids' in rope_params:
-            rope_kwargs['mm_token_type_ids'] = mm_token_type_ids
+        if "mm_token_type_ids" in rope_params:
+            rope_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
         position_ids, _ = self.rope_fn(input_ids_t, **rope_kwargs)
 
@@ -663,9 +674,7 @@ class OnTheFlyMultimodalBatcher:
                         raise ValueError("pixel_values present but image_grid_thw missing")
                     pixel_values = torch.cat(image_pixel_values_list, dim=0).to(self.vision_device)
                     image_grid_thw_vis = image_grid_thw_cpu.to(self.vision_device)
-                    _img_out = self.hf_model.get_image_features(
-                        pixel_values, image_grid_thw=image_grid_thw_vis
-                    )
+                    _img_out = self.hf_model.get_image_features(pixel_values, image_grid_thw=image_grid_thw_vis)
                     image_embeds_list, deepstack_image = _extract_mm_feature_outputs(_img_out)
                     if len(image_embeds_list) > 0:
                         image_embeds_flat = torch.cat(image_embeds_list, dim=0)
@@ -675,9 +684,7 @@ class OnTheFlyMultimodalBatcher:
                         raise ValueError("pixel_values_videos present but video_grid_thw missing")
                     pixel_values_v = torch.cat(video_pixel_values_list, dim=0).to(self.vision_device)
                     video_grid_thw_vis = video_grid_thw_cpu.to(self.vision_device)
-                    _vid_out = self.hf_model.get_video_features(
-                        pixel_values_v, video_grid_thw=video_grid_thw_vis
-                    )
+                    _vid_out = self.hf_model.get_video_features(pixel_values_v, video_grid_thw=video_grid_thw_vis)
                     video_embeds_list, deepstack_video = _extract_mm_feature_outputs(_vid_out)
                     if len(video_embeds_list) > 0:
                         video_embeds_flat = torch.cat(video_embeds_list, dim=0)
@@ -715,9 +722,7 @@ class OnTheFlyMultimodalBatcher:
                         deepstack_video = [d[:expected_video] for d in deepstack_video]
 
                 visual_seq = torch.empty((num_visual, self.hidden_size), device=self.vision_device)
-                deepstack_seq = [
-                    torch.empty_like(visual_seq) for _ in range(self.deepstack_layers)
-                ]
+                deepstack_seq = [torch.empty_like(visual_seq) for _ in range(self.deepstack_layers)]
 
                 flat_tokens = inputs.reshape(-1)
                 image_idx = 0

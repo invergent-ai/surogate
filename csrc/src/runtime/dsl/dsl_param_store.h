@@ -25,11 +25,13 @@ namespace dsl {
 struct Module;
 struct Graph;
 class DslWeightManager;
-}
+}  // namespace dsl
 
 struct RuntimeOptions;
 struct PretrainedConfig;
-namespace modules { struct ModularLoRAConfig; }
+namespace modules {
+struct ModularLoRAConfig;
+}  // namespace modules
 
 namespace dsl {
 
@@ -39,7 +41,7 @@ public:
     struct Entry {
         Tensor tensor;
         bool trainable = true;
-        bool external = false;  ///< Provided by QLoRA weight provider (no local storage)
+        bool external = false;                   ///< Provided by QLoRA weight provider (no local storage)
         bool managed_by_weight_manager = false;  ///< Provided by DslWeightManager (no local storage)
     };
 
@@ -61,15 +63,25 @@ public:
     const Tensor& template_tensor(const std::string& name) const;
 
     /// Wire an external QLoRA weight provider (optional).
-    void set_qlora_provider(QLoRAWeightProvider* provider) { mQLoRAProvider = provider; }
+    void set_qlora_provider(QLoRAWeightProvider* provider) {
+        mQLoRAProvider = provider;
+    }
     /// Access the QLoRA provider (if any).
-    [[nodiscard]] QLoRAWeightProvider* qlora_provider() const { return mQLoRAProvider; }
+    [[nodiscard]] QLoRAWeightProvider* qlora_provider() const {
+        return mQLoRAProvider;
+    }
     /// Wire a DslWeightManager (optional).
-    void set_weight_manager(DslWeightManager* manager) { mWeightManager = manager; }
+    void set_weight_manager(DslWeightManager* manager) {
+        mWeightManager = manager;
+    }
     /// Set default stream for provider-backed resolution.
-    void set_default_stream(cudaStream_t stream) { mDefaultStream = stream; }
+    void set_default_stream(cudaStream_t stream) {
+        mDefaultStream = stream;
+    }
 
-    const std::vector<std::string>& param_names() const { return mParamOrder; }
+    const std::vector<std::string>& param_names() const {
+        return mParamOrder;
+    }
 
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 
@@ -84,6 +96,6 @@ private:
     bool mUsesWeightManager = false;
 };
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_DSL_PARAM_STORE_H
+#endif  // SUROGATE_SRC_DSL_DSL_PARAM_STORE_H

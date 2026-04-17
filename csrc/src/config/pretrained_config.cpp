@@ -75,7 +75,7 @@ std::optional<std::vector<float>> as_float_array(const nlohmann::json& value) {
     return out;
 }
 
-template<typename T>
+template <typename T>
 std::optional<T> get_opt(const nlohmann::json& obj, const char* key) {
     auto it = obj.find(key);
     if (it == obj.end()) return std::nullopt;
@@ -134,11 +134,9 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
     bool vision_has_deepstack_indexes = false;
     if (vision_cfg) {
         cfg->UseVisualInputs = true;
-        if (vision_cfg->contains("deepstack_visual_indexes") &&
-            (*vision_cfg)["deepstack_visual_indexes"].is_array()) {
+        if (vision_cfg->contains("deepstack_visual_indexes") && (*vision_cfg)["deepstack_visual_indexes"].is_array()) {
             vision_has_deepstack_indexes = true;
-            cfg->DeepstackVisualLayers =
-                static_cast<int>((*vision_cfg)["deepstack_visual_indexes"].size());
+            cfg->DeepstackVisualLayers = static_cast<int>((*vision_cfg)["deepstack_visual_indexes"].size());
         }
     }
     if (!cfg->UseVisualInputs && !cfg->ModelTypeName.empty()) {

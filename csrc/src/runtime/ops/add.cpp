@@ -8,6 +8,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -22,10 +25,8 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
     // Backward accumulation outputs (e.g. d_*_accum_N) should not reuse aliased
     // buffers: they are reduction nodes and can become incorrect if out aliases an
     // input or if stale mapped storage is reused across accumulation steps.
-    const bool is_accum_output =
-        !op.outputs.empty() && op.outputs[0].name.find("_accum_") != std::string::npos;
-    const bool aliases_input =
-        out.Data && (out.Data == a.Data || out.Data == b.Data);
+    const bool is_accum_output = !op.outputs.empty() && op.outputs[0].name.find("_accum_") != std::string::npos;
+    const bool aliases_input = out.Data && (out.Data == a.Data || out.Data == b.Data);
 
     // For element-wise add, output shape must match inputs. Reallocate when shape
     // is missing/wrong, when aliasing would make add in-place unsafe, or for
@@ -70,11 +71,19 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                         }
                         if (target.Data != d_out.Data) {
                             if (accumulate) {
-                                vector_add_sr(target, target, d_out, 1.0f,
-                                              static_cast<long>(target.nelem()), 0, mRunState.MainStream);
+                                vector_add_sr(target,
+                                              target,
+                                              d_out,
+                                              1.0f,
+                                              static_cast<long>(target.nelem()),
+                                              0,
+                                              mRunState.MainStream);
                             } else {
-                                CUDA_CHECK(cudaMemcpyAsync(target.Data, d_out.Data, target.bytes(),
-                                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                                CUDA_CHECK(cudaMemcpyAsync(target.Data,
+                                                           d_out.Data,
+                                                           target.bytes(),
+                                                           cudaMemcpyDeviceToDevice,
+                                                           mRunState.MainStream));
                             }
                         }
                         store_tensor(ref, target);
@@ -108,8 +117,11 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                     throw std::runtime_error("dispatch_add_backward: dtype mismatch for " + ref.name);
                 }
                 if (base_grad->Data != d_out.Data) {
-                    CUDA_CHECK(cudaMemcpyAsync(base_grad->Data, d_out.Data, d_out.bytes(),
-                                               cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                    CUDA_CHECK(cudaMemcpyAsync(base_grad->Data,
+                                               d_out.Data,
+                                               d_out.bytes(),
+                                               cudaMemcpyDeviceToDevice,
+                                               mRunState.MainStream));
                 }
                 store_tensor(ref, view_tensor(*base_grad, ref.shape));
                 return;
@@ -118,15 +130,17 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
             // Aliasing to d_out can cause stale memory access when the stack is restored at
             // layer boundaries because the aliased memory gets recycled.
             const bool is_stack_grad = mRunState.large_bwd_temps_on_stack() &&
-                (ref.slot == TensorSlot::BlockDQKV ||
-                 ref.slot == TensorSlot::BlockDMLPUp ||
-                 ref.slot == TensorSlot::BlockDSwiGLU);
+                                       (ref.slot == TensorSlot::BlockDQKV || ref.slot == TensorSlot::BlockDMLPUp ||
+                                        ref.slot == TensorSlot::BlockDSwiGLU);
             if (is_stack_grad) {
                 // Allocate proper stack storage and copy data
                 mRunState.temp_acquire(*base_grad);
                 mTemps.push_back(*base_grad);
-                CUDA_CHECK(cudaMemcpyAsync(base_grad->Data, d_out.Data, d_out.bytes(),
-                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                CUDA_CHECK(cudaMemcpyAsync(base_grad->Data,
+                                           d_out.Data,
+                                           d_out.bytes(),
+                                           cudaMemcpyDeviceToDevice,
+                                           mRunState.MainStream));
                 store_tensor(ref, view_tensor(*base_grad, ref.shape));
                 return;
             }
@@ -145,5 +159,101 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     }
 }
 
+namespace {
 
+// -----------------------------------------------------------------------------
+// Add backward rule
+// Forward: C = A + B
+// Backward: dA = dC, dB = dC (with broadcast reduction if needed)
+// -----------------------------------------------------------------------------
+std::vector<Operation> add_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    // Gradient passes through unchanged (identity for addition)
+    // Note: if shapes differ due to broadcasting, would need reduce_sum
+    // For now, assume same shapes. Emit a single add_backward op so compiled
+    // executor can copy into both base gradients in one place.
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    if (ctx.needs_grad(0) || ctx.needs_grad(1)) {
+        ops.push_back(make_operation("add_backward_" + std::to_string(ctx.op_counter++),
+                                     "add_backward",
+                                     "add_backward",
+                                     {ctx.d_output},
+                                     outputs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("add", ::dsl::add_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// Add (elementwise)
+// ------------------------------------------------------------------------
+const int _add_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "add";
+    sig.min_inputs = 2;
+    sig.max_inputs = 2;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap&, const ShapeEnv&) {
+        if (inputs.size() < 2 || outputs.empty()) {
+            ShapeValidationError err;
+            err.message = "add requires 2 inputs and 1 output";
+            return std::make_optional(err);
+        }
+        return validators::check_broadcastable(inputs[0], inputs[1], "add");
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// AddBackward
+// ------------------------------------------------------------------------
+const int _add_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "add_backward";
+    sig.min_inputs = 1;
+    sig.max_inputs = 1;
+    sig.min_outputs = 2;
+    sig.max_outputs = 2;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& d_out = inputs[0];
+        const auto& d_in1 = outputs[0];
+        const auto& d_in2 = outputs[1];
+
+        // Both outputs should match input gradient shape
+        if (auto err = validators::check_same_numel(d_in1, d_out, "d_in1", "d_out", "add_backward")) {
+            return err;
+        }
+        if (auto err = validators::check_same_numel(d_in2, d_out, "d_in2", "d_out", "add_backward")) {
+            return err;
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

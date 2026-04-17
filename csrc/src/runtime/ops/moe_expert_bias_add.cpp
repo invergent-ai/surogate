@@ -5,6 +5,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/comm.h"
@@ -51,8 +54,7 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
         auto it_saved = mMoeSavedBuffers.find(key);
         std::string size_key = key;
         if (it_saved == mMoeSavedBuffers.end()) {
-            const std::string legacy_key =
-                "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+            const std::string legacy_key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
             it_saved = mMoeSavedBuffers.find(legacy_key);
             if (it_saved != mMoeSavedBuffers.end()) {
                 size_key = legacy_key;
@@ -62,17 +64,17 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
             cudaPointerAttributes attr{};
             cudaError_t err = cudaPointerGetAttributes(&attr, it_saved->second);
             if (err == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
-            expert_offsets_view.DType = ETensorDType::INT32;
-            expert_offsets_view.Rank = 1;
-            // Use actual stored size (may be num_merged+1 when LLEP is active, not num_local+1)
-            auto size_it = mMoeSavedSizes.find(size_key);
-            if (size_it != mMoeSavedSizes.end()) {
-                expert_offsets_view.Sizes[0] = static_cast<long>(size_it->second / sizeof(int));
-            } else {
-                expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
-            }
-            expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
-            expert_offsets_ptr = &expert_offsets_view;
+                expert_offsets_view.DType = ETensorDType::INT32;
+                expert_offsets_view.Rank = 1;
+                // Use actual stored size (may be num_merged+1 when LLEP is active, not num_local+1)
+                auto size_it = mMoeSavedSizes.find(size_key);
+                if (size_it != mMoeSavedSizes.end()) {
+                    expert_offsets_view.Sizes[0] = static_cast<long>(size_it->second / sizeof(int));
+                } else {
+                    expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
+                }
+                expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
+                expert_offsets_ptr = &expert_offsets_view;
             } else {
                 cudaGetLastError();
             }
@@ -149,42 +151,60 @@ void CompiledExecutor::dispatch_moe_expert_bias_add(const CompiledOp& op) {
         // Direct HF mapping (2D tensors are not EP-sharded).
         const size_t row_bytes = static_cast<size_t>(hidden_size) * get_dtype_size(bias.DType);
         Tensor merged_bias = mRunState.temp_alloc(bias.DType,
-            {static_cast<long>(num_experts), static_cast<long>(hidden_size)}, "moe_expert_bias_add_merged_bias");
+                                                  {static_cast<long>(num_experts), static_cast<long>(hidden_size)},
+                                                  "moe_expert_bias_add_merged_bias");
         mTemps.push_back(merged_bias);
         for (int m = 0; m < num_experts; ++m) {
             const int global_e = llep->merged_to_global[m];
-            const std::byte* src = static_cast<const std::byte*>(bias.Data)
-                + static_cast<size_t>(global_e) * row_bytes;
-            std::byte* dst = static_cast<std::byte*>(merged_bias.Data)
-                + static_cast<size_t>(m) * row_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(dst, src, row_bytes,
-                                        cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            const std::byte* src = static_cast<const std::byte*>(bias.Data) + static_cast<size_t>(global_e) * row_bytes;
+            std::byte* dst = static_cast<std::byte*>(merged_bias.Data) + static_cast<size_t>(m) * row_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
         }
 
         if (inp.DType == ETensorDType::BF16) {
-            moe_expert_bias_add_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(),
+            moe_expert_bias_add_forward(out.get<nv_bfloat16>(),
+                                        inp.get<nv_bfloat16>(),
                                         merged_bias.get<nv_bfloat16>(),
-                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+                                        expert_offsets,
+                                        num_experts,
+                                        hidden_size,
+                                        total_tokens,
+                                        mRunState.MainStream);
         } else if (inp.DType == ETensorDType::FP32) {
-            moe_expert_bias_add_forward(out.get<float>(), inp.get<float>(),
+            moe_expert_bias_add_forward(out.get<float>(),
+                                        inp.get<float>(),
                                         merged_bias.get<float>(),
-                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+                                        expert_offsets,
+                                        num_experts,
+                                        hidden_size,
+                                        total_tokens,
+                                        mRunState.MainStream);
         } else {
             throw std::logic_error("moe_expert_bias_add: unsupported input dtype");
         }
     } else {
         // Basic EP (or no EP): bias tensor contains all experts, offset to local range.
-        const int ep_bias_offset = (mConfig.EPSize > 1 && mComm && mComm->ep_enabled())
-            ? mComm->ep_rank() * num_experts * hidden_size : 0;
+        const int ep_bias_offset =
+            (mConfig.EPSize > 1 && mComm && mComm->ep_enabled()) ? mComm->ep_rank() * num_experts * hidden_size : 0;
 
         if (inp.DType == ETensorDType::BF16) {
-            moe_expert_bias_add_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(),
+            moe_expert_bias_add_forward(out.get<nv_bfloat16>(),
+                                        inp.get<nv_bfloat16>(),
                                         bias.get<nv_bfloat16>() + ep_bias_offset,
-                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+                                        expert_offsets,
+                                        num_experts,
+                                        hidden_size,
+                                        total_tokens,
+                                        mRunState.MainStream);
         } else if (inp.DType == ETensorDType::FP32) {
-            moe_expert_bias_add_forward(out.get<float>(), inp.get<float>(),
+            moe_expert_bias_add_forward(out.get<float>(),
+                                        inp.get<float>(),
                                         bias.get<float>() + ep_bias_offset,
-                                        expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+                                        expert_offsets,
+                                        num_experts,
+                                        hidden_size,
+                                        total_tokens,
+                                        mRunState.MainStream);
         } else {
             throw std::logic_error("moe_expert_bias_add: unsupported input dtype");
         }
@@ -271,26 +291,38 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     Tensor d_bias_f32;
     if (need_temp) {
         d_bias_f32 = mRunState.temp_alloc(ETensorDType::FP32,
-                                          {static_cast<long>(num_experts), static_cast<long>(hidden_size)}, "moe_expert_bias_add_d_bias_f32");
+                                          {static_cast<long>(num_experts), static_cast<long>(hidden_size)},
+                                          "moe_expert_bias_add_d_bias_f32");
         mTemps.push_back(d_bias_f32);
     }
 
     float* d_bias_ptr = need_temp ? d_bias_f32.get<float>() : d_bias.get<float>();
 
     if (d_out.DType == ETensorDType::BF16) {
-        moe_expert_bias_add_backward(nullptr, d_bias_ptr, d_out.get<nv_bfloat16>(),
-                                     expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+        moe_expert_bias_add_backward(nullptr,
+                                     d_bias_ptr,
+                                     d_out.get<nv_bfloat16>(),
+                                     expert_offsets,
+                                     num_experts,
+                                     hidden_size,
+                                     total_tokens,
+                                     mRunState.MainStream);
     } else if (d_out.DType == ETensorDType::FP32) {
-        moe_expert_bias_add_backward(nullptr, d_bias_ptr, d_out.get<float>(),
-                                     expert_offsets, num_experts, hidden_size, total_tokens, mRunState.MainStream);
+        moe_expert_bias_add_backward(nullptr,
+                                     d_bias_ptr,
+                                     d_out.get<float>(),
+                                     expert_offsets,
+                                     num_experts,
+                                     hidden_size,
+                                     total_tokens,
+                                     mRunState.MainStream);
     } else {
         throw std::logic_error("moe_expert_bias_add_backward: unsupported d_out dtype");
     }
 
     if (d_bias.DType == ETensorDType::FP32) {
         if (accumulate) {
-            vector_add_sr(d_bias, d_bias, d_bias_f32, 1.0f,
-                          static_cast<long>(d_bias.nelem()), 0, mRunState.MainStream);
+            vector_add_sr(d_bias, d_bias, d_bias_f32, 1.0f, static_cast<long>(d_bias.nelem()), 0, mRunState.MainStream);
         }
         return;
     }
@@ -301,15 +333,149 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     };
     Tensor d_bias_cast = mRunState.temp_alloc(d_bias.DType, shape_vec(d_bias), "moe_expert_bias_add_d_bias_cast");
     mTemps.push_back(d_bias_cast);
-    convert_dtype(d_bias_cast.get<nv_bfloat16>(), d_bias_f32.get<float>(),
-                  d_bias_f32.nelem(), mRunState.MainStream);
+    convert_dtype(d_bias_cast.get<nv_bfloat16>(), d_bias_f32.get<float>(), d_bias_f32.nelem(), mRunState.MainStream);
     if (accumulate) {
-        vector_add_sr(d_bias, d_bias, d_bias_cast, 1.0f,
-                      static_cast<long>(d_bias.nelem()), 0, mRunState.MainStream);
+        vector_add_sr(d_bias, d_bias, d_bias_cast, 1.0f, static_cast<long>(d_bias.nelem()), 0, mRunState.MainStream);
     } else {
-        CUDA_CHECK(cudaMemcpyAsync(d_bias.Data, d_bias_cast.Data, d_bias.bytes(),
-                                   cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(d_bias.Data,
+                                   d_bias_cast.Data,
+                                   d_bias.bytes(),
+                                   cudaMemcpyDeviceToDevice,
+                                   mRunState.MainStream));
     }
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// MoE expert bias add backward rule
+// Forward: out = moe_expert_bias_add(x, bias)
+// Backward: d_x, d_bias = moe_expert_bias_add_backward(d_out, bias)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_expert_bias_add_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.empty()) {
+        return ops;
+    }
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
+    if (fwd.inputs.size() > 1) {
+        outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
+    }
+
+    std::vector<std::string> inputs = {ctx.d_output};
+    if (fwd.inputs.size() > 1) {
+        inputs.push_back(fwd.inputs[1]);
+    }
+
+    ops.push_back(make_operation("moe_expert_bias_add_backward_" + std::to_string(ctx.op_counter++),
+                                 "moe_expert_bias_add_backward",
+                                 "moe_expert_bias_add_backward",
+                                 inputs,
+                                 outputs));
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("moe_expert_bias_add", ::dsl::moe_expert_bias_add_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// MoE Expert Bias Add
+// ------------------------------------------------------------------------
+const int _moe_expert_bias_add_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "moe_expert_bias_add";
+    sig.min_inputs = 2;
+    sig.max_inputs = 2;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        if (inputs.size() < 2 || outputs.empty()) {
+            return std::make_optional(ShapeValidationError{"moe_expert_bias_add requires 2 inputs and 1 output"});
+        }
+        const auto& x = inputs[0];
+        const auto& bias = inputs[1];
+        const auto& out = outputs[0];
+        if (!x.empty() && x.size() != 2) {
+            return std::make_optional(ShapeValidationError{"moe_expert_bias_add: input must be 2D [tokens, hidden]"});
+        }
+        if (!bias.empty() && bias.size() != 2) {
+            return std::make_optional(ShapeValidationError{"moe_expert_bias_add: bias must be 2D [experts, hidden]"});
+        }
+        if (!out.empty() && !x.empty()) {
+            if (out.size() != 2 || out[0] != x[0] || out[1] != x[1]) {
+                ShapeValidationError err;
+                err.message = "moe_expert_bias_add: output shape must match input shape";
+                return std::make_optional(err);
+            }
+        }
+        if (!x.empty() && !bias.empty() && bias[1] != x[1]) {
+            ShapeValidationError err;
+            err.message = "moe_expert_bias_add: bias hidden dim must match input hidden dim";
+            return std::make_optional(err);
+        }
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// MoE Expert Bias Add Backward
+// ------------------------------------------------------------------------
+const int _moe_expert_bias_add_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "moe_expert_bias_add_backward";
+    sig.min_inputs = 1;
+    sig.max_inputs = 2;
+    sig.min_outputs = 2;
+    sig.max_outputs = 2;
+    sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                       const std::vector<std::vector<long>>& outputs,
+                       const AttrMap& attrs,
+                       const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+        const auto& d_out = inputs[0];
+        const auto& d_inp = outputs[0];
+        const auto& d_bias = outputs[1];
+
+        if (auto err = validators::check_same_numel(d_inp, d_out, "d_inp", "d_out", "moe_expert_bias_add_backward")) {
+            return err;
+        }
+
+        if (!d_bias.empty()) {
+            if (d_bias.size() != 2) {
+                ShapeValidationError err;
+                err.message = "moe_expert_bias_add_backward: d_bias must be 2D [experts, hidden]";
+                return std::make_optional(err);
+            }
+            if (!d_out.empty() && d_bias[1] != d_out.back()) {
+                ShapeValidationError err;
+                err.message = "moe_expert_bias_add_backward: d_bias hidden dim must match d_out last dim";
+                return std::make_optional(err);
+            }
+        }
+
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

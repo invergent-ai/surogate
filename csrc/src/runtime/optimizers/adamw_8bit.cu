@@ -139,8 +139,7 @@ quantize_2D(float* __restrict__ quadrants, float* __restrict__ const smem_code, 
  * @param n Total number of parameters.
  */
 template <typename T, int BLOCK_SIZE, int N_PER_TH>
-__launch_bounds__(256, 3)
-__global__ void kAdamW8bitBlockwise(
+__launch_bounds__(256, 3) __global__ void kAdamW8bitBlockwise(
     T* p,
     T* __restrict__ const g,
     unsigned char* state1,
@@ -159,8 +158,7 @@ __global__ void kAdamW8bitBlockwise(
     const int* __restrict__ opt_step,
     const float* __restrict__ gnorm_scale_ptr,  // Device pointer for graph-capture compatibility
     const bool skip_zeros,
-    const int n
-) {
+    const int n) {
     // Read gnorm_scale from device memory (allows CUDA graph capture)
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
@@ -190,7 +188,7 @@ __global__ void kAdamW8bitBlockwise(
     const float correction1 = 1.0f - __powf(beta1_val, step_val);
     const float correction2 = sqrtf(1.0f - __powf(beta2_val, step_val));
     const float step_size = __fdividef(-lr_val * correction2, correction1);
-    
+
     const int lane_id = threadIdx.x % ADAMW8BIT_LANES;
     float new_local_abs_max1 = -FLT_MAX;
     float new_local_abs_max2 = -FLT_MAX;
@@ -205,7 +203,7 @@ __global__ void kAdamW8bitBlockwise(
     // Shared memory for quantization maps (replicated across lanes for coalesced access)
     __shared__ float smem_quantiles1[ADAMW8BIT_LANES][257];
     __shared__ float smem_quantiles2[ADAMW8BIT_LANES][257];
-    
+
     // Block-level reduction storage
     __shared__ float smem_exchange1[1];
     __shared__ float smem_exchange2[1];
@@ -214,7 +212,7 @@ __global__ void kAdamW8bitBlockwise(
     if (threadIdx.x < 256) {
         smem_quantiles1[0][threadIdx.x] = quantiles1[threadIdx.x];
         smem_quantiles2[0][threadIdx.x] = quantiles2[threadIdx.x];
-        #pragma unroll
+#pragma unroll
         for (unsigned int j = 1; j < ADAMW8BIT_LANES; j++) {
             smem_quantiles1[j][threadIdx.x] = smem_quantiles1[0][threadIdx.x];
             smem_quantiles2[j][threadIdx.x] = smem_quantiles2[0][threadIdx.x];
@@ -229,8 +227,8 @@ __global__ void kAdamW8bitBlockwise(
     }
     __syncthreads();
 
-    // Compute quadrant pivots for fast quantization
-    #pragma unroll
+// Compute quadrant pivots for fast quantization
+#pragma unroll
     for (int k = 0; k < ADAMW8BIT_QUAD; k++) {
         quadrants1[k] = smem_quantiles1[lane_id][(k * 256 / (ADAMW8BIT_QUAD + 1)) + (256 / (ADAMW8BIT_QUAD + 1) - 1)];
         quadrants2[k] = smem_quantiles2[lane_id][(k * 256 / (ADAMW8BIT_QUAD + 1)) + (256 / (ADAMW8BIT_QUAD + 1) - 1)];
@@ -239,10 +237,10 @@ __global__ void kAdamW8bitBlockwise(
     // Process blocks
     for (unsigned int i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
         valid_items = n - i >= BLOCK_SIZE ? BLOCK_SIZE : n - i;
-        
+
         // Load data
         const int thread_offset = i + threadIdx.x * N_PER_TH;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -259,11 +257,11 @@ __global__ void kAdamW8bitBlockwise(
         new_local_abs_max1 = -FLT_MAX;
         new_local_abs_max2 = -FLT_MAX;
 
-        // Update moments
-        #pragma unroll
+// Update moments
+#pragma unroll
         for (unsigned int j = 0; j < N_PER_TH; j++) {
             g_val = float(g_vals[j]);
-            
+
             if (!isnan(g_val) && !isinf(g_val)) {
                 // Apply gradient scaling
                 g_val *= gnorm_scale;
@@ -292,7 +290,7 @@ __global__ void kAdamW8bitBlockwise(
             new_local_abs_max1 = fmaxf(new_local_abs_max1, __shfl_xor_sync(0xFFFFFFFF, new_local_abs_max1, offset));
             new_local_abs_max2 = fmaxf(new_local_abs_max2, __shfl_xor_sync(0xFFFFFFFF, new_local_abs_max2, offset));
         }
-        
+
         // First thread of each warp writes to shared memory
         if (threadIdx.x % 32 == 0) {
             atomicMax(reinterpret_cast<int*>(&smem_exchange1[0]), __float_as_int(new_local_abs_max1));
@@ -305,21 +303,21 @@ __global__ void kAdamW8bitBlockwise(
             absmax1[i / BLOCK_SIZE] = smem_exchange1[0];
             absmax2[i / BLOCK_SIZE] = smem_exchange2[0];
         }
-        
+
         // All threads read the final absmax
         new_local_abs_max1 = smem_exchange1[0];
         new_local_abs_max2 = smem_exchange2[0];
-        
+
         // Reset for next iteration
         if (threadIdx.x == 0) {
             smem_exchange1[0] = -FLT_MAX;
             smem_exchange2[0] = -FLT_MAX;
         }
-        
+
         __syncthreads();
 
-        // Load parameters
-        #pragma unroll
+// Load parameters
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -329,8 +327,8 @@ __global__ void kAdamW8bitBlockwise(
             }
         }
 
-        // Update parameters
-        #pragma unroll
+// Update parameters
+#pragma unroll
         for (unsigned int j = 0; j < N_PER_TH; j++) {
             if (!isnan(float(g_vals[j])) && !isinf(float(g_vals[j]))) {
                 // AdamW update: p = p - lr * (m_hat / (sqrt(v_hat) + eps))
@@ -345,8 +343,8 @@ __global__ void kAdamW8bitBlockwise(
             }
         }
 
-        // Store updated parameters
-        #pragma unroll
+// Store updated parameters
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -354,14 +352,13 @@ __global__ void kAdamW8bitBlockwise(
             }
         }
 
-        // Quantize and store states
-        #pragma unroll
+// Quantize and store states
+#pragma unroll
         for (unsigned int j = 0; j < N_PER_TH; j++) {
             // Quantize first moment (signed)
-            float normalized1 = new_local_abs_max1 > 0.0f ? 
-                __fdividef(s1_vals[j], new_local_abs_max1) : 0.0f;
+            float normalized1 = new_local_abs_max1 > 0.0f ? __fdividef(s1_vals[j], new_local_abs_max1) : 0.0f;
             c1s[j] = quantize_2D<1>(quadrants1, smem_quantiles1[lane_id], normalized1);
-            
+
             // Ensure sign consistency after quantization
             if (signbit(smem_quantiles1[lane_id][c1s[j]]) != signbit(s1_vals[j])) {
                 if (s1_vals[j] > 0.0f)
@@ -371,13 +368,12 @@ __global__ void kAdamW8bitBlockwise(
             }
 
             // Quantize second moment (unsigned, always positive)
-            float normalized2 = new_local_abs_max2 > 0.0f ?
-                __fdividef(s2_vals[j], new_local_abs_max2) : 0.0f;
+            float normalized2 = new_local_abs_max2 > 0.0f ? __fdividef(s2_vals[j], new_local_abs_max2) : 0.0f;
             c2s[j] = quantize_2D<0>(quadrants2, smem_quantiles2[lane_id], normalized2);
         }
 
-        // Store quantized states
-        #pragma unroll
+// Store quantized states
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -390,13 +386,12 @@ __global__ void kAdamW8bitBlockwise(
 
 /**
  * @brief Mixed-precision 8-bit AdamW optimizer kernel (TParam params, TGrad gradients).
- * 
+ *
  * Similar to kAdamW8bitBlockwise but supports different types for parameters and gradients.
  * Gradients are converted to float for the update computation.
  */
 template <typename TParam, typename TGrad, int BLOCK_SIZE, int N_PER_TH>
-__launch_bounds__(256, 3)
-__global__ void kAdamW8bitBlockwiseMixed(
+__launch_bounds__(256, 3) __global__ void kAdamW8bitBlockwiseMixed(
     TParam* p,
     TGrad* __restrict__ const g,
     unsigned char* state1,
@@ -415,8 +410,7 @@ __global__ void kAdamW8bitBlockwiseMixed(
     const int* __restrict__ opt_step,
     const float* __restrict__ gnorm_scale_ptr,  // Device pointer for graph-capture compatibility
     const bool skip_zeros,
-    const int n
-) {
+    const int n) {
     // Read gnorm_scale from device memory (allows CUDA graph capture)
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
@@ -466,7 +460,7 @@ __global__ void kAdamW8bitBlockwiseMixed(
     if (threadIdx.x < 256) {
         smem_quantiles1[0][threadIdx.x] = quantiles1[threadIdx.x];
         smem_quantiles2[0][threadIdx.x] = quantiles2[threadIdx.x];
-        #pragma unroll
+#pragma unroll
         for (unsigned int j = 1; j < ADAMW8BIT_LANES; j++) {
             smem_quantiles1[j][threadIdx.x] = smem_quantiles1[0][threadIdx.x];
             smem_quantiles2[j][threadIdx.x] = smem_quantiles2[0][threadIdx.x];
@@ -478,8 +472,8 @@ __global__ void kAdamW8bitBlockwiseMixed(
     }
     __syncthreads();
 
-    // Compute quadrant pivots for fast quantization
-    #pragma unroll
+// Compute quadrant pivots for fast quantization
+#pragma unroll
     for (int k = 0; k < ADAMW8BIT_QUAD; k++) {
         quadrants1[k] = smem_quantiles1[lane_id][(k * 256 / (ADAMW8BIT_QUAD + 1)) + (256 / (ADAMW8BIT_QUAD + 1) - 1)];
         quadrants2[k] = smem_quantiles2[lane_id][(k * 256 / (ADAMW8BIT_QUAD + 1)) + (256 / (ADAMW8BIT_QUAD + 1) - 1)];
@@ -491,7 +485,7 @@ __global__ void kAdamW8bitBlockwiseMixed(
 
         // Load gradients and state codes
         const int thread_offset = i + threadIdx.x * N_PER_TH;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -505,8 +499,8 @@ __global__ void kAdamW8bitBlockwiseMixed(
             }
         }
 
-        // Update moments
-        #pragma unroll
+// Update moments
+#pragma unroll
         for (unsigned int j = 0; j < N_PER_TH; j++) {
             float g_val = float(g_vals[j]);
             if (!isnan(g_val) && !isinf(g_val)) {
@@ -546,8 +540,8 @@ __global__ void kAdamW8bitBlockwiseMixed(
         }
         __syncthreads();
 
-        // Load parameters
-        #pragma unroll
+// Load parameters
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -557,8 +551,8 @@ __global__ void kAdamW8bitBlockwiseMixed(
             }
         }
 
-        // Update parameters
-        #pragma unroll
+// Update parameters
+#pragma unroll
         for (unsigned int j = 0; j < N_PER_TH; j++) {
             float g_val = float(g_vals[j]);
             if (!isnan(g_val) && !isinf(g_val)) {
@@ -571,8 +565,8 @@ __global__ void kAdamW8bitBlockwiseMixed(
             }
         }
 
-        // Store updated parameters
-        #pragma unroll
+// Store updated parameters
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -580,24 +574,24 @@ __global__ void kAdamW8bitBlockwiseMixed(
             }
         }
 
-        // Quantize and store states
-        #pragma unroll
+// Quantize and store states
+#pragma unroll
         for (unsigned int j = 0; j < N_PER_TH; j++) {
-            float normalized1 = new_local_abs_max1 > 0.0f ?
-                __fdividef(s1_vals[j], new_local_abs_max1) : 0.0f;
+            float normalized1 = new_local_abs_max1 > 0.0f ? __fdividef(s1_vals[j], new_local_abs_max1) : 0.0f;
             c1s[j] = quantize_2D<1>(quadrants1, smem_quantiles1[lane_id], normalized1);
 
             if (signbit(smem_quantiles1[lane_id][c1s[j]]) != signbit(s1_vals[j])) {
-                if (s1_vals[j] > 0.0f) c1s[j] += 1;
-                else c1s[j] -= 1;
+                if (s1_vals[j] > 0.0f)
+                    c1s[j] += 1;
+                else
+                    c1s[j] -= 1;
             }
 
-            float normalized2 = new_local_abs_max2 > 0.0f ?
-                __fdividef(s2_vals[j], new_local_abs_max2) : 0.0f;
+            float normalized2 = new_local_abs_max2 > 0.0f ? __fdividef(s2_vals[j], new_local_abs_max2) : 0.0f;
             c2s[j] = quantize_2D<0>(quadrants2, smem_quantiles2[lane_id], normalized2);
         }
 
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < N_PER_TH; j++) {
             const int idx = thread_offset + j;
             if (idx < n) {
@@ -632,27 +626,25 @@ __global__ void kAdamW8bitBlockwiseMixed(
  * @param absmax2 Per-block absmax for second moment.
  * @param stream CUDA stream.
  */
-void adamw_update_8bit(
-    float* p,
-    const float* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-) {
+void adamw_update_8bit(float* p,
+                       const float* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream) {
     constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
@@ -660,40 +652,50 @@ void adamw_update_8bit(
     int threads_per_block = BLOCK_SIZE / N_PER_TH;
 
     kAdamW8bitBlockwise<float, BLOCK_SIZE, N_PER_TH>
-        <<<num_blocks, threads_per_block, 0, stream>>>(
-            p, const_cast<float*>(g), state1, state2,
-            beta1, beta2, eps, step, lr,
-            const_cast<float*>(quantiles1), const_cast<float*>(quantiles2),
-            absmax1, absmax2,
-            weight_decay, opt_params, opt_step, gnorm_scale, false, (int)n
-        );
+        <<<num_blocks, threads_per_block, 0, stream>>>(p,
+                                                       const_cast<float*>(g),
+                                                       state1,
+                                                       state2,
+                                                       beta1,
+                                                       beta2,
+                                                       eps,
+                                                       step,
+                                                       lr,
+                                                       const_cast<float*>(quantiles1),
+                                                       const_cast<float*>(quantiles2),
+                                                       absmax1,
+                                                       absmax2,
+                                                       weight_decay,
+                                                       opt_params,
+                                                       opt_step,
+                                                       gnorm_scale,
+                                                       false,
+                                                       (int)n);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Launch the 8-bit AdamW optimizer kernel for BF16 parameters.
  */
-void adamw_update_8bit(
-    nv_bfloat16* p,
-    const nv_bfloat16* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-) {
+void adamw_update_8bit(nv_bfloat16* p,
+                       const nv_bfloat16* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream) {
     constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
@@ -701,13 +703,25 @@ void adamw_update_8bit(
     int threads_per_block = BLOCK_SIZE / N_PER_TH;
 
     kAdamW8bitBlockwise<nv_bfloat16, BLOCK_SIZE, N_PER_TH>
-        <<<num_blocks, threads_per_block, 0, stream>>>(
-            p, const_cast<nv_bfloat16*>(g), state1, state2,
-            beta1, beta2, eps, step, lr,
-            const_cast<float*>(quantiles1), const_cast<float*>(quantiles2),
-            absmax1, absmax2,
-            weight_decay, opt_params, opt_step, gnorm_scale, false, (int)n
-        );
+        <<<num_blocks, threads_per_block, 0, stream>>>(p,
+                                                       const_cast<nv_bfloat16*>(g),
+                                                       state1,
+                                                       state2,
+                                                       beta1,
+                                                       beta2,
+                                                       eps,
+                                                       step,
+                                                       lr,
+                                                       const_cast<float*>(quantiles1),
+                                                       const_cast<float*>(quantiles2),
+                                                       absmax1,
+                                                       absmax2,
+                                                       weight_decay,
+                                                       opt_params,
+                                                       opt_step,
+                                                       gnorm_scale,
+                                                       false,
+                                                       (int)n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -717,27 +731,25 @@ void adamw_update_8bit(
  * This variant converts BF16 gradients to FP32 on-the-fly for the update computation,
  * keeping parameters in FP32 for full precision master weights with LoRA.
  */
-void adamw_update_8bit(
-    float* p,
-    const nv_bfloat16* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-) {
+void adamw_update_8bit(float* p,
+                       const nv_bfloat16* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream) {
     constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
@@ -746,40 +758,50 @@ void adamw_update_8bit(
 
     // Use the mixed-precision kernel
     kAdamW8bitBlockwiseMixed<float, nv_bfloat16, BLOCK_SIZE, N_PER_TH>
-        <<<num_blocks, threads_per_block, 0, stream>>>(
-            p, const_cast<nv_bfloat16*>(g), state1, state2,
-            beta1, beta2, eps, step, lr,
-            const_cast<float*>(quantiles1), const_cast<float*>(quantiles2),
-            absmax1, absmax2,
-            weight_decay, opt_params, opt_step, gnorm_scale, false, (int)n
-        );
+        <<<num_blocks, threads_per_block, 0, stream>>>(p,
+                                                       const_cast<nv_bfloat16*>(g),
+                                                       state1,
+                                                       state2,
+                                                       beta1,
+                                                       beta2,
+                                                       eps,
+                                                       step,
+                                                       lr,
+                                                       const_cast<float*>(quantiles1),
+                                                       const_cast<float*>(quantiles2),
+                                                       absmax1,
+                                                       absmax2,
+                                                       weight_decay,
+                                                       opt_params,
+                                                       opt_step,
+                                                       gnorm_scale,
+                                                       false,
+                                                       (int)n);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Launch the 8-bit AdamW optimizer kernel for FP16 parameters.
  */
-void adamw_update_8bit(
-    half* p,
-    const half* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-) {
+void adamw_update_8bit(half* p,
+                       const half* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream) {
     constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
@@ -787,13 +809,25 @@ void adamw_update_8bit(
     int threads_per_block = BLOCK_SIZE / N_PER_TH;
 
     kAdamW8bitBlockwise<half, BLOCK_SIZE, N_PER_TH>
-        <<<num_blocks, threads_per_block, 0, stream>>>(
-            p, const_cast<half*>(g), state1, state2,
-            beta1, beta2, eps, step, lr,
-            const_cast<float*>(quantiles1), const_cast<float*>(quantiles2),
-            absmax1, absmax2,
-            weight_decay, opt_params, opt_step, gnorm_scale, false, (int)n
-        );
+        <<<num_blocks, threads_per_block, 0, stream>>>(p,
+                                                       const_cast<half*>(g),
+                                                       state1,
+                                                       state2,
+                                                       beta1,
+                                                       beta2,
+                                                       eps,
+                                                       step,
+                                                       lr,
+                                                       const_cast<float*>(quantiles1),
+                                                       const_cast<float*>(quantiles2),
+                                                       absmax1,
+                                                       absmax2,
+                                                       weight_decay,
+                                                       opt_params,
+                                                       opt_step,
+                                                       gnorm_scale,
+                                                       false,
+                                                       (int)n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -820,34 +854,33 @@ __host__ void create_dynamic_quantization_map(float* code, bool signed_map) {
     const int total_bits = 8;
     const int max_exponent_bits = 7;
     const bool is_signed = signed_map;
-    
+
     std::vector<float> data;
-    
+
     // Non-sign bits available
     int non_sign_bits = total_bits - 1;
-    
+
     // Additional items from the case where all exponent bits are zero
     int additional_items = (1 << (non_sign_bits - max_exponent_bits)) - 1;
-    
+
     for (int i = 0; i < max_exponent_bits; i++) {
-        int fraction_items = is_signed ?
-            (1 << (i + non_sign_bits - max_exponent_bits)) + 1 :
-            (1 << (i + non_sign_bits - max_exponent_bits + 1)) + 1;
-        
+        int fraction_items = is_signed ? (1 << (i + non_sign_bits - max_exponent_bits)) + 1
+                                       : (1 << (i + non_sign_bits - max_exponent_bits + 1)) + 1;
+
         float scale = powf(10.0f, -(max_exponent_bits - 1) + i);
-        
+
         for (int j = 0; j < fraction_items - 1; j++) {
             float boundary_low = 0.1f + (0.9f * j) / (fraction_items - 1);
             float boundary_high = 0.1f + (0.9f * (j + 1)) / (fraction_items - 1);
             float mean = (boundary_low + boundary_high) / 2.0f;
-            
+
             data.push_back(scale * mean);
             if (is_signed) {
                 data.push_back(-scale * mean);
             }
         }
     }
-    
+
     // Handle additional items
     if (additional_items > 0) {
         float scale = powf(10.0f, -(max_exponent_bits - 1) + max_exponent_bits - 1);
@@ -855,27 +888,27 @@ __host__ void create_dynamic_quantization_map(float* code, bool signed_map) {
             float boundary_low = 0.1f + (0.9f * j) / additional_items;
             float boundary_high = 0.1f + (0.9f * (j + 1)) / additional_items;
             float mean = (boundary_low + boundary_high) / 2.0f;
-            
+
             data.push_back(scale * mean);
             if (is_signed) {
                 data.push_back(-scale * mean);
             }
         }
     }
-    
+
     // Add zero and one
     data.push_back(0.0f);
     data.push_back(1.0f);
-    
+
     // Sort the data
     std::sort(data.begin(), data.end());
-    
+
     // Pad to 256 elements if needed
     while (data.size() < 256) {
         data.push_back(0.0f);
     }
     std::sort(data.begin(), data.end());
-    
+
     // Copy to output
     for (int i = 0; i < 256; i++) {
         code[i] = data[i];
@@ -917,17 +950,16 @@ __host__ void create_adamw8bit_quantiles2(float* code) {
  * @param n Number of parameters.
  * @param stream CUDA stream.
  */
-__global__ void kInitAdamW8bitState(
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    size_t n,
-    size_t num_blocks
-) {
+__global__ void kInitAdamW8bitState(unsigned char* state1,
+                                    unsigned char* state2,
+                                    float* absmax1,
+                                    float* absmax2,
+                                    size_t n,
+                                    size_t num_blocks) {
     const size_t total = n > num_blocks ? n : num_blocks;
     const size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-    for (size_t idx = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
+    for (size_t idx =
+             static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
          idx < total;
          idx += stride) {
         if (idx < n) {
@@ -941,14 +973,12 @@ __global__ void kInitAdamW8bitState(
     }
 }
 
-void init_adamw8bit_state(
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    size_t n,
-    cudaStream_t stream
-) {
+void init_adamw8bit_state(unsigned char* state1,
+                          unsigned char* state2,
+                          float* absmax1,
+                          float* absmax2,
+                          size_t n,
+                          cudaStream_t stream) {
     // Guard against empty tensors - nothing to initialize
     if (n == 0) {
         return;
@@ -961,9 +991,7 @@ void init_adamw8bit_state(
     const size_t blocks_ideal = div_ceil(total_elements, (size_t)threads);
     const int blocks = static_cast<int>(std::min(blocks_ideal, (size_t)65535));
 
-    kInitAdamW8bitState<<<blocks, threads, 0, stream>>>(
-        state1, state2, absmax1, absmax2, n, num_blocks
-    );
+    kInitAdamW8bitState<<<blocks, threads, 0, stream>>>(state1, state2, absmax1, absmax2, n, num_blocks);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -989,13 +1017,12 @@ void init_adamw8bit_state(
  * @tparam T Parameter type (float or nv_bfloat16).
  */
 template <typename T, int BLOCK_SIZE, int N_PER_TH>
-__launch_bounds__(256, 3)
-__global__ void kAdamW8bitMultiTensor(
+__launch_bounds__(256, 3) __global__ void kAdamW8bitMultiTensor(
     // Tensor metadata (device arrays)
-    T** __restrict__ params,           // Array of param pointers
-    T** __restrict__ grads,            // Array of grad pointers
-    const int* __restrict__ sizes,     // Array of tensor sizes
-    const int num_tensors,             // Number of tensors
+    T** __restrict__ params,        // Array of param pointers
+    T** __restrict__ grads,         // Array of grad pointers
+    const int* __restrict__ sizes,  // Array of tensor sizes
+    const int num_tensors,          // Number of tensors
     // Combined state buffers
     unsigned char* __restrict__ state1,
     unsigned char* __restrict__ state2,
@@ -1013,8 +1040,7 @@ __global__ void kAdamW8bitMultiTensor(
     float weight_decay,
     const float* __restrict__ opt_params,
     const int* __restrict__ opt_step,
-    const float* __restrict__ gnorm_scale_ptr
-) {
+    const float* __restrict__ gnorm_scale_ptr) {
     // Read gnorm_scale from device memory
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
@@ -1051,7 +1077,7 @@ __global__ void kAdamW8bitMultiTensor(
     if (threadIdx.x < 256) {
         smem_quantiles1[0][threadIdx.x] = quantiles1[threadIdx.x];
         smem_quantiles2[0][threadIdx.x] = quantiles2[threadIdx.x];
-        #pragma unroll
+#pragma unroll
         for (unsigned int j = 1; j < ADAMW8BIT_LANES; j++) {
             smem_quantiles1[j][threadIdx.x] = smem_quantiles1[0][threadIdx.x];
             smem_quantiles2[j][threadIdx.x] = smem_quantiles2[0][threadIdx.x];
@@ -1067,7 +1093,7 @@ __global__ void kAdamW8bitMultiTensor(
     // Compute quadrant pivots
     float quadrants1[ADAMW8BIT_QUAD];
     float quadrants2[ADAMW8BIT_QUAD];
-    #pragma unroll
+#pragma unroll
     for (int k = 0; k < ADAMW8BIT_QUAD; k++) {
         quadrants1[k] = smem_quantiles1[lane_id][(k * 256 / (ADAMW8BIT_QUAD + 1)) + (256 / (ADAMW8BIT_QUAD + 1) - 1)];
         quadrants2[k] = smem_quantiles2[lane_id][(k * 256 / (ADAMW8BIT_QUAD + 1)) + (256 / (ADAMW8BIT_QUAD + 1) - 1)];
@@ -1108,7 +1134,7 @@ __global__ void kAdamW8bitMultiTensor(
 
             // Load data
             const int thread_offset = base_idx + threadIdx.x * N_PER_TH;
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < N_PER_TH; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
@@ -1122,8 +1148,8 @@ __global__ void kAdamW8bitMultiTensor(
                 }
             }
 
-            // Update moments
-            #pragma unroll
+// Update moments
+#pragma unroll
             for (unsigned int j = 0; j < N_PER_TH; j++) {
                 float g_val = float(g_vals[j]);
 
@@ -1170,8 +1196,8 @@ __global__ void kAdamW8bitMultiTensor(
             }
             __syncthreads();
 
-            // Load parameters
-            #pragma unroll
+// Load parameters
+#pragma unroll
             for (int j = 0; j < N_PER_TH; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
@@ -1181,8 +1207,8 @@ __global__ void kAdamW8bitMultiTensor(
                 }
             }
 
-            // Update parameters
-            #pragma unroll
+// Update parameters
+#pragma unroll
             for (unsigned int j = 0; j < N_PER_TH; j++) {
                 if (!isnan(float(g_vals[j])) && !isinf(float(g_vals[j]))) {
                     float param = float(p_vals[j]);
@@ -1195,8 +1221,8 @@ __global__ void kAdamW8bitMultiTensor(
                 }
             }
 
-            // Store updated parameters
-            #pragma unroll
+// Store updated parameters
+#pragma unroll
             for (int j = 0; j < N_PER_TH; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
@@ -1204,11 +1230,10 @@ __global__ void kAdamW8bitMultiTensor(
                 }
             }
 
-            // Quantize and store states
-            #pragma unroll
+// Quantize and store states
+#pragma unroll
             for (unsigned int j = 0; j < N_PER_TH; j++) {
-                float normalized1 = new_local_abs_max1 > 0.0f ?
-                    __fdividef(s1_vals[j], new_local_abs_max1) : 0.0f;
+                float normalized1 = new_local_abs_max1 > 0.0f ? __fdividef(s1_vals[j], new_local_abs_max1) : 0.0f;
                 c1s[j] = quantize_2D<1>(quadrants1, smem_quantiles1[lane_id], normalized1);
 
                 if (signbit(smem_quantiles1[lane_id][c1s[j]]) != signbit(s1_vals[j])) {
@@ -1218,13 +1243,12 @@ __global__ void kAdamW8bitMultiTensor(
                         c1s[j] -= 1;
                 }
 
-                float normalized2 = new_local_abs_max2 > 0.0f ?
-                    __fdividef(s2_vals[j], new_local_abs_max2) : 0.0f;
+                float normalized2 = new_local_abs_max2 > 0.0f ? __fdividef(s2_vals[j], new_local_abs_max2) : 0.0f;
                 c2s[j] = quantize_2D<0>(quadrants2, smem_quantiles2[lane_id], normalized2);
             }
 
-            // Store quantized states
-            #pragma unroll
+// Store quantized states
+#pragma unroll
             for (int j = 0; j < N_PER_TH; j++) {
                 const int idx = thread_offset + j;
                 if (idx < n) {
@@ -1263,30 +1287,28 @@ __global__ void kAdamW8bitMultiTensor(
  * @param quantiles2 Quantization map for second moment.
  * @param stream CUDA stream.
  */
-void adamw_update_8bit_multi_tensor(
-    float** params,
-    float** grads,
-    const int* sizes,
-    int num_tensors,
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    const int* state_offsets,
-    size_t total_params,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-) {
+void adamw_update_8bit_multi_tensor(float** params,
+                                    float** grads,
+                                    const int* sizes,
+                                    int num_tensors,
+                                    unsigned char* state1,
+                                    unsigned char* state2,
+                                    float* absmax1,
+                                    float* absmax2,
+                                    const int* state_offsets,
+                                    size_t total_params,
+                                    float lr,
+                                    float beta1,
+                                    float beta2,
+                                    int step,
+                                    float eps,
+                                    float weight_decay,
+                                    const float* gnorm_scale,
+                                    const float* quantiles1,
+                                    const float* quantiles2,
+                                    const float* opt_params,
+                                    const int* opt_step,
+                                    cudaStream_t stream) {
     // Guard against empty tensors
     if (num_tensors == 0 || total_params == 0) {
         return;
@@ -1302,40 +1324,51 @@ void adamw_update_8bit_multi_tensor(
     int threads_per_block = BLOCK_SIZE / N_PER_TH;
 
     kAdamW8bitMultiTensor<float, BLOCK_SIZE, N_PER_TH>
-        <<<grid_size, threads_per_block, 0, stream>>>(
-            params, grads, sizes, num_tensors,
-            state1, state2, absmax1, absmax2, state_offsets,
-            beta1, beta2, eps, step, lr,
-            const_cast<float*>(quantiles1), const_cast<float*>(quantiles2),
-            weight_decay, opt_params, opt_step, gnorm_scale
-        );
+        <<<grid_size, threads_per_block, 0, stream>>>(params,
+                                                      grads,
+                                                      sizes,
+                                                      num_tensors,
+                                                      state1,
+                                                      state2,
+                                                      absmax1,
+                                                      absmax2,
+                                                      state_offsets,
+                                                      beta1,
+                                                      beta2,
+                                                      eps,
+                                                      step,
+                                                      lr,
+                                                      const_cast<float*>(quantiles1),
+                                                      const_cast<float*>(quantiles2),
+                                                      weight_decay,
+                                                      opt_params,
+                                                      opt_step,
+                                                      gnorm_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void adamw_update_8bit_multi_tensor(
-    nv_bfloat16** params,
-    nv_bfloat16** grads,
-    const int* sizes,
-    int num_tensors,
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    const int* state_offsets,
-    size_t total_params,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-) {
+void adamw_update_8bit_multi_tensor(nv_bfloat16** params,
+                                    nv_bfloat16** grads,
+                                    const int* sizes,
+                                    int num_tensors,
+                                    unsigned char* state1,
+                                    unsigned char* state2,
+                                    float* absmax1,
+                                    float* absmax2,
+                                    const int* state_offsets,
+                                    size_t total_params,
+                                    float lr,
+                                    float beta1,
+                                    float beta2,
+                                    int step,
+                                    float eps,
+                                    float weight_decay,
+                                    const float* gnorm_scale,
+                                    const float* quantiles1,
+                                    const float* quantiles2,
+                                    const float* opt_params,
+                                    const int* opt_step,
+                                    cudaStream_t stream) {
     // Guard against empty tensors
     if (num_tensors == 0 || total_params == 0) {
         return;
@@ -1349,14 +1382,27 @@ void adamw_update_8bit_multi_tensor(
     int threads_per_block = BLOCK_SIZE / N_PER_TH;
 
     kAdamW8bitMultiTensor<nv_bfloat16, BLOCK_SIZE, N_PER_TH>
-        <<<grid_size, threads_per_block, 0, stream>>>(
-            params, grads, sizes, num_tensors,
-            state1, state2, absmax1, absmax2, state_offsets,
-            beta1, beta2, eps, step, lr,
-            const_cast<float*>(quantiles1), const_cast<float*>(quantiles2),
-            weight_decay, opt_params, opt_step, gnorm_scale
-        );
+        <<<grid_size, threads_per_block, 0, stream>>>(params,
+                                                      grads,
+                                                      sizes,
+                                                      num_tensors,
+                                                      state1,
+                                                      state2,
+                                                      absmax1,
+                                                      absmax2,
+                                                      state_offsets,
+                                                      beta1,
+                                                      beta2,
+                                                      eps,
+                                                      step,
+                                                      lr,
+                                                      const_cast<float*>(quantiles1),
+                                                      const_cast<float*>(quantiles2),
+                                                      weight_decay,
+                                                      opt_params,
+                                                      opt_step,
+                                                      gnorm_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace optimizers
+}  // namespace optimizers

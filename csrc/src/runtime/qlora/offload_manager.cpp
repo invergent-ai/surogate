@@ -44,12 +44,10 @@ bool is_device_pointer(const std::byte* ptr) {
 /// - Async prefetching on a separate stream with event-based synchronization
 class OffloadManagerImpl final : public OffloadManager {
 public:
-    OffloadManagerImpl(const OffloadConfig& config,
-                       const std::shared_ptr<TensorAllocator>& allocator)
-        : mConfig(config)
-        , mAllocator(allocator)
-        , mCurrentStep(0)
-    {
+    OffloadManagerImpl(const OffloadConfig& config, const std::shared_ptr<TensorAllocator>& allocator)
+        : mConfig(config),
+          mAllocator(allocator),
+          mCurrentStep(0) {
         if (mConfig.enable_prefetch) {
             CUDA_CHECK(cudaStreamCreateWithFlags(&mPrefetchStream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&mPrefetchEvent, cudaEventDisableTiming));
@@ -74,11 +72,7 @@ public:
     // OffloadManager interface
     // =========================================================================
 
-    void register_tensor(
-        QuantizedTensor* tensor,
-        int group_id,
-        const std::string& name) override
-    {
+    void register_tensor(QuantizedTensor* tensor, int group_id, const std::string& name) override {
         auto& group = get_or_create_group(group_id);
 
         TensorEntry entry;
@@ -102,8 +96,8 @@ public:
             ensure_host_backing(*tensor, entry);
         }
 
-        group.total_bytes += entry.cpu_data_bytes + entry.cpu_scales_bytes
-                           + entry.cpu_meta_bytes + entry.cpu_meta2_bytes;
+        group.total_bytes +=
+            entry.cpu_data_bytes + entry.cpu_scales_bytes + entry.cpu_meta_bytes + entry.cpu_meta2_bytes;
         group.entries.push_back(std::move(entry));
 
         // If offloading is disabled (max_resident == 0 means unlimited), mark as resident
@@ -422,10 +416,22 @@ private:
     /// Free GPU shadow buffers for a group.
     void free_gpu_buffers(Group& group) {
         for (auto& entry : group.entries) {
-            if (entry.gpu_data) { cudaFree(entry.gpu_data); entry.gpu_data = nullptr; }
-            if (entry.gpu_scales) { cudaFree(entry.gpu_scales); entry.gpu_scales = nullptr; }
-            if (entry.gpu_meta) { cudaFree(entry.gpu_meta); entry.gpu_meta = nullptr; }
-            if (entry.gpu_meta2) { cudaFree(entry.gpu_meta2); entry.gpu_meta2 = nullptr; }
+            if (entry.gpu_data) {
+                cudaFree(entry.gpu_data);
+                entry.gpu_data = nullptr;
+            }
+            if (entry.gpu_scales) {
+                cudaFree(entry.gpu_scales);
+                entry.gpu_scales = nullptr;
+            }
+            if (entry.gpu_meta) {
+                cudaFree(entry.gpu_meta);
+                entry.gpu_meta = nullptr;
+            }
+            if (entry.gpu_meta2) {
+                cudaFree(entry.gpu_meta2);
+                entry.gpu_meta2 = nullptr;
+            }
         }
     }
 
@@ -435,30 +441,32 @@ private:
             if (!entry.tensor) continue;
 
             if (entry.gpu_data && entry.cpu_data && entry.cpu_data_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.gpu_data, entry.cpu_data,
-                                            entry.cpu_data_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(entry.gpu_data, entry.cpu_data, entry.cpu_data_bytes, cudaMemcpyDefault, stream));
                 entry.tensor->data.Data = entry.gpu_data;
                 entry.tensor->data.Device = mConfig.device_id;
             }
             if (entry.gpu_scales && entry.cpu_scales && entry.cpu_scales_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.gpu_scales, entry.cpu_scales,
-                                            entry.cpu_scales_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(cudaMemcpyAsync(entry.gpu_scales,
+                                           entry.cpu_scales,
+                                           entry.cpu_scales_bytes,
+                                           cudaMemcpyDefault,
+                                           stream));
                 entry.tensor->scales.Data = entry.gpu_scales;
                 entry.tensor->scales.Device = mConfig.device_id;
             }
             if (entry.gpu_meta && entry.cpu_meta && entry.cpu_meta_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.gpu_meta, entry.cpu_meta,
-                                            entry.cpu_meta_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(entry.gpu_meta, entry.cpu_meta, entry.cpu_meta_bytes, cudaMemcpyDefault, stream));
                 entry.tensor->meta.Data = entry.gpu_meta;
                 entry.tensor->meta.Device = mConfig.device_id;
             }
             if (entry.gpu_meta2 && entry.cpu_meta2 && entry.cpu_meta2_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.gpu_meta2, entry.cpu_meta2,
-                                            entry.cpu_meta2_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(cudaMemcpyAsync(entry.gpu_meta2,
+                                           entry.cpu_meta2,
+                                           entry.cpu_meta2_bytes,
+                                           cudaMemcpyDefault,
+                                           stream));
                 entry.tensor->meta2.Data = entry.gpu_meta2;
                 entry.tensor->meta2.Device = mConfig.device_id;
             }
@@ -471,30 +479,32 @@ private:
             if (!entry.tensor) continue;
 
             if (entry.gpu_data && entry.cpu_data && entry.cpu_data_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.cpu_data, entry.gpu_data,
-                                            entry.cpu_data_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(entry.cpu_data, entry.gpu_data, entry.cpu_data_bytes, cudaMemcpyDefault, stream));
                 entry.tensor->data.Data = entry.cpu_data;
                 entry.tensor->data.Device = -1;
             }
             if (entry.gpu_scales && entry.cpu_scales && entry.cpu_scales_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.cpu_scales, entry.gpu_scales,
-                                            entry.cpu_scales_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(cudaMemcpyAsync(entry.cpu_scales,
+                                           entry.gpu_scales,
+                                           entry.cpu_scales_bytes,
+                                           cudaMemcpyDefault,
+                                           stream));
                 entry.tensor->scales.Data = entry.cpu_scales;
                 entry.tensor->scales.Device = -1;
             }
             if (entry.gpu_meta && entry.cpu_meta && entry.cpu_meta_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.cpu_meta, entry.gpu_meta,
-                                            entry.cpu_meta_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(entry.cpu_meta, entry.gpu_meta, entry.cpu_meta_bytes, cudaMemcpyDefault, stream));
                 entry.tensor->meta.Data = entry.cpu_meta;
                 entry.tensor->meta.Device = -1;
             }
             if (entry.gpu_meta2 && entry.cpu_meta2 && entry.cpu_meta2_bytes > 0) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.cpu_meta2, entry.gpu_meta2,
-                                            entry.cpu_meta2_bytes,
-                                            cudaMemcpyDefault, stream));
+                CUDA_CHECK(cudaMemcpyAsync(entry.cpu_meta2,
+                                           entry.gpu_meta2,
+                                           entry.cpu_meta2_bytes,
+                                           cudaMemcpyDefault,
+                                           stream));
                 entry.tensor->meta2.Data = entry.cpu_meta2;
                 entry.tensor->meta2.Device = -1;
             }
@@ -522,10 +532,7 @@ private:
         }
     }
 
-    void maybe_stage_one_component(std::byte*& cpu_ptr,
-                                   size_t bytes,
-                                   bool& owns_cpu_ptr,
-                                   Tensor& field) {
+    void maybe_stage_one_component(std::byte*& cpu_ptr, size_t bytes, bool& owns_cpu_ptr, Tensor& field) {
         if (!cpu_ptr || bytes == 0 || !is_device_pointer(cpu_ptr)) {
             return;
         }
@@ -538,14 +545,10 @@ private:
     }
 
     void ensure_host_backing(QuantizedTensor& tensor, TensorEntry& entry) {
-        maybe_stage_one_component(entry.cpu_data, entry.cpu_data_bytes,
-                                  entry.owns_cpu_data, tensor.data);
-        maybe_stage_one_component(entry.cpu_scales, entry.cpu_scales_bytes,
-                                  entry.owns_cpu_scales, tensor.scales);
-        maybe_stage_one_component(entry.cpu_meta, entry.cpu_meta_bytes,
-                                  entry.owns_cpu_meta, tensor.meta);
-        maybe_stage_one_component(entry.cpu_meta2, entry.cpu_meta2_bytes,
-                                  entry.owns_cpu_meta2, tensor.meta2);
+        maybe_stage_one_component(entry.cpu_data, entry.cpu_data_bytes, entry.owns_cpu_data, tensor.data);
+        maybe_stage_one_component(entry.cpu_scales, entry.cpu_scales_bytes, entry.owns_cpu_scales, tensor.scales);
+        maybe_stage_one_component(entry.cpu_meta, entry.cpu_meta_bytes, entry.owns_cpu_meta, tensor.meta);
+        maybe_stage_one_component(entry.cpu_meta2, entry.cpu_meta2_bytes, entry.owns_cpu_meta2, tensor.meta2);
     }
 
     void free_owned_host_buffers(Group& group) noexcept {
@@ -595,9 +598,8 @@ private:
 // Factory function
 // =============================================================================
 
-std::unique_ptr<OffloadManager> create_offload_manager(
-    const OffloadConfig& config,
-    const std::shared_ptr<TensorAllocator>& allocator) {
+std::unique_ptr<OffloadManager> create_offload_manager(const OffloadConfig& config,
+                                                       const std::shared_ptr<TensorAllocator>& allocator) {
     return std::make_unique<OffloadManagerImpl>(config, allocator);
 }
 

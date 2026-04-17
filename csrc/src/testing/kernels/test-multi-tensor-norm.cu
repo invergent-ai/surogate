@@ -33,7 +33,7 @@ double ref_norm_squared_prescaled(const std::vector<float>& vals, float prescale
     return sum;
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("multi-tensor amax: single FP32 tensor", "[kernels][multi-tensor-norm][gpu]") {
     if (!cuda_available()) SKIP("CUDA not available");
@@ -93,7 +93,8 @@ TEST_CASE("multi-tensor amax: mixed FP32 + BF16 tensors", "[kernels][multi-tenso
     // BF16 tensor: max abs = 7.0
     std::vector<float> h_bf16_float = {-7.0f, 3.0f, 0.5f, 1.0f};
     std::vector<nv_bfloat16> h_bf16(h_bf16_float.size());
-    for (size_t i = 0; i < h_bf16_float.size(); ++i) h_bf16[i] = __float2bfloat16(h_bf16_float[i]);
+    for (size_t i = 0; i < h_bf16_float.size(); ++i)
+        h_bf16[i] = __float2bfloat16(h_bf16_float[i]);
 
     float* d_fp32 = nullptr;
     nv_bfloat16* d_bf16 = nullptr;
@@ -136,7 +137,8 @@ TEST_CASE("multi-tensor amax: mixed FP32 + BF16 tensors", "[kernels][multi-tenso
     CUDA_CHECK(cudaFree(d_amax));
 }
 
-TEST_CASE("multi-tensor prescaled norm²: matches sequential per-tensor computation", "[kernels][multi-tensor-norm][gpu]") {
+TEST_CASE("multi-tensor prescaled norm²: matches sequential per-tensor computation",
+          "[kernels][multi-tensor-norm][gpu]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     cudaDeviceProp dp{};
@@ -147,7 +149,8 @@ TEST_CASE("multi-tensor prescaled norm²: matches sequential per-tensor computat
     std::vector<float> h_fp32 = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
     std::vector<float> h_bf16_float = {6.0f, 7.0f, 8.0f};
     std::vector<nv_bfloat16> h_bf16(h_bf16_float.size());
-    for (size_t i = 0; i < h_bf16_float.size(); ++i) h_bf16[i] = __float2bfloat16(h_bf16_float[i]);
+    for (size_t i = 0; i < h_bf16_float.size(); ++i)
+        h_bf16[i] = __float2bfloat16(h_bf16_float[i]);
 
     float* d_fp32 = nullptr;
     nv_bfloat16* d_bf16 = nullptr;
@@ -209,7 +212,8 @@ TEST_CASE("multi-tensor prescaled norm²: matches sequential per-tensor computat
     // Reference: sum((val / 8)^2) for all values
     std::vector<float> all_vals = h_fp32;
     // BF16 values have rounding, use the BF16-rounded values
-    for (auto bf : h_bf16) all_vals.push_back(__bfloat162float(bf));
+    for (auto bf : h_bf16)
+        all_vals.push_back(__bfloat162float(bf));
     double ref = ref_norm_squared_prescaled(all_vals, h_prescale);
 
     REQUIRE(h_sum_fused == Catch::Approx(h_sum_seq).epsilon(1e-5));
@@ -237,7 +241,8 @@ TEST_CASE("multi-tensor norm² (no prescale): matches sequential computation", "
     std::vector<float> h_fp32 = {1.0f, 2.0f, 3.0f};
     std::vector<float> h_bf16_float = {4.0f, 5.0f};
     std::vector<nv_bfloat16> h_bf16(h_bf16_float.size());
-    for (size_t i = 0; i < h_bf16_float.size(); ++i) h_bf16[i] = __float2bfloat16(h_bf16_float[i]);
+    for (size_t i = 0; i < h_bf16_float.size(); ++i)
+        h_bf16[i] = __float2bfloat16(h_bf16_float[i]);
 
     float* d_fp32 = nullptr;
     nv_bfloat16* d_bf16 = nullptr;
@@ -302,7 +307,8 @@ TEST_CASE("multi-tensor norm² (no prescale): matches sequential computation", "
     CUDA_CHECK(cudaFree(d_sum_seq));
 }
 
-TEST_CASE("multi-tensor prescaled norm²: large BF16 values use prescale to prevent overflow", "[kernels][multi-tensor-norm][gpu]") {
+TEST_CASE("multi-tensor prescaled norm²: large BF16 values use prescale to prevent overflow",
+          "[kernels][multi-tensor-norm][gpu]") {
     if (!cuda_available()) SKIP("CUDA not available");
 
     cudaDeviceProp dp{};
@@ -313,7 +319,8 @@ TEST_CASE("multi-tensor prescaled norm²: large BF16 values use prescale to prev
     const float large_val = 1.0e18f;
     const int count = 64;
     std::vector<nv_bfloat16> h_bf16(count);
-    for (int i = 0; i < count; ++i) h_bf16[i] = __float2bfloat16(large_val);
+    for (int i = 0; i < count; ++i)
+        h_bf16[i] = __float2bfloat16(large_val);
 
     nv_bfloat16* d_bf16 = nullptr;
     CUDA_CHECK(cudaMalloc(&d_bf16, count * sizeof(nv_bfloat16)));

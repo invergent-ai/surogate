@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from .. import nn
+from ..blocks.qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
+from ..hf import build_mlp_mappings, build_norm_mappings
 from ..nn import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
-from ..hf import build_norm_mappings, build_mlp_mappings
-from ..blocks.qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
 
 
 def _parse_qwen3_5_layer_types(
@@ -17,10 +17,7 @@ def _parse_qwen3_5_layer_types(
     """Convert HF layer_types to DSL HybridStackedBlocks types."""
     if layer_types is None:
         interval = max(1, int(full_attention_interval))
-        layer_types = [
-            "linear_attention" if ((i + 1) % interval) != 0 else "full_attention"
-            for i in range(n_layers)
-        ]
+        layer_types = ["linear_attention" if ((i + 1) % interval) != 0 else "full_attention" for i in range(n_layers)]
     if len(layer_types) != n_layers:
         raise ValueError(f"layer_types length ({len(layer_types)}) must match n_layers ({n_layers})")
 
@@ -31,9 +28,7 @@ def _parse_qwen3_5_layer_types(
         elif t == "full_attention":
             out.append("attention")
         else:
-            raise ValueError(
-                f"Unsupported Qwen3.5 layer type '{t}'. Expected 'linear_attention' or 'full_attention'."
-            )
+            raise ValueError(f"Unsupported Qwen3.5 layer type '{t}'. Expected 'linear_attention' or 'full_attention'.")
     return out
 
 
@@ -191,9 +186,11 @@ class Qwen3_5CausalModel(nn.Model):
             n_layers=n_layers,
             full_attention_interval=full_attention_interval,
         )
-        self.layer_types = layer_types if layer_types is not None else [
-            "linear_attention" if t == "mamba" else "full_attention" for t in self.block_types
-        ]
+        self.layer_types = (
+            layer_types
+            if layer_types is not None
+            else ["linear_attention" if t == "mamba" else "full_attention" for t in self.block_types]
+        )
         self.n_linear_blocks = sum(1 for t in self.block_types if t == "mamba")
         self.n_attn_blocks = sum(1 for t in self.block_types if t == "attention")
         self.has_linear_blocks = self.n_linear_blocks > 0
@@ -207,36 +204,44 @@ class Qwen3_5CausalModel(nn.Model):
         # Build block configs for HybridBlockStack
         block_configs = []
         if self.n_linear_blocks > 0:
-            block_configs.append((
-                "mamba_blocks", Qwen3_5LinearBlock, self.n_linear_blocks,
-                dict(
-                    d_model=d_model,
-                    d_ff=d_ff,
-                    linear_conv_kernel_dim=linear_conv_kernel_dim,
-                    linear_key_head_dim=linear_key_head_dim,
-                    linear_value_head_dim=linear_value_head_dim,
-                    linear_num_key_heads=linear_num_key_heads,
-                    linear_num_value_heads=linear_num_value_heads,
-                    chunk_size=chunk_size,
-                    eps=eps,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "mamba_blocks",
+                    Qwen3_5LinearBlock,
+                    self.n_linear_blocks,
+                    dict(
+                        d_model=d_model,
+                        d_ff=d_ff,
+                        linear_conv_kernel_dim=linear_conv_kernel_dim,
+                        linear_key_head_dim=linear_key_head_dim,
+                        linear_value_head_dim=linear_value_head_dim,
+                        linear_num_key_heads=linear_num_key_heads,
+                        linear_num_value_heads=linear_num_value_heads,
+                        chunk_size=chunk_size,
+                        eps=eps,
+                    ),
+                )
+            )
         if self.n_attn_blocks > 0:
-            block_configs.append((
-                "attn_blocks", Qwen3_5AttentionBlock, self.n_attn_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    eps=eps,
-                    use_qkv_bias=use_qkv_bias,
-                    partial_rotary_factor=partial_rotary_factor,
-                    mrope_section=mrope_section,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "attn_blocks",
+                    Qwen3_5AttentionBlock,
+                    self.n_attn_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        eps=eps,
+                        use_qkv_bias=use_qkv_bias,
+                        partial_rotary_factor=partial_rotary_factor,
+                        mrope_section=mrope_section,
+                    ),
+                )
+            )
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
@@ -253,10 +258,10 @@ class Qwen3_5CausalModel(nn.Model):
         # IO slots
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
-        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                                  aliases=["labels"])
-        self._register_activation("freq_cis", ("max_seq", "rotary_dim // 2", 2),
-                                  dtype="fp32", scope=G, aliases=["rope_freqs"])
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
+        self._register_activation(
+            "freq_cis", ("max_seq", "rotary_dim // 2", 2), dtype="fp32", scope=G, aliases=["rope_freqs"]
+        )
 
         # Global intermediate slots
         _h = ("B", "T", "d_model")
@@ -267,10 +272,8 @@ class Qwen3_5CausalModel(nn.Model):
         self._register_activation("residual_final", _h, scope=G)
         self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
         self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                                  save=True, scope=G)
-        self._register_activation("loss", ("B * T",), dtype="fp32",
-                                  aliases=["losses"], scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
         x = self.embedding(token_ids)
         residual = self._zeros(["B", "T", "d_model"])
@@ -370,9 +373,11 @@ class Qwen3_5ConditionalModel(nn.Model):
             n_layers=n_layers,
             full_attention_interval=full_attention_interval,
         )
-        self.layer_types = layer_types if layer_types is not None else [
-            "linear_attention" if t == "mamba" else "full_attention" for t in self.block_types
-        ]
+        self.layer_types = (
+            layer_types
+            if layer_types is not None
+            else ["linear_attention" if t == "mamba" else "full_attention" for t in self.block_types]
+        )
         self.n_linear_blocks = sum(1 for t in self.block_types if t == "mamba")
         self.n_attn_blocks = sum(1 for t in self.block_types if t == "attention")
         self.has_linear_blocks = self.n_linear_blocks > 0
@@ -385,36 +390,44 @@ class Qwen3_5ConditionalModel(nn.Model):
         # Build block configs for HybridBlockStack
         block_configs = []
         if self.n_linear_blocks > 0:
-            block_configs.append((
-                "mamba_blocks", Qwen3_5LinearBlock, self.n_linear_blocks,
-                dict(
-                    d_model=d_model,
-                    d_ff=d_ff,
-                    linear_conv_kernel_dim=linear_conv_kernel_dim,
-                    linear_key_head_dim=linear_key_head_dim,
-                    linear_value_head_dim=linear_value_head_dim,
-                    linear_num_key_heads=linear_num_key_heads,
-                    linear_num_value_heads=linear_num_value_heads,
-                    chunk_size=chunk_size,
-                    eps=eps,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "mamba_blocks",
+                    Qwen3_5LinearBlock,
+                    self.n_linear_blocks,
+                    dict(
+                        d_model=d_model,
+                        d_ff=d_ff,
+                        linear_conv_kernel_dim=linear_conv_kernel_dim,
+                        linear_key_head_dim=linear_key_head_dim,
+                        linear_value_head_dim=linear_value_head_dim,
+                        linear_num_key_heads=linear_num_key_heads,
+                        linear_num_value_heads=linear_num_value_heads,
+                        chunk_size=chunk_size,
+                        eps=eps,
+                    ),
+                )
+            )
         if self.n_attn_blocks > 0:
-            block_configs.append((
-                "attn_blocks", Qwen3_5AttentionBlock, self.n_attn_blocks,
-                dict(
-                    d_model=d_model,
-                    num_query_heads=num_query_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    d_ff=d_ff,
-                    max_seq=max_seq,
-                    eps=eps,
-                    use_qkv_bias=use_qkv_bias,
-                    partial_rotary_factor=partial_rotary_factor,
-                    mrope_section=mrope_section,
-                ),
-            ))
+            block_configs.append(
+                (
+                    "attn_blocks",
+                    Qwen3_5AttentionBlock,
+                    self.n_attn_blocks,
+                    dict(
+                        d_model=d_model,
+                        num_query_heads=num_query_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        d_ff=d_ff,
+                        max_seq=max_seq,
+                        eps=eps,
+                        use_qkv_bias=use_qkv_bias,
+                        partial_rotary_factor=partial_rotary_factor,
+                        mrope_section=mrope_section,
+                    ),
+                )
+            )
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
@@ -438,14 +451,16 @@ class Qwen3_5ConditionalModel(nn.Model):
         # IO slots
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
-        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
-                                  aliases=["labels"])
-        self._register_activation("visual_pos_masks", ("B", "T"), dtype="int32", scope=G,
-                                  description="Mask for visual token positions")
-        self._register_activation("visual_embeds", ("B * T", "d_model"), scope=G,
-                                  description="Visual embeddings (packed by mask)")
-        self._register_activation("freq_cis", ("max_seq", "rotary_dim // 2", 2),
-                                  dtype="fp32", scope=G, aliases=["rope_freqs"])
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
+        self._register_activation(
+            "visual_pos_masks", ("B", "T"), dtype="int32", scope=G, description="Mask for visual token positions"
+        )
+        self._register_activation(
+            "visual_embeds", ("B * T", "d_model"), scope=G, description="Visual embeddings (packed by mask)"
+        )
+        self._register_activation(
+            "freq_cis", ("max_seq", "rotary_dim // 2", 2), dtype="fp32", scope=G, aliases=["rope_freqs"]
+        )
 
         # Global intermediate slots
         _h = ("B", "T", "d_model")
@@ -456,10 +471,8 @@ class Qwen3_5ConditionalModel(nn.Model):
         self._register_activation("residual_final", _h, scope=G)
         self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
         self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
-        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
-                                  save=True, scope=G)
-        self._register_activation("loss", ("B * T",), dtype="fp32",
-                                  aliases=["losses"], scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32", save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32", aliases=["losses"], scope=G)
 
         # Embedding + visual injection
         x = self.embedding(token_ids)

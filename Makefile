@@ -12,7 +12,7 @@ CUDA_HOME ?= $(or $(CUDA_PATH),$(shell dirname $$(dirname $$(which nvcc 2>/dev/n
 export CCACHE_CUDA_PATHS := $(CUDA_HOME)
 endif
 
-.PHONY: all build export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all help info
+.PHONY: all build export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all help info format format-check format-cpp format-py lint-py
 
 # Default target
 all: build
@@ -70,6 +70,52 @@ wheel-dev: configure
 	cp -f $(BUILD_DIR)/_surogate*.so .venv/lib/python3.12/site-packages/surogate/
 	cp -f $(BUILD_DIR)/libsurogate-common.so surogate/
 	cp -f $(BUILD_DIR)/libsurogate-common.so .venv/lib/python3.12/site-packages/surogate/
+
+# ==============================================================================
+# Format / Lint
+# ==============================================================================
+# `make format`       - format C++/CUDA with clang-format + Python with ruff
+# `make format-check` - verify everything is already formatted (CI-friendly)
+#
+# Requirements:
+#   clang-format (>= 18 recommended)  apt install clang-format
+#   ruff                              pip install ruff  (or uv tool install ruff)
+
+CLANG_FORMAT ?= clang-format
+RUFF         ?= ruff
+
+# Files to format: C++/CUDA under csrc/src, excluding vendored + generated.
+CPP_SRC_FIND := find csrc/src \
+    \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \
+       -o -name '*.h' -o -name '*.hpp' -o -name '*.hh' \
+       -o -name '*.cu' -o -name '*.cuh' \) \
+    ! -path 'csrc/src/third_party/*'
+
+format-cpp:
+	@echo "==> clang-format (C++/CUDA)"
+	@$(CPP_SRC_FIND) -print0 | xargs -0 $(CLANG_FORMAT) -i
+
+format-py:
+	@echo "==> ruff format (Python)"
+	@$(RUFF) format surogate tests 2>/dev/null || $(RUFF) format surogate
+	@echo "==> ruff check --fix (Python; non-blocking for remaining lint issues)"
+	@$(RUFF) check --fix surogate tests 2>/dev/null || \
+	  $(RUFF) check --fix surogate || \
+	  echo "    (some lint issues remain — run 'make lint-py' to see them)"
+
+lint-py:
+	@$(RUFF) check surogate tests 2>/dev/null || $(RUFF) check surogate
+
+format: format-cpp format-py
+	@echo "==> done"
+
+format-check:
+	@echo "==> clang-format --dry-run"
+	@$(CPP_SRC_FIND) -print0 | xargs -0 $(CLANG_FORMAT) --dry-run --Werror
+	@echo "==> ruff format --check"
+	@$(RUFF) format --check surogate tests 2>/dev/null || $(RUFF) format --check surogate
+	@echo "==> ruff check"
+	@$(RUFF) check surogate tests 2>/dev/null || $(RUFF) check surogate
 
 # ==============================================================================
 # Testing Targets
@@ -141,6 +187,12 @@ help:
 	@echo "  wheel            - Build Python wheel using uv"
 	@echo "  wheel-dev        - Build Python wheel in development mode"
 	@echo "  configure        - Run CMake configuration"
+	@echo ""
+	@echo "Format Targets:"
+	@echo "  format           - Format C++/CUDA (clang-format) and Python (ruff)"
+	@echo "  format-cpp       - Only format C++/CUDA under csrc/src"
+	@echo "  format-py        - Only format Python under surogate/"
+	@echo "  format-check     - Verify formatting is clean (exits nonzero if not)"
 	@echo ""
 	@echo "Test Targets:"
 	@echo "  build-tests      - Build test executables without running them"

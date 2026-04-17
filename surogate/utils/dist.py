@@ -7,6 +7,7 @@ def is_ray_worker() -> bool:
     """
     try:
         import ray
+
         if not ray.is_initialized():
             return False
 
@@ -28,6 +29,7 @@ def is_ray_head() -> bool:
     """
     try:
         import ray
+
         if not ray.is_initialized():
             # Not in Ray context, assume head/driver
             return True
@@ -50,6 +52,7 @@ def get_ray_worker_rank() -> int:
     """
     try:
         import ray
+
         if not ray.is_initialized() or not is_ray_worker():
             return -1
 

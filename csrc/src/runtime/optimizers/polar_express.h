@@ -23,13 +23,11 @@ constexpr int POLAR_EXPRESS_ITERATIONS = 5;
 //   A = X @ X.T
 //   B = b*A + c*(A @ A)
 //   X = a*X + B @ X
-constexpr float POLAR_EXPRESS_COEFFS[5][3] = {
-    {8.156554524902461f, -22.48329292557795f, 15.878769915207462f},
-    {4.042929935166739f, -2.808917465908714f, 0.5000178451051316f},
-    {3.8916678022926607f, -2.772484153217685f, 0.5060648178503393f},
-    {3.285753657755655f, -2.3681294933425376f, 0.46449024233003106f},
-    {2.3465413258596377f, -1.7097828382687081f, 0.42323551169305323f}
-};
+constexpr float POLAR_EXPRESS_COEFFS[5][3] = {{8.156554524902461f, -22.48329292557795f, 15.878769915207462f},
+                                              {4.042929935166739f, -2.808917465908714f, 0.5000178451051316f},
+                                              {3.8916678022926607f, -2.772484153217685f, 0.5060648178503393f},
+                                              {3.285753657755655f, -2.3681294933425376f, 0.46449024233003106f},
+                                              {2.3465413258596377f, -1.7097828382687081f, 0.42323551169305323f}};
 
 /**
  * @brief Compute symmetric matrix multiplication C = X @ X.T
@@ -44,14 +42,7 @@ constexpr float POLAR_EXPRESS_COEFFS[5][3] = {
  * @param K Number of columns in X
  * @param stream CUDA stream for async execution
  */
-void XXT(
-    const nv_bfloat16* X,
-    nv_bfloat16* C,
-    int batch,
-    int M,
-    int K,
-    cudaStream_t stream
-);
+void XXT(const nv_bfloat16* X, nv_bfloat16* C, int batch, int M, int K, cudaStream_t stream);
 
 /**
  * @brief Compute fused operation C = beta*A + alpha*(A @ A.T)
@@ -67,15 +58,7 @@ void XXT(
  * @param beta Coefficient for A term
  * @param stream CUDA stream
  */
-void ba_plus_cAA(
-    const nv_bfloat16* A,
-    nv_bfloat16* C,
-    int batch,
-    int M,
-    float alpha,
-    float beta,
-    cudaStream_t stream
-);
+void ba_plus_cAA(const nv_bfloat16* A, nv_bfloat16* C, int batch, int M, float alpha, float beta, cudaStream_t stream);
 
 /**
  * @brief Compute Frobenius norm of matrix and return scaling factor
@@ -89,14 +72,7 @@ void ba_plus_cAA(
  * @param K Columns
  * @param stream CUDA stream
  */
-void compute_spectral_scale(
-    const nv_bfloat16* X,
-    float* scale,
-    int batch,
-    int M,
-    int K,
-    cudaStream_t stream
-);
+void compute_spectral_scale(const nv_bfloat16* X, float* scale, int batch, int M, int K, cudaStream_t stream);
 
 /**
  * @brief Apply scaling factor to matrix: X = X * scale
@@ -108,14 +84,7 @@ void compute_spectral_scale(
  * @param K Columns
  * @param stream CUDA stream
  */
-void apply_scale(
-    nv_bfloat16* X,
-    const float* scale,
-    int batch,
-    int M,
-    int K,
-    cudaStream_t stream
-);
+void apply_scale(nv_bfloat16* X, const float* scale, int batch, int M, int K, cudaStream_t stream);
 
 /**
  * @brief Add scaled matrix: C = alpha * A + C
@@ -128,15 +97,7 @@ void apply_scale(
  * @param N Cols
  * @param stream CUDA stream
  */
-void axpy_matrix(
-    const nv_bfloat16* A,
-    nv_bfloat16* C,
-    float alpha,
-    int batch,
-    int M,
-    int N,
-    cudaStream_t stream
-);
+void axpy_matrix(const nv_bfloat16* A, nv_bfloat16* C, float alpha, int batch, int M, int N, cudaStream_t stream);
 
 /**
  * @brief Full Polar Express orthogonalization
@@ -162,15 +123,13 @@ void axpy_matrix(
  * @param N Cols of input
  * @param stream CUDA stream
  */
-void polar_express(
-    cublasHandle_t handle,
-    nv_bfloat16* G,
-    nv_bfloat16* workspace,
-    int batch,
-    int M,
-    int N,
-    cudaStream_t stream
-);
+void polar_express(cublasHandle_t handle,
+                   nv_bfloat16* G,
+                   nv_bfloat16* workspace,
+                   int batch,
+                   int M,
+                   int N,
+                   cudaStream_t stream);
 
 /**
  * @brief Calculate workspace size needed for polar_express
@@ -182,6 +141,6 @@ void polar_express(
  */
 size_t polar_express_workspace_size(int batch, int M, int N);
 
-} // namespace optimizers
+}  // namespace optimizers
 
-#endif // SUROGATE_SRC_MODULES_OPTIMIZERS_POLAR_EXPRESS_H
+#endif  // SUROGATE_SRC_MODULES_OPTIMIZERS_POLAR_EXPRESS_H

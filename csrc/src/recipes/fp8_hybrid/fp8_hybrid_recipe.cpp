@@ -38,9 +38,20 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         std::optional<Tensor> bias_opt = ctx.has_bias() ? std::make_optional(*ctx.bias) : std::nullopt;
         // BF16 forward: out = inp @ weight.T, using same layout as base Recipe class
         // Weight is (N, K), inp is (M, K), out is (M, N)
-        matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt, nullptr, nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        matmul(*ctx.out,
+               *ctx.weight,
+               *ctx.inp,
+               bias_opt,
+               nullptr,
+               nullptr,
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               N,
+               M,
+               K,
+               EMMTranspose::TN,
+               /*accumulate=*/false,
+               ctx.stream);
         return;
     }
 
@@ -60,9 +71,8 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
 
     // Verify inp_quant is FP8 E4M3
     if (inp_fp8.DType != ETensorDType::FP8_E4M3) {
-        throw std::runtime_error(std::string(
-            "FP8HybridRecipe::forward_matmul: inp_quant should be E4M3, got ") +
-            dtype_to_str(inp_fp8.DType));
+        throw std::runtime_error(std::string("FP8HybridRecipe::forward_matmul: inp_quant should be E4M3, got ") +
+                                 dtype_to_str(inp_fp8.DType));
     }
 
     // Step 1: Quantize input to FP8 E4M3
@@ -77,8 +87,8 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
                 auto qidx = static_cast<modules::QuantizerIndex>(ctx.delayed_quantizer_idx);
                 // Verify input dtype before calling typed function
                 if (ctx.inp->DType != ETensorDType::BF16) {
-                    throw std::runtime_error(std::string(
-                        "FP8HybridRecipe::forward_matmul: delayed scaling requires BF16 input, got ") +
+                    throw std::runtime_error(
+                        std::string("FP8HybridRecipe::forward_matmul: delayed scaling requires BF16 input, got ") +
                         dtype_to_str(ctx.inp->DType));
                 }
                 quantize_with_delayed_scale(
@@ -87,16 +97,28 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
                     inp_fp8.scale(),
                     ctx.inp->get<nv_bfloat16>(),
                     scaling_state->get_scale(qidx),
-                    num_elements, rs.DeviceProp, ctx.stream);
+                    num_elements,
+                    rs.DeviceProp,
+                    ctx.stream);
             } else {
                 // Fallback to JIT scaling
-                quantize_with_abs_max(inp_fp8, inp_fp8.scale(), *ctx.inp, inp_fp8.abs_max(),
-                                      num_elements, rs.DeviceProp, ctx.stream);
+                quantize_with_abs_max(inp_fp8,
+                                      inp_fp8.scale(),
+                                      *ctx.inp,
+                                      inp_fp8.abs_max(),
+                                      num_elements,
+                                      rs.DeviceProp,
+                                      ctx.stream);
             }
         } else {
             // JIT scaling: compute abs_max and scale on-the-fly
-            quantize_with_abs_max(inp_fp8, inp_fp8.scale(), *ctx.inp, inp_fp8.abs_max(),
-                                  num_elements, rs.DeviceProp, ctx.stream);
+            quantize_with_abs_max(inp_fp8,
+                                  inp_fp8.scale(),
+                                  *ctx.inp,
+                                  inp_fp8.abs_max(),
+                                  num_elements,
+                                  rs.DeviceProp,
+                                  ctx.stream);
         }
     }
 
@@ -108,10 +130,20 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
 
     // Helper: BF16 fallback matmul (used when FP8 is rejected by cuBLASLt)
     auto bf16_fallback = [&]() {
-        matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt,
-               /*scale_a=*/nullptr, /*scale_b=*/nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        matmul(*ctx.out,
+               *ctx.weight,
+               *ctx.inp,
+               bias_opt,
+               /*scale_a=*/nullptr,
+               /*scale_b=*/nullptr,
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               N,
+               M,
+               K,
+               EMMTranspose::TN,
+               /*accumulate=*/false,
+               ctx.stream);
     };
 
     // QLoRA-FP8: Check for cached FP8 weight from weight provider first
@@ -120,38 +152,77 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         // Use pre-cached FP8 weight (from QLoRA weight manager)
         float* weight_scale = const_cast<Tensor*>(ctx.cached_weight)->scale();
         try {
-            matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
-                   weight_scale, inp_fp8.scale(),
-                   rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+            matmul(*ctx.out,
+                   *ctx.cached_weight,
+                   inp_fp8,
+                   bias_opt,
+                   weight_scale,
+                   inp_fp8.scale(),
+                   rs.CublasLtHandle,
+                   rs.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   EMMTranspose::TN,
+                   /*accumulate=*/false,
+                   ctx.stream);
         } catch (const std::runtime_error& e) {
             static bool warned = false;
-            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            if (!warned) {
+                fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what());
+                warned = true;
+            }
             bf16_fallback();
         }
     } else if (ctx.weight->DType == ETensorDType::FP8_E4M3) {
         // Weight already FP8 (persistent quantization mode)
         try {
-            matmul(*ctx.out, *ctx.weight, inp_fp8, bias_opt,
-                   ctx.weight->scale(), inp_fp8.scale(),
-                   rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+            matmul(*ctx.out,
+                   *ctx.weight,
+                   inp_fp8,
+                   bias_opt,
+                   ctx.weight->scale(),
+                   inp_fp8.scale(),
+                   rs.CublasLtHandle,
+                   rs.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   EMMTranspose::TN,
+                   /*accumulate=*/false,
+                   ctx.stream);
         } catch (const std::runtime_error& e) {
             static bool warned = false;
-            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            if (!warned) {
+                fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what());
+                warned = true;
+            }
             bf16_fallback();
         }
     } else if (ctx.cached_weight && ctx.cached_weight->Data) {
         // Use pre-cached FP8 weight (from weight manager)
         float* weight_scale = const_cast<Tensor*>(ctx.cached_weight)->scale();
         try {
-            matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
-                   weight_scale, inp_fp8.scale(),
-                   rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+            matmul(*ctx.out,
+                   *ctx.cached_weight,
+                   inp_fp8,
+                   bias_opt,
+                   weight_scale,
+                   inp_fp8.scale(),
+                   rs.CublasLtHandle,
+                   rs.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   EMMTranspose::TN,
+                   /*accumulate=*/false,
+                   ctx.stream);
         } catch (const std::runtime_error& e) {
             static bool warned = false;
-            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            if (!warned) {
+                fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what());
+                warned = true;
+            }
             bf16_fallback();
         }
     } else if (ctx.weight->DType == ETensorDType::BF16) {
@@ -162,21 +233,39 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
 
         // Compute abs_max and quantize weight to FP8
         abs_max(weight_fp8.abs_max(), *ctx.weight, static_cast<long>(N) * K, rs.DeviceProp, ctx.stream);
-        quantize_with_abs_max(weight_fp8, weight_fp8.scale(), *ctx.weight, weight_fp8.abs_max(),
-                              static_cast<long>(N) * K, rs.DeviceProp, ctx.stream);
+        quantize_with_abs_max(weight_fp8,
+                              weight_fp8.scale(),
+                              *ctx.weight,
+                              weight_fp8.abs_max(),
+                              static_cast<long>(N) * K,
+                              rs.DeviceProp,
+                              ctx.stream);
 
         // FP8 x FP8 matmul with BF16 fallback (free temps in both paths)
         try {
-            matmul(*ctx.out, weight_fp8, inp_fp8, bias_opt,
-                   weight_fp8.scale(), inp_fp8.scale(),
-                   rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+            matmul(*ctx.out,
+                   weight_fp8,
+                   inp_fp8,
+                   bias_opt,
+                   weight_fp8.scale(),
+                   inp_fp8.scale(),
+                   rs.CublasLtHandle,
+                   rs.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   EMMTranspose::TN,
+                   /*accumulate=*/false,
+                   ctx.stream);
         } catch (const std::runtime_error& e) {
             // Free temps before fallback to keep stack consistent
             rs.temp_free(weight_stats);
             rs.temp_free(weight_fp8);
             static bool warned = false;
-            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            if (!warned) {
+                fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what());
+                warned = true;
+            }
             bf16_fallback();
             return;
         }
@@ -211,25 +300,55 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;
-        const int C = ctx.C_in;   // Input channels
-        const int OC = ctx.C_out; // Output channels
+        const int C = ctx.C_in;    // Input channels
+        const int OC = ctx.C_out;  // Output channels
 
         // dinp = W^T @ dout (always needed for gradient flow)
         // Use Tensor-based matmul identical to backward_qmm
-        matmul(*ctx.dinp, *ctx.weight, *ctx.dout, std::nullopt, nullptr, nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               C, B * T, OC, EMMTranspose::NN, /*accumulate=*/false, ctx.stream);
+        matmul(*ctx.dinp,
+               *ctx.weight,
+               *ctx.dout,
+               std::nullopt,
+               nullptr,
+               nullptr,
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               C,
+               B * T,
+               OC,
+               EMMTranspose::NN,
+               /*accumulate=*/false,
+               ctx.stream);
 
         // dweight = inp^T @ dout (skip if weights are frozen in LoRA-only mode)
         if (!ctx.skip_weight_grad && ctx.dweight) {
-            matmul(*ctx.dweight, *ctx.inp, *ctx.dout, std::nullopt, nullptr, nullptr,
-                   rs.CublasLtHandle, rs.CuBlasWorkspace,
-                   C, OC, B * T, EMMTranspose::NT, /*accumulate=*/ctx.accumulate, ctx.stream);
+            matmul(*ctx.dweight,
+                   *ctx.inp,
+                   *ctx.dout,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   rs.CublasLtHandle,
+                   rs.CuBlasWorkspace,
+                   C,
+                   OC,
+                   B * T,
+                   EMMTranspose::NT,
+                   /*accumulate=*/ctx.accumulate,
+                   ctx.stream);
 
             // Bias gradient if needed
             if (ctx.dbias && ctx.bias_buffer) {
-                backward_bias(*ctx.dbias, *ctx.dout, nullptr, nullptr, *ctx.bias_buffer,
-                              B, T, OC, rs.DeviceProp, ctx.stream);
+                backward_bias(*ctx.dbias,
+                              *ctx.dout,
+                              nullptr,
+                              nullptr,
+                              *ctx.bias_buffer,
+                              B,
+                              T,
+                              OC,
+                              rs.DeviceProp,
+                              ctx.stream);
             }
         }
         return;
@@ -250,19 +369,22 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
 
     // Verify dtypes
     if (dout_e5m2.DType != ETensorDType::FP8_E5M2) {
-        throw std::runtime_error(std::string(
-            "FP8HybridRecipe::backward_matmul: dout_quant should be E5M2, got ") +
-            dtype_to_str(dout_e5m2.DType));
+        throw std::runtime_error(std::string("FP8HybridRecipe::backward_matmul: dout_quant should be E5M2, got ") +
+                                 dtype_to_str(dout_e5m2.DType));
     }
     if (ctx.dout->DType != ETensorDType::BF16 && ctx.dout->DType != ETensorDType::FP32) {
-        throw std::runtime_error(std::string(
-            "FP8HybridRecipe::backward_matmul: dout should be BF16/FP32, got ") +
-            dtype_to_str(ctx.dout->DType));
+        throw std::runtime_error(std::string("FP8HybridRecipe::backward_matmul: dout should be BF16/FP32, got ") +
+                                 dtype_to_str(ctx.dout->DType));
     }
 
     // Step 1: Quantize upstream gradient to E5M2 (larger dynamic range for gradients)
-    quantize_with_abs_max(dout_e5m2, dout_e5m2.scale(), *ctx.dout, dout_e5m2.abs_max(),
-                          static_cast<long>(M) * N, rs.DeviceProp, ctx.stream);
+    quantize_with_abs_max(dout_e5m2,
+                          dout_e5m2.scale(),
+                          *ctx.dout,
+                          dout_e5m2.abs_max(),
+                          static_cast<long>(M) * N,
+                          rs.DeviceProp,
+                          ctx.stream);
 
     // Step 2: Get E4M3 weight for backward
     Tensor weight_e4m3{};
@@ -274,10 +396,8 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     // - If cached weight is (N, K), we treat it as W and still transpose each call.
     const Tensor* cached_fp8 = (ctx.cached_weight && ctx.cached_weight->Data) ? ctx.cached_weight : nullptr;
     const bool cached_is_fp8 = (cached_fp8 && cached_fp8->DType == ETensorDType::FP8_E4M3);
-    const bool cached_is_transposed = (cached_is_fp8 &&
-                                       cached_fp8->Rank == 2 &&
-                                       cached_fp8->Sizes[0] == K &&
-                                       cached_fp8->Sizes[1] == N);
+    const bool cached_is_transposed =
+        (cached_is_fp8 && cached_fp8->Rank == 2 && cached_fp8->Sizes[0] == K && cached_fp8->Sizes[1] == N);
 
     if (ctx.weight->DType == ETensorDType::FP8_E4M3) {
         // Weight already FP8 (e.g., QLoRA FP8 base)
@@ -285,8 +405,7 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         if (!weight_e4m3.scale()) {
             throw std::runtime_error("FP8HybridRecipe::backward_matmul: FP8 weight missing scale Stats");
         }
-    } else if (cached_is_fp8 && cached_fp8->Rank == 2 &&
-               cached_fp8->Sizes[0] == N && cached_fp8->Sizes[1] == K) {
+    } else if (cached_is_fp8 && cached_fp8->Rank == 2 && cached_fp8->Sizes[0] == N && cached_fp8->Sizes[1] == K) {
         // Use cached FP8 weight (non-transposed) and still transpose per call.
         weight_e4m3 = *cached_fp8;
         if (!weight_e4m3.scale()) {
@@ -299,8 +418,13 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         weight_e4m3.Stats = weight_stats.get<float>();
 
         abs_max(weight_e4m3.abs_max(), *ctx.weight, static_cast<long>(N) * K, rs.DeviceProp, ctx.stream);
-        quantize_with_abs_max(weight_e4m3, weight_e4m3.scale(), *ctx.weight, weight_e4m3.abs_max(),
-                              static_cast<long>(N) * K, rs.DeviceProp, ctx.stream);
+        quantize_with_abs_max(weight_e4m3,
+                              weight_e4m3.scale(),
+                              *ctx.weight,
+                              weight_e4m3.abs_max(),
+                              static_cast<long>(N) * K,
+                              rs.DeviceProp,
+                              ctx.stream);
         weight_is_temp = true;
     }
 
@@ -310,9 +434,20 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         if (!cached_fp8->scale()) {
             throw std::runtime_error("FP8HybridRecipe::backward_matmul: cached FP8 W^T missing scale Stats");
         }
-        matmul(*ctx.dinp, *cached_fp8, dout_e5m2, std::nullopt, cached_fp8->scale(), dout_e5m2.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        matmul(*ctx.dinp,
+               *cached_fp8,
+               dout_e5m2,
+               std::nullopt,
+               cached_fp8->scale(),
+               dout_e5m2.scale(),
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               K,
+               M,
+               N,
+               EMMTranspose::TN,
+               /*accumulate=*/false,
+               ctx.stream);
     } else {
         // Need to transpose weight: (N, K) -> (K, N)
         auto weight_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {K, N}, "weight_tp");
@@ -324,9 +459,20 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         cudaMemcpyAsync(weight_tp.scale(), weight_e4m3.scale(), sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream);
 
         // dinp = W^T @ dout: (K, N) × (N, M)^T = (K, M)^T -> (M, K)
-        matmul(*ctx.dinp, weight_tp, dout_e5m2, std::nullopt, weight_tp.scale(), dout_e5m2.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        matmul(*ctx.dinp,
+               weight_tp,
+               dout_e5m2,
+               std::nullopt,
+               weight_tp.scale(),
+               dout_e5m2.scale(),
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               K,
+               M,
+               N,
+               EMMTranspose::TN,
+               /*accumulate=*/false,
+               ctx.stream);
 
         rs.temp_free(weight_tp_stats);
         rs.temp_free(weight_tp);
@@ -345,13 +491,25 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
 
         // Use abs_max from forward pass if available
         if (ctx.inp_quant && ctx.inp_quant->abs_max()) {
-            quantize_and_transpose_with_abs_max(activation_tp, activation_tp.scale(), *ctx.inp, ctx.inp_quant->abs_max(),
-                                                M, K, rs.DeviceProp, ctx.stream);
+            quantize_and_transpose_with_abs_max(activation_tp,
+                                                activation_tp.scale(),
+                                                *ctx.inp,
+                                                ctx.inp_quant->abs_max(),
+                                                M,
+                                                K,
+                                                rs.DeviceProp,
+                                                ctx.stream);
         } else {
             // Compute abs_max and quantize
             abs_max(activation_tp.abs_max(), *ctx.inp, static_cast<long>(M) * K, rs.DeviceProp, ctx.stream);
-            quantize_and_transpose_with_abs_max(activation_tp, activation_tp.scale(), *ctx.inp, activation_tp.abs_max(),
-                                                M, K, rs.DeviceProp, ctx.stream);
+            quantize_and_transpose_with_abs_max(activation_tp,
+                                                activation_tp.scale(),
+                                                *ctx.inp,
+                                                activation_tp.abs_max(),
+                                                M,
+                                                K,
+                                                rs.DeviceProp,
+                                                ctx.stream);
         }
 
         // Transpose gradient to E5M2: (M, N) -> (N, M)
@@ -362,14 +520,33 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         cudaMemcpyAsync(grad_tp.scale(), dout_e5m2.scale(), sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream);
 
         // dweight = inp^T @ dout: (K, M) × (M, N)^T = (K, N)^T -> (N, K)
-        matmul(*ctx.dweight, activation_tp, grad_tp, std::nullopt, activation_tp.scale(), grad_tp.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               K, N, M, EMMTranspose::TN, /*accumulate=*/ctx.accumulate, ctx.stream);
+        matmul(*ctx.dweight,
+               activation_tp,
+               grad_tp,
+               std::nullopt,
+               activation_tp.scale(),
+               grad_tp.scale(),
+               rs.CublasLtHandle,
+               rs.CuBlasWorkspace,
+               K,
+               N,
+               M,
+               EMMTranspose::TN,
+               /*accumulate=*/ctx.accumulate,
+               ctx.stream);
 
         // Optional: compute dbias
         if (ctx.dbias && ctx.bias_buffer) {
-            backward_bias(*ctx.dbias, dout_e5m2, activation_tp.scale(), dout_e5m2.scale(), *ctx.bias_buffer,
-                          ctx.B, ctx.T, N, rs.DeviceProp, ctx.stream);
+            backward_bias(*ctx.dbias,
+                          dout_e5m2,
+                          activation_tp.scale(),
+                          dout_e5m2.scale(),
+                          *ctx.bias_buffer,
+                          ctx.B,
+                          ctx.T,
+                          N,
+                          rs.DeviceProp,
+                          ctx.stream);
         }
 
         rs.temp_free(grad_stats);
@@ -389,14 +566,20 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // Path 1: Pre-quantized FP8 weights (Weight-Only Quantization via cuDNN FE)
     // =========================================================================
     if (ctx.has_fp8_weights()) {
-        bool success = moe_cudnn_grouped_gemm_fp8(
-            ctx.out, ctx.inp,
-            ctx.weights_fp8, ctx.fp8_block_scales,
-            ctx.expert_offsets, ctx.num_experts,
-            ctx.N, ctx.K, ctx.total_tokens,
-            ctx.fp8_block_size,
-            ctx.cudnn_handle, ctx.workspace, ctx.workspace_size,
-            ctx.stream);
+        bool success = moe_cudnn_grouped_gemm_fp8(ctx.out,
+                                                  ctx.inp,
+                                                  ctx.weights_fp8,
+                                                  ctx.fp8_block_scales,
+                                                  ctx.expert_offsets,
+                                                  ctx.num_experts,
+                                                  ctx.N,
+                                                  ctx.K,
+                                                  ctx.total_tokens,
+                                                  ctx.fp8_block_size,
+                                                  ctx.cudnn_handle,
+                                                  ctx.workspace,
+                                                  ctx.workspace_size,
+                                                  ctx.stream);
 
         if (success) {
             return;
@@ -408,18 +591,16 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // Path 2: Full FP8 Training (quantize activations + use FP8 kernels)
     // =========================================================================
 
-    if (ctx.allow_fp8 && ctx.inp_quant && ctx.inp_quant->Data && ctx.run_state &&
-        ctx.cublas_handle && ctx.host_offsets) {
+    if (ctx.allow_fp8 && ctx.inp_quant && ctx.inp_quant->Data && ctx.run_state && ctx.cublas_handle &&
+        ctx.host_offsets) {
         IRunState& rs = *ctx.run_state;
         const long num_elements = static_cast<long>(ctx.total_tokens) * ctx.K;
 
         if (ctx.inp_quant->DType != ETensorDType::FP8_E4M3) {
-            throw std::runtime_error(
-                "FP8HybridRecipe::forward_moe_matmul: inp_quant should be E4M3");
+            throw std::runtime_error("FP8HybridRecipe::forward_moe_matmul: inp_quant should be E4M3");
         }
         if (!ctx.inp_quant->abs_max() || !ctx.inp_quant->scale()) {
-            throw std::runtime_error(
-                "FP8HybridRecipe::forward_moe_matmul: inp_quant missing abs_max/scale Stats");
+            throw std::runtime_error("FP8HybridRecipe::forward_moe_matmul: inp_quant missing abs_max/scale Stats");
         }
 
         Tensor& inp_fp8 = *ctx.inp_quant;
@@ -436,13 +617,14 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
                 inp_bf16.Sizes[0] = ctx.total_tokens;
                 inp_bf16.Sizes[1] = ctx.K;
 
-                quantize_with_delayed_scale(
-                    inp_fp8.get<__nv_fp8_e4m3>(),
-                    scaling_state->get_recorded_amax_ptr(qidx),
-                    inp_fp8.scale(),
-                    inp_bf16.get<nv_bfloat16>(),
-                    scaling_state->get_scale(qidx),
-                    num_elements, rs.DeviceProp, ctx.stream);
+                quantize_with_delayed_scale(inp_fp8.get<__nv_fp8_e4m3>(),
+                                            scaling_state->get_recorded_amax_ptr(qidx),
+                                            inp_fp8.scale(),
+                                            inp_bf16.get<nv_bfloat16>(),
+                                            scaling_state->get_scale(qidx),
+                                            num_elements,
+                                            rs.DeviceProp,
+                                            ctx.stream);
             }
         } else {
             // JIT scaling
@@ -453,8 +635,13 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
             inp_bf16.Sizes[0] = ctx.total_tokens;
             inp_bf16.Sizes[1] = ctx.K;
 
-            quantize_with_abs_max(inp_fp8, inp_fp8.scale(), inp_bf16, inp_fp8.abs_max(),
-                                  num_elements, rs.DeviceProp, ctx.stream);
+            quantize_with_abs_max(inp_fp8,
+                                  inp_fp8.scale(),
+                                  inp_bf16,
+                                  inp_fp8.abs_max(),
+                                  num_elements,
+                                  rs.DeviceProp,
+                                  ctx.stream);
         }
 
         // Step 2: Quantize expert weights to FP8 E4M3 (per-expert quantization)
@@ -469,23 +656,34 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
             float* scale_e = weight_scales.get<float>() + e;
 
             abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
-            quantize_with_abs_max(weight_fp8_e, scale_e, weight_e, abs_max_e,
-                                  static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+            quantize_with_abs_max(weight_fp8_e,
+                                  scale_e,
+                                  weight_e,
+                                  abs_max_e,
+                                  static_cast<long>(ctx.N) * ctx.K,
+                                  rs.DeviceProp,
+                                  ctx.stream);
         }
 
         // Step 3: FP8×FP8 MoE grouped GEMM
-        moe_grouped_gemm(
-            ctx.out,
-            inp_fp8.get<__nv_fp8_e4m3>(),
-            weights_fp8.get<__nv_fp8_e4m3>(),
-            inp_fp8.scale(),
-            weight_scales.get<float>(),
-            ctx.expert_offsets, ctx.num_experts,
-            ctx.N, ctx.K,
-            reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle), ctx.stream,
-            ctx.host_offsets,
-            1.0f, 0.0f, EMMTranspose::TN,
-            ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
+        moe_grouped_gemm(ctx.out,
+                         inp_fp8.get<__nv_fp8_e4m3>(),
+                         weights_fp8.get<__nv_fp8_e4m3>(),
+                         inp_fp8.scale(),
+                         weight_scales.get<float>(),
+                         ctx.expert_offsets,
+                         ctx.num_experts,
+                         ctx.N,
+                         ctx.K,
+                         reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle),
+                         ctx.stream,
+                         ctx.host_offsets,
+                         1.0f,
+                         0.0f,
+                         EMMTranspose::TN,
+                         ctx.active_experts,
+                         ctx.weight_is_compact,
+                         ctx.num_active);
 
         rs.temp_free(weight_scales);
         rs.temp_free(weight_amax);
@@ -523,12 +721,10 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
     // Use FP8 backward if buffers are available
     if (ctx.dout_quant && ctx.dout_quant->Data && ctx.cublas_handle && ctx.host_offsets) {
         if (ctx.dout_quant->DType != ETensorDType::FP8_E5M2) {
-            throw std::runtime_error(
-                "FP8HybridRecipe::backward_moe_matmul: dout_quant should be E5M2");
+            throw std::runtime_error("FP8HybridRecipe::backward_moe_matmul: dout_quant should be E5M2");
         }
         if (!ctx.dout_quant->abs_max() || !ctx.dout_quant->scale()) {
-            throw std::runtime_error(
-                "FP8HybridRecipe::backward_moe_matmul: dout_quant missing abs_max/scale Stats");
+            throw std::runtime_error("FP8HybridRecipe::backward_moe_matmul: dout_quant missing abs_max/scale Stats");
         }
 
         IRunState& rs = *ctx.run_state;
@@ -543,8 +739,13 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
         dout_bf16.Sizes[0] = ctx.total_tokens;
         dout_bf16.Sizes[1] = ctx.N;
 
-        quantize_with_abs_max(dout_e5m2, dout_e5m2.scale(), dout_bf16, dout_e5m2.abs_max(),
-                              num_elements, rs.DeviceProp, ctx.stream);
+        quantize_with_abs_max(dout_e5m2,
+                              dout_e5m2.scale(),
+                              dout_bf16,
+                              dout_e5m2.abs_max(),
+                              num_elements,
+                              rs.DeviceProp,
+                              ctx.stream);
 
         // Step 2: Quantize expert weights to E4M3
         Tensor weights_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_e4m3");
@@ -558,22 +759,31 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
             float* scale_e = weight_scales.get<float>() + e;
 
             abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
-            quantize_with_abs_max(weight_fp8_e, scale_e, weight_e, abs_max_e,
-                                  static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+            quantize_with_abs_max(weight_fp8_e,
+                                  scale_e,
+                                  weight_e,
+                                  abs_max_e,
+                                  static_cast<long>(ctx.N) * ctx.K,
+                                  rs.DeviceProp,
+                                  ctx.stream);
         }
 
         // Step 3: FP8 backward GEMM (E4M3 weights × E5M2 gradients → BF16 dinp)
-        moe_grouped_gemm_up_backward(
-            ctx.dinp,
-            dout_e5m2.get<__nv_fp8_e5m2>(),
-            weights_e4m3.get<__nv_fp8_e4m3>(),
-            dout_e5m2.scale(),
-            weight_scales.get<float>(),
-            ctx.expert_offsets, ctx.num_experts,
-            ctx.K, ctx.N,
-            reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle), ctx.stream,
-            ctx.host_offsets,
-            ctx.active_experts, ctx.weight_is_compact, ctx.num_active);
+        moe_grouped_gemm_up_backward(ctx.dinp,
+                                     dout_e5m2.get<__nv_fp8_e5m2>(),
+                                     weights_e4m3.get<__nv_fp8_e4m3>(),
+                                     dout_e5m2.scale(),
+                                     weight_scales.get<float>(),
+                                     ctx.expert_offsets,
+                                     ctx.num_experts,
+                                     ctx.K,
+                                     ctx.N,
+                                     reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle),
+                                     ctx.stream,
+                                     ctx.host_offsets,
+                                     ctx.active_experts,
+                                     ctx.weight_is_compact,
+                                     ctx.num_active);
 
         rs.temp_free(weight_scales);
         rs.temp_free(weight_amax);

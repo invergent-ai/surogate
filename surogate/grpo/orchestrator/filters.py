@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import verifiers as vf
+
 from surogate.utils.logger import get_logger
 
 logger = get_logger()

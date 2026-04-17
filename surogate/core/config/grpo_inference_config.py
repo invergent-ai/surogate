@@ -1,9 +1,9 @@
 from argparse import Namespace
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
+from surogate.grpo.utils.utils import rsetattr
 from surogate.utils.dict import DictDefault
-from surogate.grpo.utils.utils import rgetattr, rsetattr
 from surogate.utils.logger import get_logger
 
 # TODO: Set thinking/ solution budget
@@ -25,6 +25,7 @@ All2AllBackend = Literal[
     "naive",
     "pplx",
 ]
+
 
 @dataclass
 class GRPOInferenceConfig:
@@ -60,40 +61,40 @@ class GRPOInferenceConfig:
     """
 
     # VLLM server configuration
-    host: Optional[str] = None
-    port: Optional[int] = 8000
+    host: str | None = None
+    port: int | None = 8000
 
     # Model configuration (formerly ModelConfig)
-    model: Optional[str] = None
-    dtype: Optional[Literal["auto", "float16", "bfloat16", "float32"]] = "auto"
-    max_model_len: Optional[int] = None
-    enforce_eager: Optional[bool] = False
-    trust_remote_code: Optional[bool] = False
-    enable_auto_tool_choice: Optional[bool] = False
-    tool_call_parser: Optional[str] = "hermes"
-    reasoning_parser: Optional[str] = None
-    rope_scaling: Optional[dict[str, Any] | str] = None
+    model: str | None = None
+    dtype: Literal["auto", "float16", "bfloat16", "float32"] | None = "auto"
+    max_model_len: int | None = None
+    enforce_eager: bool | None = False
+    trust_remote_code: bool | None = False
+    enable_auto_tool_choice: bool | None = False
+    tool_call_parser: str | None = "hermes"
+    reasoning_parser: str | None = None
+    rope_scaling: dict[str, Any] | str | None = None
 
     # Parallel configuration (formerly ParallelConfig)
-    tp: Optional[int] = 1
-    dp: Optional[int] = 1
+    tp: int | None = 1
+    dp: int | None = 1
 
-    enable_lora: Optional[bool] = True
-    max_loras: Optional[int] = 8
+    enable_lora: bool | None = True
+    max_loras: int | None = 8
     # TODO: The default value is very high because our areal impl for lora isn't ideal
     # We add a lora with the same name instead of changing weights inplace
     # Because we dont cancel requests that are past max_async, these requests could be using a LoRA that gets unloaded which will crash the inference server
-    max_cpu_loras: Optional[int] = 100
-    max_lora_rank: Optional[int] = None
-    enable_prefix_caching: Optional[bool] = None
-    gpu_memory_utilization: Optional[float] = 0.9
-    api_server_count: Optional[int] = 1
-    seed: Optional[int] = 0
+    max_cpu_loras: int | None = 100
+    max_lora_rank: int | None = None
+    enable_prefix_caching: bool | None = None
+    gpu_memory_utilization: float | None = 0.9
+    api_server_count: int | None = 1
+    seed: int | None = 0
     weight_broadcast_type: Literal["nccl", "filesystem", "colocate"] = "filesystem"
-    enable_expert_parallel: Optional[bool] = False
-    all2all_backend: Optional[All2AllBackend] = "allgather_reducescatter"
-    enable_eplb: Optional[bool] = False
-    
+    enable_expert_parallel: bool | None = False
+    all2all_backend: All2AllBackend | None = "allgather_reducescatter"
+    enable_eplb: bool | None = False
+
     def __init__(self, cfg: DictDefault):
         self.host = cfg.get("host", self.host)
         self.port = cfg.get("port", self.port)
@@ -133,7 +134,7 @@ class GRPOInferenceConfig:
             self.api_server_count = self.dp
 
         if self.enable_lora:
-            self.api_server_count = 1  # LoRA requires only one API server 
+            self.api_server_count = 1  # LoRA requires only one API server
 
     def to_vllm(self) -> Namespace:
         """Convert InferenceConfig to vLLM-compatible Namespace."""
@@ -179,8 +180,8 @@ class GRPOInferenceConfig:
         if hasattr(namespace, "rope_scaling"):
             if namespace.rope_scaling is None:
                 delattr(namespace, "rope_scaling")
-        
+
         rsetattr(namespace, "disable_uvicorn_access_log", "true")
         rsetattr(namespace, "language_model_only", "true")
-        
+
         return namespace

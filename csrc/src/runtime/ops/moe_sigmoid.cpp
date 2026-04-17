@@ -7,6 +7,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -47,32 +50,22 @@ void CompiledExecutor::dispatch_moe_sigmoid(const CompiledOp& op) {
 
     if (out_dtype == inp.DType) {
         if (inp.DType == ETensorDType::BF16) {
-            moe_sigmoid_forward(out.get<nv_bfloat16>(),
-                                inp.get<nv_bfloat16>(),
-                                num_elements, mRunState.MainStream);
+            moe_sigmoid_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), num_elements, mRunState.MainStream);
         } else if (inp.DType == ETensorDType::FP32) {
-            moe_sigmoid_forward(out.get<float>(),
-                                inp.get<float>(),
-                                num_elements, mRunState.MainStream);
+            moe_sigmoid_forward(out.get<float>(), inp.get<float>(), num_elements, mRunState.MainStream);
         } else {
             throw std::logic_error("moe_sigmoid_forward: unsupported input dtype");
         }
     } else if (out_dtype == ETensorDType::FP32 && inp.DType == ETensorDType::BF16) {
         Tensor inp_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape, "moe_sigmoid_inp_f32");
         mTemps.push_back(inp_f32);
-        convert_dtype(inp_f32.get<float>(), inp.get<nv_bfloat16>(),
-                      num_elements, mRunState.MainStream);
-        moe_sigmoid_forward(out.get<float>(),
-                            inp_f32.get<float>(),
-                            num_elements, mRunState.MainStream);
+        convert_dtype(inp_f32.get<float>(), inp.get<nv_bfloat16>(), num_elements, mRunState.MainStream);
+        moe_sigmoid_forward(out.get<float>(), inp_f32.get<float>(), num_elements, mRunState.MainStream);
     } else if (out_dtype == ETensorDType::BF16 && inp.DType == ETensorDType::FP32) {
         Tensor out_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape, "moe_sigmoid_out_f32");
         mTemps.push_back(out_f32);
-        moe_sigmoid_forward(out_f32.get<float>(),
-                            inp.get<float>(),
-                            num_elements, mRunState.MainStream);
-        convert_dtype(out.get<nv_bfloat16>(), out_f32.get<float>(),
-                      num_elements, mRunState.MainStream);
+        moe_sigmoid_forward(out_f32.get<float>(), inp.get<float>(), num_elements, mRunState.MainStream);
+        convert_dtype(out.get<nv_bfloat16>(), out_f32.get<float>(), num_elements, mRunState.MainStream);
     } else {
         throw std::logic_error("moe_sigmoid_forward: unsupported dtype conversion");
     }
@@ -101,45 +94,43 @@ void CompiledExecutor::dispatch_moe_sigmoid_backward(const CompiledOp& op) {
         if (d_out.DType == ETensorDType::BF16) {
             d_out_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape, "moe_sigmoid_backward_d_out_f32");
             mTemps.push_back(d_out_f32);
-            convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(),
-                          num_elements, mRunState.MainStream);
+            convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(), num_elements, mRunState.MainStream);
         } else if (d_out.DType != ETensorDType::FP32) {
             throw std::logic_error("moe_sigmoid_backward: unsupported d_out dtype");
         }
         if (sigmoid_out.DType == ETensorDType::BF16) {
             sig_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape, "moe_sigmoid_backward_sig_f32");
             mTemps.push_back(sig_f32);
-            convert_dtype(sig_f32.get<float>(), sigmoid_out.get<nv_bfloat16>(),
-                          num_elements, mRunState.MainStream);
+            convert_dtype(sig_f32.get<float>(), sigmoid_out.get<nv_bfloat16>(), num_elements, mRunState.MainStream);
         } else if (sigmoid_out.DType != ETensorDType::FP32) {
             throw std::logic_error("moe_sigmoid_backward: unsupported sigmoid_out dtype");
         }
         moe_sigmoid_backward(d_inp.get<float>(),
                              d_out_f32.get<float>(),
                              sig_f32.get<float>(),
-                             num_elements, mRunState.MainStream);
+                             num_elements,
+                             mRunState.MainStream);
     } else if (out_dtype == ETensorDType::BF16) {
         if (d_out.DType == ETensorDType::BF16 && sigmoid_out.DType == ETensorDType::BF16) {
             moe_sigmoid_backward(d_inp.get<nv_bfloat16>(),
                                  d_out.get<nv_bfloat16>(),
                                  sigmoid_out.get<nv_bfloat16>(),
-                                 num_elements, mRunState.MainStream);
+                                 num_elements,
+                                 mRunState.MainStream);
         } else {
             Tensor d_out_f32 = d_out;
             Tensor sig_f32 = sigmoid_out;
             if (d_out.DType == ETensorDType::BF16) {
                 d_out_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape, "moe_sigmoid_backward_d_out_f32");
                 mTemps.push_back(d_out_f32);
-                convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(),
-                              num_elements, mRunState.MainStream);
+                convert_dtype(d_out_f32.get<float>(), d_out.get<nv_bfloat16>(), num_elements, mRunState.MainStream);
             } else if (d_out.DType != ETensorDType::FP32) {
                 throw std::logic_error("moe_sigmoid_backward: unsupported d_out dtype");
             }
             if (sigmoid_out.DType == ETensorDType::BF16) {
                 sig_f32 = mRunState.temp_alloc(ETensorDType::FP32, d_inp_shape, "moe_sigmoid_backward_sig_f32");
                 mTemps.push_back(sig_f32);
-                convert_dtype(sig_f32.get<float>(), sigmoid_out.get<nv_bfloat16>(),
-                              num_elements, mRunState.MainStream);
+                convert_dtype(sig_f32.get<float>(), sigmoid_out.get<nv_bfloat16>(), num_elements, mRunState.MainStream);
             } else if (sigmoid_out.DType != ETensorDType::FP32) {
                 throw std::logic_error("moe_sigmoid_backward: unsupported sigmoid_out dtype");
             }
@@ -148,9 +139,9 @@ void CompiledExecutor::dispatch_moe_sigmoid_backward(const CompiledOp& op) {
             moe_sigmoid_backward(d_inp_f32.get<float>(),
                                  d_out_f32.get<float>(),
                                  sig_f32.get<float>(),
-                                 num_elements, mRunState.MainStream);
-            convert_dtype(d_inp.get<nv_bfloat16>(), d_inp_f32.get<float>(),
-                          num_elements, mRunState.MainStream);
+                                 num_elements,
+                                 mRunState.MainStream);
+            convert_dtype(d_inp.get<nv_bfloat16>(), d_inp_f32.get<float>(), num_elements, mRunState.MainStream);
         }
     } else {
         throw std::logic_error("moe_sigmoid_backward: unsupported output dtype");
@@ -159,5 +150,89 @@ void CompiledExecutor::dispatch_moe_sigmoid_backward(const CompiledOp& op) {
     store_tensor(op.outputs[0], d_inp);
 }
 
+namespace {
 
+// -----------------------------------------------------------------------------
+// MoE Sigmoid backward rule
+// Forward: probs = moe_sigmoid(logits)
+// Backward: d_logits = d_probs * probs * (1 - probs)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_sigmoid_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string out = fwd.outputs.empty() ? "out" : fwd.outputs[0];
+
+        ops.push_back(make_operation("moe_sigmoid_backward_" + std::to_string(ctx.op_counter++),
+                                     "moe_sigmoid_backward",
+                                     "moe_sigmoid_backward",
+                                     {ctx.d_output, saved_ref(out)},
+                                     {ctx.d_inputs[0]}));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("sigmoid", ::dsl::moe_sigmoid_backward);
+REGISTER_AUTODIFF("moe_sigmoid", ::dsl::moe_sigmoid_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// MoE Sigmoid: probs = moe_sigmoid(logits)
+// Input: [num_tokens, num_experts], Output: [num_tokens, num_experts]
+// ------------------------------------------------------------------------
+const int _moe_sigmoid_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "moe_sigmoid";
+    sig.min_inputs = 1;
+    sig.max_inputs = 1;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto& inputs, const auto& outputs, const AttrMap&, const ShapeEnv&) {
+        if (inputs.empty() || outputs.empty()) {
+            return std::make_optional(ShapeValidationError{"moe_sigmoid: missing inputs/outputs"});
+        }
+        // Output should have same shape as input
+        if (inputs[0] != outputs[0]) {
+            ShapeValidationError err;
+            err.message = "moe_sigmoid: output shape must match input shape";
+            return std::make_optional(err);
+        }
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+// ------------------------------------------------------------------------
+// MoE backward operations (accept all - shapes match forward counterparts)
+// ------------------------------------------------------------------------
+const int _moe_sigmoid_backward_shape_reg = [] {
+    // moe_sigmoid_backward
+    OpShapeSignature sig;
+    sig.op_name = "moe_sigmoid_backward";
+    sig.min_inputs = 2;
+    sig.max_inputs = 2;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

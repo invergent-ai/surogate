@@ -28,16 +28,15 @@ namespace {
 //   send_order[write_pos] = token_idx
 template <typename T>
 __global__ void ep_scatter_send_buffer_kernel(
-    T* __restrict__ send_buf,             // [total_tokens, hidden_size] output
-    const T* __restrict__ input,          // [total_tokens, hidden_size] expert-sorted
-    const int* __restrict__ expert_offsets,// [num_experts + 1]
-    const int* __restrict__ expert_to_gpu, // [num_experts] → GPU id
-    const int* __restrict__ peer_write_offsets, // [num_experts] per-expert write offset in send buf
-    int* __restrict__ send_order,         // [total_tokens] output: send_order[write_pos] = token_idx (may be null)
+    T* __restrict__ send_buf,                    // [total_tokens, hidden_size] output
+    const T* __restrict__ input,                 // [total_tokens, hidden_size] expert-sorted
+    const int* __restrict__ expert_offsets,      // [num_experts + 1]
+    const int* __restrict__ expert_to_gpu,       // [num_experts] → GPU id
+    const int* __restrict__ peer_write_offsets,  // [num_experts] per-expert write offset in send buf
+    int* __restrict__ send_order,  // [total_tokens] output: send_order[write_pos] = token_idx (may be null)
     int num_experts,
     int hidden_size,
     int total_tokens) {
-
     const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (token_idx >= total_tokens) return;
 
@@ -77,13 +76,11 @@ __global__ void ep_scatter_send_buffer_kernel(
 // Kernel to compute per-expert write offsets in the send buffer.
 // Groups experts by destination GPU, producing cumulative offsets.
 // peer_write_offsets[e] = starting position for expert e's tokens in send buffer.
-__global__ void ep_compute_write_offsets_kernel(
-    int* __restrict__ peer_write_offsets,  // [num_experts]
-    const int* __restrict__ expert_offsets, // [num_experts + 1]
-    const int* __restrict__ expert_to_gpu, // [num_experts]
-    int num_experts,
-    int ep_size) {
-
+__global__ void ep_compute_write_offsets_kernel(int* __restrict__ peer_write_offsets,    // [num_experts]
+                                                const int* __restrict__ expert_offsets,  // [num_experts + 1]
+                                                const int* __restrict__ expert_to_gpu,   // [num_experts]
+                                                int num_experts,
+                                                int ep_size) {
     // Single-thread kernel (num_experts is small, typically 64-256)
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
@@ -121,57 +118,68 @@ __global__ void ep_compute_write_offsets_kernel(
 
 // C++ linkage to match kernels.h declarations
 
-void ep_fused_prepare_send_buffer_bf16(
-    nv_bfloat16* send_buf,
-    const nv_bfloat16* input,
-    const int* expert_offsets,
-    const int* expert_to_gpu,
-    int* peer_write_offsets,  // temporary [num_experts] buffer
-    int* send_order,          // [total_tokens] output (may be null)
-    int num_experts,
-    int ep_size,
-    int hidden_size,
-    int total_tokens,
-    cudaStream_t stream) {
-
+void ep_fused_prepare_send_buffer_bf16(nv_bfloat16* send_buf,
+                                       const nv_bfloat16* input,
+                                       const int* expert_offsets,
+                                       const int* expert_to_gpu,
+                                       int* peer_write_offsets,  // temporary [num_experts] buffer
+                                       int* send_order,          // [total_tokens] output (may be null)
+                                       int num_experts,
+                                       int ep_size,
+                                       int hidden_size,
+                                       int total_tokens,
+                                       cudaStream_t stream) {
     if (total_tokens <= 0) return;
 
     // Step 1: Compute per-expert write offsets on GPU
-    ep_compute_write_offsets_kernel<<<1, 1, 0, stream>>>(
-        peer_write_offsets, expert_offsets, expert_to_gpu,
-        num_experts, ep_size);
+    ep_compute_write_offsets_kernel<<<1, 1, 0, stream>>>(peer_write_offsets,
+                                                         expert_offsets,
+                                                         expert_to_gpu,
+                                                         num_experts,
+                                                         ep_size);
 
     // Step 2: Scatter tokens into send buffer + record send_order
     const int threads_x = 256;
     const int blocks = (total_tokens + threads_x - 1) / threads_x;
-    ep_scatter_send_buffer_kernel<nv_bfloat16><<<blocks, threads_x, 0, stream>>>(
-        send_buf, input, expert_offsets, expert_to_gpu, peer_write_offsets,
-        send_order, num_experts, hidden_size, total_tokens);
+    ep_scatter_send_buffer_kernel<nv_bfloat16><<<blocks, threads_x, 0, stream>>>(send_buf,
+                                                                                 input,
+                                                                                 expert_offsets,
+                                                                                 expert_to_gpu,
+                                                                                 peer_write_offsets,
+                                                                                 send_order,
+                                                                                 num_experts,
+                                                                                 hidden_size,
+                                                                                 total_tokens);
 }
 
-void ep_fused_prepare_send_buffer_fp32(
-    float* send_buf,
-    const float* input,
-    const int* expert_offsets,
-    const int* expert_to_gpu,
-    int* peer_write_offsets,
-    int* send_order,
-    int num_experts,
-    int ep_size,
-    int hidden_size,
-    int total_tokens,
-    cudaStream_t stream) {
-
+void ep_fused_prepare_send_buffer_fp32(float* send_buf,
+                                       const float* input,
+                                       const int* expert_offsets,
+                                       const int* expert_to_gpu,
+                                       int* peer_write_offsets,
+                                       int* send_order,
+                                       int num_experts,
+                                       int ep_size,
+                                       int hidden_size,
+                                       int total_tokens,
+                                       cudaStream_t stream) {
     if (total_tokens <= 0) return;
 
-    ep_compute_write_offsets_kernel<<<1, 1, 0, stream>>>(
-        peer_write_offsets, expert_offsets, expert_to_gpu,
-        num_experts, ep_size);
+    ep_compute_write_offsets_kernel<<<1, 1, 0, stream>>>(peer_write_offsets,
+                                                         expert_offsets,
+                                                         expert_to_gpu,
+                                                         num_experts,
+                                                         ep_size);
 
     const int threads_x = 256;
     const int blocks = (total_tokens + threads_x - 1) / threads_x;
-    ep_scatter_send_buffer_kernel<float><<<blocks, threads_x, 0, stream>>>(
-        send_buf, input, expert_offsets, expert_to_gpu, peer_write_offsets,
-        send_order, num_experts, hidden_size, total_tokens);
+    ep_scatter_send_buffer_kernel<float><<<blocks, threads_x, 0, stream>>>(send_buf,
+                                                                           input,
+                                                                           expert_offsets,
+                                                                           expert_to_gpu,
+                                                                           peer_write_offsets,
+                                                                           send_order,
+                                                                           num_experts,
+                                                                           hidden_size,
+                                                                           total_tokens);
 }
-

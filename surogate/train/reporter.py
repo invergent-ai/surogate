@@ -1,12 +1,12 @@
 import contextlib
 import functools
-import pathlib
 import json
+import pathlib
 import sys
-from typing import List, Dict, Union, Callable, Any
+from collections.abc import Callable
+from typing import Any
 
 from surogate import _surogate
-
 from surogate.core.config.sft_config import SFTConfig
 
 
@@ -14,7 +14,7 @@ from surogate.core.config.sft_config import SFTConfig
 def training_logger_context(config: SFTConfig):
     report_to = config.report_to
     if report_to is None:
-        backends: List[str] = []
+        backends: list[str] = []
     elif isinstance(report_to, str):
         backends = [report_to]
     else:
@@ -28,8 +28,8 @@ def training_logger_context(config: SFTConfig):
     log_options.pop("model_info")
     log_options.pop("model")
     log_options.pop("tokenizer")
-    
-    filtered_options: Dict[str, Union[bool, int, float, str]] = {}
+
+    filtered_options: dict[str, bool | int | float | str] = {}
     for k, v in log_options.items():
         if v is None:
             filtered_options[k] = ""
@@ -45,7 +45,7 @@ def training_logger_context(config: SFTConfig):
             filtered_options[k] = str(v)
 
     with contextlib.ExitStack() as stack:
-        handlers: List[Callable[[dict], None]] = []
+        handlers: list[Callable[[dict], None]] = []
 
         if "wandb" in backends_set:
             import wandb
@@ -93,7 +93,7 @@ def training_logger_context(config: SFTConfig):
 
         if "surogate" in backends_set:
             from surogate.train.metrics_writer import MetricsWriter
-            
+
             metrics_path = getattr(config, "surogate_metrics_path", None)
             writer = stack.enter_context(MetricsWriter(output_path=metrics_path))
             handlers.append(functools.partial(log_line_to_surogate, writer))
@@ -126,11 +126,7 @@ def log_line_to_wandb(run: "wandb.Run", entry: dict):
         duration_ms = entry.get("duration_ms", 0)
         tps = step_tokens / (duration_ms / 1000) if duration_ms else 0.0
         run.log(
-            {
-                f"train/{k}": v
-                for k, v in entry.items()
-                if k not in {"log", "step", "time", "step_tokens"}
-            },
+            {f"train/{k}": v for k, v in entry.items() if k not in {"log", "step", "time", "step_tokens"}},
             step=step,
         )
         run.log({"train/tokens_per_second": tps}, step=step)
@@ -139,28 +135,20 @@ def log_line_to_wandb(run: "wandb.Run", entry: dict):
         duration_ms = entry.get("duration_ms", 0)
         tps = eval_tokens / (duration_ms / 1000) if duration_ms else 0.0
         run.log(
-            {
-                f"eval/{k}": v
-                for k, v in entry.items()
-                if k not in {"log", "step", "time", "eval_tokens"}
-            },
+            {f"eval/{k}": v for k, v in entry.items() if k not in {"log", "step", "time", "eval_tokens"}},
             step=step,
         )
         run.log({"eval/tokens_per_second": tps}, step=step)
     elif kind == "gpu":
-        gpu_entry = {
-            k: v
-            for k, v in entry.items()
-            if k not in {"log", "step", "time", "throttle", "id"}
-        }
+        gpu_entry = {k: v for k, v in entry.items() if k not in {"log", "step", "time", "throttle", "id"}}
         if gpu_entry.get("fan", 0) == 0:
             gpu_entry.pop("fan", None)
         if "dram_free" in gpu_entry:
-            gpu_entry["dram_free"] /= 1024 ** 2  # MiB
+            gpu_entry["dram_free"] /= 1024**2  # MiB
         if "pcie_rx" in gpu_entry:
-            gpu_entry["pcie_rx"] /= 1024 ** 2  # MiB/s
+            gpu_entry["pcie_rx"] /= 1024**2  # MiB/s
         if "pcie_tx" in gpu_entry:
-            gpu_entry["pcie_tx"] /= 1024 ** 2  # MiB/s
+            gpu_entry["pcie_tx"] /= 1024**2  # MiB/s
         run.log({f"gpu/{k}": v for k, v in gpu_entry.items()}, step=step)
     elif kind == "cmd":
         # where is belongs
@@ -172,13 +160,14 @@ def log_line_to_wandb(run: "wandb.Run", entry: dict):
             run.config[f"gpu-{entry['rank']}"] = entry
     elif kind == "allocator":
         import plotly.express as px
+
         names = [alloc["name"] for alloc in entry["stats"]]
         amounts = [round(alloc["device"] / 1024 / 1024, 1) for alloc in entry["stats"]]
 
         fig = px.pie(
             names=names,
             values=amounts,
-            title=f"GPU Allocations",
+            title="GPU Allocations",
         )
         run.log({"allocations": fig}, step=step)
     elif kind == "dataset":
@@ -192,13 +181,14 @@ def log_line_to_wandb(run: "wandb.Run", entry: dict):
         if entry["rank"] != 0:
             return
         import plotly.express as px
+
         names = ["Blocks", "LM-Head", "Attention"]
         amounts = [entry["blocks"], entry["lm_head"], entry["attention"]]
 
         fig = px.pie(
             names=names,
             values=amounts,
-            title=f"FLOPs",
+            title="FLOPs",
         )
         run.log({"ops": fig}, step=step)
     else:
@@ -246,9 +236,9 @@ def log_line_to_aim(run: "aim.Run", entry: dict):
             if k == "fan" and v == 0:
                 continue
             if k == "dram_free":
-                v = v / 1024 ** 2  # MiB
+                v = v / 1024**2  # MiB
             elif k in {"pcie_rx", "pcie_tx"}:
-                v = v / 1024 ** 2  # MiB/s
+                v = v / 1024**2  # MiB/s
             run.track(v, name=f"gpu/{gpu_id}/{k}", step=step)
     elif kind == "cmd":
         try:
@@ -268,7 +258,7 @@ def log_line_to_aim(run: "aim.Run", entry: dict):
         stats = entry.get("stats") or []
         for alloc in stats:
             name = alloc.get("name", "unknown")
-            device_mib = alloc.get("device", 0) / 1024 ** 2
+            device_mib = alloc.get("device", 0) / 1024**2
             run.track(device_mib, name=f"allocator/{name}_mib", step=step)
     elif kind == "dataset":
         pass
@@ -292,7 +282,8 @@ def log_line_to_surogate(writer, entry: dict):
 
     if kind == "step":
         metrics = {
-            f"train/{k}": v for k, v in entry.items()
+            f"train/{k}": v
+            for k, v in entry.items()
             if k not in {"log", "step", "time", "step_tokens"} and isinstance(v, (int, float))
         }
         step_tokens = entry.get("step_tokens", 0)
@@ -302,7 +293,8 @@ def log_line_to_surogate(writer, entry: dict):
         writer.track(step, **metrics)
     elif kind == "eval":
         metrics = {
-            f"eval/{k}": v for k, v in entry.items()
+            f"eval/{k}": v
+            for k, v in entry.items()
             if k not in {"log", "step", "time", "eval_tokens"} and isinstance(v, (int, float))
         }
         eval_tokens = entry.get("eval_tokens", 0)
@@ -310,14 +302,13 @@ def log_line_to_surogate(writer, entry: dict):
         if duration_ms:
             metrics["eval/tokens_per_second"] = eval_tokens / (duration_ms / 1000)
         writer.track(step, **metrics)
-    elif kind in {"gpu", "cmd", "gpu-model", "allocator", "dataset",
-                   "option", "info", "message", "sol"}:
+    elif kind in {"gpu", "cmd", "gpu-model", "allocator", "dataset", "option", "info", "message", "sol"}:
         pass  # skip non-training metrics
     else:
         raise RuntimeError(f"Unknown kind {kind}")
 
 
-def make_multi_backend_log_callback(handlers: List[Callable[[dict], None]]):
+def make_multi_backend_log_callback(handlers: list[Callable[[dict], None]]):
     if not handlers:
         return None
 
@@ -345,14 +336,14 @@ def _aim_run_context(config: SFTConfig):
     repo = getattr(config, "aim_repo", None)
     run_name = getattr(config, "aim_name", None) or getattr(config, "run_name", None)
 
-    kwargs: Dict[str, Any] = {"experiment": experiment}
+    kwargs: dict[str, Any] = {"experiment": experiment}
     if repo:
         kwargs["repo"] = repo
 
     # When resuming from checkpoint, try to resume the existing run using stored hash
     checkpoint_dir = getattr(config, "checkpoint_dir", None)
     resume_from_checkpoint = getattr(config, "resume_from_checkpoint", False)
-    
+
     run_hash = None
     if resume_from_checkpoint and checkpoint_dir:
         # Try to load run_hash from checkpoint metadata if available

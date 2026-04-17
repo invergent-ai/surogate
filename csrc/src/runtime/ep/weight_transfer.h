@@ -22,7 +22,7 @@
 
 namespace dsl {
 class DslRunState;
-}
+}  // namespace dsl
 
 namespace qlora {
 struct QuantizedTensor;
@@ -65,7 +65,9 @@ struct ForeignExpertWeights {
         weights.clear();
         // Do NOT free GPU memory here — use free_gpu() explicitly
     }
-    bool empty() const { return weights.empty(); }
+    bool empty() const {
+        return weights.empty();
+    }
 
     /// Free all cudaMalloc'd GPU buffers owned by this struct.
     /// Call after the data has been consumed (e.g., merged into combined tensors).
@@ -92,16 +94,15 @@ struct ForeignExpertWeights {
 /// @param native_down       Native dequantized down weights [E_local, rows, cols]
 /// @param num_local_experts Number of native experts per GPU
 /// @param ep_rank           This GPU's EP rank
-void transfer_expert_weights(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    dsl::DslRunState& run_state,
-    cudaStream_t stream,
-    ForeignExpertWeights& received,
-    const Tensor& native_gate_up,
-    const Tensor& native_down,
-    int num_local_experts,
-    int ep_rank);
+void transfer_expert_weights(const LPTPlan& plan,
+                             NCCLCommunicator& comm,
+                             dsl::DslRunState& run_state,
+                             cudaStream_t stream,
+                             ForeignExpertWeights& received,
+                             const Tensor& native_gate_up,
+                             const Tensor& native_down,
+                             int num_local_experts,
+                             int ep_rank);
 
 /// Transfer expert weights using quantized format for reduced P2P bandwidth.
 ///
@@ -123,19 +124,18 @@ void transfer_expert_weights(
 /// @param quantizer           Quantizer for dequantization on receiver
 /// @param num_local_experts   Number of native experts per GPU
 /// @param ep_rank             This GPU's EP rank
-void transfer_expert_weights_quantized(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    dsl::DslRunState& run_state,
-    cudaStream_t stream,
-    ForeignExpertWeights& received,
-    const qlora::QuantizedTensor& native_gate_up_qt,
-    const qlora::QuantizedTensor& native_down_qt,
-    const Tensor& native_gate_up,
-    const Tensor& native_down,
-    qlora::IQuantizer* quantizer,
-    int num_local_experts,
-    int ep_rank);
+void transfer_expert_weights_quantized(const LPTPlan& plan,
+                                       NCCLCommunicator& comm,
+                                       dsl::DslRunState& run_state,
+                                       cudaStream_t stream,
+                                       ForeignExpertWeights& received,
+                                       const qlora::QuantizedTensor& native_gate_up_qt,
+                                       const qlora::QuantizedTensor& native_down_qt,
+                                       const Tensor& native_gate_up,
+                                       const Tensor& native_down,
+                                       qlora::IQuantizer* quantizer,
+                                       int num_local_experts,
+                                       int ep_rank);
 
 /// Transfer expert weight gradients back from helper to native GPUs.
 ///
@@ -150,15 +150,14 @@ void transfer_expert_weights_quantized(
 /// @param native_down_grad     Native down gradient tensor (receive target)
 /// @param num_local_experts    Number of native experts per GPU
 /// @param ep_rank              This GPU's EP rank
-void transfer_weight_gradients_back(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    cudaStream_t stream,
-    const ForeignExpertWeights& foreign_grads,
-    Tensor& native_gate_up_grad,
-    Tensor& native_down_grad,
-    int num_local_experts,
-    int ep_rank);
+void transfer_weight_gradients_back(const LPTPlan& plan,
+                                    NCCLCommunicator& comm,
+                                    cudaStream_t stream,
+                                    const ForeignExpertWeights& foreign_grads,
+                                    Tensor& native_gate_up_grad,
+                                    Tensor& native_down_grad,
+                                    int num_local_experts,
+                                    int ep_rank);
 
 /// Transfer per-expert LoRA adapters from native to helper GPUs.
 ///
@@ -181,18 +180,21 @@ void transfer_weight_gradients_back(
 /// @param local_down_B      Local down LoRA B [E_local, C, rank] (null if no down LoRA)
 /// @param num_local_experts Number of native experts per GPU
 /// @param ep_rank           This GPU's EP rank
-void transfer_expert_lora(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    dsl::DslRunState& run_state,
-    cudaStream_t stream,
-    ForeignExpertWeights& received,
-    const Tensor& local_gate_up_A, const Tensor& local_gate_up_B,
-    const Tensor& local_gate_A, const Tensor& local_gate_B,
-    const Tensor& local_up_A, const Tensor& local_up_B,
-    const Tensor& local_down_A, const Tensor& local_down_B,
-    int num_local_experts,
-    int ep_rank);
+void transfer_expert_lora(const LPTPlan& plan,
+                          NCCLCommunicator& comm,
+                          dsl::DslRunState& run_state,
+                          cudaStream_t stream,
+                          ForeignExpertWeights& received,
+                          const Tensor& local_gate_up_A,
+                          const Tensor& local_gate_up_B,
+                          const Tensor& local_gate_A,
+                          const Tensor& local_gate_B,
+                          const Tensor& local_up_A,
+                          const Tensor& local_up_B,
+                          const Tensor& local_down_A,
+                          const Tensor& local_down_B,
+                          int num_local_experts,
+                          int ep_rank);
 
 }  // namespace ep
 

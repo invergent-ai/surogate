@@ -26,8 +26,13 @@ class Qwen3VLBlock(nn.Block):
         super().__init__()
         self.attn_norm = nn.RMSNorm(d_model, eps=eps)
         self.self_attn = nn.Qwen3VLAttention(
-            d_model, num_query_heads, num_kv_heads, head_size,
-            max_seq, use_qkv_bias=use_qkv_bias, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            use_qkv_bias=use_qkv_bias,
+            eps=eps,
             mrope_section=mrope_section,
         )
         self.mlp_norm = nn.RMSNorm(d_model, eps=eps)

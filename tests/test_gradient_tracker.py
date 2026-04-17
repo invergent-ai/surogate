@@ -67,8 +67,8 @@ class TestGradientTracker:
         gt = GradientTracker(logger, window=10, warmup=3)
         for i in range(5):
             gt.step(1.0, step=i)
-        gt.step(float('nan'), step=5)
-        gt.step(float('inf'), step=6)
+        gt.step(float("nan"), step=5)
+        gt.step(float("inf"), step=6)
         # Should still have 5 entries, not 7
         assert len(gt.history) == 5
         assert gt.mean == pytest.approx(1.0)
@@ -87,8 +87,12 @@ class TestGradientTracker:
     def test_warning_emitted_on_sustained_trend(self, logger, caplog):
         """A strong upward trend maintained for patience steps triggers a warning."""
         gt = GradientTracker(
-            logger, window=10, warmup=5,
-            trend_threshold=0.1, patience=3, cooldown=0,
+            logger,
+            window=10,
+            warmup=5,
+            trend_threshold=0.1,
+            patience=3,
+            cooldown=0,
         )
         # Feed strongly increasing norms to trigger warning
         with caplog.at_level(logging.WARNING):
@@ -98,8 +102,12 @@ class TestGradientTracker:
 
     def test_no_warning_for_stable_norms(self, logger, caplog):
         gt = GradientTracker(
-            logger, window=10, warmup=5,
-            trend_threshold=0.5, patience=3, cooldown=0,
+            logger,
+            window=10,
+            warmup=5,
+            trend_threshold=0.5,
+            patience=3,
+            cooldown=0,
         )
         with caplog.at_level(logging.WARNING):
             for i in range(20):
@@ -108,8 +116,12 @@ class TestGradientTracker:
 
     def test_cooldown_suppresses_repeated_warnings(self, logger, caplog):
         gt = GradientTracker(
-            logger, window=10, warmup=5,
-            trend_threshold=0.1, patience=2, cooldown=50,
+            logger,
+            window=10,
+            warmup=5,
+            trend_threshold=0.1,
+            patience=2,
+            cooldown=50,
         )
         with caplog.at_level(logging.WARNING):
             for i in range(30):
@@ -121,8 +133,12 @@ class TestGradientTracker:
 
     def test_trend_count_resets_on_stable(self, logger):
         gt = GradientTracker(
-            logger, window=10, warmup=5,
-            trend_threshold=0.1, patience=5, cooldown=0,
+            logger,
+            window=10,
+            warmup=5,
+            trend_threshold=0.1,
+            patience=5,
+            cooldown=0,
         )
         # Build up trend count with increasing norms
         for i in range(10):

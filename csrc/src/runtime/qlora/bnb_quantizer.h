@@ -31,25 +31,23 @@ public:
     explicit BnBQuantizer(const QuantizerConfig& config);
     ~BnBQuantizer() override;
 
-    void quantize(
-        const Tensor& input,
-        QuantizedTensor& output,
-        cudaStream_t stream) override;
+    void quantize(const Tensor& input, QuantizedTensor& output, cudaStream_t stream) override;
 
-    void dequantize(
-        const QuantizedTensor& input,
-        Tensor& output,
-        cudaStream_t stream) override;
+    void dequantize(const QuantizedTensor& input, Tensor& output, cudaStream_t stream) override;
 
-    void allocate_storage(
-        int M, int K,
-        QuantizedTensor& output,
-        TensorAllocator& allocator,
-        EAllocationType alloc_type,
-        const std::string& name) override;
+    void allocate_storage(int M,
+                          int K,
+                          QuantizedTensor& output,
+                          TensorAllocator& allocator,
+                          EAllocationType alloc_type,
+                          const std::string& name) override;
 
-    [[nodiscard]] QuantFormat format() const override { return QuantFormat::BNB_NF4; }
-    [[nodiscard]] int block_size() const override { return mBlockSize; }
+    [[nodiscard]] QuantFormat format() const override {
+        return QuantFormat::BNB_NF4;
+    }
+    [[nodiscard]] int block_size() const override {
+        return mBlockSize;
+    }
     [[nodiscard]] size_t estimate_storage_bytes(int M, int K) const override;
 
 private:

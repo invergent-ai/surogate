@@ -34,7 +34,9 @@
 
 class SafeTensorsReader;
 
-namespace dsl { class DslWeightLoader; }
+namespace dsl {
+class DslWeightLoader;
+}  // namespace dsl
 
 namespace qlora {
 
@@ -165,10 +167,9 @@ public:
     /// @param config       Manager configuration.
     /// @param quantizer    Quantizer for format-specific quantize/dequantize.
     /// @param allocator    Tensor allocator for GPU/CPU memory.
-    GenericWeightManager(
-        const GenericWeightManagerConfig& config,
-        std::unique_ptr<IQuantizer> quantizer,
-        std::shared_ptr<TensorAllocator> allocator);
+    GenericWeightManager(const GenericWeightManagerConfig& config,
+                         std::unique_ptr<IQuantizer> quantizer,
+                         std::shared_ptr<TensorAllocator> allocator);
 
     ~GenericWeightManager();
 
@@ -193,11 +194,8 @@ public:
     /// @param shape          Full tensor shape for dequant buffer (e.g., {E, M, K}).
     ///                       If empty, uses {M, K}. Allows 3D expert weights to
     ///                       retain their [E, per_M, K] shape after dequantization.
-    void register_weight(
-        const std::string& name,
-        int M, int K,
-        int offload_group = -1,
-        const std::vector<long>& shape = {});
+    void
+    register_weight(const std::string& name, int M, int K, int offload_group = -1, const std::vector<long>& shape = {});
 
     /// Register a full-precision weight (not quantized).
     ///
@@ -206,9 +204,7 @@ public:
     ///
     /// @param name    Unique weight name
     /// @param tensor  The full-precision tensor to store
-    void register_full_precision(
-        const std::string& name,
-        Tensor tensor);
+    void register_full_precision(const std::string& name, Tensor tensor);
 
     /// Quantize a BF16 tensor and store it under the given name.
     ///
@@ -217,10 +213,7 @@ public:
     /// @param name    Weight name (must match a prior register_weight call)
     /// @param bf16    Input BF16 tensor [M, K]
     /// @param stream  CUDA stream for async quantization
-    void quantize_and_store(
-        const std::string& name,
-        const Tensor& bf16,
-        cudaStream_t stream);
+    void quantize_and_store(const std::string& name, const Tensor& bf16, cudaStream_t stream);
 
     /// Store a pre-populated QuantizedTensor directly (no online quantization).
     ///
@@ -240,13 +233,12 @@ public:
     /// @param transform_fn   Transform function ("transpose" or empty). When set,
     ///                       the dequantized output will be post-processed to match
     ///                       the DSL layout (e.g., per-expert 2D transpose).
-    void store_prequantized(
-        const std::string& name,
-        QuantizedTensor&& qt,
-        int offload_group = -1,
-        const std::vector<long>& shape = {},
-        const std::string& transform_fn = "",
-        int fuse_swap_at = 0);
+    void store_prequantized(const std::string& name,
+                            QuantizedTensor&& qt,
+                            int offload_group = -1,
+                            const std::vector<long>& shape = {},
+                            const std::string& transform_fn = "",
+                            int fuse_swap_at = 0);
 
     /// Quantize a single expert's BF16 data into a slice of a registered weight.
     ///
@@ -263,12 +255,11 @@ public:
     /// @param per_expert_M   Rows per expert (one expert's M dimension).
     /// @param bf16           Input BF16 tensor [per_expert_M, K] for this expert.
     /// @param stream         CUDA stream for async quantization.
-    void quantize_expert_slice(
-        const std::string& name,
-        int expert_idx,
-        int per_expert_M,
-        const Tensor& bf16,
-        cudaStream_t stream);
+    void quantize_expert_slice(const std::string& name,
+                               int expert_idx,
+                               int per_expert_M,
+                               const Tensor& bf16,
+                               cudaStream_t stream);
 
     // =========================================================================
     // Weight access
@@ -351,13 +342,19 @@ public:
     [[nodiscard]] int num_active_dequant_buffers() const;
 
     /// Get the quantizer.
-    [[nodiscard]] IQuantizer* quantizer() const { return mQuantizer.get(); }
+    [[nodiscard]] IQuantizer* quantizer() const {
+        return mQuantizer.get();
+    }
 
     /// Get the offload manager (may be null if offloading disabled).
-    [[nodiscard]] OffloadManager* offload_manager() const { return mOffloadManager.get(); }
+    [[nodiscard]] OffloadManager* offload_manager() const {
+        return mOffloadManager.get();
+    }
 
     /// Whether pooled mode is active (max_dequant_cache_size > 0).
-    [[nodiscard]] bool is_pooled() const { return mConfig.max_dequant_cache_size > 0; }
+    [[nodiscard]] bool is_pooled() const {
+        return mConfig.max_dequant_cache_size > 0;
+    }
 
     /// Mark all weights as frozen (immutable).
     ///
@@ -368,10 +365,14 @@ public:
     ///
     /// Pool-evicted buffers still get re-dequantized on next access (the
     /// eviction path sets dequant_valid = false regardless of frozen state).
-    void set_frozen(bool frozen) { mFrozenWeights = frozen; }
+    void set_frozen(bool frozen) {
+        mFrozenWeights = frozen;
+    }
 
     /// Whether weights are frozen.
-    [[nodiscard]] bool is_frozen() const { return mFrozenWeights; }
+    [[nodiscard]] bool is_frozen() const {
+        return mFrozenWeights;
+    }
 
 private:
     // =========================================================================

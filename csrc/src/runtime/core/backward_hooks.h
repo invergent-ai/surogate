@@ -30,14 +30,14 @@ enum class BackwardHookPoint {
     AfterMLPDownBackward,   ///< After MLP down projection backward
     BeforeMLPUpBackward,    ///< Before MLP up projection backward
     AfterMLPUpBackward,     ///< After MLP up projection backward
-    MoEExpertGroupManual,    ///< Manual expert group backward (fused)
+    MoEExpertGroupManual,   ///< Manual expert group backward (fused)
 
     // MoE router
-    AfterRouterBackward,    ///< After router backward (for router LoRA gradients)
+    AfterRouterBackward,  ///< After router backward (for router LoRA gradients)
 
     // Layer-level
-    BeforeLayerBackward,    ///< Before any backward computation for this layer
-    AfterLayerBackward,     ///< After all backward computation for this layer
+    BeforeLayerBackward,  ///< Before any backward computation for this layer
+    AfterLayerBackward,   ///< After all backward computation for this layer
 };
 
 /**
@@ -72,13 +72,8 @@ constexpr const char* hook_point_name(BackwardHookPoint point) {
  * Hooks are called synchronously during the backward pass. The hook
  * implementation should enqueue GPU work on the provided stream.
  */
-using BackwardHook = std::function<void(
-    int layer_idx,
-    bool accumulate,
-    cudaStream_t stream,
-    BackwardHookPoint point,
-    void* context
-)>;
+using BackwardHook =
+    std::function<void(int layer_idx, bool accumulate, cudaStream_t stream, BackwardHookPoint point, void* context)>;
 
 /**
  * @brief Registry for managing backward hooks
@@ -146,8 +141,7 @@ public:
      */
     bool unregister_hook(HookId id) {
         for (auto& [point, hooks] : mHooks) {
-            auto it = std::find_if(hooks.begin(), hooks.end(),
-                [id](const HookEntry& e) { return e.id == id; });
+            auto it = std::find_if(hooks.begin(), hooks.end(), [id](const HookEntry& e) { return e.id == id; });
             if (it != hooks.end()) {
                 hooks.erase(it);
                 return true;
@@ -167,7 +161,11 @@ public:
      * @param stream CUDA stream for GPU work
      * @param context Optional caller-provided context (passed to hook)
      */
-    void invoke(int layer_idx, BackwardHookPoint point, bool accumulate, cudaStream_t stream, void* context = nullptr) const {
+    void invoke(int layer_idx,
+                BackwardHookPoint point,
+                bool accumulate,
+                cudaStream_t stream,
+                void* context = nullptr) const {
         auto it = mHooks.find(point);
         if (it != mHooks.end()) {
             for (const auto& entry : it->second) {
@@ -236,7 +234,8 @@ private:
 class BackwardHookGuard {
 public:
     explicit BackwardHookGuard(BackwardHookRegistry& registry)
-        : mRegistry(registry) {}
+        : mRegistry(registry) {
+    }
 
     ~BackwardHookGuard() {
         for (auto id : mHookIds) {
@@ -250,7 +249,8 @@ public:
 
     // Movable
     BackwardHookGuard(BackwardHookGuard&& other) noexcept
-        : mRegistry(other.mRegistry), mHookIds(std::move(other.mHookIds)) {
+        : mRegistry(other.mRegistry),
+          mHookIds(std::move(other.mHookIds)) {
         other.mHookIds.clear();
     }
 
@@ -268,6 +268,6 @@ private:
     std::vector<BackwardHookRegistry::HookId> mHookIds;
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_BACKWARD_HOOKS_H
+#endif  // SUROGATE_SRC_MODULES_BACKWARD_HOOKS_H

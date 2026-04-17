@@ -49,18 +49,32 @@ class NCCLCommunicator;
 //! C++ implementation. For C++, each thread has its own DataLoader, providing `B*T` tokens each step. For python,
 //! we have only one interface-visible thread, which gets `nGPU*B*T` tokens per step, and splits them into `B*T`-sized
 //! chunks for each GPU.
-class MultiGPUPyTrainer
-{
+class MultiGPUPyTrainer {
 public:
     //! Single-node constructor (original)
-    MultiGPUPyTrainer(int ngpus, const PretrainedConfig& config, RuntimeOptions options, int batch_size, int seq_len, int grad_accum, bool memcpy_all_gather, bool memcpy_send_recv, std::optional<LoRAAdapterConfig> lora_config = std::nullopt, std::optional<modules::QLoRAConfig> qlora_config = std::nullopt);
+    MultiGPUPyTrainer(int ngpus,
+                      const PretrainedConfig& config,
+                      RuntimeOptions options,
+                      int batch_size,
+                      int seq_len,
+                      int grad_accum,
+                      bool memcpy_all_gather,
+                      bool memcpy_send_recv,
+                      std::optional<LoRAAdapterConfig> lora_config = std::nullopt,
+                      std::optional<modules::QLoRAConfig> qlora_config = std::nullopt);
 
     //! Multi-node constructor (for Ray distributed training)
-    MultiGPUPyTrainer(int ngpus, int node_rank, int num_nodes,
+    MultiGPUPyTrainer(int ngpus,
+                      int node_rank,
+                      int num_nodes,
                       const void* nccl_id,
-                      const PretrainedConfig& config, RuntimeOptions options,
-                      int batch_size, int seq_len, int grad_accum,
-                      bool memcpy_all_gather, bool memcpy_send_recv,
+                      const PretrainedConfig& config,
+                      RuntimeOptions options,
+                      int batch_size,
+                      int seq_len,
+                      int grad_accum,
+                      bool memcpy_all_gather,
+                      bool memcpy_send_recv,
                       std::optional<LoRAAdapterConfig> lora_config = std::nullopt,
                       std::optional<modules::QLoRAConfig> qlora_config = std::nullopt);
 
@@ -68,9 +82,8 @@ public:
 
     void set_adapter_path(std::string path);
     void import_weights(std::string path);
-    void import_weights_from_external(
-        std::string safetensors_path,
-        std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
+    void import_weights_from_external(std::string safetensors_path,
+                                      std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
     void export_model(std::string path);
     void export_adapter(std::string path, std::string base_model_path = "");
     void init_weights();
@@ -79,9 +92,11 @@ public:
     void step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
     float validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
     std::pair<float, float> update_with_config(const optimizers::OptimizerConfig& config, int step);
-    std::pair<float, float> train_step_graphed(const std::int32_t* inputs, const std::int32_t* targets,
+    std::pair<float, float> train_step_graphed(const std::int32_t* inputs,
+                                               const std::int32_t* targets,
                                                const std::int32_t* position_ids,
-                                               const optimizers::OptimizerConfig& config, int step);
+                                               const optimizers::OptimizerConfig& config,
+                                               int step);
     void stop();
 
     std::vector<GPUUtilInfo> get_gpu_info();
@@ -91,14 +106,31 @@ public:
     std::tuple<float, float, float, float, bool> get_moe_stats();
 
     int world_size() const;
-    int local_world_size() const { return static_cast<int>(mContexts.size()); }
-    int batch_size() const { return B; }
-    int seq_length() const { return T; }
-    int grad_accumulation() const { return mGradAccumulation; }
-    void set_grad_accumulation(int n) { mGradAccumulation = n; mTrainMicroStep = 0; }
-    const PretrainedConfig& config() const { return *mConfig; }
-    const RuntimeOptions& options() const { return mOptions; }
-    bool is_qlora() const { return mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized(); }
+    int local_world_size() const {
+        return static_cast<int>(mContexts.size());
+    }
+    int batch_size() const {
+        return B;
+    }
+    int seq_length() const {
+        return T;
+    }
+    int grad_accumulation() const {
+        return mGradAccumulation;
+    }
+    void set_grad_accumulation(int n) {
+        mGradAccumulation = n;
+        mTrainMicroStep = 0;
+    }
+    const PretrainedConfig& config() const {
+        return *mConfig;
+    }
+    const RuntimeOptions& options() const {
+        return mOptions;
+    }
+    bool is_qlora() const {
+        return mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized();
+    }
 
     std::vector<std::pair<std::string, sSegmentMemory>> get_allocations(int gpu_id);
     std::vector<std::pair<std::string, long>> get_stack_info(int gpu_id);
@@ -114,25 +146,30 @@ public:
     // use_lora=true applies LoRA (policy model); use_lora=false skips LoRA (reference model).
     // position_ids: optional [B, T] position IDs for packed sequences (nullptr = sequential).
     // Returns B*T float log-probs; masked positions (target==-100) receive 0.
-    std::vector<float> compute_logprobs(const std::int32_t* input_ids, const std::int32_t* targets,
-                                        int B, int T, bool use_lora,
+    std::vector<float> compute_logprobs(const std::int32_t* input_ids,
+                                        const std::int32_t* targets,
+                                        int B,
+                                        int T,
+                                        bool use_lora,
                                         const std::int32_t* position_ids = nullptr,
                                         const float* temperatures = nullptr);
 
     // GRPO: run one training micro-step with externally-computed per-token gradient multipliers.
     // per_token_grads[b*T + t] = dL_GRPO/d(log_prob_policy)[b, t].
     // Replaces the standard d_loss=1.0 seeding; call update_with_config() after grad_accum steps.
-    void step_with_custom_loss(const std::int32_t* inputs, const std::int32_t* targets,
-                                const float* per_token_grads,
-                                const std::int32_t* position_ids = nullptr,
-                                const float* temperatures = nullptr);
+    void step_with_custom_loss(const std::int32_t* inputs,
+                               const std::int32_t* targets,
+                               const float* per_token_grads,
+                               const std::int32_t* position_ids = nullptr,
+                               const float* temperatures = nullptr);
 
     // GRPO single-pass: training forward that saves activations AND returns logprobs.
     // Returns B*T float logprobs extracted from the loss buffer (logprob = -loss).
     // Call backward_grpo() after computing per-token grads from these logprobs.
-    std::vector<float> forward_for_grpo(const std::int32_t* inputs, const std::int32_t* targets,
-                                         const std::int32_t* position_ids = nullptr,
-                                         const float* temperatures = nullptr);
+    std::vector<float> forward_for_grpo(const std::int32_t* inputs,
+                                        const std::int32_t* targets,
+                                        const std::int32_t* position_ids = nullptr,
+                                        const float* temperatures = nullptr);
 
     // GRPO backward pass using activations saved by forward_for_grpo().
     // Inputs/targets/position_ids are reused from forward_for_grpo (already in GPU buffers).
@@ -181,10 +218,9 @@ private:
     std::atomic<int> mWorkDone = 0;
 
     std::function<void(sThreadContext& ctx)> fetch_work(sThreadContext& ctx);
-    void run_work(std::function<void(sThreadContext& ctx)> work, int idx=-1);
+    void run_work(std::function<void(sThreadContext& ctx)> work, int idx = -1);
     void main_loop(NCCLCommunicator& comm);
     void print_timing_breakdown(int step, int micro_steps);
 };
 
-
-#endif //SUROGATE_SRC_BINDING_PY_TRAIN_H
+#endif  //SUROGATE_SRC_BINDING_PY_TRAIN_H

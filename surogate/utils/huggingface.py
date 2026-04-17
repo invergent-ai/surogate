@@ -4,10 +4,11 @@ import os
 import shutil
 
 import huggingface_hub
+from accelerate import init_empty_weights
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.hf_api import RepoFile
 from transformers import AutoConfig, AutoModel
-from accelerate import init_empty_weights
+
 
 async def get_model_details_from_huggingface(hugging_face_id: str):
     """
@@ -111,7 +112,7 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
         local_config_path = huggingface_hub.hf_hub_download(repo_id=hugging_face_id, filename="config.json")
 
         # Read from the local downloaded file
-        with open(local_config_path, "r") as f:
+        with open(local_config_path) as f:
             filedata = json.load(f)
     except Exception:
         try:
@@ -177,7 +178,7 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
             "tags": model_tags,
             "license": model_card_data.get("license", ""),
             "pipeline_tag": pipeline_tag,
-            "config": filedata
+            "config": filedata,
         }
         return config
     except huggingface_hub.utils.EntryNotFoundError as e:
@@ -196,6 +197,7 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
         print(f"ERROR: Unexpected error processing {hugging_face_id}: {type(e).__name__}: {e}")
         raise
 
+
 def _is_gguf_repository(hf_model_info):
     """
     Determine if a repository is primarily a GGUF repository by checking the repository tags for 'gguf'
@@ -206,6 +208,7 @@ def _is_gguf_repository(hf_model_info):
     if "gguf" in model_tags_lower and "safetensors" not in model_tags_lower:
         return True
     return False
+
 
 def _create_gguf_repo_config(hugging_face_id: str, hf_model_info, model_card_data, pipeline_tag: str):
     """
@@ -248,6 +251,7 @@ def _create_gguf_repo_config(hugging_face_id: str, hf_model_info, model_card_dat
 
     return config
 
+
 def get_huggingface_download_size(model_id: str, allow_patterns: list = [], repo_type="model"):
     """
     Get the size in bytes of all files to be downloaded from Hugging Face.
@@ -278,6 +282,7 @@ def get_huggingface_download_size(model_id: str, allow_patterns: list = [], repo
 
     return download_size
 
+
 def delete_model_from_hf_cache(model_id: str, cache_dir: str = None) -> None:
     """
     Delete a model from the Hugging Face cache by scanning the cache to locate
@@ -301,6 +306,7 @@ def delete_model_from_hf_cache(model_id: str, cache_dir: str = None) -> None:
             shutil.rmtree(repo.repo_path)
             break
 
+
 def delete_dataset_from_hf_cache(dataset_id: str, cache_dir: str = None) -> None:
     # Scan the cache using the provided cache_dir if available.
     hf_cache_info = scan_cache_dir(cache_dir=cache_dir) if cache_dir else scan_cache_dir()
@@ -313,12 +319,14 @@ def delete_dataset_from_hf_cache(dataset_id: str, cache_dir: str = None) -> None
             break
 
     from huggingface_hub.constants import HF_HOME
+
     repo_name = dataset_id.replace("/", "___")
     cache2 = os.path.join(HF_HOME, f"datasets/{repo_name}")
     try:
         shutil.rmtree(cache2)
     except:
         pass
+
 
 def get_model_architecture(repo_id):
     """Extract and return model architecture as hierarchical JSON."""
@@ -332,22 +340,22 @@ def get_model_architecture(repo_id):
         """Recursively build a tree structure of modules."""
         module_info = {
             "type": module.__class__.__name__,
-            "parameters": sum(p.numel() for p in module.parameters(recurse=False))
+            "parameters": sum(p.numel() for p in module.parameters(recurse=False)),
         }
 
         # Add layer-specific attributes
-        if hasattr(module, 'in_features') and hasattr(module, 'out_features'):
+        if hasattr(module, "in_features") and hasattr(module, "out_features"):
             module_info["in_features"] = module.in_features
             module_info["out_features"] = module.out_features
-        if hasattr(module, 'num_heads'):
+        if hasattr(module, "num_heads"):
             module_info["num_heads"] = module.num_heads
-        if hasattr(module, 'hidden_size'):
+        if hasattr(module, "hidden_size"):
             module_info["hidden_size"] = module.hidden_size
-        if hasattr(module, 'eps'):
+        if hasattr(module, "eps"):
             module_info["eps"] = module.eps
 
         # Handle ModuleList specially - group by type
-        if module.__class__.__name__ == 'ModuleList':
+        if module.__class__.__name__ == "ModuleList":
             child_list = list(module.children())
             if child_list:
                 # Count types of children
@@ -388,5 +396,5 @@ def get_model_architecture(repo_id):
     return {
         "model_id": repo_id,
         "architecture": architecture,
-        "total_parameters": sum(p.numel() for p in model.parameters())
+        "total_parameters": sum(p.numel() for p in model.parameters()),
     }

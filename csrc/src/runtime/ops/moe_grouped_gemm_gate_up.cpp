@@ -9,6 +9,9 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/dsl/dsl_param_store.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -24,7 +27,8 @@ namespace dsl {
 
 void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
-    Tensor weights = resolve_tensor(op.inputs[1]);  // Parameter name resolved by graph compiler (copy for LLEP override)
+    Tensor weights =
+        resolve_tensor(op.inputs[1]);  // Parameter name resolved by graph compiler (copy for LLEP override)
     Tensor& scatter_indices = resolve_tensor(op.inputs[2]);
     const int num_tokens = static_cast<int>(mB * mT);
     int top_k = op.attrs.top_k;
@@ -63,8 +67,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     Tensor expert_offsets_view;
     Tensor* expert_offsets_ptr = nullptr;
     if (layer_idx_any >= 0) {
-        const std::string base_key =
-            "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+        const std::string base_key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
         std::vector<std::string> candidate_keys;
         if (mOptions.EPSize > 1) {
             candidate_keys.push_back(base_key + (mInReplay ? "#r1" : "#r0"));
@@ -111,9 +114,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     int num_experts = num_experts_for_offsets;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
     // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
-    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
-        ? static_cast<int>(mConfig.MoeIntermediateSize)
-        : static_cast<int>(mConfig.IntermediateSize);
+    const int intermediate_size = (mConfig.MoeIntermediateSize > 0) ? static_cast<int>(mConfig.MoeIntermediateSize)
+                                                                    : static_cast<int>(mConfig.IntermediateSize);
     const bool gate_up_interleaved = op.attrs.gate_up_interleaved;
 
     // LLEP per-expert weight pointer override: when LLEP is active, use per-expert
@@ -136,15 +138,13 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             auto meta_it = mEPLayerMeta.find(ep_key_any);
             if (meta_it != mEPLayerMeta.end()) {
                 const auto& meta = meta_it->second;
-                if (meta.num_local == num_experts &&
-                    meta.native_start >= 0 &&
+                if (meta.num_local == num_experts && meta.native_start >= 0 &&
                     (meta.native_start + num_experts) <= weight_rows) {
                     const std::size_t elem_sz = get_dtype_size(weights.DType);
                     const std::size_t expert_elems =
-                        static_cast<std::size_t>(weights.Sizes[1]) *
-                        static_cast<std::size_t>(weights.Sizes[2]);
-                    weights.Data = static_cast<std::byte*>(weights.Data)
-                        + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                        static_cast<std::size_t>(weights.Sizes[1]) * static_cast<std::size_t>(weights.Sizes[2]);
+                    weights.Data = static_cast<std::byte*>(weights.Data) +
+                                   static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
                     weights.Sizes[0] = num_experts;
                 }
             }
@@ -153,8 +153,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
 
     // When LLEP is active, per-expert weight pointers handle indexing — use merged expert count.
     // Otherwise use the weight tensor's leading dimension (local expert count).
-    const int weight_experts = llep_weight_ptrs ? num_experts
-        : ((weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts);
+    const int weight_experts =
+        llep_weight_ptrs ? num_experts : ((weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts);
     const bool offsets_owned = mRunState.Stack.owns(expert_offsets.Data);
     if (offsets_owned && !mRunState.Stack.is_live(expert_offsets.Data)) {
         throw std::runtime_error("moe_grouped_gemm_gate_up: expert_offsets pointer is not live");
@@ -162,8 +162,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     const int* host_offsets_ptr = nullptr;
     if (num_experts > 0 && expert_offsets.Data) {
         // Use cached host offsets (populated by dispatch_moe_permute for this layer).
-        host_offsets_ptr = get_or_sync_moe_host_offsets(
-            ep_key_any, expert_offsets.get<int>(), num_experts);
+        host_offsets_ptr = get_or_sync_moe_host_offsets(ep_key_any, expert_offsets.get<int>(), num_experts);
     }
 
     if (host_offsets_ptr) {
@@ -194,27 +193,22 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
 
     // Refresh MoE expert weights for this layer using the current routing offsets.
     auto* qlora_provider = mWeights.qlora_provider();
-    if (host_offsets_ptr && layer_idx_any >= 0 &&
-        qlora_provider && qlora_provider->supports_selective_moe()) {
-        (void)refresh_moe_experts_if_needed(layer_idx_any,
-                                            host_offsets_ptr,
-                                            num_experts,
-                                            mWeights,
-                                            mRunState.MainStream);
+    if (host_offsets_ptr && layer_idx_any >= 0 && qlora_provider && qlora_provider->supports_selective_moe()) {
+        (void)
+            refresh_moe_experts_if_needed(layer_idx_any, host_offsets_ptr, num_experts, mWeights, mRunState.MainStream);
     }
 
-    MoeCompactInfo compact = host_offsets_ptr
-        ? build_moe_compact_info_from_host(host_offsets_ptr,
-                                           num_experts,
-                                           weight_experts,
-                                           layer_idx_any,
-                                           "moe_grouped_gemm_gate_up")
-        : build_moe_compact_info(expert_offsets.get<int>(),
-                                 num_experts,
-                                 weight_experts,
-                                 mRunState.MainStream,
-                                 layer_idx_any,
-                                 "moe_grouped_gemm_gate_up");
+    MoeCompactInfo compact = host_offsets_ptr ? build_moe_compact_info_from_host(host_offsets_ptr,
+                                                                                 num_experts,
+                                                                                 weight_experts,
+                                                                                 layer_idx_any,
+                                                                                 "moe_grouped_gemm_gate_up")
+                                              : build_moe_compact_info(expert_offsets.get<int>(),
+                                                                       num_experts,
+                                                                       weight_experts,
+                                                                       mRunState.MainStream,
+                                                                       layer_idx_any,
+                                                                       "moe_grouped_gemm_gate_up");
     if (!host_offsets_ptr && !compact.host_offsets.empty()) {
         host_offsets_ptr = compact.host_offsets.data();
     }
@@ -300,8 +294,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                                  inp.get<nv_bfloat16>(),
                                  weights.get<nv_bfloat16>(),
                                  expert_offsets.get<int>(),
-                                 num_experts, hidden_size, intermediate_size,
-                                 mRunState.cublas_handle(), mRunState.MainStream,
+                                 num_experts,
+                                 hidden_size,
+                                 intermediate_size,
+                                 mRunState.cublas_handle(),
+                                 mRunState.MainStream,
                                  host_offsets_ptr,
                                  active_ptr,
                                  weight_is_compact,
@@ -312,8 +309,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                                  inp.get<float>(),
                                  weights.get<float>(),
                                  expert_offsets.get<int>(),
-                                 num_experts, hidden_size, intermediate_size,
-                                 mRunState.cublas_handle(), mRunState.MainStream,
+                                 num_experts,
+                                 hidden_size,
+                                 intermediate_size,
+                                 mRunState.cublas_handle(),
+                                 mRunState.MainStream,
                                  host_offsets_ptr,
                                  active_ptr,
                                  weight_is_compact,
@@ -322,8 +322,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     }
 
     // Apply grouped MoE LoRA (gate/up) when enabled.
-    if (mLoRAConfig && mLoRAWeights && mLoRARunState &&
-        mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
+    if (mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
         layer_idx_any >= 0) {
         auto& lora_block = mLoRAWeights->get_block(layer_idx_any, mRunState.MainStream);
         if (lora_block.moe.use_grouped) {
@@ -331,8 +330,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             const auto* lora_grouped_ptr = &lora_block.moe.grouped;
             {
                 auto llep_lora_it = mLLEPStates.find(ep_key_any);
-                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
-                    && llep_lora_it->second.has_merged_lora) {
+                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active &&
+                    llep_lora_it->second.has_merged_lora) {
                     lora_grouped_ptr = &llep_lora_it->second.merged_lora;
                 }
             }
@@ -347,10 +346,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
             bool lora_applied = false;
 
             auto get_dropout_seed = [&](int proj_type) -> unsigned int {
-                return mLoRARunState->dropout_base_seed
-                       + static_cast<unsigned int>(layer_idx_any) * 1000000u
-                       + static_cast<unsigned int>(proj_type) * 100000u
-                       + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+                return mLoRARunState->dropout_base_seed + static_cast<unsigned int>(layer_idx_any) * 1000000u +
+                       static_cast<unsigned int>(proj_type) * 100000u +
+                       static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
             };
 
             auto view_or_temp = [&](Tensor& buf, long rows, long cols) -> Tensor {
@@ -365,12 +363,19 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                 view.Rank = 2;
                 view.Sizes[0] = rows;
                 view.Sizes[1] = cols;
-                for (int i = 2; i < MAX_TENSOR_DIM; ++i) view.Sizes[i] = 1;
+                for (int i = 2; i < MAX_TENSOR_DIM; ++i)
+                    view.Sizes[i] = 1;
                 return view;
             };
 
-            auto dispatch_grouped_gemm = [&](Tensor& out_t, const Tensor& in_t, const Tensor& weight_t,
-                                             int M, int K, float alpha, float beta, EMMTranspose mode) {
+            auto dispatch_grouped_gemm = [&](Tensor& out_t,
+                                             const Tensor& in_t,
+                                             const Tensor& weight_t,
+                                             int M,
+                                             int K,
+                                             float alpha,
+                                             float beta,
+                                             EMMTranspose mode) {
                 if (in_t.DType != weight_t.DType || in_t.DType != out_t.DType) {
                     std::string msg = "MoE LoRA: dtype mismatch between activation and LoRA weights. "
                                       "Set lora_dtype='bf16' in your config to match activation dtype.";
@@ -382,16 +387,13 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                     auto meta_it = mEPLayerMeta.find(ep_key_any);
                     if (meta_it != mEPLayerMeta.end()) {
                         const auto& meta = meta_it->second;
-                        if (meta.num_local == num_experts &&
-                            meta.native_start >= 0 &&
+                        if (meta.num_local == num_experts && meta.native_start >= 0 &&
                             (meta.native_start + num_experts) <= weight_rows) {
                             const std::size_t elem_sz = get_dtype_size(weight_view.DType);
-                            const std::size_t expert_elems =
-                                static_cast<std::size_t>(weight_view.Sizes[1]) *
-                                static_cast<std::size_t>(weight_view.Sizes[2]);
-                            weight_view.Data =
-                                static_cast<std::byte*>(weight_view.Data)
-                                + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                            const std::size_t expert_elems = static_cast<std::size_t>(weight_view.Sizes[1]) *
+                                                             static_cast<std::size_t>(weight_view.Sizes[2]);
+                            weight_view.Data = static_cast<std::byte*>(weight_view.Data) +
+                                               static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
                             weight_view.Sizes[0] = num_experts;
                             weight_rows = num_experts;
                         }
@@ -412,17 +414,39 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                     lora_num_active = fallback_count;
                 }
                 if (in_t.DType == ETensorDType::BF16) {
-                    moe_grouped_gemm(out_t.get<nv_bfloat16>(), in_t.get<nv_bfloat16>(), weight_view.get<nv_bfloat16>(),
-                                     expert_offsets.get<int>(), num_experts, M, K,
-                                     mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
-                                     lora_weight_is_compact, lora_num_active);
+                    moe_grouped_gemm(out_t.get<nv_bfloat16>(),
+                                     in_t.get<nv_bfloat16>(),
+                                     weight_view.get<nv_bfloat16>(),
+                                     expert_offsets.get<int>(),
+                                     num_experts,
+                                     M,
+                                     K,
+                                     mRunState.cublas_handle(),
+                                     mRunState.MainStream,
+                                     host_offsets_ptr,
+                                     alpha,
+                                     beta,
+                                     mode,
+                                     lora_active_ptr,
+                                     lora_weight_is_compact,
+                                     lora_num_active);
                 } else {
-                    moe_grouped_gemm(out_t.get<float>(), in_t.get<float>(), weight_view.get<float>(),
-                                     expert_offsets.get<int>(), num_experts, M, K,
-                                     mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
-                                     lora_weight_is_compact, lora_num_active);
+                    moe_grouped_gemm(out_t.get<float>(),
+                                     in_t.get<float>(),
+                                     weight_view.get<float>(),
+                                     expert_offsets.get<int>(),
+                                     num_experts,
+                                     M,
+                                     K,
+                                     mRunState.cublas_handle(),
+                                     mRunState.MainStream,
+                                     host_offsets_ptr,
+                                     alpha,
+                                     beta,
+                                     mode,
+                                     lora_active_ptr,
+                                     lora_weight_is_compact,
+                                     lora_num_active);
                 }
             };
 
@@ -441,11 +465,23 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
 
                 if (has_gate_up) {
                     Tensor lora_gate_up = view_or_temp(mLoRARunState->moe_lora_gate_up, total_tokens_l, gate_up_dim);
-                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate_up->A,
-                                          rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                    dispatch_grouped_gemm(lora_intermediate,
+                                          inp,
+                                          grouped.gate_up->A,
+                                          rank,
+                                          hidden_size,
+                                          1.0f,
+                                          0.0f,
+                                          EMMTranspose::TN);
                     scale_and_dropout(lora_intermediate, get_dropout_seed(7));
-                    dispatch_grouped_gemm(lora_gate_up, lora_intermediate, grouped.gate_up->B,
-                                          gate_up_dim, rank, 1.0f, 0.0f, EMMTranspose::TN);
+                    dispatch_grouped_gemm(lora_gate_up,
+                                          lora_intermediate,
+                                          grouped.gate_up->B,
+                                          gate_up_dim,
+                                          rank,
+                                          1.0f,
+                                          0.0f,
+                                          EMMTranspose::TN);
                     vector_add_sr(out, out, lora_gate_up, 1.0f, out.nelem(), /*seed=*/0, mRunState.MainStream);
                     lora_applied = true;
                 } else {
@@ -456,41 +492,85 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                     bool has_up = false;
 
                     if (grouped.gate.has_value() && grouped.gate->has_value()) {
-                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate->A,
-                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        dispatch_grouped_gemm(lora_intermediate,
+                                              inp,
+                                              grouped.gate->A,
+                                              rank,
+                                              hidden_size,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::TN);
                         scale_and_dropout(lora_intermediate, get_dropout_seed(5));
-                        dispatch_grouped_gemm(lora_gate, lora_intermediate, grouped.gate->B,
-                                              intermediate_size, rank, 1.0f, 0.0f, EMMTranspose::TN);
+                        dispatch_grouped_gemm(lora_gate,
+                                              lora_intermediate,
+                                              grouped.gate->B,
+                                              intermediate_size,
+                                              rank,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::TN);
                         has_gate = true;
                         if (!gate_up_interleaved) {
-                            add_2d_slice(out, lora_gate, total_tokens_l, gate_up_dim, intermediate_size,
-                                         /*dst_col_offset=*/intermediate_size, mRunState.MainStream);
+                            add_2d_slice(out,
+                                         lora_gate,
+                                         total_tokens_l,
+                                         gate_up_dim,
+                                         intermediate_size,
+                                         /*dst_col_offset=*/intermediate_size,
+                                         mRunState.MainStream);
                         }
                     }
 
                     if (grouped.up.has_value() && grouped.up->has_value()) {
-                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.up->A,
-                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        dispatch_grouped_gemm(lora_intermediate,
+                                              inp,
+                                              grouped.up->A,
+                                              rank,
+                                              hidden_size,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::TN);
                         scale_and_dropout(lora_intermediate, get_dropout_seed(4));
-                        dispatch_grouped_gemm(lora_up, lora_intermediate, grouped.up->B,
-                                              intermediate_size, rank, 1.0f, 0.0f, EMMTranspose::TN);
+                        dispatch_grouped_gemm(lora_up,
+                                              lora_intermediate,
+                                              grouped.up->B,
+                                              intermediate_size,
+                                              rank,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::TN);
                         has_up = true;
                         if (!gate_up_interleaved) {
-                            add_2d_slice(out, lora_up, total_tokens_l, gate_up_dim, intermediate_size,
-                                         /*dst_col_offset=*/0, mRunState.MainStream);
+                            add_2d_slice(out,
+                                         lora_up,
+                                         total_tokens_l,
+                                         gate_up_dim,
+                                         intermediate_size,
+                                         /*dst_col_offset=*/0,
+                                         mRunState.MainStream);
                         }
                     }
 
                     if (gate_up_interleaved) {
                         if (has_gate && has_up) {
-                            add_gate_up_interleaved(out, lora_up, lora_gate,
-                                                    total_tokens_i, intermediate_size, mRunState.MainStream);
+                            add_gate_up_interleaved(out,
+                                                    lora_up,
+                                                    lora_gate,
+                                                    total_tokens_i,
+                                                    intermediate_size,
+                                                    mRunState.MainStream);
                         } else if (has_gate) {
-                            add_gate_up_interleaved_gate(out, lora_gate,
-                                                         total_tokens_i, intermediate_size, mRunState.MainStream);
+                            add_gate_up_interleaved_gate(out,
+                                                         lora_gate,
+                                                         total_tokens_i,
+                                                         intermediate_size,
+                                                         mRunState.MainStream);
                         } else if (has_up) {
-                            add_gate_up_interleaved_up(out, lora_up,
-                                                       total_tokens_i, intermediate_size, mRunState.MainStream);
+                            add_gate_up_interleaved_up(out,
+                                                       lora_up,
+                                                       total_tokens_i,
+                                                       intermediate_size,
+                                                       mRunState.MainStream);
                         }
                     }
                     lora_applied = has_gate || has_up;
@@ -568,8 +648,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     if (layer_idx >= 0) {
         std::vector<std::string> candidate_keys;
         if (mOptions.EPSize > 1) {
-            const std::string base_key =
-                "blocks[" + std::to_string(layer_idx) + "].moe_expert_offsets";
+            const std::string base_key = "blocks[" + std::to_string(layer_idx) + "].moe_expert_offsets";
             candidate_keys.push_back(base_key + "#r1");
             candidate_keys.push_back(base_key + "#r0");
         } else {
@@ -608,9 +687,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     int num_experts = num_experts_for_offsets;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
     // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
-    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
-        ? static_cast<int>(mConfig.MoeIntermediateSize)
-        : static_cast<int>(mConfig.IntermediateSize);
+    const int intermediate_size = (mConfig.MoeIntermediateSize > 0) ? static_cast<int>(mConfig.MoeIntermediateSize)
+                                                                    : static_cast<int>(mConfig.IntermediateSize);
 
     // LLEP per-expert weight pointer override for backward.
     // Case 1: Full LLEP state (last MoE layer) — use directly.
@@ -640,7 +718,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                 const long gu_cols = (weights.Rank >= 3) ? weights.Sizes[2] : 0;
                 const size_t expert_bytes = static_cast<size_t>(gu_rows * gu_cols) * elem_sz;
                 std::vector<long> zw_shape = {1L, gu_rows, gu_cols};
-                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape, "moe_grouped_gemm_gate_up_zero_weight");
+                Tensor zero_weight =
+                    mRunState.temp_alloc(weights.DType, zw_shape, "moe_grouped_gemm_gate_up_zero_weight");
                 fill_zero(zero_weight, mRunState.MainStream);
                 mTemps.push_back(zero_weight);
 
@@ -649,8 +728,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                     const int global_e = meta.merged_to_global[m];
                     const int local_idx = global_e - meta.native_start;
                     if (local_idx >= 0 && local_idx < meta.num_local) {
-                        reconstructed_weight_ptrs[m] = static_cast<const std::byte*>(weights.Data)
-                            + static_cast<size_t>(local_idx) * expert_bytes;
+                        reconstructed_weight_ptrs[m] =
+                            static_cast<const std::byte*>(weights.Data) + static_cast<size_t>(local_idx) * expert_bytes;
                     } else {
                         reconstructed_weight_ptrs[m] = zero_weight.Data;
                     }
@@ -665,40 +744,36 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
             auto meta_it = mEPLayerMeta.find(ep_key);
             if (meta_it != mEPLayerMeta.end()) {
                 const auto& meta = meta_it->second;
-                if (meta.num_local == num_experts &&
-                    meta.native_start >= 0 &&
+                if (meta.num_local == num_experts && meta.native_start >= 0 &&
                     (meta.native_start + num_experts) <= weight_rows) {
                     const std::size_t elem_sz = get_dtype_size(weights.DType);
                     const std::size_t expert_elems =
-                        static_cast<std::size_t>(weights.Sizes[1]) *
-                        static_cast<std::size_t>(weights.Sizes[2]);
-                    weights.Data = static_cast<std::byte*>(weights.Data)
-                        + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                        static_cast<std::size_t>(weights.Sizes[1]) * static_cast<std::size_t>(weights.Sizes[2]);
+                    weights.Data = static_cast<std::byte*>(weights.Data) +
+                                   static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
                     weights.Sizes[0] = num_experts;
                 }
             }
         }
     }
 
-    const int weight_experts = llep_weight_ptrs ? num_experts
-        : ((weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts);
+    const int weight_experts =
+        llep_weight_ptrs ? num_experts : ((weights.Rank > 0) ? static_cast<int>(weights.Sizes[0]) : num_experts);
 
     // Get host offsets from cache (populates on first backward access for this layer).
-    const int* cached_host_offsets = get_or_sync_moe_host_offsets(
-        ep_key, expert_offsets_ptr->get<int>(), num_experts);
+    const int* cached_host_offsets = get_or_sync_moe_host_offsets(ep_key, expert_offsets_ptr->get<int>(), num_experts);
 
-    MoeCompactInfo compact = cached_host_offsets
-        ? build_moe_compact_info_from_host(cached_host_offsets,
-                                           num_experts,
-                                           weight_experts,
-                                           layer_idx,
-                                           "moe_grouped_gemm_gate_up_backward")
-        : build_moe_compact_info(expert_offsets_ptr->get<int>(),
-                                 num_experts,
-                                 weight_experts,
-                                 mRunState.MainStream,
-                                 layer_idx,
-                                 "moe_grouped_gemm_gate_up_backward");
+    MoeCompactInfo compact = cached_host_offsets ? build_moe_compact_info_from_host(cached_host_offsets,
+                                                                                    num_experts,
+                                                                                    weight_experts,
+                                                                                    layer_idx,
+                                                                                    "moe_grouped_gemm_gate_up_backward")
+                                                 : build_moe_compact_info(expert_offsets_ptr->get<int>(),
+                                                                          num_experts,
+                                                                          weight_experts,
+                                                                          mRunState.MainStream,
+                                                                          layer_idx,
+                                                                          "moe_grouped_gemm_gate_up_backward");
     const bool weight_is_compact = compact.weight_is_compact;
     const int* host_offsets_ptr = cached_host_offsets;
     if (!host_offsets_ptr && !compact.host_offsets.empty()) {
@@ -738,22 +813,15 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     if (qlora_provider && qlora_provider->supports_selective_moe()) {
         const int* refresh_offsets = host_offsets_ptr;
         if (refresh_offsets) {
-            (void)refresh_moe_experts_if_needed(layer_idx,
-                                                refresh_offsets,
-                                                num_experts,
-                                                mWeights,
-                                                mRunState.MainStream);
+            (void)
+                refresh_moe_experts_if_needed(layer_idx, refresh_offsets, num_experts, mWeights, mRunState.MainStream);
         }
     }
 
-    const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState &&
-                              mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
-                              layer_idx >= 0;
-    const bool skip_base_backward =
-        lora_enabled &&
-        mRunState.is_lora_only_mode() &&
-        mRunState.is_prequantized() &&
-        mConfig.Architecture == PretrainedConfig::GPT_OSS;
+    const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() &&
+                              mLoRAWeights->enabled() && layer_idx >= 0;
+    const bool skip_base_backward = lora_enabled && mRunState.is_lora_only_mode() && mRunState.is_prequantized() &&
+                                    mConfig.Architecture == PretrainedConfig::GPT_OSS;
 
     auto zero_d_input = [&]() {
         if (!d_input_ptr->Data || d_input_ptr->bytes() == 0) return;
@@ -771,8 +839,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                                           d_gate_up.get<nv_bfloat16>(),
                                           weights.get<nv_bfloat16>(),
                                           expert_offsets_ptr->get<int>(),
-                                          num_experts, hidden_size, intermediate_size,
-                                          mRunState.cublas_handle(), mRunState.MainStream,
+                                          num_experts,
+                                          hidden_size,
+                                          intermediate_size,
+                                          mRunState.cublas_handle(),
+                                          mRunState.MainStream,
                                           host_offsets_ptr,
                                           active_ptr,
                                           weight_is_compact,
@@ -783,8 +854,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                                           d_gate_up.get<float>(),
                                           weights.get<float>(),
                                           expert_offsets_ptr->get<int>(),
-                                          num_experts, hidden_size, intermediate_size,
-                                          mRunState.cublas_handle(), mRunState.MainStream,
+                                          num_experts,
+                                          hidden_size,
+                                          intermediate_size,
+                                          mRunState.cublas_handle(),
+                                          mRunState.MainStream,
                                           host_offsets_ptr,
                                           active_ptr,
                                           weight_is_compact,
@@ -801,8 +875,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
             bool llep_lora_active = false;
             {
                 auto llep_lora_it = mLLEPStates.find(ep_key);
-                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active
-                    && llep_lora_it->second.has_merged_lora) {
+                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active &&
+                    llep_lora_it->second.has_merged_lora) {
                     lora_grouped_ptr = &llep_lora_it->second.merged_lora;
                     llep_lora_active = true;
                 }
@@ -816,10 +890,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
             const int total_tokens_i = static_cast<int>(total_tokens_l);
 
             auto get_dropout_seed = [&](int proj_type) -> unsigned int {
-                return mLoRARunState->dropout_base_seed
-                       + static_cast<unsigned int>(layer_idx) * 1000000u
-                       + static_cast<unsigned int>(proj_type) * 100000u
-                       + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+                return mLoRARunState->dropout_base_seed + static_cast<unsigned int>(layer_idx) * 1000000u +
+                       static_cast<unsigned int>(proj_type) * 100000u +
+                       static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
             };
 
             auto view_or_temp = [&](Tensor& buf, long rows, long cols) -> Tensor {
@@ -834,12 +907,19 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                 view.Rank = 2;
                 view.Sizes[0] = rows;
                 view.Sizes[1] = cols;
-                for (int i = 2; i < MAX_TENSOR_DIM; ++i) view.Sizes[i] = 1;
+                for (int i = 2; i < MAX_TENSOR_DIM; ++i)
+                    view.Sizes[i] = 1;
                 return view;
             };
 
-            auto dispatch_grouped_gemm = [&](Tensor& out_t, const Tensor& in_t, const Tensor& weight_t,
-                                             int M, int K, float alpha, float beta, EMMTranspose mode) {
+            auto dispatch_grouped_gemm = [&](Tensor& out_t,
+                                             const Tensor& in_t,
+                                             const Tensor& weight_t,
+                                             int M,
+                                             int K,
+                                             float alpha,
+                                             float beta,
+                                             EMMTranspose mode) {
                 if (in_t.DType != weight_t.DType || in_t.DType != out_t.DType) {
                     std::string msg = "MoE LoRA backward: dtype mismatch between activation and LoRA weights. "
                                       "Set lora_dtype='bf16' in your config to match activation dtype.";
@@ -851,16 +931,13 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                     auto meta_it = mEPLayerMeta.find(ep_key);
                     if (meta_it != mEPLayerMeta.end()) {
                         const auto& meta = meta_it->second;
-                        if (meta.num_local == num_experts &&
-                            meta.native_start >= 0 &&
+                        if (meta.num_local == num_experts && meta.native_start >= 0 &&
                             (meta.native_start + num_experts) <= weight_rows) {
                             const std::size_t elem_sz = get_dtype_size(weight_view.DType);
-                            const std::size_t expert_elems =
-                                static_cast<std::size_t>(weight_view.Sizes[1]) *
-                                static_cast<std::size_t>(weight_view.Sizes[2]);
-                            weight_view.Data =
-                                static_cast<std::byte*>(weight_view.Data)
-                                + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                            const std::size_t expert_elems = static_cast<std::size_t>(weight_view.Sizes[1]) *
+                                                             static_cast<std::size_t>(weight_view.Sizes[2]);
+                            weight_view.Data = static_cast<std::byte*>(weight_view.Data) +
+                                               static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
                             weight_view.Sizes[0] = num_experts;
                             weight_rows = num_experts;
                         }
@@ -881,85 +958,122 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                     lora_num_active = fallback_count;
                 }
                 if (in_t.DType == ETensorDType::BF16) {
-                    moe_grouped_gemm(out_t.get<nv_bfloat16>(), in_t.get<nv_bfloat16>(), weight_view.get<nv_bfloat16>(),
-                                     expert_offsets_ptr->get<int>(), num_experts, M, K,
-                                     mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
-                                     lora_weight_is_compact, lora_num_active);
+                    moe_grouped_gemm(out_t.get<nv_bfloat16>(),
+                                     in_t.get<nv_bfloat16>(),
+                                     weight_view.get<nv_bfloat16>(),
+                                     expert_offsets_ptr->get<int>(),
+                                     num_experts,
+                                     M,
+                                     K,
+                                     mRunState.cublas_handle(),
+                                     mRunState.MainStream,
+                                     host_offsets_ptr,
+                                     alpha,
+                                     beta,
+                                     mode,
+                                     lora_active_ptr,
+                                     lora_weight_is_compact,
+                                     lora_num_active);
                 } else {
-                    moe_grouped_gemm(out_t.get<float>(), in_t.get<float>(), weight_view.get<float>(),
-                                     expert_offsets_ptr->get<int>(), num_experts, M, K,
-                                     mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
-                                     lora_weight_is_compact, lora_num_active);
+                    moe_grouped_gemm(out_t.get<float>(),
+                                     in_t.get<float>(),
+                                     weight_view.get<float>(),
+                                     expert_offsets_ptr->get<int>(),
+                                     num_experts,
+                                     M,
+                                     K,
+                                     mRunState.cublas_handle(),
+                                     mRunState.MainStream,
+                                     host_offsets_ptr,
+                                     alpha,
+                                     beta,
+                                     mode,
+                                     lora_active_ptr,
+                                     lora_weight_is_compact,
+                                     lora_num_active);
                 }
             };
 
-            auto dispatch_weight_grad = [&](Tensor& d_weight, const Tensor& grad_output, const Tensor& in,
-                                            int M, int N, float beta) {
-                if (grad_output.DType != in.DType) {
-                    throw std::runtime_error("MoE LoRA backward: grad/output dtype mismatch.");
-                }
-                Tensor d_weight_view = d_weight;
-                int weight_rows = (d_weight_view.Rank > 0) ? static_cast<int>(d_weight_view.Sizes[0]) : num_experts;
-                if (mOptions.EPSize > 1 && layer_idx >= 0 && d_weight_view.Rank >= 3 && weight_rows > num_experts) {
-                    auto meta_it = mEPLayerMeta.find(ep_key);
-                    if (meta_it != mEPLayerMeta.end()) {
-                        const auto& meta = meta_it->second;
-                        if (meta.num_local == num_experts &&
-                            meta.native_start >= 0 &&
-                            (meta.native_start + num_experts) <= weight_rows) {
-                            const std::size_t elem_sz = get_dtype_size(d_weight_view.DType);
-                            const std::size_t expert_elems =
-                                static_cast<std::size_t>(d_weight_view.Sizes[1]) *
-                                static_cast<std::size_t>(d_weight_view.Sizes[2]);
-                            d_weight_view.Data =
-                                static_cast<std::byte*>(d_weight_view.Data)
-                                + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
-                            d_weight_view.Sizes[0] = num_experts;
-                            weight_rows = num_experts;
+            auto dispatch_weight_grad =
+                [&](Tensor& d_weight, const Tensor& grad_output, const Tensor& in, int M, int N, float beta) {
+                    if (grad_output.DType != in.DType) {
+                        throw std::runtime_error("MoE LoRA backward: grad/output dtype mismatch.");
+                    }
+                    Tensor d_weight_view = d_weight;
+                    int weight_rows = (d_weight_view.Rank > 0) ? static_cast<int>(d_weight_view.Sizes[0]) : num_experts;
+                    if (mOptions.EPSize > 1 && layer_idx >= 0 && d_weight_view.Rank >= 3 && weight_rows > num_experts) {
+                        auto meta_it = mEPLayerMeta.find(ep_key);
+                        if (meta_it != mEPLayerMeta.end()) {
+                            const auto& meta = meta_it->second;
+                            if (meta.num_local == num_experts && meta.native_start >= 0 &&
+                                (meta.native_start + num_experts) <= weight_rows) {
+                                const std::size_t elem_sz = get_dtype_size(d_weight_view.DType);
+                                const std::size_t expert_elems = static_cast<std::size_t>(d_weight_view.Sizes[1]) *
+                                                                 static_cast<std::size_t>(d_weight_view.Sizes[2]);
+                                d_weight_view.Data =
+                                    static_cast<std::byte*>(d_weight_view.Data) +
+                                    static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                                d_weight_view.Sizes[0] = num_experts;
+                                weight_rows = num_experts;
+                            }
                         }
                     }
-                }
-                const bool lora_weight_is_compact = (weight_rows != num_experts);
-                const int* lora_active_ptr = active_ptr;
-                int lora_num_active = num_active;
-                std::vector<int> fallback_active;
-                if (lora_weight_is_compact &&
-                    (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
-                    const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
-                    fallback_active.resize(static_cast<std::size_t>(fallback_count));
-                    for (int i = 0; i < fallback_count; ++i) {
-                        fallback_active[static_cast<std::size_t>(i)] = i;
+                    const bool lora_weight_is_compact = (weight_rows != num_experts);
+                    const int* lora_active_ptr = active_ptr;
+                    int lora_num_active = num_active;
+                    std::vector<int> fallback_active;
+                    if (lora_weight_is_compact &&
+                        (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
+                        const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
+                        fallback_active.resize(static_cast<std::size_t>(fallback_count));
+                        for (int i = 0; i < fallback_count; ++i) {
+                            fallback_active[static_cast<std::size_t>(i)] = i;
+                        }
+                        lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
+                        lora_num_active = fallback_count;
                     }
-                    lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
-                    lora_num_active = fallback_count;
-                }
-                if (grad_output.DType == ETensorDType::BF16) {
-                    if (d_weight_view.DType != ETensorDType::BF16) {
-                        throw std::runtime_error("MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "
-                                                 "Set lora_dtype='bf16' in your config.");
+                    if (grad_output.DType == ETensorDType::BF16) {
+                        if (d_weight_view.DType != ETensorDType::BF16) {
+                            throw std::runtime_error(
+                                "MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "
+                                "Set lora_dtype='bf16' in your config.");
+                        }
+                        moe_grouped_gemm_weight_grad(d_weight_view.get<nv_bfloat16>(),
+                                                     grad_output.get<nv_bfloat16>(),
+                                                     in.get<nv_bfloat16>(),
+                                                     expert_offsets_ptr->get<int>(),
+                                                     num_experts,
+                                                     M,
+                                                     N,
+                                                     mRunState.cublas_handle(),
+                                                     mRunState.MainStream,
+                                                     host_offsets_ptr,
+                                                     /*alpha=*/1.0f,
+                                                     beta,
+                                                     lora_active_ptr,
+                                                     lora_weight_is_compact,
+                                                     lora_num_active);
+                    } else {
+                        if (d_weight_view.DType != ETensorDType::FP32) {
+                            throw std::runtime_error("MoE LoRA backward: dtype mismatch in weight gradients.");
+                        }
+                        moe_grouped_gemm_weight_grad(d_weight_view.get<float>(),
+                                                     grad_output.get<float>(),
+                                                     in.get<float>(),
+                                                     expert_offsets_ptr->get<int>(),
+                                                     num_experts,
+                                                     M,
+                                                     N,
+                                                     mRunState.cublas_handle(),
+                                                     mRunState.MainStream,
+                                                     host_offsets_ptr,
+                                                     /*alpha=*/1.0f,
+                                                     beta,
+                                                     lora_active_ptr,
+                                                     lora_weight_is_compact,
+                                                     lora_num_active);
                     }
-                    moe_grouped_gemm_weight_grad(d_weight_view.get<nv_bfloat16>(),
-                                                 grad_output.get<nv_bfloat16>(),
-                                                 in.get<nv_bfloat16>(),
-                                                 expert_offsets_ptr->get<int>(), num_experts, M, N,
-                                                 mRunState.cublas_handle(), mRunState.MainStream,
-                                                 host_offsets_ptr, /*alpha=*/1.0f, beta,
-                                                 lora_active_ptr, lora_weight_is_compact, lora_num_active);
-                } else {
-                    if (d_weight_view.DType != ETensorDType::FP32) {
-                        throw std::runtime_error("MoE LoRA backward: dtype mismatch in weight gradients.");
-                    }
-                    moe_grouped_gemm_weight_grad(d_weight_view.get<float>(),
-                                                 grad_output.get<float>(),
-                                                 in.get<float>(),
-                                                 expert_offsets_ptr->get<int>(), num_experts, M, N,
-                                                 mRunState.cublas_handle(), mRunState.MainStream,
-                                                 host_offsets_ptr, /*alpha=*/1.0f, beta,
-                                                 lora_active_ptr, lora_weight_is_compact, lora_num_active);
-                }
-            };
+                };
 
             auto scale_and_dropout = [&](Tensor& t, unsigned int seed) {
                 if (training && dropout > 0.0f) {
@@ -987,28 +1101,59 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
 
                 if (has_gate_up) {
                     const unsigned int seed_gate_up = get_dropout_seed(7);
-                    dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate_up->A,
-                                          rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                    dispatch_grouped_gemm(lora_intermediate,
+                                          inp,
+                                          grouped.gate_up->A,
+                                          rank,
+                                          hidden_size,
+                                          1.0f,
+                                          0.0f,
+                                          EMMTranspose::TN);
                     scale_and_dropout(lora_intermediate, seed_gate_up);
                     if (lora_grads && lora_grads->moe.grouped.gate_up.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.gate_up->B, d_gate_up, lora_intermediate,
-                                             gate_up_dim, rank, grad_beta);
+                        dispatch_weight_grad(lora_grads->moe.grouped.gate_up->B,
+                                             d_gate_up,
+                                             lora_intermediate,
+                                             gate_up_dim,
+                                             rank,
+                                             grad_beta);
                     }
-                    dispatch_grouped_gemm(lora_intermediate, d_gate_up, grouped.gate_up->B,
-                                          rank, gate_up_dim, 1.0f, 0.0f, EMMTranspose::NN);
+                    dispatch_grouped_gemm(lora_intermediate,
+                                          d_gate_up,
+                                          grouped.gate_up->B,
+                                          rank,
+                                          gate_up_dim,
+                                          1.0f,
+                                          0.0f,
+                                          EMMTranspose::NN);
                     scale_and_dropout(lora_intermediate, seed_gate_up);
                     if (lora_grads && lora_grads->moe.grouped.gate_up.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.gate_up->A, lora_intermediate, inp,
-                                             rank, hidden_size, grad_beta);
+                        dispatch_weight_grad(lora_grads->moe.grouped.gate_up->A,
+                                             lora_intermediate,
+                                             inp,
+                                             rank,
+                                             hidden_size,
+                                             grad_beta);
                     }
-                    dispatch_grouped_gemm(*d_input_ptr, lora_intermediate, grouped.gate_up->A,
-                                          hidden_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
+                    dispatch_grouped_gemm(*d_input_ptr,
+                                          lora_intermediate,
+                                          grouped.gate_up->A,
+                                          hidden_size,
+                                          rank,
+                                          1.0f,
+                                          1.0f,
+                                          EMMTranspose::NN);
                 } else {
                     Tensor d_up = view_or_temp(mLoRARunState->moe_lora_up, total_tokens_l, intermediate_size);
                     Tensor d_gate = view_or_temp(mLoRARunState->moe_lora_gate, total_tokens_l, intermediate_size);
 
                     if (op.attrs.gate_up_interleaved) {
-                        split_gate_up_interleaved(d_gate_up, d_up, d_gate, total_tokens_i, intermediate_size, mRunState.MainStream);
+                        split_gate_up_interleaved(d_gate_up,
+                                                  d_up,
+                                                  d_gate,
+                                                  total_tokens_i,
+                                                  intermediate_size,
+                                                  mRunState.MainStream);
                     } else {
                         split_gate_up(d_gate_up, d_up, d_gate, total_tokens_i, intermediate_size, mRunState.MainStream);
                     }
@@ -1017,45 +1162,97 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                     if (grouped.gate.has_value() && grouped.gate->has_value()) {
                         const unsigned int seed_gate = get_dropout_seed(5);
                         // intermediate = x @ A^T
-                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.gate->A,
-                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        dispatch_grouped_gemm(lora_intermediate,
+                                              inp,
+                                              grouped.gate->A,
+                                              rank,
+                                              hidden_size,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::TN);
                         scale_and_dropout(lora_intermediate, seed_gate);
                         if (lora_grads && lora_grads->moe.grouped.gate.has_value()) {
-                            dispatch_weight_grad(lora_grads->moe.grouped.gate->B, d_gate, lora_intermediate,
-                                                 intermediate_size, rank, grad_beta);
+                            dispatch_weight_grad(lora_grads->moe.grouped.gate->B,
+                                                 d_gate,
+                                                 lora_intermediate,
+                                                 intermediate_size,
+                                                 rank,
+                                                 grad_beta);
                         }
                         // intermediate = d_gate @ B
-                        dispatch_grouped_gemm(lora_intermediate, d_gate, grouped.gate->B,
-                                              rank, intermediate_size, 1.0f, 0.0f, EMMTranspose::NN);
+                        dispatch_grouped_gemm(lora_intermediate,
+                                              d_gate,
+                                              grouped.gate->B,
+                                              rank,
+                                              intermediate_size,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::NN);
                         scale_and_dropout(lora_intermediate, seed_gate);
                         if (lora_grads && lora_grads->moe.grouped.gate.has_value()) {
-                            dispatch_weight_grad(lora_grads->moe.grouped.gate->A, lora_intermediate, inp,
-                                                 rank, hidden_size, grad_beta);
+                            dispatch_weight_grad(lora_grads->moe.grouped.gate->A,
+                                                 lora_intermediate,
+                                                 inp,
+                                                 rank,
+                                                 hidden_size,
+                                                 grad_beta);
                         }
                         // dx += intermediate @ A
-                        dispatch_grouped_gemm(*d_input_ptr, lora_intermediate, grouped.gate->A,
-                                              hidden_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
+                        dispatch_grouped_gemm(*d_input_ptr,
+                                              lora_intermediate,
+                                              grouped.gate->A,
+                                              hidden_size,
+                                              rank,
+                                              1.0f,
+                                              1.0f,
+                                              EMMTranspose::NN);
                     }
 
                     // Up projection
                     if (grouped.up.has_value() && grouped.up->has_value()) {
                         const unsigned int seed_up = get_dropout_seed(4);
-                        dispatch_grouped_gemm(lora_intermediate, inp, grouped.up->A,
-                                              rank, hidden_size, 1.0f, 0.0f, EMMTranspose::TN);
+                        dispatch_grouped_gemm(lora_intermediate,
+                                              inp,
+                                              grouped.up->A,
+                                              rank,
+                                              hidden_size,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::TN);
                         scale_and_dropout(lora_intermediate, seed_up);
                         if (lora_grads && lora_grads->moe.grouped.up.has_value()) {
-                            dispatch_weight_grad(lora_grads->moe.grouped.up->B, d_up, lora_intermediate,
-                                                 intermediate_size, rank, grad_beta);
+                            dispatch_weight_grad(lora_grads->moe.grouped.up->B,
+                                                 d_up,
+                                                 lora_intermediate,
+                                                 intermediate_size,
+                                                 rank,
+                                                 grad_beta);
                         }
-                        dispatch_grouped_gemm(lora_intermediate, d_up, grouped.up->B,
-                                              rank, intermediate_size, 1.0f, 0.0f, EMMTranspose::NN);
+                        dispatch_grouped_gemm(lora_intermediate,
+                                              d_up,
+                                              grouped.up->B,
+                                              rank,
+                                              intermediate_size,
+                                              1.0f,
+                                              0.0f,
+                                              EMMTranspose::NN);
                         scale_and_dropout(lora_intermediate, seed_up);
                         if (lora_grads && lora_grads->moe.grouped.up.has_value()) {
-                            dispatch_weight_grad(lora_grads->moe.grouped.up->A, lora_intermediate, inp,
-                                                 rank, hidden_size, grad_beta);
+                            dispatch_weight_grad(lora_grads->moe.grouped.up->A,
+                                                 lora_intermediate,
+                                                 inp,
+                                                 rank,
+                                                 hidden_size,
+                                                 grad_beta);
                         }
-                        dispatch_grouped_gemm(*d_input_ptr, lora_intermediate, grouped.up->A,
-                                              hidden_size, rank, 1.0f, 1.0f, EMMTranspose::NN);
+                        dispatch_grouped_gemm(*d_input_ptr,
+                                              lora_intermediate,
+                                              grouped.up->A,
+                                              hidden_size,
+                                              rank,
+                                              1.0f,
+                                              1.0f,
+                                              EMMTranspose::NN);
                     }
                 }
             }
@@ -1067,5 +1264,88 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     // Weight gradient computation would go here if needed (for fine-tuning experts)
 }
 
+namespace {
 
+// -----------------------------------------------------------------------------
+// MoE Grouped GEMM Gate+Up backward rule
+// Forward: out = moe_grouped_gemm_gate_up(inp, weights, scatter_indices)
+// Backward: d_inp = moe_grouped_gemm_gate_up_backward(d_out, inp, weights, scatter_indices)
+// Note: weights gradient is computed but not propagated (frozen expert weights)
+// -----------------------------------------------------------------------------
+std::vector<Operation> moe_grouped_gemm_gate_up_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        const auto& fwd = ctx.fwd_op;
+        std::string inp = fwd.inputs[0];
+        std::string weights = fwd.inputs[1];
+        std::string scatter_indices = fwd.inputs[2];
+
+        std::string inp_ref = ctx.is_param(inp) ? inp : saved_ref(inp);
+        std::string weights_ref = ctx.is_param(weights) ? weights : saved_ref(weights);
+        std::string scatter_ref = saved_ref(scatter_indices);
+        AttrMap attrs = copy_attrs(fwd.attrs, {"gate_up_interleaved"});
+
+        ops.push_back(make_operation("moe_grouped_gemm_gate_up_backward_" + std::to_string(ctx.op_counter++),
+                                     "moe_grouped_gemm_gate_up_backward",
+                                     "moe_grouped_gemm_gate_up_backward",
+                                     {ctx.d_output, inp_ref, weights_ref, scatter_ref},
+                                     {ctx.d_inputs[0]},
+                                     attrs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
+}  // namespace dsl
+
+REGISTER_AUTODIFF("moe_grouped_gemm_gate_up", ::dsl::moe_grouped_gemm_gate_up_backward);
+
+// ---------------------------------------------------------------------------
+// Shape signatures (Phase 2c)
+// ---------------------------------------------------------------------------
+namespace dsl {
+namespace shape_checker {
+namespace {
+
+// ------------------------------------------------------------------------
+// MoE Grouped GEMM Gate+Up
+// Input[0]: x [total_tokens, hidden_size]
+// Input[1]: weights [num_experts, 2*intermediate, hidden_size]
+// Input[2]: scatter_indices
+// Output: [total_tokens, 2*intermediate]
+// ------------------------------------------------------------------------
+const int _moe_grouped_gemm_gate_up_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "moe_grouped_gemm_gate_up";
+    sig.min_inputs = 3;
+    sig.max_inputs = 3;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+        // Complex grouped GEMM shapes; accept for now
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+const int _moe_grouped_gemm_gate_up_backward_shape_reg = [] {
+    OpShapeSignature sig;
+    sig.op_name = "moe_grouped_gemm_gate_up_backward";
+    sig.min_inputs = 4;
+    sig.max_inputs = 4;
+    sig.min_outputs = 1;
+    sig.max_outputs = 1;
+    sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
+        return std::optional<ShapeValidationError>();
+    };
+    OpShapeRegistry::instance().register_signature(sig);
+    return 0;
+}();
+
+}  // namespace
+}  // namespace shape_checker
 }  // namespace dsl

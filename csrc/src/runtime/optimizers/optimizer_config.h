@@ -38,17 +38,20 @@ struct OptimizerConfig {
     // NorMuon-specific parameters
     // NorMuon uses a hybrid approach: AdamW for embeddings/norms/lm_head,
     // NorMuon (orthogonalized momentum) for 2D weight matrices
-    float normuon_momentum = 0.95f;     // β₁ for SGD momentum
-    float normuon_beta2 = 0.95f;        // β₂ for variance EMA
-    float normuon_lr = 0.02f;           // Higher default LR than AdamW
-    bool normuon_cautious_wd = true;    // Use cautious (sign-aware) weight decay
+    float normuon_momentum = 0.95f;   // β₁ for SGD momentum
+    float normuon_beta2 = 0.95f;      // β₂ for variance EMA
+    float normuon_lr = 0.02f;         // Higher default LR than AdamW
+    bool normuon_cautious_wd = true;  // Use cautious (sign-aware) weight decay
 
     /**
      * @brief Create default AdamW (full-precision) config
      */
-    static OptimizerConfig adamw(float lr = 2e-4f, float beta1 = 0.9f,
-                                  float beta2 = 0.999f, float epsilon = 1e-8f,
-                                  float weight_decay = 0.1f, float grad_clip = 0.0f) {
+    static OptimizerConfig adamw(float lr = 2e-4f,
+                                 float beta1 = 0.9f,
+                                 float beta2 = 0.999f,
+                                 float epsilon = 1e-8f,
+                                 float weight_decay = 0.1f,
+                                 float grad_clip = 0.0f) {
         OptimizerConfig config;
         config.type = OptimizerType::ADAMW;
         config.learning_rate = lr;
@@ -63,9 +66,12 @@ struct OptimizerConfig {
     /**
      * @brief Create default AdamW 8-bit config
      */
-    static OptimizerConfig adamw_8bit(float lr = 2e-4f, float beta1 = 0.9f,
-                                       float beta2 = 0.999f, float epsilon = 1e-8f,
-                                       float weight_decay = 0.1f, float grad_clip = 0.0f) {
+    static OptimizerConfig adamw_8bit(float lr = 2e-4f,
+                                      float beta1 = 0.9f,
+                                      float beta2 = 0.999f,
+                                      float epsilon = 1e-8f,
+                                      float weight_decay = 0.1f,
+                                      float grad_clip = 0.0f) {
         OptimizerConfig config;
         config.type = OptimizerType::ADAMW_8BIT;
         config.learning_rate = lr;
@@ -84,9 +90,12 @@ struct OptimizerConfig {
      * - AdamW 8-bit for embeddings, norms, lm_head, and 0D/1D parameters
      * - Orthogonalized momentum (NorMuon) for 2D weight matrices
      */
-    static OptimizerConfig normuon(float lr = 0.02f, float momentum = 0.95f,
-                                    float beta2 = 0.95f, float weight_decay = 0.01f,
-                                    float grad_clip = 0.0f, bool cautious_wd = true) {
+    static OptimizerConfig normuon(float lr = 0.02f,
+                                   float momentum = 0.95f,
+                                   float beta2 = 0.95f,
+                                   float weight_decay = 0.01f,
+                                   float grad_clip = 0.0f,
+                                   bool cautious_wd = true) {
         OptimizerConfig config;
         config.type = OptimizerType::NORMUON;
         config.learning_rate = lr;
@@ -106,6 +115,6 @@ struct OptimizerConfig {
     }
 };
 
-} // namespace optimizers
+}  // namespace optimizers
 
-#endif // SUROGATE_SRC_MODULES_OPTIMIZERS_OPTIMIZER_CONFIG_H
+#endif  // SUROGATE_SRC_MODULES_OPTIMIZERS_OPTIMIZER_CONFIG_H

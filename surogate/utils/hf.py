@@ -5,7 +5,7 @@ import shutil
 from typing import Literal
 
 import huggingface_hub
-from huggingface_hub import scan_cache_dir, HfFileSystem, snapshot_download
+from huggingface_hub import HfFileSystem, scan_cache_dir, snapshot_download
 from huggingface_hub.errors import GatedRepoError
 from huggingface_hub.hf_api import RepoFile, list_repo_files
 from transformers import AutoModel
@@ -113,7 +113,7 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
         local_config_path = huggingface_hub.hf_hub_download(repo_id=hugging_face_id, filename="config.json")
 
         # Read from the local downloaded file
-        with open(local_config_path, "r") as f:
+        with open(local_config_path) as f:
             filedata = json.load(f)
     except Exception:
         try:
@@ -179,7 +179,7 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
             "tags": model_tags,
             "license": model_card_data.get("license", ""),
             "pipeline_tag": pipeline_tag,
-            "config": filedata
+            "config": filedata,
         }
         return config
     except huggingface_hub.utils.EntryNotFoundError as e:
@@ -198,6 +198,7 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
         print(f"ERROR: Unexpected error processing {hugging_face_id}: {type(e).__name__}: {e}")
         raise
 
+
 def _is_gguf_repository(hf_model_info):
     """
     Determine if a repository is primarily a GGUF repository by checking the repository tags for 'gguf'
@@ -208,6 +209,7 @@ def _is_gguf_repository(hf_model_info):
     if "gguf" in model_tags_lower and "safetensors" not in model_tags_lower:
         return True
     return False
+
 
 def _create_gguf_repo_config(hugging_face_id: str, hf_model_info, model_card_data, pipeline_tag: str):
     """
@@ -250,6 +252,7 @@ def _create_gguf_repo_config(hugging_face_id: str, hf_model_info, model_card_dat
 
     return config
 
+
 def get_huggingface_download_size(model_id: str, allow_patterns: list = [], repo_type="model"):
     """
     Get the size in bytes of all files to be downloaded from Hugging Face.
@@ -280,6 +283,7 @@ def get_huggingface_download_size(model_id: str, allow_patterns: list = [], repo
 
     return download_size
 
+
 def delete_model_from_hf_cache(model_id: str, cache_dir: str = None) -> None:
     """
     Delete a model from the Hugging Face cache by scanning the cache to locate
@@ -303,6 +307,7 @@ def delete_model_from_hf_cache(model_id: str, cache_dir: str = None) -> None:
             shutil.rmtree(repo.repo_path)
             break
 
+
 def delete_dataset_from_hf_cache(dataset_id: str, cache_dir: str = None) -> None:
     # Scan the cache using the provided cache_dir if available.
     hf_cache_info = scan_cache_dir(cache_dir=cache_dir) if cache_dir else scan_cache_dir()
@@ -315,12 +320,14 @@ def delete_dataset_from_hf_cache(dataset_id: str, cache_dir: str = None) -> None
             break
 
     from huggingface_hub.constants import HF_HOME
+
     repo_name = dataset_id.replace("/", "___")
     cache2 = os.path.join(HF_HOME, f"datasets/{repo_name}")
     try:
         shutil.rmtree(cache2)
     except:
         pass
+
 
 def get_model_architecture(repo_id):
     """Extract and return model architecture as hierarchical JSON."""
@@ -332,22 +339,22 @@ def get_model_architecture(repo_id):
         """Recursively build a tree structure of modules."""
         module_info = {
             "type": module.__class__.__name__,
-            "parameters": sum(p.numel() for p in module.parameters(recurse=False))
+            "parameters": sum(p.numel() for p in module.parameters(recurse=False)),
         }
 
         # Add layer-specific attributes
-        if hasattr(module, 'in_features') and hasattr(module, 'out_features'):
+        if hasattr(module, "in_features") and hasattr(module, "out_features"):
             module_info["in_features"] = module.in_features
             module_info["out_features"] = module.out_features
-        if hasattr(module, 'num_heads'):
+        if hasattr(module, "num_heads"):
             module_info["num_heads"] = module.num_heads
-        if hasattr(module, 'hidden_size'):
+        if hasattr(module, "hidden_size"):
             module_info["hidden_size"] = module.hidden_size
-        if hasattr(module, 'eps'):
+        if hasattr(module, "eps"):
             module_info["eps"] = module.eps
 
         # Handle ModuleList specially - group by type
-        if module.__class__.__name__ == 'ModuleList':
+        if module.__class__.__name__ == "ModuleList":
             child_list = list(module.children())
             if child_list:
                 # Count types of children
@@ -388,7 +395,7 @@ def get_model_architecture(repo_id):
     return {
         "model_id": repo_id,
         "architecture": architecture,
-        "total_parameters": sum(p.numel() for p in model.parameters())
+        "total_parameters": sum(p.numel() for p in model.parameters()),
     }
 
 
@@ -504,11 +511,12 @@ def get_repo_file_metadata(repo_id, repo_type: Literal["model", "dataset"], allo
         files = list_repo_files(repo_id, repo_type=repo_type)
 
         # Filter out git files
-        files = [f for f in files if not f.startswith('.git')]
+        files = [f for f in files if not f.startswith(".git")]
 
         # Filter by allow_patterns if provided
         if allow_patterns:
             import fnmatch
+
             filtered_files = []
             for file in files:
                 if any(fnmatch.fnmatch(file, pattern) for pattern in allow_patterns):
@@ -524,7 +532,7 @@ def get_repo_file_metadata(repo_id, repo_type: Literal["model", "dataset"], allo
             try:
                 # Get file info including size
                 file_info = fs.info(f"{repo_id}/{file}")
-                file_size = file_info.get('size', 0)
+                file_size = file_info.get("size", 0)
                 file_metadata[file] = file_size
                 total_size += file_size
             except Exception as e:
@@ -536,28 +544,28 @@ def get_repo_file_metadata(repo_id, repo_type: Literal["model", "dataset"], allo
     except Exception as e:
         print(f"Error getting repo metadata: {e}")
         return {}, 0
-    
+
 
 def resolve_model_path(model_name_or_path: str) -> str:
     """Resolve a HuggingFace model name or local path to an actual path.
-    
+
     If model_name_or_path is a local directory, return it as-is.
     Otherwise, download the model from HuggingFace Hub and return the local path.
-    
+
     Args:
         model_name_or_path: Either a local path or a HuggingFace model name (e.g., "Qwen/Qwen2.5-0.5B-Instruct")
-    
+
     Returns:
         Local path to the model files.
     """
     # Check if it's already a local path
     if os.path.isdir(model_name_or_path):
         return model_name_or_path
-    
+
     # Check if it's a path to a specific file (safetensors)
     if os.path.isfile(model_name_or_path):
         return model_name_or_path
-    
+
     # Otherwise, treat as HuggingFace model name and download
     local_path = snapshot_download(
         repo_id=model_name_or_path,
@@ -565,22 +573,23 @@ def resolve_model_path(model_name_or_path: str) -> str:
     )
     return local_path
 
+
 def get_model_weights_path(model_dir: str) -> str:
     """Get the path to the model weights file within a model directory.
-    
+
     Args:
         model_dir: Path to the model directory.
-        
+
     Returns:
         Path to model.safetensors or model.safetensors.index.json
     """
     model_path = os.path.join(model_dir, "model.safetensors")
     if os.path.exists(model_path):
         return model_path
-    
+
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     if os.path.exists(index_path):
         return index_path
-    
+
     # If neither exists, return the directory itself (let import_weights handle it)
     return model_dir

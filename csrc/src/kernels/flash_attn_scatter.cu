@@ -13,10 +13,12 @@ namespace {
 // dQ: (total_q, Hq, HS) contiguous.
 // dqkv: (total_q, H, HS) interleaved, where H = Hq + 2*Hkv.
 // Each thread handles one element.
-__global__ void scatter_dq_kernel(
-        nv_bfloat16* __restrict__ dqkv,
-        const nv_bfloat16* __restrict__ dq,
-        int total_q, int Hq, int Hkv, int HS) {
+__global__ void scatter_dq_kernel(nv_bfloat16* __restrict__ dqkv,
+                                  const nv_bfloat16* __restrict__ dq,
+                                  int total_q,
+                                  int Hq,
+                                  int Hkv,
+                                  int HS) {
     const int H = Hq + 2 * Hkv;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = total_q * Hq * HS;
@@ -33,10 +35,12 @@ __global__ void scatter_dq_kernel(
 // dk_expanded: (total_q, Hq, HS) contiguous — each KV head has h_ratio query-head slots.
 // dqkv K section starts at offset Hq*HS from dqkv base.
 // For MHA (Hq == Hkv, h_ratio == 1): this is a simple copy.
-__global__ void reduce_scatter_dk_kernel(
-        nv_bfloat16* __restrict__ dqkv,
-        const nv_bfloat16* __restrict__ dk_expanded,
-        int total_q, int Hq, int Hkv, int HS) {
+__global__ void reduce_scatter_dk_kernel(nv_bfloat16* __restrict__ dqkv,
+                                         const nv_bfloat16* __restrict__ dk_expanded,
+                                         int total_q,
+                                         int Hq,
+                                         int Hkv,
+                                         int HS) {
     const int H = Hq + 2 * Hkv;
     const int h_ratio = Hq / Hkv;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -59,10 +63,12 @@ __global__ void reduce_scatter_dk_kernel(
 }
 
 // Same as reduce_scatter_dk_kernel but for V section.
-__global__ void reduce_scatter_dv_kernel(
-        nv_bfloat16* __restrict__ dqkv,
-        const nv_bfloat16* __restrict__ dv_expanded,
-        int total_q, int Hq, int Hkv, int HS) {
+__global__ void reduce_scatter_dv_kernel(nv_bfloat16* __restrict__ dqkv,
+                                         const nv_bfloat16* __restrict__ dv_expanded,
+                                         int total_q,
+                                         int Hq,
+                                         int Hkv,
+                                         int HS) {
     const int H = Hq + 2 * Hkv;
     const int h_ratio = Hq / Hkv;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -86,64 +92,63 @@ __global__ void reduce_scatter_dv_kernel(
 
 }  // anonymous namespace
 
-void scatter_reduce_dqkv(
-        nv_bfloat16* dqkv,
-        const nv_bfloat16* dq,
-        const nv_bfloat16* dk_expanded,
-        const nv_bfloat16* dv_expanded,
-        int total_q, int Hq, int Hkv, int HS,
-        cudaStream_t stream) {
+void scatter_reduce_dqkv(nv_bfloat16* dqkv,
+                         const nv_bfloat16* dq,
+                         const nv_bfloat16* dk_expanded,
+                         const nv_bfloat16* dv_expanded,
+                         int total_q,
+                         int Hq,
+                         int Hkv,
+                         int HS,
+                         cudaStream_t stream) {
     constexpr int kThreads = 256;
 
     // Scatter dQ
     {
         const int n = total_q * Hq * HS;
         const int blocks = (n + kThreads - 1) / kThreads;
-        scatter_dq_kernel<<<blocks, kThreads, 0, stream>>>(
-            dqkv, dq, total_q, Hq, Hkv, HS);
+        scatter_dq_kernel<<<blocks, kThreads, 0, stream>>>(dqkv, dq, total_q, Hq, Hkv, HS);
     }
 
     // Reduce+scatter dK
     {
         const int n = total_q * Hkv * HS;
         const int blocks = (n + kThreads - 1) / kThreads;
-        reduce_scatter_dk_kernel<<<blocks, kThreads, 0, stream>>>(
-            dqkv, dk_expanded, total_q, Hq, Hkv, HS);
+        reduce_scatter_dk_kernel<<<blocks, kThreads, 0, stream>>>(dqkv, dk_expanded, total_q, Hq, Hkv, HS);
     }
 
     // Reduce+scatter dV
     {
         const int n = total_q * Hkv * HS;
         const int blocks = (n + kThreads - 1) / kThreads;
-        reduce_scatter_dv_kernel<<<blocks, kThreads, 0, stream>>>(
-            dqkv, dv_expanded, total_q, Hq, Hkv, HS);
+        reduce_scatter_dv_kernel<<<blocks, kThreads, 0, stream>>>(dqkv, dv_expanded, total_q, Hq, Hkv, HS);
     }
 }
 
 // Reduce dk_expanded/dv_expanded (Hq heads each) to Hkv KV heads and scatter
 // into the K and V sections of interleaved dqkv. dQ is assumed to already be
 // in the correct position in dqkv (written directly by flash backward).
-void reduce_scatter_dkv(
-        nv_bfloat16* dqkv,
-        const nv_bfloat16* dk_expanded,
-        const nv_bfloat16* dv_expanded,
-        int total_q, int Hq, int Hkv, int HS,
-        cudaStream_t stream) {
+void reduce_scatter_dkv(nv_bfloat16* dqkv,
+                        const nv_bfloat16* dk_expanded,
+                        const nv_bfloat16* dv_expanded,
+                        int total_q,
+                        int Hq,
+                        int Hkv,
+                        int HS,
+                        cudaStream_t stream) {
     constexpr int kThreads = 256;
 
     // Reduce+scatter dK
     {
         const int n = total_q * Hkv * HS;
         const int blocks = (n + kThreads - 1) / kThreads;
-        reduce_scatter_dk_kernel<<<blocks, kThreads, 0, stream>>>(
-            dqkv, dk_expanded, total_q, Hq, Hkv, HS);
+        reduce_scatter_dk_kernel<<<blocks, kThreads, 0, stream>>>(dqkv, dk_expanded, total_q, Hq, Hkv, HS);
     }
 
     // Reduce+scatter dV
     {
         const int n = total_q * Hkv * HS;
         const int blocks = (n + kThreads - 1) / kThreads;
-        reduce_scatter_dv_kernel<<<blocks, kThreads, 0, stream>>>(
-            dqkv, dv_expanded, total_q, Hq, Hkv, HS);
+        reduce_scatter_dv_kernel<<<blocks, kThreads, 0, stream>>>(dqkv, dv_expanded, total_q, Hq, Hkv, HS);
     }
 }

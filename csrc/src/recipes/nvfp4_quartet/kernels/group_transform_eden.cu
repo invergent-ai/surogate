@@ -11,11 +11,15 @@ namespace quartet {
 
 constexpr int NUM_WARPS = 12;
 
-template<bool Transpose>
-__global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_group_transform_128_eden_kernel(
-    __nv_fp4x2_storage_t* y, nv_bfloat16* scales, unsigned* max_scale,
-    const nv_bfloat16* h, const nv_bfloat16* x, int rows, int cols, float inv_fp4_max)
-{
+template <bool Transpose>
+__global__ __launch_bounds__(NUM_WARPS * 32, 1) void cutlass_group_transform_128_eden_kernel(__nv_fp4x2_storage_t* y,
+                                                                                             nv_bfloat16* scales,
+                                                                                             unsigned* max_scale,
+                                                                                             const nv_bfloat16* h,
+                                                                                             const nv_bfloat16* x,
+                                                                                             int rows,
+                                                                                             int cols,
+                                                                                             float inv_fp4_max) {
     constexpr int G = 128;
     constexpr int T = 16;
     constexpr int W = NUM_WARPS;
@@ -31,7 +35,7 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_group_transform_128_e
     extern __shared__ uint4 dynamic_smem[];
 
     nv_bfloat16 local_scale_max = 0.f;
-    nv_bfloat16* a_smem = reinterpret_cast<nv_bfloat16*>(dynamic_smem) + T*G*warp_id;
+    nv_bfloat16* a_smem = reinterpret_cast<nv_bfloat16*>(dynamic_smem) + T * G * warp_id;
 
     // Load Hadamard matrix into shared memory
     for (int k = warp_id; k < T_PER_G * T_PER_G; k += W) {
@@ -113,17 +117,17 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_group_transform_128_e
 
         nv_bfloat16 out_scales[SPT];
 
-        // Process accumulator fragments and quantize
-        #pragma unroll
+// Process accumulator fragments and quantize
+#pragma unroll
         for (int k = 0; k < 2; ++k) {
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < T_PER_G; ++j) {
-                int s = j + T_PER_G*k;
+                int s = j + T_PER_G * k;
                 group_f_vec nv_group;
-                nv_group[0] = acc[j].v[0 + 2*k];
-                nv_group[1] = acc[j].v[1 + 2*k];
-                nv_group[2] = acc[j].v[4 + 2*k];
-                nv_group[3] = acc[j].v[5 + 2*k];
+                nv_group[0] = acc[j].v[0 + 2 * k];
+                nv_group[1] = acc[j].v[1 + 2 * k];
+                nv_group[2] = acc[j].v[4 + 2 * k];
+                nv_group[3] = acc[j].v[5 + 2 * k];
 
                 // Determine local abs-max
                 float abs_max = 0.f;
@@ -147,9 +151,11 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_group_transform_128_e
 
                 // Quantize to FP4 and compute EDEN correction factors
                 for (int t = 0; t < group_f_vec::size; t += 2) {
-                    float2 v = make_float2(nv_group[t] * factor, nv_group[t+1] * factor);
-                    __nv_fp4x2_storage_t bits = __nv_cvt_float2_to_fp4x2(v, __nv_fp4_interpretation_t::__NV_E2M1, cudaRoundMode::cudaRoundNearest);
-                    converted[t/2] = bits;
+                    float2 v = make_float2(nv_group[t] * factor, nv_group[t + 1] * factor);
+                    __nv_fp4x2_storage_t bits = __nv_cvt_float2_to_fp4x2(v,
+                                                                         __nv_fp4_interpretation_t::__NV_E2M1,
+                                                                         cudaRoundMode::cudaRoundNearest);
+                    converted[t / 2] = bits;
                     float2 back = __nv_cvt_fp4x2_to_float2(bits);
                     x_x += v.x * v.x + v.y * v.y;
                     x_y += v.x * back.x + v.y * back.y;
@@ -174,19 +180,19 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_group_transform_128_e
                     const int row = (i * T) / cols * G;
 
                     if (s < 8) {
-                        __nv_fp4x2_storage_t* y_base = y + (col + r4) * rows/2 + row/2;
-                        converted.store(y_base + 2 * t4 + s*8);
+                        __nv_fp4x2_storage_t* y_base = y + (col + r4) * rows / 2 + row / 2;
+                        converted.store(y_base + 2 * t4 + s * 8);
                     } else {
-                        __nv_fp4x2_storage_t* y_base = y + (col + r4 + 8) * rows/2 + row/2;
-                        converted.store(y_base + 2 * t4 + (s-8)*8);
+                        __nv_fp4x2_storage_t* y_base = y + (col + r4 + 8) * rows / 2 + row / 2;
+                        converted.store(y_base + 2 * t4 + (s - 8) * 8);
                     }
                 } else {
                     if (s < 8) {
-                        __nv_fp4x2_storage_t* y_base = y + i * T * G / 2 + r4 * G/2;
-                        converted.store(y_base + 2 * t4 + s*8);
+                        __nv_fp4x2_storage_t* y_base = y + i * T * G / 2 + r4 * G / 2;
+                        converted.store(y_base + 2 * t4 + s * 8);
                     } else {
-                        __nv_fp4x2_storage_t* y_base = y + (i * T + 8) * G / 2 + r4 * G/2;
-                        converted.store(y_base + 2 * t4 + (s-8)*8);
+                        __nv_fp4x2_storage_t* y_base = y + (i * T + 8) * G / 2 + r4 * G / 2;
+                        converted.store(y_base + 2 * t4 + (s - 8) * 8);
                     }
                 }
             }
@@ -225,11 +231,13 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_group_transform_128_e
 }
 
 // Scale conversion kernel: convert BF16 scales to FP8 E4M3 with stochastic rounding
-__global__ void eden_convert_scales_kernel(
-    __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,
-    const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr,
-    long seed, int groups, float inv_fp8_max)
-{
+__global__ void eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8,
+                                           float* global_scale_ptr,
+                                           const nv_bfloat16* scales_bf16,
+                                           const unsigned* max_scale_ptr,
+                                           long seed,
+                                           int groups,
+                                           float inv_fp8_max) {
     using bf16x8 = GenericVector<nv_bfloat16, 8>;
     using fp32x8 = GenericVector<float, 8>;
     using fp8x8 = GenericVector<__nv_fp8_e4m3, 8>;
@@ -238,9 +246,9 @@ __global__ void eden_convert_scales_kernel(
     if (i >= groups) return;
 
     uint4 rng = philox<10>(seed, threadIdx.x, blockIdx.x);
-    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
-    #endif
+#endif
 
     float max_scale = __uint_as_float(*max_scale_ptr);
     float global_scale = max_scale * inv_fp8_max;
@@ -272,14 +280,17 @@ __global__ void eden_convert_scales_kernel(
     dst_scales.store(scales_fp8 + i * 8);
 }
 
-void launch_eden_convert_scales_kernel(
-    __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,
-    const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr,
-    long seed, int groups, float inv_fp8_max, cudaStream_t stream)
-{
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8,
+                                       float* global_scale_ptr,
+                                       const nv_bfloat16* scales_bf16,
+                                       const unsigned* max_scale_ptr,
+                                       long seed,
+                                       int groups,
+                                       float inv_fp8_max,
+                                       cudaStream_t stream) {
     cudaLaunchConfig_t config;
     config.blockDim = dim3(128);
-    config.gridDim = dim3((groups + 127)/128);
+    config.gridDim = dim3((groups + 127) / 128);
     config.dynamicSmemBytes = 0;
     config.stream = stream;
     config.attrs = nullptr;
@@ -299,41 +310,104 @@ void launch_eden_convert_scales_kernel(
             config.numAttrs = 1;
         }
     }
-    QUARTET_CUDA_CHECK(cudaLaunchKernelEx(&config, eden_convert_scales_kernel, scales_fp8, global_scale_ptr, scales_bf16, max_scale_ptr, seed, groups, inv_fp8_max));
+    QUARTET_CUDA_CHECK(cudaLaunchKernelEx(&config,
+                                          eden_convert_scales_kernel,
+                                          scales_fp8,
+                                          global_scale_ptr,
+                                          scales_bf16,
+                                          max_scale_ptr,
+                                          seed,
+                                          groups,
+                                          inv_fp8_max));
 }
 
-template<bool TransposeA>
-void group_transform_128_eden_launcher(
-    __nv_fp4x2_storage_t* y, __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,
-    nv_bfloat16* scratch_scales, unsigned* max_scale, const nv_bfloat16* h, const nv_bfloat16* x,
-    long seed, float fp4_max, float fp8_max, int M, int N, cudaStream_t stream)
-{
+template <bool TransposeA>
+void group_transform_128_eden_launcher(__nv_fp4x2_storage_t* y,
+                                       __nv_fp8_e4m3* scales_fp8,
+                                       float* global_scale_ptr,
+                                       nv_bfloat16* scratch_scales,
+                                       unsigned* max_scale,
+                                       const nv_bfloat16* h,
+                                       const nv_bfloat16* x,
+                                       long seed,
+                                       float fp4_max,
+                                       float fp8_max,
+                                       int M,
+                                       int N,
+                                       cudaStream_t stream) {
     int groups = M * N / 128;
     int blocks, device;
     int smem = NUM_WARPS * 16 * 128 * 2;
     QUARTET_CUDA_CHECK(cudaGetDevice(&device));
 
-    QUARTET_CUDA_CHECK(cudaFuncSetAttribute(cutlass_group_transform_128_eden_kernel<TransposeA>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    QUARTET_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, cutlass_group_transform_128_eden_kernel<TransposeA>, 32*NUM_WARPS, smem));
+    QUARTET_CUDA_CHECK(cudaFuncSetAttribute(cutlass_group_transform_128_eden_kernel<TransposeA>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem));
+    QUARTET_CUDA_CHECK(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,
+                                                      cutlass_group_transform_128_eden_kernel<TransposeA>,
+                                                      32 * NUM_WARPS,
+                                                      smem));
     int sms;
     QUARTET_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
 
     QUARTET_CUDA_CHECK(cudaMemsetAsync(max_scale, 0, sizeof(unsigned), stream));
 
-    cutlass_group_transform_128_eden_kernel<TransposeA><<<sms * blocks, dim3(32, NUM_WARPS), smem, stream>>>(y, scratch_scales, max_scale, h, x, M, N, 1.f / fp4_max);
+    cutlass_group_transform_128_eden_kernel<TransposeA>
+        <<<sms * blocks, dim3(32, NUM_WARPS), smem, stream>>>(y, scratch_scales, max_scale, h, x, M, N, 1.f / fp4_max);
     QUARTET_CUDA_CHECK(cudaGetLastError());
-    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, groups, 1.f / fp8_max, stream);
+    launch_eden_convert_scales_kernel(scales_fp8,
+                                      global_scale_ptr,
+                                      scratch_scales,
+                                      max_scale,
+                                      seed,
+                                      groups,
+                                      1.f / fp8_max,
+                                      stream);
 }
 
-void group_transform_128_eden(
-    __nv_fp4x2_storage_t* y, __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,
-    nv_bfloat16* scratch_scales, unsigned* max_scale, const nv_bfloat16* h, const nv_bfloat16* x,
-    long seed, float fp4_max, float fp8_max, int M, int N, bool transposeX, cudaStream_t stream)
-{
+void group_transform_128_eden(__nv_fp4x2_storage_t* y,
+                              __nv_fp8_e4m3* scales_fp8,
+                              float* global_scale_ptr,
+                              nv_bfloat16* scratch_scales,
+                              unsigned* max_scale,
+                              const nv_bfloat16* h,
+                              const nv_bfloat16* x,
+                              long seed,
+                              float fp4_max,
+                              float fp8_max,
+                              int M,
+                              int N,
+                              bool transposeX,
+                              cudaStream_t stream) {
     if (transposeX) {
-        group_transform_128_eden_launcher<true>(y, scales_fp8, global_scale_ptr, scratch_scales, max_scale, h, x, seed, fp4_max, fp8_max, M, N, stream);
+        group_transform_128_eden_launcher<true>(y,
+                                                scales_fp8,
+                                                global_scale_ptr,
+                                                scratch_scales,
+                                                max_scale,
+                                                h,
+                                                x,
+                                                seed,
+                                                fp4_max,
+                                                fp8_max,
+                                                M,
+                                                N,
+                                                stream);
     } else {
-        group_transform_128_eden_launcher<false>(y, scales_fp8, global_scale_ptr, scratch_scales, max_scale, h, x, seed, fp4_max, fp8_max, M, N, stream);
+        group_transform_128_eden_launcher<false>(y,
+                                                 scales_fp8,
+                                                 global_scale_ptr,
+                                                 scratch_scales,
+                                                 max_scale,
+                                                 h,
+                                                 x,
+                                                 seed,
+                                                 fp4_max,
+                                                 fp8_max,
+                                                 M,
+                                                 N,
+                                                 stream);
     }
 }
 

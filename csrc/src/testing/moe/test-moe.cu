@@ -59,8 +59,11 @@ static void softmax_cpu(float* out, const float* inp, int num_tokens, int num_ex
 }
 
 // CPU softmax backward
-static void softmax_backward_cpu(float* d_logits, const float* d_probs,
-                                  const float* softmax_probs, int num_tokens, int num_experts) {
+static void softmax_backward_cpu(float* d_logits,
+                                 const float* d_probs,
+                                 const float* softmax_probs,
+                                 int num_tokens,
+                                 int num_experts) {
     for (int t = 0; t < num_tokens; ++t) {
         const float* d_p = d_probs + t * num_experts;
         const float* p = softmax_probs + t * num_experts;
@@ -87,8 +90,13 @@ static void sigmoid_cpu(float* out, const float* inp, int num_elements) {
 }
 
 // CPU top-K selection per row
-static void topk_cpu(int* indices, float* weights, const float* scores,
-                     int num_tokens, int num_experts, int top_k, bool normalize) {
+static void topk_cpu(int* indices,
+                     float* weights,
+                     const float* scores,
+                     int num_tokens,
+                     int num_experts,
+                     int top_k,
+                     bool normalize) {
     for (int t = 0; t < num_tokens; ++t) {
         const float* row = scores + t * num_experts;
         int* idx_out = indices + t * top_k;
@@ -101,8 +109,9 @@ static void topk_cpu(int* indices, float* weights, const float* scores,
         }
 
         // Partial sort to get top-k
-        std::partial_sort(pairs.begin(), pairs.begin() + top_k, pairs.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::partial_sort(pairs.begin(), pairs.begin() + top_k, pairs.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first;
+        });
 
         // Extract top-k
         float sum = 0.0f;
@@ -122,8 +131,8 @@ static void topk_cpu(int* indices, float* weights, const float* scores,
 }
 
 // CPU expert counts
-static void compute_expert_counts_cpu(int* counts, const int* expert_indices,
-                                       int num_tokens, int top_k, int num_experts) {
+static void
+compute_expert_counts_cpu(int* counts, const int* expert_indices, int num_tokens, int top_k, int num_experts) {
     std::fill(counts, counts + num_experts, 0);
     for (int i = 0; i < num_tokens * top_k; ++i) {
         int expert_id = expert_indices[i];
@@ -134,8 +143,13 @@ static void compute_expert_counts_cpu(int* counts, const int* expert_indices,
 }
 
 // CPU token permutation
-static void permute_tokens_cpu(float* out, const float* inp, const int* gather_indices,
-                                int total_tokens, int num_tokens, int hidden_size, int top_k) {
+static void permute_tokens_cpu(float* out,
+                               const float* inp,
+                               const int* gather_indices,
+                               int total_tokens,
+                               int num_tokens,
+                               int hidden_size,
+                               int top_k) {
     for (int out_idx = 0; out_idx < total_tokens; ++out_idx) {
         int token_assignment_idx = gather_indices[out_idx];
         int token_idx = token_assignment_idx / top_k;
@@ -150,9 +164,14 @@ static void permute_tokens_cpu(float* out, const float* inp, const int* gather_i
 }
 
 // CPU unpermute and combine
-static void unpermute_and_combine_cpu(float* out, const float* expert_out,
-                                       const float* routing_weights, const int* scatter_indices,
-                                       int num_tokens, int total_tokens, int hidden_size, int top_k) {
+static void unpermute_and_combine_cpu(float* out,
+                                      const float* expert_out,
+                                      const float* routing_weights,
+                                      const int* scatter_indices,
+                                      int num_tokens,
+                                      int total_tokens,
+                                      int hidden_size,
+                                      int top_k) {
     // Zero output
     std::fill(out, out + num_tokens * hidden_size, 0.0f);
 
@@ -174,8 +193,12 @@ static void unpermute_and_combine_cpu(float* out, const float* expert_out,
 }
 
 // CPU auxiliary loss
-static float compute_aux_loss_cpu(const float* routing_probs, const int* expert_indices,
-                                   int num_tokens, int num_experts, int top_k, float aux_loss_coef) {
+static float compute_aux_loss_cpu(const float* routing_probs,
+                                  const int* expert_indices,
+                                  int num_tokens,
+                                  int num_experts,
+                                  int top_k,
+                                  float aux_loss_coef) {
     // Compute expert fractions (tokens assigned / total assignments)
     std::vector<float> expert_fractions(num_experts, 0.0f);
     int total_assignments = num_tokens * top_k;
@@ -205,9 +228,13 @@ static float compute_aux_loss_cpu(const float* routing_probs, const int* expert_
 }
 
 // Create simple gather indices for testing (sequential assignment)
-static void create_gather_indices(int* gather_indices, int* scatter_indices,
-                                   const int* expert_indices, const int* expert_counts,
-                                   int num_tokens, int top_k, int num_experts) {
+static void create_gather_indices(int* gather_indices,
+                                  int* scatter_indices,
+                                  const int* expert_indices,
+                                  const int* expert_counts,
+                                  int num_tokens,
+                                  int top_k,
+                                  int num_experts) {
     // Compute expert offsets (cumsum of counts)
     std::vector<int> expert_offsets(num_experts + 1, 0);
     for (int e = 0; e < num_experts; ++e) {
@@ -238,7 +265,7 @@ static float max_abs_diff(const float* a, const float* b, size_t n) {
     return max_diff;
 }
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // Test Cases
@@ -260,11 +287,11 @@ TEST_CASE("moe_softmax_forward fp32 matches CPU", "[moe][softmax]") {
     thrust::device_vector<float> d_inp = to_device(h_inp);
     thrust::device_vector<float> d_out(n);
 
-    moe_softmax_forward(
-        thrust::raw_pointer_cast(d_out.data()),
-        thrust::raw_pointer_cast(d_inp.data()),
-        num_tokens, num_experts, 0
-    );
+    moe_softmax_forward(thrust::raw_pointer_cast(d_out.data()),
+                        thrust::raw_pointer_cast(d_inp.data()),
+                        num_tokens,
+                        num_experts,
+                        0);
 
     std::vector<float> h_out = from_device(d_out);
 
@@ -302,11 +329,11 @@ TEST_CASE("moe_softmax_forward bf16 matches CPU", "[moe][softmax]") {
     thrust::device_vector<nv_bfloat16> d_inp = to_device(h_inp_bf16);
     thrust::device_vector<nv_bfloat16> d_out(n);
 
-    moe_softmax_forward(
-        thrust::raw_pointer_cast(d_out.data()),
-        thrust::raw_pointer_cast(d_inp.data()),
-        num_tokens, num_experts, 0
-    );
+    moe_softmax_forward(thrust::raw_pointer_cast(d_out.data()),
+                        thrust::raw_pointer_cast(d_inp.data()),
+                        num_tokens,
+                        num_experts,
+                        0);
 
     std::vector<nv_bfloat16> h_out_bf16 = from_device(d_out);
 
@@ -333,11 +360,10 @@ TEST_CASE("moe_sigmoid_forward fp32 matches CPU", "[moe][sigmoid]") {
     thrust::device_vector<float> d_inp = to_device(h_inp);
     thrust::device_vector<float> d_out(num_elements);
 
-    moe_sigmoid_forward(
-        thrust::raw_pointer_cast(d_out.data()),
-        thrust::raw_pointer_cast(d_inp.data()),
-        num_elements, 0
-    );
+    moe_sigmoid_forward(thrust::raw_pointer_cast(d_out.data()),
+                        thrust::raw_pointer_cast(d_inp.data()),
+                        num_elements,
+                        0);
 
     std::vector<float> h_out = from_device(d_out);
 
@@ -371,31 +397,33 @@ TEST_CASE("moe_topk_forward fp32 matches CPU", "[moe][topk]") {
     // CPU reference
     std::vector<int> h_indices_cpu(n_topk);
     std::vector<float> h_weights_cpu(n_topk);
-    topk_cpu(h_indices_cpu.data(), h_weights_cpu.data(), h_scores.data(),
-             num_tokens, num_experts, top_k, normalize);
+    topk_cpu(h_indices_cpu.data(), h_weights_cpu.data(), h_scores.data(), num_tokens, num_experts, top_k, normalize);
 
     // GPU computation
     thrust::device_vector<float> d_scores = to_device(h_scores);
     thrust::device_vector<int> d_indices(n_topk);
     thrust::device_vector<float> d_weights(n_topk);
 
-    moe_topk_forward(
-        thrust::raw_pointer_cast(d_indices.data()),
-        thrust::raw_pointer_cast(d_weights.data()),
-        thrust::raw_pointer_cast(d_scores.data()),
-        nullptr,  // no correction bias
-        num_tokens, num_experts, top_k, normalize, false, false, 0.0f, 0
-    );
+    moe_topk_forward(thrust::raw_pointer_cast(d_indices.data()),
+                     thrust::raw_pointer_cast(d_weights.data()),
+                     thrust::raw_pointer_cast(d_scores.data()),
+                     nullptr,  // no correction bias
+                     num_tokens,
+                     num_experts,
+                     top_k,
+                     normalize,
+                     false,
+                     false,
+                     0.0f,
+                     0);
 
     std::vector<int> h_indices = from_device(d_indices);
     std::vector<float> h_weights = from_device(d_weights);
 
     // Verify indices match (order within top-k may vary if tied, so check set membership)
     for (int t = 0; t < num_tokens; ++t) {
-        std::vector<int> cpu_set(h_indices_cpu.begin() + t * top_k,
-                                  h_indices_cpu.begin() + (t + 1) * top_k);
-        std::vector<int> gpu_set(h_indices.begin() + t * top_k,
-                                  h_indices.begin() + (t + 1) * top_k);
+        std::vector<int> cpu_set(h_indices_cpu.begin() + t * top_k, h_indices_cpu.begin() + (t + 1) * top_k);
+        std::vector<int> gpu_set(h_indices.begin() + t * top_k, h_indices.begin() + (t + 1) * top_k);
         std::sort(cpu_set.begin(), cpu_set.end());
         std::sort(gpu_set.begin(), gpu_set.end());
         REQUIRE(cpu_set == gpu_set);
@@ -429,18 +457,18 @@ TEST_CASE("moe_compute_expert_counts matches CPU", "[moe][counts]") {
 
     // CPU reference
     std::vector<int> h_counts_cpu(num_experts);
-    compute_expert_counts_cpu(h_counts_cpu.data(), h_indices.data(),
-                               num_tokens, top_k, num_experts);
+    compute_expert_counts_cpu(h_counts_cpu.data(), h_indices.data(), num_tokens, top_k, num_experts);
 
     // GPU computation
     thrust::device_vector<int> d_indices = to_device(h_indices);
     thrust::device_vector<int> d_counts(num_experts);
 
-    moe_compute_expert_counts(
-        thrust::raw_pointer_cast(d_counts.data()),
-        thrust::raw_pointer_cast(d_indices.data()),
-        num_tokens, top_k, num_experts, 0
-    );
+    moe_compute_expert_counts(thrust::raw_pointer_cast(d_counts.data()),
+                              thrust::raw_pointer_cast(d_indices.data()),
+                              num_tokens,
+                              top_k,
+                              num_experts,
+                              0);
 
     std::vector<int> h_counts = from_device(d_counts);
 
@@ -474,31 +502,41 @@ TEST_CASE("moe_permute_tokens fp32 matches CPU", "[moe][permute]") {
 
     // Compute expert counts and create gather/scatter indices
     std::vector<int> h_expert_counts(num_experts, 0);
-    compute_expert_counts_cpu(h_expert_counts.data(), h_expert_indices.data(),
-                               num_tokens, top_k, num_experts);
+    compute_expert_counts_cpu(h_expert_counts.data(), h_expert_indices.data(), num_tokens, top_k, num_experts);
 
     std::vector<int> h_gather_indices(total_tokens);
     std::vector<int> h_scatter_indices(total_tokens);
-    create_gather_indices(h_gather_indices.data(), h_scatter_indices.data(),
-                           h_expert_indices.data(), h_expert_counts.data(),
-                           num_tokens, top_k, num_experts);
+    create_gather_indices(h_gather_indices.data(),
+                          h_scatter_indices.data(),
+                          h_expert_indices.data(),
+                          h_expert_counts.data(),
+                          num_tokens,
+                          top_k,
+                          num_experts);
 
     // CPU reference
     std::vector<float> h_out_cpu(total_tokens * hidden_size);
-    permute_tokens_cpu(h_out_cpu.data(), h_inp.data(), h_gather_indices.data(),
-                        total_tokens, num_tokens, hidden_size, top_k);
+    permute_tokens_cpu(h_out_cpu.data(),
+                       h_inp.data(),
+                       h_gather_indices.data(),
+                       total_tokens,
+                       num_tokens,
+                       hidden_size,
+                       top_k);
 
     // GPU computation
     thrust::device_vector<float> d_inp = to_device(h_inp);
     thrust::device_vector<int> d_gather_indices = to_device(h_gather_indices);
     thrust::device_vector<float> d_out(total_tokens * hidden_size);
 
-    moe_permute_tokens(
-        thrust::raw_pointer_cast(d_out.data()),
-        thrust::raw_pointer_cast(d_inp.data()),
-        thrust::raw_pointer_cast(d_gather_indices.data()),
-        total_tokens, num_tokens, hidden_size, top_k, 0
-    );
+    moe_permute_tokens(thrust::raw_pointer_cast(d_out.data()),
+                       thrust::raw_pointer_cast(d_inp.data()),
+                       thrust::raw_pointer_cast(d_gather_indices.data()),
+                       total_tokens,
+                       num_tokens,
+                       hidden_size,
+                       top_k,
+                       0);
 
     std::vector<float> h_out = from_device(d_out);
 
@@ -540,20 +578,28 @@ TEST_CASE("moe_unpermute_and_combine fp32 matches CPU", "[moe][combine]") {
 
     // Compute expert counts and create indices
     std::vector<int> h_expert_counts(num_experts, 0);
-    compute_expert_counts_cpu(h_expert_counts.data(), h_expert_indices.data(),
-                               num_tokens, top_k, num_experts);
+    compute_expert_counts_cpu(h_expert_counts.data(), h_expert_indices.data(), num_tokens, top_k, num_experts);
 
     std::vector<int> h_gather_indices(total_tokens);
     std::vector<int> h_scatter_indices(total_tokens);
-    create_gather_indices(h_gather_indices.data(), h_scatter_indices.data(),
-                           h_expert_indices.data(), h_expert_counts.data(),
-                           num_tokens, top_k, num_experts);
+    create_gather_indices(h_gather_indices.data(),
+                          h_scatter_indices.data(),
+                          h_expert_indices.data(),
+                          h_expert_counts.data(),
+                          num_tokens,
+                          top_k,
+                          num_experts);
 
     // CPU reference
     std::vector<float> h_out_cpu(num_tokens * hidden_size);
-    unpermute_and_combine_cpu(h_out_cpu.data(), h_expert_out.data(),
-                               h_routing_weights.data(), h_scatter_indices.data(),
-                               num_tokens, total_tokens, hidden_size, top_k);
+    unpermute_and_combine_cpu(h_out_cpu.data(),
+                              h_expert_out.data(),
+                              h_routing_weights.data(),
+                              h_scatter_indices.data(),
+                              num_tokens,
+                              total_tokens,
+                              hidden_size,
+                              top_k);
 
     // GPU computation
     thrust::device_vector<float> d_expert_out = to_device(h_expert_out);
@@ -561,13 +607,15 @@ TEST_CASE("moe_unpermute_and_combine fp32 matches CPU", "[moe][combine]") {
     thrust::device_vector<int> d_scatter_indices = to_device(h_scatter_indices);
     thrust::device_vector<float> d_out(num_tokens * hidden_size);
 
-    moe_unpermute_and_combine(
-        thrust::raw_pointer_cast(d_out.data()),
-        thrust::raw_pointer_cast(d_expert_out.data()),
-        thrust::raw_pointer_cast(d_routing_weights.data()),
-        thrust::raw_pointer_cast(d_scatter_indices.data()),
-        num_tokens, total_tokens, hidden_size, top_k, 0
-    );
+    moe_unpermute_and_combine(thrust::raw_pointer_cast(d_out.data()),
+                              thrust::raw_pointer_cast(d_expert_out.data()),
+                              thrust::raw_pointer_cast(d_routing_weights.data()),
+                              thrust::raw_pointer_cast(d_scatter_indices.data()),
+                              num_tokens,
+                              total_tokens,
+                              hidden_size,
+                              top_k,
+                              0);
 
     std::vector<float> h_out = from_device(d_out);
 
@@ -605,20 +653,22 @@ TEST_CASE("moe_compute_aux_loss fp32 matches CPU", "[moe][auxloss]") {
     }
 
     // CPU reference
-    float cpu_loss = compute_aux_loss_cpu(h_probs.data(), h_indices.data(),
-                                           num_tokens, num_experts, top_k, aux_loss_coef);
+    float cpu_loss =
+        compute_aux_loss_cpu(h_probs.data(), h_indices.data(), num_tokens, num_experts, top_k, aux_loss_coef);
 
     // GPU computation
     thrust::device_vector<float> d_probs = to_device(h_probs);
     thrust::device_vector<int> d_indices = to_device(h_indices);
     thrust::device_vector<float> d_loss(1);
 
-    moe_compute_aux_loss(
-        thrust::raw_pointer_cast(d_loss.data()),
-        thrust::raw_pointer_cast(d_probs.data()),
-        thrust::raw_pointer_cast(d_indices.data()),
-        num_tokens, num_experts, top_k, aux_loss_coef, 0
-    );
+    moe_compute_aux_loss(thrust::raw_pointer_cast(d_loss.data()),
+                         thrust::raw_pointer_cast(d_probs.data()),
+                         thrust::raw_pointer_cast(d_indices.data()),
+                         num_tokens,
+                         num_experts,
+                         top_k,
+                         aux_loss_coef,
+                         0);
 
     cudaDeviceSynchronize();
     std::vector<float> h_loss = from_device(d_loss);
@@ -644,20 +694,19 @@ TEST_CASE("moe_softmax_backward fp32 matches CPU", "[moe][softmax]") {
 
     // CPU backward reference
     std::vector<float> h_d_logits_cpu(n);
-    softmax_backward_cpu(h_d_logits_cpu.data(), h_d_probs.data(), h_probs.data(),
-                          num_tokens, num_experts);
+    softmax_backward_cpu(h_d_logits_cpu.data(), h_d_probs.data(), h_probs.data(), num_tokens, num_experts);
 
     // GPU computation
     thrust::device_vector<float> d_probs = to_device(h_probs);
     thrust::device_vector<float> d_d_probs = to_device(h_d_probs);
     thrust::device_vector<float> d_d_logits(n);
 
-    moe_softmax_backward(
-        thrust::raw_pointer_cast(d_d_logits.data()),
-        thrust::raw_pointer_cast(d_d_probs.data()),
-        thrust::raw_pointer_cast(d_probs.data()),
-        num_tokens, num_experts, 0
-    );
+    moe_softmax_backward(thrust::raw_pointer_cast(d_d_logits.data()),
+                         thrust::raw_pointer_cast(d_d_probs.data()),
+                         thrust::raw_pointer_cast(d_probs.data()),
+                         num_tokens,
+                         num_experts,
+                         0);
 
     std::vector<float> h_d_logits = from_device(d_d_logits);
 
@@ -685,33 +734,45 @@ TEST_CASE("moe full forward pass integration", "[moe][integration]") {
     // Step 3: Top-K selection
     std::vector<int> h_expert_indices(total_tokens);
     std::vector<float> h_routing_weights(total_tokens);
-    topk_cpu(h_expert_indices.data(), h_routing_weights.data(), h_probs.data(),
-             num_tokens, num_experts, top_k, true);
+    topk_cpu(h_expert_indices.data(), h_routing_weights.data(), h_probs.data(), num_tokens, num_experts, top_k, true);
 
     // Step 4: Compute expert counts and create indices
     std::vector<int> h_expert_counts(num_experts);
-    compute_expert_counts_cpu(h_expert_counts.data(), h_expert_indices.data(),
-                               num_tokens, top_k, num_experts);
+    compute_expert_counts_cpu(h_expert_counts.data(), h_expert_indices.data(), num_tokens, top_k, num_experts);
 
     std::vector<int> h_gather_indices(total_tokens);
     std::vector<int> h_scatter_indices(total_tokens);
-    create_gather_indices(h_gather_indices.data(), h_scatter_indices.data(),
-                           h_expert_indices.data(), h_expert_counts.data(),
-                           num_tokens, top_k, num_experts);
+    create_gather_indices(h_gather_indices.data(),
+                          h_scatter_indices.data(),
+                          h_expert_indices.data(),
+                          h_expert_counts.data(),
+                          num_tokens,
+                          top_k,
+                          num_experts);
 
     // Step 5: Permute tokens
     std::vector<float> h_permuted(total_tokens * hidden_size);
-    permute_tokens_cpu(h_permuted.data(), h_input.data(), h_gather_indices.data(),
-                        total_tokens, num_tokens, hidden_size, top_k);
+    permute_tokens_cpu(h_permuted.data(),
+                       h_input.data(),
+                       h_gather_indices.data(),
+                       total_tokens,
+                       num_tokens,
+                       hidden_size,
+                       top_k);
 
     // Step 6: Simulate expert computation (identity for now)
     std::vector<float> h_expert_out = h_permuted;  // Identity expert
 
     // Step 7: Unpermute and combine
     std::vector<float> h_output_cpu(num_tokens * hidden_size);
-    unpermute_and_combine_cpu(h_output_cpu.data(), h_expert_out.data(),
-                               h_routing_weights.data(), h_scatter_indices.data(),
-                               num_tokens, total_tokens, hidden_size, top_k);
+    unpermute_and_combine_cpu(h_output_cpu.data(),
+                              h_expert_out.data(),
+                              h_routing_weights.data(),
+                              h_scatter_indices.data(),
+                              num_tokens,
+                              total_tokens,
+                              hidden_size,
+                              top_k);
 
     // Now run the GPU version
     thrust::device_vector<float> d_input = to_device(h_input);
@@ -727,40 +788,49 @@ TEST_CASE("moe full forward pass integration", "[moe][integration]") {
     thrust::device_vector<float> d_output(num_tokens * hidden_size);
 
     // GPU softmax
-    moe_softmax_forward(
-        thrust::raw_pointer_cast(d_probs.data()),
-        thrust::raw_pointer_cast(d_logits.data()),
-        num_tokens, num_experts, 0
-    );
+    moe_softmax_forward(thrust::raw_pointer_cast(d_probs.data()),
+                        thrust::raw_pointer_cast(d_logits.data()),
+                        num_tokens,
+                        num_experts,
+                        0);
 
     // GPU top-k
-    moe_topk_forward(
-        thrust::raw_pointer_cast(d_expert_indices.data()),
-        thrust::raw_pointer_cast(d_routing_weights.data()),
-        thrust::raw_pointer_cast(d_probs.data()),
-        nullptr,  // no correction bias
-        num_tokens, num_experts, top_k, true, false, false, 0.0f, 0
-    );
+    moe_topk_forward(thrust::raw_pointer_cast(d_expert_indices.data()),
+                     thrust::raw_pointer_cast(d_routing_weights.data()),
+                     thrust::raw_pointer_cast(d_probs.data()),
+                     nullptr,  // no correction bias
+                     num_tokens,
+                     num_experts,
+                     top_k,
+                     true,
+                     false,
+                     false,
+                     0.0f,
+                     0);
 
     // GPU permute
-    moe_permute_tokens(
-        thrust::raw_pointer_cast(d_permuted.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        thrust::raw_pointer_cast(d_gather_indices.data()),
-        total_tokens, num_tokens, hidden_size, top_k, 0
-    );
+    moe_permute_tokens(thrust::raw_pointer_cast(d_permuted.data()),
+                       thrust::raw_pointer_cast(d_input.data()),
+                       thrust::raw_pointer_cast(d_gather_indices.data()),
+                       total_tokens,
+                       num_tokens,
+                       hidden_size,
+                       top_k,
+                       0);
 
     // Copy permuted as expert output (identity)
     thrust::copy(d_permuted.begin(), d_permuted.end(), d_expert_out.begin());
 
     // GPU combine
-    moe_unpermute_and_combine(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_expert_out.data()),
-        thrust::raw_pointer_cast(d_routing_weights.data()),
-        thrust::raw_pointer_cast(d_scatter_indices.data()),
-        num_tokens, total_tokens, hidden_size, top_k, 0
-    );
+    moe_unpermute_and_combine(thrust::raw_pointer_cast(d_output.data()),
+                              thrust::raw_pointer_cast(d_expert_out.data()),
+                              thrust::raw_pointer_cast(d_routing_weights.data()),
+                              thrust::raw_pointer_cast(d_scatter_indices.data()),
+                              num_tokens,
+                              total_tokens,
+                              hidden_size,
+                              top_k,
+                              0);
 
     std::vector<float> h_output = from_device(d_output);
 
@@ -798,8 +868,8 @@ static float z_loss_cpu(const float* router_logits, int num_tokens, int num_expe
 }
 
 // CPU reference for z-loss backward
-static void z_loss_backward_cpu(float* d_logits, const float* router_logits,
-                                 int num_tokens, int num_experts, float z_loss_coef) {
+static void
+z_loss_backward_cpu(float* d_logits, const float* router_logits, int num_tokens, int num_experts, float z_loss_coef) {
     for (int t = 0; t < num_tokens; ++t) {
         const float* logits = router_logits + t * num_experts;
         float* d_l = d_logits + t * num_experts;
@@ -844,16 +914,17 @@ TEST_CASE("moe_router_z_loss_forward FP32", "[moe][z_loss]") {
     thrust::device_vector<float> d_logits = to_device(h_logits);
     thrust::device_vector<float> d_z_loss(1, 0.0f);
 
-    moe_router_z_loss_forward(
-        thrust::raw_pointer_cast(d_z_loss.data()),
-        thrust::raw_pointer_cast(d_logits.data()),
-        num_tokens, num_experts, z_loss_coef, 0
-    );
+    moe_router_z_loss_forward(thrust::raw_pointer_cast(d_z_loss.data()),
+                              thrust::raw_pointer_cast(d_logits.data()),
+                              num_tokens,
+                              num_experts,
+                              z_loss_coef,
+                              0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     float z_loss_gpu;
-    CUDA_CHECK(cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()),
-                          sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()), sizeof(float), cudaMemcpyDeviceToHost));
 
     INFO("CPU z-loss: " << z_loss_cpu_val);
     INFO("GPU z-loss: " << z_loss_gpu);
@@ -883,16 +954,17 @@ TEST_CASE("moe_router_z_loss_forward BF16", "[moe][z_loss]") {
     thrust::device_vector<nv_bfloat16> d_logits(h_logits_bf16.begin(), h_logits_bf16.end());
     thrust::device_vector<float> d_z_loss(1, 0.0f);
 
-    moe_router_z_loss_forward(
-        thrust::raw_pointer_cast(d_z_loss.data()),
-        thrust::raw_pointer_cast(d_logits.data()),
-        num_tokens, num_experts, z_loss_coef, 0
-    );
+    moe_router_z_loss_forward(thrust::raw_pointer_cast(d_z_loss.data()),
+                              thrust::raw_pointer_cast(d_logits.data()),
+                              num_tokens,
+                              num_experts,
+                              z_loss_coef,
+                              0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     float z_loss_gpu;
-    CUDA_CHECK(cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()),
-                          sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()), sizeof(float), cudaMemcpyDeviceToHost));
 
     INFO("CPU z-loss: " << z_loss_cpu_val);
     INFO("GPU z-loss (BF16): " << z_loss_gpu);
@@ -912,18 +984,18 @@ TEST_CASE("moe_router_z_loss_backward FP32", "[moe][z_loss]") {
 
     // CPU reference
     std::vector<float> h_d_logits_cpu(num_tokens * num_experts);
-    z_loss_backward_cpu(h_d_logits_cpu.data(), h_logits.data(),
-                        num_tokens, num_experts, z_loss_coef);
+    z_loss_backward_cpu(h_d_logits_cpu.data(), h_logits.data(), num_tokens, num_experts, z_loss_coef);
 
     // GPU
     thrust::device_vector<float> d_logits = to_device(h_logits);
     thrust::device_vector<float> d_d_logits(num_tokens * num_experts, 0.0f);
 
-    moe_router_z_loss_backward(
-        thrust::raw_pointer_cast(d_d_logits.data()),
-        thrust::raw_pointer_cast(d_logits.data()),
-        num_tokens, num_experts, z_loss_coef, 0
-    );
+    moe_router_z_loss_backward(thrust::raw_pointer_cast(d_d_logits.data()),
+                               thrust::raw_pointer_cast(d_logits.data()),
+                               num_tokens,
+                               num_experts,
+                               z_loss_coef,
+                               0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_d_logits_gpu = from_device(d_d_logits);
@@ -952,16 +1024,17 @@ TEST_CASE("moe_router_z_loss large logits", "[moe][z_loss]") {
     thrust::device_vector<float> d_logits = to_device(h_logits);
     thrust::device_vector<float> d_z_loss(1, 0.0f);
 
-    moe_router_z_loss_forward(
-        thrust::raw_pointer_cast(d_z_loss.data()),
-        thrust::raw_pointer_cast(d_logits.data()),
-        num_tokens, num_experts, z_loss_coef, 0
-    );
+    moe_router_z_loss_forward(thrust::raw_pointer_cast(d_z_loss.data()),
+                              thrust::raw_pointer_cast(d_logits.data()),
+                              num_tokens,
+                              num_experts,
+                              z_loss_coef,
+                              0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     float z_loss_gpu;
-    CUDA_CHECK(cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()),
-                          sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        cudaMemcpy(&z_loss_gpu, thrust::raw_pointer_cast(d_z_loss.data()), sizeof(float), cudaMemcpyDeviceToHost));
 
     INFO("CPU z-loss (large logits): " << z_loss_cpu_val);
     INFO("GPU z-loss (large logits): " << z_loss_gpu);
@@ -976,7 +1049,7 @@ TEST_CASE("moe_router_z_loss large logits", "[moe][z_loss]") {
 
 TEST_CASE("moe_grouped_gemm_gate_up FP32", "[moe][grouped_gemm]") {
     const int num_experts = 4;
-    const int hidden_size = 64;     // C
+    const int hidden_size = 64;         // C
     const int intermediate_size = 128;  // D
     const int total_tokens = 32;
 
@@ -990,11 +1063,13 @@ TEST_CASE("moe_grouped_gemm_gate_up FP32", "[moe][grouped_gemm]") {
 
     // Create random input (total_tokens, C)
     std::vector<float> h_input(total_tokens * hidden_size);
-    for (auto& v : h_input) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+    for (auto& v : h_input)
+        v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
 
     // Create random weights (num_experts, 2*D, C)
     std::vector<float> h_weights(num_experts * 2 * intermediate_size * hidden_size);
-    for (auto& v : h_weights) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+    for (auto& v : h_weights)
+        v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
 
     // CPU reference: sequential per-expert matmul
     std::vector<float> h_output_cpu(total_tokens * 2 * intermediate_size, 0.0f);
@@ -1028,20 +1103,20 @@ TEST_CASE("moe_grouped_gemm_gate_up FP32", "[moe][grouped_gemm]") {
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
 
-    moe_grouped_gemm_gate_up(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        thrust::raw_pointer_cast(d_weights.data()),
-        thrust::raw_pointer_cast(d_offsets.data()),
-        num_experts, hidden_size, intermediate_size,
-        cublas_handle, 0
-    );
+    moe_grouped_gemm_gate_up(thrust::raw_pointer_cast(d_output.data()),
+                             thrust::raw_pointer_cast(d_input.data()),
+                             thrust::raw_pointer_cast(d_weights.data()),
+                             thrust::raw_pointer_cast(d_offsets.data()),
+                             num_experts,
+                             hidden_size,
+                             intermediate_size,
+                             cublas_handle,
+                             0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_output_gpu = from_device(d_output);
 
-    float max_diff = max_abs_diff(h_output_gpu.data(), h_output_cpu.data(),
-                                   total_tokens * 2 * intermediate_size);
+    float max_diff = max_abs_diff(h_output_gpu.data(), h_output_cpu.data(), total_tokens * 2 * intermediate_size);
     INFO("Max difference in grouped gate_up GEMM: " << max_diff);
     REQUIRE(max_diff < 1e-4f);
 
@@ -1050,7 +1125,7 @@ TEST_CASE("moe_grouped_gemm_gate_up FP32", "[moe][grouped_gemm]") {
 
 TEST_CASE("moe_grouped_gemm_down FP32", "[moe][grouped_gemm]") {
     const int num_experts = 4;
-    const int hidden_size = 64;     // C
+    const int hidden_size = 64;         // C
     const int intermediate_size = 128;  // D
     const int total_tokens = 32;
 
@@ -1064,11 +1139,13 @@ TEST_CASE("moe_grouped_gemm_down FP32", "[moe][grouped_gemm]") {
 
     // Create random input (total_tokens, D)
     std::vector<float> h_input(total_tokens * intermediate_size);
-    for (auto& v : h_input) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+    for (auto& v : h_input)
+        v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
 
     // Create random weights (num_experts, C, D)
     std::vector<float> h_weights(num_experts * hidden_size * intermediate_size);
-    for (auto& v : h_weights) v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
+    for (auto& v : h_weights)
+        v = 0.1f * (static_cast<float>(rand()) / RAND_MAX - 0.5f);
 
     // CPU reference
     std::vector<float> h_output_cpu(total_tokens * hidden_size, 0.0f);
@@ -1101,20 +1178,20 @@ TEST_CASE("moe_grouped_gemm_down FP32", "[moe][grouped_gemm]") {
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
 
-    moe_grouped_gemm_down(
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_input.data()),
-        thrust::raw_pointer_cast(d_weights.data()),
-        thrust::raw_pointer_cast(d_offsets.data()),
-        num_experts, hidden_size, intermediate_size,
-        cublas_handle, 0
-    );
+    moe_grouped_gemm_down(thrust::raw_pointer_cast(d_output.data()),
+                          thrust::raw_pointer_cast(d_input.data()),
+                          thrust::raw_pointer_cast(d_weights.data()),
+                          thrust::raw_pointer_cast(d_offsets.data()),
+                          num_experts,
+                          hidden_size,
+                          intermediate_size,
+                          cublas_handle,
+                          0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> h_output_gpu = from_device(d_output);
 
-    float max_diff = max_abs_diff(h_output_gpu.data(), h_output_cpu.data(),
-                                   total_tokens * hidden_size);
+    float max_diff = max_abs_diff(h_output_gpu.data(), h_output_cpu.data(), total_tokens * hidden_size);
     INFO("Max difference in grouped down GEMM: " << max_diff);
     REQUIRE(max_diff < 1e-4f);
 

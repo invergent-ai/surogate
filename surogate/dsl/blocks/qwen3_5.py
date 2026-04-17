@@ -62,8 +62,13 @@ class Qwen3_5AttentionBlock(nn.Block):
 
         self.attn_norm = nn.RMSNormPlus1(d_model, eps=eps)
         self.self_attn = nn.Qwen3_5Attention(
-            d_model, num_query_heads, num_kv_heads, head_size,
-            max_seq, use_qkv_bias=use_qkv_bias, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            use_qkv_bias=use_qkv_bias,
+            eps=eps,
             partial_rotary_factor=partial_rotary_factor,
             mrope_section=mrope_section,
         )
@@ -117,8 +122,7 @@ class Qwen3_5LinearBlock(nn.Block):
 
         if linear_num_value_heads % linear_num_key_heads != 0:
             raise ValueError(
-                "Qwen3_5LinearBlock requires linear_num_value_heads to be "
-                "divisible by linear_num_key_heads"
+                "Qwen3_5LinearBlock requires linear_num_value_heads to be divisible by linear_num_key_heads"
             )
 
         # Derived dimensions for shape resolution

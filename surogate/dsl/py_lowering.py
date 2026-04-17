@@ -6,39 +6,40 @@ into the existing GraphIR/ModuleIR format for execution.
 """
 
 from __future__ import annotations
-from typing import Any, TYPE_CHECKING
 
-from .specs import (
-    ModuleSpec,
-    BlockSpec,
-    ModelSpec,
-    PrimitiveSpec,
-    ParamSpec,
-    ParamKind,
-    ForwardSpec,
-    BackwardSpec,
-    IOSpec,
-    HFConfigSpec,
-    HFMappingSpec,
-)
-from .graph_builder import GraphBuilder, GraphNode, GraphRef
-from .tensor_type import TensorAnnotation
+from typing import Any
+
+from .graph_builder import GraphBuilder, GraphNode
 from .ir import (
-    ModuleIR,
+    CompilationContext,
     GraphIR,
+    KernelType,
+    ModuleIR,
     OpNode,
     TensorRef,
-    KernelType,
-    CompilationContext,
+)
+from .ir import (
     PrimitiveSpec as IRPrimitiveSpec,
 )
+from .specs import (
+    BackwardSpec,
+    BlockSpec,
+    ForwardSpec,
+    HFConfigSpec,
+    HFMappingSpec,
+    ModelSpec,
+    ModuleSpec,
+    ParamKind,
+    ParamSpec,
+    PrimitiveSpec,
+)
+from .tensor_type import TensorAnnotation
 from .types import (
-    Dtype,
-    Shape,
-    TensorTypeSpec,
-    SymbolicDim,
     ConcreteDim,
+    Dtype,
     MemoryMode,
+    Shape,
+    SymbolicDim,
 )
 
 
@@ -323,7 +324,7 @@ class SpecLowerer:
 
     def _lower_hf_mapping(self, spec: HFMappingSpec) -> dict[str, Any]:
         """Lower HFMappingSpec to dict."""
-        from .hf import mapping_to_dict, is_hf_mapping_spec
+        from .hf import is_hf_mapping_spec, mapping_to_dict
 
         result = {}
         for internal_name, external_spec in spec.mappings.items():

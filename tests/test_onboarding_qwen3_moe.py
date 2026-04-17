@@ -49,8 +49,8 @@ BATCH = 1
 SEQ_LEN = 16
 # bf16 forward through MoE layers accumulates more error than dense models
 # due to routing (sigmoid + topk + correction bias) numerical variation.
-RMS_TOL = 5e-2           # per-layer mid-state tolerance
-FINAL_NORM_TOL = 2e-1    # post-norm tolerance (RMSNorm amplifies small diffs)
+RMS_TOL = 5e-2  # per-layer mid-state tolerance
+FINAL_NORM_TOL = 2e-1  # post-norm tolerance (RMSNorm amplifies small diffs)
 
 MINI_MODEL_DIR = Path("tmp/onboarding_qwen3_moe_mini")
 DUMP_DIR = Path("tmp/onboarding_qwen3_moe_dumps")
@@ -59,6 +59,7 @@ DUMP_DIR = Path("tmp/onboarding_qwen3_moe_dumps")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_model_path() -> Path:
     """Resolve the path to Qwen3 MoE weights."""
@@ -88,9 +89,7 @@ def prepare_mini_model(snapshot_dir: Path) -> Path:
 
     config = json.loads((snapshot_dir / "config.json").read_text())
     config["num_hidden_layers"] = NUM_LAYERS
-    (MINI_MODEL_DIR / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n"
-    )
+    (MINI_MODEL_DIR / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     for tok_file in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
         src = snapshot_dir / tok_file
@@ -148,14 +147,14 @@ def load_dump(name: str) -> np.ndarray:
     return data.reshape(shape)
 
 
-def diff_stats(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+def diff_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     diff = a.astype(np.float32) - b.astype(np.float32)
     rms = float(np.sqrt(np.mean(diff * diff)))
     max_abs = float(np.max(np.abs(diff)))
     return rms, max_abs
 
 
-def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
+def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     inputs = rng.integers(0, vocab_size, size=(BATCH, SEQ_LEN), dtype=np.int32)
     targets = inputs.copy()
@@ -168,7 +167,8 @@ def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
 # HuggingFace forward — uses hooks for reliable per-layer capture
 # ---------------------------------------------------------------------------
 
-def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]:
+
+def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]:
     """Run HF forward and capture per-layer outputs via hooks.
 
     Captures mid-layer states (after attention, before MoE) via pre-hook on
@@ -184,29 +184,30 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     )
     model.eval()
 
-    result: Dict[str, np.ndarray] = {}
-    layer_outs: Dict[int, torch.Tensor] = {}
-    mid_states: Dict[int, torch.Tensor] = {}
+    result: dict[str, np.ndarray] = {}
+    layer_outs: dict[int, torch.Tensor] = {}
+    mid_states: dict[int, torch.Tensor] = {}
     hooks = []
 
     for i in range(NUM_LAYERS):
+
         def make_layer_hook(idx):
             def hook_fn(module, args, output):
                 hs = output[0] if isinstance(output, tuple) else output
                 layer_outs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(model.model.layers[i].register_forward_hook(make_layer_hook(i)))
 
         def make_mid_hook(idx):
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
                 mid_states[idx] = hs.detach().clone()
+
             return hook_fn
-        hooks.append(
-            model.model.layers[i].post_attention_layernorm.register_forward_pre_hook(
-                make_mid_hook(i)
-            )
-        )
+
+        hooks.append(model.model.layers[i].post_attention_layernorm.register_forward_pre_hook(make_mid_hook(i)))
 
     with torch.no_grad():
         input_ids = torch.tensor(inputs, device="cuda", dtype=torch.long)
@@ -236,8 +237,8 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
 # Surogate forward
 # ---------------------------------------------------------------------------
 
-def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
-                         targets: np.ndarray) -> None:
+
+def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarray) -> None:
     """Run Surogate forward pass and dump tensors to DUMP_DIR."""
     DUMP_DIR.mkdir(parents=True, exist_ok=True)
     for p in DUMP_DIR.glob("*"):
@@ -283,6 +284,7 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def model_dir():
     snapshot = resolve_model_path()
@@ -307,6 +309,7 @@ def forward_results(model_dir):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestQwen3MoEOnboarding:
     """Per-layer forward comparison: Surogate vs HuggingFace."""
 
@@ -329,9 +332,7 @@ class TestQwen3MoEOnboarding:
             hf_mid = hf[f"mid_state_{i}"]
             rms, max_abs = diff_stats(rt_res_att, hf_mid)
             if rms > RMS_TOL:
-                failures.append(
-                    f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-                )
+                failures.append(f"layer {i}: rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})")
 
         if failures:
             pytest.fail("Per-layer mid-state mismatches:\n" + "\n".join(failures))
@@ -359,14 +360,12 @@ class TestQwen3MoEOnboarding:
             pytest.skip("residual_final dump not available")
 
         rms, max_abs = diff_stats(rt_residual_final, hf["pre_norm"])
-        assert rms < RMS_TOL, (
-            f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
-        )
+        assert rms < RMS_TOL, f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_summary(self, forward_results):
         """Print a summary table of all comparisons (informational)."""
         hf = forward_results
-        rows: List[Tuple[str, float, float]] = []
+        rows: list[tuple[str, float, float]] = []
 
         for i in range(NUM_LAYERS - 1):
             try:

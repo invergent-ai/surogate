@@ -1,0 +1,89 @@
+# .clang-format — tuned for LLM/agent ergonomics (grep, Edit, diff stability).
+# See also: docs/format.md if added.
+Language: Cpp
+BasedOnStyle: LLVM
+
+# ────────── Core: indent + columns ──────────
+IndentWidth:            4
+UseTab:                 Never
+ColumnLimit:            120      # current p99 is 110; 120 leaves room for
+                                 # typical long matmul signatures without
+                                 # re-wrapping.
+
+# ────────── Braces & control flow ──────────
+BreakBeforeBraces:                Attach
+AllowShortFunctionsOnASingleLine: None         # one-liners hide control flow
+AllowShortIfStatementsOnASingleLine:   WithoutElse # allow `if (ptr) free(ptr);`
+AllowShortLoopsOnASingleLine:          false   #   traces.
+AllowShortBlocksOnASingleLine:         Never
+AllowShortCaseLabelsOnASingleLine:     true   # keep `case X: return "y";`
+                                               #   dense (op_type_to_string,
+                                               #   enum-to-string maps).
+AllowShortLambdasOnASingleLine:        Inline  # keep short captureless
+                                               #   lambdas as call args on
+                                               #   one line.
+CompactNamespaces: false
+
+# ────────── Pointer/ref alignment ──────────
+PointerAlignment:        Left                  # `int* p` — type is a unit
+                                               #   for grep/rename.
+ReferenceAlignment:      Pointer
+
+# ────────── Function sig wrapping (LLM greppability) ──────────
+AllowAllArgumentsOnNextLine:                false
+AllowAllParametersOfDeclarationOnNextLine:  false
+BinPackArguments:                           false   # when wrapped, each arg
+BinPackParameters:                          false   #   on its own line → each
+                                                    #   is a grep target and
+                                                    #   diffs stay 1-line.
+AlignAfterOpenBracket:   Align
+
+# ────────── Line-start anchors for grep ──────────
+IndentPPDirectives:      None
+AccessModifierOffset:    -4                    # `public:` / `private:` at
+                                               #   column 1 → greppable with
+                                               #   `^public:`.
+IndentAccessModifiers:   false
+
+# ────────── Comments & stability ──────────
+ReflowComments:          false                 # never rewrap comments — edits
+                                               #   to code shouldn't cascade
+                                               #   into comment reformatting.
+AlignTrailingComments:   true
+SpacesBeforeTrailingComments: 2
+
+# ────────── Includes ──────────
+SortIncludes:            Never                 # preserve hand-curated order
+                                               #   within each include block
+                                               #   (avoids breaking subtle
+                                               #   include-order deps).
+IncludeBlocks:           Preserve              # keep current grouping.
+
+# ────────── Other stability wins ──────────
+DerivePointerAlignment:  false                 # never infer from source —
+                                               #   one canonical output.
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep:     1
+FixNamespaceComments:    true                  # `}  // namespace X` trailers
+ShortNamespaceLines:     0                     #   on every close, always.
+
+# ────────── Alignment (kept off — avoids "edit one line, diff 20") ──────────
+AlignConsecutiveAssignments:      false
+AlignConsecutiveDeclarations:     false
+AlignConsecutiveMacros:           false
+AlignOperands:                    Align
+AlignEscapedNewlines:             Left
+AlignArrayOfStructures:           None
+
+# ────────── Template / init-list ──────────
+AlwaysBreakTemplateDeclarations:      Yes      # `template <...>` on its own
+                                               #   line → `grep "^template"`.
+AlwaysBreakAfterReturnType:           None
+BreakConstructorInitializers:         BeforeColon
+PackConstructorInitializers:          Never
+
+# ────────── Case labels / enums ──────────
+IndentCaseLabels:        true
+AllowShortEnumsOnASingleLine: false            # one enumerator per line
+                                               #   (matches CompiledOpType
+                                               #   style).

@@ -46,10 +46,8 @@ int parse_layer_index(std::string_view name) {
 // Construction
 // =============================================================================
 
-GenericQLoRAProvider::GenericQLoRAProvider(
-    std::unique_ptr<GenericWeightManager> weight_mgr)
-    : mWeightMgr(std::move(weight_mgr))
-{
+GenericQLoRAProvider::GenericQLoRAProvider(std::unique_ptr<GenericWeightManager> weight_mgr)
+    : mWeightMgr(std::move(weight_mgr)) {
     // Compute total BF16 bytes for memory savings calculation
     mTotalBF16Bytes = 0;
     for (const auto& name : mWeightMgr->weight_names()) {
@@ -65,15 +63,13 @@ GenericQLoRAProvider::GenericQLoRAProvider(
     mWeightMgr->set_frozen(true);
 }
 
-GenericQLoRAProvider::GenericQLoRAProvider(
-    DslQLoRAPipelineConfig config,
-    const PretrainedConfig& pt_config,
-    std::shared_ptr<TensorAllocator> allocator)
-    : mDeferredConfig(std::make_unique<DslQLoRAPipelineConfig>(std::move(config)))
-    , mPtConfig(&pt_config)
-    , mAllocator(std::move(allocator))
-    , mEPSize(mDeferredConfig->ep_size)
-{
+GenericQLoRAProvider::GenericQLoRAProvider(DslQLoRAPipelineConfig config,
+                                           const PretrainedConfig& pt_config,
+                                           std::shared_ptr<TensorAllocator> allocator)
+    : mDeferredConfig(std::make_unique<DslQLoRAPipelineConfig>(std::move(config))),
+      mPtConfig(&pt_config),
+      mAllocator(std::move(allocator)),
+      mEPSize(mDeferredConfig->ep_size) {
 }
 
 GenericQLoRAProvider::~GenericQLoRAProvider() = default;
@@ -91,43 +87,28 @@ bool GenericQLoRAProvider::handles_param(std::string_view name) const {
 
 Tensor& GenericQLoRAProvider::resolve_param(std::string_view name, cudaStream_t stream) {
     if (!mWeightMgr) {
-        throw std::runtime_error(
-            "GenericQLoRAProvider: weights not initialized "
-            "(import_and_quantize not called)");
+        throw std::runtime_error("GenericQLoRAProvider: weights not initialized "
+                                 "(import_and_quantize not called)");
     }
     return mWeightMgr->get(std::string(name), stream);
 }
 
-void GenericQLoRAProvider::import_and_quantize(
-    const std::string& file_name,
-    NCCLCommunicator& /*comm*/,
-    cudaStream_t stream) {
-
+void GenericQLoRAProvider::import_and_quantize(const std::string& file_name,
+                                               NCCLCommunicator& /*comm*/,
+                                               cudaStream_t stream) {
     if (mWeightMgr) {
-        throw std::runtime_error(
-            "GenericQLoRAProvider: weights already imported");
+        throw std::runtime_error("GenericQLoRAProvider: weights already imported");
     }
 
     if (!mDeferredConfig) {
-        throw std::runtime_error(
-            "GenericQLoRAProvider: no deferred config (constructed with "
-            "pre-built weight manager?)");
+        throw std::runtime_error("GenericQLoRAProvider: no deferred config (constructed with "
+                                 "pre-built weight manager?)");
     }
 
     if (mDeferredConfig->prequantized) {
-        mWeightMgr = import_prequantized_weights(
-            file_name,
-            *mDeferredConfig,
-            *mPtConfig,
-            mAllocator,
-            stream);
+        mWeightMgr = import_prequantized_weights(file_name, *mDeferredConfig, *mPtConfig, mAllocator, stream);
     } else {
-        mWeightMgr = import_and_quantize_weights(
-            file_name,
-            *mDeferredConfig,
-            *mPtConfig,
-            mAllocator,
-            stream);
+        mWeightMgr = import_and_quantize_weights(file_name, *mDeferredConfig, *mPtConfig, mAllocator, stream);
     }
 
     // Compute total BF16 bytes for memory savings
@@ -152,20 +133,16 @@ void GenericQLoRAProvider::import_and_quantize(
     mPtConfig = nullptr;
 }
 
-void GenericQLoRAProvider::import_from_external(
-    const std::string& file_name,
-    const std::vector<ExternalWeight>& external_weights,
-    cudaStream_t stream) {
-
+void GenericQLoRAProvider::import_from_external(const std::string& file_name,
+                                                const std::vector<ExternalWeight>& external_weights,
+                                                cudaStream_t stream) {
     if (mWeightMgr) {
-        throw std::runtime_error(
-            "GenericQLoRAProvider: weights already imported");
+        throw std::runtime_error("GenericQLoRAProvider: weights already imported");
     }
 
     if (!mDeferredConfig) {
-        throw std::runtime_error(
-            "GenericQLoRAProvider: no deferred config (constructed with "
-            "pre-built weight manager?)");
+        throw std::runtime_error("GenericQLoRAProvider: no deferred config (constructed with "
+                                 "pre-built weight manager?)");
     }
 
     // Use import_external_weights for all formats (BnB NF4, FP8, NVFP4).
@@ -173,13 +150,7 @@ void GenericQLoRAProvider::import_from_external(
     // with surogate's dequant kernel — the F8_128x4 scale swizzle is identical, and
     // the packed FP4 data is unchanged. Non-quantized weights (norms, embeddings)
     // are loaded from SafeTensors as a fallback.
-    mWeightMgr = import_external_weights(
-        file_name,
-        external_weights,
-        *mDeferredConfig,
-        *mPtConfig,
-        mAllocator,
-        stream);
+    mWeightMgr = import_external_weights(file_name, external_weights, *mDeferredConfig, *mPtConfig, mAllocator, stream);
 
     // Compute total BF16 bytes for memory savings
     mTotalBF16Bytes = 0;
@@ -217,10 +188,9 @@ void GenericQLoRAProvider::invalidate_cache() {
     mStepCount++;
 }
 
-bool GenericQLoRAProvider::refresh_moe_experts(
-    int /*layer_idx*/,
-    const modules::SelectiveExpertInfo& /*selection*/,
-    cudaStream_t /*stream*/) {
+bool GenericQLoRAProvider::refresh_moe_experts(int /*layer_idx*/,
+                                               const modules::SelectiveExpertInfo& /*selection*/,
+                                               cudaStream_t /*stream*/) {
     // The generic system handles expert offloading through the OffloadManager
     // which is group-based. Selective expert dequantization is not supported
     // in the generic path - all experts in a group are loaded/unloaded together.
@@ -255,8 +225,7 @@ float GenericQLoRAProvider::memory_savings_ratio() const {
     if (!mWeightMgr || mTotalBF16Bytes == 0) {
         return 1.0f;
     }
-    return static_cast<float>(mWeightMgr->quantized_bytes()) /
-           static_cast<float>(mTotalBF16Bytes);
+    return static_cast<float>(mWeightMgr->quantized_bytes()) / static_cast<float>(mTotalBF16Bytes);
 }
 
 // =============================================================================
@@ -298,19 +267,22 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     // 2× the quantized group size), so reserve extra to avoid OOM during forward.
     size_t reserve = std::max(static_cast<size_t>(1ULL * 1024 * 1024 * 1024), gpu_total / 20);
     if (mEPSize > 1 && max_grp > 0) {
-        reserve += max_grp * 6;  // LLEP foreign BF16 weights + NCCL wt-transfer buffers + dequant pool growth + fragmentation
+        reserve +=
+            max_grp * 6;  // LLEP foreign BF16 weights + NCCL wt-transfer buffers + dequant pool growth + fragmentation
     }
     const size_t available = (gpu_free > reserve) ? (gpu_free - reserve) : 0;
-    int new_max = (max_grp > 0)
-        ? static_cast<int>(available / max_grp) : om->max_resident_groups();
+    int new_max = (max_grp > 0) ? static_cast<int>(available / max_grp) : om->max_resident_groups();
     new_max = std::max(2, std::min(new_max, num_grp));
 
-    fprintf(stderr, "[QLoRA] Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
+    fprintf(stderr,
+            "[QLoRA] Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
             "max_group=%.1f MB, %d groups -> max_resident: %d -> %d%s\n",
             static_cast<double>(gpu_free) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(reserve) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(max_grp) / (1024.0 * 1024.0),
-            num_grp, om->max_resident_groups(), new_max,
+            num_grp,
+            om->max_resident_groups(),
+            new_max,
             (new_max >= num_grp) ? " (all fit)" : "");
     om->set_max_resident_groups(new_max);
 }

@@ -1,12 +1,18 @@
 from pathlib import Path
-from typing import Optional, Tuple, List
 
 import numpy as np
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
 from datasets import Dataset as HfDataset
-from datasets import IterableDataset, Dataset, DatasetDict, IterableDatasetDict, load_from_disk, load_dataset, \
-    concatenate_datasets
 from huggingface_hub import snapshot_download
-from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError, HFValidationError
+from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError, RevisionNotFoundError
 
 from surogate.core.config.dataset_config import DatasetConfig
 from surogate.core.config.enums import SurogateDatasetType
@@ -71,12 +77,12 @@ def _shard_dataset_for_node(
 
 
 def load_dataset_with_config(
-        dataset_config: DatasetConfig,
-        *,
-        streaming=False,
-        num_workers: int = 1,
-        node_rank: Optional[int] = None,
-        num_nodes: Optional[int] = None,
+    dataset_config: DatasetConfig,
+    *,
+    streaming=False,
+    num_workers: int = 1,
+    node_rank: int | None = None,
+    num_nodes: int | None = None,
 ) -> Dataset | IterableDataset:
     load_dataset_kwargs = {
         "split": dataset_config.split if dataset_config.split else None,
@@ -108,8 +114,7 @@ def load_dataset_with_config(
     if node_rank is not None and num_nodes is not None and num_nodes > 1:
         if streaming:
             logger.warning(
-                "Node-based sharding is not supported for streaming datasets. "
-                "Each node will see the full dataset."
+                "Node-based sharding is not supported for streaming datasets. Each node will see the full dataset."
             )
         elif isinstance(dataset, Dataset):
             dataset = _shard_dataset_for_node(dataset, node_rank, num_nodes)
@@ -126,19 +131,15 @@ def _check_if_hub_dataset(path: str) -> bool:
     """Check if a dataset exists on the HuggingFace Hub."""
     try:
         logger.info_once("Fetching dataset...")
-        snapshot_download(
-            repo_id=path,
-            repo_type="dataset",
-            ignore_patterns=["*"]
-        )
+        snapshot_download(repo_id=path, repo_type="dataset", ignore_patterns=["*"])
         return True
     except (
-            RepositoryNotFoundError,
-            RevisionNotFoundError,
-            FileNotFoundError,
-            ConnectionError,
-            HFValidationError,
-            ValueError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+        FileNotFoundError,
+        ConnectionError,
+        HFValidationError,
+        ValueError,
     ):
         return False
 
@@ -160,7 +161,7 @@ def _extract_split(dataset, split: str | None):
 
 
 def _load_from_local_path(
-        dataset_config: DatasetConfig, load_dataset_kwargs: dict
+    dataset_config: DatasetConfig, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from a local path."""
     local_path = Path(dataset_config.path)
@@ -181,13 +182,11 @@ def _load_from_local_path(
             **load_dataset_kwargs,
         )
     else:
-        raise ValueError(
-            "Unhandled dataset load: local path exists, but is neither a directory or a file"
-        )
+        raise ValueError("Unhandled dataset load: local path exists, but is neither a directory or a file")
 
 
 def _load_from_hub(
-        dataset_config: DatasetConfig, load_dataset_kwargs: dict
+    dataset_config: DatasetConfig, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
     """Load a dataset from the HuggingFace Hub."""
     return load_dataset(
@@ -206,12 +205,12 @@ def get_dataset_type(dataset_config: DatasetConfig) -> str:
 
 
 def pre_process(
-        dataset: DATASET_TYPE,
-        ds_config: DatasetConfig,
-        *,
-        num_proc: int = 1,
-        load_from_cache_file: bool = True,
-        strict: bool = False,
+    dataset: DATASET_TYPE,
+    ds_config: DatasetConfig,
+    *,
+    num_proc: int = 1,
+    load_from_cache_file: bool = True,
+    strict: bool = False,
 ):
     preprocessor = AutoPreprocessor()
     if ds_config.type == SurogateDatasetType.instruction:
@@ -226,14 +225,14 @@ def pre_process(
 
 
 def post_process(
-        train_dataset: DATASET_TYPE,
-        *,
-        dataset_sample: Optional[int] = None,
-        split_dataset_ratio: float = 0.,
-        streaming: bool = False,
-        shuffle: bool = True,
-        random_state: Optional[np.random.RandomState] = None,
-) -> Tuple[DATASET_TYPE, Optional[DATASET_TYPE]]:
+    train_dataset: DATASET_TYPE,
+    *,
+    dataset_sample: int | None = None,
+    split_dataset_ratio: float = 0.0,
+    streaming: bool = False,
+    shuffle: bool = True,
+    random_state: np.random.RandomState | None = None,
+) -> tuple[DATASET_TYPE, DATASET_TYPE | None]:
     """Split into train/val datasets and perform dataset sampling."""
     assert dataset_sample is None or dataset_sample > 0
     assert 0 <= split_dataset_ratio <= 1
@@ -245,8 +244,10 @@ def post_process(
             elif split_dataset_ratio == 1:
                 train_dataset, val_dataset = None, train_dataset
             else:
-                raise ValueError('The IterableDataset does not support splitting the training set '
-                                 'and validation set when dataset_sample is None.')
+                raise ValueError(
+                    "The IterableDataset does not support splitting the training set "
+                    "and validation set when dataset_sample is None."
+                )
         else:
             # not shuffle
             train_dataset = train_dataset.take(dataset_sample)
@@ -264,7 +265,7 @@ def post_process(
             train_dataset, val_dataset = None, train_dataset
             val_sample = dataset_sample
             # Avoid duplication in the val_dataset.
-            assert val_sample <= len(val_dataset), f'val_sample: {val_sample}, len(val_dataset): {len(val_dataset)}'
+            assert val_sample <= len(val_dataset), f"val_sample: {val_sample}, len(val_dataset): {len(val_dataset)}"
             val_dataset = sample_dataset(val_dataset, val_sample, shuffle, random_state)
         else:
             # Avoid duplication in the val_dataset.
@@ -273,12 +274,13 @@ def post_process(
             train_sample = dataset_sample - val_sample
             assert train_sample > 0
             train_dataset, val_dataset = train_dataset.train_test_split(
-                test_size=val_sample, shuffle=shuffle, seed=get_seed(random_state)).values()
+                test_size=val_sample, shuffle=shuffle, seed=get_seed(random_state)
+            ).values()
             train_dataset = sample_dataset(train_dataset, train_sample, shuffle, random_state)
     return train_dataset, val_dataset
 
 
-def concat_datasets(datasets: List[HfDataset]) -> Optional[HfDataset]:
+def concat_datasets(datasets: list[HfDataset]) -> HfDataset | None:
     """Concatenate datasets, normalizing schemas to handle type mismatches.
 
     When datasets have columns with the same name but different types (e.g., 'id' as
@@ -295,13 +297,24 @@ def concat_datasets(datasets: List[HfDataset]) -> Optional[HfDataset]:
     # These are the columns that preprocessors actually use
     essential_columns = {
         # Conversation format
-        'messages', 'conversations', 'conversation',
+        "messages",
+        "conversations",
+        "conversation",
         # Instruction format
-        'instruction', 'input', 'output', 'response', 'system',
+        "instruction",
+        "input",
+        "output",
+        "response",
+        "system",
         # Text format
-        'text', 'content',
+        "text",
+        "content",
         # Common useful fields
-        'question', 'answer', 'query', 'chosen', 'rejected',
+        "question",
+        "answer",
+        "query",
+        "chosen",
+        "rejected",
     }
 
     # Find columns present in all datasets
@@ -311,7 +324,7 @@ def concat_datasets(datasets: List[HfDataset]) -> Optional[HfDataset]:
     # Check for type conflicts in common columns
     def get_feature_type(feature):
         """Get a comparable type representation for a feature."""
-        if hasattr(feature, 'dtype'):
+        if hasattr(feature, "dtype"):
             return str(feature.dtype)
         return str(type(feature).__name__)
 

@@ -1,24 +1,26 @@
 """Transformer Blocks for Python DSL"""
 
 from .common import Activation
-from .qwen3 import Qwen3Block
-from .qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
-from .qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
-from .qwen3_vl import Qwen3VLBlock
-from .qwen3_moe import Qwen3MoEBlock
+from .gemma4 import (
+    Gemma4FullBlock,
+    Gemma4FullMoEBlock,
+    Gemma4SharedKVBlock,
+    Gemma4SlidingBlock,
+    Gemma4SlidingMoEBlock,
+)
 from .gpt_oss import GptOssBlock
 from .llama import LlamaBlock
-from .gemma4 import (
-    Gemma4SlidingBlock, Gemma4FullBlock,
-    Gemma4SlidingMoEBlock, Gemma4FullMoEBlock,
-    Gemma4SharedKVBlock,
-)
 from .nemotron_h import (
-    NemotronHMamba2Block,
     NemotronHAttentionBlock,
+    NemotronHMamba2Block,
     NemotronHMLPBlock,
     NemotronHMoEBlock,
 )
+from .qwen3 import Qwen3Block
+from .qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
+from .qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
+from .qwen3_moe import Qwen3MoEBlock
+from .qwen3_vl import Qwen3VLBlock
 
 __all__ = [
     "Activation",

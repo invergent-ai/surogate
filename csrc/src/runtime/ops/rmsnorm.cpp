@@ -4,6 +4,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 
@@ -44,8 +46,7 @@ void CompiledExecutor::dispatch_rmsnorm(const CompiledOp& op) {
         mTemps.push_back(y);
     }
 
-    rmsnorm_forward(y, rstd, x, weight, /*abs_max_ptr=*/nullptr, eps, total_rows, 1, C,
-                    mRunState.MainStream);
+    rmsnorm_forward(y, rstd, x, weight, /*abs_max_ptr=*/nullptr, eps, total_rows, 1, C, mRunState.MainStream);
     store_tensor(op.outputs[1], rstd);
 }
 
@@ -93,9 +94,66 @@ void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
     mTemps.push_back(zero_dresidual);
     cudaMemsetAsync(zero_dresidual.Data, 0, zero_dresidual.bytes(), mRunState.MainStream);
 
-    rmsnorm_backward(d_x, d_weight_buf, scratch, zero_dresidual, d_out, x, weight, rstd,
-                     /*abs_max_ptr=*/nullptr, total_rows, 1, C,
-                     mRunState.DeviceProp, mRunState.MainStream);
+    rmsnorm_backward(d_x,
+                     d_weight_buf,
+                     scratch,
+                     zero_dresidual,
+                     d_out,
+                     x,
+                     weight,
+                     rstd,
+                     /*abs_max_ptr=*/nullptr,
+                     total_rows,
+                     1,
+                     C,
+                     mRunState.DeviceProp,
+                     mRunState.MainStream);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// RMSNorm backward rule
+// Forward: y, rstd = rmsnorm(x, weight, eps)
+// Backward: dx, dweight = rmsnorm_backward(dy, x, weight, rstd, ...)
+// -----------------------------------------------------------------------------
+std::vector<Operation> rmsnorm_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+
+    // Forward inputs: x, weight
+    // Forward outputs: y, rstd
+    std::string x = fwd.inputs[0];
+    std::string weight = fwd.inputs[1];
+    std::string rstd = fwd.outputs.size() > 1 ? fwd.outputs[1] : fwd.outputs[0] + "_rstd";
+
+    // Carry forward eps attribute
+    AttrMap attrs = copy_attrs(fwd.attrs, {"eps"});
+
+    // Outputs: dx, dweight
+    std::vector<std::string> outputs;
+    if (ctx.needs_grad(0)) {
+        outputs.push_back(ctx.d_inputs[0]);
+    } else {
+        outputs.push_back("");  // placeholder
+    }
+    if (ctx.needs_grad(1)) {
+        outputs.push_back(ctx.d_inputs[1]);
+    }
+
+    ops.push_back(make_operation("rmsnorm_backward_" + std::to_string(ctx.op_counter++),
+                                 "rmsnorm_backward",
+                                 "rmsnorm_backward",
+                                 {ctx.d_output, saved_ref(x), weight, saved_ref(rstd)},
+                                 outputs,
+                                 attrs));
+
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("rmsnorm", ::dsl::rmsnorm_backward);

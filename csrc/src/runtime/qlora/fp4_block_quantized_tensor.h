@@ -142,9 +142,7 @@ struct FP4BlockQuantizedWeight {
      * @brief Check if the weight is properly initialized
      */
     [[nodiscard]] bool is_valid() const {
-        return data.Data != nullptr &&
-               block_scales_rowwise.Data != nullptr &&
-               M > 0 && K > 0;
+        return data.Data != nullptr && block_scales_rowwise.Data != nullptr && M > 0 && K > 0;
     }
 
     /**
@@ -250,8 +248,7 @@ struct FP4BlockWeights {
      * @brief Get total memory footprint for this block
      */
     [[nodiscard]] std::size_t bytes() const {
-        std::size_t total = qkv_proj.bytes() + out_proj.bytes() +
-                            gate_up_proj.bytes() + down_proj.bytes() +
+        std::size_t total = qkv_proj.bytes() + out_proj.bytes() + gate_up_proj.bytes() + down_proj.bytes() +
                             ln1_weight.bytes() + ln2_weight.bytes();
         if (q_norm_weight.has_value()) total += q_norm_weight->bytes();
         if (k_norm_weight.has_value()) total += k_norm_weight->bytes();
@@ -295,6 +292,6 @@ struct FP4ScaleConfig {
     }
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_QLORA_FP4_BLOCK_QUANTIZED_TENSOR_H
+#endif  // SUROGATE_SRC_MODULES_QLORA_FP4_BLOCK_QUANTIZED_TENSOR_H

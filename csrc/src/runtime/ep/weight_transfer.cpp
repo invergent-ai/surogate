@@ -23,13 +23,13 @@ namespace ep {
 namespace {
 
 /// Build a Tensor wrapping a raw GPU pointer with proper Rank/Device set.
-inline Tensor make_tensor_from_ptr(void* ptr, ETensorDType dtype,
-                                   const std::vector<long>& shape, int device = 0) {
+inline Tensor make_tensor_from_ptr(void* ptr, ETensorDType dtype, const std::vector<long>& shape, int device = 0) {
     Tensor t{};
     t.Data = static_cast<std::byte*>(ptr);
     t.DType = dtype;
     t.Rank = static_cast<int>(shape.size());
-    for (int i = 0; i < t.Rank && i < 4; ++i) t.Sizes[i] = shape[static_cast<size_t>(i)];
+    for (int i = 0; i < t.Rank && i < 4; ++i)
+        t.Sizes[i] = shape[static_cast<size_t>(i)];
     t.Device = device;
     return t;
 }
@@ -44,14 +44,13 @@ struct PerExpertQuantSizes {
     size_t meta2_bytes = 0;
 };
 
-PerExpertQuantSizes compute_per_expert_sizes(
-    const qlora::QuantizedTensor& qt, int num_experts) {
+PerExpertQuantSizes compute_per_expert_sizes(const qlora::QuantizedTensor& qt, int num_experts) {
     PerExpertQuantSizes s;
     if (num_experts <= 0) return s;
-    if (!qt.data.is_null())   s.data_bytes  = qt.data.bytes()  / static_cast<size_t>(num_experts);
+    if (!qt.data.is_null()) s.data_bytes = qt.data.bytes() / static_cast<size_t>(num_experts);
     if (!qt.scales.is_null()) s.scale_bytes = qt.scales.bytes() / static_cast<size_t>(num_experts);
-    if (!qt.meta.is_null())   s.meta_bytes  = qt.meta.bytes()  / static_cast<size_t>(num_experts);
-    if (!qt.meta2.is_null())  s.meta2_bytes = qt.meta2.bytes() / static_cast<size_t>(num_experts);
+    if (!qt.meta.is_null()) s.meta_bytes = qt.meta.bytes() / static_cast<size_t>(num_experts);
+    if (!qt.meta2.is_null()) s.meta2_bytes = qt.meta2.bytes() / static_cast<size_t>(num_experts);
     return s;
 }
 
@@ -63,11 +62,10 @@ size_t total_quant_expert_bytes(const PerExpertQuantSizes& s) {
 /// Create a QuantizedTensor sub-view for a single expert's quantized data.
 /// The returned QuantizedTensor has M = per_expert_M, K = qt.K, and pointers
 /// into the original qt's buffers at the correct per-expert offset.
-qlora::QuantizedTensor make_expert_slice_view(
-    const qlora::QuantizedTensor& qt,
-    int expert_idx,
-    int per_expert_M,
-    const PerExpertQuantSizes& sizes) {
+qlora::QuantizedTensor make_expert_slice_view(const qlora::QuantizedTensor& qt,
+                                              int expert_idx,
+                                              int per_expert_M,
+                                              const PerExpertQuantSizes& sizes) {
     qlora::QuantizedTensor slice;
     slice.M = per_expert_M;
     slice.K = qt.K;
@@ -105,11 +103,10 @@ qlora::QuantizedTensor make_expert_slice_view(
 /// Allocate GPU receive buffers matching a quantized expert slice layout.
 /// Returns a QuantizedTensor with freshly allocated GPU buffers (cudaMalloc).
 /// Tracks allocated pointers in `owned` for cleanup.
-qlora::QuantizedTensor alloc_recv_quant_expert(
-    const qlora::QuantizedTensor& template_qt,
-    int per_expert_M,
-    const PerExpertQuantSizes& sizes,
-    std::vector<void*>& owned) {
+qlora::QuantizedTensor alloc_recv_quant_expert(const qlora::QuantizedTensor& template_qt,
+                                               int per_expert_M,
+                                               const PerExpertQuantSizes& sizes,
+                                               std::vector<void*>& owned) {
     qlora::QuantizedTensor recv;
     recv.M = per_expert_M;
     recv.K = template_qt.K;
@@ -143,45 +140,35 @@ qlora::QuantizedTensor alloc_recv_quant_expert(
 }
 
 /// Send all components of a quantized expert slice via P2P.
-void send_quant_expert(
-    NCCLCommunicator& comm,
-    const qlora::QuantizedTensor& slice,
-    const PerExpertQuantSizes& sizes,
-    int dst_rank, cudaStream_t stream) {
-    if (sizes.data_bytes > 0)
-        comm.send_wt(slice.data.Data, sizes.data_bytes, dst_rank, stream);
-    if (sizes.scale_bytes > 0)
-        comm.send_wt(slice.scales.Data, sizes.scale_bytes, dst_rank, stream);
-    if (sizes.meta_bytes > 0)
-        comm.send_wt(slice.meta.Data, sizes.meta_bytes, dst_rank, stream);
-    if (sizes.meta2_bytes > 0)
-        comm.send_wt(slice.meta2.Data, sizes.meta2_bytes, dst_rank, stream);
+void send_quant_expert(NCCLCommunicator& comm,
+                       const qlora::QuantizedTensor& slice,
+                       const PerExpertQuantSizes& sizes,
+                       int dst_rank,
+                       cudaStream_t stream) {
+    if (sizes.data_bytes > 0) comm.send_wt(slice.data.Data, sizes.data_bytes, dst_rank, stream);
+    if (sizes.scale_bytes > 0) comm.send_wt(slice.scales.Data, sizes.scale_bytes, dst_rank, stream);
+    if (sizes.meta_bytes > 0) comm.send_wt(slice.meta.Data, sizes.meta_bytes, dst_rank, stream);
+    if (sizes.meta2_bytes > 0) comm.send_wt(slice.meta2.Data, sizes.meta2_bytes, dst_rank, stream);
 }
 
 /// Receive all components of a quantized expert into pre-allocated buffers.
-void recv_quant_expert(
-    NCCLCommunicator& comm,
-    qlora::QuantizedTensor& recv,
-    const PerExpertQuantSizes& sizes,
-    int src_rank, cudaStream_t stream) {
-    if (sizes.data_bytes > 0)
-        comm.recv_wt(recv.data.Data, sizes.data_bytes, src_rank, stream);
-    if (sizes.scale_bytes > 0)
-        comm.recv_wt(recv.scales.Data, sizes.scale_bytes, src_rank, stream);
-    if (sizes.meta_bytes > 0)
-        comm.recv_wt(recv.meta.Data, sizes.meta_bytes, src_rank, stream);
-    if (sizes.meta2_bytes > 0)
-        comm.recv_wt(recv.meta2.Data, sizes.meta2_bytes, src_rank, stream);
+void recv_quant_expert(NCCLCommunicator& comm,
+                       qlora::QuantizedTensor& recv,
+                       const PerExpertQuantSizes& sizes,
+                       int src_rank,
+                       cudaStream_t stream) {
+    if (sizes.data_bytes > 0) comm.recv_wt(recv.data.Data, sizes.data_bytes, src_rank, stream);
+    if (sizes.scale_bytes > 0) comm.recv_wt(recv.scales.Data, sizes.scale_bytes, src_rank, stream);
+    if (sizes.meta_bytes > 0) comm.recv_wt(recv.meta.Data, sizes.meta_bytes, src_rank, stream);
+    if (sizes.meta2_bytes > 0) comm.recv_wt(recv.meta2.Data, sizes.meta2_bytes, src_rank, stream);
 }
 
 /// Allocate a Tensor backed by cudaMalloc (not the stack allocator).
 /// Tracks the pointer in received.owned_gpu_ptrs for cleanup.
-Tensor alloc_foreign_tensor(
-    ForeignExpertWeights& received,
-    ETensorDType dtype,
-    const std::vector<long>& shape) {
+Tensor alloc_foreign_tensor(ForeignExpertWeights& received, ETensorDType dtype, const std::vector<long>& shape) {
     size_t bytes = static_cast<size_t>(get_dtype_size(dtype));
-    for (auto s : shape) bytes *= static_cast<size_t>(s);
+    for (auto s : shape)
+        bytes *= static_cast<size_t>(s);
     if (bytes == 0) return Tensor{};
     void* ptr = nullptr;
     CUDA_CHECK(cudaMalloc(&ptr, bytes));
@@ -191,17 +178,15 @@ Tensor alloc_foreign_tensor(
 
 }  // namespace
 
-void transfer_expert_weights(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    dsl::DslRunState& run_state,
-    cudaStream_t stream,
-    ForeignExpertWeights& received,
-    const Tensor& native_gate_up,
-    const Tensor& native_down,
-    int num_local_experts,
-    int ep_rank) {
-
+void transfer_expert_weights(const LPTPlan& plan,
+                             NCCLCommunicator& comm,
+                             dsl::DslRunState& run_state,
+                             cudaStream_t stream,
+                             ForeignExpertWeights& received,
+                             const Tensor& native_gate_up,
+                             const Tensor& native_down,
+                             int num_local_experts,
+                             int ep_rank) {
     received.free_gpu();
 
     if (plan.weights_to_send.empty() && plan.weights_to_receive.empty()) {
@@ -219,10 +204,8 @@ void transfer_expert_weights(
 
     for (const auto& [expert_id, src_rank] : plan.weights_to_receive) {
         auto& pair = received.weights[expert_id];
-        pair.gate_up = alloc_foreign_tensor(received, native_gate_up.DType,
-            {gate_up_rows, gate_up_cols});
-        pair.down = alloc_foreign_tensor(received, native_down.DType,
-            {down_rows, down_cols});
+        pair.gate_up = alloc_foreign_tensor(received, native_gate_up.DType, {gate_up_rows, gate_up_cols});
+        pair.down = alloc_foreign_tensor(received, native_down.DType, {down_rows, down_cols});
     }
 
     comm.weight_transfer_group_start();
@@ -231,12 +214,12 @@ void transfer_expert_weights(
         const int local_idx = expert_id - ep_rank * num_local_experts;
         if (local_idx < 0 || local_idx >= num_local_experts) continue;
 
-        const std::byte* gate_up_ptr = static_cast<const std::byte*>(native_gate_up.Data)
-            + static_cast<size_t>(local_idx) * gate_up_expert_bytes;
+        const std::byte* gate_up_ptr =
+            static_cast<const std::byte*>(native_gate_up.Data) + static_cast<size_t>(local_idx) * gate_up_expert_bytes;
         comm.send_wt(gate_up_ptr, gate_up_expert_bytes, dst_rank, stream);
 
-        const std::byte* down_ptr = static_cast<const std::byte*>(native_down.Data)
-            + static_cast<size_t>(local_idx) * down_expert_bytes;
+        const std::byte* down_ptr =
+            static_cast<const std::byte*>(native_down.Data) + static_cast<size_t>(local_idx) * down_expert_bytes;
         comm.send_wt(down_ptr, down_expert_bytes, dst_rank, stream);
     }
 
@@ -249,20 +232,18 @@ void transfer_expert_weights(
     comm.weight_transfer_group_end();
 }
 
-void transfer_expert_weights_quantized(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    dsl::DslRunState& run_state,
-    cudaStream_t stream,
-    ForeignExpertWeights& received,
-    const qlora::QuantizedTensor& native_gate_up_qt,
-    const qlora::QuantizedTensor& native_down_qt,
-    const Tensor& native_gate_up,
-    const Tensor& native_down,
-    qlora::IQuantizer* quantizer,
-    int num_local_experts,
-    int ep_rank) {
-
+void transfer_expert_weights_quantized(const LPTPlan& plan,
+                                       NCCLCommunicator& comm,
+                                       dsl::DslRunState& run_state,
+                                       cudaStream_t stream,
+                                       ForeignExpertWeights& received,
+                                       const qlora::QuantizedTensor& native_gate_up_qt,
+                                       const qlora::QuantizedTensor& native_down_qt,
+                                       const Tensor& native_gate_up,
+                                       const Tensor& native_down,
+                                       qlora::IQuantizer* quantizer,
+                                       int num_local_experts,
+                                       int ep_rank) {
     received.free_gpu();
 
     if (plan.weights_to_send.empty() && plan.weights_to_receive.empty()) {
@@ -294,10 +275,8 @@ void transfer_expert_weights_quantized(
 
     for (const auto& [expert_id, src_rank] : plan.weights_to_receive) {
         auto& pair = received.weights[expert_id];
-        pair.gate_up = alloc_foreign_tensor(received, native_gate_up.DType,
-            {gate_up_rows, gate_up_cols});
-        pair.down = alloc_foreign_tensor(received, native_down.DType,
-            {down_rows, down_cols});
+        pair.gate_up = alloc_foreign_tensor(received, native_gate_up.DType, {gate_up_rows, gate_up_cols});
+        pair.down = alloc_foreign_tensor(received, native_down.DType, {down_rows, down_cols});
 
         RecvEntry entry;
         entry.expert_id = expert_id;
@@ -336,16 +315,14 @@ void transfer_expert_weights_quantized(
     }
 }
 
-void transfer_weight_gradients_back(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    cudaStream_t stream,
-    const ForeignExpertWeights& foreign_grads,
-    Tensor& native_gate_up_grad,
-    Tensor& native_down_grad,
-    int num_local_experts,
-    int ep_rank) {
-
+void transfer_weight_gradients_back(const LPTPlan& plan,
+                                    NCCLCommunicator& comm,
+                                    cudaStream_t stream,
+                                    const ForeignExpertWeights& foreign_grads,
+                                    Tensor& native_gate_up_grad,
+                                    Tensor& native_down_grad,
+                                    int num_local_experts,
+                                    int ep_rank) {
     if (plan.weights_to_send.empty() && plan.weights_to_receive.empty()) {
         return;
     }
@@ -371,12 +348,12 @@ void transfer_weight_gradients_back(
         const int local_idx = expert_id - ep_rank * num_local_experts;
         if (local_idx < 0 || local_idx >= num_local_experts) continue;
 
-        std::byte* gate_up_ptr = static_cast<std::byte*>(native_gate_up_grad.Data)
-            + static_cast<size_t>(local_idx) * gate_up_expert_bytes;
+        std::byte* gate_up_ptr =
+            static_cast<std::byte*>(native_gate_up_grad.Data) + static_cast<size_t>(local_idx) * gate_up_expert_bytes;
         comm.recv_wt(gate_up_ptr, gate_up_expert_bytes, dst_rank, stream);
 
-        std::byte* down_ptr = static_cast<std::byte*>(native_down_grad.Data)
-            + static_cast<size_t>(local_idx) * down_expert_bytes;
+        std::byte* down_ptr =
+            static_cast<std::byte*>(native_down_grad.Data) + static_cast<size_t>(local_idx) * down_expert_bytes;
         comm.recv_wt(down_ptr, down_expert_bytes, dst_rank, stream);
     }
 
@@ -387,34 +364,30 @@ namespace {
 
 /// Helper: send a single expert's LoRA slice (A and B) for one projection.
 /// The grouped tensor is [E, ...], each expert is a contiguous slice.
-void send_lora_pair(
-    NCCLCommunicator& comm,
-    const Tensor& grouped_A,  // [E_local, rank, in]
-    const Tensor& grouped_B,  // [E_local, out, rank]
-    int local_idx,
-    int dst_rank,
-    cudaStream_t stream) {
+void send_lora_pair(NCCLCommunicator& comm,
+                    const Tensor& grouped_A,  // [E_local, rank, in]
+                    const Tensor& grouped_B,  // [E_local, out, rank]
+                    int local_idx,
+                    int dst_rank,
+                    cudaStream_t stream) {
     if (grouped_A.is_null() || grouped_B.is_null()) return;
     const size_t a_expert_bytes = grouped_A.bytes() / static_cast<size_t>(grouped_A.Sizes[0]);
     const size_t b_expert_bytes = grouped_B.bytes() / static_cast<size_t>(grouped_B.Sizes[0]);
-    const auto* a_ptr = static_cast<const std::byte*>(grouped_A.Data)
-        + static_cast<size_t>(local_idx) * a_expert_bytes;
-    const auto* b_ptr = static_cast<const std::byte*>(grouped_B.Data)
-        + static_cast<size_t>(local_idx) * b_expert_bytes;
+    const auto* a_ptr = static_cast<const std::byte*>(grouped_A.Data) + static_cast<size_t>(local_idx) * a_expert_bytes;
+    const auto* b_ptr = static_cast<const std::byte*>(grouped_B.Data) + static_cast<size_t>(local_idx) * b_expert_bytes;
     comm.send_wt(a_ptr, a_expert_bytes, dst_rank, stream);
     comm.send_wt(b_ptr, b_expert_bytes, dst_rank, stream);
 }
 
 /// Helper: allocate and receive a single expert's LoRA pair.
-void recv_lora_pair(
-    NCCLCommunicator& comm,
-    ForeignExpertWeights& received,
-    const Tensor& template_A,  // [E_local, rank, in] (for shape/dtype)
-    const Tensor& template_B,  // [E_local, out, rank]
-    Tensor& out_A,
-    Tensor& out_B,
-    int src_rank,
-    cudaStream_t stream) {
+void recv_lora_pair(NCCLCommunicator& comm,
+                    ForeignExpertWeights& received,
+                    const Tensor& template_A,  // [E_local, rank, in] (for shape/dtype)
+                    const Tensor& template_B,  // [E_local, out, rank]
+                    Tensor& out_A,
+                    Tensor& out_B,
+                    int src_rank,
+                    cudaStream_t stream) {
     if (template_A.is_null() || template_B.is_null()) return;
     // Single expert shape: template.Sizes[1..] (remove expert dimension)
     const long a_rows = template_A.Sizes[1];
@@ -429,19 +402,21 @@ void recv_lora_pair(
 
 }  // anonymous namespace
 
-void transfer_expert_lora(
-    const LPTPlan& plan,
-    NCCLCommunicator& comm,
-    dsl::DslRunState& run_state,
-    cudaStream_t stream,
-    ForeignExpertWeights& received,
-    const Tensor& local_gate_up_A, const Tensor& local_gate_up_B,
-    const Tensor& local_gate_A, const Tensor& local_gate_B,
-    const Tensor& local_up_A, const Tensor& local_up_B,
-    const Tensor& local_down_A, const Tensor& local_down_B,
-    int num_local_experts,
-    int ep_rank) {
-
+void transfer_expert_lora(const LPTPlan& plan,
+                          NCCLCommunicator& comm,
+                          dsl::DslRunState& run_state,
+                          cudaStream_t stream,
+                          ForeignExpertWeights& received,
+                          const Tensor& local_gate_up_A,
+                          const Tensor& local_gate_up_B,
+                          const Tensor& local_gate_A,
+                          const Tensor& local_gate_B,
+                          const Tensor& local_up_A,
+                          const Tensor& local_up_B,
+                          const Tensor& local_down_A,
+                          const Tensor& local_down_B,
+                          int num_local_experts,
+                          int ep_rank) {
     // Check if any LoRA is present
     const bool has_gate_up = !local_gate_up_A.is_null();
     const bool has_gate = !local_gate_A.is_null();
@@ -456,14 +431,10 @@ void transfer_expert_lora(
         const int local_idx = expert_id - ep_rank * num_local_experts;
         if (local_idx < 0 || local_idx >= num_local_experts) continue;
 
-        if (has_gate_up)
-            send_lora_pair(comm, local_gate_up_A, local_gate_up_B, local_idx, dst_rank, stream);
-        if (has_gate)
-            send_lora_pair(comm, local_gate_A, local_gate_B, local_idx, dst_rank, stream);
-        if (has_up)
-            send_lora_pair(comm, local_up_A, local_up_B, local_idx, dst_rank, stream);
-        if (has_down)
-            send_lora_pair(comm, local_down_A, local_down_B, local_idx, dst_rank, stream);
+        if (has_gate_up) send_lora_pair(comm, local_gate_up_A, local_gate_up_B, local_idx, dst_rank, stream);
+        if (has_gate) send_lora_pair(comm, local_gate_A, local_gate_B, local_idx, dst_rank, stream);
+        if (has_up) send_lora_pair(comm, local_up_A, local_up_B, local_idx, dst_rank, stream);
+        if (has_down) send_lora_pair(comm, local_down_A, local_down_B, local_idx, dst_rank, stream);
     }
 
     // Receive LoRA slices for each foreign expert
@@ -473,17 +444,19 @@ void transfer_expert_lora(
         auto& lora = it->second.lora;
 
         if (has_gate_up)
-            recv_lora_pair(comm, received, local_gate_up_A, local_gate_up_B,
-                           lora.gate_up_A, lora.gate_up_B, src_rank, stream);
+            recv_lora_pair(comm,
+                           received,
+                           local_gate_up_A,
+                           local_gate_up_B,
+                           lora.gate_up_A,
+                           lora.gate_up_B,
+                           src_rank,
+                           stream);
         if (has_gate)
-            recv_lora_pair(comm, received, local_gate_A, local_gate_B,
-                           lora.gate_A, lora.gate_B, src_rank, stream);
-        if (has_up)
-            recv_lora_pair(comm, received, local_up_A, local_up_B,
-                           lora.up_A, lora.up_B, src_rank, stream);
+            recv_lora_pair(comm, received, local_gate_A, local_gate_B, lora.gate_A, lora.gate_B, src_rank, stream);
+        if (has_up) recv_lora_pair(comm, received, local_up_A, local_up_B, lora.up_A, lora.up_B, src_rank, stream);
         if (has_down)
-            recv_lora_pair(comm, received, local_down_A, local_down_B,
-                           lora.down_A, lora.down_B, src_rank, stream);
+            recv_lora_pair(comm, received, local_down_A, local_down_B, lora.down_A, lora.down_B, src_rank, stream);
     }
 
     comm.weight_transfer_group_end();

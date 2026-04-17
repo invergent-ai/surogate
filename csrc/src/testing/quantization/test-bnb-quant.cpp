@@ -20,12 +20,22 @@
 namespace {
 
 // NF4 codebook values (same as in bnb_quant.cu)
-constexpr float NF4_CODEBOOK[16] = {
-    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
-    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
-    0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
-    0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f
-};
+constexpr float NF4_CODEBOOK[16] = {-1.0f,
+                                    -0.6961928009986877f,
+                                    -0.5250730514526367f,
+                                    -0.39491748809814453f,
+                                    -0.28444138169288635f,
+                                    -0.18477343022823334f,
+                                    -0.09105003625154495f,
+                                    0.0f,
+                                    0.07958029955625534f,
+                                    0.16093020141124725f,
+                                    0.24611230194568634f,
+                                    0.33791524171829224f,
+                                    0.44070982933044434f,
+                                    0.5626170039176941f,
+                                    0.7229568362236023f,
+                                    1.0f};
 
 // Helper to get device properties
 cudaDeviceProp get_device_props() {
@@ -75,7 +85,7 @@ void unpack_nf4(unsigned char packed, unsigned char& hi, unsigned char& lo) {
     lo = packed & 0x0F;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 TEST_CASE("BnB NF4 quantization basic roundtrip", "[quantization][bnb]") {
     const int M = 64;
@@ -104,9 +114,8 @@ TEST_CASE("BnB NF4 quantization basic roundtrip", "[quantization][bnb]") {
     CUDA_CHECK(cudaMalloc(&d_output, num_elements * sizeof(nv_bfloat16)));
 
     // Copy input to device
-    CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(d_input, h_input.data(), num_elements * sizeof(nv_bfloat16), cudaMemcpyHostToDevice, stream));
 
     // Quantize
     quantize_bnb_nf4(d_quantized, d_absmax, d_input, M, K, block_size, dp, stream);
@@ -118,12 +127,9 @@ TEST_CASE("BnB NF4 quantization basic roundtrip", "[quantization][bnb]") {
     std::vector<nv_bfloat16> h_output(num_elements);
     std::vector<float> h_absmax(num_blocks);
 
-    CUDA_CHECK(cudaMemcpyAsync(h_output.data(), d_output,
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(h_absmax.data(), d_absmax,
-                               num_blocks * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(h_output.data(), d_output, num_elements * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_absmax.data(), d_absmax, num_blocks * sizeof(float), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Verify roundtrip accuracy
@@ -199,18 +205,15 @@ TEST_CASE("BnB NF4 absmax computation", "[quantization][bnb]") {
     CUDA_CHECK(cudaMalloc(&d_absmax, num_blocks * sizeof(float)));
 
     // Copy input
-    CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(d_input, h_input.data(), num_elements * sizeof(nv_bfloat16), cudaMemcpyHostToDevice, stream));
 
     // Quantize (this computes absmax)
     quantize_bnb_nf4(d_quantized, d_absmax, d_input, 1, num_elements, block_size, dp, stream);
 
     // Get absmax results
     std::vector<float> h_absmax(num_blocks);
-    CUDA_CHECK(cudaMemcpyAsync(h_absmax.data(), d_absmax,
-                               num_blocks * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_absmax.data(), d_absmax, num_blocks * sizeof(float), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Verify absmax values
@@ -262,27 +265,39 @@ TEST_CASE("BnB NF4 double quantization roundtrip", "[quantization][bnb]") {
     CUDA_CHECK(cudaMalloc(&d_output, num_elements * sizeof(nv_bfloat16)));
 
     // Copy input to device
-    CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(d_input, h_input.data(), num_elements * sizeof(nv_bfloat16), cudaMemcpyHostToDevice, stream));
 
     // Step 1: Quantize to NF4 with FP32 absmax
     quantize_bnb_nf4(d_quantized, d_absmax_fp32, d_input, M, K, block_size, dp, stream);
 
     // Step 2: Apply double quantization to absmax values
-    quantize_absmax_double(d_absmax_quant, d_absmax_scale, d_absmax_offset,
-                           d_absmax_fp32, num_absmax, absmax_group_size, dp, stream);
+    quantize_absmax_double(d_absmax_quant,
+                           d_absmax_scale,
+                           d_absmax_offset,
+                           d_absmax_fp32,
+                           num_absmax,
+                           absmax_group_size,
+                           dp,
+                           stream);
 
     // Step 3: Dequantize with double quantization
-    dequantize_bnb_nf4_double(d_output, d_quantized, d_absmax_quant,
-                               d_absmax_scale, d_absmax_offset,
-                               M, K, block_size, absmax_group_size, dp, stream);
+    dequantize_bnb_nf4_double(d_output,
+                              d_quantized,
+                              d_absmax_quant,
+                              d_absmax_scale,
+                              d_absmax_offset,
+                              M,
+                              K,
+                              block_size,
+                              absmax_group_size,
+                              dp,
+                              stream);
 
     // Copy results back
     std::vector<nv_bfloat16> h_output(num_elements);
-    CUDA_CHECK(cudaMemcpyAsync(h_output.data(), d_output,
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(h_output.data(), d_output, num_elements * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Verify roundtrip accuracy
@@ -323,8 +338,7 @@ TEST_CASE("BnB NF4 codebook values match expected", "[quantization][bnb]") {
 
     // Verify each value
     for (int i = 0; i < 16; ++i) {
-        INFO("Codebook index " << i << ": expected " << NF4_CODEBOOK[i]
-             << ", got " << kernel_codebook[i]);
+        INFO("Codebook index " << i << ": expected " << NF4_CODEBOOK[i] << ", got " << kernel_codebook[i]);
         REQUIRE(std::abs(kernel_codebook[i] - NF4_CODEBOOK[i]) < 1e-6f);
     }
 }
@@ -344,9 +358,8 @@ TEST_CASE("BnB NF4 handles different block sizes", "[quantization][bnb]") {
     // Allocate input
     nv_bfloat16* d_input = nullptr;
     CUDA_CHECK(cudaMalloc(&d_input, num_elements * sizeof(nv_bfloat16)));
-    CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(d_input, h_input.data(), num_elements * sizeof(nv_bfloat16), cudaMemcpyHostToDevice, stream));
 
     // Test different block sizes
     std::vector<int> block_sizes = {64, 128, 256, 512};
@@ -365,16 +378,16 @@ TEST_CASE("BnB NF4 handles different block sizes", "[quantization][bnb]") {
             CUDA_CHECK(cudaMalloc(&d_output, num_elements * sizeof(nv_bfloat16)));
 
             // Quantize and dequantize
-            REQUIRE_NOTHROW(quantize_bnb_nf4(d_quantized, d_absmax, d_input,
-                                              M, K, block_size, dp, stream));
-            REQUIRE_NOTHROW(dequantize_bnb_nf4(d_output, d_quantized, d_absmax,
-                                                M, K, block_size, dp, stream));
+            REQUIRE_NOTHROW(quantize_bnb_nf4(d_quantized, d_absmax, d_input, M, K, block_size, dp, stream));
+            REQUIRE_NOTHROW(dequantize_bnb_nf4(d_output, d_quantized, d_absmax, M, K, block_size, dp, stream));
 
             // Copy results
             std::vector<nv_bfloat16> h_output(num_elements);
-            CUDA_CHECK(cudaMemcpyAsync(h_output.data(), d_output,
+            CUDA_CHECK(cudaMemcpyAsync(h_output.data(),
+                                       d_output,
                                        num_elements * sizeof(nv_bfloat16),
-                                       cudaMemcpyDeviceToHost, stream));
+                                       cudaMemcpyDeviceToHost,
+                                       stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             // Verify basic roundtrip
@@ -426,9 +439,8 @@ TEST_CASE("BnB NF4 preserves zeros", "[quantization][bnb]") {
     CUDA_CHECK(cudaMalloc(&d_absmax, num_blocks * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_output, num_elements * sizeof(nv_bfloat16)));
 
-    CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(d_input, h_input.data(), num_elements * sizeof(nv_bfloat16), cudaMemcpyHostToDevice, stream));
 
     // Quantize and dequantize
     quantize_bnb_nf4(d_quantized, d_absmax, d_input, 1, num_elements, block_size, dp, stream);
@@ -436,9 +448,8 @@ TEST_CASE("BnB NF4 preserves zeros", "[quantization][bnb]") {
 
     // Copy results
     std::vector<nv_bfloat16> h_output(num_elements);
-    CUDA_CHECK(cudaMemcpyAsync(h_output.data(), d_output,
-                               num_elements * sizeof(nv_bfloat16),
-                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(h_output.data(), d_output, num_elements * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Most values should be near zero (NF4 has 0 as codebook value 7)
@@ -528,9 +539,11 @@ TEST_CASE("BnB NF4 quantization performance", "[quantization][bnb]") {
             CUDA_CHECK(cudaMalloc(&d_quantized, packed_size));
             CUDA_CHECK(cudaMalloc(&d_absmax, num_blocks * sizeof(float)));
 
-            CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
+            CUDA_CHECK(cudaMemcpyAsync(d_input,
+                                       h_input.data(),
                                        num_elements * sizeof(nv_bfloat16),
-                                       cudaMemcpyHostToDevice, stream));
+                                       cudaMemcpyHostToDevice,
+                                       stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             // Warmup
@@ -618,9 +631,11 @@ TEST_CASE("BnB NF4 dequantization performance", "[quantization][bnb]") {
             CUDA_CHECK(cudaMalloc(&d_absmax, num_blocks * sizeof(float)));
             CUDA_CHECK(cudaMalloc(&d_output, num_elements * sizeof(nv_bfloat16)));
 
-            CUDA_CHECK(cudaMemcpyAsync(d_input, h_input.data(),
+            CUDA_CHECK(cudaMemcpyAsync(d_input,
+                                       h_input.data(),
                                        num_elements * sizeof(nv_bfloat16),
-                                       cudaMemcpyHostToDevice, stream));
+                                       cudaMemcpyHostToDevice,
+                                       stream));
 
             // Quantize once
             quantize_bnb_nf4(d_quantized, d_absmax, d_input, M, K, block_size, dp, stream);

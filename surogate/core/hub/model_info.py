@@ -10,7 +10,7 @@ Returns a dict of fields suitable for merging into DeployedModel creation.
 import json
 import math
 import re
-from typing import Any, Optional
+from typing import Any
 
 from huggingface_hub import hf_hub_download, model_info
 from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
@@ -89,7 +89,7 @@ def _parse_params_from_name(name: str) -> str | None:
 
 def _extract_model_info(
     config: dict[str, Any],
-    generation_config: Optional[dict[str, Any]],
+    generation_config: dict[str, Any] | None,
     repo_name: str = "",
 ) -> dict[str, Any]:
     """Extract canonical fields from HF-style config dicts."""
@@ -103,11 +103,7 @@ def _extract_model_info(
         info["family"] = config["model_type"]
 
     # param_count — calculate from config, parse from name as fallback
-    num_params = (
-        config.get("num_parameters")
-        or config.get("num_params")
-        or _estimate_params(config)
-    )
+    num_params = config.get("num_parameters") or config.get("num_params") or _estimate_params(config)
     if num_params and isinstance(num_params, (int, float)) and num_params > 0:
         info["param_count"] = _format_params(num_params)
     elif repo_name:
@@ -161,8 +157,11 @@ def _extract_model_info(
 
 
 async def _read_lakefs_json(
-    client: ApiClient, repo: str, ref: str, path: str,
-) -> Optional[dict[str, Any]]:
+    client: ApiClient,
+    repo: str,
+    ref: str,
+    path: str,
+) -> dict[str, Any] | None:
     data = await lakefs.get_object_content(client, repo, ref, path)
     if data is None:
         return None
@@ -174,7 +173,8 @@ async def _read_lakefs_json(
 
 
 async def resolve_from_lakefs(
-    client: ApiClient, hub_ref: str,
+    client: ApiClient,
+    hub_ref: str,
 ) -> dict[str, Any]:
     """Resolve model info from a LakeFS hub_ref like 'repo@branch'."""
     parts = hub_ref.split("@", 1)
@@ -194,8 +194,10 @@ async def resolve_from_lakefs(
 
 
 def _download_hf_json(
-    repo_id: str, filename: str, token: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
+    repo_id: str,
+    filename: str,
+    token: str | None = None,
+) -> dict[str, Any] | None:
     try:
         path = hf_hub_download(repo_id=repo_id, filename=filename, token=token)
         with open(path) as f:
@@ -208,7 +210,8 @@ def _download_hf_json(
 
 
 def resolve_from_huggingface(
-    repo_id: str, token: Optional[str] = None,
+    repo_id: str,
+    token: str | None = None,
 ) -> dict[str, Any]:
     """Resolve model info from a Hugging Face repo.
 

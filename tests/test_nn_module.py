@@ -4,12 +4,11 @@ import pytest
 
 from surogate.dsl import nn
 from surogate.dsl.specs import (
+    ActivationScope,
     BlockSpec,
     ParamKind,
     SharePolicy,
-    ActivationScope,
 )
-
 
 # ============================================================================
 # Fixtures — reusable block instances
@@ -30,6 +29,7 @@ QWEN3_CONFIG = dict(
 
 def _make_qwen3_block(**overrides):
     from surogate.dsl.blocks.qwen3 import Qwen3Block
+
     cfg = {**QWEN3_CONFIG, **overrides}
     return Qwen3Block(**cfg)
 
@@ -37,6 +37,7 @@ def _make_qwen3_block(**overrides):
 # ============================================================================
 # Basic compilation
 # ============================================================================
+
 
 class TestBlockCompile:
     """Verify that nn.Block.compile() produces a valid BlockSpec."""
@@ -196,7 +197,6 @@ class TestMinimalBlock:
     """Test a minimal custom block to verify the framework."""
 
     def test_simple_mlp_block(self):
-
         class SimpleMLP(nn.Block):
             def __init__(self, d_model, d_ff):
                 super().__init__()
@@ -217,13 +217,15 @@ class TestMinimalBlock:
         assert spec.params["norm_weight"].quantizable is False
 
     def test_attention_only_block(self):
-
         class AttnBlock(nn.Block):
             def __init__(self):
                 super().__init__()
                 self.attn = nn.GQAAttention(
-                    d_model=512, num_query_heads=8, num_kv_heads=4,
-                    head_size=64, max_seq=2048,
+                    d_model=512,
+                    num_query_heads=8,
+                    num_kv_heads=4,
+                    head_size=64,
+                    max_seq=2048,
                 )
 
             def forward(self, x, position_ids):
@@ -240,14 +242,22 @@ class TestMinimalBlock:
 # MoE block compilation
 # ============================================================================
 
+
 class TestMoEBlock:
     """Verify Qwen3MoEBlock compilation."""
 
     def test_moe_block_compiles(self):
         from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
+
         blk = Qwen3MoEBlock(
-            d_model=2048, num_query_heads=16, num_kv_heads=4, head_size=128,
-            d_ff=1408, max_seq=4096, num_experts=64, num_experts_per_tok=8,
+            d_model=2048,
+            num_query_heads=16,
+            num_kv_heads=4,
+            head_size=128,
+            d_ff=1408,
+            max_seq=4096,
+            num_experts=64,
+            num_experts_per_tok=8,
         )
         spec = blk.compile()
         assert isinstance(spec, BlockSpec)
@@ -257,12 +267,20 @@ class TestMoEBlock:
 
     def test_moe_block_with_shared_expert(self):
         from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
+
         blk = Qwen3MoEBlock(
-            d_model=2048, num_query_heads=16, num_kv_heads=4, head_size=128,
-            d_ff=1408, max_seq=4096, num_experts=64, num_experts_per_tok=8,
-            use_shared_expert=True, shared_expert_intermediate=5632,
+            d_model=2048,
+            num_query_heads=16,
+            num_kv_heads=4,
+            head_size=128,
+            d_ff=1408,
+            max_seq=4096,
+            num_experts=64,
+            num_experts_per_tok=8,
+            use_shared_expert=True,
+            shared_expert_intermediate=5632,
         )
         spec = blk.compile()
         ops = {n.op for n in spec.forward._traced_graph.nodes}
         assert "silu" in ops  # shared expert gate activation
-        assert "add" in ops   # moe_out + shared_out
+        assert "add" in ops  # moe_out + shared_out

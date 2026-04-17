@@ -6,38 +6,35 @@ with the C++ runtime.
 """
 
 from __future__ import annotations
+
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from .decorators import _model_registry, _block_registry, _module_registry, _primitive_registry
-from .specs import (
-    ModelSpec,
-    BlockSpec,
-    ModuleSpec,
-    ParamSpec,
-    ParamKind,
-    ForwardSpec,
-    HFConfigSpec,
-    HFMappingSpec,
-    HFTransformSpec,
-    ActivationSlotSpec,
-    ActivationLayoutSpec,
-    ActivationScope,
-    ActivationMemoryHint,
-)
-from .graph_builder import GraphBuilder, GraphNode, GraphRef
-from .hf import FuseMapping, SplitMapping, TransformMapping, StackExpertsMapping, TiedToMapping
-from .dim import Dim, DimExpr, ConcreteDimValue, dim_to_ir
+from .decorators import _block_registry, _model_registry, _module_registry, _primitive_registry
+from .dim import ConcreteDimValue, Dim, DimExpr
 from .errors import (
     DSLError,
+    DSLShapeError,
     DSLSyntaxError,
     DSLTypeError,
-    DSLShapeError,
     DSLUndefinedError,
     ErrorCode,
     WarningCode,
     WarningCollector,
+)
+from .graph_builder import GraphBuilder, GraphNode
+from .hf import FuseMapping, SplitMapping, StackExpertsMapping, TiedToMapping, TransformMapping
+from .specs import (
+    ActivationLayoutSpec,
+    ActivationSlotSpec,
+    BlockSpec,
+    ForwardSpec,
+    HFTransformSpec,
+    ModelSpec,
+    ModuleSpec,
+    ParamKind,
+    ParamSpec,
 )
 
 if TYPE_CHECKING:
@@ -52,8 +49,9 @@ if TYPE_CHECKING:
 @dataclass
 class TensorRef:
     """Tensor reference in the IR."""
-    shape: List[Any]
-    dtype: Optional[str] = None
+
+    shape: list[Any]
+    dtype: str | None = None
     is_param: bool = False
     is_input: bool = False
     is_output: bool = False
@@ -64,25 +62,27 @@ class TensorRef:
 @dataclass
 class OpIR:
     """Operation in the IR graph."""
-    id: Optional[int] = None
-    name: Optional[str] = None
-    kernel_type: Optional[str] = None
-    inputs: List[str] = field(default_factory=list)
-    outputs: List[str] = field(default_factory=list)
-    attrs: Dict[str, Any] = field(default_factory=dict)
+
+    id: int | None = None
+    name: str | None = None
+    kernel_type: str | None = None
+    inputs: list[str] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
+    attrs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class GraphIR:
     """Computation graph IR."""
-    name: Optional[str] = None
-    inputs: Dict[str, TensorRef] = field(default_factory=dict)
-    outputs: Dict[str, TensorRef] = field(default_factory=dict)
-    params: Dict[str, TensorRef] = field(default_factory=dict)
-    intermediates: Dict[str, TensorRef] = field(default_factory=dict)
-    nodes: List[OpIR] = field(default_factory=list)
-    save_list: List[str] = field(default_factory=list)
-    recompute_list: List[str] = field(default_factory=list)
+
+    name: str | None = None
+    inputs: dict[str, TensorRef] = field(default_factory=dict)
+    outputs: dict[str, TensorRef] = field(default_factory=dict)
+    params: dict[str, TensorRef] = field(default_factory=dict)
+    intermediates: dict[str, TensorRef] = field(default_factory=dict)
+    nodes: list[OpIR] = field(default_factory=list)
+    save_list: list[str] = field(default_factory=list)
+    recompute_list: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -95,20 +95,21 @@ class ActivationSlotIR:
     - Build shape inference tables
     - Create save/restore mappings for backward pass
     """
+
     name: str
     scope: str  # "block", "global", "gradient", "global_gradient"
-    shape: List[Any]  # Shape expression with symbolic dims
-    dtype: Optional[str] = None
-    aliases: List[str] = field(default_factory=list)
+    shape: list[Any]  # Shape expression with symbolic dims
+    dtype: str | None = None
+    aliases: list[str] = field(default_factory=list)
     memory_hint: str = "persistent"  # "persistent", "save", "recompute", "temporary", "shared"
-    shares_with: Optional[str] = None
+    shares_with: str | None = None
     save_for_backward: bool = False
     share_policy: str = "when_recomputed"  # "per_layer", "when_recomputed", "always_share", "fft_share", "lora_share"
-    gradient_of: Optional[str] = None
-    alias_of: Optional[str] = None
+    gradient_of: str | None = None
+    alias_of: str | None = None
     slot_index: int = -1  # Index in the activation struct
-    condition: Optional[str] = None
-    description: Optional[str] = None
+    condition: str | None = None
+    description: str | None = None
 
 
 @dataclass
@@ -120,33 +121,35 @@ class ActivationLayoutIR:
     - Name → slot index mapping
     - Alias resolution table
     """
+
     name: str
-    slots: List[ActivationSlotIR] = field(default_factory=list)
-    gradient_slots: List[ActivationSlotIR] = field(default_factory=list)
-    alias_map: Dict[str, str] = field(default_factory=dict)  # alias -> canonical name
-    extends: Optional[str] = None
+    slots: list[ActivationSlotIR] = field(default_factory=list)
+    gradient_slots: list[ActivationSlotIR] = field(default_factory=list)
+    alias_map: dict[str, str] = field(default_factory=dict)  # alias -> canonical name
+    extends: str | None = None
 
 
 @dataclass
 class ModuleIR:
     """Module IR output."""
+
     name: str
     kind: str  # "model", "block", "module"
-    extends: Optional[str] = None
-    config: Dict[str, Any] = field(default_factory=dict)
+    extends: str | None = None
+    config: dict[str, Any] = field(default_factory=dict)
     # hf_config is the nested structure: {architecture, param_mapping, model_type}
-    hf_config: Dict[str, Any] = field(default_factory=dict)
-    hf_weight_mapping: Dict[str, Any] = field(default_factory=dict)
-    hf_export_mapping: Dict[str, Any] = field(default_factory=dict)
-    params: Dict[str, TensorRef] = field(default_factory=dict)
-    forward_graph: Optional[GraphIR] = None
-    backward_graph: Optional[GraphIR] = None
-    save_tensors: List[str] = field(default_factory=list)
-    recompute_tensors: List[str] = field(default_factory=list)
+    hf_config: dict[str, Any] = field(default_factory=dict)
+    hf_weight_mapping: dict[str, Any] = field(default_factory=dict)
+    hf_export_mapping: dict[str, Any] = field(default_factory=dict)
+    params: dict[str, TensorRef] = field(default_factory=dict)
+    forward_graph: GraphIR | None = None
+    backward_graph: GraphIR | None = None
+    save_tensors: list[str] = field(default_factory=list)
+    recompute_tensors: list[str] = field(default_factory=list)
     is_model: bool = False
     is_block: bool = False
     # Activation layout for this module (block activations or global model activations)
-    activation_layout: Optional[ActivationLayoutIR] = None
+    activation_layout: ActivationLayoutIR | None = None
 
 
 # =============================================================================
@@ -165,8 +168,8 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return result
 
 
-def _dsl_error_to_dict(err: DSLError) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"code": err.code.value, "message": err.message}
+def _dsl_error_to_dict(err: DSLError) -> dict[str, Any]:
+    payload: dict[str, Any] = {"code": err.code.value, "message": err.message}
     if err.location is not None:
         payload["location"] = str(err.location)
     if err.hint:
@@ -174,8 +177,8 @@ def _dsl_error_to_dict(err: DSLError) -> Dict[str, Any]:
     return payload
 
 
-def _dsl_warning_to_dict(w) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"code": w.code.value, "message": w.message}
+def _dsl_warning_to_dict(w) -> dict[str, Any]:
+    payload: dict[str, Any] = {"code": w.code.value, "message": w.message}
     if w.location is not None:
         payload["location"] = str(w.location)
     return payload
@@ -198,7 +201,7 @@ def _parse_shape_dim(dim: Any) -> Any:
     return str(dim)
 
 
-def _build_dim_map(instance: Any) -> Dict[str, str]:
+def _build_dim_map(instance: Any) -> dict[str, str]:
     """Build a mapping from attribute names to their Dim expression strings.
 
     This maps annotation strings like "C", "D", "QKV" to config parameter expressions
@@ -213,7 +216,7 @@ def _build_dim_map(instance: Any) -> Dict[str, str]:
     Returns:
         Dict mapping attribute name to its expression string.
     """
-    dim_map: Dict[str, str] = {}
+    dim_map: dict[str, str] = {}
     for attr_name in dir(instance):
         if attr_name.startswith("_"):
             continue
@@ -248,26 +251,27 @@ def _tensor_annotation_to_ref(
     )
 
 
-def _substitute_dim_names(expr: str, dim_map: Dict[str, str]) -> str:
+def _substitute_dim_names(expr: str, dim_map: dict[str, str]) -> str:
     """Substitute dimension attribute names in an expression with their config names.
 
     For example, "D // 2" with dim_map {"D": "head_size"} becomes "head_size // 2".
     """
     import re
+
     # Sort dim_map keys by length (longest first) to avoid partial substitutions
     sorted_names = sorted(dim_map.keys(), key=len, reverse=True)
     result = expr
     for name in sorted_names:
         # Use word boundaries to avoid partial matches (e.g., "C" shouldn't match in "MUp")
-        pattern = r'\b' + re.escape(name) + r'\b'
+        pattern = r"\b" + re.escape(name) + r"\b"
         result = re.sub(pattern, dim_map[name], result)
     return result
 
 
 def _param_spec_to_ref(
     spec: ParamSpec,
-    config: Dict[str, Any],
-    dim_map: Optional[Dict[str, str]] = None,
+    config: dict[str, Any],
+    dim_map: dict[str, str] | None = None,
 ) -> TensorRef:
     """Convert a ParamSpec to a TensorRef.
 
@@ -343,7 +347,7 @@ def _is_symbolic_dim_expr(dim: str) -> bool:
 
 
 def _validate_param_shapes(
-    params: Dict[str, TensorRef],
+    params: dict[str, TensorRef],
     *,
     warnings: WarningCollector | None = None,
 ) -> None:
@@ -361,7 +365,7 @@ def _validate_param_shapes(
                 raise DSLShapeError(
                     f"param '{name}' has zero dimension at axis {i}",
                     hint="Ensure the dimension is exported to the IR config "
-                         "(check @hf_config param_mapping and __init__).",
+                    "(check @hf_config param_mapping and __init__).",
                 )
             if isinstance(dim, str) and not dim.isdigit() and not _is_symbolic_dim_expr(dim):
                 _warn(
@@ -393,7 +397,7 @@ def _validate_graph_activation_slots(
         base_name = name
         dot = name.rfind(".")
         if dot >= 0:
-            base_name = name[dot + 1:]
+            base_name = name[dot + 1 :]
 
         if name not in known and base_name not in known:
             _warn(
@@ -487,8 +491,8 @@ def _serialize_hf_spec(spec: Any) -> Any:
 
 def _compile_activation_slot(
     slot: ActivationSlotSpec,
-    config: Dict[str, Any],
-    dim_map: Optional[Dict[str, str]] = None,
+    config: dict[str, Any],
+    dim_map: dict[str, str] | None = None,
     slot_index: int = -1,
 ) -> ActivationSlotIR:
     """Compile an ActivationSlotSpec to ActivationSlotIR.
@@ -534,8 +538,8 @@ def _compile_activation_slot(
 
 def _compile_activation_layout(
     layout: ActivationLayoutSpec,
-    config: Dict[str, Any],
-    dim_map: Optional[Dict[str, str]] = None,
+    config: dict[str, Any],
+    dim_map: dict[str, str] | None = None,
 ) -> ActivationLayoutIR:
     """Compile an ActivationLayoutSpec to ActivationLayoutIR.
 
@@ -569,7 +573,7 @@ def _compile_activation_layout(
 def _infer_output_names_from_graph(
     builder: GraphBuilder,
     num_outputs: int,
-) -> Optional[List[str]]:
+) -> list[str] | None:
     """Infer output tensor names from graph by finding terminal tensors.
 
     For transformer blocks, we know the typical pattern:
@@ -582,7 +586,7 @@ def _infer_output_names_from_graph(
         return None
 
     # Collect all produced tensors and consumed tensors
-    produced: List[str] = []  # Ordered list of produced tensors
+    produced: list[str] = []  # Ordered list of produced tensors
     consumed: set = set()
 
     for node in builder.nodes:
@@ -642,10 +646,10 @@ def _infer_output_names_from_graph(
 def _compile_graph_builder(
     builder: GraphBuilder,
     spec: ForwardSpec,
-    config: Dict[str, Any],
-    params: Dict[str, ParamSpec],
+    config: dict[str, Any],
+    params: dict[str, ParamSpec],
     *,
-    dim_map: Optional[Dict[str, str]] = None,
+    dim_map: dict[str, str] | None = None,
     warnings: WarningCollector | None = None,
 ) -> GraphIR:
     """Compile a GraphBuilder to GraphIR."""
@@ -658,7 +662,7 @@ def _compile_graph_builder(
 
     # Add outputs - use actual tensor names from graph if available
     # The returned outputs from forward() are stored in builder._returned_outputs
-    returned_outputs = getattr(builder, '_returned_outputs', None)
+    returned_outputs = getattr(builder, "_returned_outputs", None)
 
     # If _returned_outputs wasn't captured, try to infer from graph structure
     if not returned_outputs and len(spec.outputs) > 0:
@@ -730,7 +734,7 @@ def _compile_graph_builder(
     return graph
 
 
-def _init_instance_from_config(instance: Any, cls: type, config: Dict[str, Any]) -> None:
+def _init_instance_from_config(instance: Any, cls: type, config: dict[str, Any]) -> None:
     """Initialize instance with config keys accepted by __init__.
 
     Raises ValueError if the __init__ fails with a ValueError (config validation error).
@@ -745,7 +749,7 @@ def _init_instance_from_config(instance: Any, cls: type, config: Dict[str, Any])
     except (TypeError, ValueError):
         return
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     for name, param in sig.parameters.items():
         if name == "self":
             continue
@@ -761,7 +765,7 @@ def _init_instance_from_config(instance: Any, cls: type, config: Dict[str, Any])
         pass
 
 
-def _expand_hybrid_hf_mappings(ir: "ModuleIR", block_types: list, block_mappings: dict) -> None:
+def _expand_hybrid_hf_mappings(ir: ModuleIR, block_types: list, block_mappings: dict) -> None:
     """Expand template-based HF mappings for hybrid models with physical layer indices.
 
     In hybrid models, all blocks use ``blocks[N]`` with physical layer indices.
@@ -794,7 +798,7 @@ def _expand_hybrid_hf_mappings(ir: "ModuleIR", block_types: list, block_mappings
         if dot < 0:
             continue
         prefix_part = param_name[:dot]
-        field = param_name[dot + 1:]
+        field = param_name[dot + 1 :]
         # Match blocks[N]
         if not prefix_part.startswith("blocks["):
             continue
@@ -816,7 +820,7 @@ def _expand_hybrid_hf_mappings(ir: "ModuleIR", block_types: list, block_mappings
 def _inline_stacked_blocks(
     graph: GraphIR,
     model_spec: ModelSpec,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     *,
     warnings: WarningCollector | None = None,
 ) -> GraphIR:
@@ -831,7 +835,7 @@ def _inline_stacked_blocks(
         if not param_spec or param_spec.kind != ParamKind.ARRAY or not param_spec.element_type:
             raise DSLTypeError(
                 f"StackedBlocks expects array param '{blocks_param}' with element_type",
-                hint="Declare blocks as Param(Array[\"n_layers\", \"YourBlock\"]) and pass blocks=\"blocks\" in g.call().",
+                hint='Declare blocks as Param(Array["n_layers", "YourBlock"]) and pass blocks="blocks" in g.call().',
             )
         block_spec = get_block_spec(param_spec.element_type)
         if block_spec is None:
@@ -841,7 +845,7 @@ def _inline_stacked_blocks(
     # Cache compiled block graphs by block name + param_name to support hybrid models
     # where different block types use the same Block class with different configs
     # (e.g., Gemma4SharedKVBlock with head_size=256 vs head_size=512).
-    block_cache: Dict[str, ModuleIR] = {}
+    block_cache: dict[str, ModuleIR] = {}
 
     def _get_block_ir(block_spec: BlockSpec, cache_key: str | None = None) -> ModuleIR:
         key = cache_key or block_spec.name
@@ -852,22 +856,24 @@ def _inline_stacked_blocks(
         block_cache[key] = ir
         return ir
 
-    new_nodes: List[OpIR] = []
-    new_params: Dict[str, TensorRef] = dict(graph.params)
-    new_save: List[str] = []
+    new_nodes: list[OpIR] = []
+    new_params: dict[str, TensorRef] = dict(graph.params)
+    new_save: list[str] = []
     op_id = 0
 
     for node in graph.nodes:
         if node.name not in ("StackedBlocks", "HybridStackedBlocks"):
             op_id += 1
-            new_nodes.append(OpIR(
-                id=op_id,
-                name=node.name,
-                kernel_type=node.kernel_type,
-                inputs=list(node.inputs),
-                outputs=list(node.outputs),
-                attrs=dict(node.attrs),
-            ))
+            new_nodes.append(
+                OpIR(
+                    id=op_id,
+                    name=node.name,
+                    kernel_type=node.kernel_type,
+                    inputs=list(node.inputs),
+                    outputs=list(node.outputs),
+                    attrs=dict(node.attrs),
+                )
+            )
             continue
 
         n_layers = node.attrs.get("n_layers") or config.get("n_layers")
@@ -909,11 +915,11 @@ def _inline_stacked_blocks(
                 block_type_to_param[bt] = node.attrs.get(default_param, default_param)
 
             # Track indices per block type
-            block_type_indices: Dict[str, int] = {bt: 0 for bt in unique_block_types}
+            block_type_indices: dict[str, int] = {bt: 0 for bt in unique_block_types}
 
             # Resolve all block specs upfront
-            block_specs: Dict[str, BlockSpec] = {}
-            block_irs: Dict[str, ModuleIR] = {}
+            block_specs: dict[str, BlockSpec] = {}
+            block_irs: dict[str, ModuleIR] = {}
             for block_type, param_name in block_type_to_param.items():
                 # Only resolve if this block type is actually used
                 if block_type in block_types:
@@ -990,7 +996,7 @@ def _inline_stacked_blocks(
                 # Build name mapping — use physical layer index with uniform "blocks[N]"
                 # prefix so the C++ parse_block_param (which expects "blocks[N]") works.
                 prefix = f"blocks[{layer_idx}]."
-                mapping: Dict[str, str] = {}
+                mapping: dict[str, str] = {}
 
                 # Map block inputs to current layer inputs (handle mismatched counts)
                 # Some blocks take 2 inputs (x, residual), some take 3 (x, residual, position_ids)
@@ -1015,28 +1021,32 @@ def _inline_stacked_blocks(
                     narrow_out = f"pli_narrow_layer{layer_idx}"
                     pli_slice_name = f"pli_slice_layer{layer_idx}"
                     op_id += 1
-                    new_nodes.append(OpIR(
-                        id=op_id,
-                        name=f"narrow_pli_{layer_idx}",
-                        kernel_type="narrow",
-                        inputs=[pli_tensor_ref],
-                        outputs=[narrow_out],
-                        attrs={"dim": 2, "start": layer_idx, "length": 1},
-                    ))
+                    new_nodes.append(
+                        OpIR(
+                            id=op_id,
+                            name=f"narrow_pli_{layer_idx}",
+                            kernel_type="narrow",
+                            inputs=[pli_tensor_ref],
+                            outputs=[narrow_out],
+                            attrs={"dim": 2, "start": layer_idx, "length": 1},
+                        )
+                    )
                     op_id += 1
-                    new_nodes.append(OpIR(
-                        id=op_id,
-                        name=f"view_pli_{layer_idx}",
-                        kernel_type="view",
-                        inputs=[narrow_out],
-                        outputs=[pli_slice_name],
-                        # narrow dim=2 produced [B, T, 1, PLI_D]; collapse the
-                        # singleton to [B, T, PLI_D]. Without this, shape
-                        # inference defaults to [1] and the saved activation is
-                        # misinterpreted during backward recompute (all NaNs
-                        # downstream of the PLI gating).
-                        attrs={"shape": ["B", "T", "PLI_D"]},
-                    ))
+                    new_nodes.append(
+                        OpIR(
+                            id=op_id,
+                            name=f"view_pli_{layer_idx}",
+                            kernel_type="view",
+                            inputs=[narrow_out],
+                            outputs=[pli_slice_name],
+                            # narrow dim=2 produced [B, T, 1, PLI_D]; collapse the
+                            # singleton to [B, T, PLI_D]. Without this, shape
+                            # inference defaults to [1] and the saved activation is
+                            # misinterpreted during backward recompute (all NaNs
+                            # downstream of the PLI gating).
+                            attrs={"shape": ["B", "T", "PLI_D"]},
+                        )
+                    )
                     mapping[pli_block_name] = pli_slice_name
                     # Save PLI narrow+view outputs for backward replay (stack-allocated,
                     # freed after forward layer boundary).
@@ -1053,17 +1063,19 @@ def _inline_stacked_blocks(
                     op_id += 1
                     mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
                     mapped_outputs = [mapping.get(o, f"{prefix}{o}") for o in bnode.outputs]
-                    new_nodes.append(OpIR(
-                        id=op_id,
-                        name=bnode.name,
-                        kernel_type=bnode.kernel_type,
-                        inputs=mapped_inputs,
-                        outputs=mapped_outputs,
-                        attrs=dict(bnode.attrs),
-                    ))
+                    new_nodes.append(
+                        OpIR(
+                            id=op_id,
+                            name=bnode.name,
+                            kernel_type=bnode.kernel_type,
+                            inputs=mapped_inputs,
+                            outputs=mapped_outputs,
+                            attrs=dict(bnode.attrs),
+                        )
+                    )
 
                 # Merge block's save_list into model's save_list with layer prefix
-                for save_name in getattr(block_graph, 'save_list', []) or []:
+                for save_name in getattr(block_graph, "save_list", []) or []:
                     new_save.append(mapping.get(save_name, f"{prefix}{save_name}"))
 
                 # Next layer inputs (x, residual from outputs; keep position_ids)
@@ -1097,8 +1109,8 @@ def _inline_stacked_blocks(
                 )
             extra_inputs = []
             if len(cur_inputs) > len(block_inputs):
-                extra_inputs = cur_inputs[len(block_inputs):]
-                cur_inputs = cur_inputs[:len(block_inputs)]
+                extra_inputs = cur_inputs[len(block_inputs) :]
+                cur_inputs = cur_inputs[: len(block_inputs)]
             position_ids_input = cur_inputs[-1]
             deepstack_layers = int(node.attrs.get("deepstack_layers", 0)) if node.attrs else 0
 
@@ -1111,7 +1123,7 @@ def _inline_stacked_blocks(
 
                 # Build name mapping
                 prefix = f"{blocks_param}[{layer_idx}]."
-                mapping: Dict[str, str] = {}
+                mapping: dict[str, str] = {}
                 for b_in, c_in in zip(block_inputs, cur_inputs):
                     mapping[b_in] = c_in
                 for b_out, c_out in zip(block_outputs, layer_outputs):
@@ -1126,14 +1138,16 @@ def _inline_stacked_blocks(
                     op_id += 1
                     mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
                     mapped_outputs = [mapping.get(o, f"{prefix}{o}") for o in bnode.outputs]
-                    new_nodes.append(OpIR(
-                        id=op_id,
-                        name=bnode.name,
-                        kernel_type=bnode.kernel_type,
-                        inputs=mapped_inputs,
-                        outputs=mapped_outputs,
-                        attrs=dict(bnode.attrs),
-                    ))
+                    new_nodes.append(
+                        OpIR(
+                            id=op_id,
+                            name=bnode.name,
+                            kernel_type=bnode.kernel_type,
+                            inputs=mapped_inputs,
+                            outputs=mapped_outputs,
+                            attrs=dict(bnode.attrs),
+                        )
+                    )
 
                 # Inject deepstack visual embeddings after the layer output (first N layers only)
                 if deepstack_layers > 0 and extra_inputs:
@@ -1141,21 +1155,23 @@ def _inline_stacked_blocks(
                     deepstack_inputs = extra_inputs[1:]
                     if layer_idx < deepstack_layers and layer_idx < len(deepstack_inputs):
                         op_id += 1
-                        new_nodes.append(OpIR(
-                            id=op_id,
-                            name="deepstack_inject",
-                            kernel_type="deepstack_inject",
-                            inputs=[layer_outputs[0], visual_mask, deepstack_inputs[layer_idx]],
-                            outputs=[layer_outputs[0]],
-                            attrs={},
-                        ))
+                        new_nodes.append(
+                            OpIR(
+                                id=op_id,
+                                name="deepstack_inject",
+                                kernel_type="deepstack_inject",
+                                inputs=[layer_outputs[0], visual_mask, deepstack_inputs[layer_idx]],
+                                outputs=[layer_outputs[0]],
+                                attrs={},
+                            )
+                        )
 
                 # Next layer inputs
-                cur_inputs = list(layer_outputs[:len(block_inputs) - 1])
+                cur_inputs = list(layer_outputs[: len(block_inputs) - 1])
                 cur_inputs.append(position_ids_input)  # position_ids stays constant
 
     # Rebuild intermediates
-    new_intermediates: Dict[str, TensorRef] = {}
+    new_intermediates: dict[str, TensorRef] = {}
     for op in new_nodes:
         for out in op.outputs:
             if out in graph.inputs or out in new_params or out in graph.outputs:
@@ -1173,8 +1189,8 @@ def _inline_stacked_blocks(
 
 def _evaluate_forward_for_graph(
     model_class: type,
-    config: Dict[str, Any],
-) -> Optional[GraphBuilder]:
+    config: dict[str, Any],
+) -> GraphBuilder | None:
     """
     Instantiate the model and call forward to capture the graph.
 
@@ -1217,9 +1233,9 @@ def _evaluate_forward_for_graph(
 
 def _compile_merged_activation_layout(
     spec: ModelSpec,
-    config: Dict[str, Any],
-    dim_map: Optional[Dict[str, str]] = None,
-) -> Optional[ActivationLayoutIR]:
+    config: dict[str, Any],
+    dim_map: dict[str, str] | None = None,
+) -> ActivationLayoutIR | None:
     """Compile and merge model's global activation slots with block activation slots.
 
     For models with stacked blocks, the activation layout needs both:
@@ -1238,9 +1254,9 @@ def _compile_merged_activation_layout(
         Merged ActivationLayoutIR containing both global and block-scoped slots,
         or None if no activation slots are declared.
     """
-    slots: List[ActivationSlotIR] = []
-    gradient_slots: List[ActivationSlotIR] = []
-    alias_map: Dict[str, str] = {}
+    slots: list[ActivationSlotIR] = []
+    gradient_slots: list[ActivationSlotIR] = []
+    alias_map: dict[str, str] = {}
 
     # 1. Compile model's global activation slots
     if spec.activations:
@@ -1263,7 +1279,7 @@ def _compile_merged_activation_layout(
             continue
 
         # Build dim_map for the block if we have its python_class
-        block_dim_map: Dict[str, str] = {}
+        block_dim_map: dict[str, str] = {}
         if block_spec.python_class:
             try:
                 block_instance = object.__new__(block_spec.python_class)
@@ -1275,9 +1291,7 @@ def _compile_merged_activation_layout(
                 pass
 
         # Compile block activation layout
-        block_layout = _compile_activation_layout(
-            block_spec.activations, config, block_dim_map or dim_map
-        )
+        block_layout = _compile_activation_layout(block_spec.activations, config, block_dim_map or dim_map)
 
         # Add block slots with scope="block", deduplicating by name
         block_slot_start = len(slots)
@@ -1326,18 +1340,19 @@ def _compile_merged_activation_layout(
 def _capture_forward_graph(
     forward_fn: Any,
     instance: Any,
-    inputs: List[IOSpec],
-) -> Optional[GraphBuilder]:
+    inputs: list[IOSpec],
+) -> GraphBuilder | None:
     """
     Capture the graph from a forward function by temporarily patching the graph context.
 
     The forward function creates its own graph() context inside, so we need to
     intercept that context to capture the nodes.
     """
-    from .graph_builder import GraphBuilder, _graph_stack
     import surogate.dsl.graph_builder as graph_module
 
-    captured_builder: Optional[GraphBuilder] = None
+    from .graph_builder import GraphBuilder, _graph_stack
+
+    captured_builder: GraphBuilder | None = None
 
     # Create a patched graph context manager that captures the builder
     from contextlib import contextmanager
@@ -1360,13 +1375,14 @@ def _capture_forward_graph(
 
     # Get the module containing the forward function
     import sys
+
     original_graph = graph_module.graph
 
     # Find all modules that might have imported graph
     modules_to_patch = []
     for name, mod in list(sys.modules.items()):
-        if mod is not None and hasattr(mod, 'graph') and getattr(mod, 'graph', None) is original_graph:
-            modules_to_patch.append((mod, 'graph', original_graph))
+        if mod is not None and hasattr(mod, "graph") and getattr(mod, "graph", None) is original_graph:
+            modules_to_patch.append((mod, "graph", original_graph))
 
     # Patch all occurrences
     graph_module.graph = patched_graph
@@ -1389,13 +1405,13 @@ def _capture_forward_graph(
         # Store the returned output tensor names on the builder for later use
         if captured_builder is not None:
             from .graph_builder import GraphRef
+
             if returned_outputs is not None:
                 if isinstance(returned_outputs, GraphRef):
                     captured_builder._returned_outputs = [returned_outputs.name]
                 elif isinstance(returned_outputs, tuple):
                     captured_builder._returned_outputs = [
-                        ref.name if isinstance(ref, GraphRef) else str(ref)
-                        for ref in returned_outputs
+                        ref.name if isinstance(ref, GraphRef) else str(ref) for ref in returned_outputs
                     ]
                 else:
                     captured_builder._returned_outputs = []
@@ -1416,7 +1432,7 @@ def _capture_forward_graph(
 
 def compile_model_spec(
     spec: ModelSpec,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     *,
     warnings: WarningCollector | None = None,
 ) -> ModuleIR:
@@ -1425,6 +1441,7 @@ def compile_model_spec(
     # to get a fully-populated spec, then continue with normal compilation.
     if hasattr(spec, "_nn_model_class"):
         import inspect as _inspect
+
         nn_cls = spec._nn_model_class
         # Filter config to only include params the __init__ accepts
         init_sig = _inspect.signature(nn_cls.__init__)
@@ -1499,7 +1516,7 @@ def compile_model_spec(
 
     # Create instance first so we can build dim_map for param resolution
     instance = None
-    dim_map: Dict[str, str] = {}
+    dim_map: dict[str, str] = {}
     init_error: Exception | None = None
     if spec.python_class:
         try:
@@ -1592,10 +1609,13 @@ def compile_model_spec(
 
         # For hybrid models, expand block-level HF mappings with physical layer
         # indices so the C++ weight loader resolves typed block indices correctly.
-        if (instance and hasattr(instance, "block_types") and
-                spec.python_class and hasattr(spec.python_class, "_hf_block_mappings_")):
-            _expand_hybrid_hf_mappings(
-                ir, instance.block_types, spec.python_class._hf_block_mappings_)
+        if (
+            instance
+            and hasattr(instance, "block_types")
+            and spec.python_class
+            and hasattr(spec.python_class, "_hf_block_mappings_")
+        ):
+            _expand_hybrid_hf_mappings(ir, instance.block_types, spec.python_class._hf_block_mappings_)
 
     # Save/recompute
     if spec.forward:
@@ -1619,7 +1639,7 @@ def compile_model_spec(
 
 def compile_block_spec(
     spec: BlockSpec,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     *,
     warnings: WarningCollector | None = None,
 ) -> ModuleIR:
@@ -1627,6 +1647,7 @@ def compile_block_spec(
     # nn.Block subclasses carry _nn_block_class — instantiate and compile them
     if hasattr(spec, "_nn_block_class"):
         import inspect as _inspect
+
         nn_cls = spec._nn_block_class
         init_sig = _inspect.signature(nn_cls.__init__)
         init_params = set(init_sig.parameters.keys()) - {"self"}
@@ -1656,7 +1677,7 @@ def compile_block_spec(
 
     # Create instance first so we can build dim_map for param resolution
     instance = None
-    dim_map: Dict[str, str] = {}
+    dim_map: dict[str, str] = {}
     if spec.python_class:
         try:
             instance = object.__new__(spec.python_class)
@@ -1694,7 +1715,9 @@ def compile_block_spec(
                 builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
 
         if builder is not None:
-            ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
+            ir.forward_graph = _compile_graph_builder(
+                builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings
+            )
 
     # Compile activation layout if present
     if spec.activations:
@@ -1709,7 +1732,7 @@ def compile_block_spec(
 
 def compile_module_spec(
     spec: ModuleSpec,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     *,
     warnings: WarningCollector | None = None,
 ) -> ModuleIR:
@@ -1734,7 +1757,7 @@ def compile_module_spec(
 
     # Create instance first so we can build dim_map for param resolution
     instance = None
-    dim_map: Dict[str, str] = {}
+    dim_map: dict[str, str] = {}
     if spec.python_class:
         try:
             instance = object.__new__(spec.python_class)
@@ -1775,7 +1798,9 @@ def compile_module_spec(
                         hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
                     )
             else:
-                ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
+                ir.forward_graph = _compile_graph_builder(
+                    builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings
+                )
 
     # Validate param shapes (zero dims and unresolved string dims)
     if ir.forward_graph:
@@ -1799,7 +1824,7 @@ class _OffloadGroupResolver:
     """
 
     def __init__(self) -> None:
-        self._name_to_id: Dict[str, int] = {}
+        self._name_to_id: dict[str, int] = {}
         self._next_id: int = 0
 
     def resolve(self, group: int | str) -> int:
@@ -1819,7 +1844,7 @@ class _OffloadGroupResolver:
 _offload_resolver = _OffloadGroupResolver()
 
 
-def _tensor_ref_to_dict(ref: TensorRef) -> Dict[str, Any]:
+def _tensor_ref_to_dict(ref: TensorRef) -> dict[str, Any]:
     """Convert TensorRef to JSON-serializable dict."""
     result = {
         "shape": ref.shape,
@@ -1836,7 +1861,7 @@ def _tensor_ref_to_dict(ref: TensorRef) -> Dict[str, Any]:
     return result
 
 
-def _graph_ir_to_dict(graph: GraphIR) -> Dict[str, Any]:
+def _graph_ir_to_dict(graph: GraphIR) -> dict[str, Any]:
     """Convert GraphIR to JSON-serializable dict."""
     return {
         "name": graph.name,
@@ -1861,7 +1886,7 @@ def _graph_ir_to_dict(graph: GraphIR) -> Dict[str, Any]:
     }
 
 
-def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> Dict[str, Any]:
+def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> dict[str, Any]:
     """Convert ActivationSlotIR to JSON-serializable dict."""
     result = {
         "name": slot.name,
@@ -1893,7 +1918,7 @@ def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> Dict[str, Any]:
     return result
 
 
-def _activation_layout_ir_to_dict(layout: ActivationLayoutIR) -> Dict[str, Any]:
+def _activation_layout_ir_to_dict(layout: ActivationLayoutIR) -> dict[str, Any]:
     """Convert ActivationLayoutIR to JSON-serializable dict."""
     result = {
         "name": layout.name,
@@ -1908,7 +1933,7 @@ def _activation_layout_ir_to_dict(layout: ActivationLayoutIR) -> Dict[str, Any]:
     return result
 
 
-def _module_ir_to_dict(ir: ModuleIR) -> Dict[str, Any]:
+def _module_ir_to_dict(ir: ModuleIR) -> dict[str, Any]:
     """Convert ModuleIR to JSON-serializable dict."""
     result = {
         "name": ir.name,
@@ -1946,24 +1971,24 @@ def _module_ir_to_dict(ir: ModuleIR) -> Dict[str, Any]:
 # =============================================================================
 
 
-def get_model_spec(name: str) -> Optional[ModelSpec]:
+def get_model_spec(name: str) -> ModelSpec | None:
     """Get a registered model spec by name."""
     return _model_registry.get(name)
 
 
-def get_block_spec(name: str) -> Optional[BlockSpec]:
+def get_block_spec(name: str) -> BlockSpec | None:
     """Get a registered block spec by name."""
     return _block_registry.get(name)
 
 
-def get_module_spec(name: str) -> Optional[ModuleSpec]:
+def get_module_spec(name: str) -> ModuleSpec | None:
     """Get a registered module spec by name."""
     return _module_registry.get(name)
 
 
 def compile_model(
     model_class_or_name: type | str,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     *,
     raise_on_error: bool = False,
     warnings: WarningCollector | None = None,
@@ -2010,7 +2035,7 @@ def compile_model(
         ir = compile_model_spec(spec, config, warnings=diag)
 
         # Serialize
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "source_file": source_file,
             "success": True,
             "modules": [_module_ir_to_dict(ir)],
@@ -2048,9 +2073,9 @@ def compile_model(
 
 def compile_model_for_hf(
     architecture: str,
-    hf_config: Dict[str, Any],
+    hf_config: dict[str, Any],
     *,
-    extra_config: Dict[str, Any] | None = None,
+    extra_config: dict[str, Any] | None = None,
     raise_on_error: bool = False,
     warnings: WarningCollector | None = None,
 ) -> str:
@@ -2102,7 +2127,7 @@ def compile_model_for_hf(
         return json.dumps(result)
 
     # Build config from HF config using the mapping
-    def _get_hf_value(config_dict: Dict[str, Any], key: str) -> Any | None:
+    def _get_hf_value(config_dict: dict[str, Any], key: str) -> Any | None:
         if key in config_dict:
             return config_dict[key]
         if "." not in key:
@@ -2131,7 +2156,7 @@ def compile_model_for_hf(
         ir = compile_model_spec(spec, config, warnings=diag)
 
         # Serialize
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "source_file": f"python:{spec.name}",
             "success": True,
             "modules": [_module_ir_to_dict(ir)],
@@ -2166,7 +2191,7 @@ def compile_model_for_hf(
         return json.dumps(result)
 
 
-def get_hf_param_mapping(architecture: str) -> tuple[Dict[str, str], str]:
+def get_hf_param_mapping(architecture: str) -> tuple[dict[str, str], str]:
     """
     Get the HuggingFace parameter mapping for an architecture.
 
@@ -2186,16 +2211,16 @@ def get_hf_param_mapping(architecture: str) -> tuple[Dict[str, str], str]:
     raise DSLUndefinedError(architecture)
 
 
-def list_registered_models() -> List[str]:
+def list_registered_models() -> list[str]:
     """List all registered model names."""
     return list(_model_registry.keys())
 
 
-def list_registered_blocks() -> List[str]:
+def list_registered_blocks() -> list[str]:
     """List all registered block names."""
     return list(_block_registry.keys())
 
 
-def list_registered_modules() -> List[str]:
+def list_registered_modules() -> list[str]:
     """List all registered module names."""
     return list(_module_registry.keys())

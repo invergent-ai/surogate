@@ -70,31 +70,39 @@ namespace small {
 using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
+    ArchTag,
+    OperatorClass,
+    TileShape,
+    ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutCTag, AlignmentC,
-    ElementD, LayoutDTag, AlignmentD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
->::CollectiveOp;
-
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutATag, AlignmentA,
-    ElementB, LayoutBTag, AlignmentB,
     ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto
->::CollectiveOp;
+    ElementAccumulator,
+    ElementC,
+    LayoutCTag,
+    AlignmentC,
+    ElementD,
+    LayoutDTag,
+    AlignmentD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<ArchTag,
+                                                          OperatorClass,
+                                                          ElementA,
+                                                          LayoutATag,
+                                                          AlignmentA,
+                                                          ElementB,
+                                                          LayoutBTag,
+                                                          AlignmentB,
+                                                          ElementAccumulator,
+                                                          TileShape,
+                                                          ClusterShape,
+                                                          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<
+                                                              int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+                                                          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace small
@@ -104,45 +112,56 @@ namespace large {
 using TileShape = cute::Shape<cute::_256, cute::_128, cute::_128>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
+    ArchTag,
+    OperatorClass,
+    TileShape,
+    ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutCTag, AlignmentC,
-    ElementD, LayoutDTag, AlignmentD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
->::CollectiveOp;
-
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutATag, AlignmentA,
-    ElementB, LayoutBTag, AlignmentB,
     ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto
->::CollectiveOp;
+    ElementAccumulator,
+    ElementC,
+    LayoutCTag,
+    AlignmentC,
+    ElementD,
+    LayoutDTag,
+    AlignmentD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<ArchTag,
+                                                          OperatorClass,
+                                                          ElementA,
+                                                          LayoutATag,
+                                                          AlignmentA,
+                                                          ElementB,
+                                                          LayoutBTag,
+                                                          AlignmentB,
+                                                          ElementAccumulator,
+                                                          TileShape,
+                                                          ClusterShape,
+                                                          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<
+                                                              int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+                                                          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace large
 
 // Helper template for running any GEMM variant
-template<typename Gemm>
-void run_gemm(
-    nv_bfloat16* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+template <typename Gemm>
+void run_gemm(nv_bfloat16* d,
+              const uint8_t* a,
+              const uint8_t* b,
+              const uint8_t* scale_a,
+              const uint8_t* scale_b,
+              std::byte* workspace,
+              std::size_t workspace_size,
+              int M,
+              int N,
+              int K,
+              cudaStream_t stream) {
     using StrideA = typename Gemm::GemmKernel::StrideA;
     using StrideB = typename Gemm::GemmKernel::StrideB;
     using StrideC = typename Gemm::GemmKernel::StrideC;
@@ -157,23 +176,17 @@ void run_gemm(
     auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
 
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
-        {reinterpret_cast<const typename ElementA::DataType*>(a),
-         stride_A,
-         reinterpret_cast<const typename ElementB::DataType*>(b),
-         stride_B,
-         reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
-         layout_SFA,
-         reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
-         layout_SFB},
-        {{1.0f, 0.0f},
-         nullptr,
-         stride_C,
-         reinterpret_cast<ElementD*>(d),
-         stride_D}
-    };
+    typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                  {M, N, K, 1},
+                                  {reinterpret_cast<const typename ElementA::DataType*>(a),
+                                   stride_A,
+                                   reinterpret_cast<const typename ElementB::DataType*>(b),
+                                   stride_B,
+                                   reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
+                                   layout_SFA,
+                                   reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
+                                   layout_SFB},
+                                  {{1.0f, 0.0f}, nullptr, stride_C, reinterpret_cast<ElementD*>(d), stride_D}};
 
     Gemm gemm_op;
     auto status = gemm_op.can_implement(args);
@@ -193,8 +206,7 @@ void run_gemm(
 
     cudaError_t cuda_err = cudaPeekAtLastError();
     if (cuda_err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUTLASS FP4 SM120 GEMM launch failed: ") +
-                                 cudaGetErrorString(cuda_err));
+        throw std::runtime_error(std::string("CUTLASS FP4 SM120 GEMM launch failed: ") + cudaGetErrorString(cuda_err));
     }
 }
 
@@ -214,30 +226,39 @@ namespace small {
 using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
+    ArchTag,
+    OperatorClass,
+    TileShape,
+    ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC_F32, LayoutCTag, AlignmentC_F32,
-    ElementD_F32, LayoutDTag, AlignmentD_F32,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
->::CollectiveOp;
-
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutATag, AlignmentA,
-    ElementB, LayoutBTag, AlignmentB,
     ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto
->::CollectiveOp;
+    ElementAccumulator,
+    ElementC_F32,
+    LayoutCTag,
+    AlignmentC_F32,
+    ElementD_F32,
+    LayoutDTag,
+    AlignmentD_F32,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<ArchTag,
+                                                          OperatorClass,
+                                                          ElementA,
+                                                          LayoutATag,
+                                                          AlignmentA,
+                                                          ElementB,
+                                                          LayoutBTag,
+                                                          AlignmentB,
+                                                          ElementAccumulator,
+                                                          TileShape,
+                                                          ClusterShape,
+                                                          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<
+                                                              int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+                                                          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace small
@@ -247,30 +268,39 @@ namespace large {
 using TileShape = cute::Shape<cute::_256, cute::_128, cute::_128>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
+    ArchTag,
+    OperatorClass,
+    TileShape,
+    ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC_F32, LayoutCTag, AlignmentC_F32,
-    ElementD_F32, LayoutDTag, AlignmentD_F32,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
->::CollectiveOp;
-
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutATag, AlignmentA,
-    ElementB, LayoutBTag, AlignmentB,
     ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto
->::CollectiveOp;
+    ElementAccumulator,
+    ElementC_F32,
+    LayoutCTag,
+    AlignmentC_F32,
+    ElementD_F32,
+    LayoutDTag,
+    AlignmentD_F32,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<ArchTag,
+                                                          OperatorClass,
+                                                          ElementA,
+                                                          LayoutATag,
+                                                          AlignmentA,
+                                                          ElementB,
+                                                          LayoutBTag,
+                                                          AlignmentB,
+                                                          ElementAccumulator,
+                                                          TileShape,
+                                                          ClusterShape,
+                                                          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<
+                                                              int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+                                                          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace large
@@ -288,30 +318,39 @@ namespace small {
 using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
+    ArchTag,
+    OperatorClass,
+    TileShape,
+    ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutCTag, AlignmentC,
-    ElementD, LayoutDTag, AlignmentD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
->::CollectiveOp;
-
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutATag, AlignmentA,
-    ElementB, LayoutBTag, AlignmentB,
     ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto
->::CollectiveOp;
+    ElementAccumulator,
+    ElementC,
+    LayoutCTag,
+    AlignmentC,
+    ElementD,
+    LayoutDTag,
+    AlignmentD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<ArchTag,
+                                                          OperatorClass,
+                                                          ElementA,
+                                                          LayoutATag,
+                                                          AlignmentA,
+                                                          ElementB,
+                                                          LayoutBTag,
+                                                          AlignmentB,
+                                                          ElementAccumulator,
+                                                          TileShape,
+                                                          ClusterShape,
+                                                          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<
+                                                              int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+                                                          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace small
@@ -321,30 +360,39 @@ namespace large {
 using TileShape = cute::Shape<cute::_256, cute::_128, cute::_128>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
+    ArchTag,
+    OperatorClass,
+    TileShape,
+    ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutCTag, AlignmentC,
-    ElementD, LayoutDTag, AlignmentD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
->::CollectiveOp;
-
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutATag, AlignmentA,
-    ElementB, LayoutBTag, AlignmentB,
     ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto
->::CollectiveOp;
+    ElementAccumulator,
+    ElementC,
+    LayoutCTag,
+    AlignmentC,
+    ElementD,
+    LayoutDTag,
+    AlignmentD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    cute::Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<ArchTag,
+                                                          OperatorClass,
+                                                          ElementA,
+                                                          LayoutATag,
+                                                          AlignmentA,
+                                                          ElementB,
+                                                          LayoutBTag,
+                                                          AlignmentB,
+                                                          ElementAccumulator,
+                                                          TileShape,
+                                                          ClusterShape,
+                                                          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<
+                                                              int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+                                                          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace large
@@ -352,16 +400,19 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 }  // namespace alpha_ptr
 
 // Helper template for alpha-pointer BF16 output GEMMs (reads alpha from device pointer)
-template<typename Gemm>
-void run_gemm_alpha_ptr(
-    nv_bfloat16* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    const float* alpha_ptr,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+template <typename Gemm>
+void run_gemm_alpha_ptr(nv_bfloat16* d,
+                        const uint8_t* a,
+                        const uint8_t* b,
+                        const uint8_t* scale_a,
+                        const uint8_t* scale_b,
+                        const float* alpha_ptr,
+                        std::byte* workspace,
+                        std::size_t workspace_size,
+                        int M,
+                        int N,
+                        int K,
+                        cudaStream_t stream) {
     using StrideA = typename Gemm::GemmKernel::StrideA;
     using StrideB = typename Gemm::GemmKernel::StrideB;
     using StrideC = typename Gemm::GemmKernel::StrideC;
@@ -376,23 +427,21 @@ void run_gemm_alpha_ptr(
     auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
 
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
-        {reinterpret_cast<const typename ElementA::DataType*>(a),
-         stride_A,
-         reinterpret_cast<const typename ElementB::DataType*>(b),
-         stride_B,
-         reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
-         layout_SFA,
-         reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
-         layout_SFB},
-        {{},  // Default epilogue args, will set alpha_ptr below
-         nullptr,
-         stride_C,
-         reinterpret_cast<ElementD*>(d),
-         stride_D}
-    };
+    typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                  {M, N, K, 1},
+                                  {reinterpret_cast<const typename ElementA::DataType*>(a),
+                                   stride_A,
+                                   reinterpret_cast<const typename ElementB::DataType*>(b),
+                                   stride_B,
+                                   reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
+                                   layout_SFA,
+                                   reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
+                                   layout_SFB},
+                                  {{},  // Default epilogue args, will set alpha_ptr below
+                                   nullptr,
+                                   stride_C,
+                                   reinterpret_cast<ElementD*>(d),
+                                   stride_D}};
 
     // Set alpha_ptr for device-side alpha reading
     args.epilogue.thread.alpha_ptr = alpha_ptr;
@@ -421,15 +470,18 @@ void run_gemm_alpha_ptr(
 }
 
 // Helper template for FP32 output GEMMs
-template<typename Gemm>
-void run_gemm_f32(
-    float* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+template <typename Gemm>
+void run_gemm_f32(float* d,
+                  const uint8_t* a,
+                  const uint8_t* b,
+                  const uint8_t* scale_a,
+                  const uint8_t* scale_b,
+                  std::byte* workspace,
+                  std::size_t workspace_size,
+                  int M,
+                  int N,
+                  int K,
+                  cudaStream_t stream) {
     using StrideA = typename Gemm::GemmKernel::StrideA;
     using StrideB = typename Gemm::GemmKernel::StrideB;
     using StrideC = typename Gemm::GemmKernel::StrideC;
@@ -444,23 +496,17 @@ void run_gemm_f32(
     auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
 
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
-        {reinterpret_cast<const typename ElementA::DataType*>(a),
-         stride_A,
-         reinterpret_cast<const typename ElementB::DataType*>(b),
-         stride_B,
-         reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
-         layout_SFA,
-         reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
-         layout_SFB},
-        {{1.0f, 0.0f},
-         nullptr,
-         stride_C,
-         d,
-         stride_D}
-    };
+    typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                  {M, N, K, 1},
+                                  {reinterpret_cast<const typename ElementA::DataType*>(a),
+                                   stride_A,
+                                   reinterpret_cast<const typename ElementB::DataType*>(b),
+                                   stride_B,
+                                   reinterpret_cast<const typename ElementA::ScaleFactorType*>(scale_a),
+                                   layout_SFA,
+                                   reinterpret_cast<const typename ElementB::ScaleFactorType*>(scale_b),
+                                   layout_SFB},
+                                  {{1.0f, 0.0f}, nullptr, stride_C, d, stride_D}};
 
     Gemm gemm_op;
     auto status = gemm_op.can_implement(args);
@@ -493,60 +539,89 @@ void run_gemm_f32(
 // Public API Implementation for SM120
 // ============================================================================
 
-void matmul_cutlass_fp4_sm120(
-    nv_bfloat16* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+void matmul_cutlass_fp4_sm120(nv_bfloat16* d,
+                              const uint8_t* a,
+                              const uint8_t* b,
+                              const uint8_t* scale_a,
+                              const uint8_t* scale_b,
+                              std::byte* workspace,
+                              std::size_t workspace_size,
+                              int M,
+                              int N,
+                              int K,
+                              cudaStream_t stream) {
     // M-based tile selection for SM120 (GeForce):
     // - Small M (<512): 128x128x128 - better for small batches
     // - Large M (>=512): 256x128x128 - better throughput for training
     if (M < 512) {
-        sm120_fp4::run_gemm<sm120_fp4::small::Gemm>(
-            d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
+        sm120_fp4::run_gemm<
+            sm120_fp4::small::Gemm>(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
     } else {
-        sm120_fp4::run_gemm<sm120_fp4::large::Gemm>(
-            d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
+        sm120_fp4::run_gemm<
+            sm120_fp4::large::Gemm>(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
     }
 }
 
-void matmul_cutlass_fp4_sm120_f32(
-    float* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+void matmul_cutlass_fp4_sm120_f32(float* d,
+                                  const uint8_t* a,
+                                  const uint8_t* b,
+                                  const uint8_t* scale_a,
+                                  const uint8_t* scale_b,
+                                  std::byte* workspace,
+                                  std::size_t workspace_size,
+                                  int M,
+                                  int N,
+                                  int K,
+                                  cudaStream_t stream) {
     // FP32 output variant for alpha scaling before BF16 conversion
     if (M < 512) {
-        sm120_fp4::run_gemm_f32<sm120_fp4::fp32_out::small::Gemm>(
-            d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
+        sm120_fp4::run_gemm_f32<
+            sm120_fp4::fp32_out::small::Gemm>(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
     } else {
-        sm120_fp4::run_gemm_f32<sm120_fp4::fp32_out::large::Gemm>(
-            d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
+        sm120_fp4::run_gemm_f32<
+            sm120_fp4::fp32_out::large::Gemm>(d, a, b, scale_a, scale_b, workspace, workspace_size, M, N, K, stream);
     }
 }
 
-void matmul_cutlass_fp4_sm120_alpha(
-    nv_bfloat16* d,
-    const uint8_t* a, const uint8_t* b,
-    const uint8_t* scale_a, const uint8_t* scale_b,
-    const float* alpha_ptr,
-    std::byte* workspace, std::size_t workspace_size,
-    int M, int N, int K,
-    cudaStream_t stream)
-{
+void matmul_cutlass_fp4_sm120_alpha(nv_bfloat16* d,
+                                    const uint8_t* a,
+                                    const uint8_t* b,
+                                    const uint8_t* scale_a,
+                                    const uint8_t* scale_b,
+                                    const float* alpha_ptr,
+                                    std::byte* workspace,
+                                    std::size_t workspace_size,
+                                    int M,
+                                    int N,
+                                    int K,
+                                    cudaStream_t stream) {
     // Alpha-scaled BF16 output via device pointer (no FP32 intermediate needed)
     if (M < 512) {
-        sm120_fp4::run_gemm_alpha_ptr<sm120_fp4::alpha_ptr::small::Gemm>(
-            d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
+        sm120_fp4::run_gemm_alpha_ptr<sm120_fp4::alpha_ptr::small::Gemm>(d,
+                                                                         a,
+                                                                         b,
+                                                                         scale_a,
+                                                                         scale_b,
+                                                                         alpha_ptr,
+                                                                         workspace,
+                                                                         workspace_size,
+                                                                         M,
+                                                                         N,
+                                                                         K,
+                                                                         stream);
     } else {
-        sm120_fp4::run_gemm_alpha_ptr<sm120_fp4::alpha_ptr::large::Gemm>(
-            d, a, b, scale_a, scale_b, alpha_ptr, workspace, workspace_size, M, N, K, stream);
+        sm120_fp4::run_gemm_alpha_ptr<sm120_fp4::alpha_ptr::large::Gemm>(d,
+                                                                         a,
+                                                                         b,
+                                                                         scale_a,
+                                                                         scale_b,
+                                                                         alpha_ptr,
+                                                                         workspace,
+                                                                         workspace_size,
+                                                                         M,
+                                                                         N,
+                                                                         K,
+                                                                         stream);
     }
 }
 

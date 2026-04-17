@@ -60,10 +60,7 @@ def _detect_sm() -> int:
         major, minor = out.split("\n")[0].strip().split(".")
         return int(major) * 10 + int(minor)
     except Exception:
-        raise RuntimeError(
-            "Cannot detect GPU SM version. Pass sm= explicitly or ensure "
-            "nvidia-smi is available."
-        )
+        raise RuntimeError("Cannot detect GPU SM version. Pass sm= explicitly or ensure nvidia-smi is available.")
 
 
 def compile_triton_kernel(
@@ -94,8 +91,9 @@ def compile_triton_kernel(
     Returns:
         Path to the generated JSON manifest file.
     """
-    from triton.compiler import ASTSource, compile as triton_compile
-    from triton.backends.nvidia.compiler import CUDAOptions, GPUTarget
+    from triton.backends.nvidia.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.compiler import compile as triton_compile
 
     if sm is None:
         sm = _detect_sm()
@@ -155,7 +153,12 @@ def compile_triton_kernel(
 
     logger.info(
         "Compiled %s -> %s (%d bytes, sm%d, %d warps, %d shared)",
-        name, cubin_path, len(cubin), sm, num_warps, shared_mem,
+        name,
+        cubin_path,
+        len(cubin),
+        sm,
+        num_warps,
+        shared_mem,
     )
 
     return str(manifest_path)
@@ -213,11 +216,7 @@ def autotune_triton_kernel(
         constants = {}
 
     if configs is None:
-        configs = [
-            {"num_warps": w, "num_stages": s}
-            for w in [1, 2, 4, 8]
-            for s in [1, 2]
-        ]
+        configs = [{"num_warps": w, "num_stages": s} for w in [1, 2, 4, 8] for s in [1, 2]]
 
     best_time = float("inf")
     best_config = configs[0]
@@ -226,10 +225,7 @@ def autotune_triton_kernel(
         num_warps = config.get("num_warps", 4)
         num_stages = config.get("num_stages", 2)
         # Merge base constants with config-specific overrides
-        cfg_constants = {
-            k: v for k, v in config.items()
-            if k not in ("num_warps", "num_stages")
-        }
+        cfg_constants = {k: v for k, v in config.items() if k not in ("num_warps", "num_stages")}
         merged = {**constants, **cfg_constants}
 
         def _launch(_m=merged, _nw=num_warps, _ns=num_stages):
@@ -237,7 +233,10 @@ def autotune_triton_kernel(
 
         try:
             times = triton.testing.do_bench(
-                _launch, warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8),
+                _launch,
+                warmup=warmup,
+                rep=rep,
+                quantiles=(0.5, 0.2, 0.8),
             )
             median = times[0]
         except Exception as e:
@@ -246,7 +245,8 @@ def autotune_triton_kernel(
 
         logger.info(
             "  config num_warps=%d num_stages=%d %s -> %.3f ms",
-            num_warps, num_stages,
+            num_warps,
+            num_stages,
             {k: v for k, v in cfg_constants.items()} if cfg_constants else "",
             median,
         )
@@ -257,15 +257,15 @@ def autotune_triton_kernel(
 
     best_warps = best_config.get("num_warps", 4)
     best_stages = best_config.get("num_stages", 2)
-    best_extra = {
-        k: v for k, v in best_config.items()
-        if k not in ("num_warps", "num_stages")
-    }
+    best_extra = {k: v for k, v in best_config.items() if k not in ("num_warps", "num_stages")}
     final_constants = {**constants, **best_extra}
 
     logger.info(
         "Autotuning %s: best config num_warps=%d num_stages=%d (%.3f ms)",
-        kernel_name or fn.__name__, best_warps, best_stages, best_time,
+        kernel_name or fn.__name__,
+        best_warps,
+        best_stages,
+        best_time,
     )
 
     return compile_triton_kernel(
@@ -331,7 +331,8 @@ def compile_cute_kernel(
 
     # ---- compile ----
     compiled = cute.compile[cute.KeepPTX(True), cute.KeepCUBIN(True)](
-        kernel, *compile_args,
+        kernel,
+        *compile_args,
     )
 
     cubin_data = compiled.artifacts.CUBIN
@@ -376,8 +377,11 @@ def compile_cute_kernel(
 
     logger.info(
         "Compiled CuTe %s -> %s (%d bytes, %d threads, %d shared)",
-        manifest["name"], output_dir / cubin_file,
-        len(cubin_data), num_threads, shared_mem,
+        manifest["name"],
+        output_dir / cubin_file,
+        len(cubin_data),
+        num_threads,
+        shared_mem,
     )
 
     return str(manifest_path)

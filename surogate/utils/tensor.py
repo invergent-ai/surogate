@@ -1,10 +1,11 @@
 import random
-from typing import Optional, Any, Union, Mapping
-from typing_extensions import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import numpy as np
 import torch
 from transformers import enable_full_determinism, set_seed
+
 
 def get_dataset_lengths(dataset, from_arrow=False):
     if "length" in dataset.column_names:
@@ -21,7 +22,8 @@ def get_dataset_lengths(dataset, from_arrow=False):
             lengths = np.array([len(seq) for seq in input_ids])
     return lengths
 
-def seed_everything(seed: Optional[int] = None, full_determinism: bool = False) -> int:
+
+def seed_everything(seed: int | None = None, full_determinism: bool = False) -> int:
     if seed is None:
         seed_max = np.iinfo(np.int32).max
         seed = random.randint(0, seed_max)
@@ -45,9 +47,7 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
 
     diffs = position_ids[1:] - position_ids[:-1]
     boundaries = torch.where(diffs != 1)[0] + 1  # indices where a new seq starts
-    starts = torch.cat(
-        [torch.tensor([0], device=position_ids.device, dtype=boundaries.dtype), boundaries]
-    )
+    starts = torch.cat([torch.tensor([0], device=position_ids.device, dtype=boundaries.dtype), boundaries])
     ends = torch.cat(
         [boundaries, torch.tensor([len(position_ids)], device=position_ids.device, dtype=boundaries.dtype)]
     )
@@ -59,7 +59,7 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     return cu_seqlens
 
 
-def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bool = False) -> Any:
+def to_device(data: Any, device: str | torch.device | int, non_blocking: bool = False) -> Any:
     """Move inputs to a device"""
     if isinstance(data, Mapping):
         return type(data)({k: to_device(v, device, non_blocking) for k, v in data.items()})
@@ -69,8 +69,9 @@ def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bo
         return data.to(device=device, non_blocking=non_blocking)
     else:
         return data
-    
-def to_surogate_dtype(torch_dtype: torch.dtype) -> Literal['bf16', 'fp32']:
+
+
+def to_surogate_dtype(torch_dtype: torch.dtype) -> Literal["bf16", "fp32"]:
     if torch_dtype == torch.bfloat16:
         return "bf16"
     elif torch_dtype == torch.float32:

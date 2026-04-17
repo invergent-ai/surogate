@@ -27,7 +27,7 @@ struct ModelConfig;
 enum class MatmulOp;
 enum class ForwardHookPoint;
 enum class BackwardHookPoint;
-}
+}  // namespace modules
 
 struct RuntimeOptions;
 
@@ -40,6 +40,14 @@ class DslRunState;
 class DslParamStore;
 class DslGradStore;
 class DslWeightManager;
+class CompiledExecutor;
+struct CompiledOp;
+
+// Dispatch function pointer baked into each CompiledOp at graph-compile
+// time. Replaces the switch-on-op.type pattern. Declared here so
+// CompiledOp can embed it; implementations live in per-op files that
+// register via REGISTER_OP (see runtime/executor/op_registry.h).
+using OpExecFn = void (*)(CompiledExecutor&, const CompiledOp&, const void* hook);
 
 // ============================================================================
 // Operation Type Enumeration (compile-time dispatch)
@@ -167,12 +175,12 @@ enum class CompiledOpType : std::uint8_t {
 // Pre-resolved tensor reference
 struct TensorRef {
     TensorSlot slot = TensorSlot::Mapped;
-    int layer_idx = -1;          // For block-indexed slots
-    int tensor_id = -1;          // Index into CompiledExecutor::mTensors flat vector (compile-time assigned)
-    std::string name;            // For Parameter/Saved/Mapped slots
-    std::vector<long> shape;     // Pre-computed shape (empty = use base tensor shape)
+    int layer_idx = -1;       // For block-indexed slots
+    int tensor_id = -1;       // Index into CompiledExecutor::mTensors flat vector (compile-time assigned)
+    std::string name;         // For Parameter/Saved/Mapped slots
+    std::vector<long> shape;  // Pre-computed shape (empty = use base tensor shape)
     ETensorDType dtype = ETensorDType::BF16;
-    bool is_gradient = false;    // True for gradient tensors (d_ prefix) — avoids runtime string checks
+    bool is_gradient = false;  // True for gradient tensors (d_ prefix) — avoids runtime string checks
 };
 
 // ============================================================================
@@ -190,12 +198,12 @@ struct CompiledAttrs {
 
     // Shape info
     std::vector<long> shape;
-    std::string shape_like;  // Reference tensor name for runtime shape lookup (used by view backward)
+    std::string shape_like;         // Reference tensor name for runtime shape lookup (used by view backward)
     int shape_like_tensor_id = -1;  // Pre-resolved tensor_id for shape_like (avoids runtime map lookup)
 
     // MoE side-channel tensor IDs (pre-resolved to avoid runtime string lookups)
-    int moe_offsets_tensor_id = -1;    // Pre-resolved "moe_expert_offsets"
-    int moe_gather_tensor_id = -1;     // Pre-resolved "moe_gather_indices"
+    int moe_offsets_tensor_id = -1;  // Pre-resolved "moe_expert_offsets"
+    int moe_gather_tensor_id = -1;   // Pre-resolved "moe_gather_indices"
 
     // Matmul-specific
     std::optional<modules::MatmulOp> matmul_op;
@@ -275,7 +283,13 @@ struct CompiledAttrs {
 
 struct CompiledOp {
     CompiledOpType type = CompiledOpType::Unknown;
-    std::uint16_t original_idx = 0;     // Index in original operation list (for debugging)
+    std::uint16_t original_idx = 0;  // Index in original operation list (for debugging)
+
+    // Dispatch function, populated by the graph compiler from OpRegistry.
+    // Execute paths call `op.fn(exec, op, hook)` directly — no switch, no
+    // registry lookup in the hot path. Null means "no handler for this
+    // op in the current graph direction" → dispatch throws.
+    OpExecFn fn = nullptr;
 
     // Pre-resolved inputs/outputs
     std::vector<TensorRef> inputs;
@@ -285,11 +299,11 @@ struct CompiledOp {
     CompiledAttrs attrs;
 
     // Layer boundary info (for prefetch optimization)
-    int layer_start = -1;               // If >= 0, this op starts a new layer
-    int layer_end = -1;                 // If >= 0, this op ends a layer
+    int layer_start = -1;  // If >= 0, this op starts a new layer
+    int layer_end = -1;    // If >= 0, this op ends a layer
 
     // Debug info
-    std::string op_id;                  // Original operation ID
+    std::string op_id;  // Original operation ID
 };
 
 // ============================================================================
@@ -297,20 +311,30 @@ struct CompiledOp {
 // ============================================================================
 
 struct TensorMeta {
-    static constexpr uint8_t kCrossLayer   = 1 << 0;  // name starts with "layer"
-    static constexpr uint8_t kMoeOffsets   = 1 << 1;  // name == "moe_expert_offsets"
-    static constexpr uint8_t kDBlocks      = 1 << 2;  // name starts with "d_blocks["
-    static constexpr uint8_t kBlocks       = 1 << 3;  // name starts with "blocks["
-    static constexpr uint8_t kMoeGather    = 1 << 4;  // name == "moe_gather_indices"
+    static constexpr uint8_t kCrossLayer = 1 << 0;  // name starts with "layer"
+    static constexpr uint8_t kMoeOffsets = 1 << 1;  // name == "moe_expert_offsets"
+    static constexpr uint8_t kDBlocks = 1 << 2;     // name starts with "d_blocks["
+    static constexpr uint8_t kBlocks = 1 << 3;      // name starts with "blocks["
+    static constexpr uint8_t kMoeGather = 1 << 4;   // name == "moe_gather_indices"
 
     uint8_t flags = 0;
     int block_layer_idx = -1;  // For "blocks[N].*" or "d_blocks[N].*", the parsed N
 
-    bool is_cross_layer() const { return flags & kCrossLayer; }
-    bool is_moe_offsets() const { return flags & kMoeOffsets; }
-    bool is_d_blocks() const { return flags & kDBlocks; }
-    bool is_blocks() const { return flags & kBlocks; }
-    bool is_moe_gather() const { return flags & kMoeGather; }
+    bool is_cross_layer() const {
+        return flags & kCrossLayer;
+    }
+    bool is_moe_offsets() const {
+        return flags & kMoeOffsets;
+    }
+    bool is_d_blocks() const {
+        return flags & kDBlocks;
+    }
+    bool is_blocks() const {
+        return flags & kBlocks;
+    }
+    bool is_moe_gather() const {
+        return flags & kMoeGather;
+    }
 };
 
 // ============================================================================
@@ -320,9 +344,9 @@ struct TensorMeta {
 /// A contiguous range of ops within a layer that can be captured as a single
 /// CUDA graph, or must run eagerly (e.g., FlashAttention with doc masking).
 struct GraphSegment {
-    std::size_t start_op;    ///< Inclusive start index in CompiledGraph::ops
-    std::size_t end_op;      ///< Exclusive end index in CompiledGraph::ops
-    bool eager;              ///< true = run eagerly (attention ops with dynamic cu_seqlens)
+    std::size_t start_op;  ///< Inclusive start index in CompiledGraph::ops
+    std::size_t end_op;    ///< Exclusive end index in CompiledGraph::ops
+    bool eager;            ///< true = run eagerly (attention ops with dynamic cu_seqlens)
 };
 
 // ============================================================================
@@ -392,8 +416,6 @@ struct CompiledGraph {
     std::size_t view_ops = 0;
 };
 
-
-
 // ============================================================================
 // Graph Compiler
 // ============================================================================
@@ -406,8 +428,10 @@ public:
                   DslParamStore& weights,
                   DslGradStore& grads);
 
-    // Compile a forward or backward graph
-    CompiledGraph compile(const Graph& graph, long B, long T);
+    // Compile a forward or backward graph. `is_backward=true` selects the
+    // backward dispatch function for each op when both a forward and a
+    // backward are registered (e.g. View, Zeros, MatmulBackward).
+    CompiledGraph compile(const Graph& graph, long B, long T, bool is_backward = false);
 
     // Reset the per-compile-pair namespace. This clears:
     //   - tensor-id map (so fresh forward+backward get consistent tids)
@@ -425,16 +449,16 @@ public:
     void update_dimensions(long B, long T);
 
     // Get the slot registry (for passing to CompiledExecutor)
-    const TensorSlotRegistry& slot_registry() const { return mSlotRegistry; }
+    const TensorSlotRegistry& slot_registry() const {
+        return mSlotRegistry;
+    }
 
 private:
     CompiledOpType classify_op(const std::string& op_type) const;
 
-    TensorRef resolve_tensor_ref(const std::string& name, bool is_output,
-                                 const Operation& op, const ShapeEnv& env);
+    TensorRef resolve_tensor_ref(const std::string& name, bool is_output, const Operation& op, const ShapeEnv& env);
 
-    CompiledAttrs resolve_attrs(const Operation& op, CompiledOpType type,
-                                const ShapeEnv& env);
+    CompiledAttrs resolve_attrs(const Operation& op, CompiledOpType type, const ShapeEnv& env);
 
     void annotate_layer_boundaries(CompiledGraph& graph);
 
@@ -446,9 +470,10 @@ private:
     };
 
     bool resolve_tensor_shape(const std::string& name, std::vector<long>& shape);
-    void infer_output_shapes(const Operation& op, CompiledOpType type,
-                            const std::vector<std::vector<long>>& input_shapes,
-                            std::vector<std::vector<long>>& output_shapes);
+    void infer_output_shapes(const Operation& op,
+                             CompiledOpType type,
+                             const std::vector<std::vector<long>>& input_shapes,
+                             std::vector<std::vector<long>>& output_shapes);
     void validate_operation_shapes(const Operation& op, CompiledOpType type, size_t op_index);
 
     const Module& mModule;
@@ -463,8 +488,8 @@ private:
     std::unordered_map<std::string, std::vector<long>> mExtraShapes;
     std::unordered_map<std::string, TensorShape> mTensorShapes;
     std::unordered_map<std::string, ETensorDType> mTensorDtypes;
-    bool mDebugShapes = false;  // Set via SUROGATE_DEBUG_SHAPES env var
-    bool mHasHybridBlocks = false; // True if model uses HybridStackedBlocks
+    bool mDebugShapes = false;      // Set via SUROGATE_DEBUG_SHAPES env var
+    bool mHasHybridBlocks = false;  // True if model uses HybridStackedBlocks
 
     // Per-layer dimensions for hybrid models (populated from IR param shapes)
     std::vector<BlockTypeDims> mPerLayerDims;
@@ -484,7 +509,6 @@ private:
     void build_tensor_metadata(CompiledGraph& graph);
 };
 
-
-}
+}  // namespace dsl
 
 #endif  // SUROGATE_SRC_DSL_GRAPH_COMPILER_H

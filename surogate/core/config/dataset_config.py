@@ -1,8 +1,7 @@
-from abc import ABC
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Literal
 
-from surogate.core.config.enums import SurogateDatasetType, InstructionDatasetSystemPromptType
+from surogate.core.config.enums import InstructionDatasetSystemPromptType, SurogateDatasetType
 from surogate.utils.dict import DictDefault
 
 
@@ -18,18 +17,27 @@ class DatasetConfig:
         type (Optional[Literal['text', 'instruction', 'conversation']]): The type of dataset.
         samples (Optional[int]): Number of samples to use.
     """
+
     path: str | None = None
-    subset: Optional[str] = None
+    subset: str | None = None
     split: str | None = None
-    type: Literal[SurogateDatasetType.text, SurogateDatasetType.instruction, SurogateDatasetType.conversation, SurogateDatasetType.auto] | None = None
-    samples: Optional[int] = None
+    type: (
+        Literal[
+            SurogateDatasetType.text,
+            SurogateDatasetType.instruction,
+            SurogateDatasetType.conversation,
+            SurogateDatasetType.auto,
+        ]
+        | None
+    ) = None
+    samples: int | None = None
 
     def __init__(self, cfg: DictDefault):
-        self.path = cfg['path']
-        self.subset = cfg['subset']
-        self.split = cfg['split'] or 'train'
-        self.type = cfg['type']
-        self.samples = cfg['samples']
+        self.path = cfg["path"]
+        self.subset = cfg["subset"]
+        self.split = cfg["split"] or "train"
+        self.type = cfg["type"]
+        self.samples = cfg["samples"]
 
     def __post_init__(self):
         if self.type not in SurogateDatasetType.__dict__.values():
@@ -38,6 +46,7 @@ class DatasetConfig:
     def validate_columns(self, columns: list[str]):
         pass
 
+
 class TextDatasetConfig(DatasetConfig):
     """
     TextDatasetConfig class is a dataclass that holds configuration parameters for a text dataset.
@@ -45,11 +54,12 @@ class TextDatasetConfig(DatasetConfig):
     Args:
         text_field (str): The name of the column in your dataset that contains the raw text.
     """
-    text_field: Optional[str] = None
+
+    text_field: str | None = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
-        self.text_field = cfg['text_field'] or 'text'
+        self.text_field = cfg["text_field"] or "text"
         self.__post_init__()
 
     def __post_init__(self):
@@ -79,28 +89,29 @@ class InstructionDatasetConfig(DatasetConfig):
         prompt_format_no_input (Optional[str]): Format of the prompt as a Python string template when there is no 'input'. Use {system}, {instruction} and {output} as placeholders.
     """
 
-    system_prompt_type: Optional[
-        Literal[InstructionDatasetSystemPromptType.field, InstructionDatasetSystemPromptType.fixed]] = None
-    system_prompt_field: Optional[str] = None
-    system_prompt: Optional[str] = None
+    system_prompt_type: (
+        Literal[InstructionDatasetSystemPromptType.field, InstructionDatasetSystemPromptType.fixed] | None
+    ) = None
+    system_prompt_field: str | None = None
+    system_prompt: str | None = None
 
     instruction_field: str | None = None
-    input_field: Optional[str] = None
+    input_field: str | None = None
     output_field: str | None = None
 
-    prompt_format: Optional[str] = None
-    prompt_format_no_input: Optional[str] = None
+    prompt_format: str | None = None
+    prompt_format_no_input: str | None = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
-        self.system_prompt_type = cfg['system_prompt_type']
-        self.system_prompt_field = cfg['system_prompt_field']
-        self.system_prompt = cfg['system_prompt']
-        self.instruction_field = cfg['instruction_field']
-        self.input_field = cfg['input_field']
-        self.output_field = cfg['output_field']
-        self.prompt_format = cfg['prompt_format']
-        self.prompt_format_no_input = cfg['prompt_format_no_input']
+        self.system_prompt_type = cfg["system_prompt_type"]
+        self.system_prompt_field = cfg["system_prompt_field"]
+        self.system_prompt = cfg["system_prompt"]
+        self.instruction_field = cfg["instruction_field"]
+        self.input_field = cfg["input_field"]
+        self.output_field = cfg["output_field"]
+        self.prompt_format = cfg["prompt_format"]
+        self.prompt_format_no_input = cfg["prompt_format_no_input"]
         self.__post_init__()
 
     def __post_init__(self):
@@ -111,13 +122,9 @@ class InstructionDatasetConfig(DatasetConfig):
         if self.output_field is None:
             raise ValueError("'output_field' must be specified for InstructionDataset.")
         if self.system_prompt_type == InstructionDatasetSystemPromptType.fixed and len(self.system_prompt or "") == 0:
-            raise ValueError(
-                "'system_prompt' must be a non-empty string when 'system_prompt_type' is 'fixed'."
-            )
+            raise ValueError("'system_prompt' must be a non-empty string when 'system_prompt_type' is 'fixed'.")
         if self.system_prompt_type == InstructionDatasetSystemPromptType.field and self.system_prompt_field is None:
-            raise ValueError(
-                "'system_prompt_field' must be specified when 'system_prompt_type' is 'field'."
-            )
+            raise ValueError("'system_prompt_field' must be specified when 'system_prompt_type' is 'field'.")
 
     def validate_columns(self, columns: list[str]):
         if self.instruction_field not in columns:
@@ -128,7 +135,10 @@ class InstructionDatasetConfig(DatasetConfig):
             raise ValueError(
                 f"Output field '{self.output_field}' is missing from the dataset. Dataset columns: {columns}."
             )
-        if self.system_prompt_type == InstructionDatasetSystemPromptType.field and self.system_prompt_field not in columns:
+        if (
+            self.system_prompt_type == InstructionDatasetSystemPromptType.field
+            and self.system_prompt_field not in columns
+        ):
             raise ValueError(
                 f"System prompt field '{self.system_prompt_field}' is missing from the dataset. Dataset columns: {columns}."
             )
@@ -145,19 +155,20 @@ class ConversationDatasetConfig(DatasetConfig):
             and completion into separate columns (e.g. prompt=[{role:user,...}],
             completion=[{role:assistant,...}]).
     """
-    system_field: Optional[str] = None
-    messages_field: Optional[str] = None
-    completion_field: Optional[str] = None
-    tools_field: Optional[str] = None
-    message_property_mappings: Optional[dict[str, str]] = None
+
+    system_field: str | None = None
+    messages_field: str | None = None
+    completion_field: str | None = None
+    tools_field: str | None = None
+    message_property_mappings: dict[str, str] | None = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
-        self.system_field = cfg['system_field']
-        self.messages_field = cfg['messages_field'] or "messages"
-        self.completion_field = cfg['completion_field']
-        self.tools_field = cfg['tools_field']
-        self.message_property_mappings = cfg['message_property_mappings'] or {
+        self.system_field = cfg["system_field"]
+        self.messages_field = cfg["messages_field"] or "messages"
+        self.completion_field = cfg["completion_field"]
+        self.tools_field = cfg["tools_field"]
+        self.message_property_mappings = cfg["message_property_mappings"] or {
             "role": "role",
             "content": "content",
             "tool_calls": "tool_calls",
@@ -189,13 +200,14 @@ class ConversationDatasetConfig(DatasetConfig):
 
 SurogateDatasetConfig = TextDatasetConfig | InstructionDatasetConfig | ConversationDatasetConfig
 
+
 def create_dataset_config(ds_cfg: DictDefault):
-    ds_type = ds_cfg['type']
-    if ds_type == 'text':
+    ds_type = ds_cfg["type"]
+    if ds_type == "text":
         return TextDatasetConfig(ds_cfg)
-    elif ds_type == 'instruction':
+    elif ds_type == "instruction":
         return InstructionDatasetConfig(ds_cfg)
-    elif ds_type == 'conversation':
+    elif ds_type == "conversation":
         return ConversationDatasetConfig(ds_cfg)
     else:
         return DatasetConfig(ds_cfg)

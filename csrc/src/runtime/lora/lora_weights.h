@@ -16,4 +16,4 @@
 #include "lora_optimizer_state.h"
 #include "lora_utils.h"
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_H

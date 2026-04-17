@@ -1,20 +1,20 @@
 import asyncio
 import functools
-import traceback
 import importlib
 import os
 import subprocess
+import traceback
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.distributed as dist
 import wandb
 
 from surogate.core.config.grpo_orch_config import GRPOEnvConfig, GRPOEvalEnvConfig
-from surogate.utils.logger import get_logger
 
 # TODO: Change all imports to use utils.pathing
 # ruff: noqa: F401
@@ -32,8 +32,10 @@ from surogate.grpo.utils.pathing import (
     sync_wait_for_path,
     wait_for_path,
 )
+from surogate.utils.logger import get_logger
 
 logger = get_logger()
+
 
 def import_object(dotted_path: str) -> Any:
     """Import an object from a dotted path like 'my_module.submodule.MyClass'."""

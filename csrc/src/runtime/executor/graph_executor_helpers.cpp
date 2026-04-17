@@ -27,16 +27,11 @@ Tensor* fp8_forward_buffer(DslRunState& rs, ::modules::MatmulOp op) {
     if (!rs.has_fp8_forward()) return nullptr;
     auto& q = rs.fp8_forward_quants();
     switch (op) {
-        case ::modules::MatmulOp::QKV:
-            return &q.ln1;
-        case ::modules::MatmulOp::MLPUp:
-            return &q.ln2;
-        case ::modules::MatmulOp::AttnOut:
-            return &q.att;
-        case ::modules::MatmulOp::MLPDown:
-            return &q.swiglu;
-        default:
-            return nullptr;
+        case ::modules::MatmulOp::QKV: return &q.ln1;
+        case ::modules::MatmulOp::MLPUp: return &q.ln2;
+        case ::modules::MatmulOp::AttnOut: return &q.att;
+        case ::modules::MatmulOp::MLPDown: return &q.swiglu;
+        default: return nullptr;
     }
 }
 
@@ -44,32 +39,25 @@ Tensor* fp8_grad_buffer(DslRunState& rs, ::modules::MatmulOp op) {
     if (!rs.has_fp8_hybrid_backward()) return nullptr;
     auto& q = rs.simplified_quant_grads();
     switch (op) {
-        case ::modules::MatmulOp::QKV:
-            return &q.d_qkv;
-        case ::modules::MatmulOp::MLPUp:
-            return &q.d_mlp_up;
-        case ::modules::MatmulOp::AttnOut:
-            return &q.d_res_att;
-        case ::modules::MatmulOp::MLPDown:
-            return &q.d_res_ffn;
-        default:
-            return nullptr;
+        case ::modules::MatmulOp::QKV: return &q.d_qkv;
+        case ::modules::MatmulOp::MLPUp: return &q.d_mlp_up;
+        case ::modules::MatmulOp::AttnOut: return &q.d_res_att;
+        case ::modules::MatmulOp::MLPDown: return &q.d_res_ffn;
+        default: return nullptr;
     }
 }
 
 int fp8_quantizer_index(const DslRunState& rs, ::modules::MatmulOp op, int layer_idx) {
     if (!rs.has_fp8_delayed_scaling()) return -1;
     switch (op) {
-        case ::modules::MatmulOp::QKV:
-            return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_LN1);
+        case ::modules::MatmulOp::QKV: return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_LN1);
         case ::modules::MatmulOp::MLPUp:
             return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_LN2);
         case ::modules::MatmulOp::AttnOut:
             return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_ATT);
         case ::modules::MatmulOp::MLPDown:
             return modules::get_quantizer_index(layer_idx, modules::QuantizerIndex::FWD_SWIGLU);
-        default:
-            return -1;
+        default: return -1;
     }
 }
 
@@ -92,20 +80,29 @@ void reduce_loss(DslRunState& rs, long B, long T, NCCLCommunicator& comm) {
     deterministic_sum(rs.Losses.template get<float>(), rs.Losses.template get<float>(), B * T, rs.MainStream);
     comm.reduce_loss(rs.Losses.template get<float>(), rs.MainStream);
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    const bool capturing = (cudaStreamIsCapturing(rs.MainStream, &status) == cudaSuccess &&
-                            status != cudaStreamCaptureStatusNone);
+    const bool capturing =
+        (cudaStreamIsCapturing(rs.MainStream, &status) == cudaSuccess && status != cudaStreamCaptureStatusNone);
     if (!capturing) {
-        CUDA_CHECK(cudaMemcpyAsync(rs.LossHost, rs.Losses.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(rs.LossHost,
+                                   rs.Losses.template get<float>(),
+                                   sizeof(float),
+                                   cudaMemcpyDeviceToHost,
+                                   rs.MainStream));
     }
 }
 
-Tensor recompute_lora_rmsnorm(::modules::LoRARunState& lora_rs, const Tensor& residual, const Tensor& weight,
-                              float eps, int B, int T, int C, cudaStream_t stream) {
+Tensor recompute_lora_rmsnorm(::modules::LoRARunState& lora_rs,
+                              const Tensor& residual,
+                              const Tensor& weight,
+                              float eps,
+                              int B,
+                              int T,
+                              int C,
+                              cudaStream_t stream) {
     if (!lora_rs.recompute_ln.Data || !lora_rs.recompute_rstd.Data) {
         throw std::runtime_error("DSL graph executor: LoRA recompute buffers not allocated");
     }
-    rmsnorm_forward(lora_rs.recompute_ln, lora_rs.recompute_rstd,
-                    residual, weight, nullptr, eps, B, T, C, stream);
+    rmsnorm_forward(lora_rs.recompute_ln, lora_rs.recompute_rstd, residual, weight, nullptr, eps, B, T, C, stream);
     return lora_rs.recompute_ln;
 }
 

@@ -45,14 +45,15 @@
  * @param T Sequence length.
  * @param C Embedding dimension (hidden size).
  */
-template<typename floatX>
-__global__ void encoder_forward_kernel3(floatX* out,
-                               const int* inp, const floatX* wte, const floatX* wpe,
-                               int B, int T, int C) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+template <typename floatX>
+__global__ void
+encoder_forward_kernel3(floatX* out, const int* inp, const floatX* wte, const floatX* wpe, int B, int T, int C) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     long long idx = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     long long N = (long long)B * T * C;
-    if (idx >= N) { return; }
+    if (idx >= N) {
+        return;
+    }
 
     long long bt = idx / C;
     int b = (int)(bt / T);
@@ -90,18 +91,19 @@ __global__ void encoder_forward_kernel3(floatX* out,
  * @param C Embedding dimension (hidden size).
  * @param V Vocabulary size (for bounds checking).
  */
-template<typename floatX>
-__global__ void encoder_forward_kernel3_nowpe(floatX* out,
-                               const int* inp, const floatX* wte,
-                               int B, int T, int C, int V) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+template <typename floatX>
+__global__ void
+encoder_forward_kernel3_nowpe(floatX* out, const int* inp, const floatX* wte, int B, int T, int C, int V) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     // Use 64-bit arithmetic for element addressing: vocab_size * C can exceed
     // INT32_MAX for large embeddings (e.g., Gemma4 PLI has V=262144, C=8960
     // → V*C ≈ 2.35e9 > 2^31). INT32 overflow would make wte + ix*C + c point
     // to garbage memory for high token ids, producing NaN output.
     long long idx = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     long long N = (long long)B * T * C;
-    if (idx >= N) { return; }
+    if (idx >= N) {
+        return;
+    }
     long long bt = idx / C;
     int b = (int)(bt / T);
     int t = (int)(bt % T);
@@ -132,15 +134,20 @@ __global__ void encoder_forward_kernel3_nowpe(floatX* out,
  * @param V Vocabulary size.
  * @param stream CUDA stream for asynchronous execution.
  */
-template<class floatX>
+template <class floatX>
 void encoder_forward_imp(floatX* out,
-                         const int* inp, const floatX* wte, const floatX* wpe,
-                         int B, int T, int C, int V, cudaStream_t stream) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+                         const int* inp,
+                         const floatX* wte,
+                         const floatX* wpe,
+                         int B,
+                         int T,
+                         int C,
+                         int V,
+                         cudaStream_t stream) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     constexpr int block_size = 256;
     const long long N = (long long)B * T * C;
-    const long long grid_ll = (N + (long long)block_size * x128::size - 1) /
-                              ((long long)block_size * x128::size);
+    const long long grid_ll = (N + (long long)block_size * x128::size - 1) / ((long long)block_size * x128::size);
     const int grid_size = (int)grid_ll;
     if (wpe == nullptr) {
         // Llama 3 does not use positional encoder
@@ -165,7 +172,15 @@ void encoder_forward_imp(floatX* out,
  * @param V Vocabulary size.
  * @param stream CUDA stream.
  */
-void encoder_forward(float* out, const int* inp, const float* wte, const float* wpe, int B, int T, int C, int V, cudaStream_t stream) {
+void encoder_forward(float* out,
+                     const int* inp,
+                     const float* wte,
+                     const float* wpe,
+                     int B,
+                     int T,
+                     int C,
+                     int V,
+                     cudaStream_t stream) {
     encoder_forward_imp(out, inp, wte, wpe, B, T, C, V, stream);
 }
 
@@ -182,10 +197,17 @@ void encoder_forward(float* out, const int* inp, const float* wte, const float* 
  * @param V Vocabulary size.
  * @param stream CUDA stream.
  */
-void encoder_forward(nv_bfloat16* out, const int* inp, const nv_bfloat16* wte, const nv_bfloat16* wpe, int B, int T, int C, int V, cudaStream_t stream) {
+void encoder_forward(nv_bfloat16* out,
+                     const int* inp,
+                     const nv_bfloat16* wte,
+                     const nv_bfloat16* wpe,
+                     int B,
+                     int T,
+                     int C,
+                     int V,
+                     cudaStream_t stream) {
     encoder_forward_imp(out, inp, wte, wpe, B, T, C, V, stream);
 }
-
 
 /**
  * @brief CUDA kernel for deterministic token embedding gradient computation.
@@ -213,10 +235,16 @@ void encoder_forward(nv_bfloat16* out, const int* inp, const nv_bfloat16* wte, c
  * @param T Sequence length.
  * @param C Embedding dimension.
  */
-template <typename floatX, int BLOCK_SIZE=256>
+template <typename floatX, int BLOCK_SIZE = 256>
 __global__ void wte_backward_kernel(floatX* dwte,
-                                    const int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
-                                    unsigned int seed, int B, int T, int C) {
+                                    const int4* bucket_info,
+                                    const int* workload_indices,
+                                    const floatX* dout,
+                                    const int* inp,
+                                    unsigned int seed,
+                                    int B,
+                                    int T,
+                                    int C) {
     // In order to be deterministic, we preprocess the inputs on the cpu into "buckets"
     // Each bucket corresponds to (WARP_SIZE * x128::size) channels for a single vocabulary token
     // Each thread handles x128::size channels, e.g. 256 per warp for BF16
@@ -224,7 +252,7 @@ __global__ void wte_backward_kernel(floatX* dwte,
     // If a bucket has less than 8 elements, some warps will return immediately
     // If a bucket has more than 8 elements, we will loop over all of them
     // The buckets are sorted on the CPU so the largest buckets start 1st
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     int bucket = blockIdx.x;
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
@@ -237,14 +265,18 @@ __global__ void wte_backward_kernel(floatX* dwte,
 
     // Each thread handles "x128::size" channels, so at fp8, each warp would handle 512 channels
     // If C is not a multiple of this (e.g. 768), some buckets/c_groups cannot use the entire warp
-    if (c >= C) { return; }
+    if (c >= C) {
+        return;
+    }
     // Exit early if this is a small bucket and this warp doesn't have any items to process
-    if (warp_id >= bucket_size) { return; }
+    if (warp_id >= bucket_size) {
+        return;
+    }
 
     float accum[x128::size] = {0.0f};
     __shared__ float accum_shared[x128::size * BLOCK_SIZE];
 
-    for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/32) {
+    for (int item = warp_id; item < bucket_size; item += BLOCK_SIZE / 32) {
         int bt = workload_indices[bucket_start_idx + item];
 
         const floatX* dout_btc = dout + bt * C + c;
@@ -259,7 +291,7 @@ __global__ void wte_backward_kernel(floatX* dwte,
         for (int k = 0; k < x128::size; k++) {
             accum_shared[threadIdx.x + k * BLOCK_SIZE] = accum[k];
         }
-        return; // only warp 0 is needed after writing to shared memory
+        return;  // only warp 0 is needed after writing to shared memory
     }
 
     // Read dwte for warp 0 even if other warps are not finished yet to maximise latency tolerance
@@ -270,7 +302,7 @@ __global__ void wte_backward_kernel(floatX* dwte,
     __syncthreads();
 
     // Accumulate into warp 0's registers by reading the values of the other warps in shared memory
-    for (int i = threadIdx.x+32; i < min(BLOCK_SIZE, bucket_size*32); i += 32) {
+    for (int i = threadIdx.x + 32; i < min(BLOCK_SIZE, bucket_size * 32); i += 32) {
         for (int k = 0; k < x128::size; k++) {
             accum[k] += accum_shared[i + k * BLOCK_SIZE];
         }
@@ -316,12 +348,22 @@ __global__ void wte_backward_kernel(floatX* dwte,
  * @param sync_event Event for synchronizing with copy stream.
  * @param copy_stream Separate stream for async host-to-device copies.
  */
-template<class floatX>
-void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
-                      int* workload_indices, int4* bucket_info,    // cpu scratch buffers
-                      const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
-                      int B, int T, int C, unsigned int seed, cudaStream_t stream, cudaEvent_t sync_event, cudaStream_t copy_stream) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+template <class floatX>
+void encoder_backward_imp(floatX* dwte,
+                          int* scratch,  // gpu outputs & scratch
+                          int* workload_indices,
+                          int4* bucket_info,  // cpu scratch buffers
+                          const floatX* dout,
+                          const int* inp,
+                          const int* inputs_cpu,  // cpu/gpu inputs
+                          int B,
+                          int T,
+                          int C,
+                          unsigned int seed,
+                          cudaStream_t stream,
+                          cudaEvent_t sync_event,
+                          cudaStream_t copy_stream) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     // CUDA graph capture: avoid cross-stream sync by copying on the main stream.
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -333,7 +375,7 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
     }
 
     int num_c_groups = div_ceil((size_t)C, x128::size * 32);
-    assert(B*T*num_c_groups * (sizeof(int4)+sizeof(int)) <= B*T*3*C * sizeof(floatX));
+    assert(B * T * num_c_groups * (sizeof(int4) + sizeof(int)) <= B * T * 3 * C * sizeof(floatX));
 
     // Step 1: Sort inputs into buckets
     int total_items = 0;
@@ -341,7 +383,7 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
     for (uint64_t bt = 0; bt < B * T; bt++) {
         for (uint64_t c_group = 0; c_group < num_c_groups; c_group++) {
             // todo - passing c_group/inputs_cpu[bt] in data to avoid a second hash lookup is a bit hacky
-            uint64_t data = bt + (c_group<<32ULL) + ((uint64_t)inputs_cpu[bt]<<42ULL);
+            uint64_t data = bt + (c_group << 32ULL) + ((uint64_t)inputs_cpu[bt] << 42ULL);
             buckets[c_group + num_c_groups * inputs_cpu[bt]].push_back(data);
             total_items++;
         }
@@ -351,31 +393,36 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
     // this is so the largest buckets are processed first by the GPU
     // otherwise, if they started late, they would still be running with the rest of the GPU idle
     std::vector<std::pair<uint64_t, std::vector<uint64_t>>> sortedBuckets(buckets.begin(), buckets.end());
-    std::sort(sortedBuckets.begin(), sortedBuckets.end(), // ugly because we don't have a typedef for the std::pair
-              [](const std::pair<uint64_t, std::vector<uint64_t>>& a, const std::pair<uint64_t, std::vector<uint64_t>>& b) {
-                  return a.second.size() > b.second.size();
-              });
+    std::sort(sortedBuckets.begin(),
+              sortedBuckets.end(),  // ugly because we don't have a typedef for the std::pair
+              [](const std::pair<uint64_t, std::vector<uint64_t>>& a,
+                 const std::pair<uint64_t, std::vector<uint64_t>>& b) { return a.second.size() > b.second.size(); });
 
     int num_buckets = buckets.size();
     int bucket_index = 0;
     int workload_index = 0;
     for (const auto& bucket : sortedBuckets) {
-        bucket_info[bucket_index].x = workload_index; // bucket start
-        bucket_info[bucket_index].y = bucket.second.size(); // bucket size
-        bucket_info[bucket_index].z = (bucket.second[0] >> 42ULL) & ((1ULL<<20ULL)-1); // bucket ix
-        bucket_info[bucket_index].w = (bucket.second[0] >> 32ULL) & ((1ULL<<10ULL)-1); // bucket c
+        bucket_info[bucket_index].x = workload_index;                                       // bucket start
+        bucket_info[bucket_index].y = bucket.second.size();                                 // bucket size
+        bucket_info[bucket_index].z = (bucket.second[0] >> 42ULL) & ((1ULL << 20ULL) - 1);  // bucket ix
+        bucket_info[bucket_index].w = (bucket.second[0] >> 32ULL) & ((1ULL << 10ULL) - 1);  // bucket c
 
         for (uint64_t idx : bucket.second) {
-            workload_indices[workload_index++] = (int)(idx & ((1ULL<<31ULL)-1ULL));
+            workload_indices[workload_index++] = (int)(idx & ((1ULL << 31ULL) - 1ULL));
         }
         bucket_index++;
     }
 
     // Step 3: Copy data from host to device (async on a different stream unless capturing)
     int4* d_bucket_info = (int4*)scratch;
-    int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * 4);
-    CUDA_CHECK(cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice, copy_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice, copy_stream));
+    int* d_workload_indices = (int*)(scratch + B * T * num_c_groups * 4);
+    CUDA_CHECK(
+        cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice, copy_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_workload_indices,
+                               workload_indices,
+                               total_items * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               copy_stream));
     if (sync_event) {
         CUDA_CHECK(cudaEventRecord(sync_event, copy_stream));
         CUDA_CHECK(cudaStreamWaitEvent(stream, sync_event, 0));
@@ -383,7 +430,8 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
 
     // Launch wte kernel
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
-    wte_backward_kernel<floatX, 256><<<num_buckets, 256, 0, stream>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
+    wte_backward_kernel<floatX, 256>
+        <<<num_buckets, 256, 0, stream>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -407,11 +455,34 @@ void encoder_backward_imp(floatX* dwte, int* scratch, // gpu outputs & scratch
  * @param sync_event Synchronization event.
  * @param copy_stream Stream for async copies.
  */
-void encoder_backward(float* dwte, int* scratch, // gpu outputs & scratch
-                      int* workload_indices, int4* bucket_info,    // cpu scratch buffers
-                      const float* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
-                      int B, int T, int C, unsigned int seed, cudaStream_t stream, cudaEvent_t sync_event, cudaStream_t copy_stream) {
-    encoder_backward_imp(dwte, scratch, workload_indices, bucket_info, dout, inp, inputs_cpu, B, T, C, seed, stream, sync_event, copy_stream);
+void encoder_backward(float* dwte,
+                      int* scratch,  // gpu outputs & scratch
+                      int* workload_indices,
+                      int4* bucket_info,  // cpu scratch buffers
+                      const float* dout,
+                      const int* inp,
+                      const int* inputs_cpu,  // cpu/gpu inputs
+                      int B,
+                      int T,
+                      int C,
+                      unsigned int seed,
+                      cudaStream_t stream,
+                      cudaEvent_t sync_event,
+                      cudaStream_t copy_stream) {
+    encoder_backward_imp(dwte,
+                         scratch,
+                         workload_indices,
+                         bucket_info,
+                         dout,
+                         inp,
+                         inputs_cpu,
+                         B,
+                         T,
+                         C,
+                         seed,
+                         stream,
+                         sync_event,
+                         copy_stream);
 }
 
 /**
@@ -434,16 +505,38 @@ void encoder_backward(float* dwte, int* scratch, // gpu outputs & scratch
  * @param sync_event Synchronization event.
  * @param copy_stream Stream for async copies.
  */
-void encoder_backward(nv_bfloat16* dwte, int* scratch, // gpu outputs & scratch
-                      int* workload_indices, int4* bucket_info,    // cpu scratch buffers
-                      const nv_bfloat16* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
-                      int B, int T, int C, unsigned int seed, cudaStream_t stream, cudaEvent_t sync_event, cudaStream_t copy_stream) {
-    encoder_backward_imp(dwte, scratch, workload_indices, bucket_info, dout, inp, inputs_cpu, B, T, C, seed, stream, sync_event, copy_stream);
+void encoder_backward(nv_bfloat16* dwte,
+                      int* scratch,  // gpu outputs & scratch
+                      int* workload_indices,
+                      int4* bucket_info,  // cpu scratch buffers
+                      const nv_bfloat16* dout,
+                      const int* inp,
+                      const int* inputs_cpu,  // cpu/gpu inputs
+                      int B,
+                      int T,
+                      int C,
+                      unsigned int seed,
+                      cudaStream_t stream,
+                      cudaEvent_t sync_event,
+                      cudaStream_t copy_stream) {
+    encoder_backward_imp(dwte,
+                         scratch,
+                         workload_indices,
+                         bucket_info,
+                         dout,
+                         inp,
+                         inputs_cpu,
+                         B,
+                         T,
+                         C,
+                         seed,
+                         stream,
+                         sync_event,
+                         copy_stream);
 }
 
 template <typename InT>
-__global__ void embedding_backward_atomic_kernel(float* dwte, const InT* dout, const int* inp,
-                                                 int B, int T, int C) {
+__global__ void embedding_backward_atomic_kernel(float* dwte, const InT* dout, const int* inp, int B, int T, int C) {
     const long total = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
     const long stride = static_cast<long>(blockDim.x) * static_cast<long>(gridDim.x);
     for (long idx = static_cast<long>(blockIdx.x) * static_cast<long>(blockDim.x) + static_cast<long>(threadIdx.x);
@@ -456,8 +549,13 @@ __global__ void embedding_backward_atomic_kernel(float* dwte, const InT* dout, c
     }
 }
 
-void encoder_backward_atomic(float* dwte, const nv_bfloat16* dout, const int* inp,
-                             int B, int T, int C, cudaStream_t stream) {
+void encoder_backward_atomic(float* dwte,
+                             const nv_bfloat16* dout,
+                             const int* inp,
+                             int B,
+                             int T,
+                             int C,
+                             cudaStream_t stream) {
     const long total = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
     if (total <= 0) return;
     constexpr int threads = 256;
@@ -466,8 +564,7 @@ void encoder_backward_atomic(float* dwte, const nv_bfloat16* dout, const int* in
     CUDA_CHECK(cudaGetLastError());
 }
 
-void encoder_backward_atomic(float* dwte, const half* dout, const int* inp,
-                             int B, int T, int C, cudaStream_t stream) {
+void encoder_backward_atomic(float* dwte, const half* dout, const int* inp, int B, int T, int C, cudaStream_t stream) {
     const long total = static_cast<long>(B) * static_cast<long>(T) * static_cast<long>(C);
     if (total <= 0) return;
     constexpr int threads = 256;

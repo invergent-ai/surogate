@@ -17,7 +17,6 @@ Startup sequence:
 import asyncio
 import logging
 import sys
-import time
 from threading import Event, Thread
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
@@ -48,11 +47,12 @@ def _run_vllm_server(
     """
     try:
         import signal
+
         import uvloop
+        import vllm.entrypoints.openai.api_server as _api_server_mod
         from vllm.entrypoints.openai.api_server import run_server
         from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
         from vllm.utils.argparse_utils import FlexibleArgumentParser
-        import vllm.entrypoints.openai.api_server as _api_server_mod
 
         # Import our custom server module FIRST to apply its monkey patches
         # (custom_init_app_state, custom_build_app, etc.)
@@ -91,12 +91,12 @@ def _run_vllm_server(
             # Share the loop so the main thread can schedule collective_rpc calls
             loop_holder.append(loop)
             loop.run_until_complete(run_server(args))
-        except RuntimeError as e:
+        except RuntimeError:
             # When the main thread calls loop.stop() for graceful shutdown,
             # run_until_complete() raises "Event loop stopped before Future completed".
             # This is expected — not an error.
             if shutdown_event.is_set():
-                logger.info(f"vLLM server stopped (graceful shutdown)")
+                logger.info("vLLM server stopped (graceful shutdown)")
             else:
                 raise
         finally:
@@ -117,8 +117,7 @@ def _run_vllm_server(
                     # Give cancelled tasks a chance to run their cleanup.
                     # After loop.stop(), we need to restart before run_until_complete.
                     if pending:
-                        loop.run_until_complete(
-                            asyncio.gather(*pending, return_exceptions=True))
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                 except Exception:
                     pass
                 finally:
@@ -154,14 +153,13 @@ def _extract_vllm_weights(
 
         # Replicate for all GPUs (in DP mode, all GPUs have identical weights)
         per_gpu_weights = [weights] * num_gpus
-        logger.info(f"Extracted {len(weights)} quantized weights from vLLM "
-                     f"for {num_gpus} GPU(s)")
+        logger.info(f"Extracted {len(weights)} quantized weights from vLLM for {num_gpus} GPU(s)")
         return per_gpu_weights
 
     except Exception as e:
-        logger.warning(f"Weight extraction from vLLM failed: {e}. "
-                       f"Falling back to disk loading.")
+        logger.warning(f"Weight extraction from vLLM failed: {e}. Falling back to disk loading.")
         import traceback
+
         traceback.print_exc()
         return None
 
@@ -180,13 +178,13 @@ def _estimate_trainer_memory(train_config: GRPOTrainConfig) -> tuple[float, dict
     from surogate.core.model.hf_config import HfConfigFactory
 
     config = train_config.model_info.config
-    d_model = HfConfigFactory.get_config_attr(config, 'hidden_size') or 1024
-    n_layers = HfConfigFactory.get_config_attr(config, 'num_hidden_layers') or 1
-    d_ff = HfConfigFactory.get_config_attr(config, 'intermediate_size') or d_model * 4
-    n_heads = HfConfigFactory.get_config_attr(config, 'num_attention_heads') or 1
-    n_kv_heads = HfConfigFactory.get_config_attr(config, 'num_key_value_heads') or n_heads
-    vocab_size = HfConfigFactory.get_config_attr(config, 'vocab_size') or 32000
-    tie_word_embeddings = HfConfigFactory.get_config_attr(config, 'tie_word_embeddings')
+    d_model = HfConfigFactory.get_config_attr(config, "hidden_size") or 1024
+    n_layers = HfConfigFactory.get_config_attr(config, "num_hidden_layers") or 1
+    d_ff = HfConfigFactory.get_config_attr(config, "intermediate_size") or d_model * 4
+    n_heads = HfConfigFactory.get_config_attr(config, "num_attention_heads") or 1
+    n_kv_heads = HfConfigFactory.get_config_attr(config, "num_key_value_heads") or n_heads
+    vocab_size = HfConfigFactory.get_config_attr(config, "vocab_size") or 32000
+    tie_word_embeddings = HfConfigFactory.get_config_attr(config, "tie_word_embeddings")
     if tie_word_embeddings is None:
         tie_word_embeddings = True
 
@@ -198,17 +196,17 @@ def _estimate_trainer_memory(train_config: GRPOTrainConfig) -> tuple[float, dict
     # --- 1. LoRA parameter memory ---
     # A + B matrices for each target module per layer.
     # Standard targets: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
-    attn_A = d_model * rank * 4                          # A for q, k, v, o (all use d_model input)
+    attn_A = d_model * rank * 4  # A for q, k, v, o (all use d_model input)
     attn_B = rank * (d_model + kv_size + kv_size + d_model)  # B outputs
-    mlp_A = d_model * rank * 2 + d_ff * rank             # A for gate, up (d_model input) + down (d_ff input)
-    mlp_B = rank * d_ff * 2 + rank * d_model             # B for gate, up (d_ff output) + down (d_model output)
+    mlp_A = d_model * rank * 2 + d_ff * rank  # A for gate, up (d_model input) + down (d_ff input)
+    mlp_B = rank * d_ff * 2 + rank * d_model  # B for gate, up (d_ff output) + down (d_model output)
     lora_elements_per_layer = attn_A + attn_B + mlp_A + mlp_B
     total_lora_elements = lora_elements_per_layer * n_layers
 
     # Per-element byte cost: weight + master + gradient + optimizer
-    lora_w_bytes = 4 if train_config.lora_dtype == 'fp32' else 2
-    master_bytes = 4 if train_config.master_dtype == 'fp32' else 2
-    grad_bytes = 4 if train_config.gradient_dtype == 'fp32' else 2
+    lora_w_bytes = 4 if train_config.lora_dtype == "fp32" else 2
+    master_bytes = 4 if train_config.master_dtype == "fp32" else 2
+    grad_bytes = 4 if train_config.gradient_dtype == "fp32" else 2
     optim_bytes = 2  # 8-bit AdamW (momentum + variance)
     bytes_per_lora_param = lora_w_bytes + master_bytes + grad_bytes + optim_bytes
     lora_memory = total_lora_elements * bytes_per_lora_param
@@ -237,10 +235,10 @@ def _estimate_trainer_memory(train_config: GRPOTrainConfig) -> tuple[float, dict
     # DequantBufferPool recycles BF16 buffers via LRU. Peak: ~3 concurrent buffers
     # (current layer forward + backward overlap during recompute)
     max_weight_elements = max(
-        2 * d_ff * d_model,                      # gate_up_proj fused
-        d_ff * d_model,                           # down_proj
-        (d_model + 2 * kv_size) * d_model,        # qkv fused
-        d_model * d_model,                         # o_proj
+        2 * d_ff * d_model,  # gate_up_proj fused
+        d_ff * d_model,  # down_proj
+        (d_model + 2 * kv_size) * d_model,  # qkv fused
+        d_model * d_model,  # o_proj
     )
     dequant_buffer_memory = max_weight_elements * 2 * 3  # 3 concurrent BF16 buffers
 
@@ -320,6 +318,7 @@ def _run_trainer(
     """Run the GRPO trainer in a background thread."""
     try:
         from surogate.grpo.trainer import GRPOTrainer
+
         trainer = GRPOTrainer(train_config, external_weights=external_weights)
         trainer.train()
     except Exception as e:
@@ -358,8 +357,9 @@ def grpo_unified(
     auto_gpu_mem = _compute_gpu_memory_utilization(train_config)
     user_gpu_mem = infer_config.gpu_memory_utilization
     if user_gpu_mem is not None and user_gpu_mem < auto_gpu_mem:
-        logger.info(f"Using user-specified gpu_memory_utilization={user_gpu_mem:.2f} "
-                     f"(auto-computed was {auto_gpu_mem:.2f})")
+        logger.info(
+            f"Using user-specified gpu_memory_utilization={user_gpu_mem:.2f} (auto-computed was {auto_gpu_mem:.2f})"
+        )
         infer_config.gpu_memory_utilization = user_gpu_mem
     else:
         infer_config.gpu_memory_utilization = auto_gpu_mem
@@ -371,14 +371,13 @@ def grpo_unified(
     vllm_ready = Event()
     shutdown_event = Event()  # Set before stopping vLLM loop for graceful shutdown
     engine_holder: list = []  # Shared: vLLM thread appends engine_client here
-    loop_holder: list = []    # Shared: vLLM thread appends event loop here
+    loop_holder: list = []  # Shared: vLLM thread appends event loop here
 
     # Phase 1: Start vLLM server in background thread
-    logger.info(f"Starting vLLM server on port {infer_config.port}" )
+    logger.info(f"Starting vLLM server on port {infer_config.port}")
     vllm_thread = Thread(
         target=_run_vllm_server,
-        args=(infer_config, vllm_ready, error_event, engine_holder, loop_holder,
-              shutdown_event),
+        args=(infer_config, vllm_ready, error_event, engine_holder, loop_holder, shutdown_event),
         daemon=True,
         name="vllm-server",
     )
@@ -422,6 +421,7 @@ def grpo_unified(
     logger.info("Starting orchestrator")
     try:
         from surogate.grpo.orchestrator.grpo_orch import orchestrate
+
         asyncio.run(orchestrate(orch_config))
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")

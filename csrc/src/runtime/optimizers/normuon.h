@@ -50,15 +50,13 @@ constexpr int NORMUON_GRAPH_PARAM_COUNT = 8;
  * @param reduce_over_cols If true, reduce over columns (for tall matrices)
  * @param stream CUDA stream
  */
-void compute_variance_mean(
-    const nv_bfloat16* v,
-    float* v_mean,
-    int batch,
-    int M,
-    int N,
-    bool reduce_over_cols,
-    cudaStream_t stream
-);
+void compute_variance_mean(const nv_bfloat16* v,
+                           float* v_mean,
+                           int batch,
+                           int M,
+                           int N,
+                           bool reduce_over_cols,
+                           cudaStream_t stream);
 
 /**
  * @brief Apply NorMuon variance reduction to update tensor
@@ -77,16 +75,14 @@ void compute_variance_mean(
  * @param reduce_over_cols If true, reduce over columns (for tall matrices)
  * @param stream CUDA stream
  */
-void apply_variance_reduction(
-    nv_bfloat16* v,
-    float* variance_buffer,
-    int batch,
-    int M,
-    int N,
-    float beta2,
-    bool reduce_over_cols,
-    cudaStream_t stream
-);
+void apply_variance_reduction(nv_bfloat16* v,
+                              float* variance_buffer,
+                              int batch,
+                              int M,
+                              int N,
+                              float beta2,
+                              bool reduce_over_cols,
+                              cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // 8-bit Momentum State Management
@@ -100,12 +96,7 @@ void apply_variance_reduction(
  * @param n Number of elements
  * @param stream CUDA stream
  */
-void init_normuon_momentum_state(
-    unsigned char* momentum_state,
-    float* momentum_absmax,
-    size_t n,
-    cudaStream_t stream
-);
+void init_normuon_momentum_state(unsigned char* momentum_state, float* momentum_absmax, size_t n, cudaStream_t stream);
 
 /**
  * @brief Creates the signed quantization map for NorMuon momentum
@@ -134,23 +125,19 @@ void create_normuon_quantiles(float* code);
  * @param weight_decay Weight decay coefficient
  * @param stream CUDA stream
  */
-void cautious_weight_decay_update(
-    nv_bfloat16* p,
-    const nv_bfloat16* v,
-    size_t n,
-    float lr,
-    float weight_decay,
-    cudaStream_t stream
-);
+void cautious_weight_decay_update(nv_bfloat16* p,
+                                  const nv_bfloat16* v,
+                                  size_t n,
+                                  float lr,
+                                  float weight_decay,
+                                  cudaStream_t stream);
 
-void cautious_weight_decay_update(
-    float* p,
-    const nv_bfloat16* v,
-    size_t n,
-    float lr,
-    float weight_decay,
-    cudaStream_t stream
-);
+void cautious_weight_decay_update(float* p,
+                                  const nv_bfloat16* v,
+                                  size_t n,
+                                  float lr,
+                                  float weight_decay,
+                                  cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // Momentum Update with 8-bit Quantization
@@ -171,27 +158,23 @@ void cautious_weight_decay_update(
  * @param absmax Per-block absmax values (updated in place)
  * @param stream CUDA stream
  */
-void normuon_momentum_update_8bit(
-    const nv_bfloat16* gradient,
-    unsigned char* momentum_state,
-    nv_bfloat16* momentum_out,
-    size_t n,
-    float beta1,
-    const float* quantiles,
-    float* absmax,
-    cudaStream_t stream
-);
+void normuon_momentum_update_8bit(const nv_bfloat16* gradient,
+                                  unsigned char* momentum_state,
+                                  nv_bfloat16* momentum_out,
+                                  size_t n,
+                                  float beta1,
+                                  const float* quantiles,
+                                  float* absmax,
+                                  cudaStream_t stream);
 
-void normuon_momentum_update_8bit(
-    const float* gradient,
-    unsigned char* momentum_state,
-    float* momentum_out,
-    size_t n,
-    float beta1,
-    const float* quantiles,
-    float* absmax,
-    cudaStream_t stream
-);
+void normuon_momentum_update_8bit(const float* gradient,
+                                  unsigned char* momentum_state,
+                                  float* momentum_out,
+                                  size_t n,
+                                  float beta1,
+                                  const float* quantiles,
+                                  float* absmax,
+                                  cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // Full NorMuon Update Step
@@ -222,23 +205,21 @@ void normuon_momentum_update_8bit(
  * @param absmax Per-block momentum absmax (updated in place)
  * @param stream CUDA stream
  */
-void normuon_update_2d(
-    cublasHandle_t handle,
-    nv_bfloat16* param,
-    const nv_bfloat16* gradient,
-    unsigned char* momentum_state,
-    float* variance_buffer,
-    nv_bfloat16* polar_workspace,
-    int M,
-    int N,
-    float lr,
-    float beta1,
-    float beta2,
-    float weight_decay,
-    const float* quantiles,
-    float* absmax,
-    cudaStream_t stream
-);
+void normuon_update_2d(cublasHandle_t handle,
+                       nv_bfloat16* param,
+                       const nv_bfloat16* gradient,
+                       unsigned char* momentum_state,
+                       float* variance_buffer,
+                       nv_bfloat16* polar_workspace,
+                       int M,
+                       int N,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       float weight_decay,
+                       const float* quantiles,
+                       float* absmax,
+                       cudaStream_t stream);
 
 /**
  * @brief Graph-capturable NorMuon update for 2D weight tensor
@@ -250,22 +231,20 @@ void normuon_update_2d(
  * @param lr_multiplier Per-weight LR multiplier (based on M/N ratio), applied on device
  * @param wd_scale Weight decay scale (0 or 1), applied on device
  */
-void normuon_update_2d_graph(
-    cublasHandle_t handle,
-    nv_bfloat16* param,
-    const nv_bfloat16* gradient,
-    unsigned char* momentum_state,
-    float* variance_buffer,
-    nv_bfloat16* polar_workspace,
-    int M,
-    int N,
-    float lr_multiplier,
-    float wd_scale,
-    const float* quantiles,
-    float* absmax,
-    const float* opt_params,
-    cudaStream_t stream
-);
+void normuon_update_2d_graph(cublasHandle_t handle,
+                             nv_bfloat16* param,
+                             const nv_bfloat16* gradient,
+                             unsigned char* momentum_state,
+                             float* variance_buffer,
+                             nv_bfloat16* polar_workspace,
+                             int M,
+                             int N,
+                             float lr_multiplier,
+                             float wd_scale,
+                             const float* quantiles,
+                             float* absmax,
+                             const float* opt_params,
+                             cudaStream_t stream);
 
 /**
  * @brief Calculate variance buffer size for a 2D weight tensor
@@ -295,6 +274,6 @@ inline float normuon_lr_multiplier(int M, int N) {
     return sqrtf(fmaxf(1.0f, ratio));
 }
 
-} // namespace optimizers
+}  // namespace optimizers
 
-#endif // SUROGATE_SRC_MODULES_OPTIMIZERS_NORMUON_H
+#endif  // SUROGATE_SRC_MODULES_OPTIMIZERS_NORMUON_H

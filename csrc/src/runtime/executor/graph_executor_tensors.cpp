@@ -16,7 +16,9 @@
 
 namespace dsl {
 
-Tensor* resolve_block_activation_tensor(ExecState& st, const std::string& name, ETensorDType dtype,
+Tensor* resolve_block_activation_tensor(ExecState& st,
+                                        const std::string& name,
+                                        ETensorDType dtype,
                                         const std::vector<long>& shape) {
     int layer_idx = -1;
     std::string field;
@@ -46,7 +48,9 @@ Tensor* resolve_block_activation_tensor(ExecState& st, const std::string& name, 
                 view = view_tensor(base, {shape[0], static_cast<long>(base_n / static_cast<std::size_t>(shape[0]))});
             } else if (shape_n < base_n && shape.size() == 3) {
                 // 3D view (B, T, dim): use actual buffer size for the last dim
-                view = view_tensor(base, {shape[0], shape[1], static_cast<long>(base_n / static_cast<std::size_t>(shape[0] * shape[1]))});
+                view = view_tensor(
+                    base,
+                    {shape[0], shape[1], static_cast<long>(base_n / static_cast<std::size_t>(shape[0] * shape[1]))});
             }
         }
         auto [it, inserted] = st.tensors.emplace(name, view);
@@ -190,7 +194,9 @@ Tensor* resolve_block_activation_base(ExecState& st, const std::string& name) {
     return nullptr;
 }
 
-Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ETensorDType dtype,
+Tensor* resolve_block_gradient_tensor(ExecState& st,
+                                      const std::string& name,
+                                      ETensorDType dtype,
                                       const std::vector<long>& shape) {
     if (!starts_with(name, "d_")) {
         return nullptr;
@@ -224,7 +230,9 @@ Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ET
                 view = view_tensor(base, {shape[0], static_cast<long>(base_n / static_cast<std::size_t>(shape[0]))});
             } else if (shape_n < base_n && shape.size() == 3) {
                 // 3D view (B, T, dim): use actual buffer size for the last dim
-                view = view_tensor(base, {shape[0], shape[1], static_cast<long>(base_n / static_cast<std::size_t>(shape[0] * shape[1]))});
+                view = view_tensor(
+                    base,
+                    {shape[0], shape[1], static_cast<long>(base_n / static_cast<std::size_t>(shape[0] * shape[1]))});
             }
         }
         auto [it, inserted] = st.tensors.emplace(name, view);
@@ -300,8 +308,7 @@ Tensor* resolve_gradient_view_tensor(ExecState& st,
             return nullptr;
         }
     } else {
-        shape.assign(it_shape->second.Sizes.begin(),
-                     it_shape->second.Sizes.begin() + it_shape->second.Rank);
+        shape.assign(it_shape->second.Sizes.begin(), it_shape->second.Sizes.begin() + it_shape->second.Rank);
     }
     Tensor view = view_for_shape(*base, shape, name);
     auto [ins_it, inserted] = st.tensors.emplace(name, view);
@@ -412,8 +419,8 @@ Tensor& get_tensor(ExecState& st, const std::string& name, const std::unordered_
             int layer_idx = -1;
             std::string field;
             if (parse_block_param(key, layer_idx, field)) {
-                throw std::runtime_error(
-                    "DSL graph executor: recompute_block active but saved tensor not mappable: " + key);
+                throw std::runtime_error("DSL graph executor: recompute_block active but saved tensor not mappable: " +
+                                         key);
             }
         }
         return const_cast<Tensor&>(it->second);
@@ -549,11 +556,10 @@ Tensor* try_get_tensor(ExecState& st, const std::string& name, std::unordered_ma
 }
 
 // Resolve view shape from either "shape" or "shape_like" attribute
-std::vector<long> resolve_view_shape(
-    const Operation& op,
-    const ShapeEnv& env,
-    ExecState& st,
-    std::unordered_map<std::string, Tensor>& saved) {
+std::vector<long> resolve_view_shape(const Operation& op,
+                                     const ShapeEnv& env,
+                                     ExecState& st,
+                                     std::unordered_map<std::string, Tensor>& saved) {
     // Check for shape_like attribute (used by autodiff to reference tensor shape)
     auto* shape_like_attr = find_attr(op.attrs, "shape_like");
     if (shape_like_attr) {

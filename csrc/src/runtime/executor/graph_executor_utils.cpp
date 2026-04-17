@@ -30,8 +30,7 @@ bool starts_with(std::string_view value, std::string_view prefix) {
 }
 
 bool ends_with(std::string_view value, std::string_view suffix) {
-    return value.size() >= suffix.size() &&
-        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 // Environment variable check
@@ -164,8 +163,8 @@ bool infer_block_tensor_shape(const ExecState& st, std::string_view name, std::v
         shape = {B * T, C};
         return true;
     }
-    if (field == "ln1" || field == "ln2" || field == "res_att" || field == "res_ffn" ||
-        field == "res_in" || field == "att_out" || field == "mlp_down") {
+    if (field == "ln1" || field == "ln2" || field == "res_att" || field == "res_ffn" || field == "res_in" ||
+        field == "att_out" || field == "mlp_down") {
         shape = {B, T, C};
         return true;
     }
@@ -342,12 +341,13 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     int up_factor = 2;
     if (mlp_activation) {
         std::string act = *mlp_activation;
-        std::transform(act.begin(), act.end(), act.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(act.begin(), act.end(), act.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         if (act == "swiglu" || act == "geglu") {
             up_factor = 2;
-        } else if (act == "relu" || act == "relu2" || act == "gelu" || act == "gelu_new" ||
-                   act == "gelu_fast" || act == "silu" || act == "swish") {
+        } else if (act == "relu" || act == "relu2" || act == "gelu" || act == "gelu_new" || act == "gelu_fast" ||
+                   act == "silu" || act == "swish") {
             up_factor = 1;
         }
     }
@@ -506,25 +506,23 @@ EMMTranspose swap_transpose(EMMTranspose mode) {
     // Row-major GEMM mapping to column-major: swap A/B, swap M/N, and swap transpose flags.
     // NN -> NN, NT -> TN, TN -> NT, TT -> TT.
     switch (mode) {
-        case EMMTranspose::NN:
-            return EMMTranspose::NN;
-        case EMMTranspose::NT:
-            return EMMTranspose::TN;
-        case EMMTranspose::TN:
-            return EMMTranspose::NT;
-        case EMMTranspose::TT:
-            return EMMTranspose::TT;
+        case EMMTranspose::NN: return EMMTranspose::NN;
+        case EMMTranspose::NT: return EMMTranspose::TN;
+        case EMMTranspose::TN: return EMMTranspose::NT;
+        case EMMTranspose::TT: return EMMTranspose::TT;
     }
     return EMMTranspose::NN;
 }
 
 void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, int& N, int& K) {
     if (a.Rank != 2 || b.Rank != 2) {
-        std::string msg = "DSL graph executor: matmul expects rank-2 tensors, got a.Rank=" +
-            std::to_string(a.Rank) + " a.Sizes=[";
-        for (int i = 0; i < a.Rank; i++) msg += (i ? "," : "") + std::to_string(a.Sizes[i]);
+        std::string msg =
+            "DSL graph executor: matmul expects rank-2 tensors, got a.Rank=" + std::to_string(a.Rank) + " a.Sizes=[";
+        for (int i = 0; i < a.Rank; i++)
+            msg += (i ? "," : "") + std::to_string(a.Sizes[i]);
         msg += "] b.Rank=" + std::to_string(b.Rank) + " b.Sizes=[";
-        for (int i = 0; i < b.Rank; i++) msg += (i ? "," : "") + std::to_string(b.Sizes[i]);
+        for (int i = 0; i < b.Rank; i++)
+            msg += (i ? "," : "") + std::to_string(b.Sizes[i]);
         msg += "]";
         throw std::runtime_error(msg);
     }
@@ -540,9 +538,11 @@ void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, in
     const long b_cols = transB ? b0 : b1;
     if (a_cols != b_rows) {
         std::string msg = "DSL graph executor: matmul dimension mismatch: a=[";
-        for (int i = 0; i < a.Rank; i++) msg += (i ? "," : "") + std::to_string(a.Sizes[i]);
+        for (int i = 0; i < a.Rank; i++)
+            msg += (i ? "," : "") + std::to_string(a.Sizes[i]);
         msg += "] b=[";
-        for (int i = 0; i < b.Rank; i++) msg += (i ? "," : "") + std::to_string(b.Sizes[i]);
+        for (int i = 0; i < b.Rank; i++)
+            msg += (i ? "," : "") + std::to_string(b.Sizes[i]);
         msg += "] mode=" + std::to_string(static_cast<int>(mode));
         msg += " a_cols=" + std::to_string(a_cols) + " b_rows=" + std::to_string(b_rows);
         throw std::runtime_error(msg);

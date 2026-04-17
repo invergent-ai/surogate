@@ -20,48 +20,47 @@ Example:
 """
 
 from __future__ import annotations
+
 import inspect
-import functools
+from collections.abc import Callable
 from typing import (
-    Any,
-    Callable,
-    TypeVar,
-    overload,
-    get_type_hints,
     TYPE_CHECKING,
+    Any,
+    TypeVar,
+    get_type_hints,
+    overload,
 )
 
-from .tensor_type import (
-    TensorAnnotation,
-    ArrayAnnotation,
-    extract_tensor_annotation,
-    extract_array_annotation,
-)
 from .specs import (
-    ModuleSpec,
-    BlockSpec,
-    ModelSpec,
-    PrimitiveSpec,
-    PrimitiveIOSpec,
-    ParamSpec,
-    ParamKind,
-    ForwardSpec,
+    ActivationLayoutSpec,
+    ActivationMemoryHint,
+    ActivationScope,
+    ActivationSlotSpec,
     BackwardSpec,
-    IOSpec,
-    LetBindingSpec,
+    BlockSpec,
     ConstraintSpec,
+    ForwardSpec,
     HFConfigSpec,
     HFMappingSpec,
-    HFTransformSpec,
-    ActivationSlotSpec,
-    ActivationLayoutSpec,
-    ActivationScope,
-    ActivationMemoryHint,
+    IOSpec,
+    LetBindingSpec,
+    ModelSpec,
+    ModuleSpec,
+    ParamKind,
+    ParamSpec,
+    PrimitiveIOSpec,
+    PrimitiveSpec,
     SharePolicy,
+)
+from .tensor_type import (
+    ArrayAnnotation,
+    TensorAnnotation,
+    extract_array_annotation,
+    extract_tensor_annotation,
 )
 
 if TYPE_CHECKING:
-    from .graph_builder import GraphBuilder
+    pass
 
 
 T = TypeVar("T", bound=type)
@@ -325,9 +324,11 @@ def abstract(cls: T) -> T:
 
 def extends(base_name: str) -> Callable[[T], T]:
     """Decorator to specify module inheritance."""
+
     def decorator(cls: T) -> T:
         cls._extends_ = base_name
         return cls
+
     return decorator
 
 
@@ -381,7 +382,7 @@ class Param:
             raise TypeError(
                 f"Param() requires a Tensor[...] or Array[...] annotation, "
                 f"got {type(param_type).__name__}. "
-                f"Usage: Param(Tensor[\"C\", \"D\"]) or Param(Array[\"n_layers\", \"Block\"])"
+                f'Usage: Param(Tensor["C", "D"]) or Param(Array["n_layers", "Block"])'
             )
         self.param_type = param_type
         self.when = when
@@ -492,7 +493,7 @@ class Activation:
             raise TypeError(
                 f"Activation() requires a Tensor[...] annotation, "
                 f"got {type(tensor_type).__name__}. "
-                f"Usage: Activation(Tensor[\"B\", \"T\", \"C\"])"
+                f'Usage: Activation(Tensor["B", "T", "C"])'
             )
         self.tensor_type = tensor_type
         self.dtype = dtype
@@ -630,10 +631,7 @@ class Gradient:
         description: str | None = None,
     ):
         if not isinstance(tensor_type, TensorAnnotation):
-            raise TypeError(
-                f"Gradient() requires a Tensor[...] annotation, "
-                f"got {type(tensor_type).__name__}."
-            )
+            raise TypeError(f"Gradient() requires a Tensor[...] annotation, got {type(tensor_type).__name__}.")
         self.tensor_type = tensor_type
         self.gradient_of = gradient_of
         self.dtype = dtype
@@ -705,6 +703,7 @@ class Gradient:
 @overload
 def param(fn: F) -> F: ...
 
+
 @overload
 def param(
     *,
@@ -744,6 +743,7 @@ def param(
         def blocks(self) -> Array["n_layers", "DenseTransformerBlock"]:
             ...
     """
+
     def decorator(fn: F) -> F:
         # Get return type annotation
         hints = {}
@@ -798,6 +798,7 @@ def tied_to(target: str) -> Callable[[F], F]:
         def lm_head(self) -> Tensor["vocab_size", "d_model"]:
             ...
     """
+
     def decorator(fn: F) -> F:
         # Get or create param spec
         if not hasattr(fn, "_param_spec"):
@@ -836,12 +837,14 @@ def _extract_io_specs(fn: Callable) -> tuple[list[IOSpec], list[IOSpec]]:
         tensor_ann = extract_tensor_annotation(type_hint)
 
         if tensor_ann is not None:
-            inputs.append(IOSpec(
-                name=name,
-                tensor_type=tensor_ann,
-                is_optional=tensor_ann.optional,
-                default=param.default if param.default is not inspect.Parameter.empty else None,
-            ))
+            inputs.append(
+                IOSpec(
+                    name=name,
+                    tensor_type=tensor_ann,
+                    is_optional=tensor_ann.optional,
+                    default=param.default if param.default is not inspect.Parameter.empty else None,
+                )
+            )
 
     # Extract outputs from return type
     return_hint = hints.get("return")
@@ -854,18 +857,22 @@ def _extract_io_specs(fn: Callable) -> tuple[list[IOSpec], list[IOSpec]]:
             for i, arg in enumerate(args):
                 tensor_ann = extract_tensor_annotation(arg)
                 if tensor_ann is not None:
-                    outputs.append(IOSpec(
-                        name=f"out_{i}",
-                        tensor_type=tensor_ann,
-                    ))
+                    outputs.append(
+                        IOSpec(
+                            name=f"out_{i}",
+                            tensor_type=tensor_ann,
+                        )
+                    )
         else:
             # Single output
             tensor_ann = extract_tensor_annotation(return_hint)
             if tensor_ann is not None:
-                outputs.append(IOSpec(
-                    name="out",
-                    tensor_type=tensor_ann,
-                ))
+                outputs.append(
+                    IOSpec(
+                        name="out",
+                        tensor_type=tensor_ann,
+                    )
+                )
 
     return inputs, outputs
 
@@ -934,6 +941,7 @@ def save(*tensor_names: str) -> Callable[[F], F]:
         def forward(self, x):
             ...
     """
+
     def decorator(fn: F) -> F:
         if hasattr(fn, "_forward_spec"):
             fn._forward_spec.save = list(tensor_names)
@@ -954,6 +962,7 @@ def recompute(*tensor_names: str) -> Callable[[F], F]:
         def forward(self, x):
             ...
     """
+
     def decorator(fn: F) -> F:
         if hasattr(fn, "_forward_spec"):
             fn._forward_spec.recompute = list(tensor_names)
@@ -988,6 +997,7 @@ def hf_config(
         class Qwen3Model:
             ...
     """
+
     def decorator(cls: T) -> T:
         cls._hf_config_ = HFConfigSpec(
             architecture=architecture,
@@ -1014,6 +1024,7 @@ def hf_mapping(**mappings: str) -> Callable[[T], T]:
 
     For indexed mappings (blocks), use hf_mapping.indexed().
     """
+
     def decorator(cls: T) -> T:
         if not hasattr(cls, "_hf_mapping_"):
             cls._hf_mapping_ = HFMappingSpec()
@@ -1037,6 +1048,7 @@ def hf_export(**mappings: str) -> Callable[[T], T]:
         class Qwen3Model:
             ...
     """
+
     def decorator(cls: T) -> T:
         if not hasattr(cls, "_hf_export_"):
             cls._hf_export_ = HFMappingSpec()
@@ -1073,6 +1085,7 @@ class _HFMappingIndexed:
             class Qwen3Model:
                 ...
         """
+
         def decorator(cls: T) -> T:
             if not hasattr(cls, "_hf_mapping_"):
                 cls._hf_mapping_ = HFMappingSpec()
@@ -1103,7 +1116,7 @@ def _extract_primitive_io(hints: dict, prefix: str) -> PrimitiveIOSpec | None:
 
     for name, hint in hints.items():
         if name.startswith(prefix + "_"):
-            tensor_name = name[len(prefix) + 1:]
+            tensor_name = name[len(prefix) + 1 :]
             tensor_ann = extract_tensor_annotation(hint)
             if tensor_ann:
                 named[tensor_name] = tensor_ann
@@ -1116,6 +1129,7 @@ def _extract_primitive_io(hints: dict, prefix: str) -> PrimitiveIOSpec | None:
 
 @overload
 def primitive(fn: F) -> F: ...
+
 
 @overload
 def primitive(
@@ -1153,6 +1167,7 @@ def primitive(
         ) -> tuple[Tensor["M", "K"], Tensor["K", "N"]]:
             ...
     """
+
     def decorator(fn: F) -> F:
         sig = inspect.signature(fn)
         hints = {}

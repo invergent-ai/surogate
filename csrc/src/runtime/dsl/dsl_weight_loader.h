@@ -38,14 +38,14 @@ namespace dsl {
 
 /// Sharding configuration for multi-GPU weight loading.
 struct ShardConfig {
-    int shard_idx = 0;     ///< This GPU's shard index (0-based).
-    int num_shards = 1;    ///< Total number of shards (GPUs).
+    int shard_idx = 0;   ///< This GPU's shard index (0-based).
+    int num_shards = 1;  ///< Total number of shards (GPUs).
 };
 
 /// MoE configuration for StackExperts loading.
 struct MoEWeightConfig {
-    int num_experts = 0;               ///< Number of experts (0 = auto from spec).
-    int moe_intermediate_size = 0;     ///< Expert intermediate dimension.
+    int num_experts = 0;            ///< Number of experts (0 = auto from spec).
+    int moe_intermediate_size = 0;  ///< Expert intermediate dimension.
 };
 
 /// Standalone weight loader that reads HF SafeTensors using MappingSpec rules.
@@ -138,8 +138,11 @@ public:
     /// @param allow_cast  Allow dtype conversion during load.
     /// @param stream      CUDA stream for async operations.
     /// @return true if loaded successfully.
-    bool load_expert(const std::string& name, int expert_idx,
-                     Tensor& target, bool allow_cast, cudaStream_t stream = nullptr);
+    bool load_expert(const std::string& name,
+                     int expert_idx,
+                     Tensor& target,
+                     bool allow_cast,
+                     cudaStream_t stream = nullptr);
 
     /// Resolve all deferred TiedTo parameters.
     ///
@@ -158,31 +161,53 @@ public:
     [[nodiscard]] bool has_entry(const std::string& hf_name) const;
 
     /// Get the SafeTensorsReader (for advanced use cases).
-    [[nodiscard]] SafeTensorsReader& reader() { return mReader; }
+    [[nodiscard]] SafeTensorsReader& reader() {
+        return mReader;
+    }
 
 private:
     // ---- Mapping kind handlers ----
 
-    bool load_direct(const MappingSpec& spec, const std::string& name,
-                     Tensor& target, int layer_idx, bool allow_cast,
-                     bool param_sharded, const Tensor* global_template);
+    bool load_direct(const MappingSpec& spec,
+                     const std::string& name,
+                     Tensor& target,
+                     int layer_idx,
+                     bool allow_cast,
+                     bool param_sharded,
+                     const Tensor* global_template);
 
-    bool load_fused(const MappingSpec& spec, const std::string& name,
-                    Tensor& target, int layer_idx, bool allow_cast,
-                    bool param_sharded, const Tensor* global_template);
+    bool load_fused(const MappingSpec& spec,
+                    const std::string& name,
+                    Tensor& target,
+                    int layer_idx,
+                    bool allow_cast,
+                    bool param_sharded,
+                    const Tensor* global_template);
 
-    bool load_split(const MappingSpec& spec, const std::string& name,
-                    Tensor& target, int layer_idx, bool allow_cast,
-                    bool param_sharded, const Tensor* global_template);
+    bool load_split(const MappingSpec& spec,
+                    const std::string& name,
+                    Tensor& target,
+                    int layer_idx,
+                    bool allow_cast,
+                    bool param_sharded,
+                    const Tensor* global_template);
 
-    bool load_transform(const MappingSpec& spec, const std::string& name,
-                        Tensor& target, int layer_idx, bool allow_cast,
-                        bool param_sharded, const Tensor* global_template,
+    bool load_transform(const MappingSpec& spec,
+                        const std::string& name,
+                        Tensor& target,
+                        int layer_idx,
+                        bool allow_cast,
+                        bool param_sharded,
+                        const Tensor* global_template,
                         cudaStream_t stream);
 
-    bool load_stack_experts(const MappingSpec& spec, const std::string& name,
-                            Tensor& target, int layer_idx, bool allow_cast,
-                            bool param_sharded, cudaStream_t stream);
+    bool load_stack_experts(const MappingSpec& spec,
+                            const std::string& name,
+                            Tensor& target,
+                            int layer_idx,
+                            bool allow_cast,
+                            bool param_sharded,
+                            cudaStream_t stream);
 
     // ---- Private utilities ----
 

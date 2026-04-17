@@ -39,9 +39,9 @@ public:
         bool is_moe = false;  ///< True for MoE models
 
         // MoE-specific configuration (only used when is_moe = true)
-        int num_experts = 0;              ///< Number of experts per layer
-        int moe_intermediate_size = 0;    ///< Per-expert intermediate size (0 = use intermediate_size)
-        bool train_router = false;         ///< Train MoE router gate during LoRA fine-tuning
+        int num_experts = 0;            ///< Number of experts per layer
+        int moe_intermediate_size = 0;  ///< Per-expert intermediate size (0 = use intermediate_size)
+        bool train_router = false;      ///< Train MoE router gate during LoRA fine-tuning
 
         const ModelConfig* model_config = nullptr;  ///< Per-layer block type (hybrid models)
 
@@ -66,8 +66,8 @@ public:
     /**
      * @brief Get full gradients for backward pass
      */
-    LoRABlockWeights<Tensor>& get_block_full(int layer_idx, cudaStream_t stream,
-                                              NCCLCommunicator& comm, bool& accumulate);
+    LoRABlockWeights<Tensor>&
+    get_block_full(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm, bool& accumulate);
 
     /**
      * @brief Get sharded gradients for optimizer
@@ -79,8 +79,12 @@ public:
      */
     void notify_block(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
 
-    [[nodiscard]] bool is_first_micro_step() const { return mIsFirstMicroStep; }
-    [[nodiscard]] bool is_last_micro_step() const { return mIsLastMicroStep; }
+    [[nodiscard]] bool is_first_micro_step() const {
+        return mIsFirstMicroStep;
+    }
+    [[nodiscard]] bool is_last_micro_step() const {
+        return mIsLastMicroStep;
+    }
 
 private:
     Config mConfig;
@@ -99,6 +103,6 @@ private:
     void reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm);
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_GRADS_MANAGER_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_GRADS_MANAGER_H

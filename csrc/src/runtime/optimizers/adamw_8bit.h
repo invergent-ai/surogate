@@ -43,14 +43,12 @@ void create_adamw8bit_quantiles2(float* code);
 /**
  * @brief Initializes the 8-bit optimizer state tensors.
  */
-void init_adamw8bit_state(
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    size_t n,
-    cudaStream_t stream
-);
+void init_adamw8bit_state(unsigned char* state1,
+                          unsigned char* state2,
+                          float* absmax1,
+                          float* absmax2,
+                          size_t n,
+                          cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // Single-tensor update functions
@@ -59,102 +57,94 @@ void init_adamw8bit_state(
 /**
  * @brief Launch the 8-bit AdamW optimizer kernel for float parameters.
  */
-void adamw_update_8bit(
-    float* p,
-    const float* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-);
+void adamw_update_8bit(float* p,
+                       const float* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream);
 
 /**
  * @brief Launch the 8-bit AdamW optimizer kernel for BF16 parameters.
  */
-void adamw_update_8bit(
-    nv_bfloat16* p,
-    const nv_bfloat16* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-);
+void adamw_update_8bit(nv_bfloat16* p,
+                       const nv_bfloat16* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream);
 
 /**
  * @brief Launch the 8-bit AdamW optimizer kernel for mixed precision (FP32 params, BF16 grads).
  */
-void adamw_update_8bit(
-    float* p,
-    const nv_bfloat16* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-);
+void adamw_update_8bit(float* p,
+                       const nv_bfloat16* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream);
 
 /**
  * @brief Launch the 8-bit AdamW optimizer kernel for FP16 parameters.
  */
-void adamw_update_8bit(
-    half* p,
-    const half* g,
-    unsigned char* state1,
-    unsigned char* state2,
-    size_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    float* absmax1,
-    float* absmax2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-);
+void adamw_update_8bit(half* p,
+                       const half* g,
+                       unsigned char* state1,
+                       unsigned char* state2,
+                       size_t n,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       int step,
+                       float eps,
+                       float weight_decay,
+                       const float* gnorm_scale,
+                       const float* quantiles1,
+                       const float* quantiles2,
+                       float* absmax1,
+                       float* absmax2,
+                       const float* opt_params,
+                       const int* opt_step,
+                       cudaStream_t stream);
 
 // ----------------------------------------------------------------------------
 // Multi-tensor update functions (for LoRA with many small tensors)
@@ -163,59 +153,55 @@ void adamw_update_8bit(
 /**
  * @brief Launch multi-tensor 8-bit AdamW optimizer for float parameters.
  */
-void adamw_update_8bit_multi_tensor(
-    float** params,
-    float** grads,
-    const int* sizes,
-    int num_tensors,
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    const int* state_offsets,
-    size_t total_params,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-);
+void adamw_update_8bit_multi_tensor(float** params,
+                                    float** grads,
+                                    const int* sizes,
+                                    int num_tensors,
+                                    unsigned char* state1,
+                                    unsigned char* state2,
+                                    float* absmax1,
+                                    float* absmax2,
+                                    const int* state_offsets,
+                                    size_t total_params,
+                                    float lr,
+                                    float beta1,
+                                    float beta2,
+                                    int step,
+                                    float eps,
+                                    float weight_decay,
+                                    const float* gnorm_scale,
+                                    const float* quantiles1,
+                                    const float* quantiles2,
+                                    const float* opt_params,
+                                    const int* opt_step,
+                                    cudaStream_t stream);
 
 /**
  * @brief Launch multi-tensor 8-bit AdamW optimizer for BF16 parameters.
  */
-void adamw_update_8bit_multi_tensor(
-    nv_bfloat16** params,
-    nv_bfloat16** grads,
-    const int* sizes,
-    int num_tensors,
-    unsigned char* state1,
-    unsigned char* state2,
-    float* absmax1,
-    float* absmax2,
-    const int* state_offsets,
-    size_t total_params,
-    float lr,
-    float beta1,
-    float beta2,
-    int step,
-    float eps,
-    float weight_decay,
-    const float* gnorm_scale,
-    const float* quantiles1,
-    const float* quantiles2,
-    const float* opt_params,
-    const int* opt_step,
-    cudaStream_t stream
-);
+void adamw_update_8bit_multi_tensor(nv_bfloat16** params,
+                                    nv_bfloat16** grads,
+                                    const int* sizes,
+                                    int num_tensors,
+                                    unsigned char* state1,
+                                    unsigned char* state2,
+                                    float* absmax1,
+                                    float* absmax2,
+                                    const int* state_offsets,
+                                    size_t total_params,
+                                    float lr,
+                                    float beta1,
+                                    float beta2,
+                                    int step,
+                                    float eps,
+                                    float weight_decay,
+                                    const float* gnorm_scale,
+                                    const float* quantiles1,
+                                    const float* quantiles2,
+                                    const float* opt_params,
+                                    const int* opt_step,
+                                    cudaStream_t stream);
 
-} // namespace optimizers
+}  // namespace optimizers
 
-#endif // SUROGATE_SRC_MODULES_OPTIMIZERS_ADAMW_8BIT_H
+#endif  // SUROGATE_SRC_MODULES_OPTIMIZERS_ADAMW_8BIT_H

@@ -35,10 +35,10 @@ namespace {
 
 // Local NVFP4 constants (prefixed to avoid conflicts with other headers)
 constexpr float kFP4Max = 6.0f;
-constexpr float kFP8E4M3Max = 448.0f;    // FP8 E4M3 maximum value
-constexpr int kNVFP4BlockSize = 16;      // Elements per block scale (NVFP4 standard)
-constexpr int kNVFP4TileDim = 128;       // Tile dimension for kernel
-constexpr int kNVFP4ValuesPerByte = 2;   // 2 FP4 values packed per byte
+constexpr float kFP8E4M3Max = 448.0f;   // FP8 E4M3 maximum value
+constexpr int kNVFP4BlockSize = 16;     // Elements per block scale (NVFP4 standard)
+constexpr int kNVFP4TileDim = 128;      // Tile dimension for kernel
+constexpr int kNVFP4ValuesPerByte = 2;  // 2 FP4 values packed per byte
 
 // ============================================================================
 // PTX Intrinsics for Optimized FP4 Quantization (from vLLM)
@@ -130,8 +130,7 @@ __device__ __forceinline__ uint8_t float_to_ue4m3(float scale) {
     // We use the FP8 E4M3 hardware conversion but need to handle the unsigned nature
     // UE4M3 has same bit layout as positive E4M3 values
     __nv_fp8_e4m3 fp8_val;
-    fp8_val.__x = __nv_cvt_float_to_fp8(scale, __nv_saturation_t::__NV_SATFINITE,
-                                         __nv_fp8_interpretation_t::__NV_E4M3);
+    fp8_val.__x = __nv_cvt_float_to_fp8(scale, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
     return fp8_val.__x;
 }
 
@@ -168,12 +167,10 @@ __device__ __forceinline__ float ue4m3_to_float(uint8_t ue4m3) {
  * @param num_scale_cols Total number of scale columns.
  * @return Swizzled offset into scale buffer.
  */
-__device__ __forceinline__ size_t nvfp4_cutlass_scale_offset(
-    int row, int scale_col, int num_scale_cols)
-{
+__device__ __forceinline__ size_t nvfp4_cutlass_scale_offset(int row, int scale_col, int num_scale_cols) {
     // CUTLASS Sm1xxBlkScaledConfig atom dimensions
-    constexpr int kRowsPerAtom = 128;  // Blk_MN
-    constexpr int kColsPerAtom = 4;    // Blk_SF
+    constexpr int kRowsPerAtom = 128;                       // Blk_MN
+    constexpr int kColsPerAtom = 4;                         // Blk_SF
     constexpr int kAtomSize = kRowsPerAtom * kColsPerAtom;  // 512 scales per atom
 
     // Which atom are we in?
@@ -206,12 +203,10 @@ __device__ __forceinline__ size_t nvfp4_cutlass_scale_offset(
 // Scale Layout Reorder Kernels (Linear <-> CUTLASS)
 // ============================================================================
 
-__global__ void nvfp4_scales_linear_to_cutlass_kernel(
-    uint8_t* __restrict__ out_cutlass,
-    const uint8_t* __restrict__ in_linear,
-    int rows,
-    int num_scale_cols)
-{
+__global__ void nvfp4_scales_linear_to_cutlass_kernel(uint8_t* __restrict__ out_cutlass,
+                                                      const uint8_t* __restrict__ in_linear,
+                                                      int rows,
+                                                      int num_scale_cols) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = rows * num_scale_cols;
     if (idx >= total) return;
@@ -222,12 +217,10 @@ __global__ void nvfp4_scales_linear_to_cutlass_kernel(
     out_cutlass[off] = in_linear[idx];
 }
 
-__global__ void nvfp4_scales_cutlass_to_linear_kernel(
-    uint8_t* __restrict__ out_linear,
-    const uint8_t* __restrict__ in_cutlass,
-    int rows,
-    int num_scale_cols)
-{
+__global__ void nvfp4_scales_cutlass_to_linear_kernel(uint8_t* __restrict__ out_linear,
+                                                      const uint8_t* __restrict__ in_cutlass,
+                                                      int rows,
+                                                      int num_scale_cols) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = rows * num_scale_cols;
     if (idx >= total) return;
@@ -271,13 +264,28 @@ __device__ __forceinline__ uint8_t quantize_fp4_e2m1_sr(float val, float u) {
 
     // Positive representable magnitudes for FP4 E2M1
     float lo = 0.0f, hi = 0.5f;
-    if (x < 0.5f) { lo = 0.0f; hi = 0.5f; }
-    else if (x < 1.0f) { lo = 0.5f; hi = 1.0f; }
-    else if (x < 1.5f) { lo = 1.0f; hi = 1.5f; }
-    else if (x < 2.0f) { lo = 1.5f; hi = 2.0f; }
-    else if (x < 3.0f) { lo = 2.0f; hi = 3.0f; }
-    else if (x < 4.0f) { lo = 3.0f; hi = 4.0f; }
-    else { lo = 4.0f; hi = 6.0f; }
+    if (x < 0.5f) {
+        lo = 0.0f;
+        hi = 0.5f;
+    } else if (x < 1.0f) {
+        lo = 0.5f;
+        hi = 1.0f;
+    } else if (x < 1.5f) {
+        lo = 1.0f;
+        hi = 1.5f;
+    } else if (x < 2.0f) {
+        lo = 1.5f;
+        hi = 2.0f;
+    } else if (x < 3.0f) {
+        lo = 2.0f;
+        hi = 3.0f;
+    } else if (x < 4.0f) {
+        lo = 3.0f;
+        hi = 4.0f;
+    } else {
+        lo = 4.0f;
+        hi = 6.0f;
+    }
 
     const float denom = hi - lo;
     if (denom <= 0.0f || x == lo) return quantize_fp4_e2m1_rn(s * lo);
@@ -295,7 +303,7 @@ __device__ __forceinline__ uint8_t pack_fp4(uint8_t val0, uint8_t val1) {
     return (val1 << 4) | (val0 & 0xF);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // NVFP4 Block Quantization Kernels (CUTLASS-compatible layout)
@@ -315,13 +323,13 @@ __device__ __forceinline__ uint8_t pack_fp4(uint8_t val0, uint8_t val1) {
  * @param K Number of columns.
  * @param num_scale_cols Number of scale columns (ceil(K/16)).
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_nvfp4_cutlass_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int num_scale_cols)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_cutlass_kernel(uint8_t* __restrict__ out_fp4,
+                                              uint8_t* __restrict__ block_scales,
+                                              const nv_bfloat16* __restrict__ in,
+                                              int M,
+                                              int K,
+                                              int num_scale_cols) {
     const int tile_row = blockIdx.x;
     const int tile_col = blockIdx.y;
 
@@ -348,7 +356,7 @@ __global__ void quantize_nvfp4_cutlass_kernel(
         float block_amax = 0.0f;
         float values[kNVFP4BlockSize];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -374,7 +382,7 @@ __global__ void quantize_nvfp4_cutlass_kernel(
 
         const int out_col_start = block_col_start / kNVFP4ValuesPerByte;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * quant_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * quant_scale) : 0;
@@ -390,13 +398,13 @@ __global__ void quantize_nvfp4_cutlass_kernel(
  * - Quantizes along the K dimension
  * - Scale layout: (N, ceil(K/16)) with CUTLASS interleaving
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_nvfp4_weight_cutlass_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const nv_bfloat16* __restrict__ in,
-    int N, int K, int num_scale_cols)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_weight_cutlass_kernel(uint8_t* __restrict__ out_fp4,
+                                                     uint8_t* __restrict__ block_scales,
+                                                     const nv_bfloat16* __restrict__ in,
+                                                     int N,
+                                                     int K,
+                                                     int num_scale_cols) {
     const int tile_row = blockIdx.x;  // Along N dimension
     const int tile_col = blockIdx.y;  // Along K dimension
 
@@ -422,7 +430,7 @@ __global__ void quantize_nvfp4_weight_cutlass_kernel(
         float block_amax = 0.0f;
         float values[kNVFP4BlockSize];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -443,7 +451,7 @@ __global__ void quantize_nvfp4_weight_cutlass_kernel(
 
         const int out_col_start = block_col_start / kNVFP4ValuesPerByte;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * quant_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * quant_scale) : 0;
@@ -455,14 +463,14 @@ __global__ void quantize_nvfp4_weight_cutlass_kernel(
 /**
  * @brief Per-block NVFP4 quantization with stochastic rounding (for gradients).
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_nvfp4_stochastic_cutlass_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int num_scale_cols,
-    unsigned int seed)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_stochastic_cutlass_kernel(uint8_t* __restrict__ out_fp4,
+                                                         uint8_t* __restrict__ block_scales,
+                                                         const nv_bfloat16* __restrict__ in,
+                                                         int M,
+                                                         int K,
+                                                         int num_scale_cols,
+                                                         unsigned int seed) {
     curandStatePhilox4_32_10_t rng_state;
     curand_init(seed, blockIdx.x * blockDim.x + threadIdx.x, 0, &rng_state);
 
@@ -490,7 +498,7 @@ __global__ void quantize_nvfp4_stochastic_cutlass_kernel(
         float block_amax = 0.0f;
         float values[kNVFP4BlockSize];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -509,7 +517,7 @@ __global__ void quantize_nvfp4_stochastic_cutlass_kernel(
 
         const int out_col_start = block_col_start / kNVFP4ValuesPerByte;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             const float rand0 = curand_uniform(&rng_state);
             const float rand1 = curand_uniform(&rng_state);
@@ -539,14 +547,14 @@ __global__ void quantize_nvfp4_stochastic_cutlass_kernel(
  * @param K Number of columns.
  * @param num_scale_cols Number of scale columns (ceil(K/16)).
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_nvfp4_cutlass_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int num_scale_cols)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_cutlass_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                                   uint8_t* __restrict__ block_scales,
+                                                   const float* __restrict__ global_amax_in,
+                                                   const nv_bfloat16* __restrict__ in,
+                                                   int M,
+                                                   int K,
+                                                   int num_scale_cols) {
     const int tile_row = blockIdx.x;
     const int tile_col = blockIdx.y;
 
@@ -586,7 +594,7 @@ __global__ void quantize_nvfp4_cutlass_auto_kernel(
         float block_amax = 0.0f;
         float values[kNVFP4BlockSize];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -608,7 +616,7 @@ __global__ void quantize_nvfp4_cutlass_auto_kernel(
 
         const int out_col_start = block_col_start / kNVFP4ValuesPerByte;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
@@ -620,15 +628,15 @@ __global__ void quantize_nvfp4_cutlass_auto_kernel(
 /**
  * @brief Per-block NVFP4 stochastic quantization with two-level scaling.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_nvfp4_stochastic_cutlass_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int M, int K, int num_scale_cols,
-    unsigned int seed)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_stochastic_cutlass_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                                              uint8_t* __restrict__ block_scales,
+                                                              const float* __restrict__ global_amax_in,
+                                                              const nv_bfloat16* __restrict__ in,
+                                                              int M,
+                                                              int K,
+                                                              int num_scale_cols,
+                                                              unsigned int seed) {
     curandStatePhilox4_32_10_t rng_state;
     curand_init(seed, blockIdx.x * blockDim.x + threadIdx.x, 0, &rng_state);
 
@@ -669,7 +677,7 @@ __global__ void quantize_nvfp4_stochastic_cutlass_auto_kernel(
         float block_amax = 0.0f;
         float values[kNVFP4BlockSize];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -688,7 +696,7 @@ __global__ void quantize_nvfp4_stochastic_cutlass_auto_kernel(
 
         const int out_col_start = block_col_start / kNVFP4ValuesPerByte;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             const float rand0 = curand_uniform(&rng_state);
             const float rand1 = curand_uniform(&rng_state);
@@ -703,14 +711,14 @@ __global__ void quantize_nvfp4_stochastic_cutlass_auto_kernel(
 /**
  * @brief Per-block NVFP4 weight quantization with two-level scaling (CUTLASS layout).
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_nvfp4_weight_cutlass_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int N, int K, int num_scale_cols)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_weight_cutlass_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                                          uint8_t* __restrict__ block_scales,
+                                                          const float* __restrict__ global_amax_in,
+                                                          const nv_bfloat16* __restrict__ in,
+                                                          int N,
+                                                          int K,
+                                                          int num_scale_cols) {
     const int tile_row = blockIdx.x;
     const int tile_col = blockIdx.y;
 
@@ -748,7 +756,7 @@ __global__ void quantize_nvfp4_weight_cutlass_auto_kernel(
         float block_amax = 0.0f;
         float values[kNVFP4BlockSize];
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             float val = (float)in[global_row * K + block_col_start + i];
             values[i] = val;
@@ -767,7 +775,7 @@ __global__ void quantize_nvfp4_weight_cutlass_auto_kernel(
 
         const int out_col_start = block_col_start / kNVFP4ValuesPerByte;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
@@ -783,15 +791,14 @@ __global__ void quantize_nvfp4_weight_cutlass_auto_kernel(
  * as row-major (K, N) (packed as (K, N/2) bytes). This matches the layout needed for
  * backward dgrad GEMMs without an explicit BF16 transpose.
  */
-template<int TILE_SIZE = 128>
-__global__ void quantize_nvfp4_weight_cutlass_transpose_auto_kernel(
-    uint8_t* __restrict__ out_fp4,
-    uint8_t* __restrict__ block_scales,
-    const float* __restrict__ global_amax_in,
-    const nv_bfloat16* __restrict__ in,
-    int N, int K,
-    int num_scale_cols_out)
-{
+template <int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_weight_cutlass_transpose_auto_kernel(uint8_t* __restrict__ out_fp4,
+                                                                    uint8_t* __restrict__ block_scales,
+                                                                    const float* __restrict__ global_amax_in,
+                                                                    const nv_bfloat16* __restrict__ in,
+                                                                    int N,
+                                                                    int K,
+                                                                    int num_scale_cols_out) {
     // Output matrix shape: (K, N)
     const int tile_row = blockIdx.x;  // rows over K
     const int tile_col = blockIdx.y;  // cols over N
@@ -822,7 +829,7 @@ __global__ void quantize_nvfp4_weight_cutlass_transpose_auto_kernel(
         const int local_row = block_idx / num_blocks_per_row;
         const int local_block = block_idx % num_blocks_per_row;
 
-        const int out_row = row_start + local_row;  // 0..K-1
+        const int out_row = row_start + local_row;                                  // 0..K-1
         const int out_block_col_start = col_start + local_block * kNVFP4BlockSize;  // 0..N-1
         const int out_block_col_end = min(out_block_col_start + kNVFP4BlockSize, col_end);
         const int block_width = out_block_col_end - out_block_col_start;
@@ -830,8 +837,8 @@ __global__ void quantize_nvfp4_weight_cutlass_transpose_auto_kernel(
         float block_amax = 0.0f;
         float values[kNVFP4BlockSize];
 
-        // Read transposed: out(out_row, out_col) = in(out_col, out_row)
-        #pragma unroll
+// Read transposed: out(out_row, out_col) = in(out_col, out_row)
+#pragma unroll
         for (int i = 0; i < block_width; ++i) {
             const int in_row = out_block_col_start + i;  // 0..N-1
             const int in_col = out_row;                  // 0..K-1
@@ -853,7 +860,7 @@ __global__ void quantize_nvfp4_weight_cutlass_transpose_auto_kernel(
 
         const int out_byte_col_start = out_block_col_start / kNVFP4ValuesPerByte;
 
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < block_width; i += 2) {
             uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
             uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
@@ -883,39 +890,39 @@ size_t compute_nvfp4_cutlass_scale_size(int rows, int cols) {
     return static_cast<size_t>(aligned_rows) * aligned_cols;
 }
 
-void nvfp4_scales_linear_to_cutlass(
-    uint8_t* out_cutlass,
-    const uint8_t* in_linear,
-    int rows,
-    int cols,
-    cudaStream_t stream)
-{
+void nvfp4_scales_linear_to_cutlass(uint8_t* out_cutlass,
+                                    const uint8_t* in_linear,
+                                    int rows,
+                                    int cols,
+                                    cudaStream_t stream) {
     const int num_scale_cols = div_ceil(cols, kNVFP4BlockSize);
     const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(num_scale_cols);
     if (total == 0) return;
 
     constexpr int kThreads = 256;
     const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
-    nvfp4_scales_linear_to_cutlass_kernel<<<blocks, kThreads, 0, stream>>>(
-        out_cutlass, in_linear, rows, num_scale_cols);
+    nvfp4_scales_linear_to_cutlass_kernel<<<blocks, kThreads, 0, stream>>>(out_cutlass,
+                                                                           in_linear,
+                                                                           rows,
+                                                                           num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void nvfp4_scales_cutlass_to_linear(
-    uint8_t* out_linear,
-    const uint8_t* in_cutlass,
-    int rows,
-    int cols,
-    cudaStream_t stream)
-{
+void nvfp4_scales_cutlass_to_linear(uint8_t* out_linear,
+                                    const uint8_t* in_cutlass,
+                                    int rows,
+                                    int cols,
+                                    cudaStream_t stream) {
     const int num_scale_cols = div_ceil(cols, kNVFP4BlockSize);
     const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(num_scale_cols);
     if (total == 0) return;
 
     constexpr int kThreads = 256;
     const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
-    nvfp4_scales_cutlass_to_linear_kernel<<<blocks, kThreads, 0, stream>>>(
-        out_linear, in_cutlass, rows, num_scale_cols);
+    nvfp4_scales_cutlass_to_linear_kernel<<<blocks, kThreads, 0, stream>>>(out_linear,
+                                                                           in_cutlass,
+                                                                           rows,
+                                                                           num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -930,21 +937,20 @@ void nvfp4_scales_cutlass_to_linear(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_nvfp4_cutlass(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    const nv_bfloat16* in,
-    int M, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_cutlass(uint8_t* out_fp4,
+                            uint8_t* block_scales,
+                            const nv_bfloat16* in,
+                            int M,
+                            int K,
+                            const cudaDeviceProp& dp,
+                            cudaStream_t stream) {
     const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
 
     dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_cutlass_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, in, M, K, num_scale_cols);
+    quantize_nvfp4_cutlass_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, in, M, K, num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -959,43 +965,41 @@ void quantize_nvfp4_cutlass(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_nvfp4_weight_cutlass(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    const nv_bfloat16* in,
-    int N, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_weight_cutlass(uint8_t* out_fp4,
+                                   uint8_t* block_scales,
+                                   const nv_bfloat16* in,
+                                   int N,
+                                   int K,
+                                   const cudaDeviceProp& dp,
+                                   cudaStream_t stream) {
     const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
 
     dim3 grid(div_ceil(N, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_weight_cutlass_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, in, N, K, num_scale_cols);
+    quantize_nvfp4_weight_cutlass_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, in, N, K, num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Host launcher for NVFP4 quantization with stochastic rounding.
  */
-void quantize_nvfp4_stochastic_cutlass(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    const nv_bfloat16* in,
-    int M, int K,
-    unsigned int seed,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_stochastic_cutlass(uint8_t* out_fp4,
+                                       uint8_t* block_scales,
+                                       const nv_bfloat16* in,
+                                       int M,
+                                       int K,
+                                       unsigned int seed,
+                                       const cudaDeviceProp& dp,
+                                       cudaStream_t stream) {
     const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
 
     dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_stochastic_cutlass_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, in, M, K, num_scale_cols, seed);
+    quantize_nvfp4_stochastic_cutlass_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, in, M, K, num_scale_cols, seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1018,15 +1022,14 @@ void quantize_nvfp4_stochastic_cutlass(
  * @param dp CUDA device properties.
  * @param stream CUDA stream.
  */
-void quantize_nvfp4_cutlass_auto_scale(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_cutlass_auto_scale(uint8_t* out_fp4,
+                                       uint8_t* block_scales,
+                                       float* global_amax,
+                                       const nv_bfloat16* in,
+                                       int M,
+                                       int K,
+                                       const cudaDeviceProp& dp,
+                                       cudaStream_t stream) {
     // 1) Compute true global amax (needed for alpha scaling post-GEMM)
     abs_max(global_amax, in, (long)M * K, dp, stream);
 
@@ -1036,8 +1039,8 @@ void quantize_nvfp4_cutlass_auto_scale(
     dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
+    quantize_nvfp4_cutlass_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1048,39 +1051,37 @@ void quantize_nvfp4_cutlass_auto_scale(
  * Intended to reuse amax computed in preceding fused ops (e.g., RMSNorm/SwiGLU) to
  * reduce extra memory traffic on fast GPUs.
  */
-void quantize_nvfp4_cutlass_from_amax(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    const float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_cutlass_from_amax(uint8_t* out_fp4,
+                                      uint8_t* block_scales,
+                                      const float* global_amax,
+                                      const nv_bfloat16* in,
+                                      int M,
+                                      int K,
+                                      const cudaDeviceProp& dp,
+                                      cudaStream_t stream) {
     (void)dp;
     const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
 
     dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
+    quantize_nvfp4_cutlass_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Host launcher for NVFP4 stochastic quantization with two-level scaling.
  */
-void quantize_nvfp4_stochastic_cutlass_auto_scale(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    unsigned int seed,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_stochastic_cutlass_auto_scale(uint8_t* out_fp4,
+                                                  uint8_t* block_scales,
+                                                  float* global_amax,
+                                                  const nv_bfloat16* in,
+                                                  int M,
+                                                  int K,
+                                                  unsigned int seed,
+                                                  const cudaDeviceProp& dp,
+                                                  cudaStream_t stream) {
     // 1) Compute true global amax
     abs_max(global_amax, in, (long)M * K, dp, stream);
 
@@ -1090,47 +1091,45 @@ void quantize_nvfp4_stochastic_cutlass_auto_scale(
     dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_stochastic_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
+    quantize_nvfp4_stochastic_cutlass_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Host launcher for NVFP4 stochastic quantization using a pre-computed global amax.
  */
-void quantize_nvfp4_stochastic_cutlass_from_amax(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    const float* global_amax,
-    const nv_bfloat16* in,
-    int M, int K,
-    unsigned int seed,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_stochastic_cutlass_from_amax(uint8_t* out_fp4,
+                                                 uint8_t* block_scales,
+                                                 const float* global_amax,
+                                                 const nv_bfloat16* in,
+                                                 int M,
+                                                 int K,
+                                                 unsigned int seed,
+                                                 const cudaDeviceProp& dp,
+                                                 cudaStream_t stream) {
     (void)dp;
     const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
 
     dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_stochastic_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
+    quantize_nvfp4_stochastic_cutlass_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Host launcher for NVFP4 weight quantization with two-level scaling.
  */
-void quantize_nvfp4_weight_cutlass_auto_scale(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int N, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_weight_cutlass_auto_scale(uint8_t* out_fp4,
+                                              uint8_t* block_scales,
+                                              float* global_amax,
+                                              const nv_bfloat16* in,
+                                              int N,
+                                              int K,
+                                              const cudaDeviceProp& dp,
+                                              cudaStream_t stream) {
     // 1) Compute true global amax
     abs_max(global_amax, in, (long)N * K, dp, stream);
 
@@ -1140,31 +1139,30 @@ void quantize_nvfp4_weight_cutlass_auto_scale(
     dim3 grid(div_ceil(N, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_weight_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, N, K, num_scale_cols);
+    quantize_nvfp4_weight_cutlass_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, N, K, num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /**
  * @brief Host launcher for NVFP4 weight quantization using a pre-computed global amax.
  */
-void quantize_nvfp4_weight_cutlass_from_amax(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    const float* global_amax,
-    const nv_bfloat16* in,
-    int N, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_weight_cutlass_from_amax(uint8_t* out_fp4,
+                                             uint8_t* block_scales,
+                                             const float* global_amax,
+                                             const nv_bfloat16* in,
+                                             int N,
+                                             int K,
+                                             const cudaDeviceProp& dp,
+                                             cudaStream_t stream) {
     (void)dp;
     const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
 
     dim3 grid(div_ceil(N, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_weight_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, N, K, num_scale_cols);
+    quantize_nvfp4_weight_cutlass_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, N, K, num_scale_cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1173,15 +1171,14 @@ void quantize_nvfp4_weight_cutlass_from_amax(
  *
  * This avoids an explicit BF16 transpose when computing dgrad in backward passes.
  */
-void quantize_nvfp4_weight_cutlass_transpose_auto_scale(
-    uint8_t* out_fp4,
-    uint8_t* block_scales,
-    float* global_amax,
-    const nv_bfloat16* in,
-    int N, int K,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_weight_cutlass_transpose_auto_scale(uint8_t* out_fp4,
+                                                        uint8_t* block_scales,
+                                                        float* global_amax,
+                                                        const nv_bfloat16* in,
+                                                        int N,
+                                                        int K,
+                                                        const cudaDeviceProp& dp,
+                                                        cudaStream_t stream) {
     // 1) Compute true global amax (same for W and W^T)
     abs_max(global_amax, in, (long)N * K, dp, stream);
 
@@ -1193,8 +1190,8 @@ void quantize_nvfp4_weight_cutlass_transpose_auto_scale(
     dim3 grid(div_ceil(out_rows, kNVFP4TileDim), div_ceil(out_cols, kNVFP4TileDim));
     const int threads_per_block = 256;
 
-    quantize_nvfp4_weight_cutlass_transpose_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
-        out_fp4, block_scales, global_amax, in, N, K, num_scale_cols_out);
+    quantize_nvfp4_weight_cutlass_transpose_auto_kernel<128>
+        <<<grid, threads_per_block, 0, stream>>>(out_fp4, block_scales, global_amax, in, N, K, num_scale_cols_out);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1205,13 +1202,11 @@ void quantize_nvfp4_weight_cutlass_transpose_auto_scale(
 /**
  * @brief Tensor-based wrapper for NVFP4 quantization with CUTLASS layout.
  */
-void quantize_nvfp4_cutlass(
-    Tensor& out_fp4,
-    Tensor& block_scales,
-    const Tensor& in,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_cutlass(Tensor& out_fp4,
+                            Tensor& block_scales,
+                            const Tensor& in,
+                            const cudaDeviceProp& dp,
+                            cudaStream_t stream) {
     if (in.DType != ETensorDType::BF16) {
         throw std::runtime_error("quantize_nvfp4_cutlass: input must be BF16");
     }
@@ -1228,23 +1223,23 @@ void quantize_nvfp4_cutlass(
     const int M = in.Sizes[0];
     const int K = in.Sizes[1];
 
-    quantize_nvfp4_cutlass(
-        out_fp4.get<uint8_t>(),
-        block_scales.get<uint8_t>(),
-        in.get<nv_bfloat16>(),
-        M, K, dp, stream);
+    quantize_nvfp4_cutlass(out_fp4.get<uint8_t>(),
+                           block_scales.get<uint8_t>(),
+                           in.get<nv_bfloat16>(),
+                           M,
+                           K,
+                           dp,
+                           stream);
 }
 
 /**
  * @brief Tensor-based wrapper for NVFP4 weight quantization with CUTLASS layout.
  */
-void quantize_nvfp4_weight_cutlass(
-    Tensor& out_fp4,
-    Tensor& block_scales,
-    const Tensor& in,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_weight_cutlass(Tensor& out_fp4,
+                                   Tensor& block_scales,
+                                   const Tensor& in,
+                                   const cudaDeviceProp& dp,
+                                   cudaStream_t stream) {
     if (in.DType != ETensorDType::BF16) {
         throw std::runtime_error("quantize_nvfp4_weight_cutlass: input must be BF16");
     }
@@ -1261,24 +1256,24 @@ void quantize_nvfp4_weight_cutlass(
     const int N = in.Sizes[0];
     const int K = in.Sizes[1];
 
-    quantize_nvfp4_weight_cutlass(
-        out_fp4.get<uint8_t>(),
-        block_scales.get<uint8_t>(),
-        in.get<nv_bfloat16>(),
-        N, K, dp, stream);
+    quantize_nvfp4_weight_cutlass(out_fp4.get<uint8_t>(),
+                                  block_scales.get<uint8_t>(),
+                                  in.get<nv_bfloat16>(),
+                                  N,
+                                  K,
+                                  dp,
+                                  stream);
 }
 
 /**
  * @brief Tensor-based wrapper for NVFP4 stochastic quantization.
  */
-void quantize_nvfp4_stochastic_cutlass(
-    Tensor& out_fp4,
-    Tensor& block_scales,
-    const Tensor& in,
-    unsigned int seed,
-    const cudaDeviceProp& dp,
-    cudaStream_t stream)
-{
+void quantize_nvfp4_stochastic_cutlass(Tensor& out_fp4,
+                                       Tensor& block_scales,
+                                       const Tensor& in,
+                                       unsigned int seed,
+                                       const cudaDeviceProp& dp,
+                                       cudaStream_t stream) {
     if (in.DType != ETensorDType::BF16) {
         throw std::runtime_error("quantize_nvfp4_stochastic_cutlass: input must be BF16");
     }
@@ -1292,11 +1287,14 @@ void quantize_nvfp4_stochastic_cutlass(
     const int M = in.Sizes[0];
     const int K = in.Sizes[1];
 
-    quantize_nvfp4_stochastic_cutlass(
-        out_fp4.get<uint8_t>(),
-        block_scales.get<uint8_t>(),
-        in.get<nv_bfloat16>(),
-        M, K, seed, dp, stream);
+    quantize_nvfp4_stochastic_cutlass(out_fp4.get<uint8_t>(),
+                                      block_scales.get<uint8_t>(),
+                                      in.get<nv_bfloat16>(),
+                                      M,
+                                      K,
+                                      seed,
+                                      dp,
+                                      stream);
 }
 
 // end of global namespace functions

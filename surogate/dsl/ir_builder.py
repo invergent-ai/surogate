@@ -6,17 +6,17 @@ Builds IR JSON for models from Python DSL classes.
 
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any
 
 
-def load_hf_config(model_dir: str) -> Dict[str, Any]:
+def load_hf_config(model_dir: str) -> dict[str, Any]:
     config_path = Path(model_dir) / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"config.json not found in model dir: {model_dir}")
     return json.loads(config_path.read_text())
 
 
-def resolve_architecture(config_json: Dict[str, Any]) -> str:
+def resolve_architecture(config_json: dict[str, Any]) -> str:
     archs = config_json.get("architectures", [])
     if archs:
         return archs[0]
@@ -28,8 +28,8 @@ def resolve_architecture(config_json: Dict[str, Any]) -> str:
 
 def build_dsl_ir_from_python(
     architecture: str,
-    config_json: Dict[str, Any],
-    extra_config: Dict[str, Any] | None = None,
+    config_json: dict[str, Any],
+    extra_config: dict[str, Any] | None = None,
 ) -> str:
     """Build IR JSON using Python DSL models.
 
@@ -60,8 +60,7 @@ def build_dsl_ir_from_python(
                     msg += f"\n  Hint: {err['hint']}"
                 error_msgs.append(msg)
             raise RuntimeError(
-                f"DSL compilation failed for {architecture}:\n" +
-                "\n".join(f"  - {msg}" for msg in error_msgs)
+                f"DSL compilation failed for {architecture}:\n" + "\n".join(f"  - {msg}" for msg in error_msgs)
             )
         else:
             raise RuntimeError(f"DSL compilation failed for {architecture} (no error details)")
@@ -94,7 +93,7 @@ def build_dsl_ir_from_python(
 
 def build_dsl_ir_for_model(
     model_dir: str,
-    extra_config: Dict[str, Any] | None = None,
+    extra_config: dict[str, Any] | None = None,
 ) -> str:
     """
     Build DSL IR JSON for a model.

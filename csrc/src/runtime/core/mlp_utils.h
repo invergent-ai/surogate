@@ -10,7 +10,7 @@
 
 namespace modules {
 
-template<typename Config>
+template <typename Config>
 inline int mlp_up_factor(const Config& cfg) {
     if constexpr (requires { cfg.mlp_up_factor; }) {
         return cfg.mlp_up_factor;
@@ -18,7 +18,7 @@ inline int mlp_up_factor(const Config& cfg) {
     return 2;  // Default to gated MLP
 }
 
-template<typename Config>
+template <typename Config>
 inline long mlp_up_rows(const Config& cfg) {
     if constexpr (requires { cfg.intermediate_size; }) {
         return static_cast<long>(cfg.intermediate_size) * static_cast<long>(mlp_up_factor(cfg));
@@ -29,6 +29,6 @@ inline long mlp_up_rows(const Config& cfg) {
     }
 }
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_MLP_UTILS_H
+#endif  // SUROGATE_SRC_MODULES_MLP_UTILS_H

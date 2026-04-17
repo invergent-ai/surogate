@@ -13,9 +13,7 @@ def logger():
     return logging.getLogger("test_moe_monitor")
 
 
-def _make_moe(
-    aux_loss=0.01, z_loss=0.001, load_imbalance=1.2, expert_utilization=0.95
-):
+def _make_moe(aux_loss=0.01, z_loss=0.001, load_imbalance=1.2, expert_utilization=0.95):
     return MoEMetrics(
         aux_loss=aux_loss,
         z_loss=z_loss,
@@ -46,8 +44,11 @@ class TestAutoThresholds:
     def test_explicit_thresholds_override_auto(self, logger):
         """Explicit warn/severe should override auto-computation."""
         mon = MoEMonitor(
-            logger, num_experts=128, num_experts_per_tok=8,
-            imbalance_warn=5.0, imbalance_severe=15.0,
+            logger,
+            num_experts=128,
+            num_experts_per_tok=8,
+            imbalance_warn=5.0,
+            imbalance_severe=15.0,
         )
         assert mon.imbalance_warn == 5.0
         assert mon.imbalance_severe == 15.0
@@ -61,8 +62,11 @@ class TestAutoThresholds:
     def test_auto_thresholds_no_false_warnings_qwen3(self, logger, caplog):
         """Qwen3-MoE imbalance of 10 should NOT trigger warnings."""
         mon = MoEMonitor(
-            logger, num_experts=128, num_experts_per_tok=8,
-            warmup=3, cooldown=0,
+            logger,
+            num_experts=128,
+            num_experts_per_tok=8,
+            warmup=3,
+            cooldown=0,
         )
         for i in range(3):
             mon.step(_make_moe(), step=i)
@@ -73,8 +77,11 @@ class TestAutoThresholds:
     def test_auto_thresholds_no_false_warnings_gptoss(self, logger, caplog):
         """GPT-OSS imbalance of 5.5 should NOT trigger warnings."""
         mon = MoEMonitor(
-            logger, num_experts=128, num_experts_per_tok=4,
-            warmup=3, cooldown=0,
+            logger,
+            num_experts=128,
+            num_experts_per_tok=4,
+            warmup=3,
+            cooldown=0,
         )
         for i in range(3):
             mon.step(_make_moe(), step=i)
@@ -116,9 +123,7 @@ class TestImbalanceWarnings:
         assert "Severe routing imbalance" in caplog.text
 
     def test_moderate_imbalance_warns(self, logger, caplog):
-        mon = MoEMonitor(
-            logger, warmup=3, imbalance_warn=3.0, imbalance_severe=10.0, cooldown=0
-        )
+        mon = MoEMonitor(logger, warmup=3, imbalance_warn=3.0, imbalance_severe=10.0, cooldown=0)
         for i in range(3):
             mon.step(_make_moe(), step=i)
         with caplog.at_level(logging.WARNING):
@@ -136,9 +141,7 @@ class TestImbalanceWarnings:
 
 class TestUtilizationWarnings:
     def test_critical_utilization_warns(self, logger, caplog):
-        mon = MoEMonitor(
-            logger, warmup=3, utilization_critical=0.5, cooldown=0
-        )
+        mon = MoEMonitor(logger, warmup=3, utilization_critical=0.5, cooldown=0)
         for i in range(3):
             mon.step(_make_moe(), step=i)
         with caplog.at_level(logging.WARNING):
@@ -146,9 +149,7 @@ class TestUtilizationWarnings:
         assert "Expert collapse" in caplog.text
 
     def test_low_utilization_warns(self, logger, caplog):
-        mon = MoEMonitor(
-            logger, warmup=3, utilization_warn=0.8, utilization_critical=0.5, cooldown=0
-        )
+        mon = MoEMonitor(logger, warmup=3, utilization_warn=0.8, utilization_critical=0.5, cooldown=0)
         for i in range(3):
             mon.step(_make_moe(), step=i)
         with caplog.at_level(logging.WARNING):
@@ -165,9 +166,7 @@ class TestUtilizationWarnings:
 
 class TestAuxLossSpikeWarning:
     def test_spike_detected(self, logger, caplog):
-        mon = MoEMonitor(
-            logger, warmup=5, aux_loss_spike_sigma=2.0, cooldown=0
-        )
+        mon = MoEMonitor(logger, warmup=5, aux_loss_spike_sigma=2.0, cooldown=0)
         # Stable aux_loss
         for i in range(10):
             mon.step(_make_moe(aux_loss=0.01), step=i)
@@ -187,9 +186,7 @@ class TestAuxLossSpikeWarning:
 
 class TestCooldown:
     def test_cooldown_suppresses_repeated_warnings(self, logger, caplog):
-        mon = MoEMonitor(
-            logger, warmup=3, imbalance_severe=5.0, cooldown=50
-        )
+        mon = MoEMonitor(logger, warmup=3, imbalance_severe=5.0, cooldown=50)
         for i in range(3):
             mon.step(_make_moe(), step=i)
         with caplog.at_level(logging.WARNING):
@@ -199,9 +196,7 @@ class TestCooldown:
         assert len(warnings) == 1
 
     def test_warning_repeats_after_cooldown(self, logger, caplog):
-        mon = MoEMonitor(
-            logger, warmup=3, imbalance_severe=5.0, cooldown=10
-        )
+        mon = MoEMonitor(logger, warmup=3, imbalance_severe=5.0, cooldown=10)
         for i in range(3):
             mon.step(_make_moe(), step=i)
         with caplog.at_level(logging.WARNING):

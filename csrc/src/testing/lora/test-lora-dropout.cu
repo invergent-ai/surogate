@@ -56,7 +56,7 @@ bool vectors_different(const std::vector<float>& a, const std::vector<float>& b)
     return false;
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("LoRA dropout - zero dropout is no-op", "[lora][dropout]") {
     const int N = 1024;

@@ -25,18 +25,18 @@ struct SelectiveExpertInfo;
  */
 struct MoEGroupedContext {
     // Input/State tensors (from base model)
-    const Tensor* expert_offsets;   ///< (num_experts + 1) int
-    const Tensor* permuted_input;    ///< (total_tokens, C)
-    const Tensor* expert_gate_up;    ///< (total_tokens, 2*D) output of base projection (Saved for backward)
-    const Tensor* expert_outputs;    ///< (total_tokens, C) output of base down projection
-    const Tensor* expert_indices;    ///< (BT, top_k) int - router-selected expert indices for each token
+    const Tensor* expert_offsets;  ///< (num_experts + 1) int
+    const Tensor* permuted_input;  ///< (total_tokens, C)
+    const Tensor* expert_gate_up;  ///< (total_tokens, 2*D) output of base projection (Saved for backward)
+    const Tensor* expert_outputs;  ///< (total_tokens, C) output of base down projection
+    const Tensor* expert_indices;  ///< (BT, top_k) int - router-selected expert indices for each token
 
     // Gradient tensors (during backward)
     const Tensor* d_expert_outputs;  ///< (total_tokens, C) gradient w.r.t expert outputs
     const Tensor* d_expert_gate_up;  ///< (total_tokens, 2*D) gradient w.r.t gate_up
     Tensor* d_permuted_input;        ///< (total_tokens, C) gradient w.r.t permuted input
 
-    const int* host_offsets;        ///< Cached expert offsets on host
+    const int* host_offsets;  ///< Cached expert offsets on host
     int num_experts;
     int top_k;
     int total_tokens;
@@ -117,9 +117,8 @@ struct SelectiveExpertInfo {
 // Inline Implementation
 // ============================================================================
 
-inline void SelectiveExpertInfo::build_from_router_output(
-    const Tensor& expert_indices, int num_experts, cudaStream_t stream)
-{
+inline void
+SelectiveExpertInfo::build_from_router_output(const Tensor& expert_indices, int num_experts, cudaStream_t stream) {
     // Get dimensions
     const int BT = expert_indices.Sizes[0];
     const int top_k = expert_indices.Sizes[1];
@@ -127,9 +126,11 @@ inline void SelectiveExpertInfo::build_from_router_output(
 
     // Copy expert indices from device to host
     std::vector<int> host_indices(total_selections);
-    cudaMemcpyAsync(host_indices.data(), expert_indices.get<int>(),
+    cudaMemcpyAsync(host_indices.data(),
+                    expert_indices.get<int>(),
                     total_selections * sizeof(int),
-                    cudaMemcpyDeviceToHost, stream);
+                    cudaMemcpyDeviceToHost,
+                    stream);
     cudaStreamSynchronize(stream);
 
     // Find unique experts using a set
@@ -159,11 +160,11 @@ inline void SelectiveExpertInfo::build_from_router_output(
  * LoRA to add its contribution to the router logits before softmax.
  */
 struct MoERouterContext {
-    Tensor* logits;           ///< (B*T, num_experts) router logits to modify in-place
-    const Tensor* input;      ///< (B*T, hidden_size) input to router (ln2 output)
+    Tensor* logits;       ///< (B*T, num_experts) router logits to modify in-place
+    const Tensor* input;  ///< (B*T, hidden_size) input to router (ln2 output)
     int num_experts;
     int hidden_size;
-    bool handled = false;     ///< Set to true if hook handled the computation
+    bool handled = false;  ///< Set to true if hook handled the computation
 };
 
 /**
@@ -178,14 +179,14 @@ struct MoERouterContext {
  *   d_lora_A = B^T @ d_logits^T @ input
  */
 struct MoERouterBackwardContext {
-    const Tensor* d_logits;   ///< (B*T, num_experts) FP32 gradient w.r.t router logits
-    const Tensor* input;      ///< (B*T, hidden_size) input to router (ln2 output, BF16)
+    const Tensor* d_logits;  ///< (B*T, num_experts) FP32 gradient w.r.t router logits
+    const Tensor* input;     ///< (B*T, hidden_size) input to router (ln2 output, BF16)
     int num_experts;
     int hidden_size;
-    int BT;                   ///< Batch * Sequence length (total tokens)
-    bool handled = false;     ///< Set to true if hook handled the computation
+    int BT;                ///< Batch * Sequence length (total tokens)
+    bool handled = false;  ///< Set to true if hook handled the computation
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_MOE_MOE_TYPES_H
+#endif  // SUROGATE_SRC_MODULES_MOE_MOE_TYPES_H

@@ -17,6 +17,6 @@ namespace dsl {
 // Returns nullptr if no mapping is defined.
 std::unique_ptr<modules::BaseWeightMapping> build_weight_mapping(const Module& module);
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_WEIGHT_MAPPING_H
+#endif  // SUROGATE_SRC_DSL_WEIGHT_MAPPING_H

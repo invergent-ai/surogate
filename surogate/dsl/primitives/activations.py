@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
 from ..decorators import primitive, save
+from ..tensor_type import Tensor
 
 
 @primitive(impl="kernels.swiglu")
-def swiglu(x: Tensor["*", "2M"]) -> Tensor["*", "M"]:
+def swiglu(x: Tensor["*", "2M"]) -> Tensor["*", M]:
     """SwiGLU activation: silu(gate) * up where x = [gate, up]."""
     ...
 
@@ -15,7 +15,7 @@ def swiglu(x: Tensor["*", "2M"]) -> Tensor["*", "M"]:
 @swiglu.backward
 @save("x")
 def swiglu_backward(
-    d_out: Tensor["*", "M"],
+    d_out: Tensor["*", M],
     x: Tensor["*", "2M"],
 ) -> Tensor["*", "2M"]:
     """Backward pass for SwiGLU."""

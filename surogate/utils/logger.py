@@ -1,11 +1,11 @@
+import inspect
+import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime
 from importlib.util import find_spec
 from pathlib import Path
-import logging
-import inspect
-from typing import Optional, Any
+from typing import Any
 
 logging.captureWarnings(True)
 
@@ -14,60 +14,62 @@ info_set = set()
 warning_set = set()
 DEFAULT_LOG_DIR = Path("logs")
 
+
 # ANSI color codes
 class Colors:
     """ANSI color codes for terminal output."""
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
-    ITALIC = '\033[3m'
-    UNDERLINE = '\033[4m'
+
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+    UNDERLINE = "\033[4m"
 
     # Foreground colors
-    BLACK = '\033[30m'
-    RED = '\033[31m'
-    GREEN = '\033[32m'
-    YELLOW = '\033[33m'
-    BLUE = '\033[34m'
-    MAGENTA = '\033[35m'
-    CYAN = '\033[36m'
-    WHITE = '\033[37m'
+    BLACK = "\033[30m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
 
     # Bright foreground colors
-    BRIGHT_BLACK = '\033[90m'
-    BRIGHT_RED = '\033[91m'
-    BRIGHT_GREEN = '\033[92m'
-    BRIGHT_YELLOW = '\033[93m'
-    BRIGHT_BLUE = '\033[94m'
-    BRIGHT_MAGENTA = '\033[95m'
-    BRIGHT_CYAN = '\033[96m'
-    BRIGHT_WHITE = '\033[97m'
+    BRIGHT_BLACK = "\033[90m"
+    BRIGHT_RED = "\033[91m"
+    BRIGHT_GREEN = "\033[92m"
+    BRIGHT_YELLOW = "\033[93m"
+    BRIGHT_BLUE = "\033[94m"
+    BRIGHT_MAGENTA = "\033[95m"
+    BRIGHT_CYAN = "\033[96m"
+    BRIGHT_WHITE = "\033[97m"
 
     # Background colors
-    BG_BLACK = '\033[40m'
-    BG_RED = '\033[41m'
-    BG_GREEN = '\033[42m'
-    BG_YELLOW = '\033[43m'
-    BG_BLUE = '\033[44m'
-    BG_MAGENTA = '\033[45m'
-    BG_CYAN = '\033[46m'
-    BG_WHITE = '\033[47m'
+    BG_BLACK = "\033[40m"
+    BG_RED = "\033[41m"
+    BG_GREEN = "\033[42m"
+    BG_YELLOW = "\033[43m"
+    BG_BLUE = "\033[44m"
+    BG_MAGENTA = "\033[45m"
+    BG_CYAN = "\033[46m"
+    BG_WHITE = "\033[47m"
 
     # Bright background colors
-    BG_BRIGHT_BLACK = '\033[100m'
-    BG_BRIGHT_RED = '\033[101m'
-    BG_BRIGHT_GREEN = '\033[102m'
-    BG_BRIGHT_YELLOW = '\033[103m'
-    BG_BRIGHT_BLUE = '\033[104m'
-    BG_BRIGHT_MAGENTA = '\033[105m'
-    BG_BRIGHT_CYAN = '\033[106m'
-    BG_BRIGHT_WHITE = '\033[107m'
+    BG_BRIGHT_BLACK = "\033[100m"
+    BG_BRIGHT_RED = "\033[101m"
+    BG_BRIGHT_GREEN = "\033[102m"
+    BG_BRIGHT_YELLOW = "\033[103m"
+    BG_BRIGHT_BLUE = "\033[104m"
+    BG_BRIGHT_MAGENTA = "\033[105m"
+    BG_BRIGHT_CYAN = "\033[106m"
+    BG_BRIGHT_WHITE = "\033[107m"
 
 
 class ColoredFormatter(logging.Formatter):
     """Formatter that preserves ANSI color codes and adds timestamps."""
 
-    def __init__(self, fmt='%(message)s', datefmt='%H:%M:%S'):
+    def __init__(self, fmt="%(message)s", datefmt="%H:%M:%S"):
         super().__init__(fmt, datefmt)
 
     def formatMessage(self, record):
@@ -77,15 +79,15 @@ class ColoredFormatter(logging.Formatter):
         message = self.formatMessage(record)
 
         # Add timestamp if configured
-        if hasattr(self, '_show_timestamp') and self._show_timestamp:
+        if hasattr(self, "_show_timestamp") and self._show_timestamp:
             timestamp = self.formatTime(record, self.datefmt)
             colored_timestamp = f"{Colors.DIM}{timestamp}{Colors.RESET}"
 
             # Handle multi-line messages
-            if '\n' in message:
-                lines = message.split('\n')
+            if "\n" in message:
+                lines = message.split("\n")
                 # Only add timestamp to first line
-                return f"{colored_timestamp} {lines[0]}\n" + '\n'.join(lines[1:])
+                return f"{colored_timestamp} {lines[0]}\n" + "\n".join(lines[1:])
             else:
                 return f"{colored_timestamp} {message}"
 
@@ -109,7 +111,6 @@ class LoggerWrapper:
         lineno = frame.f_lineno
         return f"{color}{Colors.ITALIC}[{filename}:{lineno}]{Colors.RESET} "
 
-
     def getEffectiveLevel(self):
         return self._logger.getEffectiveLevel()
 
@@ -126,10 +127,9 @@ class LoggerWrapper:
         colored_msg = f"{prefix} {self._add_location(Colors.BRIGHT_CYAN)}{Colors.WHITE}{msg}{Colors.RESET}"
         self._logger.info(colored_msg, *args, exc_info=exc_info, **kwargs)
 
-
     def info_once(self, msg: str, **kwargs):
         """Log info message only once."""
-        hash_id = kwargs.get('hash_id') or msg
+        hash_id = kwargs.get("hash_id") or msg
         if hash_id in info_set:
             return
         info_set.add(hash_id)
@@ -142,7 +142,7 @@ class LoggerWrapper:
 
     def debug_once(self, msg: str, **kwargs):
         """Log info message only once."""
-        hash_id = kwargs.get('hash_id') or msg
+        hash_id = kwargs.get("hash_id") or msg
         if hash_id in info_set:
             return
         info_set.add(hash_id)
@@ -165,7 +165,7 @@ class LoggerWrapper:
 
     def warning_once(self, msg: str, **kwargs):
         """Log warning message only once."""
-        hash_id = kwargs.get('hash_id') or msg
+        hash_id = kwargs.get("hash_id") or msg
         if hash_id in warning_set:
             return
         warning_set.add(hash_id)
@@ -222,7 +222,9 @@ class LoggerWrapper:
 
     def metric(self, name: str, value: Any, unit: str = "", *args, **kwargs):
         """Log a metric with special formatting."""
-        metric_msg = f"{Colors.BRIGHT_CYAN}📊 {name}:{Colors.RESET} {Colors.BRIGHT_GREEN}{Colors.BOLD}{value}{Colors.RESET}"
+        metric_msg = (
+            f"{Colors.BRIGHT_CYAN}📊 {name}:{Colors.RESET} {Colors.BRIGHT_GREEN}{Colors.BOLD}{value}{Colors.RESET}"
+        )
         if unit:
             metric_msg += f" {Colors.DIM}{unit}{Colors.RESET}"
         self._logger.info(metric_msg, *args, **kwargs)
@@ -240,7 +242,9 @@ class LoggerWrapper:
 
         metric_parts = []
         for name, value, unit in zip(names, values, units):
-            metric_str = f"{Colors.BRIGHT_CYAN}{name}:{Colors.RESET} {Colors.BRIGHT_GREEN}{Colors.BOLD}{value}{Colors.RESET}"
+            metric_str = (
+                f"{Colors.BRIGHT_CYAN}{name}:{Colors.RESET} {Colors.BRIGHT_GREEN}{Colors.BOLD}{value}{Colors.RESET}"
+            )
             if unit:
                 metric_str += f" {Colors.DIM}{unit}{Colors.RESET}"
             metric_parts.append(metric_str)
@@ -248,7 +252,6 @@ class LoggerWrapper:
         separator = f" {Colors.DIM}|{Colors.RESET} "
         metrics_msg = f"{Colors.BRIGHT_CYAN}📊{Colors.RESET} " + separator.join(metric_parts)
         self._logger.info(metrics_msg, *args, **kwargs)
-
 
     def step(self, step_num: int, total: int, msg: str, *args, **kwargs):
         """Log a step in a process."""
@@ -270,13 +273,14 @@ class LoggerWrapper:
     def addFilter(self, filter):
         pass
 
+
 def get_logger(
-        name: Optional[str] = None,
-        log_file: Optional[str] = None,
-        log_level: Optional[int] = None,
-        file_mode: str = 'w',
-        enable_file_logging: bool = False,
-        show_timestamp: bool = True  # NEW: control timestamps
+    name: str | None = None,
+    log_file: str | None = None,
+    log_level: int | None = None,
+    file_mode: str = "w",
+    enable_file_logging: bool = False,
+    show_timestamp: bool = True,  # NEW: control timestamps
 ):
     """Get logging logger with vibrant color support
 
@@ -290,10 +294,10 @@ def get_logger(
     """
 
     if log_level is None:
-        log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+        log_level = os.getenv("LOG_LEVEL", "INFO").upper()
         log_level = getattr(logging, log_level, logging.INFO)
 
-    logger_name = (name or __name__).split('.')[0]
+    logger_name = (name or __name__).split(".")[0]
     logger = logging.getLogger(logger_name)
     logger.propagate = False
 
@@ -329,7 +333,7 @@ def get_logger(
 
     # Use ColoredFormatter with or without timestamp
     if show_timestamp:
-        colored_formatter = ColoredFormatter(datefmt='%Y-%m-%d %H:%M:%S')  # ← CHANGED HERE
+        colored_formatter = ColoredFormatter(datefmt="%Y-%m-%d %H:%M:%S")  # ← CHANGED HERE
         colored_formatter._show_timestamp = True
     else:
         colored_formatter = ColoredFormatter()
@@ -350,6 +354,7 @@ def get_logger(
     wrapper = LoggerWrapper(logger)
     return wrapper
 
+
 @contextmanager
 def logger_context(logger, log_level):
     origin_log_level = logger.level
@@ -365,21 +370,22 @@ def add_file_handler_if_needed(logger, log_file, file_mode, log_level):
         if isinstance(handler, logging.FileHandler):
             return
 
-    if find_spec('torch') is not None:
-        is_worker0 = int(os.getenv('LOCAL_RANK', -1)) in {-1, 0}
+    if find_spec("torch") is not None:
+        is_worker0 = int(os.getenv("LOCAL_RANK", -1)) in {-1, 0}
     else:
         is_worker0 = True
 
     if is_worker0 and log_file is not None:
         file_handler = logging.FileHandler(log_file, file_mode)
-        file_handler.setFormatter(ColoredFormatter('%(message)s'))
+        file_handler.setFormatter(ColoredFormatter("%(message)s"))
         file_handler.setLevel(log_level)
         logger.addHandler(file_handler)
 
 
 def _is_local_master():
-    local_rank = int(os.getenv('LOCAL_RANK', -1))
+    local_rank = int(os.getenv("LOCAL_RANK", -1))
     return local_rank in {-1, 0}
+
 
 def _is_from_libraries():
     frame = inspect.currentframe()
@@ -387,54 +393,66 @@ def _is_from_libraries():
         # Go up the stack to find the actual caller (skip wrapper frames)
         caller_frame = frame.f_back
         while caller_frame:
-            caller_module = caller_frame.f_globals.get('__name__', '')
+            caller_module = caller_frame.f_globals.get("__name__", "")
             # Check if we're still in the logger wrapper
             if not caller_module.startswith(__name__):
                 break
             caller_frame = caller_frame.f_back
 
-        if caller_module.startswith('transformers') or caller_module.startswith('datasets') or caller_module.startswith('huggingface_hub'):
+        if (
+            caller_module.startswith("transformers")
+            or caller_module.startswith("datasets")
+            or caller_module.startswith("huggingface_hub")
+        ):
             return True
     finally:
         del frame  # Avoid reference cycles
 
     return False
 
+
 # Create module-level logger
 logger = get_logger()
 
-os.environ['HF_HUB_VERBOSITY'] = 'error'
+os.environ["HF_HUB_VERBOSITY"] = "error"
 
 # Monkey-patch library loggers lazily — deferred until those libraries are actually imported.
 # This avoids importing transformers/datasets/huggingface_hub at startup.
 _patched_libs = set()
 
+
 def _patch_library_loggers():
     """Patch library loggers once they are imported. Called lazily."""
     import sys
-    if 'huggingface_hub' not in _patched_libs and 'huggingface_hub' in sys.modules:
-        _patched_libs.add('huggingface_hub')
+
+    if "huggingface_hub" not in _patched_libs and "huggingface_hub" in sys.modules:
+        _patched_libs.add("huggingface_hub")
         import huggingface_hub
+
         huggingface_hub.logging.get_logger = get_logger
         huggingface_hub.utils.logging.get_logger = get_logger
 
-    if 'transformers' not in _patched_libs and 'transformers.utils.logging' in sys.modules:
-        _patched_libs.add('transformers')
+    if "transformers" not in _patched_libs and "transformers.utils.logging" in sys.modules:
+        _patched_libs.add("transformers")
         import transformers.utils.logging
+
         transformers.utils.logging.get_logger = get_logger
 
-    if 'datasets' not in _patched_libs and 'datasets' in sys.modules:
-        _patched_libs.add('datasets')
+    if "datasets" not in _patched_libs and "datasets" in sys.modules:
+        _patched_libs.add("datasets")
         import datasets
+
         datasets.utils.logging.get_logger = get_logger
 
 
 # Install an import hook that patches library loggers when they are first imported.
 import sys
 
+
 class _LoggerPatchFinder:
     """Meta path finder that patches library loggers after import."""
-    _target_modules = frozenset(['huggingface_hub', 'transformers', 'datasets'])
+
+    _target_modules = frozenset(["huggingface_hub", "transformers", "datasets"])
 
     def find_module(self, fullname, path=None):
         if fullname in self._target_modules:
@@ -453,13 +471,14 @@ class _LoggerPatchFinder:
         _patch_library_loggers()
         return sys.modules[fullname]
 
+
 sys.meta_path.append(_LoggerPatchFinder())
 
 
 # Test the logger if run directly
 if __name__ == "__main__":
     # Clear any existing logger first
-    logger_name = __name__.split('.')[0]
+    logger_name = __name__.split(".")[0]
     if logger_name in init_loggers:
         del init_loggers[logger_name]
         logging.getLogger(logger_name).handlers.clear()
@@ -482,9 +501,7 @@ if __name__ == "__main__":
     test_logger.metric("Latency", "45", "ms")
     test_logger.metric("Throughput", "1000", "req/s")
     test_logger.metrics(
-        names=["Accuracy", "Latency", "Throughput"],
-        values=["95.3%", "45", "1000"],
-        units=["", "ms", "req/s"]
+        names=["Accuracy", "Latency", "Throughput"], values=["95.3%", "45", "1000"], units=["", "ms", "req/s"]
     )
 
     test_logger.separator()

@@ -34,8 +34,9 @@ public:
     //! large area of memory from the underlying `DeviceMemoryStack`.
     //! Returns the backing tensor that must be kept alive for the lifetime of all allocated tensors.
     Tensor commit(DeviceMemoryStack& storage, const char* name);
+
 private:
     std::vector<Tensor*> mTargets;
 };
 
-#endif //SUROGATE_SRC_UTILITIES_LAZY_ALLOCATOR_H
+#endif  //SUROGATE_SRC_UTILITIES_LAZY_ALLOCATOR_H

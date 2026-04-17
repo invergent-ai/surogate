@@ -1,20 +1,20 @@
 import asyncio
 import dataclasses
+import multiprocessing as mp
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
-
-import yaml
 from pathlib import Path
 
+import yaml
+
 from surogate.grpo.orchestrator.advantage import compute_advantages
-from surogate.grpo.utils.asynyc_utils import safe_cancel
 from surogate.grpo.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from surogate.grpo.orchestrator.event_loop_lag import EventLoopLagMonitor
 from surogate.grpo.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
 from surogate.grpo.orchestrator.trajectories import interleave_rollout
 from surogate.grpo.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
+from surogate.grpo.utils.asynyc_utils import safe_cancel
 from surogate.grpo.utils.pathing import get_log_dir
 
 # This monkey patch is necessary to avoid Pydantic validating fields using typing.Iterable (e.g. in multimodal or tool call messages) lazily which leads to tokenization errors, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1249
@@ -29,9 +29,9 @@ import pandas as pd
 import verifiers as vf
 from transformers import AutoProcessor, AutoTokenizer
 
+from surogate.core.config.grpo_orch_config import GRPOBufferConfig, GRPOOrchestratorConfig
 from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.grpo.orchestrator.ckpt import Progress, setup_ckpt_manager
-from surogate.core.config.grpo_orch_config import GRPOBufferConfig, GRPOOrchestratorConfig
 from surogate.grpo.orchestrator.eval_utils import evaluate_env
 from surogate.grpo.orchestrator.filters import apply_filters, setup_filters
 from surogate.grpo.orchestrator.scheduler import Scheduler
@@ -94,6 +94,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
     class _QuotedDumper(yaml.SafeDumper):
         """YAML dumper that quotes all string values."""
+
         pass
 
     _QuotedDumper.add_representer(
@@ -101,6 +102,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     )
 
     import json
+
     config_data = json.loads(json.dumps(dataclasses.asdict(config), default=str))
     with open(config_dir / "orch.yaml", "w") as f:
         yaml.dump(config_data, f, Dumper=_QuotedDumper)
@@ -145,9 +147,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     processor = None
     if is_vlm:
         logger.info(f"Loading VLM processor for {config.model.name}")
-        processor = AutoProcessor.from_pretrained(
-            config.model.name, trust_remote_code=True, use_fast=True
-        )
+        processor = AutoProcessor.from_pretrained(config.model.name, trust_remote_code=True, use_fast=True)
 
     # Build rollout filters
     rollout_filters = setup_filters(config.filters, vocab_size=tokenizer.vocab_size)
@@ -174,7 +174,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         env_names=train_env_names,
         map_kwargs=dict(writer_batch_size=1),  # set defensively to not error on map operations on large datasets
     )
-    
+
     verification_enabled = config.verification.enabled
     train_env_deferred_group_scoring_tasks = (
         {env_name for env_name in train_env_names if task_uses_group_scoring(train_env_group, env_name)}
@@ -193,7 +193,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             f"Deferred group scoring enabled for training tasks: {deferred_tasks}. "
             "Rollouts run individually and are scored once each group completes."
         )
-    
 
     train_env_addresses = []
     env_processes: list[mp.Process] = []
@@ -356,7 +355,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         else:
             # Allow eval at resumed step by setting prev_ckpt_step one behind
             prev_ckpt_step = scheduler.ckpt_step - 1
-            
+
         # In NCCL mode, skip existence check - weights are broadcasted, not stored on disk
         check_exists = config.weight_broadcast.type != "nccl"
         wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else None
@@ -420,7 +419,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 interval=config.eval.interval,
                 eval_base_model=config.eval.eval_base_model,
             )
-            
+
         if eval_ckpt_step is not None:
             last_eval_step = ckpt_step
             if eval_ckpt_step != ckpt_step:
@@ -460,7 +459,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
         # Update prev_ckpt_step for next iteration
         prev_ckpt_step = ckpt_step
-        
+
         # Schedule generating the training batch
         temperature = compute_temperature(progress.step, config.sampling, config.max_steps)
         sampling_args = get_sampling_args(config.sampling, temperature=temperature)
@@ -514,10 +513,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             return interleave_rollout(rollout)
 
         loop = asyncio.get_event_loop()
-        futures = [
-            loop.run_in_executor(rollout_executor, process_rollout, r) 
-            for _, r in enumerate(train_rollouts)
-        ]
+        futures = [loop.run_in_executor(rollout_executor, process_rollout, r) for _, r in enumerate(train_rollouts)]
         results = await asyncio.gather(*futures)
 
         # Collect results and assign advantages
@@ -759,7 +755,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             },
             step=progress.step,
         )
-        
+
         # Flush all accumulated metrics for this step
         monitor.flush(step=progress.step)
 
@@ -828,7 +824,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         if process.is_alive():
             process.kill()
         process.join(timeout=5)
-            
+
     logger.success("Orchestrator finished.")
 
     # Optionally, print benchmark table
@@ -839,4 +835,3 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 def grpo_orchestrator(config: GRPOOrchestratorConfig):
     """Main entry-point for orchestrator."""
     asyncio.run(orchestrate(config))
-

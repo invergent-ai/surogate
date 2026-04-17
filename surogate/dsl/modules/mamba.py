@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import math
 
-from ..tensor_type import Tensor
-from ..decorators import module, forward, Param
+from ..decorators import Param, forward, module
+from ..dim import B, Dim, T
 from ..graph_builder import graph
-from ..dim import Dim, B, T
+from ..tensor_type import Tensor
 
 
 @module
@@ -87,15 +87,15 @@ class Mamba2Mixer:
         self.projection_size = self.intermediate_size + self.conv_dim + mamba_num_heads
 
         # Typed dimensions
-        self.C = Dim("C")           # d_model
-        self.I = Dim("I")           # intermediate_size
-        self.H = Dim("H")           # mamba_num_heads
-        self.D = Dim("D")           # mamba_head_dim
-        self.N = Dim("N")           # ssm_state_size
-        self.G = Dim("G")           # n_groups
-        self.K = Dim("K")           # conv_kernel
-        self.P = Dim("P")           # projection_size
-        self.D_conv = Dim("D_conv") # conv_dim
+        self.C = Dim("C")  # d_model
+        self.I = Dim("I")  # intermediate_size
+        self.H = Dim("H")  # mamba_num_heads
+        self.D = Dim("D")  # mamba_head_dim
+        self.N = Dim("N")  # ssm_state_size
+        self.G = Dim("G")  # n_groups
+        self.K = Dim("K")  # conv_kernel
+        self.P = Dim("P")  # projection_size
+        self.D_conv = Dim("D_conv")  # conv_dim
 
     # Input projection
     in_proj_weight = Param(Tensor["P", "C"])
@@ -106,9 +106,9 @@ class Mamba2Mixer:
     conv_bias = Param(Tensor["D_conv"], when="use_conv_bias")
 
     # SSM parameters
-    A_log = Param(Tensor["H"])            # Log of state decay (negative for stability)
-    D_param = Param(Tensor["H"])          # Skip connection weight
-    dt_bias = Param(Tensor["H"])          # Time step bias
+    A_log = Param(Tensor["H"])  # Log of state decay (negative for stability)
+    D_param = Param(Tensor["H"])  # Skip connection weight
+    dt_bias = Param(Tensor["H"])  # Time step bias
 
     # Gated RMSNorm
     gated_norm_weight = Param(Tensor["I"], quantizable=False)
@@ -118,7 +118,7 @@ class Mamba2Mixer:
     out_proj_bias = Param(Tensor["C"], when="use_bias")
 
     @forward
-    def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
+    def forward(self, x: Tensor[B, T, C]) -> Tensor[B, T, C]:
         """Forward pass through Mamba2 mixer.
 
         Args:
@@ -162,7 +162,12 @@ class Mamba2Mixer:
 
             # State Space Model scan
             ssm_out, ssm_state = g.mamba_ssm_scan(
-                hidden_states, dt, "A_log", ssm_B, ssm_C, "D_param",
+                hidden_states,
+                dt,
+                "A_log",
+                ssm_B,
+                ssm_C,
+                "D_param",
                 dt_bias="dt_bias",
                 dt_softplus=True,
                 dt_min=self.time_step_limit[0],
@@ -179,7 +184,9 @@ class Mamba2Mixer:
 
             # Gated RMSNorm
             gated_out = g.mamba_gated_rmsnorm(
-                ssm_out_flat, gate, "gated_norm_weight",
+                ssm_out_flat,
+                gate,
+                "gated_norm_weight",
                 eps=self.eps,
                 group_size=self.intermediate_size // self.n_groups,
             )
@@ -235,7 +242,7 @@ class SimpleMLP:
     down_bias = Param(Tensor["C"], when="use_bias")
 
     @forward
-    def forward(self, x: Tensor["B", "T", "C"]) -> Tensor["B", "T", "C"]:
+    def forward(self, x: Tensor[B, T, C]) -> Tensor[B, T, C]:
         """Forward pass.
 
         Args:

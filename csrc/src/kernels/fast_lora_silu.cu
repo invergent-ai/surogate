@@ -46,12 +46,13 @@
  * @param N Number of tokens.
  * @param D Intermediate dimension.
  */
-template<typename floatX>
+template <typename floatX>
 __global__ void silu_mul_forward_kernel(floatX* __restrict__ h,
                                         const floatX* __restrict__ e,
                                         const floatX* __restrict__ g,
-                                        int N, int D) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+                                        int N,
+                                        int D) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     const int total = N * D;
     const int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
@@ -100,13 +101,14 @@ __global__ void silu_mul_forward_kernel(floatX* __restrict__ h,
  * @param N Number of tokens.
  * @param D Intermediate dimension.
  */
-template<typename floatX>
+template <typename floatX>
 __global__ void silu_mul_backward_inplace_kernel(floatX* __restrict__ e,
-                                                  floatX* __restrict__ g,
-                                                  const floatX* __restrict__ dh,
-                                                  floatX* __restrict__ h_out,
-                                                  int N, int D) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+                                                 floatX* __restrict__ g,
+                                                 const floatX* __restrict__ dh,
+                                                 floatX* __restrict__ h_out,
+                                                 int N,
+                                                 int D) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     const int total = N * D;
     const int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
@@ -187,12 +189,13 @@ __global__ void silu_mul_backward_inplace_kernel(floatX* __restrict__ e,
  * @param N Number of tokens.
  * @param D Intermediate dimension.
  */
-template<typename floatX>
+template <typename floatX>
 __global__ void split_gate_up_kernel(const floatX* __restrict__ gate_up,
                                      floatX* __restrict__ up,
                                      floatX* __restrict__ gate,
-                                     int N, int D) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+                                     int N,
+                                     int D) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     // Each thread handles one vector in the output
     const int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
@@ -225,12 +228,13 @@ __global__ void split_gate_up_kernel(const floatX* __restrict__ gate_up,
  * @param N Number of tokens.
  * @param D Intermediate dimension.
  */
-template<typename floatX>
+template <typename floatX>
 __global__ void concat_d_gate_up_kernel(const floatX* __restrict__ dg,
                                         const floatX* __restrict__ de,
                                         floatX* __restrict__ d_gate_up,
-                                        int N, int D) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+                                        int N,
+                                        int D) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     const int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (idx >= N * D) return;
@@ -252,11 +256,12 @@ __global__ void concat_d_gate_up_kernel(const floatX* __restrict__ dg,
 /**
  * @brief Split interleaved gate_up = [gate0, up0, gate1, up1, ...] into up and gate.
  */
-template<typename floatX>
+template <typename floatX>
 __global__ void split_gate_up_interleaved_kernel(const floatX* __restrict__ gate_up,
                                                  floatX* __restrict__ up,
                                                  floatX* __restrict__ gate,
-                                                 int N, int D) {
+                                                 int N,
+                                                 int D) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * D;
     if (idx >= total) return;
@@ -268,11 +273,12 @@ __global__ void split_gate_up_interleaved_kernel(const floatX* __restrict__ gate
 /**
  * @brief Add interleaved gate/up contributions into gate_up in-place.
  */
-template<typename floatX>
+template <typename floatX>
 __global__ void add_gate_up_interleaved_kernel(floatX* __restrict__ gate_up,
                                                const floatX* __restrict__ up,
                                                const floatX* __restrict__ gate,
-                                               int N, int D) {
+                                               int N,
+                                               int D) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * D;
     if (idx >= total) return;
@@ -281,20 +287,18 @@ __global__ void add_gate_up_interleaved_kernel(floatX* __restrict__ gate_up,
     gate_up[base + 1] += up[idx];
 }
 
-template<typename floatX>
-__global__ void add_gate_up_interleaved_gate_kernel(floatX* __restrict__ gate_up,
-                                                    const floatX* __restrict__ gate,
-                                                    int N, int D) {
+template <typename floatX>
+__global__ void
+add_gate_up_interleaved_gate_kernel(floatX* __restrict__ gate_up, const floatX* __restrict__ gate, int N, int D) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * D;
     if (idx >= total) return;
     gate_up[idx * 2] += gate[idx];
 }
 
-template<typename floatX>
-__global__ void add_gate_up_interleaved_up_kernel(floatX* __restrict__ gate_up,
-                                                  const floatX* __restrict__ up,
-                                                  int N, int D) {
+template <typename floatX>
+__global__ void
+add_gate_up_interleaved_up_kernel(floatX* __restrict__ gate_up, const floatX* __restrict__ up, int N, int D) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * D;
     if (idx >= total) return;
@@ -305,10 +309,9 @@ __global__ void add_gate_up_interleaved_up_kernel(floatX* __restrict__ gate_up,
 // Kernel launchers
 // ============================================================================
 
-template<typename floatX>
-void silu_mul_forward_impl(floatX* h, const floatX* e, const floatX* g,
-                           int N, int D, cudaStream_t stream) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+template <typename floatX>
+void silu_mul_forward_impl(floatX* h, const floatX* e, const floatX* g, int N, int D, cudaStream_t stream) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     const int total = N * D;
     const int block_size = 256;
@@ -319,20 +322,23 @@ void silu_mul_forward_impl(floatX* h, const floatX* e, const floatX* g,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void silu_mul_forward(nv_bfloat16* h, const nv_bfloat16* e, const nv_bfloat16* g,
-                      int N, int D, cudaStream_t stream) {
+void silu_mul_forward(nv_bfloat16* h, const nv_bfloat16* e, const nv_bfloat16* g, int N, int D, cudaStream_t stream) {
     silu_mul_forward_impl(h, e, g, N, D, stream);
 }
 
-void silu_mul_forward(float* h, const float* e, const float* g,
-                      int N, int D, cudaStream_t stream) {
+void silu_mul_forward(float* h, const float* e, const float* g, int N, int D, cudaStream_t stream) {
     silu_mul_forward_impl(h, e, g, N, D, stream);
 }
 
-template<typename floatX>
-void silu_mul_backward_inplace_impl(floatX* e, floatX* g, const floatX* dh, floatX* h_out,
-                                     int N, int D, cudaStream_t stream) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+template <typename floatX>
+void silu_mul_backward_inplace_impl(floatX* e,
+                                    floatX* g,
+                                    const floatX* dh,
+                                    floatX* h_out,
+                                    int N,
+                                    int D,
+                                    cudaStream_t stream) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     const int total = N * D;
     const int block_size = 256;
@@ -343,20 +349,23 @@ void silu_mul_backward_inplace_impl(floatX* e, floatX* g, const floatX* dh, floa
     CUDA_CHECK(cudaGetLastError());
 }
 
-void silu_mul_backward_inplace(nv_bfloat16* e, nv_bfloat16* g, const nv_bfloat16* dh,
-                                nv_bfloat16* h_out, int N, int D, cudaStream_t stream) {
+void silu_mul_backward_inplace(nv_bfloat16* e,
+                               nv_bfloat16* g,
+                               const nv_bfloat16* dh,
+                               nv_bfloat16* h_out,
+                               int N,
+                               int D,
+                               cudaStream_t stream) {
     silu_mul_backward_inplace_impl(e, g, dh, h_out, N, D, stream);
 }
 
-void silu_mul_backward_inplace(float* e, float* g, const float* dh,
-                                float* h_out, int N, int D, cudaStream_t stream) {
+void silu_mul_backward_inplace(float* e, float* g, const float* dh, float* h_out, int N, int D, cudaStream_t stream) {
     silu_mul_backward_inplace_impl(e, g, dh, h_out, N, D, stream);
 }
 
-template<typename floatX>
-void split_gate_up_impl(const floatX* gate_up, floatX* up, floatX* gate,
-                        int N, int D, cudaStream_t stream) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+template <typename floatX>
+void split_gate_up_impl(const floatX* gate_up, floatX* up, floatX* gate, int N, int D, cudaStream_t stream) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     const int total = N * D;
     const int block_size = 256;
@@ -367,20 +376,17 @@ void split_gate_up_impl(const floatX* gate_up, floatX* up, floatX* gate,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void split_gate_up(const nv_bfloat16* gate_up, nv_bfloat16* up, nv_bfloat16* gate,
-                   int N, int D, cudaStream_t stream) {
+void split_gate_up(const nv_bfloat16* gate_up, nv_bfloat16* up, nv_bfloat16* gate, int N, int D, cudaStream_t stream) {
     split_gate_up_impl(gate_up, up, gate, N, D, stream);
 }
 
-void split_gate_up(const float* gate_up, float* up, float* gate,
-                   int N, int D, cudaStream_t stream) {
+void split_gate_up(const float* gate_up, float* up, float* gate, int N, int D, cudaStream_t stream) {
     split_gate_up_impl(gate_up, up, gate, N, D, stream);
 }
 
-template<typename floatX>
-void concat_d_gate_up_impl(const floatX* dg, const floatX* de, floatX* d_gate_up,
-                           int N, int D, cudaStream_t stream) {
-    using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
+template <typename floatX>
+void concat_d_gate_up_impl(const floatX* dg, const floatX* de, floatX* d_gate_up, int N, int D, cudaStream_t stream) {
+    using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
 
     const int total = N * D;
     const int block_size = 256;
@@ -391,19 +397,21 @@ void concat_d_gate_up_impl(const floatX* dg, const floatX* de, floatX* d_gate_up
     CUDA_CHECK(cudaGetLastError());
 }
 
-void concat_d_gate_up(const nv_bfloat16* dg, const nv_bfloat16* de, nv_bfloat16* d_gate_up,
-                      int N, int D, cudaStream_t stream) {
+void concat_d_gate_up(const nv_bfloat16* dg,
+                      const nv_bfloat16* de,
+                      nv_bfloat16* d_gate_up,
+                      int N,
+                      int D,
+                      cudaStream_t stream) {
     concat_d_gate_up_impl(dg, de, d_gate_up, N, D, stream);
 }
 
-void concat_d_gate_up(const float* dg, const float* de, float* d_gate_up,
-                      int N, int D, cudaStream_t stream) {
+void concat_d_gate_up(const float* dg, const float* de, float* d_gate_up, int N, int D, cudaStream_t stream) {
     concat_d_gate_up_impl(dg, de, d_gate_up, N, D, stream);
 }
 
 // Tensor overloads
-void silu_mul_forward(Tensor& h, const Tensor& e, const Tensor& g,
-                      int N, int D, cudaStream_t stream) {
+void silu_mul_forward(Tensor& h, const Tensor& e, const Tensor& g, int N, int D, cudaStream_t stream) {
     assert(e.DType == g.DType && e.DType == h.DType);
     if (e.DType == ETensorDType::BF16) {
         silu_mul_forward(h.get<nv_bfloat16>(), e.get<nv_bfloat16>(), g.get<nv_bfloat16>(), N, D, stream);
@@ -414,28 +422,35 @@ void silu_mul_forward(Tensor& h, const Tensor& e, const Tensor& g,
     }
 }
 
-void silu_mul_backward_inplace(Tensor& e, Tensor& g, const Tensor& dh,
-                                Tensor* h_out, int N, int D, cudaStream_t stream) {
+void silu_mul_backward_inplace(Tensor& e,
+                               Tensor& g,
+                               const Tensor& dh,
+                               Tensor* h_out,
+                               int N,
+                               int D,
+                               cudaStream_t stream) {
     assert(e.DType == g.DType && e.DType == dh.DType);
     if (e.DType == ETensorDType::BF16) {
         nv_bfloat16* h_ptr = h_out ? h_out->get<nv_bfloat16>() : nullptr;
-        silu_mul_backward_inplace(e.get<nv_bfloat16>(), g.get<nv_bfloat16>(),
-                                   dh.get<nv_bfloat16>(), h_ptr, N, D, stream);
+        silu_mul_backward_inplace(e.get<nv_bfloat16>(),
+                                  g.get<nv_bfloat16>(),
+                                  dh.get<nv_bfloat16>(),
+                                  h_ptr,
+                                  N,
+                                  D,
+                                  stream);
     } else if (e.DType == ETensorDType::FP32) {
         float* h_ptr = h_out ? h_out->get<float>() : nullptr;
-        silu_mul_backward_inplace(e.get<float>(), g.get<float>(),
-                                   dh.get<float>(), h_ptr, N, D, stream);
+        silu_mul_backward_inplace(e.get<float>(), g.get<float>(), dh.get<float>(), h_ptr, N, D, stream);
     } else {
         throw std::runtime_error("silu_mul_backward_inplace: unsupported dtype");
     }
 }
 
-void split_gate_up(const Tensor& gate_up, Tensor& up, Tensor& gate,
-                   int N, int D, cudaStream_t stream) {
+void split_gate_up(const Tensor& gate_up, Tensor& up, Tensor& gate, int N, int D, cudaStream_t stream) {
     assert(gate_up.DType == up.DType && gate_up.DType == gate.DType);
     if (gate_up.DType == ETensorDType::BF16) {
-        split_gate_up(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(),
-                      gate.get<nv_bfloat16>(), N, D, stream);
+        split_gate_up(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(), gate.get<nv_bfloat16>(), N, D, stream);
     } else if (gate_up.DType == ETensorDType::FP32) {
         split_gate_up(gate_up.get<float>(), up.get<float>(), gate.get<float>(), N, D, stream);
     } else {
@@ -443,33 +458,38 @@ void split_gate_up(const Tensor& gate_up, Tensor& up, Tensor& gate,
     }
 }
 
-template<typename floatX>
-static void split_gate_up_interleaved_impl(const floatX* gate_up, floatX* up, floatX* gate,
-                                           int N, int D, cudaStream_t stream) {
+template <typename floatX>
+static void
+split_gate_up_interleaved_impl(const floatX* gate_up, floatX* up, floatX* gate, int N, int D, cudaStream_t stream) {
     const int total = N * D;
     if (total <= 0) return;
     const int block_size = 256;
     const int grid_size = (total + block_size - 1) / block_size;
-    split_gate_up_interleaved_kernel<<<grid_size, block_size, 0, stream>>>(
-        gate_up, up, gate, N, D);
+    split_gate_up_interleaved_kernel<<<grid_size, block_size, 0, stream>>>(gate_up, up, gate, N, D);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void split_gate_up_interleaved(const nv_bfloat16* gate_up, nv_bfloat16* up, nv_bfloat16* gate,
-                               int N, int D, cudaStream_t stream) {
+void split_gate_up_interleaved(const nv_bfloat16* gate_up,
+                               nv_bfloat16* up,
+                               nv_bfloat16* gate,
+                               int N,
+                               int D,
+                               cudaStream_t stream) {
     split_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
 }
 
-void split_gate_up_interleaved(const float* gate_up, float* up, float* gate,
-                               int N, int D, cudaStream_t stream) {
+void split_gate_up_interleaved(const float* gate_up, float* up, float* gate, int N, int D, cudaStream_t stream) {
     split_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
 }
 
-void split_gate_up_interleaved(const Tensor& gate_up, Tensor& up, Tensor& gate,
-                               int N, int D, cudaStream_t stream) {
+void split_gate_up_interleaved(const Tensor& gate_up, Tensor& up, Tensor& gate, int N, int D, cudaStream_t stream) {
     if (gate_up.DType == ETensorDType::BF16) {
-        split_gate_up_interleaved(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(),
-                                  gate.get<nv_bfloat16>(), N, D, stream);
+        split_gate_up_interleaved(gate_up.get<nv_bfloat16>(),
+                                  up.get<nv_bfloat16>(),
+                                  gate.get<nv_bfloat16>(),
+                                  N,
+                                  D,
+                                  stream);
     } else if (gate_up.DType == ETensorDType::FP32) {
         split_gate_up_interleaved(gate_up.get<float>(), up.get<float>(), gate.get<float>(), N, D, stream);
     } else {
@@ -477,33 +497,38 @@ void split_gate_up_interleaved(const Tensor& gate_up, Tensor& up, Tensor& gate,
     }
 }
 
-template<typename floatX>
-static void add_gate_up_interleaved_impl(floatX* gate_up, const floatX* up, const floatX* gate,
-                                         int N, int D, cudaStream_t stream) {
+template <typename floatX>
+static void
+add_gate_up_interleaved_impl(floatX* gate_up, const floatX* up, const floatX* gate, int N, int D, cudaStream_t stream) {
     const int total = N * D;
     if (total <= 0) return;
     const int block_size = 256;
     const int grid_size = (total + block_size - 1) / block_size;
-    add_gate_up_interleaved_kernel<<<grid_size, block_size, 0, stream>>>(
-        gate_up, up, gate, N, D);
+    add_gate_up_interleaved_kernel<<<grid_size, block_size, 0, stream>>>(gate_up, up, gate, N, D);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void add_gate_up_interleaved(nv_bfloat16* gate_up, const nv_bfloat16* up, const nv_bfloat16* gate,
-                             int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved(nv_bfloat16* gate_up,
+                             const nv_bfloat16* up,
+                             const nv_bfloat16* gate,
+                             int N,
+                             int D,
+                             cudaStream_t stream) {
     add_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
 }
 
-void add_gate_up_interleaved(float* gate_up, const float* up, const float* gate,
-                             int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved(float* gate_up, const float* up, const float* gate, int N, int D, cudaStream_t stream) {
     add_gate_up_interleaved_impl(gate_up, up, gate, N, D, stream);
 }
 
-void add_gate_up_interleaved(Tensor& gate_up, const Tensor& up, const Tensor& gate,
-                             int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved(Tensor& gate_up, const Tensor& up, const Tensor& gate, int N, int D, cudaStream_t stream) {
     if (gate_up.DType == ETensorDType::BF16) {
-        add_gate_up_interleaved(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(),
-                                gate.get<nv_bfloat16>(), N, D, stream);
+        add_gate_up_interleaved(gate_up.get<nv_bfloat16>(),
+                                up.get<nv_bfloat16>(),
+                                gate.get<nv_bfloat16>(),
+                                N,
+                                D,
+                                stream);
     } else if (gate_up.DType == ETensorDType::FP32) {
         add_gate_up_interleaved(gate_up.get<float>(), up.get<float>(), gate.get<float>(), N, D, stream);
     } else {
@@ -511,30 +536,25 @@ void add_gate_up_interleaved(Tensor& gate_up, const Tensor& up, const Tensor& ga
     }
 }
 
-template<typename floatX>
-static void add_gate_up_interleaved_gate_impl(floatX* gate_up, const floatX* gate,
-                                              int N, int D, cudaStream_t stream) {
+template <typename floatX>
+static void add_gate_up_interleaved_gate_impl(floatX* gate_up, const floatX* gate, int N, int D, cudaStream_t stream) {
     const int total = N * D;
     if (total <= 0) return;
     const int block_size = 256;
     const int grid_size = (total + block_size - 1) / block_size;
-    add_gate_up_interleaved_gate_kernel<<<grid_size, block_size, 0, stream>>>(
-        gate_up, gate, N, D);
+    add_gate_up_interleaved_gate_kernel<<<grid_size, block_size, 0, stream>>>(gate_up, gate, N, D);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void add_gate_up_interleaved_gate(nv_bfloat16* gate_up, const nv_bfloat16* gate,
-                                  int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved_gate(nv_bfloat16* gate_up, const nv_bfloat16* gate, int N, int D, cudaStream_t stream) {
     add_gate_up_interleaved_gate_impl(gate_up, gate, N, D, stream);
 }
 
-void add_gate_up_interleaved_gate(float* gate_up, const float* gate,
-                                  int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved_gate(float* gate_up, const float* gate, int N, int D, cudaStream_t stream) {
     add_gate_up_interleaved_gate_impl(gate_up, gate, N, D, stream);
 }
 
-void add_gate_up_interleaved_gate(Tensor& gate_up, const Tensor& gate,
-                                  int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved_gate(Tensor& gate_up, const Tensor& gate, int N, int D, cudaStream_t stream) {
     if (gate_up.DType == ETensorDType::BF16) {
         add_gate_up_interleaved_gate(gate_up.get<nv_bfloat16>(), gate.get<nv_bfloat16>(), N, D, stream);
     } else if (gate_up.DType == ETensorDType::FP32) {
@@ -544,30 +564,25 @@ void add_gate_up_interleaved_gate(Tensor& gate_up, const Tensor& gate,
     }
 }
 
-template<typename floatX>
-static void add_gate_up_interleaved_up_impl(floatX* gate_up, const floatX* up,
-                                            int N, int D, cudaStream_t stream) {
+template <typename floatX>
+static void add_gate_up_interleaved_up_impl(floatX* gate_up, const floatX* up, int N, int D, cudaStream_t stream) {
     const int total = N * D;
     if (total <= 0) return;
     const int block_size = 256;
     const int grid_size = (total + block_size - 1) / block_size;
-    add_gate_up_interleaved_up_kernel<<<grid_size, block_size, 0, stream>>>(
-        gate_up, up, N, D);
+    add_gate_up_interleaved_up_kernel<<<grid_size, block_size, 0, stream>>>(gate_up, up, N, D);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void add_gate_up_interleaved_up(nv_bfloat16* gate_up, const nv_bfloat16* up,
-                                int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved_up(nv_bfloat16* gate_up, const nv_bfloat16* up, int N, int D, cudaStream_t stream) {
     add_gate_up_interleaved_up_impl(gate_up, up, N, D, stream);
 }
 
-void add_gate_up_interleaved_up(float* gate_up, const float* up,
-                                int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved_up(float* gate_up, const float* up, int N, int D, cudaStream_t stream) {
     add_gate_up_interleaved_up_impl(gate_up, up, N, D, stream);
 }
 
-void add_gate_up_interleaved_up(Tensor& gate_up, const Tensor& up,
-                                int N, int D, cudaStream_t stream) {
+void add_gate_up_interleaved_up(Tensor& gate_up, const Tensor& up, int N, int D, cudaStream_t stream) {
     if (gate_up.DType == ETensorDType::BF16) {
         add_gate_up_interleaved_up(gate_up.get<nv_bfloat16>(), up.get<nv_bfloat16>(), N, D, stream);
     } else if (gate_up.DType == ETensorDType::FP32) {
@@ -577,12 +592,10 @@ void add_gate_up_interleaved_up(Tensor& gate_up, const Tensor& up,
     }
 }
 
-void concat_d_gate_up(const Tensor& dg, const Tensor& de, Tensor& d_gate_up,
-                      int N, int D, cudaStream_t stream) {
+void concat_d_gate_up(const Tensor& dg, const Tensor& de, Tensor& d_gate_up, int N, int D, cudaStream_t stream) {
     assert(dg.DType == de.DType && dg.DType == d_gate_up.DType);
     if (dg.DType == ETensorDType::BF16) {
-        concat_d_gate_up(dg.get<nv_bfloat16>(), de.get<nv_bfloat16>(),
-                         d_gate_up.get<nv_bfloat16>(), N, D, stream);
+        concat_d_gate_up(dg.get<nv_bfloat16>(), de.get<nv_bfloat16>(), d_gate_up.get<nv_bfloat16>(), N, D, stream);
     } else if (dg.DType == ETensorDType::FP32) {
         concat_d_gate_up(dg.get<float>(), de.get<float>(), d_gate_up.get<float>(), N, D, stream);
     } else {

@@ -54,21 +54,21 @@ def _rebuild_tensor_from_ipc(ipc_info: dict[str, Any]) -> torch.Tensor:
         raise ValueError(f"Unknown dtype: {ipc_info['torch_dtype']}")
 
     tensor = rebuild_cuda_tensor(
-        torch.Tensor,                          # tensor_cls
-        tuple(ipc_info["tensor_size"]),         # tensor_size
-        tuple(ipc_info["tensor_stride"]),       # tensor_stride
-        ipc_info["tensor_offset"],              # tensor_offset
-        torch.storage.TypedStorage,             # storage_cls
-        torch_dtype,                            # dtype
-        ipc_info["storage_device"],             # storage_device
-        ipc_info["storage_handle"],             # storage_handle
-        ipc_info["storage_size_bytes"],         # storage_size_bytes
-        ipc_info["storage_offset_bytes"],       # storage_offset_bytes
-        ipc_info["requires_grad"],              # requires_grad
-        ipc_info["ref_counter_handle"],         # ref_counter_handle
-        ipc_info["ref_counter_offset"],         # ref_counter_offset
-        ipc_info["event_handle"],               # event_handle
-        ipc_info["event_sync_required"],        # event_sync_required
+        torch.Tensor,  # tensor_cls
+        tuple(ipc_info["tensor_size"]),  # tensor_size
+        tuple(ipc_info["tensor_stride"]),  # tensor_stride
+        ipc_info["tensor_offset"],  # tensor_offset
+        torch.storage.TypedStorage,  # storage_cls
+        torch_dtype,  # dtype
+        ipc_info["storage_device"],  # storage_device
+        ipc_info["storage_handle"],  # storage_handle
+        ipc_info["storage_size_bytes"],  # storage_size_bytes
+        ipc_info["storage_offset_bytes"],  # storage_offset_bytes
+        ipc_info["requires_grad"],  # requires_grad
+        ipc_info["ref_counter_handle"],  # ref_counter_handle
+        ipc_info["ref_counter_offset"],  # ref_counter_offset
+        ipc_info["event_handle"],  # event_handle
+        ipc_info["event_sync_required"],  # event_sync_required
     )
 
     # Keep reference to prevent GC (which would unmap the IPC memory)
@@ -176,6 +176,5 @@ def extract_vllm_weights_via_ipc(
             logger.warning(f"Failed to reconstruct IPC tensor for {entry.get('name', '?')}: {e}")
             continue
 
-    logger.info(f"Reconstructed {len(external_weights)} CUDA IPC weight tensors "
-                f"({len(ipc_entries)} from worker)")
+    logger.info(f"Reconstructed {len(external_weights)} CUDA IPC weight tensors ({len(ipc_entries)} from worker)")
     return external_weights

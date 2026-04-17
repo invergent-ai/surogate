@@ -55,8 +55,8 @@ BATCH = 1
 SEQ_LEN = 16
 # Use cosine similarity (direction) as primary metric — robust to signal
 # magnitude differences across layers.  Relative RMS as secondary check.
-COS_TOL = 0.999       # cosine similarity threshold
-REL_RMS_TOL = 0.05    # relative RMS diff / signal RMS
+COS_TOL = 0.999  # cosine similarity threshold
+REL_RMS_TOL = 0.05  # relative RMS diff / signal RMS
 
 DUMP_DIR = Path("tmp/onboarding_gemma4_dumps")
 
@@ -64,6 +64,7 @@ DUMP_DIR = Path("tmp/onboarding_gemma4_dumps")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_model_path() -> Path:
     """Resolve the path to Gemma4 weights."""
@@ -103,7 +104,7 @@ def load_dump(name: str) -> np.ndarray:
     return data.reshape(shape)
 
 
-def diff_stats(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, float]:
+def diff_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
     a_f = a.astype(np.float32).ravel()
     b_f = b.astype(np.float32).ravel()
     diff = a_f - b_f
@@ -116,7 +117,7 @@ def diff_stats(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, float]:
     return cos, rel_rms, rms
 
 
-def make_inputs(vocab_size: int) -> Dict[str, np.ndarray]:
+def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     inputs = rng.integers(0, vocab_size, size=(BATCH, SEQ_LEN), dtype=np.int32)
     targets = inputs.copy()
@@ -151,7 +152,8 @@ def _get_hf_model_internals(model):
 # HuggingFace forward — uses hooks for reliable per-layer capture
 # ---------------------------------------------------------------------------
 
-def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]:
+
+def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]:
     """Run HF forward and capture per-layer outputs via hooks.
 
     Captures:
@@ -162,6 +164,7 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     hidden state after the first residual add + attention, before MLP).
     """
     from transformers import AutoModelForCausalLM
+
     model = AutoModelForCausalLM.from_pretrained(
         str(model_dir),
         dtype=torch.bfloat16,
@@ -173,9 +176,9 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
     core, layers, final_norm, lm_head = _get_hf_model_internals(model)
     num_layers = len(layers)
 
-    result: Dict[str, np.ndarray] = {}
-    layer_outs: Dict[int, torch.Tensor] = {}
-    mid_states: Dict[int, torch.Tensor] = {}
+    result: dict[str, np.ndarray] = {}
+    layer_outs: dict[int, torch.Tensor] = {}
+    mid_states: dict[int, torch.Tensor] = {}
     hooks = []
 
     for i in range(num_layers):
@@ -184,7 +187,9 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
             def hook_fn(module, args, output):
                 hs = output[0] if isinstance(output, tuple) else output
                 layer_outs[idx] = hs.detach().clone()
+
             return hook_fn
+
         hooks.append(layers[i].register_forward_hook(make_layer_hook(i)))
 
         # Pre-hook on pre_feedforward_layernorm: captures mid-layer state
@@ -194,12 +199,10 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
                 mid_states[idx] = hs.detach().clone()
+
             return hook_fn
-        hooks.append(
-            layers[i].pre_feedforward_layernorm.register_forward_pre_hook(
-                make_mid_hook(i)
-            )
-        )
+
+        hooks.append(layers[i].pre_feedforward_layernorm.register_forward_pre_hook(make_mid_hook(i)))
 
     with torch.no_grad():
         input_ids = torch.tensor(inputs, dtype=torch.long)
@@ -238,8 +241,8 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> Dict[str, np.ndarray]
 # Surogate forward
 # ---------------------------------------------------------------------------
 
-def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
-                         targets: np.ndarray, num_layers: int) -> None:
+
+def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarray, num_layers: int) -> None:
     """Run Surogate forward pass and dump tensors to DUMP_DIR.
 
     Dumpable tensors for Gemma4:
@@ -275,9 +278,10 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
         shard_gradients=True,
         use_zero_copy=False,
     )
+    from surogate.dsl import models as _  # noqa: F401 - register models
     from surogate.dsl.ir_builder import resolve_architecture
     from surogate.dsl.py_compiler import compile_model_for_hf
-    from surogate.dsl import models as _  # noqa: F401 - register models
+
     arch = resolve_architecture(hf_config)
     opts.dsl_ir_json = compile_model_for_hf(arch, hf_config)
 
@@ -314,6 +318,7 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray,
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def model_dir():
     snapshot = resolve_model_path()
@@ -326,6 +331,7 @@ def model_dir():
 def nopli_model_dir(model_dir):
     """Create a temp dir with PLI disabled (config override + symlinked weights)."""
     import tempfile
+
     hf_config = json.loads((model_dir / "config.json").read_text())
     tc = hf_config.get("text_config", hf_config)
     tc["hidden_size_per_layer_input"] = 0
@@ -358,6 +364,7 @@ def forward_results(model_dir, nopli_model_dir):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestGemma4Onboarding:
     """Per-layer forward comparison: Surogate vs HuggingFace."""
 
@@ -383,9 +390,7 @@ class TestGemma4Onboarding:
             hf_mid = hf[f"mid_state_{i}"]
             cos, rel_rms, abs_rms = diff_stats(rt_res_attn, hf_mid)
             if cos < COS_TOL:
-                failures.append(
-                    f"layer {i}: cos={cos:.6f} rel_rms={rel_rms:.4e} (cos_tol={COS_TOL})"
-                )
+                failures.append(f"layer {i}: cos={cos:.6f} rel_rms={rel_rms:.4e} (cos_tol={COS_TOL})")
 
         if failures:
             pytest.fail("Per-layer mid-state mismatches:\n" + "\n".join(failures))
@@ -395,9 +400,7 @@ class TestGemma4Onboarding:
         hf = forward_results
         rt_xf = load_dump("xF")
         cos, rel_rms, abs_rms = diff_stats(rt_xf, hf["post_norm"])
-        assert cos > COS_TOL, (
-            f"xF (final norm output) cos={cos:.6f} rel_rms={rel_rms:.4e}"
-        )
+        assert cos > COS_TOL, f"xF (final norm output) cos={cos:.6f} rel_rms={rel_rms:.4e}"
 
     def test_residual_final(self, forward_results):
         """Check that residual_final (before final norm) matches HF pre-norm."""
@@ -409,15 +412,13 @@ class TestGemma4Onboarding:
             pytest.skip("residual_final dump not available")
 
         cos, rel_rms, abs_rms = diff_stats(rt_residual_final, hf["pre_norm"])
-        assert cos > COS_TOL, (
-            f"residual_final cos={cos:.6f} rel_rms={rel_rms:.4e}"
-        )
+        assert cos > COS_TOL, f"residual_final cos={cos:.6f} rel_rms={rel_rms:.4e}"
 
     def test_summary(self, forward_results):
         """Print a summary table of all comparisons (informational)."""
         hf = forward_results
         num_layers = hf["_num_layers"]
-        rows: List[Tuple[str, float, float, float]] = []
+        rows: list[tuple[str, float, float, float]] = []
 
         for i in range(num_layers - 1):
             try:

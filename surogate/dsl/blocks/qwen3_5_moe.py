@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from .. import nn
+from ..dim import B, Dim, T
 from ..nn import (
     QWEN3_5_MOE_ATTN_BLOCK_REMAP,
     QWEN3_5_MOE_LINEAR_BLOCK_REMAP,
 )
-from ..dim import B, T, Dim
 
 
 class Qwen3_5MoEAttentionBlock(nn.Block):
@@ -66,15 +66,24 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
 
         self.attn_norm = nn.RMSNormPlus1(d_model, eps=eps)
         self.self_attn = nn.Qwen3_5Attention(
-            d_model, num_query_heads, num_kv_heads, head_size,
-            max_seq, use_qkv_bias=use_qkv_bias, eps=eps,
+            d_model,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            max_seq,
+            use_qkv_bias=use_qkv_bias,
+            eps=eps,
             partial_rotary_factor=partial_rotary_factor,
             mrope_section=mrope_section,
         )
         self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
         self.moe = nn.MoEExpertsGated(
-            d_model, d_ff, num_experts, num_experts_per_tok,
-            norm_topk_prob=False, ep_size=ep_size,
+            d_model,
+            d_ff,
+            num_experts,
+            num_experts_per_tok,
+            norm_topk_prob=False,
+            ep_size=ep_size,
         )
         self.shared_expert = nn.MoESharedExpert(d_model, shared_expert_intermediate)
 
@@ -92,14 +101,14 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
         # Shared expert with sigmoid gate
         shared_out = self.shared_expert(h_flat)
         self._register_param("shared_expert_gate_proj_weight", (1, "C"))
-        shared_gate = self._matmul(h_flat, "shared_expert_gate_proj_weight",
-                                   name="shared_expert_gate_proj")
+        shared_gate = self._matmul(h_flat, "shared_expert_gate_proj_weight", name="shared_expert_gate_proj")
         shared_gate = self._sigmoid(shared_gate, name="shared_expert_gate_sigmoid")
         shared_out = self._mul(shared_out, shared_gate, name="shared_expert_gated")
         moe_out = self._add(moe_out, shared_out, name="moe_combined")
         # Register output slot and reshape back
         self._register_activation(
-            "mlp_down", ("B", "T", "C"),
+            "mlp_down",
+            ("B", "T", "C"),
             aliases=["mlp_down_flat"],
             share_policy="per_layer",
             description="MoE output (block output)",
@@ -148,8 +157,7 @@ class Qwen3_5MoELinearBlock(nn.Block):
 
         if linear_num_value_heads % linear_num_key_heads != 0:
             raise ValueError(
-                "Qwen3_5MoELinearBlock requires linear_num_value_heads to be "
-                "divisible by linear_num_key_heads"
+                "Qwen3_5MoELinearBlock requires linear_num_value_heads to be divisible by linear_num_key_heads"
             )
 
         # Derived dimensions for shape resolution
@@ -177,8 +185,12 @@ class Qwen3_5MoELinearBlock(nn.Block):
         )
         self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
         self.moe = nn.MoEExpertsGated(
-            d_model, d_ff, num_experts, num_experts_per_tok,
-            norm_topk_prob=False, ep_size=ep_size,
+            d_model,
+            d_ff,
+            num_experts,
+            num_experts_per_tok,
+            norm_topk_prob=False,
+            ep_size=ep_size,
         )
         self.shared_expert = nn.MoESharedExpert(d_model, shared_expert_intermediate)
 
@@ -198,14 +210,14 @@ class Qwen3_5MoELinearBlock(nn.Block):
         # Shared expert with sigmoid gate
         shared_out = self.shared_expert(h_flat)
         self._register_param("shared_expert_gate_proj_weight", (1, "C"))
-        shared_gate = self._matmul(h_flat, "shared_expert_gate_proj_weight",
-                                   name="shared_expert_gate_proj")
+        shared_gate = self._matmul(h_flat, "shared_expert_gate_proj_weight", name="shared_expert_gate_proj")
         shared_gate = self._sigmoid(shared_gate, name="shared_expert_gate_sigmoid")
         shared_out = self._mul(shared_out, shared_gate, name="shared_expert_gated")
         moe_out = self._add(moe_out, shared_out, name="moe_combined")
         # Register output slot and reshape back
         self._register_activation(
-            "mlp_down", ("B", "T", "C"),
+            "mlp_down",
+            ("B", "T", "C"),
             aliases=["mlp_down_flat"],
             share_policy="per_layer",
             description="MoE output (block output)",

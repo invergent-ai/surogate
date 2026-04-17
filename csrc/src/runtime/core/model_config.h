@@ -23,38 +23,38 @@ namespace modules {
  * @brief Architecture types supported by the modular model system
  */
 enum class ArchitectureType {
-    Dense,      ///< Standard dense transformer (LLaMA, Qwen, etc.)
-    MoE,        ///< Mixture of Experts (Mixtral, DeepSeek, etc.)
-    Hybrid      ///< Some layers dense, some MoE (Nemotron, etc.)
+    Dense,  ///< Standard dense transformer (LLaMA, Qwen, etc.)
+    MoE,    ///< Mixture of Experts (Mixtral, DeepSeek, etc.)
+    Hybrid  ///< Some layers dense, some MoE (Nemotron, etc.)
 };
 
 /**
  * @brief Activation function types
  */
 enum class ActivationType {
-    SwiGLU,     ///< SiLU-gated linear unit (LLaMA, Qwen)
-    GeGLU,      ///< GELU-gated linear unit
-    ReLU,       ///< Rectified Linear Unit
-    GeLU,       ///< Gaussian Error Linear Unit
-    SiLU,       ///< Sigmoid Linear Unit (Swish)
-    ReLU2       ///< ReLU^2 (Nemotron-H)
+    SwiGLU,  ///< SiLU-gated linear unit (LLaMA, Qwen)
+    GeGLU,   ///< GELU-gated linear unit
+    ReLU,    ///< Rectified Linear Unit
+    GeLU,    ///< Gaussian Error Linear Unit
+    SiLU,    ///< Sigmoid Linear Unit (Swish)
+    ReLU2    ///< ReLU^2 (Nemotron-H)
 };
 
 /**
  * @brief Normalization types
  */
 enum class NormType {
-    RMSNorm,    ///< Root Mean Square normalization (LLaMA, Qwen)
-    LayerNorm   ///< Standard Layer Normalization
+    RMSNorm,   ///< Root Mean Square normalization (LLaMA, Qwen)
+    LayerNorm  ///< Standard Layer Normalization
 };
 
 /**
  * @brief Attention types
  */
 enum class AttentionType {
-    MHA,        ///< Multi-Head Attention
-    GQA,        ///< Grouped Query Attention
-    MQA         ///< Multi-Query Attention
+    MHA,  ///< Multi-Head Attention
+    GQA,  ///< Grouped Query Attention
+    MQA   ///< Multi-Query Attention
 };
 
 /**
@@ -68,51 +68,51 @@ inline constexpr bool is_gated_activation(ActivationType type) {
  * @brief MoE configuration for MoE/Hybrid architectures
  */
 struct MoEConfig {
-    int num_experts = 8;            ///< Total number of experts
-    int top_k = 2;                  ///< Number of experts to route to per token
-    bool use_shared_expert = false; ///< Nemotron/DeepSeek shared expert
-    int shared_expert_size = 0;     ///< Size of shared expert (0 = same as regular)
+    int num_experts = 8;                 ///< Total number of experts
+    int top_k = 2;                       ///< Number of experts to route to per token
+    bool use_shared_expert = false;      ///< Nemotron/DeepSeek shared expert
+    int shared_expert_size = 0;          ///< Size of shared expert (0 = same as regular)
     float router_aux_loss_coef = 0.01f;  ///< Load balancing auxiliary loss coefficient
     float router_z_loss_coef = 0.001f;   ///< Router z-loss (logit regularization) coefficient
-    bool router_jitter = false;     ///< Add noise during routing for training stability
-    float capacity_factor = 1.25f;  ///< Expert capacity factor for load balancing
+    bool router_jitter = false;          ///< Add noise during routing for training stability
+    float capacity_factor = 1.25f;       ///< Expert capacity factor for load balancing
 
     // Nemotron/DeepSeek-style router options
-    bool use_sigmoid = false;       ///< Use sigmoid scores (instead of softmax) before top-k
-    float routed_scaling_factor = 1.0f; ///< Scale factor for routed expert weights
-    int n_group = 1;                ///< Number of routing groups (Nemotron)
-    int topk_group = 1;             ///< Number of groups selected per token
+    bool use_sigmoid = false;            ///< Use sigmoid scores (instead of softmax) before top-k
+    float routed_scaling_factor = 1.0f;  ///< Scale factor for routed expert weights
+    int n_group = 1;                     ///< Number of routing groups (Nemotron)
+    int topk_group = 1;                  ///< Number of groups selected per token
 
     // Qwen3 MoE-style layer configuration
-    int decoder_sparse_step = 1;    ///< MoE layer frequency: MoE every N layers (1 = all MoE)
-    std::vector<int> mlp_only_layers; ///< Explicit list of layer indices using dense MLP instead of MoE
-    bool norm_topk_prob = false;    ///< Normalize top-k routing weights to sum to 1 (Qwen3 style)
-    int moe_intermediate_size = 0;  ///< Per-expert intermediate size (0 = use IntermediateSize)
+    int decoder_sparse_step = 1;       ///< MoE layer frequency: MoE every N layers (1 = all MoE)
+    std::vector<int> mlp_only_layers;  ///< Explicit list of layer indices using dense MLP instead of MoE
+    bool norm_topk_prob = false;       ///< Normalize top-k routing weights to sum to 1 (Qwen3 style)
+    int moe_intermediate_size = 0;     ///< Per-expert intermediate size (0 = use IntermediateSize)
 };
 
 /**
  * @brief Block types for heterogeneous architectures
  */
 enum class BlockType {
-    Dense,       ///< Standard dense transformer block
-    Attention,   ///< Attention-only block (single norm + attention + residual)
-    MLP,         ///< MLP-only block (single norm + MLP + residual)
-    Mamba,       ///< Mamba/SSM block (single norm + SSM + residual)
-    MoE,         ///< Mixture of Experts block
-    Conv,        ///< Convolutional block (for LFM2)
-    SwitchMoE    ///< Switch Transformer style (top-1 routing)
+    Dense,      ///< Standard dense transformer block
+    Attention,  ///< Attention-only block (single norm + attention + residual)
+    MLP,        ///< MLP-only block (single norm + MLP + residual)
+    Mamba,      ///< Mamba/SSM block (single norm + SSM + residual)
+    MoE,        ///< Mixture of Experts block
+    Conv,       ///< Convolutional block (for LFM2)
+    SwitchMoE   ///< Switch Transformer style (top-1 routing)
 };
 
 /**
  * @brief Per-layer configuration override for hybrid architectures
  */
 struct LayerOverride {
-    int layer_idx;                          ///< Which layer this override applies to
-    BlockType block_type = BlockType::Dense; ///< Block type for this layer
-    bool is_moe = false;                    ///< Whether this layer uses MoE (deprecated, use block_type)
-    std::optional<int> num_experts;         ///< Override number of experts for this layer
-    std::optional<int> intermediate_size;   ///< Override intermediate size
-    std::optional<int> top_k;               ///< Override top-k for MoE layers
+    int layer_idx;                            ///< Which layer this override applies to
+    BlockType block_type = BlockType::Dense;  ///< Block type for this layer
+    bool is_moe = false;                      ///< Whether this layer uses MoE (deprecated, use block_type)
+    std::optional<int> num_experts;           ///< Override number of experts for this layer
+    std::optional<int> intermediate_size;     ///< Override intermediate size
+    std::optional<int> top_k;                 ///< Override top-k for MoE layers
 
     // Convenience constructors
     static LayerOverride dense(int idx) {
@@ -186,24 +186,24 @@ struct ModelConfig : public PretrainedConfig {
     int MambaConvKernel = 0;
     int MambaNGroups = 1;
     int MambaChunkSize = 0;
-    int MambaIntermediateSize = 0; ///< Optional explicit Mamba intermediate size (0 = use IntermediateSize)
+    int MambaIntermediateSize = 0;  ///< Optional explicit Mamba intermediate size (0 = use IntermediateSize)
     bool MambaUseBias = false;
     bool MambaUseConvBias = false;
     ActivationType MambaActivation = ActivationType::SiLU;
 
     // MoE convenience fields (copied from moe_config for direct access)
     // These are populated by from_pretrained_config when moe_config is set
-    int NumExperts = 0;              ///< Number of experts (0 = dense model)
-    int NumExpertsPerTok = 0;        ///< Top-K experts per token
-    int MoeIntermediateSize = 0;     ///< Per-expert intermediate size
+    int NumExperts = 0;           ///< Number of experts (0 = dense model)
+    int NumExpertsPerTok = 0;     ///< Top-K experts per token
+    int MoeIntermediateSize = 0;  ///< Per-expert intermediate size
 
     // Expert Parallelism (EP) configuration
-    int EPSize = 1;                  ///< Number of GPUs per expert group (1 = no EP)
-    int NumLocalExperts = 0;         ///< Experts on this GPU (NumExperts / EPSize)
+    int EPSize = 1;           ///< Number of GPUs per expert group (1 = no EP)
+    int NumLocalExperts = 0;  ///< Experts on this GPU (NumExperts / EPSize)
 
     // Extended RoPE configuration
-    float rope_scaling_factor = 1.0f;    ///< RoPE scaling for longer contexts
-    std::string rope_type = "default";   ///< RoPE type: "default", "linear", "dynamic", "yarn"
+    float rope_scaling_factor = 1.0f;   ///< RoPE scaling for longer contexts
+    std::string rope_type = "default";  ///< RoPE type: "default", "linear", "dynamic", "yarn"
 
     /**
      * @brief MLP up-projection multiplier (2 for gated activations, 1 for standard)
@@ -305,8 +305,7 @@ struct ModelConfig : public PretrainedConfig {
         // Check explicit layer overrides first (highest priority)
         for (const auto& override : layer_overrides) {
             if (override.layer_idx == layer_idx) {
-                return override.block_type == BlockType::MoE ||
-                       override.block_type == BlockType::SwitchMoE ||
+                return override.block_type == BlockType::MoE || override.block_type == BlockType::SwitchMoE ||
                        override.is_moe;  // Backwards compatibility
             }
         }
@@ -642,6 +641,6 @@ struct ModelOptions {
     }
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_MODEL_CONFIG_H
+#endif  // SUROGATE_SRC_MODULES_MODEL_CONFIG_H

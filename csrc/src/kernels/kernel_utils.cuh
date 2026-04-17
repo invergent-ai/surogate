@@ -36,7 +36,8 @@
  * @note Requires warp convergence (all 32 threads active) for correctness.
  * @note Uses __float_as_uint for bitwise max comparison of positive floats.
  */
-static __forceinline__ __device__ void handle_absmax_reduction(float* __restrict__ abs_max_ptr, float* __restrict__ block_max, float thread_max) {
+static __forceinline__ __device__ void
+handle_absmax_reduction(float* __restrict__ abs_max_ptr, float* __restrict__ block_max, float thread_max) {
     if (abs_max_ptr) {
         auto warp_reduce_max_u32 = [](unsigned v) {
             for (int offset = 16; offset > 0; offset >>= 1) {
@@ -50,12 +51,12 @@ static __forceinline__ __device__ void handle_absmax_reduction(float* __restrict
         // (in theory, ensuring thread 0 hasn't exited would be enough...)
         assert(__activemask() == 0xffffffff);
         unsigned warp_max = warp_reduce_max_u32(__float_as_uint(thread_max));
-        if(threadIdx.x % 32 == 0) {
+        if (threadIdx.x % 32 == 0) {
             atomicMax(reinterpret_cast<unsigned*>(block_max), warp_max);
         }
 
         __syncthreads();
-        if(threadIdx.x == 0) {
+        if (threadIdx.x == 0) {
             atomicMax(reinterpret_cast<unsigned int*>(abs_max_ptr), __float_as_uint(*block_max));
         }
     }
@@ -73,7 +74,7 @@ static __forceinline__ __device__ void handle_absmax_reduction(float* __restrict
  * @param value Thread's input value to sum.
  * @return Sum of all values across the group (same on all threads).
  */
-template<typename Group, typename Element>
+template <typename Group, typename Element>
 static __forceinline__ __device__ Element reduce_group_add(Group& group, Element value) {
     return cooperative_groups::reduce(group, value, cooperative_groups::plus<Element>());
 }
@@ -90,7 +91,7 @@ static __forceinline__ __device__ Element reduce_group_add(Group& group, Element
  * @param value Thread's input value.
  * @return Maximum of all values across the group (same on all threads).
  */
-template<typename Group, typename Element>
+template <typename Group, typename Element>
 static __forceinline__ __device__ Element reduce_group_max(Group& group, Element value) {
     return cooperative_groups::reduce(group, value, cooperative_groups::greater<Element>());
 }
@@ -133,4 +134,4 @@ __device__ inline float warpReduceMax(float val) {
     return val;
 }
 
-#endif //SUROGATE_SRC_KERNELS_KERNEL_UTILS_CUH
+#endif  //SUROGATE_SRC_KERNELS_KERNEL_UTILS_CUH

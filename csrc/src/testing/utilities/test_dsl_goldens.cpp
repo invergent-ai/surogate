@@ -70,7 +70,9 @@ struct GoldenCase {
     std::unordered_map<std::string, GoldenTensor> outputs;
     std::unordered_map<std::string, GoldenTensor> grads;  // Gradient golden data (if available)
 
-    bool has_grads() const { return !grads.empty(); }
+    bool has_grads() const {
+        return !grads.empty();
+    }
 };
 
 struct OpSpec {
@@ -81,8 +83,8 @@ struct OpSpec {
 constexpr std::size_t kStackBytes = 64ULL * 1024ULL * 1024ULL;
 
 bool is_special_input_name(const std::string& name) {
-    return name == "token_ids" || name == "position_ids" || name == "targets" ||
-           name == "labels" || name == "loss" || name == "losses" || name == "d_loss";
+    return name == "token_ids" || name == "position_ids" || name == "targets" || name == "labels" || name == "loss" ||
+           name == "losses" || name == "d_loss";
 }
 
 bool is_special_output_name(const std::string& name) {
@@ -258,8 +260,7 @@ std::vector<float> compute_logsumexp_from_logits(const GoldenTensor& logits) {
     return out;
 }
 
-std::vector<float> compute_logsumexp_from_xf_weight(const GoldenTensor& xF_flat,
-                                                    const GoldenTensor& weight) {
+std::vector<float> compute_logsumexp_from_xf_weight(const GoldenTensor& xF_flat, const GoldenTensor& weight) {
     if (xF_flat.shape.size() != 2 || weight.shape.size() != 2) {
         throw std::runtime_error("xF_flat and weight must be rank-2 for logsumexp");
     }
@@ -282,8 +283,8 @@ std::vector<float> compute_logsumexp_from_xf_weight(const GoldenTensor& xF_flat,
             const std::size_t w_off = static_cast<std::size_t>(v * C);
             const std::size_t x_off = static_cast<std::size_t>(i * C);
             for (long c = 0; c < C; ++c) {
-                acc += xF_flat.f64[x_off + static_cast<std::size_t>(c)] *
-                       weight.f64[w_off + static_cast<std::size_t>(c)];
+                acc +=
+                    xF_flat.f64[x_off + static_cast<std::size_t>(c)] * weight.f64[w_off + static_cast<std::size_t>(c)];
             }
             logits_row[static_cast<std::size_t>(v)] = acc;
             max_val = std::max(max_val, acc);
@@ -411,11 +412,13 @@ OpSpec op_spec_for(const std::string& op) {
         {"matmul_swiglu_backward", {{"d_out", "ln2", "weight", "mlp_up"}, {"d_inp", "d_weight"}}},
         {"embedding_backward", {{"d_out"}, {"d_embedding"}}},
         {"rope_backward", {{"d_out", "freqs", "position_ids"}, {"d_qkv"}}},
-        {"qkv_qk_norm_rope_backward", {{"d_out", "qkv", "q_norm", "k_norm", "q_rstd", "k_rstd", "freqs", "position_ids"}, {"d_qkv"}}},
+        {"qkv_qk_norm_rope_backward",
+         {{"d_out", "qkv", "q_norm", "k_norm", "q_rstd", "k_rstd", "freqs", "position_ids"}, {"d_qkv"}}},
         {"flash_attention_backward", {{"d_out", "out", "lse", "qkv"}, {"d_qkv"}}},
         {"cross_entropy_backward", {{"d_loss", "logits", "targets"}, {"d_logits"}}},
         {"fused_lm_head_loss_backward", {{"d_loss", "xF_flat", "weight", "targets"}, {"d_xF", "d_weight"}}},
-        {"fused_residual_rmsnorm_backward", {{"d_y", "d_residual_next", "residual_out", "weight", "rstd"}, {"d_residual", "d_input", "d_weight"}}},
+        {"fused_residual_rmsnorm_backward",
+         {{"d_y", "d_residual_next", "residual_out", "weight", "rstd"}, {"d_residual", "d_input", "d_weight"}}},
         {"zeros_backward", {{}, {}}},
     };
 
@@ -435,8 +438,8 @@ bool is_backward_op(const std::string& op) {
 }
 
 std::pair<double, double> tolerance_for_op(const std::string& op) {
-    if (op == "flash_attention" || op == "flash_attention_backward" ||
-        op == "qkv_qk_norm_rope" || op == "qkv_qk_norm_rope_backward") {
+    if (op == "flash_attention" || op == "flash_attention_backward" || op == "qkv_qk_norm_rope" ||
+        op == "qkv_qk_norm_rope_backward") {
         return {1e-3, 1e-3};
     }
     if (op == "rope" || op == "rope_backward") {
@@ -709,7 +712,8 @@ void expect_allclose(const std::string& label,
 
     INFO(label << ": max_abs=" << max_abs << " max_rel=" << max_rel);
     if (first_bad != actual_vals.size()) {
-        const double exp_val = expected.is_int() ? static_cast<double>(expected.i64[first_bad]) : expected.f64[first_bad];
+        const double exp_val =
+            expected.is_int() ? static_cast<double>(expected.i64[first_bad]) : expected.f64[first_bad];
         const double act_val = actual_vals[first_bad];
         INFO(label << ": first_bad idx=" << first_bad << " expected=" << exp_val << " actual=" << act_val);
     }
@@ -842,8 +846,15 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
             dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
 
             const dsl::DslRuntimeConfig runtime_cfg = runtime_config_from_meta(gc.meta, gc.op);
-            dsl::DslRunState run_state(cfg, runtime_cfg, options, static_cast<int>(B), static_cast<int>(T), allocator,
-                                       false, kStackBytes, true);
+            dsl::DslRunState run_state(cfg,
+                                       runtime_cfg,
+                                       options,
+                                       static_cast<int>(B),
+                                       static_cast<int>(T),
+                                       allocator,
+                                       false,
+                                       kStackBytes,
+                                       true);
 
             // Copy parameter inputs
             for (const auto& kv : param_inputs) {
@@ -877,7 +888,8 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                     }
                     const auto lse = compute_logsumexp_from_logits(it->second);
                     CUDA_CHECK(cudaMemcpy(run_state.scratch().cross_entropy_logsumexp.Data,
-                                          lse.data(), lse.size() * sizeof(float),
+                                          lse.data(),
+                                          lse.size() * sizeof(float),
                                           cudaMemcpyHostToDevice));
                 } else if (gc.op == "fused_lm_head_loss_backward") {
                     auto it_x = gc.inputs.find("xF_flat");
@@ -887,7 +899,8 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                     }
                     const auto lse = compute_logsumexp_from_xf_weight(it_x->second, it_w->second);
                     CUDA_CHECK(cudaMemcpy(run_state.scratch().cross_entropy_logsumexp.Data,
-                                          lse.data(), lse.size() * sizeof(float),
+                                          lse.data(),
+                                          lse.size() * sizeof(float),
                                           cudaMemcpyHostToDevice));
                 }
             }
@@ -907,15 +920,13 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                 INFO("compiled inputs for " << op0.op_id);
                 for (std::size_t i = 0; i < op0.inputs.size(); ++i) {
                     const auto& ref = op0.inputs[i];
-                    INFO("  in[" << i << "] name=" << ref.name
-                                 << " dtype=" << dtype_to_str(ref.dtype)
+                    INFO("  in[" << i << "] name=" << ref.name << " dtype=" << dtype_to_str(ref.dtype)
                                  << " slot=" << static_cast<int>(ref.slot));
                 }
                 INFO("compiled outputs for " << op0.op_id);
                 for (std::size_t i = 0; i < op0.outputs.size(); ++i) {
                     const auto& ref = op0.outputs[i];
-                    INFO("  out[" << i << "] name=" << ref.name
-                                  << " dtype=" << dtype_to_str(ref.dtype)
+                    INFO("  out[" << i << "] name=" << ref.name << " dtype=" << dtype_to_str(ref.dtype)
                                   << " slot=" << static_cast<int>(ref.slot));
                 }
             }
@@ -987,8 +998,7 @@ TEST_CASE("dsl primitive ops: backward graph derivation", "[dsl][goldens][autodi
         for (const auto& entry : fs::directory_iterator(goldens_dir)) {
             if (!entry.is_regular_file()) continue;
             const std::string fname = entry.path().filename().string();
-            if (fname.find(op_name) == 0 && fname.find("_backward") == std::string::npos &&
-                fname.ends_with(".json")) {
+            if (fname.find(op_name) == 0 && fname.find("_backward") == std::string::npos && fname.ends_with(".json")) {
                 golden_path = entry.path();
                 break;
             }

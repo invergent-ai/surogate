@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
-from ..decorators import module, forward, save, Param
+from ..decorators import Param, forward, module, save
+from ..dim import B, Dim, T
 from ..graph_builder import graph
-from ..dim import Dim, B, T
 from ..hf import fuse
+from ..tensor_type import Tensor
 
 
 @module
@@ -71,9 +71,9 @@ class GQAAttention:
     @save("qkv", "out", "lse")
     def forward(
         self,
-        x: Tensor["B", "T", "C"],
-        position_ids: Tensor["T", "int32"],
-    ) -> Tensor["B", "T", "C"]:
+        x: Tensor[B, T, C],
+        position_ids: Tensor[T, int32],
+    ) -> Tensor[B, T, C]:
         with graph() as g:
             # QKV projection
             x_flat = g.view(x, shape=[B * T, self.C])
@@ -154,9 +154,9 @@ class Qwen3Attention:
     @forward
     def forward(
         self,
-        x: Tensor["B", "T", "C"],
-        position_ids: Tensor["T", "int32"],
-    ) -> Tensor["B", "T", "C"]:
+        x: Tensor[B, T, C],
+        position_ids: Tensor[T, int32],
+    ) -> Tensor[B, T, C]:
         with graph() as g:
             x_flat = g.view(x, shape=[B * T, self.C])
             if self.use_qkv_bias:
@@ -236,9 +236,9 @@ class GptOssAttention:
     @forward
     def forward(
         self,
-        x: Tensor["B", "T", "C"],
-        position_ids: Tensor["T", "int32"],
-    ) -> Tensor["B", "T", "C"]:
+        x: Tensor[B, T, C],
+        position_ids: Tensor[T, int32],
+    ) -> Tensor[B, T, C]:
         with graph() as g:
             # QKV projection
             x_flat = g.view(x, shape=[B * T, self.C])

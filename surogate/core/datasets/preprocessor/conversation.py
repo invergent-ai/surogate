@@ -1,11 +1,12 @@
 import json
-from typing import Dict, Any, Optional, List
+from typing import Any
 
 from surogate.core.config.dataset_config import ConversationDatasetConfig
 from surogate.core.datasets.preprocessor.row import RowPreprocessor
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
+
 
 class ConversationPreprocessor(RowPreprocessor):
     def __init__(self, dataset_config: ConversationDatasetConfig):
@@ -20,7 +21,7 @@ class ConversationPreprocessor(RowPreprocessor):
         if self.completion_field:
             self.columns[self.completion_field] = "completion"
 
-    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def preprocess(self, row: dict[str, Any]) -> dict[str, Any] | None:
         row["messages"] = self.get_conversation_thread(row)
         tools = self._get_tools(row)
         if tools:
@@ -47,9 +48,7 @@ class ConversationPreprocessor(RowPreprocessor):
             if message.get(value) is not None:
                 transformed_message[key] = message[value]
             else:
-                logger.debug(
-                    f"Could not find value for property {value} in message: {message}"
-                )
+                logger.debug(f"Could not find value for property {value} in message: {message}")
 
         # Map the role if necessary
         if "tool_calls" in transformed_message and transformed_message["tool_calls"]:
@@ -77,8 +76,7 @@ class ConversationPreprocessor(RowPreprocessor):
 
         if not isinstance(messages, list):
             raise ValueError(
-                "Unknown messages format. Please convert it into a list[dict].\n"
-                f"Current format: {type(messages)}"
+                f"Unknown messages format. Please convert it into a list[dict].\nCurrent format: {type(messages)}"
             )
 
         if self.completion_field:
@@ -100,12 +98,9 @@ class ConversationPreprocessor(RowPreprocessor):
         if isinstance(tools, list):
             return tools
 
-        raise ValueError(
-            "Unknown tools format. Please convert it into a list[dict].\n"
-            f"Current format: {type(tools)}"
-        )
+        raise ValueError(f"Unknown tools format. Please convert it into a list[dict].\nCurrent format: {type(tools)}")
 
-    def preprocess_batch(self, rows: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
+    def preprocess_batch(self, rows: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
         """Process a batch of conversation dataset rows efficiently.
 
         1. Batches message extraction and transformation

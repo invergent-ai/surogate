@@ -30,8 +30,8 @@
 //                    In LoRA mode, fully recomputes attention and FFN segments.
 //
 enum class RecomputeLevel {
-    None = 0,    ///< recompute: false - save all activations
-    Enabled = 1, ///< recompute: true - recompute intermediates from checkpoints
+    None = 0,     ///< recompute: false - save all activations
+    Enabled = 1,  ///< recompute: true - recompute intermediates from checkpoints
 };
 
 // Runtime/training options used by the CLI and python bindings.
@@ -61,8 +61,8 @@ struct RuntimeOptions {
     bool OffloadMaster = false;
     bool OffloadQuants = false;
     bool OffloadOptimizer = false;
-    bool OffloadGrads  = false;
-    bool UseZeroCopy   = false;
+    bool OffloadGrads = false;
+    bool UseZeroCopy = false;
     bool UseWriteCombined = false;
     bool ShardWeights = false;
     bool PersistentQuants = false;
@@ -232,12 +232,11 @@ struct RuntimeOptions {
         if (level == "true" || level == "1") {
             return RecomputeLevel::Enabled;
         }
-        throw std::invalid_argument("Invalid recompute level: " + level +
-                                    ". Valid values: true, false");
+        throw std::invalid_argument("Invalid recompute level: " + level + ". Valid values: true, false");
     }
 };
 
 // Backwards-compatible alias for existing user code/bindings.
 using LLamaOptions = RuntimeOptions;
 
-#endif // SUROGATE_SRC_TRAINING_RUNTIME_OPTIONS_H
+#endif  // SUROGATE_SRC_TRAINING_RUNTIME_OPTIONS_H

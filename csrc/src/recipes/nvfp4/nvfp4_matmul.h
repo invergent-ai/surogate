@@ -61,14 +61,20 @@ inline std::pair<long, long> fp4_weight_scale_shape(int N, int K) {
  * @param seed Random seed for stochastic operations
  * @param stream CUDA stream
  */
-template<typename RunState>
+template <typename RunState>
 inline void forward_matmul(Tensor& out,
                            Tensor& inp,
-                           Tensor& inp_fp4_data, Tensor& inp_fp4_scales, float* inp_global_amax,
-                           Tensor& weight, std::optional<Tensor> bias,
+                           Tensor& inp_fp4_data,
+                           Tensor& inp_fp4_scales,
+                           float* inp_global_amax,
+                           Tensor& weight,
+                           std::optional<Tensor> bias,
                            Tensor& hadamard_ws,
                            RunState& rs,
-                           int B, int T, int C, int OC,
+                           int B,
+                           int T,
+                           int C,
+                           int OC,
                            bool use_hadamard,
                            unsigned int seed,
                            cudaStream_t stream) {
@@ -85,13 +91,14 @@ inline void forward_matmul(Tensor& out,
     (void)hadamard_ws;
 
     // Step 1: Quantize input to FP4 with two-level block scaling (auto scale)
-    quantize_fp4_block_auto_scale(
-        inp_fp4_data.template get<uint8_t>(),
-        inp_fp4_scales.template get<__nv_fp8_e4m3>(),
-        inp_global_amax,
-        inp.template get<nv_bfloat16>(),
-        BT, C,
-        rs.DeviceProp, stream);
+    quantize_fp4_block_auto_scale(inp_fp4_data.template get<uint8_t>(),
+                                  inp_fp4_scales.template get<__nv_fp8_e4m3>(),
+                                  inp_global_amax,
+                                  inp.template get<nv_bfloat16>(),
+                                  BT,
+                                  C,
+                                  rs.DeviceProp,
+                                  stream);
 
     // Step 2: Quantize weight to FP4 with column-major scale layout
     auto [w_scale_rows, w_scale_cols] = fp4_weight_scale_shape(OC, C);
@@ -100,13 +107,14 @@ inline void forward_matmul(Tensor& out,
     Tensor weight_fp4_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols}, "weight_fp4_scales");
     Tensor weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "weight_global_amax");
 
-    quantize_fp4_weight_2d_auto_scale(
-        weight_fp4_data.template get<uint8_t>(),
-        weight_fp4_scales.template get<__nv_fp8_e4m3>(),
-        weight_global_amax.template get<float>(),
-        weight.template get<nv_bfloat16>(),
-        OC, C,
-        rs.DeviceProp, stream);
+    quantize_fp4_weight_2d_auto_scale(weight_fp4_data.template get<uint8_t>(),
+                                      weight_fp4_scales.template get<__nv_fp8_e4m3>(),
+                                      weight_global_amax.template get<float>(),
+                                      weight.template get<nv_bfloat16>(),
+                                      OC,
+                                      C,
+                                      rs.DeviceProp,
+                                      stream);
 
     // Step 3: Execute FP4 matmul via cuDNN with FP32 output for numerical stability
     Tensor out_f32{};
@@ -120,31 +128,33 @@ inline void forward_matmul(Tensor& out,
         throw std::runtime_error("nvfp4::forward_matmul: output must be BF16 or FP32");
     }
 
-    fp4_matmul_f32(
-        out_f32_ptr,
-        inp_fp4_data.template get<uint8_t>(),
-        weight_fp4_data.template get<uint8_t>(),
-        inp_fp4_scales.template get<__nv_fp8_e4m3>(),
-        weight_fp4_scales.template get<__nv_fp8_e4m3>(),
-        1.0f, 1.0f,
-        rs.CuBlasWorkspace.template get<std::byte>(),
-        rs.CuBlasWorkspace.bytes(),
-        BT, OC, C,
-        FP4_BLOCK_SIZE,
-        rs.CudnnHandle, stream);
+    fp4_matmul_f32(out_f32_ptr,
+                   inp_fp4_data.template get<uint8_t>(),
+                   weight_fp4_data.template get<uint8_t>(),
+                   inp_fp4_scales.template get<__nv_fp8_e4m3>(),
+                   weight_fp4_scales.template get<__nv_fp8_e4m3>(),
+                   1.0f,
+                   1.0f,
+                   rs.CuBlasWorkspace.template get<std::byte>(),
+                   rs.CuBlasWorkspace.bytes(),
+                   BT,
+                   OC,
+                   C,
+                   FP4_BLOCK_SIZE,
+                   rs.CudnnHandle,
+                   stream);
 
     // Step 4: Apply alpha scaling correction
-    fp4_alpha_scale(
-        out_f32_ptr,
-        inp_global_amax,
-        weight_global_amax.template get<float>(),
-        (long)BT * OC,
-        rs.DeviceProp, stream);
+    fp4_alpha_scale(out_f32_ptr,
+                    inp_global_amax,
+                    weight_global_amax.template get<float>(),
+                    (long)BT * OC,
+                    rs.DeviceProp,
+                    stream);
 
     // Step 5: Cast to BF16 if needed
     if (out.DType == ETensorDType::BF16) {
-        convert_dtype(out.template get<nv_bfloat16>(), out_f32_ptr,
-                      (std::size_t)BT * (std::size_t)OC, stream);
+        convert_dtype(out.template get<nv_bfloat16>(), out_f32_ptr, (std::size_t)BT * (std::size_t)OC, stream);
         rs.temp_free(out_f32);
     }
 
@@ -187,16 +197,21 @@ inline void forward_matmul(Tensor& out,
  * @param stream CUDA stream
  * @param skip_weight_grad Skip weight gradient computation (for LoRA-only mode)
  */
-template<typename RunState>
+template <typename RunState>
 inline void backward_matmul(Tensor& dinp,
-                            Tensor& dweight, std::optional<Tensor> dbias,
+                            Tensor& dweight,
+                            std::optional<Tensor> dbias,
                             Tensor& dout,
                             Tensor& inp,
-                            Tensor& weight, std::optional<Tensor> bias_buffer,
+                            Tensor& weight,
+                            std::optional<Tensor> bias_buffer,
                             bool accumulate_gradient,
                             bool use_hadamard,
                             RunState& rs,
-                            int B, int T, int C, int OC,
+                            int B,
+                            int T,
+                            int C,
+                            int OC,
                             unsigned int seed,
                             cudaStream_t stream,
                             bool skip_weight_grad = false) {
@@ -223,27 +238,29 @@ inline void backward_matmul(Tensor& dinp,
         Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)BT, (long)(OC / 2)}, "dout_fp4");
         Tensor dout_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols}, "dout_scales");
         Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "dout_amax");
-        quantize_fp4_block_stochastic_auto_scale(
-            dout_fp4.template get<uint8_t>(),
-            dout_scales.template get<__nv_fp8_e4m3>(),
-            dout_amax.template get<float>(),
-            dout.template get<nv_bfloat16>(),
-            BT, OC,
-            sr_seed,
-            rs.DeviceProp, stream);
+        quantize_fp4_block_stochastic_auto_scale(dout_fp4.template get<uint8_t>(),
+                                                 dout_scales.template get<__nv_fp8_e4m3>(),
+                                                 dout_amax.template get<float>(),
+                                                 dout.template get<nv_bfloat16>(),
+                                                 BT,
+                                                 OC,
+                                                 sr_seed,
+                                                 rs.DeviceProp,
+                                                 stream);
 
         // Quantize W^T with 16x16 weight scaling
         auto [w_scale_rows, w_scale_cols] = fp4_weight_scale_shape(C, OC);
         Tensor w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)C, (long)(OC / 2)}, "w_fp4");
         Tensor w_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols}, "w_scales");
         Tensor w_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "w_amax");
-        quantize_fp4_weight_2d_auto_scale(
-            w_fp4.template get<uint8_t>(),
-            w_scales.template get<__nv_fp8_e4m3>(),
-            w_amax.template get<float>(),
-            weight_tp.template get<nv_bfloat16>(),
-            C, OC,
-            rs.DeviceProp, stream);
+        quantize_fp4_weight_2d_auto_scale(w_fp4.template get<uint8_t>(),
+                                          w_scales.template get<__nv_fp8_e4m3>(),
+                                          w_amax.template get<float>(),
+                                          weight_tp.template get<nv_bfloat16>(),
+                                          C,
+                                          OC,
+                                          rs.DeviceProp,
+                                          stream);
 
         // Matmul output in FP32
         Tensor dinp_f32{};
@@ -257,29 +274,31 @@ inline void backward_matmul(Tensor& dinp,
             throw std::runtime_error("nvfp4::backward_matmul: dinp must be BF16 or FP32");
         }
 
-        fp4_matmul_f32(
-            dinp_f32_ptr,
-            dout_fp4.template get<uint8_t>(),
-            w_fp4.template get<uint8_t>(),
-            dout_scales.template get<__nv_fp8_e4m3>(),
-            w_scales.template get<__nv_fp8_e4m3>(),
-            1.0f, 1.0f,
-            rs.CuBlasWorkspace.template get<std::byte>(),
-            rs.CuBlasWorkspace.bytes(),
-            BT, C, OC,
-            FP4_BLOCK_SIZE,
-            rs.CudnnHandle, stream);
+        fp4_matmul_f32(dinp_f32_ptr,
+                       dout_fp4.template get<uint8_t>(),
+                       w_fp4.template get<uint8_t>(),
+                       dout_scales.template get<__nv_fp8_e4m3>(),
+                       w_scales.template get<__nv_fp8_e4m3>(),
+                       1.0f,
+                       1.0f,
+                       rs.CuBlasWorkspace.template get<std::byte>(),
+                       rs.CuBlasWorkspace.bytes(),
+                       BT,
+                       C,
+                       OC,
+                       FP4_BLOCK_SIZE,
+                       rs.CudnnHandle,
+                       stream);
 
-        fp4_alpha_scale(
-            dinp_f32_ptr,
-            dout_amax.template get<float>(),
-            w_amax.template get<float>(),
-            (long)BT * C,
-            rs.DeviceProp, stream);
+        fp4_alpha_scale(dinp_f32_ptr,
+                        dout_amax.template get<float>(),
+                        w_amax.template get<float>(),
+                        (long)BT * C,
+                        rs.DeviceProp,
+                        stream);
 
         if (dinp.DType == ETensorDType::BF16) {
-            convert_dtype(dinp.template get<nv_bfloat16>(), dinp_f32_ptr,
-                          (std::size_t)BT * (std::size_t)C, stream);
+            convert_dtype(dinp.template get<nv_bfloat16>(), dinp_f32_ptr, (std::size_t)BT * (std::size_t)C, stream);
             rs.temp_free(dinp_f32);
         }
 
@@ -316,10 +335,18 @@ inline void backward_matmul(Tensor& dinp,
             inp_tp_r = rs.temp_alloc(ETensorDType::BF16, {(long)C, (long)BT}, "inp_tp_r");
             hadamard_transform_forward(dout_tp_r.template get<nv_bfloat16>(),
                                        dout_tp.template get<nv_bfloat16>(),
-                                       nullptr, OC, BT, rht_seed, stream);
+                                       nullptr,
+                                       OC,
+                                       BT,
+                                       rht_seed,
+                                       stream);
             hadamard_transform_forward(inp_tp_r.template get<nv_bfloat16>(),
                                        inp_tp.template get<nv_bfloat16>(),
-                                       nullptr, C, BT, rht_seed, stream);
+                                       nullptr,
+                                       C,
+                                       BT,
+                                       rht_seed,
+                                       stream);
             q_dout_tp = &dout_tp_r;
             q_inp_tp = &inp_tp_r;
         }
@@ -329,77 +356,94 @@ inline void backward_matmul(Tensor& dinp,
         Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)OC, (long)(BT / 2)}, "a_fp4");
         Tensor a_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols}, "a_scales");
         Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "a_amax");
-        quantize_fp4_block_stochastic_auto_scale(
-            a_fp4.template get<uint8_t>(),
-            a_scales.template get<__nv_fp8_e4m3>(),
-            a_amax.template get<float>(),
-            q_dout_tp->template get<nv_bfloat16>(),
-            OC, BT,
-            sr_seed + 1,
-            rs.DeviceProp, stream);
+        quantize_fp4_block_stochastic_auto_scale(a_fp4.template get<uint8_t>(),
+                                                 a_scales.template get<__nv_fp8_e4m3>(),
+                                                 a_amax.template get<float>(),
+                                                 q_dout_tp->template get<nv_bfloat16>(),
+                                                 OC,
+                                                 BT,
+                                                 sr_seed + 1,
+                                                 rs.DeviceProp,
+                                                 stream);
 
         // Quantize B (activation) with deterministic rounding
         auto [b_scale_rows, b_scale_cols] = fp4_weight_scale_shape(C, BT);
         Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)C, (long)(BT / 2)}, "b_fp4");
         Tensor b_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {b_scale_rows, b_scale_cols}, "b_scales");
         Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "b_amax");
-        quantize_fp4_weight_auto_scale(
-            b_fp4.template get<uint8_t>(),
-            b_scales.template get<__nv_fp8_e4m3>(),
-            b_amax.template get<float>(),
-            q_inp_tp->template get<nv_bfloat16>(),
-            C, BT,
-            rs.DeviceProp, stream);
+        quantize_fp4_weight_auto_scale(b_fp4.template get<uint8_t>(),
+                                       b_scales.template get<__nv_fp8_e4m3>(),
+                                       b_amax.template get<float>(),
+                                       q_inp_tp->template get<nv_bfloat16>(),
+                                       C,
+                                       BT,
+                                       rs.DeviceProp,
+                                       stream);
 
         // Matmul: (OC, BT) @ (BT, C) -> (OC, C)
         Tensor dw_f32 = rs.temp_alloc(ETensorDType::FP32, {(long)OC, (long)C}, "dw_f32");
         float* dw_f32_ptr = dw_f32.template get<float>();
 
-        fp4_matmul_f32(
-            dw_f32_ptr,
-            a_fp4.template get<uint8_t>(),
-            b_fp4.template get<uint8_t>(),
-            a_scales.template get<__nv_fp8_e4m3>(),
-            b_scales.template get<__nv_fp8_e4m3>(),
-            1.0f, 1.0f,
-            rs.CuBlasWorkspace.template get<std::byte>(),
-            rs.CuBlasWorkspace.bytes(),
-            OC, C, BT,
-            FP4_BLOCK_SIZE,
-            rs.CudnnHandle, stream);
+        fp4_matmul_f32(dw_f32_ptr,
+                       a_fp4.template get<uint8_t>(),
+                       b_fp4.template get<uint8_t>(),
+                       a_scales.template get<__nv_fp8_e4m3>(),
+                       b_scales.template get<__nv_fp8_e4m3>(),
+                       1.0f,
+                       1.0f,
+                       rs.CuBlasWorkspace.template get<std::byte>(),
+                       rs.CuBlasWorkspace.bytes(),
+                       OC,
+                       C,
+                       BT,
+                       FP4_BLOCK_SIZE,
+                       rs.CudnnHandle,
+                       stream);
 
-        fp4_alpha_scale(
-            dw_f32_ptr,
-            a_amax.template get<float>(),
-            b_amax.template get<float>(),
-            (long)OC * C,
-            rs.DeviceProp, stream);
+        fp4_alpha_scale(dw_f32_ptr,
+                        a_amax.template get<float>(),
+                        b_amax.template get<float>(),
+                        (long)OC * C,
+                        rs.DeviceProp,
+                        stream);
 
         // Accumulate or replace dweight
         if (dweight.DType == ETensorDType::BF16) {
             if (!accumulate_gradient) {
-                convert_dtype(dweight.template get<nv_bfloat16>(), dw_f32_ptr,
-                              (std::size_t)OC * (std::size_t)C, stream);
+                convert_dtype(dweight.template get<nv_bfloat16>(),
+                              dw_f32_ptr,
+                              (std::size_t)OC * (std::size_t)C,
+                              stream);
             } else {
                 Tensor dw_bf16 = rs.temp_alloc(ETensorDType::BF16, {(long)OC, (long)C}, "dw_bf16");
-                convert_dtype(dw_bf16.template get<nv_bfloat16>(), dw_f32_ptr,
-                              (std::size_t)OC * (std::size_t)C, stream);
+                convert_dtype(dw_bf16.template get<nv_bfloat16>(),
+                              dw_f32_ptr,
+                              (std::size_t)OC * (std::size_t)C,
+                              stream);
                 vector_add_sr(dweight.template get<nv_bfloat16>(),
                               dweight.template get<nv_bfloat16>(),
                               dw_bf16.template get<nv_bfloat16>(),
-                              1.0f, (long)OC * C, seed, stream);
+                              1.0f,
+                              (long)OC * C,
+                              seed,
+                              stream);
                 rs.temp_free(dw_bf16);
             }
         } else if (dweight.DType == ETensorDType::FP32) {
             if (!accumulate_gradient) {
-                CUDA_CHECK(cudaMemcpyAsync(dweight.template get<float>(), dw_f32_ptr,
+                CUDA_CHECK(cudaMemcpyAsync(dweight.template get<float>(),
+                                           dw_f32_ptr,
                                            sizeof(float) * (std::size_t)OC * (std::size_t)C,
-                                           cudaMemcpyDeviceToDevice, stream));
+                                           cudaMemcpyDeviceToDevice,
+                                           stream));
             } else {
                 vector_add_sr(dweight.template get<float>(),
                               dweight.template get<float>(),
                               dw_f32_ptr,
-                              1.0f, (long)OC * C, seed, stream);
+                              1.0f,
+                              (long)OC * C,
+                              seed,
+                              stream);
             }
         } else {
             throw std::runtime_error("nvfp4::backward_matmul: dweight must be BF16 or FP32");
@@ -409,8 +453,7 @@ inline void backward_matmul(Tensor& dinp,
             if (!bias_buffer.has_value()) {
                 throw std::runtime_error("nvfp4::backward_matmul: dbias requested but bias_buffer not provided");
             }
-            backward_bias(dbias.value(), dout, nullptr, nullptr, bias_buffer.value(),
-                          B, T, OC, rs.DeviceProp, stream);
+            backward_bias(dbias.value(), dout, nullptr, nullptr, bias_buffer.value(), B, T, OC, rs.DeviceProp, stream);
         }
 
         rs.temp_free(dw_f32);

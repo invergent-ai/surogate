@@ -35,44 +35,43 @@ public:
      * @param num_residual_buffers Number of device buffers for double-buffering (when offloading)
      * @param main_stream Stream to use for initial event synchronization
      */
-    ResidualManager(
-        std::shared_ptr<TensorAllocator> allocator,
-        int num_layers,
-        int batch_size,
-        int seq_length,
-        int hidden_size,
-        ETensorDType dtype,
-        bool offload_residuals,
-        int num_residual_buffers,
-        cudaStream_t main_stream)
+    ResidualManager(std::shared_ptr<TensorAllocator> allocator,
+                    int num_layers,
+                    int batch_size,
+                    int seq_length,
+                    int hidden_size,
+                    ETensorDType dtype,
+                    bool offload_residuals,
+                    int num_residual_buffers,
+                    cudaStream_t main_stream)
         : mAllocator(allocator),
           mNumLayers(num_layers),
           mOffloadResiduals(offload_residuals),
-          mNumResidualBuffers(num_residual_buffers)
-    {
+          mNumResidualBuffers(num_residual_buffers) {
         long B = batch_size;
         long T = seq_length;
         long C = hidden_size;
 
         // Final residual is always needed and must not alias any per-layer residual buffer.
-        mFinalResidual = mAllocator->allocate(
-            dtype, "final_residual", EAllocationType::ON_DEVICE, {B, T, C});
+        mFinalResidual = mAllocator->allocate(dtype, "final_residual", EAllocationType::ON_DEVICE, {B, T, C});
 
         if (mOffloadResiduals) {
             // With offloading: double-buffered device + per-layer host
             mDeviceResiduals.resize(mNumResidualBuffers);
             for (int i = 0; i < mNumResidualBuffers; ++i) {
-                mDeviceResiduals[i] = mAllocator->allocate(
-                    dtype, ("device_residual_" + std::to_string(i)).c_str(),
-                    EAllocationType::ON_DEVICE, {B, T, C});
+                mDeviceResiduals[i] = mAllocator->allocate(dtype,
+                                                           ("device_residual_" + std::to_string(i)).c_str(),
+                                                           EAllocationType::ON_DEVICE,
+                                                           {B, T, C});
             }
 
             // Host buffers (one per layer)
             mOffloadedResiduals.resize(mNumLayers);
             for (int i = 0; i < mNumLayers; ++i) {
-                mOffloadedResiduals[i] = mAllocator->allocate(
-                    dtype, ("offloaded_residual_" + std::to_string(i)).c_str(),
-                    EAllocationType::PINNED, {B, T, C});
+                mOffloadedResiduals[i] = mAllocator->allocate(dtype,
+                                                              ("offloaded_residual_" + std::to_string(i)).c_str(),
+                                                              EAllocationType::PINNED,
+                                                              {B, T, C});
             }
 
             // State tracking for double-buffering
@@ -90,9 +89,10 @@ public:
             // Without offloading: one device buffer per layer
             mDeviceResiduals.resize(mNumLayers);
             for (int i = 0; i < mNumLayers; ++i) {
-                mDeviceResiduals[i] = mAllocator->allocate(
-                    dtype, ("res_ffn_" + std::to_string(i)).c_str(),
-                    EAllocationType::ON_DEVICE, {B, T, C});
+                mDeviceResiduals[i] = mAllocator->allocate(dtype,
+                                                           ("res_ffn_" + std::to_string(i)).c_str(),
+                                                           EAllocationType::ON_DEVICE,
+                                                           {B, T, C});
             }
         }
     }
@@ -124,12 +124,11 @@ public:
         status.is_ready = false;
 
         const size_t size = mOffloadedResiduals.at(layer_idx).bytes();
-        CUDA_CHECK(cudaMemcpyAsync(
-            mDeviceResiduals.at((std::size_t)buf_idx).Data,
-            mOffloadedResiduals.at(layer_idx).Data,
-            size,
-            cudaMemcpyHostToDevice,
-            fetch_stream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceResiduals.at((std::size_t)buf_idx).Data,
+                                   mOffloadedResiduals.at(layer_idx).Data,
+                                   size,
+                                   cudaMemcpyHostToDevice,
+                                   fetch_stream));
 
         CUDA_CHECK(cudaEventRecord(status.event, fetch_stream));
     }
@@ -150,12 +149,11 @@ public:
         CUDA_CHECK(cudaStreamWaitEvent(put_stream, status.ready_event, 0));
 
         const size_t size = mDeviceResiduals.at((std::size_t)buf_idx).bytes();
-        CUDA_CHECK(cudaMemcpyAsync(
-            mOffloadedResiduals.at(layer_idx).Data,
-            mDeviceResiduals.at((std::size_t)buf_idx).Data,
-            size,
-            cudaMemcpyDeviceToHost,
-            put_stream));
+        CUDA_CHECK(cudaMemcpyAsync(mOffloadedResiduals.at(layer_idx).Data,
+                                   mDeviceResiduals.at((std::size_t)buf_idx).Data,
+                                   size,
+                                   cudaMemcpyDeviceToHost,
+                                   put_stream));
 
         CUDA_CHECK(cudaEventRecord(status.event, put_stream));
     }
@@ -204,7 +202,9 @@ public:
     /**
      * @brief Get the final residual buffer (output of the model block stack)
      */
-    Tensor& get_final_residual() { return mFinalResidual; }
+    Tensor& get_final_residual() {
+        return mFinalResidual;
+    }
 
 private:
     std::shared_ptr<TensorAllocator> mAllocator;
@@ -218,6 +218,6 @@ private:
     Tensor mFinalResidual;
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_RESIDUAL_MANAGER_H
+#endif  // SUROGATE_SRC_MODULES_RESIDUAL_MANAGER_H

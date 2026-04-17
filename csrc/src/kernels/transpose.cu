@@ -28,9 +28,9 @@
  * @param rows Number of rows in source.
  * @param cols Number of columns in source.
  */
-template<int VEC_SIZE, typename T>
+template <int VEC_SIZE, typename T>
 __global__ void transpose_kernel(T* dest, const T* src, int rows, int cols) {
-    apply_and_transpose_helper<VEC_SIZE>([](auto&& a){ return a; }, dest, src, rows, cols);
+    apply_and_transpose_helper<VEC_SIZE>([](auto&& a) { return a; }, dest, src, rows, cols);
 }
 
 /**
@@ -48,17 +48,19 @@ __global__ void transpose_kernel(T* dest, const T* src, int rows, int cols) {
  * @param cols Number of columns in source.
  * @param stream CUDA stream for asynchronous execution.
  */
-template<typename T>
+template <typename T>
 void transpose_imp(T* dst, const T* src, int rows, int cols, cudaStream_t stream) {
-     if(rows % 16 == 0 && cols % 16 == 0 && sizeof(T) == 1) {
+    if (rows % 16 == 0 && cols % 16 == 0 && sizeof(T) == 1) {
         dim3 block_size = {8, 8};
-        dim3 grid_size = {(unsigned)div_ceil(rows, 16*(int)block_size.x), (unsigned)div_ceil(cols, 16*(int)block_size.y)};
-         transpose_kernel<16><<<grid_size, block_size, 0, stream>>>(dst, src, rows, cols);
+        dim3 grid_size = {(unsigned)div_ceil(rows, 16 * (int)block_size.x),
+                          (unsigned)div_ceil(cols, 16 * (int)block_size.y)};
+        transpose_kernel<16><<<grid_size, block_size, 0, stream>>>(dst, src, rows, cols);
         CUDA_CHECK(cudaGetLastError());
     } else if (rows % 8 == 0 && cols % 8 == 0 && sizeof(T) <= 2) {
         dim3 block_size = {8, 8};
-        dim3 grid_size = {(unsigned)div_ceil(rows, 8*(int)block_size.x), (unsigned)div_ceil(cols, 8*(int)block_size.y)};
-         transpose_kernel<8><<<grid_size, block_size, 0, stream>>>(dst, src, rows, cols);
+        dim3 grid_size = {(unsigned)div_ceil(rows, 8 * (int)block_size.x),
+                          (unsigned)div_ceil(cols, 8 * (int)block_size.y)};
+        transpose_kernel<8><<<grid_size, block_size, 0, stream>>>(dst, src, rows, cols);
         CUDA_CHECK(cudaGetLastError());
     } else {
         dim3 block_size = {8, 8};

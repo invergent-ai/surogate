@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from transformers import PreTrainedTokenizer
 import verifiers as vf
 import wandb
+from transformers import PreTrainedTokenizer
 
 from surogate.core.config.grpo_orch_config import GRPOReportingConfig
 from surogate.grpo.utils.logger import get_logger
@@ -23,7 +23,7 @@ class WandbMonitor(Monitor):
         config: GRPOReportingConfig | None,
         output_dir: Path | None = None,
         tokenizer: PreTrainedTokenizer | None = None,
-        run_config = None,
+        run_config=None,
     ):
         self.config = config
         self.logger = get_logger()
@@ -145,7 +145,7 @@ class WandbMonitor(Monitor):
     def log_distributions(self, distributions: dict[str, list[float]], step: int) -> None:
         """Log distributions (no-op for W&B)."""
         pass
-    
+
     def flush(self, step: int) -> None:
         if not self.is_master or not self.enabled:
             return

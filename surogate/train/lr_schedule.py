@@ -8,9 +8,16 @@ class LRSchedule:
     over a grace period, as well as permanent reductions for severe anomalies.
     """
 
-    def __init__(self, base_lr: float, max_steps: int, warmup_steps: int,
-                 cooldown_steps: int, final_lr: float, schedule_type: str,
-                 wsd_decay_steps_fraction: float = 0.1):
+    def __init__(
+        self,
+        base_lr: float,
+        max_steps: int,
+        warmup_steps: int,
+        cooldown_steps: int,
+        final_lr: float,
+        schedule_type: str,
+        wsd_decay_steps_fraction: float = 0.1,
+    ):
         self.base_lr = base_lr
         self.max_steps = max_steps
         self.warmup_steps = max(0, warmup_steps)

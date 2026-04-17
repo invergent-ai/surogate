@@ -290,11 +290,13 @@ target_sources(surogate-common PRIVATE
     src/runtime/executor/compiled_ops_save.cpp
     src/runtime/executor/compiled_ops_tiled_mlp.cpp
     src/runtime/executor/compiled_ops_execute.cpp
+    src/runtime/executor/op_registry.cpp
+    src/runtime/executor/op_registrations.cpp
     src/runtime/dsl/graph_compiler.cpp
     src/runtime/dsl/weight_mapping.cpp
     src/runtime/dsl/dsl_weight_loader.cpp
     src/runtime/dsl/autodiff.cpp
-    src/runtime/dsl/autodiff_rules.cpp
+    src/runtime/executor/autodiff_registrations.cpp
     src/runtime/dsl/op_shape_signatures.cpp
     src/runtime/dsl/tensor_slot_registry.cpp
 

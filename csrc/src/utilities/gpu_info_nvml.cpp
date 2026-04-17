@@ -12,7 +12,6 @@
 
 #include "utils.h"
 
-
 /**
  * @brief Check an NVML API call result and handle errors/warnings.
  *
@@ -27,16 +26,16 @@
  * @return The original @p status (useful for conditional handling by caller).
  * @throws std::runtime_error For non-success errors when not tolerated.
  */
-inline nvmlReturn_t nvml_check(nvmlReturn_t status, const char *file, int line, bool allow_unsupported) {
-    if(status == NVML_ERROR_NOT_SUPPORTED && allow_unsupported) {
+inline nvmlReturn_t nvml_check(nvmlReturn_t status, const char* file, int line, bool allow_unsupported) {
+    if (status == NVML_ERROR_NOT_SUPPORTED && allow_unsupported) {
         static bool warned = false;
-        if(!warned) {
+        if (!warned) {
             warned = true;
             fprintf(stderr, "[NVML WARNING] NVML_ERROR_NOT_SUPPORTED\n");
         }
-    } else if(status == NVML_ERROR_NO_PERMISSION && allow_unsupported) {
+    } else if (status == NVML_ERROR_NO_PERMISSION && allow_unsupported) {
         static bool warned = false;
-        if(!warned) {
+        if (!warned) {
             warned = true;
             fprintf(stderr, "[NVML WARNING] NVML_ERROR_NO_PERMISSION\n");
         }
@@ -68,7 +67,7 @@ inline nvmlDevice_t nvml_get_device() {
         char bus_id[256];
         int did;
         CUDA_CHECK(cudaGetDevice(&did));
-        CUDA_CHECK(cudaDeviceGetPCIBusId (bus_id, sizeof(bus_id), did));
+        CUDA_CHECK(cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), did));
         NVML_CHECK(nvmlDeviceGetHandleByPciBusId(bus_id, &device));
     }
     return device;
@@ -135,7 +134,7 @@ private:
      */
     void setup_tracking_thread();
 
-    long long mLastTimestamp;       // µs
+    long long mLastTimestamp;  // µs
     std::size_t mLastPCIeRX;
     std::size_t mLastPCIeTX;
     unsigned long long mLastEnergy;
@@ -160,15 +159,20 @@ std::unique_ptr<IGPUUtilTracker> IGPUUtilTracker::create() {
     return std::make_unique<GPUUtilTrackerNVML>();
 }
 
-GPUUtilTrackerNVML::GPUUtilTrackerNVML() : mDevice(nvml_get_device()) {
-    nvmlFieldValue_t fields[] = {{NVML_FI_DEV_PCIE_COUNT_RX_BYTES}, {NVML_FI_DEV_PCIE_COUNT_TX_BYTES}, {NVML_FI_DEV_TOTAL_ENERGY_CONSUMPTION, 0}};
+GPUUtilTrackerNVML::GPUUtilTrackerNVML()
+    : mDevice(nvml_get_device()) {
+    nvmlFieldValue_t fields[] = {{NVML_FI_DEV_PCIE_COUNT_RX_BYTES},
+                                 {NVML_FI_DEV_PCIE_COUNT_TX_BYTES},
+                                 {NVML_FI_DEV_TOTAL_ENERGY_CONSUMPTION, 0}};
     NVML_CHECK(nvmlDeviceGetFieldValues(mDevice, 3, fields));
-    if(fields[0].nvmlReturn == NVML_ERROR_NOT_SUPPORTED || fields[1].nvmlReturn == NVML_ERROR_NOT_SUPPORTED || fields[2].nvmlReturn == NVML_ERROR_NOT_SUPPORTED) {
+    if (fields[0].nvmlReturn == NVML_ERROR_NOT_SUPPORTED || fields[1].nvmlReturn == NVML_ERROR_NOT_SUPPORTED ||
+        fields[2].nvmlReturn == NVML_ERROR_NOT_SUPPORTED) {
         fprintf(stderr, "[NVML WARNING] PCIe counters not supported\n");
     } else {
         NVML_CHECK(fields[0].nvmlReturn);
         NVML_CHECK(fields[1].nvmlReturn);
-        NVML_CHECK(fields[2].nvmlReturn);mLastPCIeRX = fields[0].value.uiVal;
+        NVML_CHECK(fields[2].nvmlReturn);
+        mLastPCIeRX = fields[0].value.uiVal;
         mLastPCIeTX = fields[1].value.uiVal;
         mLastEnergy = fields[2].value.ullVal;
 
@@ -179,7 +183,7 @@ GPUUtilTrackerNVML::GPUUtilTrackerNVML() : mDevice(nvml_get_device()) {
 }
 
 GPUUtilTrackerNVML::~GPUUtilTrackerNVML() {
-    if(mThread.joinable()) {
+    if (mThread.joinable()) {
         mThread.request_stop();
         mThread.join();
     }
@@ -188,11 +192,12 @@ GPUUtilTrackerNVML::~GPUUtilTrackerNVML() {
 
 void GPUUtilTrackerNVML::setup_tracking_thread() {
     // TODO should this be one thread for all devices?
-    mThread = std::jthread([this](std::stop_token stop_token)
-    {
+    mThread = std::jthread([this](std::stop_token stop_token) {
         NVML_CHECK(nvmlDeviceSetCpuAffinity(mDevice));
 
-        nvmlFieldValue_t fields[] = {{NVML_FI_DEV_PCIE_COUNT_RX_BYTES}, {NVML_FI_DEV_PCIE_COUNT_TX_BYTES}, {NVML_FI_DEV_TOTAL_ENERGY_CONSUMPTION, 0}};
+        nvmlFieldValue_t fields[] = {{NVML_FI_DEV_PCIE_COUNT_RX_BYTES},
+                                     {NVML_FI_DEV_PCIE_COUNT_TX_BYTES},
+                                     {NVML_FI_DEV_TOTAL_ENERGY_CONSUMPTION, 0}};
         while (true) {
             NVML_CHECK(nvmlDeviceGetFieldValues(mDevice, 3, fields));
             NVML_CHECK(fields[0].nvmlReturn);
@@ -201,21 +206,21 @@ void GPUUtilTrackerNVML::setup_tracking_thread() {
             unsigned pcie_rx, pcie_tx;
             unsigned long long energy;
             if (mLastPCIeRX <= fields[0].value.uiVal) {
-               pcie_rx = fields[0].value.uiVal - mLastPCIeRX;
+                pcie_rx = fields[0].value.uiVal - mLastPCIeRX;
             } else {
-               pcie_rx = std::numeric_limits<unsigned>::max() - mLastPCIeRX + fields[0].value.uiVal;
+                pcie_rx = std::numeric_limits<unsigned>::max() - mLastPCIeRX + fields[0].value.uiVal;
             }
 
             if (mLastPCIeTX <= fields[1].value.uiVal) {
-               pcie_tx = fields[1].value.uiVal - mLastPCIeTX;
+                pcie_tx = fields[1].value.uiVal - mLastPCIeTX;
             } else {
-               pcie_tx = std::numeric_limits<unsigned>::max() - mLastPCIeTX + fields[1].value.uiVal;
+                pcie_tx = std::numeric_limits<unsigned>::max() - mLastPCIeTX + fields[1].value.uiVal;
             }
 
             if (mLastEnergy <= fields[2].value.ullVal) {
-               energy = fields[2].value.ullVal - mLastEnergy;
+                energy = fields[2].value.ullVal - mLastEnergy;
             } else {
-               energy = (std::numeric_limits<unsigned long long>::max() - mLastEnergy) + fields[2].value.ullVal;
+                energy = (std::numeric_limits<unsigned long long>::max() - mLastEnergy) + fields[2].value.ullVal;
             }
 
             mIntervalPCIeRX += pcie_rx;
@@ -263,7 +268,7 @@ const GPUUtilInfo& GPUUtilTrackerNVML::update() {
     NVML_CHECK_U(nvmlDeviceGetTemperature(mDevice, NVML_TEMPERATURE_GPU, &mInfo.temperature));
     NVML_CHECK_U(nvmlDeviceGetTemperatureThreshold(mDevice, NVML_TEMPERATURE_THRESHOLD_SLOWDOWN, &mInfo.temp_slowdown));
     unsigned long long throttle;
-    if(NVML_CHECK_U(nvmlDeviceGetCurrentClocksThrottleReasons(mDevice, &throttle)) == NVML_SUCCESS) {
+    if (NVML_CHECK_U(nvmlDeviceGetCurrentClocksThrottleReasons(mDevice, &throttle)) == NVML_SUCCESS) {
         mInfo.throttle_reason = get_throttle_reason(throttle);
     }
     NVML_CHECK_U(nvmlDeviceGetFanSpeed(mDevice, &mInfo.fan));
@@ -275,9 +280,10 @@ const GPUUtilInfo& GPUUtilTrackerNVML::update() {
     nvmlSample_t buffer[BUFFER_LIMIT];
     nvmlValueType_t v_type;
     unsigned int sample_count = BUFFER_LIMIT;
-    if(NVML_CHECK_U(nvmlDeviceGetSamples(mDevice, NVML_GPU_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) == NVML_SUCCESS) {
+    if (NVML_CHECK_U(nvmlDeviceGetSamples(mDevice, NVML_GPU_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) ==
+        NVML_SUCCESS) {
         float gpu_utilization = 0.f;
-        for(unsigned i = 0; i < sample_count; ++i) {
+        for (unsigned i = 0; i < sample_count; ++i) {
             gpu_utilization += (float)buffer[i].sampleValue.uiVal;
         }
         mInfo.gpu_utilization = gpu_utilization / (float)sample_count;
@@ -285,9 +291,11 @@ const GPUUtilInfo& GPUUtilTrackerNVML::update() {
 
     // sample count may have been modified by the query above; reset back to buffer size
     sample_count = BUFFER_LIMIT;
-    if(NVML_CHECK_U(nvmlDeviceGetSamples(mDevice, NVML_MEMORY_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) == NVML_SUCCESS) {
+    if (NVML_CHECK_U(
+            nvmlDeviceGetSamples(mDevice, NVML_MEMORY_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) ==
+        NVML_SUCCESS) {
         float mem_utilization = 0.f;
-        for(unsigned i = 0; i < sample_count; ++i) {
+        for (unsigned i = 0; i < sample_count; ++i) {
             mem_utilization += (float)buffer[i].sampleValue.uiVal;
         }
         mInfo.mem_utilization = mem_utilization / (float)sample_count;
@@ -303,7 +311,8 @@ const GPUUtilInfo& GPUUtilTrackerNVML::update() {
     if (mThread.joinable()) {
         auto now = std::chrono::steady_clock::now().time_since_epoch();
         auto interval = std::chrono::duration_cast<std::chrono::microseconds>(
-            now - std::chrono::steady_clock::duration{mLastTimestamp}).count();
+                            now - std::chrono::steady_clock::duration{mLastTimestamp})
+                            .count();
 
         std::size_t int_rx = mIntervalPCIeRX.exchange(0);
         std::size_t int_tx = mIntervalPCIeTX.exchange(0);

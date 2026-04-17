@@ -23,12 +23,18 @@ class SafeTensorsReader;
 class SafeTensorEntry {
 public:
     //! Get the name of the tensor
-    const std::string& name() const { return mName; }
+    const std::string& name() const {
+        return mName;
+    }
     //! Get the shape of the tensor.
-    const std::vector<long>& shape() const { return mShape; }
+    const std::vector<long>& shape() const {
+        return mShape;
+    }
     //! Get the dtype of the tensor. Note that safetensors has very limited
     //! dtype support, so this information may not be accurate.
-    ETensorDType dtype() const { return mDType; }
+    ETensorDType dtype() const {
+        return mDType;
+    }
 
     //! Read part of the tensor data into another tensor
     //! ignoring all shape information.
@@ -36,8 +42,7 @@ public:
     //! \param offset Offset in elements from the beginning of this tensor's data
     //! \param elements Number of elements to read
     //! \param allow_cast Whether to allow dtype conversion during read
-    void read_raw(Tensor& target, std::ptrdiff_t offset,
-                  std::ptrdiff_t elements, bool allow_cast = false) const;
+    void read_raw(Tensor& target, std::ptrdiff_t offset, std::ptrdiff_t elements, bool allow_cast = false) const;
 
     //! Reads then entire Tensor into target.
     //! \param target The tensor to read into (must match shape and optionally dtype)
@@ -47,9 +52,14 @@ public:
 private:
     friend class SafeTensorsReader;
 
-    SafeTensorEntry(const std::string& name, const std::vector<long>& shape, ETensorDType dtype,
-                    std::string file_name, std::shared_ptr<cuFileRef> handle, SafeTensorsReader* reader,
-                    std::ptrdiff_t data_begin, std::ptrdiff_t data_end);
+    SafeTensorEntry(const std::string& name,
+                    const std::vector<long>& shape,
+                    ETensorDType dtype,
+                    std::string file_name,
+                    std::shared_ptr<cuFileRef> handle,
+                    SafeTensorsReader* reader,
+                    std::ptrdiff_t data_begin,
+                    std::ptrdiff_t data_end);
 
     std::string mName;
     std::vector<long> mShape;
@@ -63,20 +73,22 @@ private:
     std::ptrdiff_t mDataEnd;
 };
 
-
 class SafeTensorsReader {
 public:
     explicit SafeTensorsReader(const std::string& file_name);
     ~SafeTensorsReader();
 
     //! Get all tensor entries
-    const std::vector<SafeTensorEntry>& entries() const { return mEntries; }
+    const std::vector<SafeTensorEntry>& entries() const {
+        return mEntries;
+    }
 
     //! Load specific tensors into a container
     void load_tensors(ITensorContainer& container, bool allow_cast = false) const;
 
     //! Linear(!) search for a tensor by name
     const SafeTensorEntry& find_entry(std::string_view name) const;
+
 private:
     friend class SafeTensorEntry;
     void parse_single_file(const std::string& file_path);
@@ -105,10 +117,10 @@ public:
     void register_tensor(const std::string& name, const TensorShard& tensor);
     void prepare_metadata(NCCLCommunicator* comm);
     void write_tensor(const std::string& name, const TensorShard& tensor, NCCLCommunicator* comm);
-    void write_raw(const std::string& name, std::ptrdiff_t offset,
-                  std::ptrdiff_t elements, const TensorShard& tensor);
+    void write_raw(const std::string& name, std::ptrdiff_t offset, std::ptrdiff_t elements, const TensorShard& tensor);
     void mark_done(const std::string& name);
     void finalize(NCCLCommunicator* comm);
+
 private:
     struct sTensorInfo {
         ETensorDType DType;
@@ -138,4 +150,4 @@ std::string get_hf_model_path(std::string model_name);
 //! Gets the path to the files of a specific HF model.
 std::string get_hf_model_files(std::string model_name, std::string revision = {});
 
-#endif //SUROGATE_SRC_UTILS_SAFETENSORS_H
+#endif  //SUROGATE_SRC_UTILS_SAFETENSORS_H

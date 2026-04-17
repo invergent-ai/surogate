@@ -21,14 +21,12 @@ namespace {
 bool nccl_available() {
     static bool checked = false;
     static bool available = false;
-    
+
     if (!checked) {
         checked = true;
         try {
             // Try to run a minimal NCCL operation
-            NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
-                available = true;
-            });
+            NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) { available = true; });
         } catch (...) {
             available = false;
         }
@@ -50,7 +48,7 @@ int get_cuda_device_count() {
     return device_count;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // =============================================================================
 // Basic NCCL Availability Tests
@@ -59,14 +57,14 @@ int get_cuda_device_count() {
 TEST_CASE("CUDA device availability", "[distributed][nccl][cuda][basic]") {
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
-    
+
     INFO("CUDA device count: " << device_count);
     INFO("CUDA error: " << cudaGetErrorString(err));
-    
+
     if (err != cudaSuccess || device_count == 0) {
         SKIP("No CUDA devices available");
     }
-    
+
     REQUIRE(device_count > 0);
 }
 
@@ -74,9 +72,9 @@ TEST_CASE("NCCL communicator can be created with single GPU", "[distributed][ncc
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
-    
+
     bool communicator_created = false;
-    
+
     try {
         NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
             communicator_created = true;
@@ -87,7 +85,7 @@ TEST_CASE("NCCL communicator can be created with single GPU", "[distributed][ncc
         INFO("Exception: " << e.what());
         SKIP("NCCL initialization failed");
     }
-    
+
     REQUIRE(communicator_created == true);
 }
 
@@ -95,7 +93,7 @@ TEST_CASE("NCCL communicator properties with single GPU", "[distributed][nccl][b
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         REQUIRE(comm.rank() == 0);
         REQUIRE(comm.world_size() == 1);
@@ -111,27 +109,27 @@ TEST_CASE("NCCL communicator with multiple GPUs", "[distributed][nccl][multi-gpu
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     int num_gpus = get_cuda_device_count();
     if (num_gpus < 2) {
         SKIP("Need at least 2 GPUs for multi-GPU tests");
     }
-    
+
     // Test with 2 GPUs
     int test_gpus = std::min(num_gpus, 2);
     std::vector<int> ranks_seen(test_gpus, 0);
-    
+
     NCCLCommunicator::run_communicators(test_gpus, false, false, [&](NCCLCommunicator& comm) {
         int rank = comm.rank();
         int world = comm.world_size();
-        
+
         REQUIRE(world == test_gpus);
         REQUIRE(rank >= 0);
         REQUIRE(rank < world);
-        
+
         ranks_seen[rank] = 1;
     });
-    
+
     // Verify all ranks were created
     for (int i = 0; i < test_gpus; ++i) {
         REQUIRE(ranks_seen[i] == 1);
@@ -142,18 +140,18 @@ TEST_CASE("NCCL barrier synchronization", "[distributed][nccl][sync]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     int num_gpus = get_cuda_device_count();
     if (num_gpus < 2) {
         SKIP("Need at least 2 GPUs for barrier test");
     }
-    
+
     int test_gpus = std::min(num_gpus, 2);
-    
+
     NCCLCommunicator::run_communicators(test_gpus, false, false, [](NCCLCommunicator& comm) {
         // Simply test that barrier doesn't hang or crash
         comm.barrier();
-        
+
         // Multiple barriers should also work
         comm.barrier();
         comm.barrier();
@@ -168,11 +166,11 @@ TEST_CASE("NCCL host_gather with single GPU", "[distributed][nccl][gather]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         int value = 42;
         auto result = comm.host_gather(value);
-        
+
         // On rank 0, result should contain the gathered value
         if (comm.rank() == 0) {
             REQUIRE(result.size() == 1);
@@ -185,19 +183,19 @@ TEST_CASE("NCCL host_gather with multiple GPUs", "[distributed][nccl][gather][mu
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     int num_gpus = get_cuda_device_count();
     if (num_gpus < 2) {
         SKIP("Need at least 2 GPUs for multi-GPU gather test");
     }
-    
+
     int test_gpus = std::min(num_gpus, 2);
-    
+
     NCCLCommunicator::run_communicators(test_gpus, false, false, [&](NCCLCommunicator& comm) {
         // Each rank sends its rank number
         int value = comm.rank() * 10 + 1;  // e.g., rank 0 -> 1, rank 1 -> 11
         auto result = comm.host_gather(value);
-        
+
         if (comm.rank() == 0) {
             REQUIRE(result.size() == static_cast<size_t>(test_gpus));
             for (int i = 0; i < test_gpus; ++i) {
@@ -211,11 +209,11 @@ TEST_CASE("NCCL host_all_gather with single GPU", "[distributed][nccl][allgather
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         int value = 99;
         auto result = comm.host_all_gather(value);
-        
+
         REQUIRE(result.size() == 1);
         REQUIRE(result[0] == 99);
     });
@@ -225,19 +223,19 @@ TEST_CASE("NCCL host_all_gather with multiple GPUs", "[distributed][nccl][allgat
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     int num_gpus = get_cuda_device_count();
     if (num_gpus < 2) {
         SKIP("Need at least 2 GPUs for multi-GPU all_gather test");
     }
-    
+
     int test_gpus = std::min(num_gpus, 2);
-    
+
     NCCLCommunicator::run_communicators(test_gpus, false, false, [&](NCCLCommunicator& comm) {
         // Each rank sends its rank number
         int value = comm.rank() + 100;  // e.g., rank 0 -> 100, rank 1 -> 101
         auto result = comm.host_all_gather(value);
-        
+
         // All ranks should have the same result
         REQUIRE(result.size() == static_cast<size_t>(test_gpus));
         for (int i = 0; i < test_gpus; ++i) {
@@ -254,17 +252,17 @@ TEST_CASE("NCCL host_gather with struct", "[distributed][nccl][gather][struct]")
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     struct TestData {
         int a;
         float b;
         char c;
     };
-    
+
     NCCLCommunicator::run_communicators(1, false, false, [](NCCLCommunicator& comm) {
         TestData data{42, 3.14f, 'x'};
         auto result = comm.host_gather(data);
-        
+
         if (comm.rank() == 0) {
             REQUIRE(result.size() == 1);
             REQUIRE(result[0].a == 42);
@@ -282,7 +280,7 @@ TEST_CASE("NCCL handles zero GPUs gracefully", "[distributed][nccl][error]") {
     if (!cuda_available()) {
         SKIP("CUDA not available");
     }
-    
+
     // Requesting 0 GPUs should either throw or handle gracefully
     // This tests that the library doesn't crash on invalid input
     bool threw_exception = false;
@@ -293,7 +291,7 @@ TEST_CASE("NCCL handles zero GPUs gracefully", "[distributed][nccl][error]") {
     } catch (...) {
         threw_exception = true;
     }
-    
+
     // Either it throws an exception or handles it gracefully (both are acceptable)
     // The test passes if we get here without crashing
     INFO("Zero GPUs request threw exception: " << threw_exception);
@@ -307,7 +305,7 @@ TEST_CASE("NCCL multiple sequential communicator creations", "[distributed][nccl
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     // Create and destroy communicators multiple times
     for (int i = 0; i < 3; ++i) {
         NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
@@ -321,7 +319,7 @@ TEST_CASE("NCCL with memcpy_allgather option", "[distributed][nccl][options]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     // Test with memcpy_allgather = true
     NCCLCommunicator::run_communicators(1, true, false, [](NCCLCommunicator& comm) {
         REQUIRE(comm.rank() == 0);
@@ -333,7 +331,7 @@ TEST_CASE("NCCL with memcpy_send_recv option", "[distributed][nccl][options]") {
     if (!nccl_available()) {
         SKIP("NCCL not available");
     }
-    
+
     // Test with memcpy_send_recv = true
     NCCLCommunicator::run_communicators(1, false, true, [](NCCLCommunicator& comm) {
         REQUIRE(comm.rank() == 0);
@@ -408,19 +406,17 @@ TEST_CASE("launch_communicators_multinode with single node", "[distributed][nccl
 
     bool executed = false;
 
-    auto pack = NCCLCommunicator::launch_communicators_multinode(
-        1,              // ngpus
-        0,              // node_rank
-        1,              // num_nodes
-        nccl_id.data(),
-        false,          // memcpy_allgather
-        false,          // memcpy_send_recv
-        [&](NCCLCommunicator& comm) {
-            executed = true;
-            REQUIRE(comm.rank() == 0);
-            REQUIRE(comm.world_size() == 1);
-        }
-    );
+    auto pack = NCCLCommunicator::launch_communicators_multinode(1,  // ngpus
+                                                                 0,  // node_rank
+                                                                 1,  // num_nodes
+                                                                 nccl_id.data(),
+                                                                 false,  // memcpy_allgather
+                                                                 false,  // memcpy_send_recv
+                                                                 [&](NCCLCommunicator& comm) {
+                                                                     executed = true;
+                                                                     REQUIRE(comm.rank() == 0);
+                                                                     REQUIRE(comm.world_size() == 1);
+                                                                 });
 
     pack->join();
     REQUIRE(executed == true);
@@ -442,24 +438,22 @@ TEST_CASE("launch_communicators_multinode with multiple local GPUs", "[distribut
 
     std::vector<int> ranks_seen(test_gpus, 0);
 
-    auto pack = NCCLCommunicator::launch_communicators_multinode(
-        test_gpus,      // ngpus
-        0,              // node_rank
-        1,              // num_nodes
-        nccl_id.data(),
-        false,          // memcpy_allgather
-        false,          // memcpy_send_recv
-        [&](NCCLCommunicator& comm) {
-            int rank = comm.rank();
-            int world = comm.world_size();
+    auto pack = NCCLCommunicator::launch_communicators_multinode(test_gpus,  // ngpus
+                                                                 0,          // node_rank
+                                                                 1,          // num_nodes
+                                                                 nccl_id.data(),
+                                                                 false,  // memcpy_allgather
+                                                                 false,  // memcpy_send_recv
+                                                                 [&](NCCLCommunicator& comm) {
+                                                                     int rank = comm.rank();
+                                                                     int world = comm.world_size();
 
-            REQUIRE(world == test_gpus);
-            REQUIRE(rank >= 0);
-            REQUIRE(rank < world);
+                                                                     REQUIRE(world == test_gpus);
+                                                                     REQUIRE(rank >= 0);
+                                                                     REQUIRE(rank < world);
 
-            ranks_seen[rank] = 1;
-        }
-    );
+                                                                     ranks_seen[rank] = 1;
+                                                                 });
 
     pack->join();
 
@@ -482,17 +476,18 @@ TEST_CASE("launch_communicators_multinode barrier works", "[distributed][nccl][m
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
 
-    auto pack = NCCLCommunicator::launch_communicators_multinode(
-        test_gpus, 0, 1,
-        nccl_id.data(),
-        false, false,
-        [](NCCLCommunicator& comm) {
-            // Test barrier multiple times
-            comm.barrier();
-            comm.barrier();
-            comm.barrier();
-        }
-    );
+    auto pack = NCCLCommunicator::launch_communicators_multinode(test_gpus,
+                                                                 0,
+                                                                 1,
+                                                                 nccl_id.data(),
+                                                                 false,
+                                                                 false,
+                                                                 [](NCCLCommunicator& comm) {
+                                                                     // Test barrier multiple times
+                                                                     comm.barrier();
+                                                                     comm.barrier();
+                                                                     comm.barrier();
+                                                                 });
 
     pack->join();
 }
@@ -511,22 +506,24 @@ TEST_CASE("launch_communicators_multinode host_gather works", "[distributed][ncc
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
 
-    auto pack = NCCLCommunicator::launch_communicators_multinode(
-        test_gpus, 0, 1,
-        nccl_id.data(),
-        false, false,
-        [&](NCCLCommunicator& comm) {
-            int value = comm.rank() * 10 + 5;
-            auto result = comm.host_gather(value);
+    auto pack = NCCLCommunicator::launch_communicators_multinode(test_gpus,
+                                                                 0,
+                                                                 1,
+                                                                 nccl_id.data(),
+                                                                 false,
+                                                                 false,
+                                                                 [&](NCCLCommunicator& comm) {
+                                                                     int value = comm.rank() * 10 + 5;
+                                                                     auto result = comm.host_gather(value);
 
-            if (comm.rank() == 0) {
-                REQUIRE(result.size() == static_cast<size_t>(test_gpus));
-                for (int i = 0; i < test_gpus; ++i) {
-                    REQUIRE(result[i] == i * 10 + 5);
-                }
-            }
-        }
-    );
+                                                                     if (comm.rank() == 0) {
+                                                                         REQUIRE(result.size() ==
+                                                                                 static_cast<size_t>(test_gpus));
+                                                                         for (int i = 0; i < test_gpus; ++i) {
+                                                                             REQUIRE(result[i] == i * 10 + 5);
+                                                                         }
+                                                                     }
+                                                                 });
 
     pack->join();
 }
@@ -545,21 +542,23 @@ TEST_CASE("launch_communicators_multinode host_all_gather works", "[distributed]
 
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
 
-    auto pack = NCCLCommunicator::launch_communicators_multinode(
-        test_gpus, 0, 1,
-        nccl_id.data(),
-        false, false,
-        [&](NCCLCommunicator& comm) {
-            int value = comm.rank() + 200;
-            auto result = comm.host_all_gather(value);
+    auto pack =
+        NCCLCommunicator::launch_communicators_multinode(test_gpus,
+                                                         0,
+                                                         1,
+                                                         nccl_id.data(),
+                                                         false,
+                                                         false,
+                                                         [&](NCCLCommunicator& comm) {
+                                                             int value = comm.rank() + 200;
+                                                             auto result = comm.host_all_gather(value);
 
-            // All ranks should get the same result
-            REQUIRE(result.size() == static_cast<size_t>(test_gpus));
-            for (int i = 0; i < test_gpus; ++i) {
-                REQUIRE(result[i] == i + 200);
-            }
-        }
-    );
+                                                             // All ranks should get the same result
+                                                             REQUIRE(result.size() == static_cast<size_t>(test_gpus));
+                                                             for (int i = 0; i < test_gpus; ++i) {
+                                                                 REQUIRE(result[i] == i + 200);
+                                                             }
+                                                         });
 
     pack->join();
 }
@@ -576,15 +575,14 @@ TEST_CASE("launch_communicators_multinode validates node_rank", "[distributed][n
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
 
     // Invalid node_rank (>= num_nodes)
-    REQUIRE_THROWS_AS(
-        NCCLCommunicator::launch_communicators_multinode(
-            1, 5, 2,  // node_rank=5 but num_nodes=2
-            nccl_id.data(),
-            false, false,
-            [](NCCLCommunicator&) {}
-        ),
-        std::runtime_error
-    );
+    REQUIRE_THROWS_AS(NCCLCommunicator::launch_communicators_multinode(1,
+                                                                       5,
+                                                                       2,  // node_rank=5 but num_nodes=2
+                                                                       nccl_id.data(),
+                                                                       false,
+                                                                       false,
+                                                                       [](NCCLCommunicator&) {}),
+                      std::runtime_error);
 }
 
 TEST_CASE("launch_communicators_multinode validates num_nodes", "[distributed][nccl][multinode][error][.]") {
@@ -595,15 +593,14 @@ TEST_CASE("launch_communicators_multinode validates num_nodes", "[distributed][n
     auto nccl_id = NCCLCommunicator::generate_nccl_id();
 
     // Invalid num_nodes (< 1)
-    REQUIRE_THROWS_AS(
-        NCCLCommunicator::launch_communicators_multinode(
-            1, 0, 0,  // num_nodes=0
-            nccl_id.data(),
-            false, false,
-            [](NCCLCommunicator&) {}
-        ),
-        std::runtime_error
-    );
+    REQUIRE_THROWS_AS(NCCLCommunicator::launch_communicators_multinode(1,
+                                                                       0,
+                                                                       0,  // num_nodes=0
+                                                                       nccl_id.data(),
+                                                                       false,
+                                                                       false,
+                                                                       [](NCCLCommunicator&) {}),
+                      std::runtime_error);
 }
 
 TEST_CASE("launch_communicators_multinode validates nccl_id not null", "[distributed][nccl][multinode][error][.]") {
@@ -611,13 +608,12 @@ TEST_CASE("launch_communicators_multinode validates nccl_id not null", "[distrib
         SKIP("CUDA not available");
     }
 
-    REQUIRE_THROWS_AS(
-        NCCLCommunicator::launch_communicators_multinode(
-            1, 0, 1,
-            nullptr,  // null nccl_id
-            false, false,
-            [](NCCLCommunicator&) {}
-        ),
-        std::runtime_error
-    );
+    REQUIRE_THROWS_AS(NCCLCommunicator::launch_communicators_multinode(1,
+                                                                       0,
+                                                                       1,
+                                                                       nullptr,  // null nccl_id
+                                                                       false,
+                                                                       false,
+                                                                       [](NCCLCommunicator&) {}),
+                      std::runtime_error);
 }

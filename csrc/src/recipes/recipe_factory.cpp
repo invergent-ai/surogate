@@ -23,22 +23,18 @@ std::unique_ptr<Recipe> RecipeFactory::create(const std::string& name, const Rec
     }
 
     if (name == "fp8-hybrid" || name == "fp8_hybrid") {
-        FP8HybridRecipe::Config fp8_config{
-            .margin = config.fp8_margin,
-            .amax_history_len = config.fp8_amax_history_len,
-            .amax_compute_algo = AmaxComputeAlgo::MAX,
-            .reduce_amax = true
-        };
+        FP8HybridRecipe::Config fp8_config{.margin = config.fp8_margin,
+                                           .amax_history_len = config.fp8_amax_history_len,
+                                           .amax_compute_algo = AmaxComputeAlgo::MAX,
+                                           .reduce_amax = true};
         return std::make_unique<FP8HybridRecipe>(fp8_config);
     }
 
     if (name == "nvfp4") {
-        NVFP4Recipe::Config nvfp4_config{
-            .disable_2d_quantization = config.fp4_disable_2d_quantization,
-            .skip_quant_first_layers = config.skip_quant_first_layers,
-            .skip_quant_last_layers = config.skip_quant_last_layers,
-            .backend = config.fp4_backend
-        };
+        NVFP4Recipe::Config nvfp4_config{.disable_2d_quantization = config.fp4_disable_2d_quantization,
+                                         .skip_quant_first_layers = config.skip_quant_first_layers,
+                                         .skip_quant_last_layers = config.skip_quant_last_layers,
+                                         .backend = config.fp4_backend};
         return std::make_unique<NVFP4Recipe>(nvfp4_config);
     }
 
@@ -52,13 +48,12 @@ std::unique_ptr<Recipe> RecipeFactory::create(const std::string& name, const Rec
             .scales_max = 255.99f,
             .hadamard_dim = 128,
             .skip_quant_first_layers = config.skip_quant_first_layers,
-            .skip_quant_last_layers = config.skip_quant_last_layers
-        };
+            .skip_quant_last_layers = config.skip_quant_last_layers};
         return std::make_unique<NVFP4QuartetRecipe>(quartet_config);
     }
 
     throw std::invalid_argument("Unknown recipe: " + name +
-        ". Available recipes: bf16, fp8-hybrid, nvfp4, nvfp4-quartet");
+                                ". Available recipes: bf16, fp8-hybrid, nvfp4, nvfp4-quartet");
 }
 
 std::vector<std::string> RecipeFactory::available_recipes() {

@@ -17,11 +17,11 @@ stream them to GPU on demand.
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor
-from ..decorators import module, forward, Param
+from ..decorators import Param, forward, module
+from ..dim import B, Dim, T
 from ..graph_builder import graph
-from ..dim import Dim, B, T
 from ..hf import stack_experts, transform
+from ..tensor_type import Tensor
 
 
 @module
@@ -78,7 +78,7 @@ class MoEExpertsGated:
     experts_down = Param(Tensor["E", "C", "M"], offload_group="moe_experts")
 
     @forward
-    def forward(self, x: Tensor["B * T", "C"]) -> Tensor["B * T", "C"]:
+    def forward(self, x: Tensor[B * T, C]) -> Tensor[B * T, C]:
         """Placeholder forward - actual MoE computation is in block definitions."""
         with graph() as g:
             return x
@@ -138,7 +138,7 @@ class MoEExpertsSimple:
     experts_down = Param(Tensor["E", "C", "M"], offload_group="moe_experts")
 
     @forward
-    def forward(self, x: Tensor["B * T", "C"]) -> Tensor["B * T", "C"]:
+    def forward(self, x: Tensor[B * T, C]) -> Tensor[B * T, C]:
         """Placeholder forward - actual MoE computation is in block definitions."""
         with graph() as g:
             return x
@@ -196,7 +196,7 @@ class GptOssMoE:
     experts_down_bias = Param(Tensor["E", "C"], offload_group="moe_experts")
 
     @forward
-    def forward(self, x: Tensor["B * T", "C"]) -> Tensor["B * T", "C"]:
+    def forward(self, x: Tensor[B * T, C]) -> Tensor[B * T, C]:
         """Placeholder forward - actual MoE computation is in block definitions."""
         with graph() as g:
             return x
@@ -240,7 +240,7 @@ class MoESharedExpert:
     shared_expert_down = Param(Tensor["C", "SharedM"])
 
     @forward
-    def forward(self, x: Tensor["B * T", "C"]) -> Tensor["B * T", "C"]:
+    def forward(self, x: Tensor[B * T, C]) -> Tensor[B * T, C]:
         """Placeholder forward - actual computation is in block definitions."""
         with graph() as g:
             return x

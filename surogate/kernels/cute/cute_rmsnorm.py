@@ -141,21 +141,25 @@ def _rmsnorm_params(dtype: str, store_rstd: bool) -> list[dict]:
         },
     ]
     if store_rstd:
-        params.append({
-            "name": "mRstd",
-            "type": "tensor_1d",
+        params.append(
+            {
+                "name": "mRstd",
+                "type": "tensor_1d",
+                "dtype": "fp32",
+                "size_bytes": 16,
+                "fields": [
+                    {"name": "data_ptr", "offset": 0, "type": "ptr"},
+                ],
+            }
+        )
+    params.append(
+        {
+            "name": "eps",
+            "type": "scalar",
             "dtype": "fp32",
-            "size_bytes": 16,
-            "fields": [
-                {"name": "data_ptr", "offset": 0, "type": "ptr"},
-            ],
-        })
-    params.append({
-        "name": "eps",
-        "type": "scalar",
-        "dtype": "fp32",
-        "size_bytes": 4,
-    })
+            "size_bytes": 4,
+        }
+    )
     return params
 
 
@@ -179,6 +183,7 @@ def compile_cute_rmsnorm(
     import cuda.bindings.driver as cuda_drv
     from quack.compile_utils import make_fake_tensor as fake_tensor
     from quack.rmsnorm import RMSNorm
+
     from surogate.kernels.compiler import compile_cute_kernel
 
     dtype_map = {
@@ -202,14 +207,14 @@ def compile_cute_rmsnorm(
     stream = cuda_drv.CUstream(0)
 
     compile_args = (
-        x_cute,      # mX
-        w_cute,      # mW
-        None,        # mB  (no bias)
-        None,        # mRes (no residual)
-        out_cute,    # mO
-        None,        # mResO
-        rstd_cute,   # mRstd
-        None,        # mMean
+        x_cute,  # mX
+        w_cute,  # mW
+        None,  # mB  (no bias)
+        None,  # mRes (no residual)
+        out_cute,  # mO
+        None,  # mResO
+        rstd_cute,  # mRstd
+        None,  # mMean
         Float32(0),  # eps
         stream,
     )

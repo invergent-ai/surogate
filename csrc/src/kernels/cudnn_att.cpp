@@ -19,7 +19,7 @@ std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudn
  * @param file Source file name for error reporting.
  * @param line Source line number for error reporting.
  */
-static void cuDNNCheck_(cudnnStatus_t error, const char *file, int line) {
+static void cuDNNCheck_(cudnnStatus_t error, const char* file, int line) {
     if (error != CUDNN_STATUS_SUCCESS) {
         printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, cudnnGetErrorString(error));
         exit(EXIT_FAILURE);
@@ -33,8 +33,8 @@ static void cuDNNCheck_(cudnnStatus_t error, const char *file, int line) {
  * @param file Source file name for error reporting.
  * @param line Source line number for error reporting.
  */
-static void checkCudnnFE(const fe::error_object& e, const char *file, int line) {
-    if(!e.is_good()) {
+static void checkCudnnFE(const fe::error_object& e, const char* file, int line) {
+    if (!e.is_good()) {
         printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, e.err_msg.c_str());
         exit(EXIT_FAILURE);
     }
@@ -48,24 +48,24 @@ static void checkCudnnFE(const fe::error_object& e, const char *file, int line) 
  * positions in the cuDNN execution graph via the variant_pack.
  */
 enum UIDs {
-    Q_UID,          ///< Query tensor
-    K_UID,          ///< Key tensor
-    V_UID,          ///< Value tensor
-    Attn_scale_UID, ///< Attention scale factor (1/sqrt(HS))
-    O_UID,          ///< Output tensor
-    Stats_UID,      ///< Statistics tensor for backward pass
-    dO_UID,         ///< Gradient of output tensor
-    dQ_UID,         ///< Gradient of query tensor
-    dK_UID,         ///< Gradient of key tensor
-    dV_UID          ///< Gradient of value tensor
+    Q_UID,           ///< Query tensor
+    K_UID,           ///< Key tensor
+    V_UID,           ///< Value tensor
+    Attn_scale_UID,  ///< Attention scale factor (1/sqrt(HS))
+    O_UID,           ///< Output tensor
+    Stats_UID,       ///< Statistics tensor for backward pass
+    dO_UID,          ///< Gradient of output tensor
+    dQ_UID,          ///< Gradient of query tensor
+    dK_UID,          ///< Gradient of key tensor
+    dV_UID           ///< Gradient of value tensor
 };
 
 /// @brief Cache type for forward attention graphs, keyed by (B, Hq, Hkv, T, HS, is_inference_only).
 /// Graph building is expensive, so we cache built graphs to avoid rebuilding.
-using cache_type_fwd = std::map<std::tuple<int,int,int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
+using cache_type_fwd = std::map<std::tuple<int, int, int, int, int, int>, std::shared_ptr<fe::graph::Graph>>;
 
 /// @brief Cache type for backward attention graphs, keyed by (B, Hq, Hkv, T, HS).
-using cache_type_bwd = std::map<std::tuple<int,int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
+using cache_type_bwd = std::map<std::tuple<int, int, int, int, int>, std::shared_ptr<fe::graph::Graph>>;
 
 /**
  * @brief Retrieves a cached forward attention graph or builds a new one.
@@ -86,8 +86,13 @@ using cache_type_bwd = std::map<std::tuple<int,int,int,int,int>, std::shared_ptr
  * @param cudnn_handle cuDNN handle for graph building.
  * @return Shared pointer to the cached or newly built cuDNN graph.
  */
-auto lookup_cache_or_build_graph_fwd(int B, int Hq, int Hkv, int T, int HS, int is_inference_only, cudnnHandle_t cudnn_handle) {
-
+auto lookup_cache_or_build_graph_fwd(int B,
+                                     int Hq,
+                                     int Hkv,
+                                     int T,
+                                     int HS,
+                                     int is_inference_only,
+                                     cudnnHandle_t cudnn_handle) {
     thread_local cache_type_fwd user_maintained_cache_fwd;
 
     auto key = std::make_tuple(B, Hq, Hkv, T, HS, is_inference_only);
@@ -99,31 +104,35 @@ auto lookup_cache_or_build_graph_fwd(int B, int Hq, int Hkv, int T, int HS, int 
 
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
-          .set_intermediate_data_type(fe::DataType_t::FLOAT)
-          .set_compute_data_type(fe::DataType_t::FLOAT);
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
 
     // QKV is (B, T, 3, NH, HS) which cuDNN can handle directly without an external permute
     // for (B, N, (NH + 2*(NH/replicate_factor)) * HS)
     // (B, T, Hq + 2Hkv, HS)
     int H = Hq + 2 * Hkv;
-    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Q")
                                .set_dim({B, Hq, T, HS})
                                .set_uid(Q_UID)
-                               .set_stride({H * HS * T,  HS, H * HS, 1}));
-    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
+                               .set_stride({H * HS * T, HS, H * HS, 1}));
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("K")
                                .set_dim({B, Hkv, T, HS})
                                .set_uid(K_UID)
                                .set_stride({H * HS * T, HS, H * HS, 1}));
-    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("V")
                                .set_dim({B, Hkv, T, HS})
                                .set_uid(V_UID)
                                .set_stride({H * HS * T, HS, H * HS, 1}));
-    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
-                               .set_dim({1, 1, 1, 1})
-                               .set_stride({1, 1, 1, 1})
-                               .set_uid(Attn_scale_UID)
-                               .set_is_pass_by_value(true)
-                               .set_data_type(fe::DataType_t::FLOAT));
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes()
+                                        .set_name("attn_scale")
+                                        .set_dim({1, 1, 1, 1})
+                                        .set_stride({1, 1, 1, 1})
+                                        .set_uid(Attn_scale_UID)
+                                        .set_is_pass_by_value(true)
+                                        .set_data_type(fe::DataType_t::FLOAT));
 
     auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
     sdpa_options.set_is_inference(is_inference_only);
@@ -138,10 +147,11 @@ auto lookup_cache_or_build_graph_fwd(int B, int Hq, int Hkv, int T, int HS, int 
 
     assert(stats == nullptr || is_inference_only == false);
     if (is_inference_only == false) {
-        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT)
-                               .set_dim({B, Hq, T, 1})
-                               .set_stride({Hq * T, T, 1, 1})
-                               .set_uid(Stats_UID);
+        stats->set_output(true)
+            .set_data_type(fe::DataType_t::FLOAT)
+            .set_dim({B, Hq, T, 1})
+            .set_stride({Hq * T, T, 1, 1})
+            .set_uid(Stats_UID);
     }
 
     checkCudnnFE(graph->validate());
@@ -185,44 +195,51 @@ auto lookup_cache_or_build_graph_bwd(int B, int Hq, int Hkv, int T, int HS, cudn
 
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::BFLOAT16)
-          .set_intermediate_data_type(fe::DataType_t::FLOAT)
-          .set_compute_data_type(fe::DataType_t::FLOAT);
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
 
     // (B, N, 3, NH, HS)
     // must come from inp (which means we also need to convert THAT to FP16)
-    int H = Hq + 2*Hkv;
-    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
-                            .set_dim({B, Hq, T, HS})
-                            .set_uid(Q_UID)
-                            .set_stride({H * HS * T, HS, H * HS, 1}));
-    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
-                            .set_dim({B, Hkv, T, HS})
-                            .set_uid(K_UID)
-                            .set_stride({H * HS * T, HS, H * HS, 1}));
-    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
-                            .set_dim({B, Hkv, T, HS})
-                            .set_uid(V_UID)
-                            .set_stride({H * HS * T, HS, H * HS, 1}));
-    auto O = graph->tensor(fe::graph::Tensor_attributes().set_name("O")
-                            .set_dim({B, Hq, T, HS})
-                            .set_uid(O_UID)
-                            .set_stride({Hq * HS * T, HS, Hq * HS, 1}));
-    auto dO = graph->tensor(fe::graph::Tensor_attributes().set_name("dO")
-                            .set_dim({B, Hq, T, HS})
-                            .set_uid(dO_UID)
-                            .set_stride({Hq * HS * T, HS, Hq * HS, 1}));
+    int H = Hq + 2 * Hkv;
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Q")
+                               .set_dim({B, Hq, T, HS})
+                               .set_uid(Q_UID)
+                               .set_stride({H * HS * T, HS, H * HS, 1}));
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("K")
+                               .set_dim({B, Hkv, T, HS})
+                               .set_uid(K_UID)
+                               .set_stride({H * HS * T, HS, H * HS, 1}));
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("V")
+                               .set_dim({B, Hkv, T, HS})
+                               .set_uid(V_UID)
+                               .set_stride({H * HS * T, HS, H * HS, 1}));
+    auto O = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("O")
+                               .set_dim({B, Hq, T, HS})
+                               .set_uid(O_UID)
+                               .set_stride({Hq * HS * T, HS, Hq * HS, 1}));
+    auto dO = graph->tensor(fe::graph::Tensor_attributes()
+                                .set_name("dO")
+                                .set_dim({B, Hq, T, HS})
+                                .set_uid(dO_UID)
+                                .set_stride({Hq * HS * T, HS, Hq * HS, 1}));
 
-    auto stats = graph->tensor(fe::graph::Tensor_attributes().set_name("stats")
-                            .set_dim({B, Hq, T, 1})
-                            .set_uid(Stats_UID)
-                            .set_stride({Hq * T, T, 1, 1})
-                            .set_data_type(fe::DataType_t::FLOAT));
-    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
-                            .set_dim({1, 1, 1, 1})
-                            .set_stride({1, 1, 1, 1})
-                            .set_is_pass_by_value(true)
-                            .set_uid(Attn_scale_UID)
-                            .set_data_type(fe::DataType_t::FLOAT));
+    auto stats = graph->tensor(fe::graph::Tensor_attributes()
+                                   .set_name("stats")
+                                   .set_dim({B, Hq, T, 1})
+                                   .set_uid(Stats_UID)
+                                   .set_stride({Hq * T, T, 1, 1})
+                                   .set_data_type(fe::DataType_t::FLOAT));
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes()
+                                        .set_name("attn_scale")
+                                        .set_dim({1, 1, 1, 1})
+                                        .set_stride({1, 1, 1, 1})
+                                        .set_is_pass_by_value(true)
+                                        .set_uid(Attn_scale_UID)
+                                        .set_data_type(fe::DataType_t::FLOAT));
     // Deterministic algorithm requires cuDNN 9.18.0+ on Blackwell (SM100+)
     // Check at runtime whether we can enable it
     bool use_deterministic = false;
@@ -240,12 +257,13 @@ auto lookup_cache_or_build_graph_bwd(int B, int Hq, int Hkv, int T, int HS, cudn
         }
     }
 #endif
-    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
+    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes()
+                                     .set_name("flash_attention_backward")
 #if CUDNN_FRONTEND_MAJOR_VERSION > 1 || CUDNN_FRONTEND_MINOR_VERSION >= 5
-                            .set_deterministic_algorithm(use_deterministic)
+                                     .set_deterministic_algorithm(use_deterministic)
 #endif
-                            .set_causal_mask(true)
-                            .set_attn_scale(attn_scale);
+                                     .set_causal_mask(true)
+                                     .set_attn_scale(attn_scale);
 
     // Create the graph operation and get the output tensors back
     auto [dQ, dK, dV] = graph->sdpa_backward(Q, K, V, O, dO, stats, sdpa_backward_options);
@@ -286,11 +304,17 @@ auto lookup_cache_or_build_graph_bwd(int B, int Hq, int Hkv, int T, int HS, cudn
  * @param HS Head size (hidden dimension per head).
  * @param stream CUDA stream for asynchronous execution.
  */
-void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Hq, HS)
-                             float* stats, // output for backward pass: (B, Hq, T)
+void attention_forward_cudnn(nv_bfloat16* out,        // output: (B, T, Hq, HS)
+                             float* stats,            // output for backward pass: (B, Hq, T)
                              const nv_bfloat16* inp,  // input: (B, T, Hq + Hk + Hv, HS) QKV
-                             std::byte* workspace, cudnnHandle_t handle,
-                             int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+                             std::byte* workspace,
+                             cudnnHandle_t handle,
+                             int B,
+                             int T,
+                             int Hq,
+                             int Hkv,
+                             int HS,
+                             cudaStream_t stream) {
     bool is_inference_only = (stats == nullptr);
 
     cuDNNCheck(cudnnSetStream(handle, stream));
@@ -306,8 +330,11 @@ void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Hq, HS)
     void* devPtrO = out;
 
     // Build variant pack
-    std::unordered_map<int64_t , void*> variant_pack = {
-        {Q_UID, (void*)devPtrQ}, {K_UID, (void*)devPtrK}, {V_UID, (void*)devPtrV}, {Attn_scale_UID, &attn_scale_cpu}, {O_UID, devPtrO}};
+    std::unordered_map<int64_t, void*> variant_pack = {{Q_UID, (void*)devPtrQ},
+                                                       {K_UID, (void*)devPtrK},
+                                                       {V_UID, (void*)devPtrV},
+                                                       {Attn_scale_UID, &attn_scale_cpu},
+                                                       {O_UID, devPtrO}};
 
     // Add the stats tensor unless we are only doing inference (only needed for backward pass)
     if (is_inference_only == false) {
@@ -340,11 +367,19 @@ void attention_forward_cudnn(nv_bfloat16* out,  // output: (B, T, Hq, HS)
  * @param HS Head size (hidden dimension per head).
  * @param stream CUDA stream for asynchronous execution.
  */
-void attention_backward_cudnn(nv_bfloat16* dqkvr,                                       // output
+void attention_backward_cudnn(nv_bfloat16* dqkvr,  // output
                               const float* stats,
-                              const nv_bfloat16* o, const nv_bfloat16* dout, const nv_bfloat16* qkvr, // inputs: out, dout, qkv (matches header)
-                              std::byte* workspace, cudnnHandle_t handle,
-                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream) {
+                              const nv_bfloat16* o,
+                              const nv_bfloat16* dout,
+                              const nv_bfloat16* qkvr,  // inputs: out, dout, qkv (matches header)
+                              std::byte* workspace,
+                              cudnnHandle_t handle,
+                              int B,
+                              int T,
+                              int Hq,
+                              int Hkv,
+                              int HS,
+                              cudaStream_t stream) {
     // Get graph and tensors from cache (or generate it on first use)
     auto graph = lookup_cache_or_build_graph_bwd(B, Hq, Hkv, T, HS, handle);
 
@@ -362,10 +397,16 @@ void attention_backward_cudnn(nv_bfloat16* dqkvr,                               
     void* devPtrdV = (dqkvr + (Hq + Hkv) * HS);
 
     // Build variant pack that links each tensor to its data pointer
-    std::unordered_map<int64_t, void*> variant_pack = {
-        {Q_UID, devPtrQ}, {K_UID, devPtrK}, {V_UID, devPtrV}, {O_UID, devPtrO}, {dO_UID, devPtrdO}, {Stats_UID, devPtrStats},
-        {dQ_UID, devPtrdQ}, {dK_UID, devPtrdK}, {dV_UID, devPtrdV},
-        {Attn_scale_UID, &attn_scale_cpu}};
+    std::unordered_map<int64_t, void*> variant_pack = {{Q_UID, devPtrQ},
+                                                       {K_UID, devPtrK},
+                                                       {V_UID, devPtrV},
+                                                       {O_UID, devPtrO},
+                                                       {dO_UID, devPtrdO},
+                                                       {Stats_UID, devPtrStats},
+                                                       {dQ_UID, devPtrdQ},
+                                                       {dK_UID, devPtrdK},
+                                                       {dV_UID, devPtrdV},
+                                                       {Attn_scale_UID, &attn_scale_cpu}};
 
     // Execute graph
     cuDNNCheck(cudnnSetStream(handle, stream));
@@ -389,8 +430,7 @@ void attention_backward_cudnn(nv_bfloat16* dqkvr,                               
  * @param handle cuDNN handle for graph building.
  * @return Required workspace size in bytes.
  */
-std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle)
-{
+std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle) {
     auto graph = lookup_cache_or_build_graph_bwd(B, Hq, Hkv, T, HS, handle);
     return graph->get_workspace_size();
 }

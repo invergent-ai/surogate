@@ -6,6 +6,7 @@ from surogate.utils.logger import get_logger
 
 logger = get_logger()
 
+
 def get_log_dir(output_dir: Path) -> Path:
     return output_dir / "logs"
 

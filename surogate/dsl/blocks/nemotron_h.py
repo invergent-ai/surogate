@@ -15,13 +15,13 @@ Each block has the structure:
 from __future__ import annotations
 
 from .. import nn
+from ..dim import B, Dim, T
 from ..nn import (
-    NEMOTRON_MAMBA_BLOCK_REMAP,
     NEMOTRON_ATTN_BLOCK_REMAP,
+    NEMOTRON_MAMBA_BLOCK_REMAP,
     NEMOTRON_MLP_BLOCK_REMAP,
     NEMOTRON_MOE_BLOCK_REMAP,
 )
-from ..dim import B, T, Dim
 
 
 class NemotronHMamba2Block(nn.Block):
@@ -172,7 +172,8 @@ class NemotronHMLPBlock(nn.Block):
 
         self.norm = nn.RMSNorm(d_model, eps=eps)
         self.mixer = nn.SimpleMLP(
-            d_model, d_ff,
+            d_model,
+            d_ff,
             activation=activation,
             use_bias=mlp_bias,
         )
@@ -221,11 +222,7 @@ class NemotronHMoEBlock(nn.Block):
         self.M = moe_intermediate_size
         self.E = num_experts
         self.K = num_experts_per_tok
-        self.SharedM = (
-            shared_expert_intermediate_size
-            if shared_expert_intermediate_size > 0
-            else moe_intermediate_size
-        )
+        self.SharedM = shared_expert_intermediate_size if shared_expert_intermediate_size > 0 else moe_intermediate_size
 
         self.norm = nn.RMSNorm(d_model, eps=eps)
         self.mixer = nn.NemotronMoEExperts(
@@ -254,7 +251,8 @@ class NemotronHMoEBlock(nn.Block):
             shared_out = self.shared_expert(h_flat)
             moe_out = self._add(moe_out, shared_out, name="moe_combined")
         self._register_activation(
-            "out", ("B", "T", "C"),
+            "out",
+            ("B", "T", "C"),
             share_policy="per_layer",
             description="MoE output (block output)",
         )

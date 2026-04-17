@@ -27,8 +27,8 @@ def main() -> None:
         raise RuntimeError("No common benchmark cases between surogate and FLA artifacts.")
 
     required_cases = {
-        (1, 512, 8, 128, 128),   # dev
-        (2, 2048, 16, 128, 128), # production-shaped
+        (1, 512, 8, 128, 128),  # dev
+        (2, 2048, 16, 128, 128),  # production-shaped
     }
     missing = sorted(required_cases.difference(common))
     if missing:
@@ -44,18 +44,15 @@ def main() -> None:
         st, ft = float(su["total_ms"]), float(fl["total_ms"])
         print(
             f"{k[0]} {k[1]} {k[2]} {k[3]} {k[4]} | "
-            f"{sf:7.3f} {ff:7.3f} {ff/sf:7.2f}x | "
-            f"{sb:7.3f} {fb:7.3f} {fb/sb:7.2f}x | "
-            f"{st:8.3f} {ft:8.3f} {ft/st:7.2f}x"
+            f"{sf:7.3f} {ff:7.3f} {ff / sf:7.2f}x | "
+            f"{sb:7.3f} {fb:7.3f} {fb / sb:7.2f}x | "
+            f"{st:8.3f} {ft:8.3f} {ft / st:7.2f}x"
         )
         if k in required_cases and st > ft:
             perf_failures.append((k, st, ft))
 
     if perf_failures:
-        msg = ", ".join(
-            f"{k}: su_total={st:.3f}ms > fla_total={ft:.3f}ms"
-            for k, st, ft in perf_failures
-        )
+        msg = ", ".join(f"{k}: su_total={st:.3f}ms > fla_total={ft:.3f}ms" for k, st, ft in perf_failures)
         raise RuntimeError(f"Performance gate failed for required cases: {msg}")
 
 

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from .. import nn
+from ..blocks.qwen3_moe import Qwen3MoEBlock
+from ..hf import build_attn_mappings, build_moe_mappings, build_norm_mappings
+from ..modules.attention import Qwen3Attention
 from ..nn import STANDARD_MODEL_NAME_REMAP
 from ..specs import ActivationScope
-from ..hf import build_norm_mappings, build_attn_mappings, build_moe_mappings
-from ..modules.attention import Qwen3Attention
-from ..blocks.qwen3_moe import Qwen3MoEBlock
 
 
 @nn.hf_config(
@@ -81,7 +81,8 @@ class Qwen3MoEModel(nn.Model):
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.BlockStack(
-            n_layers, Qwen3MoEBlock,
+            n_layers,
+            Qwen3MoEBlock,
             d_model=d_model,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
@@ -108,8 +109,7 @@ class Qwen3MoEModel(nn.Model):
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", ("T",), dtype="int32", scope=G)
         self._register_activation("targets", ("B", "T"), dtype="int32", scope=G)
-        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
-                                  scope=G, aliases=["rope_freqs"])
+        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32", scope=G, aliases=["rope_freqs"])
 
         # Global intermediate slots (must match old DSL for C++ runtime)
         _h = ("B", "T", "d_model")

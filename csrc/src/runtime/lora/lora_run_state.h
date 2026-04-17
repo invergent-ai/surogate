@@ -17,17 +17,17 @@ struct LoRARunState {
     Tensor intermediate2;  // (BT, rank) - second intermediate buffer for fused ops
     Tensor slice;
     Tensor norm_buffer;
-    Tensor recompute_ln;   // (B, T, C) - buffer for recomputed ln1/ln2 activations
-    Tensor recompute_rstd; // (B, T) - buffer for recomputed rstd (unused but required by kernel)
+    Tensor recompute_ln;    // (B, T, C) - buffer for recomputed ln1/ln2 activations
+    Tensor recompute_rstd;  // (B, T) - buffer for recomputed rstd (unused but required by kernel)
     int B = 0;
     int T = 0;
 
     // Grouped MoE LoRA scratch buffers
-    Tensor moe_lora_intermediate1; // (total_tokens, rank)
-    Tensor moe_lora_intermediate2; // (total_tokens, D)
-    Tensor moe_lora_gate;          // (total_tokens, D) - contiguous buffer for gate projection
-    Tensor moe_lora_up;            // (total_tokens, D) - contiguous buffer for up projection
-    Tensor moe_lora_gate_up;       // (total_tokens, 2*D) - combined gate+up buffer
+    Tensor moe_lora_intermediate1;  // (total_tokens, rank)
+    Tensor moe_lora_intermediate2;  // (total_tokens, D)
+    Tensor moe_lora_gate;           // (total_tokens, D) - contiguous buffer for gate projection
+    Tensor moe_lora_up;             // (total_tokens, D) - contiguous buffer for up projection
+    Tensor moe_lora_gate_up;        // (total_tokens, 2*D) - combined gate+up buffer
 
     // MoE expert LoRA state: pointers to current expert activations during hook execution.
     // These are set by the MoE block before calling expert hooks and read by the hook callback.
@@ -35,9 +35,9 @@ struct LoRARunState {
 
     // Multi-tensor norm state (pre-allocated for CUDA graph compatibility).
     // Populated once by populate_lora_norm_pointers(), reused every step.
-    Tensor norm_data_ptrs;      // device: void*[N] tensor data pointers
-    Tensor norm_sizes;           // device: size_t[N] element counts
-    Tensor norm_dtype_flags;     // device: int[N] dtype flags (0=FP32, 1=BF16)
+    Tensor norm_data_ptrs;    // device: void*[N] tensor data pointers
+    Tensor norm_sizes;        // device: size_t[N] element counts
+    Tensor norm_dtype_flags;  // device: int[N] dtype flags (0=FP32, 1=BF16)
     int norm_num_tensors = 0;
     bool norm_ptrs_initialized = false;
 
@@ -47,6 +47,6 @@ struct LoRARunState {
     unsigned int dropout_base_seed = 42;  ///< Base seed for dropout RNG
 };
 
-} // namespace modules
+}  // namespace modules
 
-#endif // SUROGATE_SRC_MODULES_LORA_LORA_RUN_STATE_H
+#endif  // SUROGATE_SRC_MODULES_LORA_LORA_RUN_STATE_H

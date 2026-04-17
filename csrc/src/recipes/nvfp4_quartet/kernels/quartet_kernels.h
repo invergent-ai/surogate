@@ -33,10 +33,7 @@ constexpr float BACKWARD_SCALE_OVERRIDE = (17.0f / 16.0f) * 0.93f;  // ~1.054
  * @param seed Random seed for column sign generation
  * @param stream CUDA stream
  */
-void initialize_hadamard_128(
-    nv_bfloat16* H,
-    unsigned int seed,
-    cudaStream_t stream = nullptr);
+void initialize_hadamard_128(nv_bfloat16* H, unsigned int seed, cudaStream_t stream = nullptr);
 
 // ============================================================================
 // Hadamard Transform (128x128 groups)
@@ -53,13 +50,13 @@ void initialize_hadamard_128(
  * @param transpose If true, computes X^T @ H^T
  * @param stream CUDA stream
  */
-void group_transform_128(
-    nv_bfloat16* y,
-    const nv_bfloat16* H,
-    const nv_bfloat16* x,
-    int M, int N,
-    bool transpose,
-    cudaStream_t stream = nullptr);
+void group_transform_128(nv_bfloat16* y,
+                         const nv_bfloat16* H,
+                         const nv_bfloat16* x,
+                         int M,
+                         int N,
+                         bool transpose,
+                         cudaStream_t stream = nullptr);
 
 // ============================================================================
 // EDEN Quantization with Fused Hadamard Transform
@@ -90,20 +87,20 @@ void group_transform_128(
  * @param transposeX If true, input is interpreted as transposed
  * @param stream CUDA stream
  */
-void group_transform_128_eden(
-    __nv_fp4x2_storage_t* y,
-    __nv_fp8_e4m3* scales_fp8,
-    float* global_scale_ptr,
-    nv_bfloat16* scratch_scales,
-    unsigned* max_scale,
-    const nv_bfloat16* h,
-    const nv_bfloat16* x,
-    long seed,
-    float fp4_max,
-    float fp8_max,
-    int M, int N,
-    bool transposeX,
-    cudaStream_t stream = nullptr);
+void group_transform_128_eden(__nv_fp4x2_storage_t* y,
+                              __nv_fp8_e4m3* scales_fp8,
+                              float* global_scale_ptr,
+                              nv_bfloat16* scratch_scales,
+                              unsigned* max_scale,
+                              const nv_bfloat16* h,
+                              const nv_bfloat16* x,
+                              long seed,
+                              float fp4_max,
+                              float fp8_max,
+                              int M,
+                              int N,
+                              bool transposeX,
+                              cudaStream_t stream = nullptr);
 
 // ============================================================================
 // Standalone EDEN FP4 Quantization
@@ -121,15 +118,14 @@ void group_transform_128_eden(
  * @param nelem Number of elements
  * @param stream CUDA stream
  */
-void eden_fp4(
-    __nv_fp4x4_e2m1* y_ptr,
-    __nv_fp8_e4m3* scale_ptr,
-    const nv_bfloat16* x_ptr,
-    const float* amax_ptr,
-    float scale_override,
-    long seed,
-    long nelem,
-    cudaStream_t stream = nullptr);
+void eden_fp4(__nv_fp4x4_e2m1* y_ptr,
+              __nv_fp8_e4m3* scale_ptr,
+              const nv_bfloat16* x_ptr,
+              const float* amax_ptr,
+              float scale_override,
+              long seed,
+              long nelem,
+              cudaStream_t stream = nullptr);
 
 // ============================================================================
 // Dequantize -> Transpose -> Hadamard -> Re-quantize Pipeline
@@ -157,21 +153,21 @@ void eden_fp4(
  * @param N Number of columns
  * @param stream CUDA stream
  */
-void dequant_tp_had_quant(
-    __nv_fp4x2_storage_t* y,
-    __nv_fp8_e4m3* scales_fp8,
-    float* global_scale_ptr,
-    nv_bfloat16* scratch_scales,
-    unsigned* max_scale,
-    const nv_bfloat16* h,
-    const __nv_fp4x2_storage_t* x,
-    const __nv_fp8_e4m3* x_scales,
-    const float* x_global_scale,
-    long seed,
-    float fp4_max,
-    float fp8_max,
-    int M, int N,
-    cudaStream_t stream = nullptr);
+void dequant_tp_had_quant(__nv_fp4x2_storage_t* y,
+                          __nv_fp8_e4m3* scales_fp8,
+                          float* global_scale_ptr,
+                          nv_bfloat16* scratch_scales,
+                          unsigned* max_scale,
+                          const nv_bfloat16* h,
+                          const __nv_fp4x2_storage_t* x,
+                          const __nv_fp8_e4m3* x_scales,
+                          const float* x_global_scale,
+                          long seed,
+                          float fp4_max,
+                          float fp8_max,
+                          int M,
+                          int N,
+                          cudaStream_t stream = nullptr);
 
 // ============================================================================
 // Scale Conversion with Stochastic Rounding
@@ -189,14 +185,13 @@ void dequant_tp_had_quant(
  * @param inv_fp8_max Inverse of FP8 max value (1/255.99)
  * @param stream CUDA stream
  */
-void launch_eden_convert_scales_kernel(
-    __nv_fp8_e4m3* scales_fp8,
-    float* global_scale_ptr,
-    const nv_bfloat16* scales_bf16,
-    const unsigned* max_scale_ptr,
-    long seed,
-    int groups,
-    float inv_fp8_max,
-    cudaStream_t stream = nullptr);
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8,
+                                       float* global_scale_ptr,
+                                       const nv_bfloat16* scales_bf16,
+                                       const unsigned* max_scale_ptr,
+                                       long seed,
+                                       int groups,
+                                       float inv_fp8_max,
+                                       cudaStream_t stream = nullptr);
 
 }  // namespace quartet

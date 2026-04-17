@@ -18,7 +18,9 @@ namespace dsl {
 class DslRunState;
 
 // Block activation tensor resolution
-Tensor* resolve_block_activation_tensor(ExecState& st, const std::string& name, ETensorDType dtype,
+Tensor* resolve_block_activation_tensor(ExecState& st,
+                                        const std::string& name,
+                                        ETensorDType dtype,
                                         const std::vector<long>& shape);
 
 Tensor* block_activation_base_ptr(DslRunState& rs, int layer_idx, const std::string& field);
@@ -28,7 +30,9 @@ Tensor* resolve_recomputed_block_tensor(ExecState& st, const std::string& name);
 Tensor* resolve_block_activation_base(ExecState& st, const std::string& name);
 
 // Block gradient tensor resolution
-Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ETensorDType dtype,
+Tensor* resolve_block_gradient_tensor(ExecState& st,
+                                      const std::string& name,
+                                      ETensorDType dtype,
                                       const std::vector<long>& shape);
 
 Tensor* resolve_gradient_view_tensor(ExecState& st,
@@ -45,11 +49,10 @@ Tensor& get_tensor(ExecState& st, const std::string& name, const std::unordered_
 Tensor* try_get_tensor(ExecState& st, const std::string& name, std::unordered_map<std::string, Tensor>& saved);
 
 // View shape resolution
-std::vector<long> resolve_view_shape(
-    const Operation& op,
-    const ShapeEnv& env,
-    ExecState& st,
-    std::unordered_map<std::string, Tensor>& saved);
+std::vector<long> resolve_view_shape(const Operation& op,
+                                     const ShapeEnv& env,
+                                     ExecState& st,
+                                     std::unordered_map<std::string, Tensor>& saved);
 
 }  // namespace dsl
 

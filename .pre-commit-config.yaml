@@ -1,11 +1,39 @@
-# See https://pre-commit.com for more information
-# See https://pre-commit.com/hooks.html for more hooks
+# Pre-commit config. See https://pre-commit.com.
+# Install once:    pre-commit install
+# Run on all files: pre-commit run --all-files
+# Or use:          make format
+
 repos:
--   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v3.2.0
+  # ────────── Baseline hygiene ──────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
     hooks:
-    -   id: trailing-whitespace
+      - id: trailing-whitespace
         args: ['--markdown-linebreak-ext=md']
-    -   id: end-of-file-fixer
-    -   id: check-yaml
-    -   id: check-added-large-files
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # ────────── C++ / CUDA formatter ──────────
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.7
+    hooks:
+      - id: clang-format
+        types_or: [c++, c, cuda]
+        # Pre-commit auto-detects .clang-format at repo root.
+        # Exclude vendored + build outputs.
+        exclude: ^(csrc/third_party/|csrc/build/|build/)
+
+  # ────────── Python formatter + linter ──────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.2
+    hooks:
+      - id: ruff-format          # auto-applies; always runs on commit
+      - id: ruff                 # lint: opt-in only (887 pre-existing issues
+        args: [--fix]            # from before big-bang reformat; not worth
+        stages: [manual]         # blocking commits on). Run with:
+                                 #   pre-commit run ruff --hook-stage manual --all-files
+                                 # or `make lint-py`.

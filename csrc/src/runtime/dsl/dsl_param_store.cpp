@@ -71,12 +71,13 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     int up_factor = 2;
     if (mlp_activation) {
         std::string act = *mlp_activation;
-        std::transform(act.begin(), act.end(), act.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(act.begin(), act.end(), act.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         if (act == "swiglu" || act == "geglu") {
             up_factor = 2;
-        } else if (act == "relu" || act == "relu2" || act == "gelu" || act == "gelu_new" ||
-                   act == "gelu_fast" || act == "silu" || act == "swish") {
+        } else if (act == "relu" || act == "relu2" || act == "gelu" || act == "gelu_new" || act == "gelu_fast" ||
+                   act == "silu" || act == "swish") {
             up_factor = 1;
         }
     }
@@ -149,7 +150,7 @@ void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     }
 }
 
-} // namespace
+}  // namespace
 
 DslParamStore::DslParamStore(const Module& module,
                              const Graph& graph,
@@ -305,4 +306,4 @@ void DslParamStore::iterate_tensors(const std::function<void(std::string, const 
     }
 }
 
-} // namespace dsl
+}  // namespace dsl

@@ -71,20 +71,14 @@ public:
     ///                  have allocated output.data, output.scales, and output.meta
     ///                  via allocate_storage() first.
     /// @param stream    CUDA stream for async execution
-    virtual void quantize(
-        const Tensor& input,
-        QuantizedTensor& output,
-        cudaStream_t stream) = 0;
+    virtual void quantize(const Tensor& input, QuantizedTensor& output, cudaStream_t stream) = 0;
 
     /// Dequantize a quantized tensor back to BF16.
     ///
     /// @param input     Quantized tensor to dequantize
     /// @param output    Pre-allocated BF16 tensor [M, K] for the result
     /// @param stream    CUDA stream for async execution
-    virtual void dequantize(
-        const QuantizedTensor& input,
-        Tensor& output,
-        cudaStream_t stream) = 0;
+    virtual void dequantize(const QuantizedTensor& input, Tensor& output, cudaStream_t stream) = 0;
 
     /// Allocate storage tensors for a QuantizedTensor of given dimensions.
     ///
@@ -98,12 +92,12 @@ public:
     /// @param allocator Tensor allocator to use
     /// @param alloc_type Where to allocate (GPU, CPU pinned, etc.)
     /// @param name      Name for allocation tracking
-    virtual void allocate_storage(
-        int M, int K,
-        QuantizedTensor& output,
-        TensorAllocator& allocator,
-        EAllocationType alloc_type,
-        const std::string& name) = 0;
+    virtual void allocate_storage(int M,
+                                  int K,
+                                  QuantizedTensor& output,
+                                  TensorAllocator& allocator,
+                                  EAllocationType alloc_type,
+                                  const std::string& name) = 0;
 
     /// Get the quantization format this quantizer implements.
     [[nodiscard]] virtual QuantFormat format() const = 0;

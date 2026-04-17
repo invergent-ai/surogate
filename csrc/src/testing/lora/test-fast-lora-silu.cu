@@ -85,8 +85,8 @@ static void silu_mul_backward_inplace_cpu(float* e, float* g, const float* dh, f
 static void split_gate_up_cpu(const float* gate_up, float* up, float* gate, int N, int D) {
     for (int n = 0; n < N; ++n) {
         for (int d = 0; d < D; ++d) {
-            up[n * D + d] = gate_up[n * 2 * D + d];         // up is first D columns
-            gate[n * D + d] = gate_up[n * 2 * D + D + d];   // gate is second D columns
+            up[n * D + d] = gate_up[n * 2 * D + d];        // up is first D columns
+            gate[n * D + d] = gate_up[n * 2 * D + D + d];  // gate is second D columns
         }
     }
 }
@@ -96,8 +96,8 @@ static void split_gate_up_cpu(const float* gate_up, float* up, float* gate, int 
 static void concat_d_gate_up_cpu(const float* dg, const float* de, float* d_gate_up, int N, int D) {
     for (int n = 0; n < N; ++n) {
         for (int d = 0; d < D; ++d) {
-            d_gate_up[n * 2 * D + d] = dg[n * D + d];       // dg is first D columns
-            d_gate_up[n * 2 * D + D + d] = de[n * D + d];   // de is second D columns
+            d_gate_up[n * 2 * D + d] = dg[n * D + d];      // dg is first D columns
+            d_gate_up[n * 2 * D + D + d] = de[n * D + d];  // de is second D columns
         }
     }
 }
@@ -138,7 +138,7 @@ static float max_rel_error(const std::vector<float>& a, const std::vector<float>
     return max_err;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // Test Cases
@@ -173,11 +173,12 @@ TEST_CASE("silu_mul_forward correctness", "[lora][fast_lora][silu]") {
     thrust::copy(bf_g.begin(), bf_g.end(), d_g.begin());
 
     // Run kernel
-    silu_mul_forward(
-        thrust::raw_pointer_cast(d_h.data()),
-        thrust::raw_pointer_cast(d_e.data()),
-        thrust::raw_pointer_cast(d_g.data()),
-        N, D, nullptr);
+    silu_mul_forward(thrust::raw_pointer_cast(d_h.data()),
+                     thrust::raw_pointer_cast(d_e.data()),
+                     thrust::raw_pointer_cast(d_g.data()),
+                     N,
+                     D,
+                     nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Download and convert
@@ -229,12 +230,13 @@ TEST_CASE("silu_mul_backward_inplace correctness", "[lora][fast_lora][silu]") {
     thrust::copy(bf_dh.begin(), bf_dh.end(), d_dh.begin());
 
     // Run kernel (in-place modifies d_e -> de, d_g -> dg)
-    silu_mul_backward_inplace(
-        thrust::raw_pointer_cast(d_e.data()),
-        thrust::raw_pointer_cast(d_g.data()),
-        thrust::raw_pointer_cast(d_dh.data()),
-        thrust::raw_pointer_cast(d_h.data()),
-        N, D, nullptr);
+    silu_mul_backward_inplace(thrust::raw_pointer_cast(d_e.data()),
+                              thrust::raw_pointer_cast(d_g.data()),
+                              thrust::raw_pointer_cast(d_dh.data()),
+                              thrust::raw_pointer_cast(d_h.data()),
+                              N,
+                              D,
+                              nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Download results
@@ -289,11 +291,12 @@ TEST_CASE("split_gate_up correctness", "[lora][fast_lora][split]") {
     }
     thrust::copy(bf_gate_up.begin(), bf_gate_up.end(), d_gate_up.begin());
 
-    split_gate_up(
-        thrust::raw_pointer_cast(d_gate_up.data()),
-        thrust::raw_pointer_cast(d_up.data()),
-        thrust::raw_pointer_cast(d_gate.data()),
-        N, D, nullptr);
+    split_gate_up(thrust::raw_pointer_cast(d_gate_up.data()),
+                  thrust::raw_pointer_cast(d_up.data()),
+                  thrust::raw_pointer_cast(d_gate.data()),
+                  N,
+                  D,
+                  nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Download
@@ -343,11 +346,12 @@ TEST_CASE("concat_d_gate_up correctness", "[lora][fast_lora][concat]") {
     thrust::copy(bf_dg.begin(), bf_dg.end(), d_dg.begin());
     thrust::copy(bf_de.begin(), bf_de.end(), d_de.begin());
 
-    concat_d_gate_up(
-        thrust::raw_pointer_cast(d_dg.data()),
-        thrust::raw_pointer_cast(d_de.data()),
-        thrust::raw_pointer_cast(d_d_gate_up.data()),
-        N, D, nullptr);
+    concat_d_gate_up(thrust::raw_pointer_cast(d_dg.data()),
+                     thrust::raw_pointer_cast(d_de.data()),
+                     thrust::raw_pointer_cast(d_d_gate_up.data()),
+                     N,
+                     D,
+                     nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Download
@@ -385,19 +389,21 @@ TEST_CASE("split then concat roundtrip", "[lora][fast_lora][roundtrip]") {
     thrust::copy(bf_gate_up.begin(), bf_gate_up.end(), d_gate_up.begin());
 
     // Split
-    split_gate_up(
-        thrust::raw_pointer_cast(d_gate_up.data()),
-        thrust::raw_pointer_cast(d_up.data()),
-        thrust::raw_pointer_cast(d_gate.data()),
-        N, D, nullptr);
+    split_gate_up(thrust::raw_pointer_cast(d_gate_up.data()),
+                  thrust::raw_pointer_cast(d_up.data()),
+                  thrust::raw_pointer_cast(d_gate.data()),
+                  N,
+                  D,
+                  nullptr);
 
     // Concat back: [up | gate] -> need to use concat_d_gate_up which does [dg | de]
     // So we swap: up goes to dg position, gate goes to de position
-    concat_d_gate_up(
-        thrust::raw_pointer_cast(d_up.data()),    // goes to first D columns
-        thrust::raw_pointer_cast(d_gate.data()),  // goes to second D columns
-        thrust::raw_pointer_cast(d_reconstructed.data()),
-        N, D, nullptr);
+    concat_d_gate_up(thrust::raw_pointer_cast(d_up.data()),    // goes to first D columns
+                     thrust::raw_pointer_cast(d_gate.data()),  // goes to second D columns
+                     thrust::raw_pointer_cast(d_reconstructed.data()),
+                     N,
+                     D,
+                     nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Download and compare

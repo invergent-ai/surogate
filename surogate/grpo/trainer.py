@@ -23,12 +23,12 @@ from surogate import _surogate
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.grpo.data import GRPODataLoader
 from surogate.grpo.loss import compute_grpo_per_token_grads
+from surogate.grpo.runs import get_multi_run_manager
 from surogate.grpo.weight_broadcast import SurogateWeightBroadcast
 from surogate.train.lr_schedule import LRSchedule
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
 from surogate.utils.tensor import to_surogate_dtype
-from surogate.grpo.runs import get_multi_run_manager
 
 logger = get_logger()
 
@@ -60,6 +60,7 @@ class GRPOTrainer:
 
         # Build DSL IR for the model (same pattern as SurogateTrainerWrapper)
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
+
         dsl_extra = {}
         if getattr(config, "ep_size", 1) > 1:
             dsl_extra["ep_size"] = config.ep_size
@@ -68,6 +69,7 @@ class GRPOTrainer:
 
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
+
         jit_manifests = compile_jit_kernels(ir_json)
         if jit_manifests:
             config.runtime_config.jit_kernel_manifests = jit_manifests
@@ -91,6 +93,7 @@ class GRPOTrainer:
         self._pad_logprob = None
         try:
             from surogate.core.model.hf_config import HfConfigFactory
+
             vocab_size = HfConfigFactory.get_config_attr(config.model_info.config, "vocab_size")
         except Exception:
             vocab_size = None
@@ -101,8 +104,7 @@ class GRPOTrainer:
         model_weights_path = get_model_weights_path(config.model_dir)
         if external_weights is not None:
             # Zero-copy import from external GPU pointers (colocate mode with vLLM)
-            logger.info(f"Importing weights from external GPU pointers "
-                        f"(non-quantized from {model_weights_path})")
+            logger.info(f"Importing weights from external GPU pointers (non-quantized from {model_weights_path})")
             self.trainer.import_weights_from_external(model_weights_path, external_weights)
         else:
             logger.info(f"Importing weights from {model_weights_path}")
@@ -130,6 +132,7 @@ class GRPOTrainer:
         # Weight broadcast (with optional QeRL noise injection)
         if config.weight_broadcast_type == "colocate":
             from surogate.grpo.weight_broadcast import ColocateWeightBroadcast
+
             self.broadcast = ColocateWeightBroadcast(
                 output_dir=config.output_dir,
                 max_async_level=config.max_async_level,
@@ -154,10 +157,16 @@ class GRPOTrainer:
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
         """Copy tokenizer, vocab, and config files from source model to output directory."""
         tokenizer_files = [
-            "config.json", "preprocessor_config.json",
-            "tokenizer.json", "tokenizer_config.json",
-            "special_tokens_map.json", "vocab.json", "merges.txt",
-            "added_tokens.json", "chat_template.jinja", "generation_config.json"
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "added_tokens.json",
+            "chat_template.jinja",
+            "generation_config.json",
         ]
         src_path = Path(src_dir)
         dst_path = Path(dst_dir)
@@ -173,9 +182,11 @@ class GRPOTrainer:
         # Build transport config
         if config.transport_type == "zmq":
             from surogate.core.config.grpo_orch_config import ZMQTransportConfig
+
             transport_config = ZMQTransportConfig({})
         else:
             from surogate.core.config.grpo_orch_config import FileSystemTransportConfig
+
             transport_config = FileSystemTransportConfig({})
 
         # dp_rank = 0 for single-node (all GPUs on same node share data)
@@ -184,6 +195,7 @@ class GRPOTrainer:
 
         # Initialize MultiRunManager singleton (required before packer)
         from surogate.grpo.packer import init_multi_run_manager, setup_grpo_packer
+
         init_multi_run_manager(output_dir=config.output_dir)
 
         # Setup packer on master (packs TrainingBatch -> MicroBatch)
@@ -220,18 +232,21 @@ class GRPOTrainer:
         logger.info(f"  Model: {config.model}")
         logger.info(f"  GPUs: {config.gpus}")
         logger.info(f"  Sequence length: {config.sequence_len}")
-        logger.info(f"  Gradient accumulation: dynamic (from packer, no fixed cap)")
+        logger.info("  Gradient accumulation: dynamic (from packer, no fixed cap)")
         logger.info(f"  Learning rate: {config.learning_rate}")
         logger.info(f"  LoRA: enabled={config.lora}, rank={config.lora_rank}, alpha={config.lora_alpha}")
         logger.info(f"  Recipe: {config.recipe}")
         logger.info(f"  Optimizer: {config.optimizer}")
-        logger.info(f"  Loss: kl_tau={config.loss.kl_tau}, adv_tau={config.loss.adv_tau}, "
-                     f"ipo_mask_low={config.loss.ipo_mask_low}, ipo_mask_high={config.loss.ipo_mask_high}")
+        logger.info(
+            f"  Loss: kl_tau={config.loss.kl_tau}, adv_tau={config.loss.adv_tau}, "
+            f"ipo_mask_low={config.loss.ipo_mask_low}, ipo_mask_high={config.loss.ipo_mask_high}"
+        )
         logger.info(f"  Doc masking: {config.doc_masking}")
         if config.noise_scheduler and config.noise_scheduler.enabled:
             ns = config.noise_scheduler
-            logger.info(f"  QeRL noise: sigma_start={ns.sigma_start}, "
-                         f"sigma_end={ns.sigma_end}, num_stages={ns.num_stages}")
+            logger.info(
+                f"  QeRL noise: sigma_start={ns.sigma_start}, sigma_end={ns.sigma_end}, num_stages={ns.num_stages}"
+            )
         if max_steps > 0:
             logger.info(f"  Max steps (orchestrator): {max_steps}")
         else:
@@ -261,7 +276,7 @@ class GRPOTrainer:
                 logger.warning("No micro-batches received, retrying...")
                 continue
 
-            # Accumulate ALL micro-batches from one pack into a single optimizer step.  
+            # Accumulate ALL micro-batches from one pack into a single optimizer step.
             # No fixed gradient_accumulation_steps — the count is determined dynamically by the packer each step.
             seq_len = config.sequence_len
             n_mb = len(micro_batches)
@@ -292,9 +307,9 @@ class GRPOTrainer:
                 mb_start = time.time()
 
                 # Original micro-batch data
-                orig_input_ids = mb["input_ids"]          # [1, T_mb]
-                orig_position_ids = mb["position_ids"]    # [1, T_mb]
-                orig_targets = mb["targets"]              # [1, T_mb]
+                orig_input_ids = mb["input_ids"]  # [1, T_mb]
+                orig_position_ids = mb["position_ids"]  # [1, T_mb]
+                orig_targets = mb["targets"]  # [1, T_mb]
                 advantages_flat = mb["advantages"].flatten()
                 inference_lp = mb["inference_logprobs"].flatten()
                 loss_mask_flat = mb["loss_mask"].flatten()
@@ -354,7 +369,8 @@ class GRPOTrainer:
                 # --- Single forward pass: logprobs + save activations ---
                 logprob_start = time.time()
                 raw_lp_full = self.trainer.forward_for_grpo(
-                    input_step, targets_step,
+                    input_step,
+                    targets_step,
                     position_ids=pos_step,
                     temperatures=temp_step,
                 )
@@ -365,7 +381,7 @@ class GRPOTrainer:
                 # shift_tensor_right after a packed shift_tensor_left.
                 all_trainer_logprobs = np.zeros(T_actual, dtype=np.float32)
                 if T_actual > 1:
-                    all_trainer_logprobs[1:T_actual] = raw_lp[:T_actual - 1]
+                    all_trainer_logprobs[1:T_actual] = raw_lp[: T_actual - 1]
                 if self._pad_logprob is not None and T_actual > 0:
                     all_trainer_logprobs[0] = self._pad_logprob
 
@@ -387,7 +403,7 @@ class GRPOTrainer:
                 # Align with global next-token shift used for labels.
                 surogate_grads = np.zeros(T_actual, dtype=np.float32)
                 if T_actual > 1:
-                    surogate_grads[:T_actual - 1] = per_token_grads_flat[1:T_actual]
+                    surogate_grads[: T_actual - 1] = per_token_grads_flat[1:T_actual]
 
                 grads_padded = np.zeros((1, seq_len), dtype=np.float32)
                 grads_padded[0, :T_actual] = surogate_grads
@@ -424,8 +440,7 @@ class GRPOTrainer:
 
             # 6. Logging
             if step % config.logging_steps == 0:
-                avg_metrics = {k: v / max(n_mb, 1) for k, v in step_metrics.items()
-                               if isinstance(v, float)}
+                avg_metrics = {k: v / max(n_mb, 1) for k, v in step_metrics.items() if isinstance(v, float)}
                 logger.info(
                     f"step={step} loss={avg_metrics.get('policy_loss', 0):.4f} "
                     f"grad_norm={result['norm']:.4f} lr={lr:.2e} "
@@ -438,9 +453,7 @@ class GRPOTrainer:
                 )
 
             # 7. Checkpointing
-            if (config.save_steps > 0 and step > 0
-                    and step % config.save_steps == 0
-                    and config.checkpoint_dir):
+            if config.save_steps > 0 and step > 0 and step % config.save_steps == 0 and config.checkpoint_dir:
                 logger.info(f"Saving checkpoint at step {step}...")
                 self.trainer.save_checkpoint(config.checkpoint_dir, step)
 

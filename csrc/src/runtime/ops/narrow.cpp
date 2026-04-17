@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/dsl/autodiff.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "utilities/dtype.h"
 
@@ -37,8 +39,8 @@ void CompiledExecutor::dispatch_narrow(const CompiledOp& op) {
 
     if (start < 0 || length <= 0 || start + length > in_dim) {
         std::ostringstream oss;
-        oss << "dispatch_narrow: invalid range [" << start << ", " << start + length
-            << ") for dim " << dim << " of size " << in_dim;
+        oss << "dispatch_narrow: invalid range [" << start << ", " << start + length << ") for dim " << dim
+            << " of size " << in_dim;
         throw std::runtime_error(oss.str());
     }
 
@@ -67,23 +69,21 @@ void CompiledExecutor::dispatch_narrow(const CompiledOp& op) {
     const std::byte* in_ptr = static_cast<const std::byte*>(in.Data);
     std::byte* out_ptr = static_cast<std::byte*>(out.Data);
 
-    const std::size_t src_pitch =
-        static_cast<std::size_t>(in_dim) * static_cast<std::size_t>(inner) * elem_bytes;
-    const std::size_t row_bytes =
-        static_cast<std::size_t>(length) * static_cast<std::size_t>(inner) * elem_bytes;
-    const std::byte* src_base =
-        in_ptr + static_cast<std::size_t>(start) * static_cast<std::size_t>(inner) * elem_bytes;
+    const std::size_t src_pitch = static_cast<std::size_t>(in_dim) * static_cast<std::size_t>(inner) * elem_bytes;
+    const std::size_t row_bytes = static_cast<std::size_t>(length) * static_cast<std::size_t>(inner) * elem_bytes;
+    const std::byte* src_base = in_ptr + static_cast<std::size_t>(start) * static_cast<std::size_t>(inner) * elem_bytes;
 
     if (outer == 1) {
-        CUDA_CHECK(cudaMemcpyAsync(
-            out_ptr, src_base, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(out_ptr, src_base, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
     } else {
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            out_ptr, row_bytes,
-            src_base, src_pitch,
-            row_bytes, static_cast<std::size_t>(outer),
-            cudaMemcpyDeviceToDevice,
-            mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpy2DAsync(out_ptr,
+                                     row_bytes,
+                                     src_base,
+                                     src_pitch,
+                                     row_bytes,
+                                     static_cast<std::size_t>(outer),
+                                     cudaMemcpyDeviceToDevice,
+                                     mRunState.MainStream));
     }
 
     store_tensor(op.outputs[0], out);
@@ -117,32 +117,63 @@ void CompiledExecutor::dispatch_narrow_backward(const CompiledOp& op) {
     // Copy d_output into the slice
     const std::size_t elem_bytes = get_dtype_size(d_out.DType);
     long inner = 1;
-    for (int i = dim + 1; i < rank; ++i) inner *= fwd_input.Sizes[i];
+    for (int i = dim + 1; i < rank; ++i)
+        inner *= fwd_input.Sizes[i];
     long outer = 1;
-    for (int i = 0; i < dim; ++i) outer *= fwd_input.Sizes[i];
+    for (int i = 0; i < dim; ++i)
+        outer *= fwd_input.Sizes[i];
 
-    std::byte* dst_base = static_cast<std::byte*>(d_in.Data)
-        + static_cast<std::size_t>(start) * static_cast<std::size_t>(inner) * elem_bytes;
+    std::byte* dst_base = static_cast<std::byte*>(d_in.Data) +
+                          static_cast<std::size_t>(start) * static_cast<std::size_t>(inner) * elem_bytes;
     const std::byte* src_ptr = static_cast<const std::byte*>(d_out.Data);
 
     const std::size_t dst_pitch =
         static_cast<std::size_t>(fwd_input.Sizes[dim]) * static_cast<std::size_t>(inner) * elem_bytes;
-    const std::size_t row_bytes =
-        static_cast<std::size_t>(length) * static_cast<std::size_t>(inner) * elem_bytes;
+    const std::size_t row_bytes = static_cast<std::size_t>(length) * static_cast<std::size_t>(inner) * elem_bytes;
 
     if (outer == 1) {
-        CUDA_CHECK(cudaMemcpyAsync(
-            dst_base, src_ptr, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpyAsync(dst_base, src_ptr, row_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
     } else {
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            dst_base, dst_pitch,
-            src_ptr, row_bytes,
-            row_bytes, static_cast<std::size_t>(outer),
-            cudaMemcpyDeviceToDevice,
-            mRunState.MainStream));
+        CUDA_CHECK(cudaMemcpy2DAsync(dst_base,
+                                     dst_pitch,
+                                     src_ptr,
+                                     row_bytes,
+                                     row_bytes,
+                                     static_cast<std::size_t>(outer),
+                                     cudaMemcpyDeviceToDevice,
+                                     mRunState.MainStream));
     }
 
     store_tensor(op.outputs[0], d_in);
 }
 
+namespace {
+
+// -----------------------------------------------------------------------------
+// Narrow backward rule
+// Forward: y = narrow(x, dim, start, length)
+// Backward: d_x = zeros_like(x); d_x[..., start:start+length, ...] = d_y
+// -----------------------------------------------------------------------------
+std::vector<Operation> narrow_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        // Copy dim, start, length attributes from forward
+        AttrMap attrs = copy_attrs(ctx.fwd_op.attrs, {"dim", "start", "length"});
+        // Pass the forward input name so backward can determine the full shape
+        ops.push_back(make_operation("narrow_backward_" + std::to_string(ctx.op_counter++),
+                                     "narrow_backward",
+                                     "narrow_backward",
+                                     {ctx.d_output, saved_ref(ctx.fwd_op.inputs[0])},
+                                     {ctx.d_inputs[0]},
+                                     attrs));
+    }
+
+    return ops;
+}
+
+}  // namespace
+
 }  // namespace dsl
+
+REGISTER_AUTODIFF("narrow", ::dsl::narrow_backward_rule);

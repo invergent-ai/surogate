@@ -36,4 +36,3 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     temperatures: list[float]  # Per-token temperatures used during generation
     teacher_logprobs: list[float] | None = None
     lora_num_tokens: list[int] | None = None
-

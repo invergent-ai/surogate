@@ -33,7 +33,7 @@
 
 namespace modules {
 struct HfMapping;
-}
+}  // namespace modules
 
 namespace dsl {
 
@@ -45,7 +45,8 @@ class DslWeightManager;
 
 class EmptyTensorContainer final : public ITensorContainer {
 public:
-    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>&) override {}
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>&) override {
+    }
 };
 
 namespace detail {
@@ -53,7 +54,9 @@ namespace detail {
 class AdamW8BitMomentumContainer final : public ITensorContainer {
 public:
     AdamW8BitMomentumContainer(Tensor* state1 = nullptr, Tensor* scales1 = nullptr)
-        : mState1(state1), mScales1(scales1) {}
+        : mState1(state1),
+          mScales1(scales1) {
+    }
 
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
         if (!mState1 || !mState1->Data) return;
@@ -76,7 +79,9 @@ private:
 class AdamW8BitVarianceContainer final : public ITensorContainer {
 public:
     AdamW8BitVarianceContainer(Tensor* state2 = nullptr, Tensor* scales2 = nullptr)
-        : mState2(state2), mScales2(scales2) {}
+        : mState2(state2),
+          mScales2(scales2) {
+    }
 
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
         if (!mState2 || !mState2->Data) return;
@@ -113,10 +118,19 @@ public:
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
-    void update(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2, int t, float epsilon, float weight_decay, float grad_clip) override;
+    void update(NCCLCommunicator& comm,
+                float learning_rate,
+                float beta_1,
+                float beta_2,
+                int t,
+                float epsilon,
+                float weight_decay,
+                float grad_clip) override;
     void update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) override;
-    void update_with_graph_params(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config,
-                                  const float* opt_params, const int* opt_step);
+    void update_with_graph_params(NCCLCommunicator& comm,
+                                  const optimizers::OptimizerConfig& config,
+                                  const float* opt_params,
+                                  const int* opt_step);
     void prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config);
     void zero_grads(cudaStream_t stream);
     void set_internal_graphs_enabled(bool enabled);
@@ -135,9 +149,15 @@ public:
     void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
     void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
 
-    [[nodiscard]] bool lora_enabled() const override { return mLoRAConfig.has_value() && mLoRAConfig->enabled(); }
-    [[nodiscard]] bool qlora_enabled() const { return lora_enabled() && mQLoRAConfig.is_quantized(); }
-    [[nodiscard]] bool is_moe_model() const { return mIsMoEModel; }
+    [[nodiscard]] bool lora_enabled() const override {
+        return mLoRAConfig.has_value() && mLoRAConfig->enabled();
+    }
+    [[nodiscard]] bool qlora_enabled() const {
+        return lora_enabled() && mQLoRAConfig.is_quantized();
+    }
+    [[nodiscard]] bool is_moe_model() const {
+        return mIsMoEModel;
+    }
     [[nodiscard]] std::size_t lora_num_parameters() const {
         return mLoRAWeights ? mLoRAWeights->num_parameters() : 0;
     }
@@ -146,17 +166,25 @@ public:
     [[nodiscard]] std::size_t saved_buffers_total_bytes() const;
     [[nodiscard]] int saved_buffers_count() const;
     [[nodiscard]] const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const;
-    DslModel& base_model() { return *this; }
-    [[nodiscard]] const modules::ModelConfig& config() const { return mModelConfig; }
+    DslModel& base_model() {
+        return *this;
+    }
+    [[nodiscard]] const modules::ModelConfig& config() const {
+        return mModelConfig;
+    }
 
     // Weight streaming/sharding support
     [[nodiscard]] bool is_weight_streaming_enabled() const;
-    [[nodiscard]] DslWeightManager* weight_manager() { return mWeightManager.get(); }
+    [[nodiscard]] DslWeightManager* weight_manager() {
+        return mWeightManager.get();
+    }
 
     modules::ModularLoRAWeightsManager& lora_weights();
     modules::ModularLoRAGradsManager& lora_grads();
     modules::LoRARunState& lora_run_state();
-    [[nodiscard]] const modules::ModularLoRAConfig& lora_config() const { return *mLoRAConfig; }
+    [[nodiscard]] const modules::ModularLoRAConfig& lora_config() const {
+        return *mLoRAConfig;
+    }
     const DslGradStore& grads() const;
 
     std::vector<std::byte> rng_state() const override;
@@ -164,7 +192,9 @@ public:
 
     /// Set the path to a PEFT adapter to merge into base weights during import.
     /// Must be called before import_weights().
-    void set_adapter_path(const std::string& path) { mAdapterPath = path; }
+    void set_adapter_path(const std::string& path) {
+        mAdapterPath = path;
+    }
 
     /// Compute per-token log-probabilities for a batch of sequences.
     ///
@@ -182,7 +212,9 @@ public:
     ///               If nullptr, uses temperature=1.0 for all tokens.
     std::vector<float> compute_logprobs(const std::int32_t* input_ids,
                                         const std::int32_t* targets,
-                                        int B, int T, bool use_lora,
+                                        int B,
+                                        int T,
+                                        bool use_lora,
                                         NCCLCommunicator& comm,
                                         const std::int32_t* position_ids = nullptr,
                                         const float* temperatures = nullptr);
@@ -203,11 +235,14 @@ public:
     ///   If nullptr, uses temperature=1.0 for all tokens.
     /// grad_accum_steps:    Total gradient accumulation steps.
     /// micro_step:          Current micro-step index within grad_accum_steps.
-    void step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor targets,
-                                const float* per_token_grads_cpu,
-                                int grad_accum_steps, int micro_step,
-                                NCCLCommunicator& comm,
-                                const float* temperatures = nullptr);
+    void step_with_custom_loss(Tensor inputs,
+                               Tensor position_ids,
+                               Tensor targets,
+                               const float* per_token_grads_cpu,
+                               int grad_accum_steps,
+                               int micro_step,
+                               NCCLCommunicator& comm,
+                               const float* temperatures = nullptr);
 
     /// GRPO single-pass forward: runs training forward (saves activations) AND
     /// returns per-token log-probabilities extracted from the loss buffer.
@@ -216,17 +251,22 @@ public:
     ///
     /// logprob[t] = -loss[t] where loss[t] = logsumexp - logit[target[t]].
     /// Masked positions (target == -100) receive 0.
-    std::vector<float> forward_for_grpo(Tensor inputs, Tensor position_ids, Tensor targets,
-                                         int grad_accum_steps, int micro_step,
-                                         NCCLCommunicator& comm,
-                                         const float* temperatures = nullptr);
+    std::vector<float> forward_for_grpo(Tensor inputs,
+                                        Tensor position_ids,
+                                        Tensor targets,
+                                        int grad_accum_steps,
+                                        int micro_step,
+                                        NCCLCommunicator& comm,
+                                        const float* temperatures = nullptr);
 
     /// GRPO backward pass using activations saved by forward_for_grpo().
     /// Must be called after forward_for_grpo() in the same micro-step.
-    void backward_grpo(Tensor inputs, Tensor targets,
-                        const float* per_token_grads_cpu,
-                        int grad_accum_steps, int micro_step,
-                        NCCLCommunicator& comm);
+    void backward_grpo(Tensor inputs,
+                       Tensor targets,
+                       const float* per_token_grads_cpu,
+                       int grad_accum_steps,
+                       int micro_step,
+                       NCCLCommunicator& comm);
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
@@ -239,16 +279,18 @@ public:
     /// @param safetensors_path  Path to HF SafeTensors (for non-quantized weights).
     /// @param external_weights  Externally-owned quantized weight descriptors.
     /// @param comm              NCCL communicator.
-    void import_weights_from_external(
-        const std::string& safetensors_path,
-        const std::vector<qlora::ExternalWeight>& external_weights,
-        NCCLCommunicator& comm);
+    void import_weights_from_external(const std::string& safetensors_path,
+                                      const std::vector<qlora::ExternalWeight>& external_weights,
+                                      NCCLCommunicator& comm);
     void on_restore_checkpoint(NCCLCommunicator& comm) override;
     void export_weights(const std::string& file_name, NCCLCommunicator& comm) override;
     void prepare_optimizer_for_checkpoint_load() override;
 
-    void allocate_run_state(const RuntimeOptions& options, NCCLCommunicator& comm,
-                            int B, int T, bool allocate_optimizer) override;
+    void allocate_run_state(const RuntimeOptions& options,
+                            NCCLCommunicator& comm,
+                            int B,
+                            int T,
+                            bool allocate_optimizer) override;
 
     /// Schedule deferred QLoRA offloading auto-tune.  The actual tuning
     /// happens at the start of step 1 (inside invalidate_cache) after all
@@ -272,28 +314,48 @@ private:
     void init_optimizer_state(cudaStream_t stream);
     void init_adamw_state(cudaStream_t stream);
     void init_normuon_state(cudaStream_t stream);
-    void update_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
-                      int t, float epsilon, float weight_decay, float grad_clip);
-    void update_cpu_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
-                          int t, float epsilon, float weight_decay, float grad_clip);
+    void update_adamw(NCCLCommunicator& comm,
+                      float learning_rate,
+                      float beta_1,
+                      float beta_2,
+                      int t,
+                      float epsilon,
+                      float weight_decay,
+                      float grad_clip);
+    void update_cpu_adamw(NCCLCommunicator& comm,
+                          float learning_rate,
+                          float beta_1,
+                          float beta_2,
+                          int t,
+                          float epsilon,
+                          float weight_decay,
+                          float grad_clip);
     void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced);
     void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T);
     void ensure_lora_run_state(NCCLCommunicator& comm, int B, int T);
-    void update_lora_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
-                           int t, float epsilon, float weight_decay, float grad_clip);
-    void update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip,
-                                 const float* opt_params, const int* opt_step);
-    void update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
-                               int t, float epsilon, float weight_decay, float grad_clip);
-    void update_adamw_graph(NCCLCommunicator& comm, float grad_clip,
-                            const float* opt_params, const int* opt_step);
-    void update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
-                                 const float* opt_params, const int* opt_step);
-    void update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
-                              const float* opt_params, const int* opt_step);
-    void update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
-                                      const float* opt_params, const int* opt_step);
+    void update_lora_adamw(NCCLCommunicator& comm,
+                           float learning_rate,
+                           float beta_1,
+                           float beta_2,
+                           int t,
+                           float epsilon,
+                           float weight_decay,
+                           float grad_clip);
+    void update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
+    void update_lora_adamw_8bit(NCCLCommunicator& comm,
+                                float learning_rate,
+                                float beta_1,
+                                float beta_2,
+                                int t,
+                                float epsilon,
+                                float weight_decay,
+                                float grad_clip);
+    void update_adamw_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
+    void update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
+    void update_normuon_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
+    void
+    update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
     void update_lora_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
     void populate_lora_norm_pointers(NCCLCommunicator& comm, cudaStream_t stream);
@@ -328,8 +390,8 @@ private:
     std::unique_ptr<modules::LoRAAdamW8BitState> mLoRAAdamW8BitState;
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;
-    bool mUseTokenScale = true;  // apply 1/valid_token_count in global_norm_sqrt
-    bool mDocMaskingActive = false;  // set by forward(), cleared by backward()
+    bool mUseTokenScale = true;               // apply 1/valid_token_count in global_norm_sqrt
+    bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 
     // Pre-built name tables for LoRA backward (avoids per-layer string construction).
@@ -355,10 +417,10 @@ private:
         // Offloading configuration (copied from options during init)
         bool offload_state = false;
         bool use_zero_copy = false;
-        Tensor state1;       // signed char (int8) - softsign-quantized momentum
-        Tensor state2;       // unsigned char (uint8) - sqrt-quantized variance
-        Tensor scales1;      // FP16 per-group scales for momentum
-        Tensor scales2;      // FP16 per-group scales for variance
+        Tensor state1;   // signed char (int8) - softsign-quantized momentum
+        Tensor state2;   // unsigned char (uint8) - sqrt-quantized variance
+        Tensor scales1;  // FP16 per-group scales for momentum
+        Tensor scales2;  // FP16 per-group scales for variance
     };
     std::unique_ptr<AdamW8BitState> mAdamW8BitState;
 
@@ -423,6 +485,6 @@ private:
     std::unordered_map<std::string, MappingSpec> mHfExport;
 };
 
-} // namespace dsl
+}  // namespace dsl
 
-#endif // SUROGATE_SRC_DSL_DSL_MODEL_H
+#endif  // SUROGATE_SRC_DSL_DSL_MODEL_H

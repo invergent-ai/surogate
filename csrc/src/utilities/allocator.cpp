@@ -31,8 +31,7 @@ struct sTotalAllocations {
      * @return Reference to the counter corresponding to @p kind.
      * @throws std::logic_error If @p kind is not a recognized allocation type.
      */
-    long& operator[](EAllocationType kind)
-    {
+    long& operator[](EAllocationType kind) {
         switch (kind) {
             case EAllocationType::ON_DEVICE: return ON_DEVICE;
             case EAllocationType::MANAGED: return MANAGED;
@@ -44,8 +43,7 @@ struct sTotalAllocations {
     }
 };
 
-struct TensorAllocator::sAllocStats
-{
+struct TensorAllocator::sAllocStats {
     std::string Context = "";
     std::unordered_map<std::string, sTotalAllocations> TensorStats;
     std::unordered_map<std::string, sTotalAllocations> ContextStats;
@@ -65,10 +63,9 @@ struct TensorAllocator::sAllocStats
  * @throws std::runtime_error If tensor rank exceeds MAX_TENSOR_DIM.
  * @throws cuda_error On CUDA allocation failures (e.g., out-of-memory).
  */
-template<typename Container>
-Tensor allocate_tensor(ETensorDType dtype, EAllocationType kind, const Container& shape)
-{
-    if(shape.size() > MAX_TENSOR_DIM) {
+template <typename Container>
+Tensor allocate_tensor(ETensorDType dtype, EAllocationType kind, const Container& shape) {
+    if (shape.size() > MAX_TENSOR_DIM) {
         throw std::runtime_error("Tensor rank too large");
     }
 
@@ -78,15 +75,17 @@ Tensor allocate_tensor(ETensorDType dtype, EAllocationType kind, const Container
     int rank = narrow<int>(shape.size());
     std::size_t total = std::accumulate(std::begin(shape), std::end(shape), 1l, std::multiplies<>());
     std::byte* ptr;
-    if(kind == EAllocationType::ON_DEVICE) {
+    if (kind == EAllocationType::ON_DEVICE) {
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr), total * get_dtype_size(dtype)));
-    } else if(kind == EAllocationType::MANAGED) {
+    } else if (kind == EAllocationType::MANAGED) {
         CUDA_CHECK(cudaMallocManaged(reinterpret_cast<void**>(&ptr), total * get_dtype_size(dtype)));
-    } else if(kind == EAllocationType::PINNED) {
+    } else if (kind == EAllocationType::PINNED) {
         CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&ptr), total * get_dtype_size(dtype), cudaHostAllocMapped));
         did = -1;
-    }  else if(kind == EAllocationType::WRITE_CMB) {
-        CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&ptr), total * get_dtype_size(dtype), cudaHostAllocWriteCombined | cudaHostAllocMapped));
+    } else if (kind == EAllocationType::WRITE_CMB) {
+        CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&ptr),
+                                 total * get_dtype_size(dtype),
+                                 cudaHostAllocWriteCombined | cudaHostAllocMapped));
         did = -1;
     } else {
         ptr = new std::byte[total * get_dtype_size(dtype)];
@@ -107,7 +106,10 @@ Tensor allocate_tensor(ETensorDType dtype, EAllocationType kind, const Container
  * @param kind Allocation kind to increment.
  * @param bytes Number of bytes to add to the counter.
  */
-void record_stats(std::unordered_map<std::string, sTotalAllocations>& target, std::string name, EAllocationType kind, long bytes) {
+void record_stats(std::unordered_map<std::string, sTotalAllocations>& target,
+                  std::string name,
+                  EAllocationType kind,
+                  long bytes) {
     target[name][kind] += narrow<long>(bytes);
 }
 
@@ -121,7 +123,10 @@ void record_stats(std::unordered_map<std::string, sTotalAllocations>& target, st
  * @return Allocated Tensor.
  * @throws std::runtime_error On CUDA OOM (with enriched message) or rank/other allocation errors.
  */
-Tensor TensorAllocator::allocate(ETensorDType dtype, const char* name, EAllocationType kind, const std::initializer_list<long>& shape) {
+Tensor TensorAllocator::allocate(ETensorDType dtype,
+                                 const char* name,
+                                 EAllocationType kind,
+                                 const std::initializer_list<long>& shape) {
     return allocate_impl(dtype, name, kind, shape);
 }
 
@@ -135,7 +140,8 @@ Tensor TensorAllocator::allocate(ETensorDType dtype, const char* name, EAllocati
  * @return Allocated Tensor.
  * @throws std::runtime_error On CUDA OOM (with enriched message) or rank/other allocation errors.
  */
-Tensor TensorAllocator::allocate(ETensorDType dtype, const char* name, EAllocationType kind, const std::vector<long>& shape) {
+Tensor
+TensorAllocator::allocate(ETensorDType dtype, const char* name, EAllocationType kind, const std::vector<long>& shape) {
     return allocate_impl(dtype, name, kind, shape);
 }
 
@@ -177,7 +183,12 @@ Tensor TensorAllocator::allocate(ETensorDType dtype, const char* name, const std
  * @return TensorShard containing the allocated shard tensor and sharding metadata.
  * @throws std::runtime_error / std::logic_error If div_exact fails (shape not divisible) or allocation fails.
  */
-TensorShard TensorAllocator::allocate_shard(ETensorDType dtype, int shard_idx, int num_shards, const char* name, const std::vector<long>& shape,  EAllocationType kind) {
+TensorShard TensorAllocator::allocate_shard(ETensorDType dtype,
+                                            int shard_idx,
+                                            int num_shards,
+                                            const char* name,
+                                            const std::vector<long>& shape,
+                                            EAllocationType kind) {
     std::vector<long> shard_shape(shape);
     shard_shape[0] = div_exact(shape[0], (long)num_shards);
     return TensorShard(allocate(dtype, name, kind, shard_shape), shard_idx, num_shards, shape);
@@ -197,35 +208,40 @@ TensorShard TensorAllocator::allocate_shard(ETensorDType dtype, int shard_idx, i
  * @return Allocated Tensor.
  * @throws std::runtime_error On CUDA OOM with detailed guidance; rethrows other cuda_error exceptions.
  */
-template<typename Container>
-Tensor TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAllocationType kind, const Container& shape) {
+template <typename Container>
+Tensor
+TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAllocationType kind, const Container& shape) {
     try {
         Tensor allocated = allocate_tensor(dtype, kind, shape);
         const char* safe_name = name ? name : "<unnamed>";
-        m_Pointers.emplace_back(sAllocationData{kind, allocated.Data, narrow<long>(allocated.bytes()), safe_name, m_Stats->Context});
+        m_Pointers.emplace_back(
+            sAllocationData{kind, allocated.Data, narrow<long>(allocated.bytes()), safe_name, m_Stats->Context});
         record_stats(m_Stats->TensorStats, name, kind, allocated.bytes());
-        if (!m_Stats->Context.empty()){
+        if (!m_Stats->Context.empty()) {
             record_stats(m_Stats->ContextStats, m_Stats->Context, kind, allocated.bytes());
         }
-        if(mCallback) {
+        if (mCallback) {
             mCallback(m_Stats->Context, name, kind, allocated.bytes());
         }
         return allocated;
     } catch (const cuda_error& error) {
-        if(error.code == cudaErrorMemoryAllocation) {
+        if (error.code == cudaErrorMemoryAllocation) {
             print_stats();
             std::string shape_str = "[";
-            for(auto s: shape) {
+            for (auto s : shape) {
                 shape_str += std::to_string(s) + ", ";
             }
             shape_str.pop_back();
             shape_str.pop_back();
             shape_str.push_back(']');
-            std::string message = fmt::format(
-                "Cuda OOM when allocating tensor {} of shape {} with dtype {} in context {}. "
-                "Try reducing batch/seq length or offloading optimizer state "
-                "with 'offload_optimizer' (and optionally 'offload_grads').",
-                name, shape_str, dtype_to_str(dtype), m_Stats->Context);
+            std::string message =
+                fmt::format("Cuda OOM when allocating tensor {} of shape {} with dtype {} in context {}. "
+                            "Try reducing batch/seq length or offloading optimizer state "
+                            "with 'offload_optimizer' (and optionally 'offload_grads').",
+                            name,
+                            shape_str,
+                            dtype_to_str(dtype),
+                            m_Stats->Context);
             throw std::runtime_error(message);
         }
         throw;
@@ -235,7 +251,8 @@ Tensor TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAll
 /**
  * @brief Construct a TensorAllocator with empty allocation statistics.
  */
-TensorAllocator::TensorAllocator() : m_Stats(std::make_unique<sAllocStats>()) {
+TensorAllocator::TensorAllocator()
+    : m_Stats(std::make_unique<sAllocStats>()) {
 }
 
 /**
@@ -268,7 +285,7 @@ TensorAllocator::~TensorAllocator() noexcept {
         did = -1;
         (void)cudaGetLastError();
     }
-    for (auto& ptr: m_Pointers) {
+    for (auto& ptr : m_Pointers) {
         const char* kind_str;
         switch (ptr.Kind) {
             case EAllocationType::ON_DEVICE: kind_str = "device"; break;
@@ -286,7 +303,11 @@ TensorAllocator::~TensorAllocator() noexcept {
                 if (st != cudaSuccess) {
                     fprintf(stderr,
                             "WARNING: Cuda error on device %d when freeing allocation %p [%s of size %ld]: %s\n",
-                            did, ptr.Pointer, kind_str, ptr.Size, cudaGetErrorString(st));
+                            did,
+                            ptr.Pointer,
+                            kind_str,
+                            ptr.Size,
+                            cudaGetErrorString(st));
                     fflush(stderr);
                     (void)cudaGetLastError();
                 }
@@ -298,15 +319,17 @@ TensorAllocator::~TensorAllocator() noexcept {
                 if (st != cudaSuccess) {
                     fprintf(stderr,
                             "WARNING: Cuda error on device %d when freeing host allocation %p [%s of size %ld]: %s\n",
-                            did, ptr.Pointer, kind_str, ptr.Size, cudaGetErrorString(st));
+                            did,
+                            ptr.Pointer,
+                            kind_str,
+                            ptr.Size,
+                            cudaGetErrorString(st));
                     fflush(stderr);
                     (void)cudaGetLastError();
                 }
                 break;
             }
-            case EAllocationType::ON_HOST:
-                delete[] ptr.Pointer;
-                break;
+            case EAllocationType::ON_HOST: delete[] ptr.Pointer; break;
         }
     }
 }
@@ -369,7 +392,7 @@ void TensorAllocator::print_stats() const {
     };
     std::unordered_map<std::string, CategoryData> categories;
 
-    for (auto& [name, amount]: m_Stats->TensorStats) {
+    for (auto& [name, amount] : m_Stats->TensorStats) {
         if (amount.ON_DEVICE < total_allocation() / 1024) continue;  // skip tiny tensors
         auto cat = categorize_tensor(name);
         auto& data = categories[cat.name];
@@ -383,16 +406,18 @@ void TensorAllocator::print_stats() const {
     for (auto& [name, data] : categories) {
         sorted_categories.emplace_back(name, &data);
     }
-    std::sort(sorted_categories.begin(), sorted_categories.end(),
-              [](const auto& a, const auto& b) { return a.second->total > b.second->total; });
+    std::sort(sorted_categories.begin(), sorted_categories.end(), [](const auto& a, const auto& b) {
+        return a.second->total > b.second->total;
+    });
 
     // Print each category
     for (const auto& [category, data] : sorted_categories) {
         std::cerr << "\n=== " << category << " (" << data->total / 1024 / 1024 << " MiB) [" << data->hints << "] ===\n";
 
         // Sort tensors within category by size (descending)
-        std::sort(data->tensors.begin(), data->tensors.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::sort(data->tensors.begin(), data->tensors.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
 
         for (const auto& [name, bytes] : data->tensors) {
             if (bytes >= 1024 * 1024 * 20) {
@@ -412,7 +437,7 @@ void TensorAllocator::print_stats() const {
  */
 std::size_t TensorAllocator::total_allocation() const {
     std::size_t total = 0;
-    for(const auto& ptr: m_Pointers) {
+    for (const auto& ptr : m_Pointers) {
         total += ptr.Size;
     }
     return total;
@@ -426,8 +451,8 @@ std::size_t TensorAllocator::total_allocation() const {
  */
 std::size_t TensorAllocator::total_allocation(EAllocationType kind) const {
     std::size_t total = 0;
-    for(const auto& ptr: m_Pointers) {
-        if(ptr.Kind == kind) {
+    for (const auto& ptr : m_Pointers) {
+        if (ptr.Kind == kind) {
             total += ptr.Size;
         }
     }
@@ -462,8 +487,10 @@ const std::string& TensorAllocator::get_context() const {
  * @param name Context name to set while the monitor is alive.
  * @param alloc Allocator whose context should be managed.
  */
-TensorAllocator::AllocationMonitor::AllocationMonitor(const std::string& name, TensorAllocator* alloc) :
-    mName(name), mAllocator(alloc), mParent(alloc->get_context()) {
+TensorAllocator::AllocationMonitor::AllocationMonitor(const std::string& name, TensorAllocator* alloc)
+    : mName(name),
+      mAllocator(alloc),
+      mParent(alloc->get_context()) {
     alloc->set_context(mName);
 }
 
@@ -522,9 +549,12 @@ TensorAllocator::AllocationMonitor::~AllocationMonitor() noexcept {
     if (mAllocator->get_context() != mName) {
         // Never throw from a destructor. This can happen during exception unwinding and would
         // mask the original error with a terminate()/abort.
-        fprintf(stderr,
-                "WARNING: AllocationMonitor improper nesting: expected ctx='%s' but got ctx='%s' (restoring parent='%s')\n",
-                mName.c_str(), mAllocator->get_context().c_str(), mParent.c_str());
+        fprintf(
+            stderr,
+            "WARNING: AllocationMonitor improper nesting: expected ctx='%s' but got ctx='%s' (restoring parent='%s')\n",
+            mName.c_str(),
+            mAllocator->get_context().c_str(),
+            mParent.c_str());
         fflush(stderr);
     }
     mAllocator->set_context(mParent);
@@ -542,8 +572,10 @@ TensorAllocator::AllocationMonitor::~AllocationMonitor() noexcept {
 std::vector<std::pair<std::string, sSegmentMemory>> TensorAllocator::get_allocation_segments() const {
     long sum = 0;
     std::vector<std::pair<std::string, sSegmentMemory>> segments;
-    for (const auto& [name, amount]: m_Stats->ContextStats) {
-        segments.emplace_back(name, sSegmentMemory{amount.ON_DEVICE, amount.MANAGED, amount.PINNED + amount.WRITE_CMB, amount.ON_HOST});
+    for (const auto& [name, amount] : m_Stats->ContextStats) {
+        segments.emplace_back(
+            name,
+            sSegmentMemory{amount.ON_DEVICE, amount.MANAGED, amount.PINNED + amount.WRITE_CMB, amount.ON_HOST});
         sum += amount.ON_DEVICE;
     }
     std::size_t free = 0;
@@ -551,7 +583,7 @@ std::vector<std::pair<std::string, sSegmentMemory>> TensorAllocator::get_allocat
     long reserved = get_mem_reserved();
     CUDA_CHECK(cudaMemGetInfo(&free, &total));
     segments.emplace_back("Free", sSegmentMemory{(long)free, 0, 0, 0});
-    if(reserved > 0) {
+    if (reserved > 0) {
         segments.emplace_back("Reserved", sSegmentMemory{reserved, 0, 0, 0});
     }
     segments.emplace_back("Other", sSegmentMemory{(long)total - (long)free - sum - reserved, 0, 0, 0});
@@ -565,7 +597,8 @@ std::vector<std::pair<std::string, sSegmentMemory>> TensorAllocator::get_allocat
  *
  * @param cb Callback function; passing an empty function disables callbacks.
  */
-void TensorAllocator::set_callback(std::function<void(const std::string&, const std::string&, EAllocationType, std::size_t)> cb) {
+void TensorAllocator::set_callback(
+    std::function<void(const std::string&, const std::string&, EAllocationType, std::size_t)> cb) {
     mCallback = std::move(cb);
 }
 
@@ -580,7 +613,6 @@ std::vector<std::pair<std::string, std::size_t>> TensorAllocator::get_tensor_sta
     for (const auto& [name, allocs] : m_Stats->TensorStats) {
         result.emplace_back(name, static_cast<std::size_t>(allocs.ON_DEVICE));
     }
-    std::sort(result.begin(), result.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     return result;
 }

@@ -14,9 +14,9 @@
 namespace qlora {
 
 BnBQuantizer::BnBQuantizer(const QuantizerConfig& config)
-    : mBlockSize(config.block_size)
-    , mDoubleQuant(config.double_quant)
-    , mDoubleQuantGroupSize(config.double_quant_group_size) {
+    : mBlockSize(config.block_size),
+      mDoubleQuant(config.double_quant),
+      mDoubleQuantGroupSize(config.double_quant_group_size) {
     CUDA_CHECK(cudaGetDeviceProperties(&mDeviceProps, config.device_id));
 }
 
@@ -45,10 +45,7 @@ void BnBQuantizer::ensure_absmax_buffer(long num_blocks) {
     mAbsmaxCapacity = num_blocks;
 }
 
-void BnBQuantizer::quantize(
-    const Tensor& input,
-    QuantizedTensor& output,
-    cudaStream_t stream) {
+void BnBQuantizer::quantize(const Tensor& input, QuantizedTensor& output, cudaStream_t stream) {
     const int M = output.M;
     const int K = output.K;
     const long num_elements = static_cast<long>(M) * K;
@@ -74,78 +71,74 @@ void BnBQuantizer::quantize(
         float* temp_absmax = mAbsmaxBuffer;
 
         // Step 1: Quantize BF16 → NF4 with FP32 absmax
-        quantize_bnb_nf4(
-            output.data.get<unsigned char>(),
-            temp_absmax,
-            input.get<nv_bfloat16>(),
-            M, K,
-            mBlockSize,
-            mDeviceProps,
-            stream);
+        quantize_bnb_nf4(output.data.get<unsigned char>(),
+                         temp_absmax,
+                         input.get<nv_bfloat16>(),
+                         M,
+                         K,
+                         mBlockSize,
+                         mDeviceProps,
+                         stream);
 
         // Step 2: Double-quantize absmax FP32 → INT8 with per-group scale/offset
-        quantize_absmax_double(
-            output.scales.get<unsigned char>(),  // INT8 quantized absmax
-            output.meta.get<float>(),            // Per-group scale
-            output.meta2.get<float>(),           // Per-group offset
-            temp_absmax,
-            static_cast<int>(num_blocks),
-            mDoubleQuantGroupSize,
-            mDeviceProps,
-            stream);
+        quantize_absmax_double(output.scales.get<unsigned char>(),  // INT8 quantized absmax
+                               output.meta.get<float>(),            // Per-group scale
+                               output.meta2.get<float>(),           // Per-group offset
+                               temp_absmax,
+                               static_cast<int>(num_blocks),
+                               mDoubleQuantGroupSize,
+                               mDeviceProps,
+                               stream);
 
     } else {
         // Single-step: Quantize BF16 → NF4 with FP32 absmax directly
-        quantize_bnb_nf4(
-            output.data.get<unsigned char>(),
-            output.scales.get<float>(),
-            input.get<nv_bfloat16>(),
-            M, K,
-            mBlockSize,
-            mDeviceProps,
-            stream);
+        quantize_bnb_nf4(output.data.get<unsigned char>(),
+                         output.scales.get<float>(),
+                         input.get<nv_bfloat16>(),
+                         M,
+                         K,
+                         mBlockSize,
+                         mDeviceProps,
+                         stream);
     }
 }
 
-void BnBQuantizer::dequantize(
-    const QuantizedTensor& input,
-    Tensor& output,
-    cudaStream_t stream) {
+void BnBQuantizer::dequantize(const QuantizedTensor& input, Tensor& output, cudaStream_t stream) {
     const int M = input.M;
     const int K = input.K;
 
     if (input.double_quant) {
         // Fused dequantization: double-quant absmax + NF4 → BF16
-        dequantize_bnb_nf4_double(
-            output.get<nv_bfloat16>(),
-            input.data.get<unsigned char>(),
-            input.scales.get<unsigned char>(),   // INT8 quantized absmax
-            input.meta.get<float>(),             // Per-group scale
-            input.meta2.get<float>(),            // Per-group offset
-            M, K,
-            mBlockSize,
-            input.double_quant_group_size,
-            mDeviceProps,
-            stream);
+        dequantize_bnb_nf4_double(output.get<nv_bfloat16>(),
+                                  input.data.get<unsigned char>(),
+                                  input.scales.get<unsigned char>(),  // INT8 quantized absmax
+                                  input.meta.get<float>(),            // Per-group scale
+                                  input.meta2.get<float>(),           // Per-group offset
+                                  M,
+                                  K,
+                                  mBlockSize,
+                                  input.double_quant_group_size,
+                                  mDeviceProps,
+                                  stream);
     } else {
         // Direct dequantization: FP32 absmax + NF4 → BF16
-        dequantize_bnb_nf4(
-            output.get<nv_bfloat16>(),
-            input.data.get<unsigned char>(),
-            input.scales.get<float>(),
-            M, K,
-            mBlockSize,
-            mDeviceProps,
-            stream);
+        dequantize_bnb_nf4(output.get<nv_bfloat16>(),
+                           input.data.get<unsigned char>(),
+                           input.scales.get<float>(),
+                           M,
+                           K,
+                           mBlockSize,
+                           mDeviceProps,
+                           stream);
     }
 }
 
-void BnBQuantizer::allocate_storage(
-    int M, int K,
-    QuantizedTensor& output,
-    TensorAllocator& allocator,
-    EAllocationType alloc_type,
-    const std::string& name) {
+void BnBQuantizer::allocate_storage(int M,
+                                    int K,
+                                    QuantizedTensor& output,
+                                    TensorAllocator& allocator,
+                                    EAllocationType alloc_type,
+                                    const std::string& name) {
     const long num_elements = static_cast<long>(M) * K;
     const long num_blocks = (num_elements + mBlockSize - 1) / mBlockSize;
     const long packed_bytes = (num_elements + 1) / 2;  // 2 NF4 values per byte
@@ -158,42 +151,31 @@ void BnBQuantizer::allocate_storage(
     output.double_quant_group_size = mDoubleQuantGroupSize;
 
     // Packed NF4 data: 4 bits per value, 2 values per byte
-    output.data = allocator.allocate(
-        ETensorDType::BYTE,
-        fmt::format("{}.data", name).c_str(),
-        alloc_type,
-        {packed_bytes});
+    output.data =
+        allocator.allocate(ETensorDType::BYTE, fmt::format("{}.data", name).c_str(), alloc_type, {packed_bytes});
 
     if (mDoubleQuant) {
         const long num_groups = (num_blocks + mDoubleQuantGroupSize - 1) / mDoubleQuantGroupSize;
 
         // Scales: INT8-quantized absmax (one byte per block)
-        output.scales = allocator.allocate(
-            ETensorDType::BYTE,
-            fmt::format("{}.absmax_q", name).c_str(),
-            alloc_type,
-            {num_blocks});
+        output.scales =
+            allocator.allocate(ETensorDType::BYTE, fmt::format("{}.absmax_q", name).c_str(), alloc_type, {num_blocks});
 
         // Meta: Per-group FP32 scale for double quantization
-        output.meta = allocator.allocate(
-            ETensorDType::FP32,
-            fmt::format("{}.absmax_scale", name).c_str(),
-            alloc_type,
-            {num_groups});
+        output.meta = allocator.allocate(ETensorDType::FP32,
+                                         fmt::format("{}.absmax_scale", name).c_str(),
+                                         alloc_type,
+                                         {num_groups});
 
         // Meta2: Per-group FP32 offset for double quantization
-        output.meta2 = allocator.allocate(
-            ETensorDType::FP32,
-            fmt::format("{}.absmax_offset", name).c_str(),
-            alloc_type,
-            {num_groups});
+        output.meta2 = allocator.allocate(ETensorDType::FP32,
+                                          fmt::format("{}.absmax_offset", name).c_str(),
+                                          alloc_type,
+                                          {num_groups});
     } else {
         // Scales: FP32 absmax (one per block)
-        output.scales = allocator.allocate(
-            ETensorDType::FP32,
-            fmt::format("{}.absmax", name).c_str(),
-            alloc_type,
-            {num_blocks});
+        output.scales =
+            allocator.allocate(ETensorDType::FP32, fmt::format("{}.absmax", name).c_str(), alloc_type, {num_blocks});
     }
 }
 
@@ -206,11 +188,11 @@ size_t BnBQuantizer::estimate_storage_bytes(int M, int K) const {
 
     if (mDoubleQuant) {
         const long num_groups = (num_blocks + mDoubleQuantGroupSize - 1) / mDoubleQuantGroupSize;
-        total += static_cast<size_t>(num_blocks);        // INT8 absmax
-        total += static_cast<size_t>(num_groups) * 4;    // FP32 scale
-        total += static_cast<size_t>(num_groups) * 4;    // FP32 offset
+        total += static_cast<size_t>(num_blocks);      // INT8 absmax
+        total += static_cast<size_t>(num_groups) * 4;  // FP32 scale
+        total += static_cast<size_t>(num_groups) * 4;  // FP32 offset
     } else {
-        total += static_cast<size_t>(num_blocks) * 4;    // FP32 absmax
+        total += static_cast<size_t>(num_blocks) * 4;  // FP32 absmax
     }
 
     return total;

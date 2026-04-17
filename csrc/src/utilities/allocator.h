@@ -37,21 +37,28 @@ class TensorAllocator {
 public:
     TensorAllocator();
     ~TensorAllocator() noexcept;
-    TensorAllocator(TensorAllocator&&) noexcept ;
+    TensorAllocator(TensorAllocator&&) noexcept;
     TensorAllocator(const TensorAllocator&) = delete;
-    TensorAllocator& operator=(TensorAllocator&&) noexcept ;
+    TensorAllocator& operator=(TensorAllocator&&) noexcept;
     TensorAllocator& operator=(const TensorAllocator&) = delete;
 
     void print_stats() const;
-    void set_callback(std::function<void(const std::string& ctx, const std::string& name, EAllocationType kind, std::size_t amount)>);
+    void set_callback(
+        std::function<void(const std::string& ctx, const std::string& name, EAllocationType kind, std::size_t amount)>);
 
     Tensor allocate(ETensorDType dtype, const char* name, EAllocationType kind, const std::vector<long>& shape);
-    Tensor allocate(ETensorDType dtype, const char* name, EAllocationType kind, const std::initializer_list<long>& shape);
+    Tensor
+    allocate(ETensorDType dtype, const char* name, EAllocationType kind, const std::initializer_list<long>& shape);
 
     Tensor allocate(ETensorDType dtype, const char* name, const std::vector<long>& shape);
     Tensor allocate(ETensorDType dtype, const char* name, const std::initializer_list<long>& shape);
 
-    TensorShard allocate_shard(ETensorDType dtype, int shard_idx, int num_shards, const char* name, const std::vector<long>& shape,  EAllocationType kind=EAllocationType::ON_DEVICE);
+    TensorShard allocate_shard(ETensorDType dtype,
+                               int shard_idx,
+                               int num_shards,
+                               const char* name,
+                               const std::vector<long>& shape,
+                               EAllocationType kind = EAllocationType::ON_DEVICE);
 
     std::size_t total_allocation() const;
     std::size_t total_allocation(EAllocationType kind) const;
@@ -67,6 +74,7 @@ public:
         AllocationMonitor(AllocationMonitor&& other) noexcept;
         AllocationMonitor& operator=(AllocationMonitor&& other) noexcept;
         ~AllocationMonitor() noexcept;
+
     private:
         std::string mName;
         std::string mParent;
@@ -74,7 +82,9 @@ public:
         bool mActive = true;
     };
 
-    [[nodiscard]] AllocationMonitor with_context(const std::string& ctx) { return AllocationMonitor(ctx, this); }
+    [[nodiscard]] AllocationMonitor with_context(const std::string& ctx) {
+        return AllocationMonitor(ctx, this);
+    }
 
     std::vector<std::pair<std::string, sSegmentMemory>> get_allocation_segments() const;
 
@@ -83,9 +93,9 @@ public:
      * @return Vector of (tensor_name, device_bytes) pairs sorted by size descending.
      */
     std::vector<std::pair<std::string, std::size_t>> get_tensor_stats() const;
-private:
 
-    template<typename Container>
+private:
+    template <typename Container>
     Tensor allocate_impl(ETensorDType dtype, const char* name, EAllocationType kind, const Container& shape);
 
     struct sAllocStats;
@@ -101,7 +111,8 @@ private:
     std::vector<sAllocationData> m_Pointers;
     std::unique_ptr<sAllocStats> m_Stats;
 
-    std::function<void(const std::string& ctx, const std::string& name, EAllocationType kind, std::size_t amount)> mCallback;
+    std::function<void(const std::string& ctx, const std::string& name, EAllocationType kind, std::size_t amount)>
+        mCallback;
 };
 
-#endif //SUROGATE_SRC_UTILITIES_ALLOCATOR_H
+#endif  //SUROGATE_SRC_UTILITIES_ALLOCATOR_H
