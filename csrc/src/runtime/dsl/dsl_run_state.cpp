@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "runtime/attention/attention_backend.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "runtime/training/runtime_options.h"
@@ -1114,18 +1115,17 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
             max_D = std::max(max_D, pld.head_size);
         }
     }
-    // Must match the dispatch gate in flash_attention.cpp: cuDNN SDPA
-    // backward rejects head_dim > 128, so avoid eagerly building the
-    // backward graph for sizing. For head_dim > 128 the dispatch falls
-    // through to flash-varlen / matmul and never touches cuDNN.
-    const bool cudnn_ok = (max_D > 0 && Hq > 0 && Hkv > 0 && (max_D % 8 == 0) && max_D <= 128);
-    if (cudnn_ok) {
-        const long cudnn_ws_size = static_cast<long>(cudnn_get_workspace_size(static_cast<int>(attn_ws_batch_size),
-                                                                              static_cast<int>(T),
-                                                                              static_cast<int>(Hq),
-                                                                              static_cast<int>(Hkv),
-                                                                              static_cast<int>(max_D),
-                                                                              CudnnHandle));
+    // Delegate workspace sizing to the attention-backend registry.
+    // Only cuDNN has a persistent workspace; other backends report 0.
+    const long cudnn_ws_size =
+        static_cast<long>(AttentionBackendRegistry::instance().max_workspace_bytes(static_cast<int>(attn_ws_batch_size),
+                                                                                   static_cast<int>(T),
+                                                                                   static_cast<int>(Hq),
+                                                                                   static_cast<int>(Hkv),
+                                                                                   static_cast<int>(max_D),
+                                                                                   CudnnHandle,
+                                                                                   cublas_handle()));
+    if (cudnn_ws_size > 0) {
         // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
         // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
         // from the temp stack, checkpoint restores during backward can cause it to be reallocated

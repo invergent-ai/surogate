@@ -322,6 +322,11 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/layernorm.cpp
     src/runtime/ops/rope.cpp
     src/runtime/ops/flash_attention.cpp
+    src/runtime/attention/backend_registry.cpp
+    src/runtime/attention/backend_cudnn.cpp
+    src/runtime/attention/backend_flash_varlen.cpp
+    src/runtime/attention/backend_custom.cpp
+    src/runtime/attention/backend_sdpa.cpp
     src/runtime/ops/cross_entropy_loss.cpp
     src/runtime/ops/fused_lm_head_loss.cpp
     src/runtime/ops/silu.cpp
