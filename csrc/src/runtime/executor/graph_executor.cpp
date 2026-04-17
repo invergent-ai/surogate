@@ -3,14 +3,14 @@
 //
 // DSL Graph executor (DSL-driven).
 
-#include "runtime/dsl/graph_executor.h"
+#include "runtime/executor/graph_executor.h"
 #include "runtime/dsl/autodiff.h"
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
-#include "runtime/dsl/graph_executor_internal.h"
-#include "runtime/dsl/graph_executor_tensors.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_internal.h"
+#include "runtime/executor/graph_executor_tensors.h"
+#include "runtime/executor/graph_executor_utils.h"
 
 #include <algorithm>
 #include <cctype>

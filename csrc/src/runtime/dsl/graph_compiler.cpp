@@ -17,8 +17,8 @@
 #include <vector>
 
 #include "runtime/dsl/graph_compiler.h"
-#include "runtime/dsl/graph_executor_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"

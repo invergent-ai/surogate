@@ -15,7 +15,7 @@
 #include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
-#include "runtime/dsl/graph_executor.h"
+#include "runtime/executor/graph_executor.h"
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/qlora/adapter_merger.h"
 #include "runtime/qlora/generic_qlora_provider.h"

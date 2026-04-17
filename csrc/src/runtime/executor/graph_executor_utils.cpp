@@ -3,7 +3,7 @@
 //
 // Utility functions for DSL Graph executor.
 
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 
 #include <cstdlib>
 #include <iostream>

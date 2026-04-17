@@ -3,7 +3,7 @@
 //
 // Helper functions for DSL Graph executor.
 
-#include "runtime/dsl/graph_executor_helpers.h"
+#include "runtime/executor/graph_executor_helpers.h"
 
 #include "kernels/kernels.h"
 #include "runtime/core/fp8_scaling_state.h"

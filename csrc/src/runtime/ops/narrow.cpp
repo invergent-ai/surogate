@@ -1,12 +1,12 @@
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <cstddef>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "utilities/dtype.h"
 
 namespace dsl {

@@ -24,7 +24,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

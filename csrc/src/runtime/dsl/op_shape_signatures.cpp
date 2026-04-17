@@ -7,7 +7,7 @@
 #include <numeric>
 #include <sstream>
 
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 
 namespace dsl {

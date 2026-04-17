@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <stdexcept>
 

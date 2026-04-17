@@ -3,13 +3,13 @@
 //
 // Repeat-interleave heads operation dispatch.
 
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <stdexcept>
 #include <vector>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 
 namespace dsl {

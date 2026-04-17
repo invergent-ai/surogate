@@ -3,8 +3,8 @@
 //
 // Utility functions for DSL Graph executor.
 
-#ifndef SUROGATE_SRC_DSL_GRAPH_EXECUTOR_UTILS_H
-#define SUROGATE_SRC_DSL_GRAPH_EXECUTOR_UTILS_H
+#ifndef SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_UTILS_H
+#define SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_UTILS_H
 
 #include <optional>
 #include <string>
@@ -14,7 +14,7 @@
 
 #include <cuda_runtime.h>
 
-#include "runtime/dsl/graph_executor_internal.h"
+#include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
 #include "kernels/kernels.h"
 #include "utilities/stack.h"
@@ -110,4 +110,4 @@ inline void trace_or_execute_cuda_graph_with_stack(Function&& function, cudaStre
 
 }  // namespace dsl
 
-#endif  // SUROGATE_SRC_DSL_GRAPH_EXECUTOR_UTILS_H
+#endif  // SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_UTILS_H

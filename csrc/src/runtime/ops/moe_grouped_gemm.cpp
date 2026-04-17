@@ -1,15 +1,15 @@
 // MoE Grouped GEMM operation (generic version without fused activation)
 // Used for Nemotron-H MoE blocks that use relu2 activation instead of swiglu
 
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <vector>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "recipes/recipe.h"
 #include "utilities/dtype.h"

@@ -3,8 +3,8 @@
 //
 // DSL Graph executor (DSL-driven).
 
-#ifndef SUROGATE_SRC_DSL_GRAPH_EXECUTOR_H
-#define SUROGATE_SRC_DSL_GRAPH_EXECUTOR_H
+#ifndef SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_H
+#define SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_H
 
 #include <cstddef>
 #include <memory>
@@ -15,7 +15,7 @@
 
 #include <cuda_runtime.h>
 
-#include "runtime/dsl/graph_executor_internal.h"
+#include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/core/forward_hooks.h"
@@ -381,4 +381,4 @@ private:
 
 }  // namespace dsl
 
-#endif  // SUROGATE_SRC_DSL_GRAPH_EXECUTOR_H
+#endif  // SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_H

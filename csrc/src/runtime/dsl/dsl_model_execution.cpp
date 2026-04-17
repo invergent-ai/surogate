@@ -6,8 +6,8 @@
 #include "runtime/dsl/dsl_model.h"
 #include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/dsl_runtime.h"
-#include "runtime/dsl/graph_executor.h"
-#include "runtime/dsl/graph_executor_helpers.h"
+#include "runtime/executor/graph_executor.h"
+#include "runtime/executor/graph_executor_helpers.h"
 
 #include <algorithm>
 #include <cctype>

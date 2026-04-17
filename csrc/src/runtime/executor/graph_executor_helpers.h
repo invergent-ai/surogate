@@ -3,8 +3,8 @@
 //
 // Helper functions for DSL Graph executor (FP8/FP4, quantization, etc).
 
-#ifndef SUROGATE_SRC_DSL_GRAPH_EXECUTOR_HELPERS_H
-#define SUROGATE_SRC_DSL_GRAPH_EXECUTOR_HELPERS_H
+#ifndef SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_HELPERS_H
+#define SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_HELPERS_H
 
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/lora/lora_run_state.h"
@@ -37,4 +37,4 @@ Tensor recompute_lora_rmsnorm(::modules::LoRARunState& lora_rs, const Tensor& re
 
 }  // namespace dsl
 
-#endif  // SUROGATE_SRC_DSL_GRAPH_EXECUTOR_HELPERS_H
+#endif  // SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_HELPERS_H

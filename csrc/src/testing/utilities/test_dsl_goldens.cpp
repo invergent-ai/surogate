@@ -23,11 +23,11 @@
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/autodiff.h"
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_param_store.h"
 #include "runtime/dsl/dsl_run_state.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/core/model_config.h"
 #include "runtime/training/runtime_options.h"

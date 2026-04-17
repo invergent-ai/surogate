@@ -22,7 +22,7 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
-#include "runtime/dsl/graph_executor.h"
+#include "runtime/executor/graph_executor.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/core/qlora_provider.h"
 #include "runtime/dsl/dsl_weight_manager.h"
@@ -34,7 +34,7 @@
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/qlora/generic_qlora_provider.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "runtime/core/model_config.h"
 #include "runtime/optimizers/adamw_8bit.h"
 #include "runtime/optimizers/normuon.h"

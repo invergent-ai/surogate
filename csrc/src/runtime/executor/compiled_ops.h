@@ -6,8 +6,8 @@
 // This module eliminates runtime dispatch overhead by pre-compiling operations
 // into direct function pointer calls with pre-resolved tensors and attributes.
 
-#ifndef SUROGATE_SRC_DSL_COMPILED_OPS_H
-#define SUROGATE_SRC_DSL_COMPILED_OPS_H
+#ifndef SUROGATE_SRC_EXECUTOR_COMPILED_OPS_H
+#define SUROGATE_SRC_EXECUTOR_COMPILED_OPS_H
 
 #include <array>
 #include <cstddef>
@@ -23,7 +23,7 @@
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/forward_plan.h"
-#include "runtime/dsl/graph_executor_internal.h"
+#include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
@@ -692,4 +692,4 @@ const char* op_type_to_string(CompiledOpType type);
 
 }  // namespace dsl
 
-#endif  // SUROGATE_SRC_DSL_COMPILED_OPS_H
+#endif  // SUROGATE_SRC_EXECUTOR_COMPILED_OPS_H

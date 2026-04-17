@@ -281,13 +281,15 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/dsl_grad_store.cpp
     src/runtime/dsl/dsl_run_state.cpp
     src/runtime/dsl/dsl_weight_manager.cpp
-    src/runtime/dsl/graph_executor.cpp
-    src/runtime/dsl/graph_executor_utils.cpp
-    src/runtime/dsl/graph_executor_tensors.cpp
-    src/runtime/dsl/graph_executor_weight_cache.cpp
-    src/runtime/dsl/graph_executor_backward.cpp
-    src/runtime/dsl/graph_executor_helpers.cpp
-    src/runtime/dsl/compiled_ops.cpp
+    src/runtime/executor/graph_executor.cpp
+    src/runtime/executor/graph_executor_utils.cpp
+    src/runtime/executor/graph_executor_tensors.cpp
+    src/runtime/executor/graph_executor_weight_cache.cpp
+    src/runtime/executor/graph_executor_helpers.cpp
+    src/runtime/executor/compiled_ops.cpp
+    src/runtime/executor/compiled_ops_save.cpp
+    src/runtime/executor/compiled_ops_tiled_mlp.cpp
+    src/runtime/executor/compiled_ops_execute.cpp
     src/runtime/dsl/graph_compiler.cpp
     src/runtime/dsl/weight_mapping.cpp
     src/runtime/dsl/dsl_weight_loader.cpp

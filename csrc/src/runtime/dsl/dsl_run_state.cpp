@@ -18,7 +18,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "runtime/training/runtime_options.h"
 #include "runtime/core/fp8_run_state.h"

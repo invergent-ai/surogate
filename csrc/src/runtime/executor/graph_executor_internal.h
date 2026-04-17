@@ -3,8 +3,8 @@
 //
 // Internal types and helpers for DSL Graph executor.
 
-#ifndef SUROGATE_SRC_DSL_GRAPH_EXECUTOR_INTERNAL_H
-#define SUROGATE_SRC_DSL_GRAPH_EXECUTOR_INTERNAL_H
+#ifndef SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_INTERNAL_H
+#define SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_INTERNAL_H
 
 #include <optional>
 #include <string>
@@ -64,4 +64,4 @@ struct FP4WeightCacheEntry {
 
 }  // namespace dsl
 
-#endif  // SUROGATE_SRC_DSL_GRAPH_EXECUTOR_INTERNAL_H
+#endif  // SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_INTERNAL_H

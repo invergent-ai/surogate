@@ -1,4 +1,4 @@
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <algorithm>
 #include <cctype>
@@ -12,11 +12,11 @@
 #include <string_view>
 #include <vector>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
-#include "runtime/dsl/graph_executor_helpers.h"
+#include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/lora/lora_run_state.h"

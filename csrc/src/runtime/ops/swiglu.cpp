@@ -1,4 +1,4 @@
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -11,9 +11,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 

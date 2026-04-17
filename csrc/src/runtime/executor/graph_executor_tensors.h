@@ -3,14 +3,14 @@
 //
 // Tensor resolution functions for DSL Graph executor.
 
-#ifndef SUROGATE_SRC_DSL_GRAPH_EXECUTOR_TENSORS_H
-#define SUROGATE_SRC_DSL_GRAPH_EXECUTOR_TENSORS_H
+#ifndef SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_TENSORS_H
+#define SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_TENSORS_H
 
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "runtime/dsl/graph_executor_internal.h"
+#include "runtime/executor/graph_executor_internal.h"
 #include "utilities/tensor.h"
 
 namespace dsl {
@@ -53,4 +53,4 @@ std::vector<long> resolve_view_shape(
 
 }  // namespace dsl
 
-#endif  // SUROGATE_SRC_DSL_GRAPH_EXECUTOR_TENSORS_H
+#endif  // SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_TENSORS_H

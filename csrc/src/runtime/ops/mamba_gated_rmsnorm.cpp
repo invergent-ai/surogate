@@ -3,7 +3,7 @@
 //
 // Mamba gated RMSNorm operation dispatch.
 
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -11,8 +11,8 @@
 #include <vector>
 #include <utility>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"

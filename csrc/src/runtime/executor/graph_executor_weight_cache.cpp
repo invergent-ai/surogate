@@ -3,7 +3,7 @@
 //
 // FP8/FP4 weight caching for DSL Graph executor.
 
-#include "runtime/dsl/graph_executor.h"
+#include "runtime/executor/graph_executor.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -12,7 +12,7 @@
 
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "runtime/core/fp8_scaling_state.h"
 #include "runtime/core/matmul_context.h"

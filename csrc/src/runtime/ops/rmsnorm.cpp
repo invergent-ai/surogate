@@ -1,9 +1,9 @@
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <stdexcept>
 #include <vector>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
+#include "runtime/executor/compiled_ops_helpers.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 

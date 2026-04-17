@@ -3,7 +3,7 @@
 //
 // Qwen3.5 gated delta rule operation dispatch using JIT-compiled Triton kernels.
 
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <cmath>
 #include <cstdint>
@@ -15,8 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "utilities/comm.h"
 #include "utilities/utils.h"
 

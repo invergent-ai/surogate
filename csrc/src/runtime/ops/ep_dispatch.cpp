@@ -8,7 +8,7 @@
 //   - Modified A2A sends tokens to LPT-assigned destinations
 //   - Merged weight tensors built for GEMM (native + foreign experts)
 
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -17,9 +17,9 @@
 #include <vector>
 #include <sstream>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
+#include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/dsl_param_store.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "runtime/ep/lpt_planner.h"
 #include "runtime/ep/weight_transfer.h"
 #include "runtime/qlora/quantized_tensor.h"

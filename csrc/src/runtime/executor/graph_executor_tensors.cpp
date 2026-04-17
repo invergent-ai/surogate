@@ -3,14 +3,14 @@
 //
 // Tensor resolution functions for DSL Graph executor.
 
-#include "runtime/dsl/graph_executor_tensors.h"
+#include "runtime/executor/graph_executor_tensors.h"
 
 #include <stdexcept>
 #include <string>
 
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "runtime/dsl/ir.h"
 #include "utilities/tensor.h"
 

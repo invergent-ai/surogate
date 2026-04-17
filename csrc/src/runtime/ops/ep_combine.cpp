@@ -7,7 +7,7 @@
 // 2. Reverse all-to-all to send results back to originating GPUs
 // 3. Output is in the original permuted order (ready for moe_unpermute)
 
-#include "runtime/dsl/compiled_ops.h"
+#include "runtime/executor/compiled_ops.h"
 
 #include <algorithm>
 #include <numeric>
@@ -17,8 +17,8 @@
 
 #include <cuda_bf16.h>
 
-#include "runtime/dsl/compiled_ops_helpers.h"
-#include "runtime/dsl/graph_executor_utils.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/comm.h"
 
