@@ -1,6 +1,5 @@
 """Transformer Blocks for Python DSL"""
 
-from .common import Activation
 from .gemma4 import (
     Gemma4FullBlock,
     Gemma4FullMoEBlock,
@@ -23,7 +22,6 @@ from .qwen3_moe import Qwen3MoEBlock
 from .qwen3_vl import Qwen3VLBlock
 
 __all__ = [
-    "Activation",
     "Qwen3Block",
     "Qwen3_5AttentionBlock",
     "Qwen3_5LinearBlock",

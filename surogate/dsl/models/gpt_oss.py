@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from .. import nn
+from ..modules import Embedding, LMHead, RMSNorm
 from ..blocks.gpt_oss import GptOssBlock
 from ..hf import build_attn_mappings, build_moe_mappings, build_norm_mappings
-from ..modules.attention import GptOssAttention as GptOssAttentionOld
-from ..modules.moe import GptOssMoE
-from ..nn import STANDARD_MODEL_NAME_REMAP
+from ..modules.attention import GptOssAttention
+from ..modules.moe import GptOssMoEExperts
+from ..blocks.common import STANDARD_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
 
@@ -33,8 +34,8 @@ class GptOssModel(nn.Model):
     _name_remap_ = STANDARD_MODEL_NAME_REMAP
     _hf_block_mappings_ = {
         **build_norm_mappings(),
-        **build_attn_mappings(attn_module=GptOssAttentionOld),
-        **build_moe_mappings(moe_module=GptOssMoE),
+        **build_attn_mappings(attn_module=GptOssAttention),
+        **build_moe_mappings(moe_module=GptOssMoEExperts),
         # Model-level weight mappings
         "embedding": "model.embed_tokens.weight",
         "final_norm": "model.norm.weight",
@@ -75,7 +76,7 @@ class GptOssModel(nn.Model):
 
         self.D = head_size if head_size > 0 else d_model // num_query_heads
 
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = Embedding(vocab_size, d_model)
         self.blocks = nn.BlockStack(
             n_layers,
             GptOssBlock,
@@ -91,8 +92,8 @@ class GptOssModel(nn.Model):
             use_qkv_bias=use_qkv_bias,
             ep_size=ep_size,
         )
-        self.final_norm = nn.RMSNorm(d_model, eps=eps)
-        self.lm_head = nn.LMHead(vocab_size, d_model)
+        self.final_norm = RMSNorm(d_model, eps=eps)
+        self.lm_head = LMHead(vocab_size, d_model)
 
     def forward(self, token_ids, position_ids, targets):
         G = ActivationScope.GLOBAL

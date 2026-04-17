@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 
 from .. import nn
+from ..modules import Embedding, LMHead, RMSNorm
 from ..blocks.nemotron_h import (
     NemotronHAttentionBlock,
     NemotronHMamba2Block,
@@ -31,7 +32,7 @@ from ..hf import (
     build_simple_mlp_mappings,
     stack_experts,
 )
-from ..nn import NEMOTRON_MODEL_NAME_REMAP
+from ..blocks.nemotron_h import NEMOTRON_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
 
@@ -373,14 +374,14 @@ class NemotronHModel(nn.Model):
                 )
             )
 
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
             block_configs=block_configs,
             block_types=self.block_types,
             n_layers=n_layers,
         )
-        self.final_norm = nn.RMSNorm(d_model, eps=eps)
-        self.lm_head = nn.LMHead(vocab_size, d_model)
+        self.final_norm = RMSNorm(d_model, eps=eps)
+        self.lm_head = LMHead(vocab_size, d_model)
 
     def forward(self, token_ids, position_ids, targets):
         G = ActivationScope.GLOBAL

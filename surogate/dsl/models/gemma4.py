@@ -19,6 +19,7 @@ Key architectural features:
 from __future__ import annotations
 
 from .. import nn
+from ..modules import LMHead, RMSNorm, ScaledEmbedding
 from ..blocks.gemma4 import (
     Gemma4FullBlock,
     Gemma4FullMoEBlock,
@@ -27,7 +28,7 @@ from ..blocks.gemma4 import (
     Gemma4SlidingMoEBlock,
 )
 from ..hf import fuse
-from ..nn import GEMMA4_MODEL_NAME_REMAP
+from ..blocks.gemma4 import GEMMA4_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
 
@@ -334,11 +335,11 @@ def _build_gemma4_model(
             )
         )
 
-    cls.embedding = nn.ScaledEmbedding(vocab_size, d_model)
+    cls.embedding = ScaledEmbedding(vocab_size, d_model)
 
     # Per-layer input embeddings (only when d_per_layer_input > 0)
     if d_per_layer_input > 0:
-        cls.pli_embedding = nn.ScaledEmbedding(
+        cls.pli_embedding = ScaledEmbedding(
             vocab_size_per_layer_input,
             n_layers * d_per_layer_input,
             embed_scale=float(d_per_layer_input) ** 0.5,
@@ -352,8 +353,8 @@ def _build_gemma4_model(
         per_layer_input_name="per_layer_input" if d_per_layer_input > 0 else None,
         kv_sharing_map=kv_sharing_map if kv_sharing_map else None,
     )
-    cls.final_norm = nn.RMSNorm(d_model, eps=eps)
-    cls.lm_head = nn.LMHead(vocab_size, d_model, softcap=final_logit_softcapping)
+    cls.final_norm = RMSNorm(d_model, eps=eps)
+    cls.lm_head = LMHead(vocab_size, d_model, softcap=final_logit_softcapping)
 
 
 def _gemma4_forward(model, token_ids, position_ids, targets):

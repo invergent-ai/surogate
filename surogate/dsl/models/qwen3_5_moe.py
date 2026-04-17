@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from .. import nn
+from ..modules import Embedding, LMHead, RMSNormPlus1
+from ..modules.attention import _resolve_rotary_dim
 from ..blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
 from ..hf import build_norm_mappings, expand_module_mapping
 from ..models.qwen3_5 import _parse_qwen3_5_layer_types
-from ..nn import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
+from ..blocks.qwen3_5 import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
 
@@ -159,10 +161,7 @@ class Qwen3_5MoECausalModel(nn.Model):
 
         # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads
-        self.rotary_dim = max(2, int(round(self.D * self.partial_rotary_factor)))
-        if self.rotary_dim % 2 != 0:
-            self.rotary_dim -= 1
-        self.rotary_dim = max(2, min(self.rotary_dim, self.D))
+        self.rotary_dim = _resolve_rotary_dim(self.D, self.partial_rotary_factor)
 
         self.block_types = _parse_qwen3_5_layer_types(
             layer_types=layer_types,
@@ -233,14 +232,14 @@ class Qwen3_5MoECausalModel(nn.Model):
                 )
             )
 
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
             block_configs=block_configs,
             block_types=self.block_types,
             n_layers=n_layers,
         )
-        self.final_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.lm_head = nn.LMHead(vocab_size, d_model)
+        self.final_norm = RMSNormPlus1(d_model, eps=eps)
+        self.lm_head = LMHead(vocab_size, d_model)
 
     def forward(self, token_ids, position_ids, targets):
         G = ActivationScope.GLOBAL
@@ -399,10 +398,7 @@ class Qwen3_5MoEConditionalModel(nn.Model):
 
         # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads
-        self.rotary_dim = max(2, int(round(self.D * self.partial_rotary_factor)))
-        if self.rotary_dim % 2 != 0:
-            self.rotary_dim -= 1
-        self.rotary_dim = max(2, min(self.rotary_dim, self.D))
+        self.rotary_dim = _resolve_rotary_dim(self.D, self.partial_rotary_factor)
 
         self.block_types = _parse_qwen3_5_layer_types(
             layer_types=layer_types,
@@ -471,14 +467,14 @@ class Qwen3_5MoEConditionalModel(nn.Model):
                 )
             )
 
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = Embedding(vocab_size, d_model)
         self.hybrid_blocks = nn.HybridBlockStack(
             block_configs=block_configs,
             block_types=self.block_types,
             n_layers=n_layers,
         )
-        self.final_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.lm_head = nn.LMHead(vocab_size, d_model)
+        self.final_norm = RMSNormPlus1(d_model, eps=eps)
+        self.lm_head = LMHead(vocab_size, d_model)
 
     def forward(
         self,

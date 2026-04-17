@@ -3,10 +3,144 @@
 from __future__ import annotations
 
 from .. import nn
-from ..nn import (
-    QWEN3_5_ATTN_BLOCK_REMAP,
-    QWEN3_5_LINEAR_BLOCK_REMAP,
-)
+from ..modules import GatedDeltaNetMixer, GenericMLP, Qwen3_5Attention, RMSNormPlus1, _resolve_rotary_dim
+
+
+QWEN3_5_ATTN_BLOCK_REMAP: dict[str, str] = {
+    # --- attn_norm (RMSNormPlus1) -> ln1 / res_ffn ---
+    "attn_norm_weight": "ln1_weight",
+    "attn_norm_weight_eff": "ln1_weight_eff",
+    "attn_norm_res": "res_ffn",
+    "attn_norm_y": "ln1",
+    "attn_norm_rstd": "ln1_rstd",
+    # --- self_attn (Qwen3_5Attention) -> full_* canonical names ---
+    "self_attn_q_proj_weight": "full_q_proj_weight",
+    "self_attn_q_proj_bias": "full_q_proj_bias",
+    "self_attn_k_proj_weight": "full_k_proj_weight",
+    "self_attn_k_proj_bias": "full_k_proj_bias",
+    "self_attn_v_proj_weight": "full_v_proj_weight",
+    "self_attn_v_proj_bias": "full_v_proj_bias",
+    "self_attn_out_weight": "full_out_weight",
+    "self_attn_out_bias": "full_out_bias",
+    "self_attn_q_norm_weight": "q_norm_weight",
+    "self_attn_k_norm_weight": "k_norm_weight",
+    "self_attn_rope_freqs": "rope_freqs",
+    # Activations from Qwen3_5Attention
+    "self_attn_x_flat": "x_flat",
+    "self_attn_q_proj": "full_q_proj",
+    "self_attn_k_proj": "full_k_proj",
+    "self_attn_v_proj": "full_v_proj",
+    "self_attn_q_proj_4d": "full_q_proj_4d",
+    "self_attn_q": "full_q",
+    "self_attn_gate": "full_gate",
+    "self_attn_k": "full_k",
+    "self_attn_v": "full_v",
+    "self_attn_q_norm_weight_eff": "q_norm_weight_eff",
+    "self_attn_k_norm_weight_eff": "k_norm_weight_eff",
+    "self_attn_qkv": "qkv",
+    "self_attn_qkv_rope": "qkv_rope",
+    "self_attn_att": "att",
+    "self_attn_att_4d": "att_4d",
+    "self_attn_att_flat": "att_flat",
+    "self_attn_lse": "lse",
+    "self_attn_att_out": "att_out",
+    "self_attn_att_out_flat": "att_out_flat",
+    # --- mlp_norm (RMSNormPlus1) -> ln2 / res_att ---
+    "mlp_norm_weight": "ln2_weight",
+    "mlp_norm_weight_eff": "ln2_weight_eff",
+    "mlp_norm_res": "res_att",
+    "mlp_norm_y": "ln2",
+    "mlp_norm_rstd": "ln2_rstd",
+    # --- mlp (GenericMLP / SwiGLU) ---
+    "mlp_act": "swiglu",
+    "mlp_act_flat": "swiglu_flat",
+    "mlp_x_flat": "mlp_x_flat",
+}
+
+QWEN3_5_LINEAR_BLOCK_REMAP: dict[str, str] = {
+    # --- attn_norm (RMSNormPlus1) -> ln1 / res_ffn ---
+    "attn_norm_weight": "ln1_weight",
+    "attn_norm_weight_eff": "ln1_weight_eff",
+    "attn_norm_res": "res_ffn",
+    "attn_norm_y": "ln1",
+    "attn_norm_rstd": "ln1_rstd",
+    # --- mixer (GatedDeltaNetMixer) -> lin_* canonical names ---
+    "mixer_in_proj_qkv_weight": "lin_in_proj_qkv_weight",
+    "mixer_in_proj_z_weight": "lin_in_proj_z_weight",
+    "mixer_in_proj_b_weight": "lin_in_proj_b_weight",
+    "mixer_in_proj_a_weight": "lin_in_proj_a_weight",
+    "mixer_conv_weight": "lin_conv_weight",
+    "mixer_A_log": "lin_A_log",
+    "mixer_dt_bias": "lin_dt_bias",
+    "mixer_norm_weight": "lin_norm_weight",
+    "mixer_out_weight": "lin_out_weight",
+    # Activations from GatedDeltaNetMixer
+    "mixer_x_flat": "lin_x_flat",
+    "mixer_mixed_qkv_flat": "lin_mixed_qkv_flat",
+    "mixer_mixed_qkv": "lin_mixed_qkv",
+    "mixer_conv_w2d": "lin_conv_w2d",
+    "mixer_conv_out_cf": "lin_conv_out_cf",
+    "mixer_query": "lin_query",
+    "mixer_key": "lin_key",
+    "mixer_value": "lin_value",
+    "mixer_z_flat": "lin_z_flat",
+    "mixer_z": "lin_z",
+    "mixer_b_flat": "lin_b_flat",
+    "mixer_b": "lin_b",
+    "mixer_a_flat": "lin_a_flat",
+    "mixer_a": "lin_a",
+    "mixer_decay": "lin_decay",
+    "mixer_query_rep": "lin_query_rep",
+    "mixer_key_rep": "lin_key_rep",
+    "mixer_core_flat": "lin_core_flat",
+    "mixer_z_norm_flat": "lin_z_norm_flat",
+    "mixer_gated_flat": "lin_gated_flat",
+    "mixer_gated": "lin_gated",
+    "mixer_gated_bt_flat": "lin_gated_bt_flat",
+    "mixer_out_flat": "lin_att_out_flat",
+    "mixer_out": "lin_att_out",
+    # --- mlp_norm (RMSNormPlus1) -> ln2 / res_att ---
+    "mlp_norm_weight": "ln2_weight",
+    "mlp_norm_weight_eff": "ln2_weight_eff",
+    "mlp_norm_res": "res_att",
+    "mlp_norm_y": "ln2",
+    "mlp_norm_rstd": "ln2_rstd",
+    # --- mlp (GenericMLP / SwiGLU) ---
+    "mlp_act": "swiglu",
+    "mlp_act_flat": "swiglu_flat",
+    "mlp_x_flat": "mlp_x_flat",
+}
+
+# ---- Model-level name remaps (used by surogate.dsl.models.qwen3_5) ----
+
+QWEN3_5_MODEL_NAME_REMAP: dict[str, str] = {
+    # --- embedding ---
+    "embedding_weight": "embedding",
+    "embedding_out": "x0",
+    # --- final_norm (RMSNormPlus1) ---
+    "final_norm_weight": "final_norm",
+    "final_norm_weight_eff": "final_norm_eff",
+    "final_norm_res": "residual_final",
+    "final_norm_y": "xF",
+    "final_norm_rstd": "ln_final_rstd",
+    # --- lm_head ---
+    "lm_head_weight": "lm_head",
+    "lm_head_loss": "loss",
+    "lm_head_x_flat": "xF_flat",
+}
+
+QWEN3_5_VL_MODEL_NAME_REMAP: dict[str, str] = {
+    "embedding_weight": "embedding",
+    # No "embedding_out" -> "x0" -- mask_scatter output takes that name
+    "final_norm_weight": "final_norm",
+    "final_norm_weight_eff": "final_norm_eff",
+    "final_norm_res": "residual_final",
+    "final_norm_y": "xF",
+    "final_norm_rstd": "ln_final_rstd",
+    "lm_head_weight": "lm_head",
+    "lm_head_loss": "loss",
+    "lm_head_x_flat": "xF_flat",
+}
 
 
 class Qwen3_5AttentionBlock(nn.Block):
@@ -58,10 +192,10 @@ class Qwen3_5AttentionBlock(nn.Block):
         self.QProjDim = 2 * self.AttnDim
         self.KVDim = num_kv_heads * head_size
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.RotaryDim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
+        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
 
-        self.attn_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.self_attn = nn.Qwen3_5Attention(
+        self.attn_norm = RMSNormPlus1(d_model, eps=eps)
+        self.self_attn = Qwen3_5Attention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -72,8 +206,8 @@ class Qwen3_5AttentionBlock(nn.Block):
             partial_rotary_factor=partial_rotary_factor,
             mrope_section=mrope_section,
         )
-        self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.mlp = nn.SwiGLUMLP(d_model, d_ff)
+        self.mlp_norm = RMSNormPlus1(d_model, eps=eps)
+        self.mlp = GenericMLP(d_model, d_ff)
 
     def forward(self, x, residual, position_ids):
         # Pre-attention normalization (fused residual + rmsnorm with weight+1)
@@ -139,8 +273,8 @@ class Qwen3_5LinearBlock(nn.Block):
         self.ConvDim = self.KeyDim * 2 + self.ValueDim
         self.HeadRepeat = self.Hv // self.Hk
 
-        self.attn_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.mixer = nn.GatedDeltaNetMixer(
+        self.attn_norm = RMSNormPlus1(d_model, eps=eps)
+        self.mixer = GatedDeltaNetMixer(
             d_model,
             linear_conv_kernel_dim=linear_conv_kernel_dim,
             linear_key_head_dim=linear_key_head_dim,
@@ -150,8 +284,8 @@ class Qwen3_5LinearBlock(nn.Block):
             chunk_size=chunk_size,
             eps=eps,
         )
-        self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.mlp = nn.SwiGLUMLP(d_model, d_ff)
+        self.mlp_norm = RMSNormPlus1(d_model, eps=eps)
+        self.mlp = GenericMLP(d_model, d_ff)
 
     def forward(self, x, residual, position_ids):
         del position_ids  # Unused in linear-attention layers.

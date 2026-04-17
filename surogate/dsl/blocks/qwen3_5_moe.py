@@ -3,11 +3,65 @@
 from __future__ import annotations
 
 from .. import nn
-from ..dim import B, Dim, T
-from ..nn import (
-    QWEN3_5_MOE_ATTN_BLOCK_REMAP,
-    QWEN3_5_MOE_LINEAR_BLOCK_REMAP,
+from ..modules import (
+    GatedDeltaNetMixer,
+    MoEExpertsGated,
+    MoESharedExpert,
+    Qwen3_5Attention,
+    RMSNormPlus1,
+    _resolve_rotary_dim,
 )
+from ..dim import B, Dim, T
+from .qwen3_5 import QWEN3_5_ATTN_BLOCK_REMAP, QWEN3_5_LINEAR_BLOCK_REMAP
+
+
+QWEN3_5_MOE_ATTN_BLOCK_REMAP: dict[str, str] = {
+    # Inherit norm + attention mappings from Qwen3.5 attention block
+    **{k: v for k, v in QWEN3_5_ATTN_BLOCK_REMAP.items() if k.startswith(("attn_norm_", "self_attn_", "mlp_norm_"))},
+    # --- moe (MoEExpertsGated) -> strip moe_ prefix ---
+    "moe_router_weight": "router_weight",
+    "moe_experts_gate_up": "experts_gate_up",
+    "moe_experts_down": "experts_down",
+    "moe_experts_up": "experts_up",
+    "moe_router_logits": "router_logits",
+    "moe_router_probs": "router_probs",
+    "moe_routing_weights": "routing_weights",
+    "moe_routing_indices": "routing_indices",
+    "moe_permuted_input": "permuted_input",
+    "moe_scatter_indices": "scatter_indices",
+    "moe_ep_recv_input": "ep_recv_input",
+    "moe_ep_recv_scatter": "ep_recv_scatter",
+    "moe_expert_gate_up": "expert_gate_up",
+    "moe_expert_act": "expert_act",
+    "moe_expert_down": "expert_down",
+    "moe_ep_combined": "ep_combined",
+    # shared_expert: prefixed names are already canonical
+    # shared_expert_gate_proj: the sigmoid gate param
+}
+
+QWEN3_5_MOE_LINEAR_BLOCK_REMAP: dict[str, str] = {
+    # Inherit norm + linear attention mappings from Qwen3.5 linear block
+    **{k: v for k, v in QWEN3_5_LINEAR_BLOCK_REMAP.items() if k.startswith(("attn_norm_", "mixer_", "mlp_norm_"))},
+    # --- moe (MoEExpertsGated) -> strip moe_ prefix ---
+    "moe_router_weight": "router_weight",
+    "moe_experts_gate_up": "experts_gate_up",
+    "moe_experts_down": "experts_down",
+    "moe_experts_up": "experts_up",
+    "moe_router_logits": "router_logits",
+    "moe_router_probs": "router_probs",
+    "moe_routing_weights": "routing_weights",
+    "moe_routing_indices": "routing_indices",
+    "moe_permuted_input": "permuted_input",
+    "moe_scatter_indices": "scatter_indices",
+    "moe_ep_recv_input": "ep_recv_input",
+    "moe_ep_recv_scatter": "ep_recv_scatter",
+    "moe_expert_gate_up": "expert_gate_up",
+    "moe_expert_act": "expert_act",
+    "moe_expert_down": "expert_down",
+    "moe_ep_combined": "ep_combined",
+    # shared_expert: prefixed names are already canonical
+    # shared_expert_gate_proj: the sigmoid gate param
+}
 
 
 class Qwen3_5MoEAttentionBlock(nn.Block):
@@ -62,10 +116,10 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
         self.QProjDim = 2 * self.AttnDim
         self.KVDim = num_kv_heads * head_size
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.RotaryDim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
+        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
 
-        self.attn_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.self_attn = nn.Qwen3_5Attention(
+        self.attn_norm = RMSNormPlus1(d_model, eps=eps)
+        self.self_attn = Qwen3_5Attention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -76,8 +130,8 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
             partial_rotary_factor=partial_rotary_factor,
             mrope_section=mrope_section,
         )
-        self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.moe = nn.MoEExpertsGated(
+        self.mlp_norm = RMSNormPlus1(d_model, eps=eps)
+        self.moe = MoEExpertsGated(
             d_model,
             d_ff,
             num_experts,
@@ -85,7 +139,7 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
             norm_topk_prob=False,
             ep_size=ep_size,
         )
-        self.shared_expert = nn.MoESharedExpert(d_model, shared_expert_intermediate)
+        self.shared_expert = MoESharedExpert(d_model, shared_expert_intermediate)
 
     def forward(self, x, residual, position_ids):
         # Pre-attention normalization (fused residual + rmsnorm with weight+1)
@@ -172,8 +226,8 @@ class Qwen3_5MoELinearBlock(nn.Block):
         self.ConvDim = self.KeyDim * 2 + self.ValueDim
         self.HeadRepeat = self.Hv // self.Hk
 
-        self.attn_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.mixer = nn.GatedDeltaNetMixer(
+        self.attn_norm = RMSNormPlus1(d_model, eps=eps)
+        self.mixer = GatedDeltaNetMixer(
             d_model,
             linear_conv_kernel_dim=linear_conv_kernel_dim,
             linear_key_head_dim=linear_key_head_dim,
@@ -183,8 +237,8 @@ class Qwen3_5MoELinearBlock(nn.Block):
             chunk_size=chunk_size,
             eps=eps,
         )
-        self.mlp_norm = nn.RMSNormPlus1(d_model, eps=eps)
-        self.moe = nn.MoEExpertsGated(
+        self.mlp_norm = RMSNormPlus1(d_model, eps=eps)
+        self.moe = MoEExpertsGated(
             d_model,
             d_ff,
             num_experts,
@@ -192,7 +246,7 @@ class Qwen3_5MoELinearBlock(nn.Block):
             norm_topk_prob=False,
             ep_size=ep_size,
         )
-        self.shared_expert = nn.MoESharedExpert(d_model, shared_expert_intermediate)
+        self.shared_expert = MoESharedExpert(d_model, shared_expert_intermediate)
 
     def forward(self, x, residual, position_ids):
         del position_ids  # Unused in linear-attention layers.

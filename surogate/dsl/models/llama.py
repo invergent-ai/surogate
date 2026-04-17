@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from .. import nn
+from ..modules import Embedding, LMHead, RMSNorm
 from ..blocks.llama import LlamaBlock
 from ..hf import build_dense_block_mappings
-from ..nn import STANDARD_MODEL_NAME_REMAP
+from ..blocks.common import STANDARD_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
 
@@ -58,7 +59,7 @@ class LlamaModel(nn.Model):
 
         self.D = head_size if head_size > 0 else d_model // num_query_heads
 
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = Embedding(vocab_size, d_model)
         self.blocks = nn.BlockStack(
             n_layers,
             LlamaBlock,
@@ -70,8 +71,8 @@ class LlamaModel(nn.Model):
             max_seq=max_seq,
             eps=eps,
         )
-        self.final_norm = nn.RMSNorm(d_model, eps=eps)
-        self.lm_head = nn.LMHead(vocab_size, d_model)
+        self.final_norm = RMSNorm(d_model, eps=eps)
+        self.lm_head = LMHead(vocab_size, d_model)
 
     def forward(self, token_ids, position_ids, targets):
         G = ActivationScope.GLOBAL

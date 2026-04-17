@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from .. import nn
+from ..modules import GenericGQAttention, MoEExpertsGated, MoESharedExpert, RMSNorm
+from ..attention import AttentionConfig
 from ..dim import B, Dim, T
-from ..nn import MOE_BLOCK_NAME_REMAP
+from .common import MOE_BLOCK_NAME_REMAP
 
 
 class Qwen3MoEBlock(nn.Block):
@@ -36,19 +38,21 @@ class Qwen3MoEBlock(nn.Block):
         self.shared_expert_intermediate = shared_expert_intermediate if shared_expert_intermediate > 0 else d_ff
         self.C = Dim("C")
 
-        self.attn_norm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.Qwen3Attention(
+        self.attn_norm = RMSNorm(d_model, eps=eps)
+        self.self_attn = GenericGQAttention(
             d_model,
             num_query_heads,
             num_kv_heads,
             head_size,
             max_seq,
-            use_qkv_bias=use_qkv_bias,
-            use_qk_norm=use_qk_norm,
-            eps=eps,
+            config=AttentionConfig(
+                qk_norm=use_qk_norm,
+                qkv_bias=use_qkv_bias,
+                eps=eps,
+            ),
         )
-        self.mlp_norm = nn.RMSNorm(d_model, eps=eps)
-        self.moe = nn.MoEExpertsGated(
+        self.mlp_norm = RMSNorm(d_model, eps=eps)
+        self.moe = MoEExpertsGated(
             d_model,
             d_ff,
             num_experts,
@@ -57,7 +61,7 @@ class Qwen3MoEBlock(nn.Block):
             ep_size=ep_size,
         )
         if use_shared_expert:
-            self.shared_expert = nn.MoESharedExpert(
+            self.shared_expert = MoESharedExpert(
                 d_model,
                 self.shared_expert_intermediate,
             )

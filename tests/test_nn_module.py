@@ -197,11 +197,13 @@ class TestMinimalBlock:
     """Test a minimal custom block to verify the framework."""
 
     def test_simple_mlp_block(self):
+        from surogate.dsl.modules import GenericMLP, RMSNorm
+
         class SimpleMLP(nn.Block):
             def __init__(self, d_model, d_ff):
                 super().__init__()
-                self.norm = nn.RMSNorm(d_model)
-                self.mlp = nn.SwiGLUMLP(d_model, d_ff)
+                self.norm = RMSNorm(d_model)
+                self.mlp = GenericMLP(d_model, d_ff)
 
             def forward(self, x):
                 h = self.norm(x)
@@ -217,10 +219,12 @@ class TestMinimalBlock:
         assert spec.params["norm_weight"].quantizable is False
 
     def test_attention_only_block(self):
+        from surogate.dsl.modules import GenericGQAttention
+
         class AttnBlock(nn.Block):
             def __init__(self):
                 super().__init__()
-                self.attn = nn.GQAAttention(
+                self.attn = GenericGQAttention(
                     d_model=512,
                     num_query_heads=8,
                     num_kv_heads=4,

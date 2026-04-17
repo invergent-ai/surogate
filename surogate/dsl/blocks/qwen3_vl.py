@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from .. import nn
-from ..nn import VL_DENSE_BLOCK_NAME_REMAP
+from ..modules import GenericMLP, Qwen3VLAttention, RMSNorm
+from .common import VL_DENSE_BLOCK_NAME_REMAP
 
 
 class Qwen3VLBlock(nn.Block):
@@ -24,8 +25,8 @@ class Qwen3VLBlock(nn.Block):
         mrope_section: tuple[int, int, int] | list[int] = (24, 20, 20),
     ):
         super().__init__()
-        self.attn_norm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.Qwen3VLAttention(
+        self.attn_norm = RMSNorm(d_model, eps=eps)
+        self.self_attn = Qwen3VLAttention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -35,8 +36,8 @@ class Qwen3VLBlock(nn.Block):
             eps=eps,
             mrope_section=mrope_section,
         )
-        self.mlp_norm = nn.RMSNorm(d_model, eps=eps)
-        self.mlp = nn.SwiGLUMLP(d_model, d_ff)
+        self.mlp_norm = RMSNorm(d_model, eps=eps)
+        self.mlp = GenericMLP(d_model, d_ff)
 
     def forward(self, x, residual, position_ids):
         # Pre-attention normalization (fused residual + rmsnorm)

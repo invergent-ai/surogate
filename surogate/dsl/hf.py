@@ -466,7 +466,7 @@ def build_simple_mlp_mappings(
         param_prefix: Prefix for param names.
     """
     if mlp_module is None:
-        from .modules.mamba import SimpleMLP
+        from .modules.mlp import SimpleMLP
 
         mlp_module = SimpleMLP
 

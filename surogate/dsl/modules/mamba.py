@@ -1,32 +1,16 @@
-"""Mamba2 Modules for State Space Model based sequence mixing."""
+"""Mamba2 SSM mixer."""
 
 from __future__ import annotations
 
-import math
+from typing import Any
 
-from ..decorators import Param, forward, module
 from ..dim import B, Dim, T
-from ..graph_builder import graph
-from ..tensor_type import Tensor
+from ..nn import Module, Proxy, Tracer
 
 
-@module
-class Mamba2Mixer:
-    """Mamba2 mixer module for hybrid architectures like Nemotron-H.
+class Mamba2Mixer(Module):
+    """Mamba2 SSM module for hybrid architectures like Nemotron-H."""
 
-    Implements the Mamba2 State Space Model with:
-    - Input projection (produces gate, hidden_states for conv, B, C, dt)
-    - Causal 1D convolution
-    - Selective state space scan (SSD)
-    - Gated RMSNorm
-    - Output projection
-
-    This is based on the Mamba2 paper and Nemotron-H implementation.
-    """
-
-    # Default HF weight path templates.
-    # Use {prefix} for the Mamba mixer submodule path
-    # (e.g., "backbone.layers.{layer}.mixer" for Nemotron-H).
     _hf_mapping_defaults_ = {
         "in_proj_weight": "{prefix}.in_proj.weight",
         "in_proj_bias": "{prefix}.in_proj.bias",
@@ -55,7 +39,8 @@ class Mamba2Mixer:
         time_step_limit: tuple[float, float] | None = None,
         use_conv_bias: bool = True,
         use_bias: bool = False,
-    ):
+    ) -> None:
+        super().__init__()
         self.d_model = d_model
         self.mamba_num_heads = mamba_num_heads
         self.mamba_head_dim = mamba_head_dim
@@ -66,15 +51,17 @@ class Mamba2Mixer:
         self.eps = eps
         self.dt_min = dt_min
         self.dt_max = dt_max
+        import math as _math
+
         dt_max_default = 1e9
         if time_step_limit is None:
             time_step_limit = (0.0, dt_max_default)
         elif isinstance(time_step_limit, (list, tuple)) and len(time_step_limit) == 2:
             lo = float(time_step_limit[0])
             hi = float(time_step_limit[1])
-            if not math.isfinite(lo):
+            if not _math.isfinite(lo):
                 lo = 0.0
-            if not math.isfinite(hi):
+            if not _math.isfinite(hi):
                 hi = dt_max_default
             time_step_limit = (lo, hi)
         self.time_step_limit = time_step_limit
@@ -86,195 +73,221 @@ class Mamba2Mixer:
         self.conv_dim = self.intermediate_size + 2 * n_groups * ssm_state_size
         self.projection_size = self.intermediate_size + self.conv_dim + mamba_num_heads
 
-        # Typed dimensions
-        self.C = Dim("C")  # d_model
-        self.I = Dim("I")  # intermediate_size
-        self.H = Dim("H")  # mamba_num_heads
-        self.D = Dim("D")  # mamba_head_dim
-        self.N = Dim("N")  # ssm_state_size
-        self.G = Dim("G")  # n_groups
-        self.K = Dim("K")  # conv_kernel
-        self.P = Dim("P")  # projection_size
-        self.D_conv = Dim("D_conv")  # conv_dim
+        # Use concrete integers for Mamba-specific dims to avoid conflicts
+        # with attention dims (D, K) in hybrid models.
+        self.C = Dim("C")  # d_model — shared with attention
 
-    # Input projection
-    in_proj_weight = Param(Tensor["P", "C"])
-    in_proj_bias = Param(Tensor["P"], when="use_bias")
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
+        g = tracer.graph
+        (x,) = args
 
-    # Convolution
-    conv_weight = Param(Tensor["D_conv", "K"])
-    conv_bias = Param(Tensor["D_conv"], when="use_conv_bias")
+        P = self.projection_size
+        I = self.intermediate_size
+        H = self.mamba_num_heads
+        D_conv = self.conv_dim
+        CK = self.conv_kernel
 
-    # SSM parameters
-    A_log = Param(Tensor["H"])  # Log of state decay (negative for stability)
-    D_param = Param(Tensor["H"])  # Skip connection weight
-    dt_bias = Param(Tensor["H"])  # Time step bias
+        # -- params ----------------------------------------------------------
+        in_proj_w = tracer.register_param("in_proj_weight", (P, "C"))
+        in_proj_b = tracer.register_param("in_proj_bias", (P,), when="use_bias")
+        tracer.register_param("conv_weight", (D_conv, CK), quantizable=False)
+        tracer.register_param("conv_bias", (D_conv,), when="use_conv_bias", quantizable=False)
+        tracer.register_param("A_log", (H,), dtype="fp32", quantizable=False)
+        tracer.register_param("D_param", (H,), dtype="fp32", quantizable=False)
+        tracer.register_param("dt_bias", (H,), dtype="fp32", quantizable=False)
+        tracer.register_param("gated_norm_weight", (I,), quantizable=False)
+        out_proj_w = tracer.register_param("out_proj_weight", ("C", I))
+        out_proj_b = tracer.register_param("out_proj_bias", ("C",), when="use_bias")
 
-    # Gated RMSNorm
-    gated_norm_weight = Param(Tensor["I"], quantizable=False)
+        # -- activation slots ------------------------------------------------
+        tracer.register_activation(
+            "projected",
+            ("B", "T", P),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "gate",
+            ("B", "T", I),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "conv_out",
+            ("B", D_conv, "T"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "hidden_states",
+            ("B", I, "T"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "ssm_out",
+            ("B", "T", I),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "ssm_state",
+            ("B", H, self.mamba_head_dim, self.ssm_state_size),
+            save=True,
+            share_policy="fft_share",
+            description="Final SSM state for caching",
+        )
+        tracer.register_activation(
+            "gated_out",
+            ("B", "T", I),
+            save=True,
+            share_policy="fft_share",
+        )
+        out_slot = tracer.register_activation(
+            "out",
+            ("B", "T", "C"),
+            share_policy="per_layer",
+            description="Mamba2 mixer output",
+        )
 
-    # Output projection
-    out_proj_weight = Param(Tensor["C", "I"])
-    out_proj_bias = Param(Tensor["C"], when="use_bias")
+        # -- graph -----------------------------------------------------------
+        x_flat = g.view(
+            x.ref,
+            shape=[B * T, self.C],
+            out_name=tracer.prefixed("x_flat"),
+        )
+        if self.use_bias:
+            projected_flat = g.matmul_bias(
+                x_flat,
+                in_proj_w,
+                in_proj_b,
+                transpose="NT",
+                out_name=tracer.prefixed("projected_flat"),
+            )
+        else:
+            projected_flat = g.matmul(
+                x_flat,
+                in_proj_w,
+                transpose="NT",
+                out_name=tracer.prefixed("projected_flat"),
+            )
+        projected = g.view(
+            projected_flat,
+            shape=[B, T, P],
+            out_name=tracer.prefixed("projected"),
+        )
 
-    @forward
-    def forward(self, x: Tensor[B, T, C]) -> Tensor[B, T, C]:
-        """Forward pass through Mamba2 mixer.
+        # Split projection
+        gate, conv_input, dt = g.mamba_split_proj(
+            projected,
+            intermediate_size=self.intermediate_size,
+            conv_dim=self.conv_dim,
+            num_heads=self.mamba_num_heads,
+            head_dim=self.mamba_head_dim,
+            gate_name=tracer.prefixed("gate"),
+            conv_input_name=tracer.prefixed("conv_input"),
+            dt_name=tracer.prefixed("dt"),
+        )
 
-        Args:
-            x: Input tensor [batch, seq_len, d_model]
-
-        Returns:
-            Output tensor [batch, seq_len, d_model]
-        """
-        with graph() as g:
-            # Input projection
-            x_flat = g.view(x, shape=[B * T, self.C])
-            if self.use_bias:
-                projected_flat = g.matmul_bias(x_flat, "in_proj_weight", "in_proj_bias", transpose="NT")
-            else:
-                projected_flat = g.matmul(x_flat, "in_proj_weight", transpose="NT")
-            projected = g.view(projected_flat, shape=[B, T, self.P])
-
-            # Split projection into gate, conv_input, dt
-            gate, conv_input, dt = g.mamba_split_proj(
-                projected,
-                intermediate_size=self.intermediate_size,
-                conv_dim=self.conv_dim,
-                num_heads=self.mamba_num_heads,
-                head_dim=self.mamba_head_dim,
+        # Causal 1D convolution
+        if self.use_conv_bias:
+            conv_out = g.mamba_conv1d(
+                conv_input,
+                tracer.prefixed("conv_weight"),
+                tracer.prefixed("conv_bias"),
+                activation="silu",
+                out_name=tracer.prefixed("conv_out"),
+            )
+        else:
+            conv_out = g.mamba_conv1d(
+                conv_input,
+                tracer.prefixed("conv_weight"),
+                None,
+                activation="silu",
+                out_name=tracer.prefixed("conv_out"),
             )
 
-            # Causal 1D convolution
-            if self.use_conv_bias:
-                conv_out = g.mamba_conv1d(conv_input, "conv_weight", "conv_bias", activation="silu")
-            else:
-                conv_out = g.mamba_conv1d(conv_input, "conv_weight", None, activation="silu")
+        # Split conv output
+        hidden_states, ssm_B, ssm_C = g.mamba_split_conv_out(
+            conv_out,
+            intermediate_size=self.intermediate_size,
+            groups_state_size=self.n_groups * self.ssm_state_size,
+            n_groups=self.n_groups,
+            ssm_state_size=self.ssm_state_size,
+            hidden_name=tracer.prefixed("hidden_states"),
+            B_name=tracer.prefixed("ssm_B"),
+            C_name=tracer.prefixed("ssm_C"),
+        )
 
-            # Split conv output into hidden_states, B, C for SSM
-            hidden_states, ssm_B, ssm_C = g.mamba_split_conv_out(
-                conv_out,
-                intermediate_size=self.intermediate_size,
-                groups_state_size=self.n_groups * self.ssm_state_size,
-                n_groups=self.n_groups,
-                ssm_state_size=self.ssm_state_size,
+        # SSM scan
+        ssm_out, ssm_state = g.mamba_ssm_scan(
+            hidden_states,
+            dt,
+            tracer.prefixed("A_log"),
+            ssm_B,
+            ssm_C,
+            tracer.prefixed("D_param"),
+            dt_bias=tracer.prefixed("dt_bias"),
+            dt_softplus=True,
+            dt_min=self.time_step_limit[0],
+            dt_max=self.time_step_limit[1],
+            chunk_size=self.chunk_size,
+            num_heads=self.mamba_num_heads,
+            head_dim=self.mamba_head_dim,
+            ssm_state_size=self.ssm_state_size,
+            n_groups=self.n_groups,
+            out_name=tracer.prefixed("ssm_out"),
+            state_name=tracer.prefixed("ssm_state"),
+        )
+
+        # Reshape SSM output
+        ssm_out_flat = g.view(
+            ssm_out,
+            shape=[B, T, I],
+            out_name=tracer.prefixed("ssm_out_flat"),
+        )
+
+        # Gated RMSNorm
+        gated_out = g.mamba_gated_rmsnorm(
+            ssm_out_flat,
+            gate,
+            tracer.prefixed("gated_norm_weight"),
+            eps=self.eps,
+            n_groups=self.n_groups,
+            out_name=tracer.prefixed("gated_out"),
+        )
+
+        # Output projection
+        gated_flat = g.view(
+            gated_out,
+            shape=[B * T, I],
+            out_name=tracer.prefixed("gated_flat"),
+        )
+        if self.use_bias:
+            out_flat = g.matmul_bias(
+                gated_flat,
+                out_proj_w,
+                out_proj_b,
+                transpose="NT",
+                out_name=tracer.prefixed("out_flat"),
             )
-
-            # State Space Model scan
-            ssm_out, ssm_state = g.mamba_ssm_scan(
-                hidden_states,
-                dt,
-                "A_log",
-                ssm_B,
-                ssm_C,
-                "D_param",
-                dt_bias="dt_bias",
-                dt_softplus=True,
-                dt_min=self.time_step_limit[0],
-                dt_max=self.time_step_limit[1],
-                chunk_size=self.chunk_size,
-                num_heads=self.mamba_num_heads,
-                head_dim=self.mamba_head_dim,
-                ssm_state_size=self.ssm_state_size,
-                n_groups=self.n_groups,
+        else:
+            out_flat = g.matmul(
+                gated_flat,
+                out_proj_w,
+                transpose="NT",
+                out_name=tracer.prefixed("out_flat"),
             )
+        out = g.view(
+            out_flat,
+            shape=[B, T, self.C],
+            out_name=out_slot,
+        )
 
-            # Reshape SSM output
-            ssm_out_flat = g.view(ssm_out, shape=[B, T, self.I])
-
-            # Gated RMSNorm
-            gated_out = g.mamba_gated_rmsnorm(
-                ssm_out_flat,
-                gate,
-                "gated_norm_weight",
-                eps=self.eps,
-                group_size=self.intermediate_size // self.n_groups,
-            )
-
-            # Output projection
-            gated_flat = g.view(gated_out, shape=[B * T, self.I])
-            if self.use_bias:
-                out_flat = g.matmul_bias(gated_flat, "out_proj_weight", "out_proj_bias", transpose="NT")
-            else:
-                out_flat = g.matmul(gated_flat, "out_proj_weight", transpose="NT")
-            out = g.view(out_flat, shape=[B, T, self.C])
-
-            return out
+        return Proxy(out_slot, out)
 
 
-@module
-class SimpleMLP:
-    """Simple MLP with relu2 activation (used in Nemotron-H).
+# Self-register as an ``AttentionSpec`` kind for discovery.
+from ..attention import AttentionSpec, _register as _register_attention  # noqa: E402
 
-    Architecture: up -> relu2 -> down
-    """
-
-    # Default HF weight path templates.
-    # Use {prefix} for the MLP submodule path
-    # (e.g., "backbone.layers.{layer}.mixer" for Nemotron-H).
-    _hf_mapping_defaults_ = {
-        "up_weight": "{prefix}.up_proj.weight",
-        "up_bias": "{prefix}.up_proj.bias",
-        "down_weight": "{prefix}.down_proj.weight",
-        "down_bias": "{prefix}.down_proj.bias",
-    }
-
-    def __init__(
-        self,
-        d_model: int,
-        d_ff: int,
-        activation: str = "relu2",
-        use_bias: bool = False,
-    ):
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.activation = activation
-        self.use_bias = use_bias
-
-        # Typed dimensions
-        self.C = Dim("C")
-        self.M = Dim("M")
-
-    # MLP weights
-    up_weight = Param(Tensor["M", "C"])
-    up_bias = Param(Tensor["M"], when="use_bias")
-    down_weight = Param(Tensor["C", "M"])
-    down_bias = Param(Tensor["C"], when="use_bias")
-
-    @forward
-    def forward(self, x: Tensor[B, T, C]) -> Tensor[B, T, C]:
-        """Forward pass.
-
-        Args:
-            x: Input [B, T, C]
-
-        Returns:
-            Output [B, T, C]
-        """
-        with graph() as g:
-            x_flat = g.view(x, shape=[B * T, self.C])
-
-            # Up projection
-            if self.use_bias:
-                up_flat = g.matmul_bias(x_flat, "up_weight", "up_bias", transpose="NT")
-            else:
-                up_flat = g.matmul(x_flat, "up_weight", transpose="NT")
-
-            # Activation
-            if self.activation == "relu2":
-                act_flat = g.relu2(up_flat)
-            elif self.activation == "silu":
-                act_flat = g.silu(up_flat)
-            elif self.activation == "gelu":
-                act_flat = g.gelu(up_flat)
-            else:
-                act_flat = g.relu2(up_flat)
-
-            # Down projection
-            if self.use_bias:
-                out_flat = g.matmul_bias(act_flat, "down_weight", "down_bias", transpose="NT")
-            else:
-                out_flat = g.matmul(act_flat, "down_weight", transpose="NT")
-
-            out = g.view(out_flat, shape=[B, T, self.C])
-            return out
+_register_attention(AttentionSpec(name="mamba2", factory=Mamba2Mixer))

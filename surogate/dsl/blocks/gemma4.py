@@ -18,8 +18,106 @@ Block variants:
 from __future__ import annotations
 
 from .. import nn
+from ..modules import (
+    Gemma4Attention,
+    Gemma4MoEExperts,
+    Gemma4SharedKVAttention,
+    GenericMLP,
+    RMSNorm,
+    _resolve_rotary_dim,
+)
+from ..activations import Activation
 from ..dim import B, T
-from ..nn import GEMMA4_BLOCK_NAME_REMAP
+from ..mlp import MLPConfig
+
+
+GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
+    # --- input_layernorm (fused residual + rmsnorm) -> ln1 / res_ffn ---
+    "input_layernorm_weight": "ln1_weight",
+    "input_layernorm_res": "res_ffn",
+    "input_layernorm_y": "ln1",
+    "input_layernorm_rstd": "ln1_rstd",
+    # --- self_attn (Gemma4Attention) -> strip prefix ---
+    "self_attn_qkv_weight": "qkv_weight",
+    "self_attn_out_weight": "out_weight",
+    "self_attn_q_norm_weight": "q_norm_weight",
+    "self_attn_k_norm_weight": "k_norm_weight",
+    "self_attn_rope_freqs": "rope_freqs",
+    "self_attn_qkv": "qkv",
+    "self_attn_qkv_flat": "qkv_flat",
+    "self_attn_qkv_rope": "qkv_rope",
+    "self_attn_att": "att",
+    "self_attn_att_flat": "att_flat",
+    "self_attn_lse": "lse",
+    "self_attn_att_out": "att_out",
+    "self_attn_att_out_flat": "att_out_flat",
+    "self_attn_x_flat": "x_flat",
+    "self_attn_v_flat_2d": "v_flat_2d",
+    "self_attn_v_normed_2d": "v_normed_2d",
+    "self_attn_v_normed": "v_normed",
+    # --- post_attn_layernorm (standalone rmsnorm) ---
+    "post_attn_layernorm_weight": "ln_post_attn_weight",
+    "post_attn_layernorm_y": "ln_post_attn",
+    "post_attn_layernorm_rstd": "ln_post_attn_rstd",
+    # --- pre_ff_layernorm (standalone rmsnorm) -> ln2 ---
+    "pre_ff_layernorm_weight": "ln2_weight",
+    "pre_ff_layernorm_y": "ln2",
+    "pre_ff_layernorm_rstd": "ln2_rstd",
+    # --- mlp (GenericMLP with gelu, separate gate/up) ---
+    "mlp_gate_weight": "mlp_gate_weight",
+    "mlp_up_weight": "mlp_up_weight",
+    "mlp_down_weight": "mlp_down_weight",
+    "mlp_x_flat": "mlp_x_flat",
+    "mlp_gate_flat": "mlp_gate_flat",
+    "mlp_up_flat": "mlp_up_flat",
+    "mlp_gate_act": "mlp_gate_act",
+    "mlp_down_flat": "mlp_down_flat",
+    "mlp_down": "mlp_down",
+    # --- post_ff_layernorm (standalone rmsnorm) ---
+    "post_ff_layernorm_weight": "ln_post_ff_weight",
+    "post_ff_layernorm_y": "ln_post_ff",
+    "post_ff_layernorm_rstd": "ln_post_ff_rstd",
+    # --- res_attn (explicit residual add) ---
+    "res_attn": "res_attn",
+    # --- per-layer input gating ---
+    "pli_gate_weight": "pli_gate_weight",
+    "pli_proj_weight": "pli_proj_weight",
+    "pli_norm_weight": "pli_norm_weight",
+    "pli_gate_out": "pli_gate_out",
+    "pli_gate_act": "pli_gate_act",
+    "pli_gated": "pli_gated",
+    "pli_proj_out": "pli_proj_out",
+    "pli_normed": "pli_normed",
+    # --- layer_scalar (frozen per-layer scaling buffer) ---
+    "layer_scalar": "layer_scalar",
+}
+
+# Model-level name remap (used by surogate.dsl.models.gemma4).
+GEMMA4_MODEL_NAME_REMAP: dict[str, str] = {
+    # --- embedding ---
+    "embedding_weight": "embedding",
+    "embedding_out": "x0",
+    # --- per-layer input embedding ---
+    "pli_embedding_weight": "pli_embedding",
+    "pli_model_proj": "pli_model_proj",
+    "pli_proj_norm": "pli_proj_norm",
+    # --- final_norm (RMSNorm) ---
+    "final_norm_weight": "final_norm",
+    "final_norm_res": "residual_final",
+    "final_norm_y": "xF",
+    "final_norm_rstd": "ln_final_rstd",
+    # --- lm_head ---
+    "lm_head_weight": "lm_head",
+    "lm_head_loss": "loss",
+    "lm_head_x_flat": "xF_flat",
+}
+
+# Gemma4 uses a separate-gate GELU MLP (no gate/up fusion, GELU on gate).
+_GEMMA4_GELU_MLP_CONFIG = MLPConfig(
+    activation=Activation.GELU,
+    gated=True,
+    fuse_gate_up=False,
+)
 
 # ============================================================================
 # Helpers shared across block types
@@ -146,8 +244,8 @@ class Gemma4SlidingBlock(nn.Block):
         super().__init__()
         _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq, d_per_layer_input)
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.Gemma4Attention(
+        self.input_layernorm = RMSNorm(d_model, eps=eps)
+        self.self_attn = Gemma4Attention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -157,12 +255,16 @@ class Gemma4SlidingBlock(nn.Block):
             partial_rotary_factor=1.0,
             eps=eps,
         )
-        self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.mlp = nn.GatedMLP(d_model, d_ff, activation="gelu")
-        self.post_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
+        self.post_attn_layernorm = RMSNorm(d_model, eps=eps)
+        self.pre_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.mlp = GenericMLP(
+            d_model,
+            d_ff,
+            config=_GEMMA4_GELU_MLP_CONFIG,
+        )
+        self.post_ff_layernorm = RMSNorm(d_model, eps=eps)
         if d_per_layer_input > 0:
-            self.pli_norm = nn.RMSNorm(d_model, eps=eps)
+            self.pli_norm = RMSNorm(d_model, eps=eps)
 
     def forward(self, x, residual, position_ids, per_layer_input):
         _register_frozen_and_pli_params(self)
@@ -229,8 +331,8 @@ class Gemma4SlidingMoEBlock(nn.Block):
         self.E = num_experts
         self.K_exp = num_experts_per_tok
 
-        self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.Gemma4Attention(
+        self.input_layernorm = RMSNorm(d_model, eps=eps)
+        self.self_attn = Gemma4Attention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -240,14 +342,18 @@ class Gemma4SlidingMoEBlock(nn.Block):
             partial_rotary_factor=1.0,
             eps=eps,
         )
-        self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.mlp = nn.GatedMLP(d_model, d_ff, activation="gelu")
-        self.post_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.post_ff_layernorm_1 = nn.RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
-        self.post_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
-        self.moe = nn.Gemma4MoEExperts(
+        self.post_attn_layernorm = RMSNorm(d_model, eps=eps)
+        self.pre_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.mlp = GenericMLP(
+            d_model,
+            d_ff,
+            config=_GEMMA4_GELU_MLP_CONFIG,
+        )
+        self.post_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.post_ff_layernorm_1 = RMSNorm(d_model, eps=eps)
+        self.pre_ff_layernorm_2 = RMSNorm(d_model, eps=eps)
+        self.post_ff_layernorm_2 = RMSNorm(d_model, eps=eps)
+        self.moe = Gemma4MoEExperts(
             d_model,
             moe_intermediate_size,
             num_experts,
@@ -285,7 +391,7 @@ class Gemma4FullMoEBlock(nn.Block):
         ep_size=1,
     ):
         super().__init__()
-        rotary_dim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
+        rotary_dim = _resolve_rotary_dim(head_size, partial_rotary_factor)
         _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq, 0, rotary_dim=rotary_dim)
         if k_eq_v:
             self.QKV = (num_query_heads + num_kv_heads) * head_size
@@ -294,8 +400,8 @@ class Gemma4FullMoEBlock(nn.Block):
         self.E = num_experts
         self.K_exp = num_experts_per_tok
 
-        self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.Gemma4Attention(
+        self.input_layernorm = RMSNorm(d_model, eps=eps)
+        self.self_attn = Gemma4Attention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -305,14 +411,18 @@ class Gemma4FullMoEBlock(nn.Block):
             k_eq_v=k_eq_v,
             eps=eps,
         )
-        self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.mlp = nn.GatedMLP(d_model, d_ff, activation="gelu")
-        self.post_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.post_ff_layernorm_1 = nn.RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
-        self.post_ff_layernorm_2 = nn.RMSNorm(d_model, eps=eps)
-        self.moe = nn.Gemma4MoEExperts(
+        self.post_attn_layernorm = RMSNorm(d_model, eps=eps)
+        self.pre_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.mlp = GenericMLP(
+            d_model,
+            d_ff,
+            config=_GEMMA4_GELU_MLP_CONFIG,
+        )
+        self.post_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.post_ff_layernorm_1 = RMSNorm(d_model, eps=eps)
+        self.pre_ff_layernorm_2 = RMSNorm(d_model, eps=eps)
+        self.post_ff_layernorm_2 = RMSNorm(d_model, eps=eps)
+        self.moe = Gemma4MoEExperts(
             d_model,
             moe_intermediate_size,
             num_experts,
@@ -347,7 +457,7 @@ class Gemma4FullBlock(nn.Block):
         eps=1e-6,
     ):
         super().__init__()
-        rotary_dim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
+        rotary_dim = _resolve_rotary_dim(head_size, partial_rotary_factor)
         _make_dims(
             self,
             d_model,
@@ -364,8 +474,8 @@ class Gemma4FullBlock(nn.Block):
             self.QKV = (num_query_heads + num_kv_heads) * head_size
         else:
             self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
-        self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.Gemma4Attention(
+        self.input_layernorm = RMSNorm(d_model, eps=eps)
+        self.self_attn = Gemma4Attention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -375,12 +485,16 @@ class Gemma4FullBlock(nn.Block):
             k_eq_v=k_eq_v,
             eps=eps,
         )
-        self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.mlp = nn.GatedMLP(d_model, d_ff, activation="gelu")
-        self.post_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
+        self.post_attn_layernorm = RMSNorm(d_model, eps=eps)
+        self.pre_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.mlp = GenericMLP(
+            d_model,
+            d_ff,
+            config=_GEMMA4_GELU_MLP_CONFIG,
+        )
+        self.post_ff_layernorm = RMSNorm(d_model, eps=eps)
         if d_per_layer_input > 0:
-            self.pli_norm = nn.RMSNorm(d_model, eps=eps)
+            self.pli_norm = RMSNorm(d_model, eps=eps)
 
     def forward(self, x, residual, position_ids, per_layer_input):
         _register_frozen_and_pli_params(self)
@@ -430,7 +544,7 @@ class Gemma4SharedKVBlock(nn.Block):
         eps=1e-6,
     ):
         super().__init__()
-        rotary_dim = nn._resolve_rotary_dim(head_size, partial_rotary_factor)
+        rotary_dim = _resolve_rotary_dim(head_size, partial_rotary_factor)
         effective_d_ff = d_ff * 2 if use_double_wide_mlp else d_ff
         _make_dims(
             self,
@@ -445,8 +559,8 @@ class Gemma4SharedKVBlock(nn.Block):
         )
         self.QDim = num_query_heads * head_size
 
-        self.input_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.Gemma4SharedKVAttention(
+        self.input_layernorm = RMSNorm(d_model, eps=eps)
+        self.self_attn = Gemma4SharedKVAttention(
             d_model,
             num_query_heads,
             num_kv_heads,
@@ -455,12 +569,16 @@ class Gemma4SharedKVBlock(nn.Block):
             partial_rotary_factor=partial_rotary_factor,
             eps=eps,
         )
-        self.post_attn_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
-        self.mlp = nn.GatedMLP(d_model, effective_d_ff, activation="gelu")
-        self.post_ff_layernorm = nn.RMSNorm(d_model, eps=eps)
+        self.post_attn_layernorm = RMSNorm(d_model, eps=eps)
+        self.pre_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.mlp = GenericMLP(
+            d_model,
+            effective_d_ff,
+            config=_GEMMA4_GELU_MLP_CONFIG,
+        )
+        self.post_ff_layernorm = RMSNorm(d_model, eps=eps)
         if d_per_layer_input > 0:
-            self.pli_norm = nn.RMSNorm(d_model, eps=eps)
+            self.pli_norm = RMSNorm(d_model, eps=eps)
 
     def forward(self, x, residual, position_ids, per_layer_input, kv_source):
         _register_frozen_and_pli_params(self)

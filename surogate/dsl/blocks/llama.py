@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from .. import nn
-from ..nn import DENSE_BLOCK_NAME_REMAP
+from ..modules import GenericGQAttention, GenericMLP, RMSNorm
+from ..attention import AttentionConfig
+from ..mlp import MLPConfig
+from .common import DENSE_BLOCK_NAME_REMAP
 
 
 class LlamaBlock(nn.Block):
-    """LLaMA transformer block with GQA attention and SwiGLU MLP."""
+    """LLaMA transformer block: GQA attention + SwiGLU MLP."""
 
     _name_remap_ = DENSE_BLOCK_NAME_REMAP
 
@@ -22,16 +25,17 @@ class LlamaBlock(nn.Block):
         eps: float = 1e-6,
     ):
         super().__init__()
-        self.attn_norm = nn.RMSNorm(d_model, eps=eps)
-        self.self_attn = nn.GQAAttention(
+        self.attn_norm = RMSNorm(d_model, eps=eps)
+        self.self_attn = GenericGQAttention(
             d_model,
             num_query_heads,
             num_kv_heads,
             head_size,
             max_seq,
+            config=AttentionConfig(eps=eps),
         )
-        self.mlp_norm = nn.RMSNorm(d_model, eps=eps)
-        self.mlp = nn.SwiGLUMLP(d_model, d_ff)
+        self.mlp_norm = RMSNorm(d_model, eps=eps)
+        self.mlp = GenericMLP(d_model, d_ff, config=MLPConfig())
 
     def forward(self, x, residual, position_ids):
         residual, h = self.attn_norm(residual, x)

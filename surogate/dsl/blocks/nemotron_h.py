@@ -15,13 +15,129 @@ Each block has the structure:
 from __future__ import annotations
 
 from .. import nn
+from ..modules import Mamba2Mixer, NemotronAttention, NemotronMoEExperts, NemotronSharedExpert, RMSNorm, SimpleMLP
 from ..dim import B, Dim, T
-from ..nn import (
-    NEMOTRON_ATTN_BLOCK_REMAP,
-    NEMOTRON_MAMBA_BLOCK_REMAP,
-    NEMOTRON_MLP_BLOCK_REMAP,
-    NEMOTRON_MOE_BLOCK_REMAP,
-)
+from .common import STANDARD_MODEL_NAME_REMAP
+
+# Nemotron uses the standard model scope; alias for call-site clarity.
+NEMOTRON_MODEL_NAME_REMAP = STANDARD_MODEL_NAME_REMAP
+
+# Shared "norm → ln" prefixes used by every Nemotron block remap.
+_NEMOTRON_NORM_IN = {
+    "norm_weight": "norm_weight",
+    "norm_res": "res_in",
+    "norm_y": "ln",
+    "norm_rstd": "ln_rstd",
+}
+_NEMOTRON_NORM_ATTN = {
+    "norm_weight": "norm_weight",
+    "norm_res": "res_att",
+    "norm_y": "ln1",
+    "norm_rstd": "ln1_rstd",
+}
+
+
+NEMOTRON_MAMBA_BLOCK_REMAP: dict[str, str] = {
+    **_NEMOTRON_NORM_IN,
+    # Strip mixer_ prefix from Mamba2Mixer params
+    "mixer_in_proj_weight": "in_proj_weight",
+    "mixer_in_proj_bias": "in_proj_bias",
+    "mixer_conv_weight": "conv_weight",
+    "mixer_conv_bias": "conv_bias",
+    "mixer_A_log": "A_log",
+    "mixer_D_param": "D_param",
+    "mixer_dt_bias": "dt_bias",
+    "mixer_gated_norm_weight": "gated_norm_weight",
+    "mixer_out_proj_weight": "out_proj_weight",
+    "mixer_out_proj_bias": "out_proj_bias",
+    # Strip mixer_ prefix from Mamba2Mixer activations
+    "mixer_x_flat": "x_flat",
+    "mixer_projected_flat": "projected_flat",
+    "mixer_projected": "projected",
+    "mixer_gate": "gate",
+    "mixer_conv_input": "conv_input",
+    "mixer_dt": "dt",
+    "mixer_conv_out": "conv_out",
+    "mixer_hidden_states": "hidden_states",
+    "mixer_ssm_B": "ssm_B",
+    "mixer_ssm_C": "ssm_C",
+    "mixer_ssm_out": "ssm_out",
+    "mixer_ssm_out_flat": "ssm_out_flat",
+    "mixer_ssm_state": "ssm_state",
+    "mixer_gated_out": "gated_out",
+    "mixer_gated_flat": "gated_flat",
+    "mixer_out_flat": "out_flat",
+    "mixer_out": "out",
+}
+
+NEMOTRON_ATTN_BLOCK_REMAP: dict[str, str] = {
+    **_NEMOTRON_NORM_ATTN,
+    # Strip mixer_ prefix from NemotronAttention params
+    "mixer_qkv_weight": "qkv_weight",
+    "mixer_qkv_bias": "qkv_bias",
+    "mixer_out_weight": "out_weight",
+    "mixer_out_bias": "out_bias",
+    "mixer_rope_freqs": "rope_freqs",
+    # Strip mixer_ prefix from NemotronAttention activations
+    "mixer_x_flat": "x_flat",
+    "mixer_qkv_flat": "qkv_flat",
+    "mixer_qkv": "qkv",
+    "mixer_qkv_rope": "qkv_rope",
+    "mixer_att": "att",
+    "mixer_att_flat": "att_flat",
+    "mixer_attn": "attn",
+    "mixer_lse": "lse",
+    "mixer_att_out_flat": "att_out_flat",
+    "mixer_att_out": "att_out",
+}
+
+NEMOTRON_MLP_BLOCK_REMAP: dict[str, str] = {
+    **_NEMOTRON_NORM_IN,
+    # Strip mixer_ prefix from SimpleMLP params
+    "mixer_up_weight": "up_weight",
+    "mixer_up_bias": "up_bias",
+    "mixer_down_weight": "down_weight",
+    "mixer_down_bias": "down_bias",
+    # Strip mixer_ prefix from SimpleMLP activations
+    "mixer_x_flat": "mlp_x_flat",
+    "mixer_up_flat": "mlp_up_flat",
+    "mixer_up": "mlp_up",
+    "mixer_act": "swiglu",
+    "mixer_act_flat": "swiglu_flat",
+    "mixer_down_flat": "mlp_down_flat",
+    "mixer_down": "mlp_down",
+}
+
+NEMOTRON_MOE_BLOCK_REMAP: dict[str, str] = {
+    **_NEMOTRON_NORM_IN,
+    # Strip mixer_ prefix from NemotronMoEExperts params
+    "mixer_router_weight": "router_weight",
+    "mixer_e_score_correction_bias": "e_score_correction_bias",
+    "mixer_experts_up": "experts_up",
+    "mixer_experts_down": "experts_down",
+    # Strip mixer_ prefix from NemotronMoEExperts activations
+    "mixer_router_logits": "router_logits",
+    "mixer_router_probs": "router_probs",
+    "mixer_routing_weights": "routing_weights",
+    "mixer_routing_indices": "routing_indices",
+    "mixer_permuted_input": "permuted_input",
+    "mixer_scatter_indices": "scatter_indices",
+    "mixer_ep_recv_input": "ep_recv_input",
+    "mixer_ep_recv_scatter": "ep_recv_scatter",
+    "mixer_expert_up": "expert_up",
+    "mixer_expert_act": "expert_act",
+    "mixer_expert_down": "expert_down",
+    "mixer_ep_combined": "ep_combined",
+    "mixer_out": "moe_out",
+    "mixer_out_flat": "moe_out_flat",
+    # Strip shared_expert_ prefix from NemotronSharedExpert params
+    "shared_expert_up": "shared_expert_up",
+    "shared_expert_down": "shared_expert_down",
+    # Strip shared_expert_ prefix from activations
+    "shared_expert_up_out": "shared_up_out",
+    "shared_expert_act": "shared_act",
+    "shared_expert_out": "shared_out",
+}
 
 
 class NemotronHMamba2Block(nn.Block):
@@ -71,8 +187,8 @@ class NemotronHMamba2Block(nn.Block):
         self.P = self.projection_size
         self.D_conv = self.conv_dim
 
-        self.norm = nn.RMSNorm(d_model, eps=eps)
-        self.mixer = nn.Mamba2Mixer(
+        self.norm = RMSNorm(d_model, eps=eps)
+        self.mixer = Mamba2Mixer(
             d_model,
             mamba_num_heads=mamba_num_heads,
             mamba_head_dim=mamba_head_dim,
@@ -129,8 +245,8 @@ class NemotronHAttentionBlock(nn.Block):
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_dim
         self.AttnDim = num_query_heads * head_dim
 
-        self.norm = nn.RMSNorm(d_model, eps=eps)
-        self.mixer = nn.NemotronAttention(
+        self.norm = RMSNorm(d_model, eps=eps)
+        self.mixer = NemotronAttention(
             d_model,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
@@ -170,8 +286,8 @@ class NemotronHMLPBlock(nn.Block):
         self.C = d_model
         self.M = d_ff
 
-        self.norm = nn.RMSNorm(d_model, eps=eps)
-        self.mixer = nn.SimpleMLP(
+        self.norm = RMSNorm(d_model, eps=eps)
+        self.mixer = SimpleMLP(
             d_model,
             d_ff,
             activation=activation,
@@ -224,8 +340,8 @@ class NemotronHMoEBlock(nn.Block):
         self.K = num_experts_per_tok
         self.SharedM = shared_expert_intermediate_size if shared_expert_intermediate_size > 0 else moe_intermediate_size
 
-        self.norm = nn.RMSNorm(d_model, eps=eps)
-        self.mixer = nn.NemotronMoEExperts(
+        self.norm = RMSNorm(d_model, eps=eps)
+        self.mixer = NemotronMoEExperts(
             d_model,
             moe_intermediate_size=moe_intermediate_size,
             num_experts=num_experts,
@@ -236,7 +352,7 @@ class NemotronHMoEBlock(nn.Block):
             ep_size=ep_size,
         )
         if self.use_shared_expert:
-            self.shared_expert = nn.NemotronSharedExpert(
+            self.shared_expert = NemotronSharedExpert(
                 d_model,
                 shared_expert_intermediate_size,
                 activation=activation,
