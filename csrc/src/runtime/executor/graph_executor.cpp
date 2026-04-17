@@ -647,11 +647,9 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_hook_context(mHookContext);
     mCompiledExecutor->set_recompute_fn([this](int layer_idx, long B, long T, bool /*use_graph*/) {
         if (mCompiledForward) {
-            mCompiledExecutor->replay_layer_forward(layer_idx,
-                                                    B,
-                                                    T,
-                                                    *mCompiledForward,
-                                                    mHasReplayForwardHook ? &mReplayForwardHook : nullptr);
+            // LoRA replay is slice-driven (see ``CompiledAttrs::lora_slices``).
+            // No forward hook is needed; pass nullptr.
+            mCompiledExecutor->replay_layer_forward(layer_idx, B, T, *mCompiledForward, nullptr);
         }
     });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
@@ -909,14 +907,10 @@ void GraphExecutor::execute_forward(long B,
                                     NCCLCommunicator& comm,
                                     bool full,
                                     const modules::ForwardHook* hook) {
-    // Store forward hook for replay (LoRA deltas must be applied during recompute)
-    if (hook && *hook) {
-        mReplayForwardHook = *hook;
-        mHasReplayForwardHook = true;
-    } else {
-        mReplayForwardHook = {};
-        mHasReplayForwardHook = false;
-    }
+    // LoRA is slice-driven via ``CompiledAttrs::lora_slices``; the forward
+    // hook parameter is kept for ABI stability with callers that still
+    // build hook values, but nothing is invoked from it.
+    (void)hook;
 
     compile_graphs(B, T);
 

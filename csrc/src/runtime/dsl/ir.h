@@ -80,14 +80,29 @@ struct AttrValue {
     }
 };
 
+/// @brief A single LoRA target slice declared on a weight parameter.
+///
+/// Each target names a semantic slice of the weight's *output* dimension
+/// that can receive its own LoRA adapter. For unfused weights this is
+/// typically a single target spanning the full output. Fused weights
+/// (e.g. fused QKV, fused gate+up) carry one target per logical
+/// projection with explicit ``offset`` and ``size``.
+struct LoRATargetIR {
+    std::string name;      ///< Semantic target name ("q", "k", "v", ...).
+    int offset = 0;        ///< Element offset along the weight's output dim.
+    int size = 0;          ///< Output slice size in elements (0 = full out dim).
+    bool grouped = false;  ///< True for MoE batched-expert LoRA.
+};
+
 struct TensorInfo {
     std::vector<Dim> shape;
     std::optional<ETensorDType> dtype;
     bool is_param = false;
     bool is_input = false;
     bool is_output = false;
-    bool quantizable = true;  ///< Whether this param can be quantized (QLoRA)
-    int offload_group = -1;   ///< Offload group ID (-1 = no offloading)
+    bool quantizable = true;                 ///< Whether this param can be quantized (QLoRA)
+    int offload_group = -1;                  ///< Offload group ID (-1 = no offloading)
+    std::vector<LoRATargetIR> lora_targets;  ///< LoRA slice declarations (param-only)
 };
 
 // ============================================================================

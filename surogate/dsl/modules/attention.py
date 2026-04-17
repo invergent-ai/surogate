@@ -13,6 +13,7 @@ from ..dim import B, Dim, T
 from ..hf import fuse
 from ..nn import Module, Proxy, Tracer
 from ..rope import RoPE
+from ..specs import LoRATarget
 
 
 def _resolve_rotary_dim(head_size: int, partial_rotary_factor: float) -> int:
@@ -76,7 +77,10 @@ class GenericGQAttention(Module):
         # Flat attrs so the existing ``when=`` condition machinery
         # (which uses ``getattr(self, ...)``) keeps working.
         self.use_qkv_bias = self.config.qkv_bias
-        self.use_out_bias = self.config.out_bias or self.config.qkv_bias
+        # The two bias flags are independent: GPT-OSS, for example, has a
+        # QKV bias but no o_proj bias. Models that need both must set both
+        # explicitly on their AttentionConfig.
+        self.use_out_bias = self.config.out_bias
         self.use_qk_norm = self.config.qk_norm
         self.use_sinks = self.config.has_sinks
         self.sliding_window = self.config.sliding_window
@@ -106,10 +110,24 @@ class GenericGQAttention(Module):
 
         cfg = self.config
 
+        # LoRA target layout for the fused QKV projection. The fused weight
+        # packs Q, then K, then V along the output dim with sizes Hq*D,
+        # Hkv*D, Hkv*D (matches the HF weight fusion above). Each logical
+        # projection is a separately-addressable LoRA target.
+        _hq = self.num_query_heads * self.head_size
+        _hkv = self.num_kv_heads * self.head_size
+        _hidden = self.d_model
+        qkv_targets = [
+            LoRATarget(name="q", offset=0, size=_hq),
+            LoRATarget(name="k", offset=_hq, size=_hkv),
+            LoRATarget(name="v", offset=_hq + _hkv, size=_hkv),
+        ]
+        out_targets = [LoRATarget(name="o", offset=0, size=_hidden)]
+
         # -- params -----------------------------------------------------
-        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"))
+        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"), lora_targets=qkv_targets)
         qkv_b = tracer.register_param("qkv_bias", ("QKV",), when="use_qkv_bias")
-        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
+        out_w = tracer.register_param("out_weight", ("C", "AttnDim"), lora_targets=out_targets)
         out_b = tracer.register_param("out_bias", ("C",), when="use_out_bias")
         # q_norm / k_norm sit before rope_freqs to match the legacy
         # Qwen3Attention param ordering (preserves existing weight init /
@@ -355,10 +373,22 @@ class Qwen3VLAttention(Module):
         g = tracer.graph
         x, position_ids = args
 
+        # Fused QKV layout: Q, K, V along dim-0 of the weight with sizes
+        # Hq*D, Hkv*D, Hkv*D. Same layout as GenericGQAttention.
+        _hq = self.num_query_heads * self.head_size
+        _hkv = self.num_kv_heads * self.head_size
+        _hidden = self.d_model
+        qkv_targets = [
+            LoRATarget(name="q", offset=0, size=_hq),
+            LoRATarget(name="k", offset=_hq, size=_hkv),
+            LoRATarget(name="v", offset=_hq + _hkv, size=_hkv),
+        ]
+        out_targets = [LoRATarget(name="o", offset=0, size=_hidden)]
+
         # -- params --------------------------------------------------------------
-        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"))
+        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"), lora_targets=qkv_targets)
         qkv_b = tracer.register_param("qkv_bias", ("QKV",), when="use_qkv_bias")
-        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
+        out_w = tracer.register_param("out_weight", ("C", "AttnDim"), lora_targets=out_targets)
         out_b = tracer.register_param("out_bias", ("C",), when="use_qkv_bias")
         tracer.register_param("q_norm_weight", ("D",), quantizable=False)
         tracer.register_param("k_norm_weight", ("D",), quantizable=False)
@@ -580,14 +610,40 @@ class Qwen3_5Attention(Module):
         g = tracer.graph
         x, position_ids = args
 
+        # Qwen3.5 uses unfused Q/K/V projections. Each weight has a single
+        # LoRA target covering its full output dimension (size=0 = full).
+        # The Q projection emits 2*Hq*D (Q + gate) and receives a single
+        # "q" LoRA target over the whole 2*Hq*D output — matching the legacy
+        # C++ allocation that uses ``q_lora_out = 2 * q_out`` for Qwen3.5.
+        _hq2 = 2 * self.num_query_heads * self.head_size
+        _hkv = self.num_kv_heads * self.head_size
+        _hq = self.num_query_heads * self.head_size
+        _hidden = self.d_model
+
         # -- params ----------------------------------------------------------
-        q_proj_w = tracer.register_param("q_proj_weight", ("QProjDim", "C"))
+        q_proj_w = tracer.register_param(
+            "q_proj_weight",
+            ("QProjDim", "C"),
+            lora_targets=[LoRATarget(name="q", size=_hq2)],
+        )
         q_proj_b = tracer.register_param("q_proj_bias", ("QProjDim",), when="use_qkv_bias")
-        k_proj_w = tracer.register_param("k_proj_weight", ("KVDim", "C"))
+        k_proj_w = tracer.register_param(
+            "k_proj_weight",
+            ("KVDim", "C"),
+            lora_targets=[LoRATarget(name="k", size=_hkv)],
+        )
         k_proj_b = tracer.register_param("k_proj_bias", ("KVDim",), when="use_qkv_bias")
-        v_proj_w = tracer.register_param("v_proj_weight", ("KVDim", "C"))
+        v_proj_w = tracer.register_param(
+            "v_proj_weight",
+            ("KVDim", "C"),
+            lora_targets=[LoRATarget(name="v", size=_hkv)],
+        )
         v_proj_b = tracer.register_param("v_proj_bias", ("KVDim",), when="use_qkv_bias")
-        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
+        out_w = tracer.register_param(
+            "out_weight",
+            ("C", "AttnDim"),
+            lora_targets=[LoRATarget(name="o", size=_hidden)],
+        )
         out_b = tracer.register_param("out_bias", ("C",), when="use_qkv_bias")
         tracer.register_param("q_norm_weight", ("D",), quantizable=False)
         tracer.register_param("k_norm_weight", ("D",), quantizable=False)
@@ -862,9 +918,30 @@ class Gemma4Attention(Module):
         _attn_dim = self.num_query_heads * self.head_size
         _full_qkv_dim = (self.num_query_heads + 2 * self.num_kv_heads) * self.head_size
 
+        # LoRA targets for the fused weight.
+        # - Standard mode (k_eq_v=False): Q + K + V packed with sizes
+        #   Hq*D, Hkv*D, Hkv*D.
+        # - k_eq_v mode: Q + K packed with sizes Hq*D, Hkv*D (V reuses K,
+        #   so there is no LoRA target over the missing V).
+        _hq = self.num_query_heads * self.head_size
+        _hkv = self.num_kv_heads * self.head_size
+        _hidden = self.d_model
+        if self.k_eq_v:
+            qkv_targets = [
+                LoRATarget(name="q", offset=0, size=_hq),
+                LoRATarget(name="k", offset=_hq, size=_hkv),
+            ]
+        else:
+            qkv_targets = [
+                LoRATarget(name="q", offset=0, size=_hq),
+                LoRATarget(name="k", offset=_hq, size=_hkv),
+                LoRATarget(name="v", offset=_hq + _hkv, size=_hkv),
+            ]
+        out_targets = [LoRATarget(name="o", offset=0, size=_hidden)]
+
         # -- params ----------------------------------------------------------
-        qkv_w = tracer.register_param("qkv_weight", (_qkv_dim, "C"))
-        out_w = tracer.register_param("out_weight", ("C", _attn_dim))
+        qkv_w = tracer.register_param("qkv_weight", (_qkv_dim, "C"), lora_targets=qkv_targets)
+        out_w = tracer.register_param("out_weight", ("C", _attn_dim), lora_targets=out_targets)
         tracer.register_param("q_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param("k_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param(
@@ -1134,9 +1211,20 @@ class Gemma4SharedKVAttention(Module):
         _qdim = self.num_query_heads * self.head_size
         _attn_dim = _qdim
 
+        _hq = self.num_query_heads * self.head_size
+        _hidden = self.d_model
+
         # -- params (Q-only, no K/V weights) ---------------------------------
-        q_w = tracer.register_param("q_weight", (_qdim, "C"))
-        out_w = tracer.register_param("out_weight", ("C", _attn_dim))
+        q_w = tracer.register_param(
+            "q_weight",
+            (_qdim, "C"),
+            lora_targets=[LoRATarget(name="q", size=_hq)],
+        )
+        out_w = tracer.register_param(
+            "out_weight",
+            ("C", _attn_dim),
+            lora_targets=[LoRATarget(name="o", size=_hidden)],
+        )
         tracer.register_param("q_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param(
             "rope_freqs",
@@ -1288,10 +1376,20 @@ class NemotronAttention(Module):
         g = tracer.graph
         x, position_ids = args
 
+        _hq = self.num_query_heads * self.head_size
+        _hkv = self.num_kv_heads * self.head_size
+        _hidden = self.d_model
+        qkv_targets = [
+            LoRATarget(name="q", offset=0, size=_hq),
+            LoRATarget(name="k", offset=_hq, size=_hkv),
+            LoRATarget(name="v", offset=_hq + _hkv, size=_hkv),
+        ]
+        out_targets = [LoRATarget(name="o", offset=0, size=_hidden)]
+
         # -- params ----------------------------------------------------------
-        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"))
+        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"), lora_targets=qkv_targets)
         qkv_b = tracer.register_param("qkv_bias", ("QKV",), when="attention_bias")
-        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
+        out_w = tracer.register_param("out_weight", ("C", "AttnDim"), lora_targets=out_targets)
         out_b = tracer.register_param("out_bias", ("C",), when="attention_bias")
         if self.use_rope:
             tracer.register_param(

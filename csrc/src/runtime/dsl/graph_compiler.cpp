@@ -11,18 +11,21 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/dsl/ir.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"
+#include "runtime/lora/lora_types.h"
 
 namespace dsl {
 
@@ -804,8 +807,96 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
     return ref;
 }
 
-CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const ShapeEnv& env) {
+CompiledAttrs
+GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const ShapeEnv& env, const Graph& graph) {
     CompiledAttrs attrs;
+
+    // Populate LoRA slices from the weight input's declared targets.
+    // For matmul-family ops, the weight is inputs[1]; for *Backward forms
+    // that take (d_out, x, w, ...) it is inputs[2]. MoE grouped-gemm ops
+    // also carry targets on inputs[1] (the stacked expert weights).
+    //
+    // Each slice is validated against the weight's declared output
+    // dimension at IR-load time: a bounds violation here signals a DSL
+    // annotation bug (declared offset/size does not fit the weight
+    // shape) and must surface before any forward pass silently applies
+    // a zero-contribution LoRA.
+    auto inject_lora_slices = [&](std::size_t weight_idx) {
+        if (op.inputs.size() <= weight_idx) {
+            return;
+        }
+        const std::string& weight_name = op.inputs[weight_idx];
+        auto it = graph.params.find(weight_name);
+        if (it == graph.params.end() || it->second.lora_targets.empty()) {
+            return;
+        }
+        const auto& weight_info = it->second;
+
+        // Resolve the weight's output dimension when possible. Grouped
+        // MoE weights have shape ``[E, out, in]``; others are ``[out,
+        // in]``. A shape we cannot resolve here (e.g. a runtime-symbolic
+        // dim not in ``env``) falls through to the runtime bounds check
+        // in ``apply_lora_slices_forward``.
+        auto resolve_out_dim = [&](bool grouped) -> std::optional<long> {
+            const auto& shape = weight_info.shape;
+            const std::size_t idx = grouped ? 1 : 0;
+            if (shape.size() <= idx) return std::nullopt;
+            try {
+                return resolve_dim(shape[idx], env);
+            } catch (const std::exception&) {
+                return std::nullopt;
+            }
+        };
+
+        attrs.lora_slices.reserve(weight_info.lora_targets.size());
+        for (const auto& t : weight_info.lora_targets) {
+            if (t.offset < 0 || t.size < 0) {
+                throw std::runtime_error("graph_compiler: LoRA target '" + t.name + "' on weight '" + weight_name +
+                                         "' has negative offset/size (offset=" + std::to_string(t.offset) +
+                                         ", size=" + std::to_string(t.size) + ")");
+            }
+            const auto out_dim = resolve_out_dim(t.grouped);
+            if (out_dim.has_value()) {
+                const long off = static_cast<long>(t.offset);
+                const long sz = static_cast<long>(t.size);
+                // size=0 means "from offset to end", so the implied end is out_dim.
+                const long end = (sz == 0) ? *out_dim : (off + sz);
+                if (off < 0 || end > *out_dim || off > end) {
+                    throw std::runtime_error("graph_compiler: LoRA target '" + t.name + "' on weight '" + weight_name +
+                                             "' is out of bounds (offset=" + std::to_string(t.offset) + ", size=" +
+                                             std::to_string(t.size) + ", weight out_dim=" + std::to_string(*out_dim) +
+                                             "). Check the LoRATarget declaration in the DSL module.");
+                }
+            }
+            LoRASlice slice;
+            slice.id = modules::lora_target_from_name(t.name);
+            // Keep the raw name only for unknown targets (hot path avoids it):
+            // unknown ids need the name for dropout-seed hashing and for error
+            // messages if the runtime shape check fails.
+            if (slice.id == modules::LoRATargetId::Unknown) {
+                slice.name = t.name;
+            }
+            slice.offset = t.offset;
+            slice.size = t.size;
+            slice.grouped = t.grouped;
+            attrs.lora_slices.push_back(std::move(slice));
+        }
+    };
+
+    switch (type) {
+        case CompiledOpType::Matmul:
+        case CompiledOpType::MatmulBias:
+        case CompiledOpType::MatmulSwiGLU:
+        case CompiledOpType::MoEGroupedGemm:
+        case CompiledOpType::MoEGroupedGemmGateUp:
+        case CompiledOpType::MoEGroupedGemmDown: inject_lora_slices(/*weight_idx=*/1); break;
+        case CompiledOpType::MatmulBackward:
+        case CompiledOpType::MatmulSwiGLUBackward:
+        case CompiledOpType::MoEGroupedGemmBackward:
+        case CompiledOpType::MoEGroupedGemmGateUpBackward:
+        case CompiledOpType::MoEGroupedGemmDownBackward: inject_lora_slices(/*weight_idx=*/2); break;
+        default: break;
+    }
 
     // Epsilon for normalization ops
     if (auto* eps_attr = find_attr(op.attrs, "eps")) {
@@ -978,47 +1069,39 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
-    // MatmulBackward: weight is at inputs[2], not inputs[1]
-    // Also set backward_hook_point for LoRA hook invocation
-    if (type == CompiledOpType::MatmulBackward) {
-        if (op.inputs.size() > 2) {
-            int layer_idx = -1;
-            std::string field;
-            if (parse_block_param(op.inputs[2], layer_idx, field)) {
-                // Set matmul_op and layer_idx
-                if (field == "qkv_weight") {
-                    attrs.matmul_op = modules::MatmulOp::QKV;
-                    attrs.backward_hook_point = modules::BackwardHookPoint::AfterQKVBackward;
-                } else if (field == "out_weight") {
-                    attrs.matmul_op = modules::MatmulOp::AttnOut;
-                    attrs.backward_hook_point = modules::BackwardHookPoint::AfterAttnOutBackward;
-                } else if (field == "mlp_up_weight" || field == "up_weight") {
-                    attrs.matmul_op = modules::MatmulOp::MLPUp;
-                    attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
-                } else if (field == "mlp_down_weight" || field == "down_weight") {
-                    attrs.matmul_op = modules::MatmulOp::MLPDown;
-                    attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPDownBackward;
-                }
-                attrs.layer_idx = layer_idx;
-                attrs.allow_quant = attrs.matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
+    // MatmulBackward / MatmulSwiGLUBackward: still derive ``matmul_op``
+    // from the weight field name for recipe-dispatch and quantization
+    // routing. LoRA backward is slice-driven via
+    // ``CompiledAttrs::lora_slices`` populated from the weight's
+    // DSL-declared ``LoRATargetIR`` list above, so no backward_hook_point
+    // is set.
+    if (type == CompiledOpType::MatmulBackward && op.inputs.size() > 2) {
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(op.inputs[2], layer_idx, field)) {
+            if (field == "qkv_weight") {
+                attrs.matmul_op = modules::MatmulOp::QKV;
+            } else if (field == "out_weight") {
+                attrs.matmul_op = modules::MatmulOp::AttnOut;
+            } else if (field == "mlp_up_weight" || field == "up_weight") {
+                attrs.matmul_op = modules::MatmulOp::MLPUp;
+            } else if (field == "mlp_down_weight" || field == "down_weight") {
+                attrs.matmul_op = modules::MatmulOp::MLPDown;
             }
+            attrs.layer_idx = layer_idx;
+            attrs.allow_quant = attrs.matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
         }
     }
 
-    // MatmulSwiGLUBackward: fused MLP up+gate backward uses weight at inputs[2]
-    // Set backward_hook_point so LoRA can hook into MLPUp gradients.
-    if (type == CompiledOpType::MatmulSwiGLUBackward) {
-        if (op.inputs.size() > 2) {
-            int layer_idx = -1;
-            std::string field;
-            if (parse_block_param(op.inputs[2], layer_idx, field)) {
-                if (field == "mlp_up_weight" || field == "up_weight") {
-                    attrs.matmul_op = modules::MatmulOp::MLPUp;
-                    attrs.backward_hook_point = modules::BackwardHookPoint::AfterMLPUpBackward;
-                }
-                attrs.layer_idx = layer_idx;
-                attrs.allow_quant = attrs.matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
+    if (type == CompiledOpType::MatmulSwiGLUBackward && op.inputs.size() > 2) {
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(op.inputs[2], layer_idx, field)) {
+            if (field == "mlp_up_weight" || field == "up_weight") {
+                attrs.matmul_op = modules::MatmulOp::MLPUp;
             }
+            attrs.layer_idx = layer_idx;
+            attrs.allow_quant = attrs.matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
         }
     }
 
@@ -3507,7 +3590,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
         }
 
         // Pre-resolve attributes (use per-layer env for hybrid models)
-        compiled.attrs = resolve_attrs(op, compiled.type, *env_ptr);
+        compiled.attrs = resolve_attrs(op, compiled.type, *env_ptr, graph);
 
         // Statistics
         if (compiled.type == CompiledOpType::Matmul || compiled.type == CompiledOpType::MatmulBias ||

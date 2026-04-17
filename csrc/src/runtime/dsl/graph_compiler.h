@@ -10,6 +10,7 @@
 #define SUROGATE_SRC_DSL_GRAPH_COMPILER_H
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,7 @@
 
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
+#include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
 
 namespace modules {
@@ -35,6 +37,20 @@ namespace dsl {
 
 // Helper function to strip SSA-style numeric suffixes from tensor names
 std::string strip_ssa_suffix(const std::string& field);
+
+/// @brief Compiled LoRA slice attached to a matmul op.
+///
+/// One entry per LoRA target declared on the op's weight input. The graph
+/// compiler resolves ``name`` to ``id`` once; hot-path dispatch indexes
+/// the block storage by ``id`` and only touches ``name`` when a target is
+/// unknown (for dropout-seed hashing + error messages).
+struct LoRASlice {
+    modules::LoRATargetId id = modules::LoRATargetId::Unknown;
+    std::string name;      ///< Raw target name; only read when id == Unknown or on error.
+    int offset = 0;        ///< Element offset on the output dim (0 for unfused).
+    int size = 0;          ///< Output slice size in elements (0 = full output dim).
+    bool grouped = false;  ///< True for MoE batched-expert LoRA (uses grouped GEMM path).
+};
 
 class DslRunState;
 class DslParamStore;
@@ -210,9 +226,13 @@ struct CompiledAttrs {
     int layer_idx = -1;
     bool allow_quant = false;
 
-    // Hook-specific
+    // Activation-slot alias point. The matmul dispatch uses this to rebind
+    // ``simplified_acts`` entries (``qkv``/``att_out``/``mlp_up``/
+    // ``mlp_down``) to the freshly-produced matmul output so backward
+    // replay reads the live buffer. Only a handful of ``ForwardHookPoint``
+    // values are consumed for this purpose; they are not invoked as
+    // callbacks anymore (LoRA dispatch is slice-driven).
     std::optional<modules::ForwardHookPoint> forward_hook_point;
-    std::optional<modules::BackwardHookPoint> backward_hook_point;
 
     // MoE-specific
     int top_k = 0;
@@ -275,6 +295,14 @@ struct CompiledAttrs {
     // Non-zero means: use this exact value as the softmax scale (e.g.,
     // Gemma4 passes 1.0 because QK-norm provides the implicit scaling).
     float softmax_scale = 0.0f;
+
+    // LoRA slices declared by the DSL for this op's weight input. Populated
+    // from the weight TensorInfo::lora_targets during graph compilation.
+    // Empty = no LoRA runs for this op. Each slice names a semantic
+    // target (q/k/v/o/gate/up/down/router/expert_*/shared_*) and its offset
+    // and size along the weight's output dim. The runtime looks up the
+    // matching LoRA weight by ``name`` in the LoRAWeightsManager.
+    std::vector<LoRASlice> lora_slices;
 };
 
 // ============================================================================
@@ -458,7 +486,7 @@ private:
 
     TensorRef resolve_tensor_ref(const std::string& name, bool is_output, const Operation& op, const ShapeEnv& env);
 
-    CompiledAttrs resolve_attrs(const Operation& op, CompiledOpType type, const ShapeEnv& env);
+    CompiledAttrs resolve_attrs(const Operation& op, CompiledOpType type, const ShapeEnv& env, const Graph& graph);
 
     void annotate_layer_boundaries(CompiledGraph& graph);
 

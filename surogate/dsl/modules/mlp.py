@@ -13,6 +13,7 @@ from ..dim import B, Dim, T
 from ..hf import fuse
 from ..mlp import MLPConfig
 from ..nn import Module, Proxy, Tracer
+from ..specs import LoRATarget
 
 
 class GenericMLP(Module):
@@ -63,18 +64,53 @@ class GenericMLP(Module):
         (x,) = args
         cfg = self.config
 
+        _ff = self.d_ff
+        _hidden = self.d_model
+
         # -- params -----------------------------------------------------
+        # The fused SwiGLU weight concatenates up then gate along dim-0
+        # (up_proj first, gate_proj second — matches the HF fuse() mapping
+        # above). Each logical projection is a separately-addressable
+        # LoRA target on the fused weight.
         if cfg.gated and cfg.fuse_gate_up:
-            up_w = tracer.register_param("up_weight", ("MUp", "C"))
-            down_w = tracer.register_param("down_weight", ("C", "M"))
+            fused_targets = [
+                LoRATarget(name="up", offset=0, size=_ff),
+                LoRATarget(name="gate", offset=_ff, size=_ff),
+            ]
+            up_w = tracer.register_param("up_weight", ("MUp", "C"), lora_targets=fused_targets)
+            down_w = tracer.register_param(
+                "down_weight",
+                ("C", "M"),
+                lora_targets=[LoRATarget(name="down", size=_hidden)],
+            )
             gate_w = None
         elif cfg.gated:
-            gate_w = tracer.register_param("gate_weight", (self.d_ff, "C"))
-            up_w = tracer.register_param("up_weight", (self.d_ff, "C"))
-            down_w = tracer.register_param("down_weight", ("C", self.d_ff))
+            gate_w = tracer.register_param(
+                "gate_weight",
+                (self.d_ff, "C"),
+                lora_targets=[LoRATarget(name="gate", size=_ff)],
+            )
+            up_w = tracer.register_param(
+                "up_weight",
+                (self.d_ff, "C"),
+                lora_targets=[LoRATarget(name="up", size=_ff)],
+            )
+            down_w = tracer.register_param(
+                "down_weight",
+                ("C", self.d_ff),
+                lora_targets=[LoRATarget(name="down", size=_hidden)],
+            )
         else:
-            up_w = tracer.register_param("up_weight", ("M", "C"))
-            down_w = tracer.register_param("down_weight", ("C", "M"))
+            up_w = tracer.register_param(
+                "up_weight",
+                ("M", "C"),
+                lora_targets=[LoRATarget(name="up", size=_ff)],
+            )
+            down_w = tracer.register_param(
+                "down_weight",
+                ("C", "M"),
+                lora_targets=[LoRATarget(name="down", size=_hidden)],
+            )
             gate_w = None
 
         # -- activation slots -------------------------------------------
@@ -207,10 +243,21 @@ class SimpleMLP(Module):
         g = tracer.graph
         (x,) = args
 
+        _ff = self.d_ff
+        _hidden = self.d_model
+
         # -- params ----------------------------------------------------------
-        up_w = tracer.register_param("up_weight", ("M", "C"))
+        up_w = tracer.register_param(
+            "up_weight",
+            ("M", "C"),
+            lora_targets=[LoRATarget(name="up", size=_ff)],
+        )
         up_b = tracer.register_param("up_bias", ("M",), when="use_bias")
-        down_w = tracer.register_param("down_weight", ("C", "M"))
+        down_w = tracer.register_param(
+            "down_weight",
+            ("C", "M"),
+            lora_targets=[LoRATarget(name="down", size=_hidden)],
+        )
         down_b = tracer.register_param("down_bias", ("C",), when="use_bias")
 
         # -- activation slots ------------------------------------------------

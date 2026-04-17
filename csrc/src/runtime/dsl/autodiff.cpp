@@ -369,6 +369,12 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         backward.inputs[d_name] = info;
     }
 
+    // Re-expose forward params on the backward graph so downstream passes
+    // (e.g. ``inject_lora_slices`` in graph_compiler) can look up a weight's
+    // IR-declared metadata by name from either graph. Without this, LoRA
+    // slices on backward matmul ops stay empty and gradient norms are zero.
+    backward.params = forward.params;
+
     // Set backward graph outputs (gradients of forward inputs/params)
     for (const auto& [name, info] : forward.inputs) {
         if (grad_map.count(name)) {

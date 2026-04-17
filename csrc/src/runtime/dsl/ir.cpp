@@ -100,6 +100,23 @@ AttrMap parse_attr_map(const nlohmann::json& obj) {
     return out;
 }
 
+LoRATargetIR parse_lora_target(const nlohmann::json& obj) {
+    LoRATargetIR target;
+    if (!obj.is_object()) {
+        return target;
+    }
+    if (obj.contains("name") && obj["name"].is_string()) {
+        target.name = obj["name"].get<std::string>();
+    }
+    target.offset = obj.value("offset", 0);
+    target.size = obj.value("size", 0);
+    target.grouped = obj.value("grouped", false);
+    // ``in_features`` is accepted (for IR backwards-compat) but ignored —
+    // the dispatch helpers derive it from the matmul input tensor at
+    // runtime, so storing it on every slice is wasted bytes.
+    return target;
+}
+
 TensorInfo parse_tensor_info(const nlohmann::json& obj) {
     TensorInfo info;
     if (obj.contains("shape") && !obj["shape"].is_null()) {
@@ -115,6 +132,12 @@ TensorInfo parse_tensor_info(const nlohmann::json& obj) {
     info.is_output = obj.value("is_output", false);
     info.quantizable = obj.value("quantizable", true);
     info.offload_group = obj.value("offload_group", -1);
+    if (obj.contains("lora_targets") && obj["lora_targets"].is_array()) {
+        info.lora_targets.reserve(obj["lora_targets"].size());
+        for (const auto& t : obj["lora_targets"]) {
+            info.lora_targets.push_back(parse_lora_target(t));
+        }
+    }
     return info;
 }
 

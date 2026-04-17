@@ -10,7 +10,7 @@ gpus: 1
 ep_size: 1
 ep_load_balance_threshold: 1.0
 
-max_steps: 100
+max_steps: 3
 eval_steps: 25
 
 learning_rate: 2e-4

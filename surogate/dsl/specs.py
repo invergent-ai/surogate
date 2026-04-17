@@ -198,6 +198,35 @@ class ActivationLayoutSpec:
 
 
 @dataclass
+class LoRATarget:
+    """LoRA target declaration attached to a weight parameter.
+
+    Each target describes a semantic slice of a weight's *output* dimension
+    that can receive its own LoRA adapter. For unfused projections there is
+    typically one target covering the full output; for fused projections
+    (e.g. fused QKV or fused gate+up MLP) there is one target per logical
+    projection with its own ``offset`` and ``size``.
+
+    Attributes:
+        name: Semantic target name ("q", "k", "v", "o", "gate", "up", "down",
+            "router", "shared_up", "shared_down", "expert_gate", "expert_up",
+            "expert_down", "expert_gate_up", ...). This drives LoRA-weight
+            lookup in the runtime.
+        offset: Offset in elements along the output dimension where this
+            target's slice begins. 0 for unfused weights.
+        size: Number of output elements this target covers. 0 means "full
+            output dimension" (equivalent to the param's full out dim).
+        grouped: True for MoE routed-expert LoRA where adapters are stacked
+            across the expert dimension and applied via batched GEMM.
+    """
+
+    name: str
+    offset: int = 0
+    size: int = 0
+    grouped: bool = False
+
+
+@dataclass
 class ParamSpec:
     """Specification for a module parameter (weight, bias, submodule, etc.)."""
 
@@ -232,6 +261,10 @@ class ParamSpec:
     # HuggingFace mapping
     hf_path: str | None = None
     hf_transform: HFTransformSpec | None = None
+
+    # LoRA targets (list of slices on this weight's output dim that can receive
+    # their own LoRA adapter). Empty = weight is not a LoRA target.
+    lora_targets: list[LoRATarget] = field(default_factory=list)
 
     # Annotations
     annotations: dict[str, Any] = field(default_factory=dict)

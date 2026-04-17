@@ -34,6 +34,7 @@
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/fp8_scaling_config.h"
 #include "runtime/lora/lora_config.h"
+#include "runtime/lora/lora_slice_dispatch.h"
 #include "runtime/lora/lora_weights_manager.h"
 #include "runtime/core/matmul_context.h"
 #include "runtime/core/model_config.h"
@@ -296,55 +297,33 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
     const long chunk_size = std::min(BT, C);
     const long num_chunks = (BT + chunk_size - 1) / chunk_size;
 
-    // Tiled backward invokes LoRA hooks with chunk-sized tensors. The hook logic
-    // reads rs.B/rs.T to derive BT, so temporarily switch to (1, chunk_tokens)
-    // around hook invocation to avoid over-reading chunk buffers.
-    auto invoke_chunk_lora_hook = [&](const std::optional<modules::BackwardHookPoint>& point,
-                                      bool accumulate,
-                                      long chunk_tokens,
-                                      bool force_chunk_ln2_input) {
-        if (!(hook && *hook) || !point.has_value() || layer_idx < 0) {
-            return;
-        }
+    (void)hook;
 
-        const long prev_B = mRunState.B;
-        const long prev_T = mRunState.T;
-        Tensor prev_recompute_ln{};
-        Tensor prev_recompute_rstd{};
-        bool patched_recompute_ln = false;
-
-        // Up-proj LoRA hook can recompute LN2 from full residual when recompute is
-        // enabled. For tiled execution we must use the chunk LN2 tensor we just set.
-        if (force_chunk_ln2_input && mLoRARunState && mLoRARunState->recompute_ln.Data) {
-            prev_recompute_ln = mLoRARunState->recompute_ln;
-            prev_recompute_rstd = mLoRARunState->recompute_rstd;
-            mLoRARunState->recompute_ln.Data = nullptr;
-            mLoRARunState->recompute_rstd.Data = nullptr;
-            patched_recompute_ln = true;
-        }
-
-        mRunState.B = 1;
-        mRunState.T = chunk_tokens;
-
-        try {
-            (*hook)(layer_idx, accumulate, mRunState.MainStream, *point, mHookContext);
-        } catch (...) {
-            mRunState.B = prev_B;
-            mRunState.T = prev_T;
-            if (patched_recompute_ln) {
-                mLoRARunState->recompute_ln = prev_recompute_ln;
-                mLoRARunState->recompute_rstd = prev_recompute_rstd;
+    // Per-chunk LoRA backward: the op supplies slice declarations via
+    // ``op.attrs.lora_slices`` and the caller passes chunk-sized views.
+    auto apply_chunk_lora_backward =
+        [&](const CompiledOp& op, Tensor input_2d, Tensor d_output_2d, Tensor dx_2d, int BT_chunk, bool accumulate) {
+            if (op.attrs.lora_slices.empty() || mLoRAConfig == nullptr || !mLoRAConfig->enabled() ||
+                mLoRAWeights == nullptr || mLoRAGrads == nullptr || mLoRARunState == nullptr || mComm == nullptr ||
+                layer_idx < 0) {
+                return;
             }
-            throw;
-        }
-
-        mRunState.B = prev_B;
-        mRunState.T = prev_T;
-        if (patched_recompute_ln) {
-            mLoRARunState->recompute_ln = prev_recompute_ln;
-            mLoRARunState->recompute_rstd = prev_recompute_rstd;
-        }
-    };
+            modules::detail::apply_lora_slices_backward(op.attrs.lora_slices,
+                                                        layer_idx,
+                                                        input_2d,
+                                                        d_output_2d,
+                                                        dx_2d,
+                                                        BT_chunk,
+                                                        mLoRAWeights,
+                                                        mLoRAGrads,
+                                                        mLoRAConfig,
+                                                        mLoRARunState,
+                                                        *mComm,
+                                                        accumulate,
+                                                        mRunState.CublasLtHandle,
+                                                        mRunState.CuBlasWorkspace,
+                                                        mRunState.MainStream);
+        };
 
     for (long chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
         const long offset = chunk_idx * chunk_size;
@@ -434,31 +413,16 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
                    mRunState.MainStream);
         }
 
-        // LoRA backward hook for down-proj
-        if (hook && *hook && down_bwd_op->attrs.backward_hook_point.has_value() && layer_idx >= 0) {
-            bool lora_accum = base_accumulate_down || (chunk_idx > 0);
-            auto& grads = mRunState.simplified_grads(layer_idx);
-            auto& acts = mRunState.simplified_acts(layer_idx);
-            // Save full-size tensor state
-            auto prev_d_swiglu = grads.d_swiglu;
-            auto prev_d_res_ffn = grads.d_res_ffn;
-            auto prev_a_swiglu = acts.swiglu;
-            auto prev_a_mlp_up = acts.mlp_up;
-            // Set chunk-sized tensors with correct shapes
-            // d_swiglu: the activation gradient [N, M]
-            grads.d_swiglu = d_act;
-            // d_res_ffn: the incoming gradient d_out [N, C]
-            grads.d_res_ffn = d_out_chunk;
-            // acts.swiglu: the forward activation [N, M]
-            acts.swiglu = act_out;
-            // acts.mlp_up: the pre-activation [N, MUp] (needed for swiglu recompute)
-            acts.mlp_up = up_out;
-            invoke_chunk_lora_hook(down_bwd_op->attrs.backward_hook_point, lora_accum, N, false);
-            // Restore full-size tensors
-            grads.d_swiglu = prev_d_swiglu;
-            grads.d_res_ffn = prev_d_res_ffn;
-            acts.swiglu = prev_a_swiglu;
-            acts.mlp_up = prev_a_mlp_up;
+        // Down-proj LoRA: input = chunk swiglu output, d_out = chunk's
+        // incoming gradient, dx = chunk's d_swiglu.
+        {
+            const bool lora_accum = base_accumulate_down || (chunk_idx > 0);
+            apply_chunk_lora_backward(*down_bwd_op,
+                                      /*input_2d=*/act_out,
+                                      /*d_output_2d=*/d_out_chunk,
+                                      /*dx_2d=*/d_act,
+                                      static_cast<int>(N),
+                                      lora_accum);
         }
 
         // 4) SwiGLU backward: d_up = swiglu_backward(d_act, up_out) → [N, MUp]
@@ -512,24 +476,16 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
                    mRunState.MainStream);
         }
 
-        // LoRA backward hook for up-proj
-        if (hook && *hook && up_bwd_op->attrs.backward_hook_point.has_value() && layer_idx >= 0) {
-            bool lora_accum = base_accumulate_up || (chunk_idx > 0);
-            auto& grads = mRunState.simplified_grads(layer_idx);
-            auto& acts = mRunState.simplified_acts(layer_idx);
-            // Save full-size tensor state
-            auto prev_d_ln2 = grads.d_ln2;
-            auto prev_d_mlp_up = grads.d_mlp_up;
-            auto prev_a_ln2 = acts.ln2;
-            // Set chunk-sized tensors with correct shapes
-            grads.d_ln2 = d_ln2_chunk;
-            grads.d_mlp_up = d_up;
-            acts.ln2 = ln2_chunk;
-            invoke_chunk_lora_hook(up_bwd_op->attrs.backward_hook_point, lora_accum, N, true);
-            // Restore full-size tensors
-            grads.d_ln2 = prev_d_ln2;
-            grads.d_mlp_up = prev_d_mlp_up;
-            acts.ln2 = prev_a_ln2;
+        // Up-proj LoRA (fused up+gate): the DSL-declared slices on
+        // mlp_up_weight cover both the up and gate halves.
+        {
+            const bool lora_accum = base_accumulate_up || (chunk_idx > 0);
+            apply_chunk_lora_backward(*up_bwd_op,
+                                      /*input_2d=*/ln2_chunk,
+                                      /*d_output_2d=*/d_up,
+                                      /*dx_2d=*/d_ln2_chunk,
+                                      static_cast<int>(N),
+                                      lora_accum);
         }
 
         // Free chunk intermediates

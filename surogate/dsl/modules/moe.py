@@ -7,6 +7,7 @@ from typing import Any
 from ..dim import Dim
 from ..hf import stack_experts, transform
 from ..nn import Module, Proxy, Tracer
+from ..specs import LoRATarget
 
 
 class MoEExpertsGated(Module):
@@ -57,10 +58,40 @@ class MoEExpertsGated(Module):
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
+        _ff = self.d_ff
+        _hidden = self.d_model
+        _n_experts = self.num_experts
+
         # -- params ----------------------------------------------------------
-        tracer.register_param("router_weight", ("E", "C"))
-        tracer.register_param("experts_gate_up", ("E", "MUp", "C"), offload_group="moe_experts")
-        tracer.register_param("experts_down", ("E", "C", "M"), offload_group="moe_experts")
+        tracer.register_param(
+            "router_weight",
+            ("E", "C"),
+            lora_targets=[LoRATarget(name="router", size=_n_experts)],
+        )
+        tracer.register_param(
+            "experts_gate_up",
+            ("E", "MUp", "C"),
+            offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_gate_up",
+                    size=2 * _ff,
+                    grouped=True,
+                )
+            ],
+        )
+        tracer.register_param(
+            "experts_down",
+            ("E", "C", "M"),
+            offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_down",
+                    size=_hidden,
+                    grouped=True,
+                )
+            ],
+        )
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation(
@@ -304,19 +335,41 @@ class Gemma4MoEExperts(Module):
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
+        _ff = self.d_ff
+        _hidden = self.d_model
+        _n_experts = self.num_experts
+
         # -- params ----------------------------------------------------------
-        tracer.register_param("router_weight", ("E", "C"))
+        tracer.register_param(
+            "router_weight",
+            ("E", "C"),
+            lora_targets=[LoRATarget(name="router", size=_n_experts)],
+        )
         tracer.register_param("router_scale", ("C",), quantizable=False)
         tracer.register_param("per_expert_scale", ("E",), quantizable=False)
         tracer.register_param(
             "experts_gate_up",
             ("E", "MUp", "C"),
             offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_gate_up",
+                    size=2 * _ff,
+                    grouped=True,
+                )
+            ],
         )
         tracer.register_param(
             "experts_down",
             ("E", "C", "M"),
             offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_down",
+                    size=_hidden,
+                    grouped=True,
+                )
+            ],
         )
 
         # -- activation slots ------------------------------------------------
@@ -476,9 +529,24 @@ class MoESharedExpert(Module):
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
-        tracer.register_param("gate", ("SharedM", "C"))
-        tracer.register_param("up", ("SharedM", "C"))
-        tracer.register_param("down", ("C", "SharedM"))
+        _shared = self.shared_expert_intermediate
+        _hidden = self.d_model
+
+        tracer.register_param(
+            "gate",
+            ("SharedM", "C"),
+            lora_targets=[LoRATarget(name="shared_gate", size=_shared)],
+        )
+        tracer.register_param(
+            "up",
+            ("SharedM", "C"),
+            lora_targets=[LoRATarget(name="shared_up", size=_shared)],
+        )
+        tracer.register_param(
+            "down",
+            ("C", "SharedM"),
+            lora_targets=[LoRATarget(name="shared_down", size=_hidden)],
+        )
 
         tracer.register_activation(
             "gate_out",
@@ -572,13 +640,28 @@ class GptOssMoEExperts(Module):
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
+        _ff = self.d_ff
+        _hidden = self.d_model
+        _n_experts = self.num_experts
+
         # -- params --------------------------------------------------------------
-        tracer.register_param("router_weight", ("E", "C"))
+        tracer.register_param(
+            "router_weight",
+            ("E", "C"),
+            lora_targets=[LoRATarget(name="router", size=_n_experts)],
+        )
         tracer.register_param("router_bias", ("E",))
         tracer.register_param(
             "experts_gate_up",
             ("E", "MUp", "C"),
             offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_gate_up",
+                    size=2 * _ff,
+                    grouped=True,
+                )
+            ],
         )
         tracer.register_param(
             "experts_gate_up_bias",
@@ -589,6 +672,13 @@ class GptOssMoEExperts(Module):
             "experts_down",
             ("E", "C", "M"),
             offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_down",
+                    size=_hidden,
+                    grouped=True,
+                )
+            ],
         )
         tracer.register_param(
             "experts_down_bias",
@@ -844,11 +934,42 @@ class NemotronMoEExperts(Module):
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
+        _ff = self.moe_intermediate_size
+        _hidden = self.d_model
+        _n_experts = self.num_experts
+
         # -- params ----------------------------------------------------------
-        tracer.register_param("router_weight", ("E", "C"), quantizable=False)
+        tracer.register_param(
+            "router_weight",
+            ("E", "C"),
+            quantizable=False,
+            lora_targets=[LoRATarget(name="router", size=_n_experts)],
+        )
         tracer.register_param("e_score_correction_bias", ("E",), dtype="fp32", quantizable=False)
-        tracer.register_param("experts_up", ("E", "M", "C"), offload_group="moe_experts")
-        tracer.register_param("experts_down", ("E", "C", "M"), offload_group="moe_experts")
+        tracer.register_param(
+            "experts_up",
+            ("E", "M", "C"),
+            offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_up",
+                    size=_ff,
+                    grouped=True,
+                )
+            ],
+        )
+        tracer.register_param(
+            "experts_down",
+            ("E", "C", "M"),
+            offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_down",
+                    size=_hidden,
+                    grouped=True,
+                )
+            ],
+        )
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation(
@@ -1069,8 +1190,19 @@ class NemotronSharedExpert(Module):
         g = tracer.graph
         (x,) = args  # x is [B*T, C]
 
-        tracer.register_param("up", ("SharedM", "C"))
-        tracer.register_param("down", ("C", "SharedM"))
+        _shared = self.shared_expert_intermediate
+        _hidden = self.d_model
+
+        tracer.register_param(
+            "up",
+            ("SharedM", "C"),
+            lora_targets=[LoRATarget(name="shared_up", size=_shared)],
+        )
+        tracer.register_param(
+            "down",
+            ("C", "SharedM"),
+            lora_targets=[LoRATarget(name="shared_down", size=_hidden)],
+        )
 
         tracer.register_activation(
             "up_out",

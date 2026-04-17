@@ -58,6 +58,16 @@ std::vector<long> resolve_attr_shape(const AttrValue& value, const ShapeEnv& env
 Tensor view_tensor(const Tensor& src, const std::vector<long>& shape);
 Tensor view_for_shape(const Tensor& src, const std::vector<long>& shape, const std::string& name);
 
+/// Collapse a rank>2 tensor whose leading dims are ``[B, T, ...]`` into a
+/// 2-D ``[B*T, D]`` view. Tensors already rank-2 or with non-matching
+/// leading dims pass through unchanged.
+inline Tensor flatten_bt(const Tensor& t, long B, long T) {
+    if (t.Rank > 2 && t.Sizes[0] == B && t.Sizes[1] == T) {
+        return view_tensor(t, {B * T, t.Sizes[t.Rank - 1]});
+    }
+    return t;
+}
+
 // Matmul utilities
 std::optional<::modules::MatmulOp> matmul_op_from_weight(std::string_view name, int& layer_idx);
 EMMTranspose parse_transpose(const AttrMap& attrs);

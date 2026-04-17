@@ -16,6 +16,7 @@
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
+#include "runtime/lora/lora_slice_dispatch.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 
@@ -110,16 +111,32 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
                mRunState.MainStream);
     }
 
-    // Hook invocation (AfterMLPUpProjection should observe the projection output before activation).
-    if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
-        // Bind activation slot so forward hooks (LoRA) write into the live buffer.
-        // During replay, acts may already point to the original forward's buffer —
-        // force-update so LoRA targets the replay tensor.
-        if (op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
-            auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
-            acts.mlp_up.Data = up_out.Data;
-        }
-        (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
+    (void)hook;
+
+    // Rebind the per-layer mlp_up activation slot to the live buffer so
+    // backward replays read the fresh tensor.
+    if (op.attrs.forward_hook_point.has_value() && op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
+        auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
+        acts.mlp_up.Data = up_out.Data;
+    }
+
+    // Apply DSL-declared LoRA adapters (up/gate/...) to ``up_out`` before
+    // the SwiGLU activation.
+    if (!op.attrs.lora_slices.empty()) {
+        Tensor a_flat = flatten_bt(a, mB, mT);
+        Tensor up_flat = flatten_bt(up_out, mB, mT);
+        const int BT = static_cast<int>(a_flat.Sizes[0]);
+        modules::detail::apply_lora_slices_forward(op.attrs.lora_slices,
+                                                   op.attrs.layer_idx,
+                                                   a_flat,
+                                                   up_flat,
+                                                   BT,
+                                                   mLoRAWeights,
+                                                   mLoRAConfig,
+                                                   mLoRARunState,
+                                                   mRunState.CublasLtHandle,
+                                                   mRunState.CuBlasWorkspace,
+                                                   mRunState.MainStream);
     }
 
     Tensor up_3d = view_tensor(up_out, {mB, mT, static_cast<long>(N)});
@@ -446,11 +463,29 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         grads.d_ln2.Data = d_inp_ptr->Data;
     }
 
-    // Hook invocation for LoRA backward (MLP up/gate)
-    // Skip dense MLP hooks for MoE models - MoE has different backward path (grouped GEMM)
-    const bool is_moe = mConfig.NumExperts > 0;
-    if (hook && *hook && op.attrs.backward_hook_point.has_value() && !is_moe) {
-        (*hook)(layer_idx, do_accumulate, mRunState.MainStream, *op.attrs.backward_hook_point, mHookContext);
+    (void)hook;
+
+    if (!op.attrs.lora_slices.empty() && mLoRAConfig && mLoRAConfig->enabled() && mLoRAWeights && mLoRAGrads &&
+        mLoRARunState && mComm && layer_idx >= 0) {
+        Tensor inp_flat = flatten_bt(inp, mB, mT);
+        Tensor d_mlp_flat = d_mlp_up_flat;
+        Tensor dx_target = (d_inp_ptr && d_inp_ptr->Data) ? flatten_bt(*d_inp_ptr, mB, mT) : Tensor{};
+        const int BT = static_cast<int>(inp_flat.Sizes[0]);
+        modules::detail::apply_lora_slices_backward(op.attrs.lora_slices,
+                                                    layer_idx,
+                                                    inp_flat,
+                                                    d_mlp_flat,
+                                                    dx_target,
+                                                    BT,
+                                                    mLoRAWeights,
+                                                    mLoRAGrads,
+                                                    mLoRAConfig,
+                                                    mLoRARunState,
+                                                    *mComm,
+                                                    do_accumulate,
+                                                    mRunState.CublasLtHandle,
+                                                    mRunState.CuBlasWorkspace,
+                                                    mRunState.MainStream);
     }
 }
 

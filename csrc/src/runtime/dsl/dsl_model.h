@@ -328,12 +328,6 @@ private:
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 
-    // Pre-built name tables for LoRA backward (avoids per-layer string construction).
-    // Indexed by layer. Populated lazily on first use.
-    std::vector<std::string> mLoRALn1Names;  // ln1_weight or norm_weight per layer
-    std::vector<std::string> mLoRALn2Names;  // ln2_weight or norm_weight per layer
-    void build_lora_name_tables();
-
     // Adapter merge state (optional — stacked LoRA)
     std::string mAdapterPath;
 

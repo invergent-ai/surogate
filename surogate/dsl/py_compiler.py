@@ -31,6 +31,7 @@ from .specs import (
     BlockSpec,
     ForwardSpec,
     HFTransformSpec,
+    LoRATarget,
     ModelSpec,
     ModuleSpec,
     ParamKind,
@@ -57,6 +58,9 @@ class TensorRef:
     is_output: bool = False
     quantizable: bool = True
     offload_group: int | str = -1
+    # LoRA slice declarations attached to param tensors. Empty for
+    # non-param tensors and for params that are not LoRA targets.
+    lora_targets: list[LoRATarget] = field(default_factory=list)
 
 
 @dataclass
@@ -319,6 +323,7 @@ def _param_spec_to_ref(
         is_param=True,
         quantizable=spec.quantizable,
         offload_group=spec.offload_group,
+        lora_targets=list(spec.lora_targets),
     )
 
 
@@ -1844,6 +1849,22 @@ class _OffloadGroupResolver:
 _offload_resolver = _OffloadGroupResolver()
 
 
+def _lora_target_to_dict(target: LoRATarget) -> dict[str, Any]:
+    """Convert a LoRATarget to JSON-serializable dict.
+
+    Only non-default fields are emitted to keep the IR compact. The consumer
+    (C++ graph_compiler) fills in defaults for absent fields.
+    """
+    payload: dict[str, Any] = {"name": target.name}
+    if target.offset:
+        payload["offset"] = int(target.offset)
+    if target.size:
+        payload["size"] = int(target.size)
+    if target.grouped:
+        payload["grouped"] = True
+    return payload
+
+
 def _tensor_ref_to_dict(ref: TensorRef) -> dict[str, Any]:
     """Convert TensorRef to JSON-serializable dict."""
     result = {
@@ -1858,6 +1879,8 @@ def _tensor_ref_to_dict(ref: TensorRef) -> dict[str, Any]:
             result["quantizable"] = False
         if ref.offload_group != -1:
             result["offload_group"] = _offload_resolver.resolve(ref.offload_group)
+        if ref.lora_targets:
+            result["lora_targets"] = [_lora_target_to_dict(t) for t in ref.lora_targets]
     return result
 
 

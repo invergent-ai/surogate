@@ -6,6 +6,7 @@
 #define SUROGATE_SRC_MODULES_LORA_LORA_TYPES_H
 
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include "lora_config.h"
@@ -176,6 +177,114 @@ struct LoRAWeightsSet {
     std::vector<LoRABlockWeights<TTensor>> blocks;
     ModularLoRAConfig config;
 };
+
+/// @brief Canonical ID for each DSL-declared LoRA target.
+///
+/// The Python DSL declares LoRA targets by semantic name. The graph
+/// compiler resolves the name to a ``LoRATargetId`` once (at IR load
+/// time), so hot-path dispatch indexes the block storage by enum value
+/// rather than comparing 15 strings per slice per matmul.
+///
+/// ``Unknown`` is the sentinel for future names not yet listed here. It
+/// is still stored (with its raw name) on the slice so dropout-seeding
+/// stays deterministic, but it won't resolve to any current adapter
+/// storage slot.
+enum class LoRATargetId : std::uint8_t {
+    Q = 0,
+    K,
+    V,
+    O,
+    Up,
+    Gate,
+    Down,
+    SharedUp,
+    SharedDown,
+    SharedGate,
+    Router,
+    GateUp,
+    ExpertGate,
+    ExpertUp,
+    ExpertGateUp,
+    ExpertDown,
+    Unknown = 255,
+};
+
+inline LoRATargetId lora_target_from_name(std::string_view name) {
+    if (name == "q") return LoRATargetId::Q;
+    if (name == "k") return LoRATargetId::K;
+    if (name == "v") return LoRATargetId::V;
+    if (name == "o") return LoRATargetId::O;
+    if (name == "up") return LoRATargetId::Up;
+    if (name == "gate") return LoRATargetId::Gate;
+    if (name == "down") return LoRATargetId::Down;
+    if (name == "shared_up") return LoRATargetId::SharedUp;
+    if (name == "shared_down") return LoRATargetId::SharedDown;
+    if (name == "shared_gate") return LoRATargetId::SharedGate;
+    if (name == "router") return LoRATargetId::Router;
+    if (name == "gate_up") return LoRATargetId::GateUp;
+    if (name == "expert_gate") return LoRATargetId::ExpertGate;
+    if (name == "expert_up") return LoRATargetId::ExpertUp;
+    if (name == "expert_gate_up") return LoRATargetId::ExpertGateUp;
+    if (name == "expert_down") return LoRATargetId::ExpertDown;
+    return LoRATargetId::Unknown;
+}
+
+template <typename TTensor>
+inline LoRALayerWeights<TTensor>* get_layer_weight_by_target(LoRABlockWeights<TTensor>& block, LoRATargetId id) {
+    switch (id) {
+        case LoRATargetId::Q: return block.attention.q.has_value() ? &*block.attention.q : nullptr;
+        case LoRATargetId::K: return block.attention.k.has_value() ? &*block.attention.k : nullptr;
+        case LoRATargetId::V: return block.attention.v.has_value() ? &*block.attention.v : nullptr;
+        case LoRATargetId::O: return block.attention.o.has_value() ? &*block.attention.o : nullptr;
+        case LoRATargetId::Gate: return block.mlp.gate.has_value() ? &*block.mlp.gate : nullptr;
+        case LoRATargetId::Up: return block.mlp.up.has_value() ? &*block.mlp.up : nullptr;
+        case LoRATargetId::Down: return block.mlp.down.has_value() ? &*block.mlp.down : nullptr;
+        case LoRATargetId::GateUp: return block.mlp.gate_up.has_value() ? &*block.mlp.gate_up : nullptr;
+        case LoRATargetId::Router: return block.router.has_value() ? &*block.router : nullptr;
+        case LoRATargetId::SharedUp:
+            return (block.moe.shared.has_value() && block.moe.shared->up.has_value()) ? &*block.moe.shared->up
+                                                                                      : nullptr;
+        case LoRATargetId::SharedDown:
+            return (block.moe.shared.has_value() && block.moe.shared->down.has_value()) ? &*block.moe.shared->down
+                                                                                        : nullptr;
+        case LoRATargetId::SharedGate:
+            return (block.moe.shared.has_value() && block.moe.shared->gate.has_value()) ? &*block.moe.shared->gate
+                                                                                        : nullptr;
+        default: return nullptr;
+    }
+}
+
+template <typename TTensor>
+inline LoRAGroupedLayerWeights<TTensor>* get_grouped_weight_by_target(LoRABlockWeights<TTensor>& block,
+                                                                      LoRATargetId id) {
+    if (!block.moe.use_grouped) return nullptr;
+    auto& g = block.moe.grouped;
+    switch (id) {
+        case LoRATargetId::ExpertGate: return g.gate.has_value() ? &*g.gate : nullptr;
+        case LoRATargetId::ExpertUp: return g.up.has_value() ? &*g.up : nullptr;
+        case LoRATargetId::ExpertGateUp: return g.gate_up.has_value() ? &*g.gate_up : nullptr;
+        case LoRATargetId::ExpertDown: return g.down.has_value() ? &*g.down : nullptr;
+        default: return nullptr;
+    }
+}
+
+/// Stable integer key for a LoRA target, used to seed per-projection
+/// dropout streams so identical targets reproduce across re-runs. Canonical
+/// IDs use their enum value directly. ``Unknown`` targets fall back to a
+/// 32-bit FNV-1a hash of the raw name with the high bit set, so they land
+/// in ``[2^31, 2^32)`` — disjoint from canonical IDs, ~2^-31 pairwise
+/// collision probability between distinct unknown names.
+inline unsigned lora_target_seed_key(LoRATargetId id, std::string_view name_for_unknown) {
+    if (id != LoRATargetId::Unknown) {
+        return static_cast<unsigned>(id);
+    }
+    unsigned h = 2166136261u;
+    for (char c : name_for_unknown) {
+        h ^= static_cast<unsigned char>(c);
+        h *= 16777619u;
+    }
+    return h | 0x80000000u;
+}
 
 }  // namespace modules
 

@@ -57,6 +57,7 @@ from .specs import (
     ForwardSpec,
     HFConfigSpec,
     IOSpec,
+    LoRATarget,
     ModelSpec,
     ParamKind,
     ParamSpec,
@@ -138,8 +139,16 @@ class Tracer:
         quantizable: bool = True,
         when: str | None = None,
         offload_group: int | str = -1,
+        lora_targets: list[LoRATarget] | None = None,
     ) -> str:
-        """Register a parameter and return its fully-qualified name."""
+        """Register a parameter and return its fully-qualified name.
+
+        ``lora_targets`` declares named slices of the parameter's output
+        dimension that can receive LoRA adapters. For unfused weights pass a
+        single target with ``size=0`` (meaning the full output). For fused
+        projections (e.g. fused QKV), pass one target per logical projection
+        with explicit ``offset`` and ``size`` in elements.
+        """
         full_name = self.prefixed(local_name)
         if full_name not in self.params:
             spec = ParamSpec(
@@ -150,11 +159,15 @@ class Tracer:
                 frozen=frozen,
                 quantizable=quantizable,
                 offload_group=offload_group,
+                lora_targets=list(lora_targets) if lora_targets else [],
             )
             if when is not None:
                 spec.optional = True
                 spec.condition = lambda self_, _w=when: getattr(self_, _w, False)
             self.params[full_name] = spec
+        elif lora_targets:
+            # Update existing spec's targets (e.g. re-registration path).
+            self.params[full_name].lora_targets = list(lora_targets)
         return full_name
 
     # -- activation slot registration ----------------------------------------

@@ -284,26 +284,6 @@ private:
     void record_attn_plan(int layer_idx, const AttnForwardPlan& plan);
     const LayerForwardPlan* forward_plan(int layer_idx) const;
 
-    // Internal hook invocation helpers
-    void invoke_forward_hook(int layer_idx,
-                             modules::ForwardHookPoint point,
-                             cudaStream_t stream,
-                             const modules::ForwardHook* hook) {
-        if (hook && *hook) {
-            (*hook)(layer_idx, stream, point, mHookContext);
-        }
-    }
-
-    void invoke_backward_hook(int layer_idx,
-                              bool accumulate,
-                              modules::BackwardHookPoint point,
-                              cudaStream_t stream,
-                              const modules::BackwardHook* hook) {
-        if (hook && *hook) {
-            (*hook)(layer_idx, accumulate, stream, point, mHookContext);
-        }
-    }
-
     const Module& mModule;
     DslRunState& mRunState;
     DslParamStore& mWeights;
@@ -317,12 +297,9 @@ private:
     modules::ModularLoRAGradsManager* mLoRAGrads = nullptr;
     modules::LoRARunState* mLoRARunState = nullptr;
 
-    // Hook context (opaque pointer passed to hook callbacks)
+    // Hook context (opaque pointer passed to any remaining hook callbacks;
+    // LoRA itself is slice-driven and no longer uses this).
     void* mHookContext = nullptr;
-
-    // Forward hook stored for replay (LoRA deltas must be applied during recompute)
-    modules::ForwardHook mReplayForwardHook;
-    bool mHasReplayForwardHook = false;
 
     // Optional weight manager for streaming/sharding (owned by DslModel)
     DslWeightManager* mWeightManager = nullptr;
