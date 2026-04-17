@@ -1226,15 +1226,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                   mLoRARunState.get());
     }
 
-    if (allocate_optimizer) {
-        if (lora_enabled()) {
-            if (!mLoRAAdamW8BitState) {
-                mLoRAAdamW8BitState = std::make_unique<modules::LoRAAdamW8BitState>();
-            }
-        } else {
-            if (!mAdamW8BitState) {
-                mAdamW8BitState = std::make_unique<AdamW8BitState>();
-            }
+    if (allocate_optimizer && lora_enabled()) {
+        if (!mLoRAAdamW8BitState) {
+            mLoRAAdamW8BitState = std::make_unique<modules::LoRAAdamW8BitState>();
         }
     }
 }

@@ -712,10 +712,8 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
 
 void DslModel::on_restore_checkpoint(NCCLCommunicator& comm) {
     (void)comm;
-    if (mAdamW8BitState && mAdamW8BitState->state1.Data) {
-        mAdamW8BitState->initialized = true;
-        mAdamWMomentumContainer.update_pointers(&mAdamW8BitState->state1, &mAdamW8BitState->scales1);
-        mAdamWVarianceContainer.update_pointers(&mAdamW8BitState->state2, &mAdamW8BitState->scales2);
+    if (mOptimizer) {
+        mOptimizer->on_restore_checkpoint(*this);
     }
 }
 
@@ -723,13 +721,12 @@ void DslModel::prepare_optimizer_for_checkpoint_load() {
     if (lora_enabled()) {
         return;
     }
-    if (!mAdamW8BitState) {
-        mAdamW8BitState = std::make_unique<AdamW8BitState>();
+    if (!mOptimizer) {
+        optimizers::OptimizerConfig cfg;
+        cfg.type = optimizers::OptimizerType::ADAMW_8BIT;
+        mOptimizer = optimizers::create_optimizer(cfg);
     }
-    cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
-    if (!mAdamW8BitState->initialized) {
-        init_optimizer_state(stream);
-    }
+    mOptimizer->prepare_for_checkpoint_load(*this);
 }
 
 void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& comm) {

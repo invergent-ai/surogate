@@ -24,7 +24,7 @@
 #include "runtime/lora/lora_weights_manager.h"
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
-#include "runtime/optimizers/cpu_adamw.h"
+#include "runtime/optimizers/optimizer.h"
 #include "runtime/training/model.h"
 #include "utilities/allocator.h"
 #include "utilities/tensor_container.h"
@@ -34,6 +34,12 @@
 namespace modules {
 struct HfMapping;
 }  // namespace modules
+
+namespace optimizers {
+class AdamWOptimizer;
+class AdamW8BitOptimizer;
+class NorMuonOptimizer;
+}  // namespace optimizers
 
 namespace dsl {
 
@@ -49,62 +55,14 @@ public:
     }
 };
 
-namespace detail {
-
-class AdamW8BitMomentumContainer final : public ITensorContainer {
-public:
-    AdamW8BitMomentumContainer(Tensor* state1 = nullptr, Tensor* scales1 = nullptr)
-        : mState1(state1),
-          mScales1(scales1) {
-    }
-
-    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
-        if (!mState1 || !mState1->Data) return;
-        callback("adamw8bit.state1", TensorShard(*mState1));
-        if (mScales1 && mScales1->Data) {
-            callback("adamw8bit.scales1", TensorShard(*mScales1));
-        }
-    }
-
-    void update_pointers(Tensor* state1, Tensor* scales1) {
-        mState1 = state1;
-        mScales1 = scales1;
-    }
-
-private:
-    Tensor* mState1 = nullptr;
-    Tensor* mScales1 = nullptr;
-};
-
-class AdamW8BitVarianceContainer final : public ITensorContainer {
-public:
-    AdamW8BitVarianceContainer(Tensor* state2 = nullptr, Tensor* scales2 = nullptr)
-        : mState2(state2),
-          mScales2(scales2) {
-    }
-
-    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
-        if (!mState2 || !mState2->Data) return;
-        callback("adamw8bit.state2", TensorShard(*mState2));
-        if (mScales2 && mScales2->Data) {
-            callback("adamw8bit.scales2", TensorShard(*mScales2));
-        }
-    }
-
-    void update_pointers(Tensor* state2, Tensor* scales2) {
-        mState2 = state2;
-        mScales2 = scales2;
-    }
-
-private:
-    Tensor* mState2 = nullptr;
-    Tensor* mScales2 = nullptr;
-};
-
-}  // namespace detail
-
 class DslModel final : public IModel {
 public:
+    // Concrete optimizer implementations access DslModel's private state
+    // (params, grads, weight manager, LoRA hooks) through friendship.
+    friend class ::optimizers::AdamWOptimizer;
+    friend class ::optimizers::AdamW8BitOptimizer;
+    friend class ::optimizers::NorMuonOptimizer;
+
     DslModel(const PretrainedConfig& config,
              const RuntimeOptions& options,
              const std::string& ir_json,
@@ -311,26 +269,6 @@ private:
     const Module& pick_model_module(const IRFile& ir) const;
     void validate_config_mapping(const Module& module) const;
     void validate_param_shapes(const Module& module) const;
-    void init_optimizer_state(cudaStream_t stream);
-    void init_adamw_state(cudaStream_t stream);
-    void init_normuon_state(cudaStream_t stream);
-    void update_adamw(NCCLCommunicator& comm,
-                      float learning_rate,
-                      float beta_1,
-                      float beta_2,
-                      int t,
-                      float epsilon,
-                      float weight_decay,
-                      float grad_clip);
-    void update_cpu_adamw(NCCLCommunicator& comm,
-                          float learning_rate,
-                          float beta_1,
-                          float beta_2,
-                          int t,
-                          float epsilon,
-                          float weight_decay,
-                          float grad_clip);
-    void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
     void calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced);
     void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T);
     void ensure_lora_run_state(NCCLCommunicator& comm, int B, int T);
@@ -351,9 +289,6 @@ private:
                                 float epsilon,
                                 float weight_decay,
                                 float grad_clip);
-    void update_adamw_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
-    void update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
-    void update_normuon_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
     void
     update_lora_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip, const float* opt_params, const int* opt_step);
     void update_lora_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step);
@@ -376,8 +311,7 @@ private:
     std::unique_ptr<DslGradStore> mGrads;
     std::unique_ptr<DslWeightManager> mWeightManager;  // Optional - for streaming/sharding
     EmptyTensorContainer mEmpty;
-    detail::AdamW8BitMomentumContainer mAdamWMomentumContainer;
-    detail::AdamW8BitVarianceContainer mAdamWVarianceContainer;
+    std::unique_ptr<optimizers::Optimizer> mOptimizer;
     std::unique_ptr<IGraphExecutor> mExecutor;
     std::vector<std::byte> mRngState;
 
@@ -408,78 +342,6 @@ private:
     int mShardIdx = 0;
     int mNumShards = 1;
     std::unique_ptr<QLoRAWeightProvider> mQLoRAProvider;
-
-    struct AdamW8BitState {
-        bool initialized = false;
-        size_t total_params = 0;
-        size_t total_state_elems = 0;
-        size_t num_groups = 0;
-        // Offloading configuration (copied from options during init)
-        bool offload_state = false;
-        bool use_zero_copy = false;
-        Tensor state1;   // signed char (int8) - softsign-quantized momentum
-        Tensor state2;   // unsigned char (uint8) - sqrt-quantized variance
-        Tensor scales1;  // FP16 per-group scales for momentum
-        Tensor scales2;  // FP16 per-group scales for variance
-    };
-    std::unique_ptr<AdamW8BitState> mAdamW8BitState;
-
-    struct AdamWState {
-        bool initialized = false;
-        size_t total_params = 0;
-        size_t total_state_elems = 0;
-        // Offloading configuration (copied from options during init)
-        bool offload_state = false;
-        bool use_zero_copy = false;
-        Tensor state1;  // FP32 momentum
-        Tensor state2;  // FP32 variance
-    };
-    std::unique_ptr<AdamWState> mAdamWState;
-
-    // CPU-RAM centric FP32 AdamW state (for cpu_training mode)
-    optimizers::CPUAdamWState mCpuAdamWState;
-
-    // NorMuon optimizer state for full fine-tuning (hybrid: AdamW for 1D, NorMuon for 2D)
-    struct FFTNorMuonState {
-        bool initialized = false;
-
-        // AdamW state for 1D params (embeddings, norms, lm_head, etc.)
-        size_t adamw_total_params = 0;
-        size_t adamw_state_elems = 0;
-        size_t adamw_num_blocks = 0;
-        Tensor adamw_quantiles1;
-        Tensor adamw_quantiles2;
-        Tensor adamw_state1;
-        Tensor adamw_state2;
-        Tensor adamw_absmax1;
-        Tensor adamw_absmax2;
-
-        // NorMuon state for 2D params (attention, MLP weights)
-        size_t normuon_total_params = 0;
-        size_t normuon_state_elems = 0;
-        size_t normuon_num_blocks = 0;
-        Tensor momentum_quantiles;
-        Tensor momentum_state;
-        Tensor momentum_absmax;
-
-        // Variance buffers - one per 2D weight
-        std::vector<Tensor> variance_buffers;
-        std::vector<std::pair<int, int>> variance_shapes;  // (M, N) per buffer
-
-        // Polar Express workspace
-        Tensor polar_workspace;
-        size_t max_weight_M = 0;
-        size_t max_weight_N = 0;
-
-        // cuBLAS handle for Polar Express
-        cublasHandle_t cublas_handle = nullptr;
-
-        // Param classification: true = 2D (NorMuon), false = 1D (AdamW)
-        std::vector<std::pair<std::string, bool>> param_classification;
-
-        ~FFTNorMuonState();
-    };
-    std::unique_ptr<FFTNorMuonState> mFFTNorMuonState;
 
     std::unordered_map<std::string, MappingSpec> mHfMapping;
     std::unordered_map<std::string, MappingSpec> mHfExport;

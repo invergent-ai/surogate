@@ -275,7 +275,6 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/dsl_model_execution.cpp
     src/runtime/dsl/dsl_model_helpers.cpp
     src/runtime/dsl/dsl_model_lora.cpp
-    src/runtime/dsl/dsl_model_optimizer.cpp
     src/runtime/dsl/dsl_model_weights.cpp
     src/runtime/dsl/dsl_param_store.cpp
     src/runtime/dsl/dsl_grad_store.cpp
@@ -431,6 +430,10 @@ target_sources(surogate-common PRIVATE
     src/runtime/optimizers/cpu_adamw.cpp
     src/runtime/optimizers/polar_express.cu
     src/runtime/optimizers/normuon.cu
+    src/runtime/optimizers/optimizer.cpp
+    src/runtime/optimizers/adamw_optimizer.cpp
+    src/runtime/optimizers/adamw_8bit_optimizer.cpp
+    src/runtime/optimizers/normuon_optimizer.cpp
     src/kernels/fused_classifier.cu
     src/kernels/transpose.cu
     src/kernels/vector_add.cu

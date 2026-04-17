@@ -37,7 +37,10 @@
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/core/model_config.h"
 #include "runtime/optimizers/adamw_8bit.h"
+#include "runtime/optimizers/adamw_8bit_optimizer.h"
+#include "runtime/optimizers/adamw_optimizer.h"
 #include "runtime/optimizers/normuon.h"
+#include "runtime/optimizers/normuon_optimizer.h"
 #include "runtime/core/fp8_scaling_state.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
@@ -1360,6 +1363,170 @@ void DslModel::validate_param_shapes(const Module& module) const {
             }
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Optimizer dispatch. Per-optimizer kernel logic lives in
+// ``runtime/optimizers/<name>_optimizer.cpp``; this file only routes calls
+// through ``mOptimizer`` and owns the shared gradient-norm kernel that both
+// full-fine-tune and LoRA paths reuse.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+void ensure_optimizer(std::unique_ptr<optimizers::Optimizer>& opt, optimizers::OptimizerType type) {
+    if (!opt || opt->type() != type) {
+        optimizers::OptimizerConfig cfg;
+        cfg.type = type;
+        opt = optimizers::create_optimizer(cfg);
+    }
+}
+
+}  // namespace
+
+// Legacy non-config ``update`` entry point (IModel interface). Routes to the
+// default 8-bit AdamW optimizer using an ad-hoc OptimizerConfig.
+void DslModel::update(NCCLCommunicator& comm,
+                      float learning_rate,
+                      float beta_1,
+                      float beta_2,
+                      int t,
+                      float epsilon,
+                      float weight_decay,
+                      float grad_clip) {
+    optimizers::OptimizerConfig cfg;
+    cfg.type = optimizers::OptimizerType::ADAMW_8BIT;
+    cfg.learning_rate = learning_rate;
+    cfg.adamw_beta1 = beta_1;
+    cfg.adamw_beta2 = beta_2;
+    cfg.adamw_epsilon = epsilon;
+    cfg.weight_decay = weight_decay;
+    cfg.grad_clip = grad_clip;
+    update_with_config(comm, cfg, t);
+}
+
+void DslModel::update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
+    ensure_optimizer(mOptimizer, config.type);
+    mOptimizer->step(*this, comm, config, step);
+}
+
+void DslModel::update_with_graph_params(NCCLCommunicator& comm,
+                                        const optimizers::OptimizerConfig& config,
+                                        const float* opt_params,
+                                        const int* opt_step) {
+    if (!opt_params || !opt_step) {
+        throw std::logic_error("DslModel::update_with_graph_params: missing optimizer parameter buffers");
+    }
+    if (config.type != optimizers::OptimizerType::ADAMW && config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+        config.type != optimizers::OptimizerType::NORMUON) {
+        throw std::logic_error("DslModel::update_with_graph_params: unsupported optimizer type");
+    }
+    ensure_optimizer(mOptimizer, config.type);
+    mOptimizer->step_graph(*this, comm, config, opt_params, opt_step);
+}
+
+void DslModel::prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config) {
+    if (config.type != optimizers::OptimizerType::ADAMW && config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+        config.type != optimizers::OptimizerType::NORMUON) {
+        return;
+    }
+    if (!mRunState) {
+        throw std::logic_error("DslModel::prepare_optimizer_state_for_graph called before allocate_run_state()");
+    }
+    ensure_optimizer(mOptimizer, config.type);
+    mOptimizer->prepare_for_graph(*this, comm, config);
+}
+
+// Shared gradient-norm kernel (used by both full-fine-tune and LoRA paths).
+void DslModel::calculate_gradient_norm(NCCLCommunicator& comm,
+                                       float grad_clip,
+                                       cudaStream_t stream,
+                                       bool grads_reduced) {
+    auto& rs = *mRunState;
+
+    fill_zero(rs.scratch().norm_buffer, stream);
+
+    // Track seen Data pointers to avoid double-counting tied gradients (e.g., embedding/lm_head)
+    std::unordered_set<void*> seen_ptrs;
+    for (const auto& kv : mGrads->grads()) {
+        const Tensor& grad = kv.second;
+        if (!grad.Data || grad.nelem() == 0) continue;
+        if (seen_ptrs.count(grad.Data) > 0) {
+            continue;
+        }
+        seen_ptrs.insert(grad.Data);
+        global_norm_squared(rs.scratch().norm_buffer, grad, grad.nelem(), rs.DeviceProp, stream);
+    }
+    deterministic_sum(rs.scratch().norm_buffer.template get<float>(),
+                      rs.scratch().norm_buffer.template get<float>(),
+                      rs.scratch().norm_buffer.nelem(),
+                      stream);
+
+    if (!grads_reduced && comm.world_size() > 1) {
+        comm.reduce_norm(rs.scratch().norm_buffer.template get<float>(), stream);
+    }
+
+    float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T) *
+                         static_cast<float>(std::max(1, rs.GradAccumSteps)) *
+                         static_cast<float>(std::max(1, comm.world_size()));
+    const bool capturing = internal::stream_is_capturing(stream);
+    const int* token_count = mUseTokenScale ? rs.ValidTokenCount.template get<int>() : nullptr;
+    global_norm_sqrt(rs.scratch().norm_buffer.template get<float>(),
+                     capturing ? nullptr : rs.NormHost,
+                     grad_clip,
+                     token_count,
+                     total_tokens,
+                     rs.DeviceProp,
+                     stream);
+    // Async copy grad_scale to pinned host memory for deferred NaN check.
+    if (!capturing) {
+        CUDA_CHECK(cudaMemcpyAsync(rs.GradScaleHost,
+                                   rs.scratch().norm_buffer.template get<float>() + 1,
+                                   sizeof(float),
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
+    }
+    internal::record_event_if_not_capturing(rs.NormDone, stream);
+}
+
+// Checkpoint container accessors — delegate to the active optimizer.
+ITensorContainer& DslModel::weights() {
+    if (lora_enabled()) {
+        return *mLoRAWeights;
+    }
+    return mParams ? static_cast<ITensorContainer&>(*mParams) : mEmpty;
+}
+
+ITensorContainer& DslModel::opt_momentum() {
+    if (lora_enabled()) {
+        return mEmpty;
+    }
+    if (mOptimizer) {
+        if (auto* c = mOptimizer->momentum_container()) {
+            return *c;
+        }
+    }
+    return mEmpty;
+}
+
+ITensorContainer& DslModel::opt_momentum_scales() {
+    return mEmpty;
+}
+
+ITensorContainer& DslModel::opt_variance() {
+    if (lora_enabled()) {
+        return mEmpty;
+    }
+    if (mOptimizer) {
+        if (auto* c = mOptimizer->variance_container()) {
+            return *c;
+        }
+    }
+    return mEmpty;
+}
+
+ITensorContainer& DslModel::opt_variance_scales() {
+    return mEmpty;
 }
 
 }  // namespace dsl

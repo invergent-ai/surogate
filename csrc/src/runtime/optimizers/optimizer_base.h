@@ -17,9 +17,7 @@ namespace optimizers {
 enum class OptimizerType {
     ADAMW,       // full-precision AdamW
     ADAMW_8BIT,  // 8-bit AdamW with softsign/sqrt quantization (FlashOptim-style)
-    MUON,        // Muon optimizer (future)
-    SGD,         // SGD with momentum (future)
-    NORMUON      // NormUon optimizer (future)
+    NORMUON      // Hybrid AdamW-8bit (1D) + NorMuon with Polar Express (2D)
 };
 
 /**
@@ -30,10 +28,6 @@ inline OptimizerType optimizer_type_from_str(std::string_view str) {
         return OptimizerType::ADAMW;
     } else if (str == "adamw_8bit") {
         return OptimizerType::ADAMW_8BIT;
-    } else if (str == "muon") {
-        return OptimizerType::MUON;
-    } else if (str == "sgd") {
-        return OptimizerType::SGD;
     } else if (str == "normuon") {
         return OptimizerType::NORMUON;
     }
@@ -47,8 +41,6 @@ inline std::string_view optimizer_type_to_str(OptimizerType type) {
     switch (type) {
         case OptimizerType::ADAMW: return "adamw";
         case OptimizerType::ADAMW_8BIT: return "adamw_8bit";
-        case OptimizerType::MUON: return "muon";
-        case OptimizerType::SGD: return "sgd";
         case OptimizerType::NORMUON: return "normuon";
     }
     return "unknown";
