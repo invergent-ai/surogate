@@ -17,9 +17,19 @@ void CompiledExecutor::dispatch_embedding(const CompiledOp& op) {
     Tensor& emb = op.inputs.size() > 1 ? resolve_tensor(op.inputs[1]) : mWeights.get("embedding");
     Tensor& out = ensure_output_tensor(op.outputs[0]);
 
+    // Derive dims from the weight tensor so non-main embeddings (e.g.,
+    // Gemma4 pli_embedding with weight [vocab, n_layers * PLI_D]) work
+    // correctly instead of being clamped to mConfig.HiddenSize.
+    int emb_dim = mConfig.HiddenSize;
+    int vocab = mConfig.VocabSize;
+    if (emb.Rank >= 2) {
+        vocab = static_cast<int>(emb.Sizes[0]);
+        emb_dim = static_cast<int>(emb.Sizes[1]);
+    }
+
     encoder_forward(out, token_ids, emb, std::nullopt,
                     static_cast<int>(mB), static_cast<int>(mT),
-                    mConfig.HiddenSize, mConfig.VocabSize, mRunState.MainStream);
+                    emb_dim, vocab, mRunState.MainStream);
 }
 
 void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {

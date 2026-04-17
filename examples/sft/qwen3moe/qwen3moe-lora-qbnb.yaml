@@ -4,8 +4,8 @@ output_dir: ./output_moe
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 
-gpus: 2
-ep_size: 2
+gpus: 1
+ep_size: 1
 ep_load_balance_threshold: 1.0
 
 sample_packing: true

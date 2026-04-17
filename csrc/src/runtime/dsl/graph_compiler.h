@@ -403,6 +403,18 @@ public:
     // Compile a forward or backward graph
     CompiledGraph compile(const Graph& graph, long B, long T);
 
+    // Reset the per-compile-pair namespace. This clears:
+    //   - tensor-id map (so fresh forward+backward get consistent tids)
+    //   - mExtraShapes, mTensorShapes, mTensorDtypes (shape/dtype databases)
+    // These all share the same lifetime: forward and backward are compiled
+    // in sequence and intentionally share this state so:
+    //   - A tensor name gets ONE tid across both graphs (no slot collisions
+    //     when forward TensorRefs leak into backward).
+    //   - Backward can look up forward tensor shapes (e.g., zeros ops with
+    //     shape_like referencing a forward split output).
+    // Call this once before recompiling the forward+backward pair.
+    void reset_tid_namespace();
+
     // Update batch/sequence dimensions for shape resolution
     void update_dimensions(long B, long T);
 

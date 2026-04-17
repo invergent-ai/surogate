@@ -1,8 +1,8 @@
 model: nvidia/Nemotron-Cascade-2-30B-A3B
 output_dir: ./output_nemo
 
-gpus: 4
-ep_size: 4
+gpus: 1
+ep_size: 1
 
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4

@@ -55,7 +55,23 @@ void CompiledExecutor::dispatch_rmsnorm(const CompiledOp& op) {
 void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& x = resolve_tensor(op.inputs[1]);
-    Tensor& weight = resolve_tensor(op.inputs[2]);
+
+    // Weight may be a forward-only "ones" tensor (V-norm uses ones as weight).
+    // If it's not available, recreate it on the fly — it's just a tensor of 1.0s.
+    Tensor weight_local{};
+    Tensor* weight_ptr = nullptr;
+    const std::string& weight_name = op.inputs[2].name;
+    if (weight_name.find("ones") != std::string::npos) {
+        // Allocate and fill with ones on demand
+        const long C_ = static_cast<long>(x.Sizes[x.Rank - 1]);
+        weight_local = mRunState.temp_alloc(x.DType, {C_}, "rmsnorm_bwd_ones");
+        mTemps.push_back(weight_local);
+        fill_constant(weight_local, 1.0f, static_cast<std::size_t>(C_), mRunState.MainStream);
+        weight_ptr = &weight_local;
+    } else {
+        weight_ptr = &resolve_tensor(op.inputs[2]);
+    }
+    Tensor& weight = *weight_ptr;
     Tensor& rstd = resolve_tensor(op.inputs[3]);
 
     Tensor& d_x = ensure_output_tensor(op.outputs[0]);

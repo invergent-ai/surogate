@@ -186,7 +186,9 @@ std::vector<Operation> concat_backward(const BackwardRuleContext& ctx) {
         return ops;
     }
 
-    AttrMap attrs = copy_attrs(fwd.attrs, {"dim"}, "concat");
+    AttrMap attrs = copy_attrs(fwd.attrs, {"dim", "split_size"}, "concat");
+
+    std::vector<std::string> inputs = {ctx.d_output};
     std::vector<std::string> outputs;
     outputs.reserve(fwd.inputs.size());
     for (std::size_t i = 0; i < fwd.inputs.size(); ++i) {
@@ -197,7 +199,7 @@ std::vector<Operation> concat_backward(const BackwardRuleContext& ctx) {
         "concat_backward_" + std::to_string(ctx.op_counter++),
         "split",
         "split",
-        {ctx.d_output},
+        inputs,
         outputs,
         attrs));
 

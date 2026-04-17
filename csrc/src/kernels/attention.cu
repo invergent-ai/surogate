@@ -386,8 +386,11 @@ cudaError_t attention_gpu_backward(floatX* dqkv, const float* stats, float scale
     } else if (Hs == 64) {
         attention_backward_gpu_kernel<64><<<grid_dim, block_dim, smem, stream>>>(
             dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
+    } else if (Hs == 256) {
+        attention_backward_gpu_kernel<256><<<grid_dim, block_dim, smem, stream>>>(
+            dqkv, stats, scale, out, dout, qkv, B, T, Hq, Hkv, window_size);
     } else {
-        printf("Unsupported head dimension");
+        printf("Unsupported head dimension %d\n", Hs);
         return cudaErrorInvalidValue;
     }
     return cudaGetLastError();
@@ -697,6 +700,13 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
         row[j] = __float2bfloat16(-1e30f);  // causal mask: -inf for future positions
     __syncthreads();
 
+    // Block-wide max reduction. Stage 2 is skipped for single-warp blocks
+    // (blockDim.x <= 32) because stage 1 already produced the full answer
+    // in thread 0. Stage 2 used `__shfl_down_sync(0xffffffff, ...)` which
+    // deadlocks when fewer than 32 threads enter the divergent branch
+    // (e.g., T=32 → blockDim.x=32 → num_warps=1 → only thread 0 enters).
+    const int num_warps_local = (blockDim.x + 31) / 32;
+
     // Softmax in FP32 (matches HF's `softmax(scores, dtype=torch.float32)`)
     float mx = -1e30f;
     for (int j = threadIdx.x; j < T; j += blockDim.x)
@@ -704,12 +714,18 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x/32] = mx;
     __syncthreads();
-    if (threadIdx.x < blockDim.x/32) {
-        mx = sdata[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
-        if (threadIdx.x == 0) sdata[0] = mx;
+    if (num_warps_local > 1) {
+        if (threadIdx.x < num_warps_local) {
+            mx = sdata[threadIdx.x];
+            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu
+                                                          : ((1u << num_warps_local) - 1u);
+            for (int o = num_warps_local >> 1; o > 0; o >>= 1)
+                mx = fmaxf(mx, __shfl_down_sync(mask, mx, o));
+            if (threadIdx.x == 0) sdata[0] = mx;
+        }
+        __syncthreads();
     }
-    __syncthreads(); mx = sdata[0];
+    mx = sdata[0];
 
     // Exp + sum
     float se = 0.0f;
@@ -721,12 +737,18 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
     for (int o = 16; o > 0; o >>= 1) se += __shfl_down_sync(0xffffffff, se, o);
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x/32] = se;
     __syncthreads();
-    if (threadIdx.x < blockDim.x/32) {
-        se = sdata[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1) se += __shfl_down_sync(0xffffffff, se, o);
-        if (threadIdx.x == 0) sdata[0] = se;
+    if (num_warps_local > 1) {
+        if (threadIdx.x < num_warps_local) {
+            se = sdata[threadIdx.x];
+            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu
+                                                          : ((1u << num_warps_local) - 1u);
+            for (int o = num_warps_local >> 1; o > 0; o >>= 1)
+                se += __shfl_down_sync(mask, se, o);
+            if (threadIdx.x == 0) sdata[0] = se;
+        }
+        __syncthreads();
     }
-    __syncthreads(); se = sdata[0];
+    se = sdata[0];
 
     // Normalize → BF16 (matches HF's `.to(query.dtype)`)
     float inv = (se > 0.f) ? 1.f/se : 0.f;
@@ -816,19 +838,36 @@ __global__ void causal_softmax_backward_bf16_kernel(
     nv_bfloat16* ds_row = d_scores + (static_cast<long long>(bh) * T + t) * T;
     __shared__ float sdata[32];
 
-    // Compute rowsum(d_P * P) in FP32
+    // Compute rowsum(d_P * P) in FP32. Two-stage reduction:
+    //   (1) each warp reduces via __shfl_down_sync → lane 0 holds warp sum
+    //   (2) one warp reduces the warp sums from sdata → thread 0 holds block sum
+    // NOTE: __shfl_down_sync with mask 0xffffffff requires ALL 32 threads in
+    // the warp to be active. If fewer than 32 threads enter the second stage,
+    // the warp deadlocks. We therefore:
+    //   - Skip stage 2 when blockDim.x <= 32 (single warp — stage 1 already
+    //     has the block sum in thread 0).
+    //   - In stage 2, use a mask reflecting the actual active threads.
     float dot = 0.f;
     for (int j = threadIdx.x; j <= t; j += blockDim.x)
         dot += __bfloat162float(dp_row[j]) * __bfloat162float(p_row[j]);
     for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffff, dot, o);
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = dot;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / 32) {
-        dot = sdata[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffff, dot, o);
-        if (threadIdx.x == 0) sdata[0] = dot;
+    const int num_warps = (blockDim.x + 31) / 32;
+    if (num_warps > 1) {
+        if (threadIdx.x < num_warps) {
+            dot = sdata[threadIdx.x];
+            const unsigned active_mask = (num_warps == 32) ? 0xffffffffu
+                                                           : ((1u << num_warps) - 1u);
+            for (int o = num_warps >> 1; o > 0; o >>= 1)
+                dot += __shfl_down_sync(active_mask, dot, o);
+            if (threadIdx.x == 0) sdata[0] = dot;
+        }
+        __syncthreads();
     }
-    __syncthreads();
+    // Single warp: sdata[0] already holds the full block sum (written by
+    // thread 0 in stage 1). Multi-warp: thread 0 above just wrote it. Either
+    // way, every thread can now load the block sum from sdata[0].
     dot = sdata[0];
 
     // d_S = P * (d_P - dot) * scale; zero for future positions (causal)

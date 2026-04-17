@@ -730,14 +730,23 @@ class GraphBuilder:
         self,
         *tensors: str | GraphRef,
         dim: int = 0,
+        split_size: list[int] | None = None,
     ) -> GraphRef:
-        """Concatenate tensors along dimension."""
+        """Concatenate tensors along dimension.
+
+        Args:
+            split_size: Optional partition sizes for backward (split).
+                        Required for hybrid models where per-layer dims differ.
+        """
         out = self._fresh_name("concat")
+        attrs: dict = {"dim": dim}
+        if split_size is not None:
+            attrs["split_size"] = split_size
         self._add_node(GraphNode(
             op="concat",
             inputs=[self._resolve_input(t) for t in tensors],
             outputs=[out],
-            attrs={"dim": dim},
+            attrs=attrs,
         ))
         return self._make_output(out)
 

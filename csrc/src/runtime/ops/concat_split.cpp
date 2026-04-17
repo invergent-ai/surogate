@@ -319,7 +319,18 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
 
         Tensor& out_ref = ensure_output_tensor(op.outputs[i]);
         Tensor out = out_ref;
-        if (out.DType != in.DType || !shape_equal(out, out_shape)) {
+        // Check if multiple outputs share the same slot/tensor_id (happens when
+        // they're both mapped to the generic slot). If so, always alloc a temp
+        // to prevent overlapping writes.
+        bool shared_slot = false;
+        for (std::size_t j = 0; j < op.outputs.size(); ++j) {
+            if (j != i && op.outputs[j].tensor_id == op.outputs[i].tensor_id &&
+                op.outputs[j].tensor_id >= 0) {
+                shared_slot = true;
+                break;
+            }
+        }
+        if (shared_slot || !out.Data || out.DType != in.DType || !shape_equal(out, out_shape)) {
             out = mRunState.temp_alloc(in.DType, out_shape, "split_output");
             mTemps.push_back(out);
         }

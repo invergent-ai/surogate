@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -648,18 +649,26 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
         if (parse_block_param(base, layer_idx, field)) {
             ref.layer_idx = layer_idx;
 
+            // For hybrid models (per-layer dims differ), resolve symbolic slot
+            // shapes against the LAYER env, not the global env, so gradient
+            // slot shapes match the forward activation shapes at this layer.
+            const ShapeEnv layer_env = (layer_idx >= 0 && mHasHybridBlocks)
+                ? make_layer_env(layer_idx)
+                : mShapeEnv;
+
+            const std::string base_field = strip_ssa_suffix(field);
+
             // Look up gradient slot using "d_<field>" name (e.g., "d_ln1", "d_qkv")
-            const std::string grad_name = "d_" + strip_ssa_suffix(field);
+            const std::string grad_name = "d_" + base_field;
             if (auto slot_entry = mSlotRegistry.lookup(grad_name)) {
                 ref.slot = slot_entry->slot;
                 if (!slot_entry->shape.empty()) {
-                    ref.shape = resolve_shape(slot_entry->shape, mShapeEnv);
+                    ref.shape = resolve_shape(slot_entry->shape, layer_env);
                 }
             } else {
-                const std::string act_name = strip_ssa_suffix(field);
-                if (auto act_entry = mSlotRegistry.lookup(act_name)) {
+                if (auto act_entry = mSlotRegistry.lookup(base_field)) {
                     if (!act_entry->shape.empty()) {
-                        ref.shape = resolve_shape(act_entry->shape, mShapeEnv);
+                        ref.shape = resolve_shape(act_entry->shape, layer_env);
                     }
                 }
                 ref.slot = TensorSlot::Mapped;
@@ -677,11 +686,50 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
                 }
             }
 
+            // For hybrid models, apply per-layer dim overrides to match the
+            // forward activation shapes (parallels lines 577-603 for activations).
+            // Without this, gradient slots for hybrid-dim fields end up sized
+            // with global/default dims — downstream view_backward will claim
+            // more elements than the underlying allocation holds.
+            if (layer_idx >= 0 &&
+                static_cast<std::size_t>(layer_idx) < mPerLayerDims.size() &&
+                !ref.shape.empty()) {
+                const auto& pld = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
+                const long B = mB;
+                const long T = mT;
+                if (base_field == "qkv" || base_field == "qkv_rope") {
+                    ref.shape = {B, T, pld.qkv_channels};
+                } else if (base_field == "qkv_flat" || base_field == "qkv_biased") {
+                    ref.shape = {B * T, pld.qkv_channels};
+                } else if (base_field == "att") {
+                    ref.shape = {B, T, pld.attn_dim};
+                } else if (base_field == "att_flat") {
+                    ref.shape = {B * T, pld.attn_dim};
+                } else if (base_field == "mlp_up") {
+                    ref.shape = {B, T, pld.mlp_up};
+                } else if (base_field == "mlp_up_flat") {
+                    ref.shape = {B * T, pld.mlp_up};
+                } else if (base_field == "swiglu") {
+                    ref.shape = {B, T, pld.intermediate};
+                } else if (base_field == "swiglu_flat") {
+                    ref.shape = {B * T, pld.intermediate};
+                }
+            }
+
             if (ref.shape.empty()) {
-                const std::string base = name.substr(2);
                 auto it = mExtraShapes.find(base);
                 if (it != mExtraShapes.end()) {
                     ref.shape = it->second;
+                } else {
+                    // Fall back to forward tensor shapes inferred during forward
+                    // compile. Requires reset_tid_namespace() to have preserved
+                    // mTensorShapes across the forward+backward pair. This lets
+                    // gradient refs like d_blocks[N].v_normed_2d (RMSNorm
+                    // output) inherit their forward activation's shape.
+                    auto it2 = mTensorShapes.find(base);
+                    if (it2 != mTensorShapes.end() && !it2->second.dims.empty()) {
+                        ref.shape = it2->second.dims;
+                    }
                 }
             }
             ref.tensor_id = assign_tensor_id(ref.name);
@@ -715,6 +763,36 @@ TensorRef GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_out
             ref.shape = std::move(resolved);
         } else {
             auto it = mExtraShapes.find(ref.name);
+            if (it != mExtraShapes.end()) {
+                ref.shape = it->second;
+            }
+        }
+    }
+    // For global gradient names (d_<X>) whose forward counterpart <X> has a
+    // known shape, inherit it. Handles non-block-prefixed gradients like
+    // d_scale_4, d_pli_proj_scaled, and autodiff-accumulated names like
+    // d_scale_8_from_1468 (strip "_from_N"/"_accum_N" to get base name).
+    // Without this they fall through to the {B,T,C} default.
+    if (ref.shape.empty() && starts_with(ref.name, "d_")) {
+        std::string fwd_name = ref.name.substr(2);
+        // Strip autodiff accumulation suffixes.
+        for (const char* pat : {"_from_", "_accum_"}) {
+            auto pos = fwd_name.find(pat);
+            if (pos == std::string::npos) continue;
+            std::size_t after_pos = pos + std::strlen(pat);
+            bool all_digits = after_pos < fwd_name.size();
+            for (std::size_t i = after_pos; i < fwd_name.size(); ++i) {
+                if (!std::isdigit(static_cast<unsigned char>(fwd_name[i]))) {
+                    all_digits = false; break;
+                }
+            }
+            if (all_digits) { fwd_name = fwd_name.substr(0, pos); break; }
+        }
+        std::vector<long> resolved;
+        if (resolve_tensor_shape(fwd_name, resolved)) {
+            ref.shape = std::move(resolved);
+        } else {
+            auto it = mExtraShapes.find(fwd_name);
             if (it != mExtraShapes.end()) {
                 ref.shape = it->second;
             }
@@ -1684,6 +1762,27 @@ void GraphCompiler::infer_output_shapes(
             break;
         }
 
+        case CompiledOpType::Narrow: {
+            // Output = input shape with narrow_dim replaced by length.
+            if (input_shapes.empty() || input_shapes[0].empty()) break;
+            const auto& in_shape = input_shapes[0];
+            const int rank = static_cast<int>(in_shape.size());
+            int dim = 0;
+            long length = 0;
+            if (auto* dim_attr = find_attr(op.attrs, "dim")) {
+                if (auto v = attr_int(*dim_attr)) dim = static_cast<int>(*v);
+            }
+            if (auto* len_attr = find_attr(op.attrs, "length")) {
+                if (auto v = attr_int(*len_attr)) length = *v;
+            }
+            if (dim < 0) dim += rank;
+            if (dim < 0 || dim >= rank || length <= 0) break;
+            auto out_shape = in_shape;
+            out_shape[dim] = length;
+            output_shapes.push_back(std::move(out_shape));
+            break;
+        }
+
         case CompiledOpType::SwiGLU: {
             // Output last dim = input last dim / 2
             if (!input_shapes.empty() && !input_shapes[0].empty()) {
@@ -1794,6 +1893,20 @@ void GraphCompiler::infer_output_shapes(
                 if (!rstd_shape.empty()) {
                     rstd_shape.pop_back();
                 }
+                output_shapes.push_back(rstd_shape);
+            }
+            break;
+        }
+
+        case CompiledOpType::RMSNorm:
+        case CompiledOpType::LayerNorm: {
+            // Outputs: y [same as input x], rstd [input rows] (last dim dropped)
+            // Used for standalone (non-fused) norm ops — e.g., Gemma4 per-head
+            // Q/K/V norms with 2D [B*T*H, D] or 3D [B,T,C] input.
+            if (!input_shapes.empty() && !input_shapes[0].empty()) {
+                output_shapes.push_back(input_shapes[0]);  // y same as input[0]
+                auto rstd_shape = input_shapes[0];
+                rstd_shape.pop_back();
                 output_shapes.push_back(rstd_shape);
             }
             break;
@@ -2369,14 +2482,26 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
     }
 }
 
-CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
-    update_dimensions(B, T);
-
+void GraphCompiler::reset_tid_namespace() {
+    mTensorIdMap.clear();
+    mNextTensorId = 0;
+    // Also clear the shape/dtype databases here. They share the same scope as
+    // the tid namespace: forward and backward compiles in one pair share them
+    // so backward can look up forward tensor shapes (e.g., zeros op with
+    // shape_like referencing a forward split output).
     mExtraShapes.clear();
     mTensorShapes.clear();
     mTensorDtypes.clear();
-    mTensorIdMap.clear();
-    mNextTensorId = 0;
+}
+
+CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
+    update_dimensions(B, T);
+
+    // Note: mTensorIdMap, mNextTensorId, mExtraShapes, mTensorShapes, and
+    // mTensorDtypes are NOT cleared here — they persist across the
+    // forward+backward pair so backward can reference forward tensor
+    // shapes/dtypes. Caller (GraphExecutor::compile_graphs) calls
+    // reset_tid_namespace() once before the pair when starting fresh.
 
     // Initialize shape database from graph inputs and params
     for (const auto& [name, info] : graph.inputs) {
@@ -2795,6 +2920,59 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         ref.dtype = base_dtype;
                         ref.shape = {Mdim, Ndim > 0 ? Ndim : (2 * Ddim)};
                     }
+                } else if (compiled.type == CompiledOpType::RMSNorm ||
+                           compiled.type == CompiledOpType::LayerNorm) {
+                    // Standalone norm ops: output[0] = y (same as input x),
+                    // output[1] = rstd (FP32, input rows).
+                    // This covers Gemma4 per-head Q/K/V norms over 2D inputs
+                    // like [B*T*H, D] that would otherwise fall through to the
+                    // {B,T,C} default and break backward view/shape propagation.
+                    if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty()) {
+                        if (i == 0) {
+                            if (ref.shape.empty()) ref.shape = compiled.inputs[0].shape;
+                            ref.dtype = compiled.inputs[0].dtype;
+                        } else if (i == 1) {
+                            // rstd: input shape minus last dim, FP32
+                            if (ref.shape.empty()) {
+                                auto rstd_shape = compiled.inputs[0].shape;
+                                rstd_shape.pop_back();
+                                ref.shape = std::move(rstd_shape);
+                            }
+                            ref.dtype = ETensorDType::FP32;
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::RMSNormBackward ||
+                           compiled.type == CompiledOpType::LayerNormBackward) {
+                    // Backward inputs: [0] d_out, [1] saved x, [2] weight, [3] saved rstd
+                    // Outputs: [0] d_x (shape of x), [1] d_weight (shape of weight)
+                    if (i == 0 && compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                        // d_x has same shape/dtype as saved x (input[1])
+                        if (ref.shape.empty()) ref.shape = compiled.inputs[1].shape;
+                        ref.dtype = compiled.inputs[1].dtype;
+                    } else if (i == 1 && compiled.inputs.size() > 2 && !compiled.inputs[2].shape.empty()) {
+                        // d_weight has same shape/dtype as weight (input[2])
+                        if (ref.shape.empty()) ref.shape = compiled.inputs[2].shape;
+                        ref.dtype = compiled.inputs[2].dtype;
+                    }
+                } else if (compiled.type == CompiledOpType::Narrow) {
+                    // output = input shape with narrow dim replaced by length.
+                    // Reuses `split_concat_dim` (common "dim" attr, same as dispatch_narrow).
+                    if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty() &&
+                        ref.shape.empty()) {
+                        const auto& in_shape = compiled.inputs[0].shape;
+                        const int rank = static_cast<int>(in_shape.size());
+                        int dim = compiled.attrs.split_concat_dim;
+                        if (dim < 0) dim += rank;
+                        const long length = compiled.attrs.narrow_length;
+                        if (dim >= 0 && dim < rank && length > 0) {
+                            auto out_shape = in_shape;
+                            out_shape[dim] = length;
+                            ref.shape = std::move(out_shape);
+                        }
+                    }
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                    }
                 } else if (compiled.type == CompiledOpType::Zeros ||
                            compiled.type == CompiledOpType::Ones) {
                     // Preserve explicit output dtype/shape from graph.
@@ -2802,6 +2980,34 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                     if (auto* dtype_attr = find_attr(op.attrs, "dtype")) {
                         if (auto dtype_str = attr_string(*dtype_attr)) {
                             ref.dtype = dtype_from_str(*dtype_str);
+                        }
+                    }
+                    if (ref.shape.empty()) {
+                        // Try to resolve shape_like at compile time. The
+                        // split_backward autodiff rule emits zeros ops whose
+                        // shape should match a forward split output; without
+                        // resolving this here we'd fall back to {B,T,C},
+                        // producing concats with wrong gradient shapes.
+                        // Requires reset_tid_namespace() to have preserved
+                        // forward's mExtraShapes/mTensorShapes for backward.
+                        if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
+                            if (auto ref_name_opt = attr_string(*shape_like_attr)) {
+                                std::string ref_name = *ref_name_opt;
+                                if (starts_with(ref_name, kSavedPrefix)) {
+                                    ref_name = ref_name.substr(kSavedPrefix.size());
+                                }
+                                std::vector<long> resolved;
+                                if (auto it = mExtraShapes.find(ref_name); it != mExtraShapes.end()) {
+                                    resolved = it->second;
+                                } else if (auto it2 = mTensorShapes.find(ref_name); it2 != mTensorShapes.end()) {
+                                    resolved = it2->second.dims;
+                                } else {
+                                    infer_known_tensor_shape(ref_name, mConfig, B, T, resolved);
+                                }
+                                if (!resolved.empty()) {
+                                    ref.shape = resolved;
+                                }
+                            }
                         }
                     }
                     if (ref.shape.empty()) {
@@ -3123,9 +3329,12 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 } else if (compiled.type == CompiledOpType::Silu ||
                            compiled.type == CompiledOpType::Relu2 ||
                            compiled.type == CompiledOpType::Mul ||
+                           compiled.type == CompiledOpType::Scale ||
+                           compiled.type == CompiledOpType::Gelu ||
                            compiled.type == CompiledOpType::SiluBackward ||
                            compiled.type == CompiledOpType::Relu2Backward ||
-                           compiled.type == CompiledOpType::MulBackward) {
+                           compiled.type == CompiledOpType::MulBackward ||
+                           compiled.type == CompiledOpType::GeluBackward) {
                     // Element-wise ops (and their backward) preserve input shape and dtype
                     if (!compiled.inputs.empty()) {
                         ref.dtype = compiled.inputs[0].dtype;
@@ -3220,9 +3429,33 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 } else {
                     // Default for activation tensors — this is a best-effort guess
                     // that is often wrong for Mamba/custom ops; do NOT persist.
+                    // Only apply the fallback if resolve_tensor_ref didn't already
+                    // produce a shape. Overwriting a resolved shape breaks
+                    // gradient slots whose per-layer/per-field dims differ from
+                    // the hidden-size default (e.g., d_blocks[N].self_attn_q_rn_flat
+                    // in hybrid models resolves to [B*T*Hq, Hs], not [B,T,C]).
                     ref.dtype = ETensorDType::BF16;
-                    ref.shape = {B, T, C};
-                    shape_is_default_fallback = true;
+                    if (ref.shape.empty()) {
+                        ref.shape = {B, T, C};
+                        shape_is_default_fallback = true;
+                        static std::once_flag warned_once;
+                        std::call_once(warned_once, []() {
+                            fprintf(stderr,
+                                "[graph_compiler] warning: using {B,T,C} fallback for unknown "
+                                "Mapped-slot output shape; set SUROGATE_DEBUG_SHAPE_FALLBACK=1 "
+                                "to see each occurrence.\n");
+                            fflush(stderr);
+                        });
+                        if (const char* dbg = std::getenv("SUROGATE_DEBUG_SHAPE_FALLBACK");
+                            dbg && std::string(dbg) == "1") {
+                            fprintf(stderr,
+                                "[graph_compiler] shape fallback {B=%ld,T=%ld,C=%ld} applied to "
+                                "op=%s type=%d output[%zu]=%s (resolve_tensor_ref gave empty shape)\n",
+                                B, T, C, op.id.c_str(),
+                                static_cast<int>(compiled.type), i, op.outputs[i].c_str());
+                            fflush(stderr);
+                        }
+                    }
                 }
             }
 
@@ -3234,12 +3467,24 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
             }
 
             // Ensure embedding output writes into the persistent encoded buffer.
+            // Only the MAIN embedding (whose output is the "encoded"/"x0" slot)
+            // goes to the Encoded buffer. Other embeddings (e.g., Gemma4's
+            // pli_embedding with weight [vocab, n_layers * PLI_D]) have a
+            // different output dim and must not be coerced to [B,T,HiddenSize]
+            // or the Encoded slot; derive their dim from the weight tensor.
             if (compiled.type == CompiledOpType::Embedding && i == 0) {
                 const long Bdim = mB;
                 const long Tdim = mT;
-                const long Cdim = mConfig.HiddenSize;
-                ref.slot = TensorSlot::Encoded;
-                ref.shape = {Bdim, Tdim, Cdim};
+                long emb_dim = mConfig.HiddenSize;
+                if (compiled.inputs.size() > 1 &&
+                    compiled.inputs[1].shape.size() >= 2) {
+                    emb_dim = compiled.inputs[1].shape.back();
+                }
+                const bool is_main_embedding = (emb_dim == mConfig.HiddenSize);
+                if (is_main_embedding) {
+                    ref.slot = TensorSlot::Encoded;
+                }
+                ref.shape = {Bdim, Tdim, emb_dim};
             }
 
             // If an explicit gradient dtype override is configured, apply it to parameter gradients.

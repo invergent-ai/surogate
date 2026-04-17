@@ -1,11 +1,11 @@
 model: google/gemma-4-E2B-it
 output_dir: ./output
  
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 4
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
 
 sample_packing: true
-sequence_len: 256
+sequence_len: 2048
 
 max_steps: 5
 eval_steps: 0
@@ -17,7 +17,7 @@ recipe: bf16
 debug_memory_breakdown: false
 use_cuda_graphs: false
 
-lora: false
+lora: true
 lora_rank: 16
 lora_alpha: 32
 lora_target_modules:

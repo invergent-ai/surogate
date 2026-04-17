@@ -51,6 +51,18 @@ def _sandwich_mlp_phase(block, residual):
 
 def _per_layer_input_phase(block, residual, per_layer_input):
     """Per-layer input gating: gate → gelu → mul(pli) → project → norm → residual."""
+    # Register activation slots for PLI intermediates so backward replay can
+    # allocate output buffers when recomputing the forward pass.
+    pli_d = block.PLI_D
+    block._register_activation(
+        "pli_gate_out", ("B * T", pli_d), share_policy="always_recompute")
+    block._register_activation(
+        "pli_gate_act", ("B * T", pli_d), share_policy="always_recompute")
+    block._register_activation(
+        "pli_gated", ("B * T", pli_d), share_policy="always_recompute")
+    block._register_activation(
+        "pli_proj_out", ("B * T", "C"), share_policy="always_recompute")
+
     h_flat = block._view(residual, [B * T, block.C], name="pli_h_flat")
     gate_out = block._matmul(h_flat, "pli_gate_weight", name="pli_gate_out")
     gate_act = block._gelu(gate_out, name="pli_gate_act")

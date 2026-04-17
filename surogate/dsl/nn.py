@@ -1592,6 +1592,8 @@ class Gemma4Attention(Module):
         )
 
         ones_d = g.ones(shape=[self.head_size], dtype="bf16")
+        # Save ones for backward (used as V-norm weight; rmsnorm_backward needs it).
+        g.save(ones_d)
 
         if self.k_eq_v:
             # --- k_eq_v mode: Q+K projection only, V = raw K ---
@@ -1629,8 +1631,12 @@ class Gemma4Attention(Module):
             v_normed = g.view(v_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size],
                               out_name=tracer.prefixed("v_normed"))
 
-            qk_normed = g.concat(q_normed, k_normed, dim=2)
-            qkv_normed = g.concat(qk_normed, v_normed, dim=2)
+            qk_normed = g.concat(q_normed, k_normed, dim=2,
+                                 split_size=[self.num_query_heads,
+                                             self.num_kv_heads])
+            qkv_normed = g.concat(qk_normed, v_normed, dim=2,
+                                  split_size=[self.num_query_heads + self.num_kv_heads,
+                                              self.num_kv_heads])
 
         else:
             # --- Standard mode: Q+K+V projection ---
@@ -1668,7 +1674,10 @@ class Gemma4Attention(Module):
                 v_normed_2d, shape=[B, T, self.num_kv_heads * self.head_size],
                 out_name=tracer.prefixed("v_normed"),
             )
-            qkv_normed_3d = g.concat(qk_flat_3d, v_normed, dim=2)
+            qk_dim = (self.num_query_heads + self.num_kv_heads) * self.head_size
+            v_dim = self.num_kv_heads * self.head_size
+            qkv_normed_3d = g.concat(qk_flat_3d, v_normed, dim=2,
+                                     split_size=[qk_dim, v_dim])
             qkv_normed = g.view(
                 qkv_normed_3d,
                 shape=[B, T, self.num_query_heads + 2 * self.num_kv_heads, self.head_size],
@@ -1842,7 +1851,9 @@ class Gemma4SharedKVAttention(Module):
                          out_name=tracer.prefixed("q_roped"))
 
         # Reassemble with source K,V for packed flash attention
-        qkv_final = g.concat(q_roped, kv_part, dim=2)
+        qkv_final = g.concat(q_roped, kv_part, dim=2,
+                             split_size=[self.num_query_heads,
+                                         2 * self.num_kv_heads])
 
         attn_out, lse = g.flash_attention(
             qkv_final, causal=True,

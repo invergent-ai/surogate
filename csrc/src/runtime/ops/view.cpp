@@ -118,6 +118,37 @@ void CompiledExecutor::dispatch_view_backward(const CompiledOp& op) {
                                 " output=" + op.outputs[0].name +
                                 " shape_like=" + op.attrs.shape_like);
     }
+    // Sanity check: view_tensor silently reshapes without verifying nelem.
+    // If an upstream op produces d_out with the wrong size (e.g. a backward
+    // slot pre-sized with mismatched per-layer dims in hybrid models), the
+    // view would claim more elements than its allocation holds and downstream
+    // ops (split, memcpy) would read past the buffer end. Fail here instead
+    // of corrupting memory downstream.
+    {
+        std::size_t shape_nelem = 1;
+        for (long d : shape) shape_nelem *= static_cast<std::size_t>(d);
+        if (shape_nelem != d_out.nelem()) {
+            std::string sh = "[";
+            for (std::size_t i = 0; i < shape.size(); ++i) { if (i) sh += ","; sh += std::to_string(shape[i]); }
+            sh += "]";
+            std::string ins = "[";
+            for (int i = 0; i < d_out.Rank; ++i) { if (i) ins += ","; ins += std::to_string(d_out.Sizes[i]); }
+            ins += "]";
+            throw std::runtime_error(
+                "view_backward: shape nelem mismatch (upstream grad slot sized wrong?)"
+                " op=" + op.op_id +
+                " input=" + op.inputs[0].name +
+                " input_tid=" + std::to_string(op.inputs[0].tensor_id) +
+                " in_shape=" + ins +
+                " in_nelem=" + std::to_string(d_out.nelem()) +
+                " in_Data=" + std::to_string(reinterpret_cast<uintptr_t>(d_out.Data)) +
+                " output=" + op.outputs[0].name +
+                " output_tid=" + std::to_string(op.outputs[0].tensor_id) +
+                " target_shape=" + sh +
+                " target_nelem=" + std::to_string(shape_nelem));
+        }
+    }
+
     Tensor view = view_tensor(d_out, shape);
     store_tensor(op.outputs[0], view);
 }

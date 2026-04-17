@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -120,7 +121,17 @@ inline Tensor ensure_output_tensor_or_persistent(const Tensor& candidate,
                                                  ETensorDType dtype,
                                                  const std::vector<long>& shape,
                                                  const char* op_name) {
-    if (candidate.Data &&
+    // Backward ops: never reuse candidate.Data. Activation slots can carry
+    // stale pointers from earlier ops (view metadata sharing, freed temps),
+    // which propagate through view_backward → concat_backward → split and
+    // segfault inside cudaMemcpy2DAsync. Always route backward outputs to
+    // persistent buffers so they have stable lifetimes across the op chain.
+    const bool is_backward = op_name != nullptr &&
+        (std::strstr(op_name, "_backward") != nullptr ||
+         std::strstr(op_name, "_grad") != nullptr);
+
+    if (!is_backward &&
+        candidate.Data &&
         candidate.DType == dtype &&
         static_cast<std::size_t>(candidate.nelem()) == tensor_shape_nelem(shape)) {
         return make_raw_tensor(candidate.Data, dtype, shape, candidate.Device);

@@ -854,6 +854,7 @@ def _inline_stacked_blocks(
 
     new_nodes: List[OpIR] = []
     new_params: Dict[str, TensorRef] = dict(graph.params)
+    new_save: List[str] = []
     op_id = 0
 
     for node in graph.nodes:
@@ -1024,6 +1025,10 @@ def _inline_stacked_blocks(
                         attrs={},  # shape resolved at runtime from element count
                     ))
                     mapping[pli_block_name] = pli_slice_name
+                    # Save PLI narrow+view outputs for backward replay (stack-allocated,
+                    # freed after forward layer boundary).
+                    new_save.append(narrow_out)
+                    new_save.append(pli_slice_name)
 
                 # KV sharing: wire kv_source to the source layer's qkv_rope
                 if layer_idx in kv_sharing_map and "kv_source" in block_inputs:
@@ -1043,6 +1048,10 @@ def _inline_stacked_blocks(
                         outputs=mapped_outputs,
                         attrs=dict(bnode.attrs),
                     ))
+
+                # Merge block's save_list into model's save_list with layer prefix
+                for save_name in getattr(block_graph, 'save_list', []) or []:
+                    new_save.append(mapping.get(save_name, f"{prefix}{save_name}"))
 
                 # Next layer inputs (x, residual from outputs; keep position_ids)
                 cur_inputs = list(layer_outputs[:2])  # First 2 outputs are typically (out, residual)
@@ -1144,6 +1153,8 @@ def _inline_stacked_blocks(
     graph.nodes = new_nodes
     graph.params = new_params
     graph.intermediates = new_intermediates
+    if new_save:
+        graph.save_list = list(graph.save_list) + new_save
     return graph
 
 

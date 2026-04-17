@@ -727,6 +727,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
 
     // Recompile if batch/sequence dimensions changed
     if (B != mCompiledB || T != mCompiledT) {
+        // Reset the tensor-id namespace so the forward+backward pair shares
+        // a single tid space. Each compile() inherits the prior compile's
+        // tid map, so a tensor name has the same tid in both graphs.
+        // This prevents runtime slot collisions in mTensors when a forward
+        // TensorRef leaks into backward execution.
+        mCompiler->reset_tid_namespace();
         if (mForward) {
             mCompiledForward = std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T));
             mCompiledForward->compute_layer_segments();
