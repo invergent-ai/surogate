@@ -92,7 +92,6 @@ from __future__ import annotations
 
 import os
 import time
-import traceback
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -103,7 +102,9 @@ from surogate.utils.logger import get_logger
 
 from ._shared import (
     DebugResolveError,
+    allocate_token_buffers,
     build_optimizer_config,
+    capture_exception,
     configure_for_single_step,
     make_dumps_root,
     parallel_stat,
@@ -210,10 +211,7 @@ def _run_with_dumps_root(
         logger.error(f"failed to construct trainer: {type(e).__name__}: {e}")
         return 1
 
-    total_rows = config.gpus * config.per_device_train_batch_size
-    in_tokens = np.empty((total_rows, config.sequence_len), dtype=np.int32)
-    out_tokens = np.empty((total_rows, config.sequence_len), dtype=np.int32)
-    pos_ids = np.empty((total_rows, config.sequence_len), dtype=np.int32)
+    in_tokens, out_tokens, pos_ids = allocate_token_buffers(config)
     wrapper.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
     grad_fn = wrapper.trainer.get_lora_gradients if config.lora else wrapper.trainer.get_gradients
@@ -257,7 +255,7 @@ def _run_with_dumps_root(
             step_dir.mkdir(parents=True, exist_ok=True)
             os.environ["SUROGATE_DEBUG_DUMP_DIR"] = str(step_dir)
 
-            ok, err = _capture("trainer.step", lambda: wrapper.trainer.step(in_tokens, out_tokens, pos_ids))
+            ok, err = capture_exception(lambda: wrapper.trainer.step(in_tokens, out_tokens, pos_ids))
             if not ok:
                 trainer_error = err
                 logger.warning(f"step {step} raised in trainer.step; emitting partial: {err.splitlines()[0]}")
@@ -269,8 +267,7 @@ def _run_with_dumps_root(
                 w, step_dir, dump_files, n_layers, block_grad_slots, step, first_failure
             )
 
-            ok, err = _capture(
-                "optimizer_update",
+            ok, err = capture_exception(
                 lambda: wrapper.trainer.update_with_config(
                     build_optimizer_config(config, _lr_for_step(wrapper, config, step)), step + 1
                 ),
@@ -282,7 +279,7 @@ def _run_with_dumps_root(
 
             rmtree_quiet(step_dir)
 
-            ok, err = _capture("advance_batch", lambda: _advance_batch(wrapper, in_tokens, out_tokens, pos_ids))
+            ok, err = capture_exception(lambda: _advance_batch(wrapper, in_tokens, out_tokens, pos_ids))
             if not ok:
                 trainer_error = err
                 logger.warning(f"step {step} raised in advance_batch; ending: {err.splitlines()[0]}")
@@ -372,14 +369,6 @@ def _emit_run_and_model(
             for s in global_grad_slots
         ],
     )
-
-
-def _capture(_stage: str, fn: Any) -> tuple[bool, str]:
-    try:
-        fn()
-        return True, ""
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
 def _lr_for_step(wrapper: Any, config: Any, step: int) -> float:

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tempfile
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,14 +112,22 @@ class DumpResult:
     error: str | None = None
 
 
-def load_and_stat(dump_dir: Path, tensor_name: str, dump_files: set[str]) -> DumpResult:
-    """Load one ``<name>.bin`` + ``<name>.json`` pair and compute stats."""
+def load_dump_tensor(
+    dump_dir: Path, tensor_name: str, dump_files: set[str]
+) -> tuple[np.ndarray | None, dict | None, DumpStatus, str | None]:
+    """Load ``<name>.bin`` + ``<name>.json`` sidecar. Returns ``(array, meta,
+    status, error)``. ``array`` is flat fp32; caller reshapes via ``meta.shape``.
+
+    This is the primitive tensor-loader shared by ``load_and_stat`` (which
+    also computes stats) and the ``diff`` subcommand (which needs the raw
+    tensor for element-wise compare against an HF reference).
+    """
     safe = sanitize_dump_name(tensor_name)
     bin_name = f"{safe}.bin"
     json_name = f"{safe}.json"
 
     if bin_name not in dump_files:
-        return DumpResult(status=DumpStatus.MISSING)
+        return None, None, DumpStatus.MISSING, None
 
     meta: dict[str, Any] | None = None
     if json_name in dump_files:
@@ -131,15 +140,22 @@ def load_and_stat(dump_dir: Path, tensor_name: str, dump_files: set[str]) -> Dum
     try:
         data = np.fromfile(dump_dir / bin_name, dtype=np.float32)
     except Exception as e:
-        return DumpResult(
-            status=DumpStatus.READ_FAILED,
-            meta=meta,
-            error=f"{type(e).__name__}: {e}",
-        )
+        return None, meta, DumpStatus.READ_FAILED, f"{type(e).__name__}: {e}"
 
     if data.size == 0:
-        return DumpResult(status=DumpStatus.EMPTY, stats={"size": 0}, meta=meta)
+        return data, meta, DumpStatus.EMPTY, None
 
+    return data, meta, DumpStatus.LOADED, None
+
+
+def load_and_stat(dump_dir: Path, tensor_name: str, dump_files: set[str]) -> DumpResult:
+    """Load one ``<name>.bin`` + ``<name>.json`` pair and compute stats."""
+    data, meta, status, error = load_dump_tensor(dump_dir, tensor_name, dump_files)
+    if status in (DumpStatus.MISSING, DumpStatus.READ_FAILED):
+        return DumpResult(status=status, meta=meta, error=error)
+    if status == DumpStatus.EMPTY:
+        return DumpResult(status=status, stats={"size": 0}, meta=meta)
+    assert data is not None
     return DumpResult(status=DumpStatus.LOADED, stats=compute_stats_numpy(data), meta=meta)
 
 
@@ -180,6 +196,45 @@ def configure_for_single_step(config: Any, steps: int = 1) -> None:
         config.auto_lr_reduction = False
     if hasattr(config, "distributed"):
         config.distributed = None
+
+
+def disable_cuda_graphs(config: Any) -> None:
+    """Disable CUDA-graph capture on both the config and its runtime_config mirror.
+
+    The dump hook's ``cudaStreamSynchronize`` collides with stream capture
+    (``cudaErrorStreamCaptureUnsupported``). One-step debug runs are fine eager.
+    """
+    if hasattr(config, "use_cuda_graphs"):
+        config.use_cuda_graphs = False
+    rt = getattr(config, "runtime_config", None)
+    if rt is not None and hasattr(rt, "use_cuda_graphs"):
+        rt.use_cuda_graphs = False
+
+
+def allocate_token_buffers(config: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Allocate ``(in_tokens, out_tokens, pos_ids)`` in the shape the trainer
+    expects — ``(gpus * per_device_batch_size, sequence_len)`` int32.
+
+    ``pos_ids`` is pre-filled with ``arange(seq_len)`` per row; ``in_tokens``
+    and ``out_tokens`` are left as zeros for the caller to populate.
+    """
+    total_rows = int(config.gpus) * int(config.per_device_train_batch_size)
+    seq_len = int(config.sequence_len)
+    in_tokens = np.zeros((total_rows, seq_len), dtype=np.int32)
+    out_tokens = np.zeros((total_rows, seq_len), dtype=np.int32)
+    pos_ids = np.tile(np.arange(seq_len, dtype=np.int32), (total_rows, 1))
+    return in_tokens, out_tokens, pos_ids
+
+
+def capture_exception(fn: Callable[[], Any]) -> tuple[bool, str]:
+    """Call ``fn()`` and return ``(True, "")`` on success, ``(False, formatted_traceback)``
+    on any exception. Used by debug subcommands to uniformly capture per-stage failures
+    without losing the traceback."""
+    try:
+        fn()
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
 def tokenize_and_get_train_files(config: Any) -> list[str]:

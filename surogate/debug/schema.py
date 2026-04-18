@@ -43,6 +43,7 @@ class Tag(str, Enum):
     GRAD = "GRAD"
 
     # Reference diff
+    REFERENCE = "REFERENCE"
     DIFF = "DIFF"
 
     # Terminal
@@ -63,6 +64,19 @@ class DumpStatus(str, Enum):
     MISSING = "missing_dump"
     EMPTY = "empty"
     READ_FAILED = "read_failed"
+
+
+class DiffStatus(str, Enum):
+    """Status of one DIFF record emitted by ``surogate debug diff``."""
+
+    COMPARED = "compared"
+    SHAPE_MISMATCH = "shape_mismatch"
+    NONFINITE = "nonfinite"  # hf or dsl tensor had NaN/Inf; numeric diff skipped
+    DSL_DUMP_MISSING = "dsl_dump_missing"
+    DSL_READ_FAILED = "dsl_read_failed"
+    DSL_RESHAPE_FAILED = "dsl_reshape_failed"
+    HF_OUTPUT_MISSING = "hf_output_missing"
+    NO_PAIRED_SLOT = "no_paired_dsl_slot"
 
 
 class MappingKind(str, Enum):
