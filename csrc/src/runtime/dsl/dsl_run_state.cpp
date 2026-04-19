@@ -33,20 +33,6 @@
 namespace dsl {
 
 namespace {
-int resolve_mlp_up_factor(const PretrainedConfig& cfg) {
-    if (auto* model_cfg = dynamic_cast<const modules::ModelConfig*>(&cfg)) {
-        return model_cfg->mlp_up_factor();
-    }
-    return 2;
-}
-
-bool is_hybrid_architecture(const PretrainedConfig& cfg) {
-    if (auto* model_cfg = dynamic_cast<const modules::ModelConfig*>(&cfg)) {
-        return model_cfg->architecture == modules::ArchitectureType::Hybrid;
-    }
-    return false;
-}
-
 constexpr double kPi = 3.14159265358979323846;
 
 struct RopeInvFreq {
@@ -322,7 +308,6 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          bool lora_only_mode,
                          bool prequantized,
                          std::size_t stack_bytes,
-                         bool allocate_stack,
                          const ActivationLayoutIR* activation_layout)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
@@ -360,22 +345,33 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     }
     mLMHeadChunks = options.LMHeadChunks;
     mAttnBwdChunks = options.AttBwdChunks;
-    mStackSimulate = !allocate_stack;
 
+    // Stack is always device-backed now; `dsl::required_stack_bytes` is the
+    // single source of truth for the size (see dsl_model.cpp). Historically
+    // a sizing pass ran first with a null-backed dummy stack — that pass is
+    // gone, replaced by `BufferPlan::plan_stack_peak_bytes`.
     const std::size_t stack_capacity = (stack_bytes > 0) ? stack_bytes : kDefaultStackBytes;
-    if (allocate_stack) {
-        // Allocate stack memory (heuristic size).
-        mStackBuffer = mAllocator->allocate(ETensorDType::BYTE,
-                                            "dsl_stack",
-                                            EAllocationType::ON_DEVICE,
-                                            {static_cast<long>(stack_capacity)});
-        Stack = DeviceMemoryStack(mStackBuffer.Data, stack_capacity, DeviceId);
-    } else {
-        // Dummy stack for sizing pass (no device allocation).
-        Stack = DeviceMemoryStack(nullptr, stack_capacity, DeviceId);
-    }
+    mStackBuffer = mAllocator->allocate(ETensorDType::BYTE,
+                                        "dsl_stack",
+                                        EAllocationType::ON_DEVICE,
+                                        {static_cast<long>(stack_capacity)});
+    Stack = DeviceMemoryStack(mStackBuffer.Data, stack_capacity, DeviceId);
 
     create_cuda_resources();
+
+    // Build the buffer plan *before* any allocation: captures all sharing,
+    // sizing, and stack-temp decisions in one place so allocate_simplified_*
+    // can be a mechanical walk over the plan.
+    mBufferPlan = BufferPlan::build(config,
+                                    mRuntimeConfig,
+                                    options,
+                                    mSlotRegistry,
+                                    mLoraOnlyMode,
+                                    static_cast<long>(B),
+                                    static_cast<long>(T),
+                                    mActivationDtype,
+                                    mGradDtype);
+
     allocate_non_block_state(config);
     allocate_simplified_activations(config);
     allocate_simplified_gradients(config);
@@ -410,7 +406,6 @@ void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::Alloc
     if (!high_mark.empty()) {
         Stack.set_high_mark(high_mark);
     }
-    mStackSimulate = false;
 }
 
 Tensor& DslRunState::get_residual(int layer_idx, cudaStream_t stream) {
@@ -560,97 +555,32 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
 }
 
 void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
-    const long B = this->B;
-    const long T = this->T;
-    const long C = cfg.HiddenSize;
-    const long D = cfg.head_size();
-    const long Hq = cfg.NumQueryHeads;
-    const long Hkv = cfg.NumKeyValHeads;
-    // Derive attention output channels directly from Hq * head_size to avoid
-    // config mismatches (e.g. attn_out_channels not reflecting GQA layout).
-    long AttnDim = Hq * D;
-    long QKV = D * (Hq + 2 * Hkv);
-    long M = cfg.IntermediateSize;
-    long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
+    // All sharing / sizing / stack-temp decisions come from the plan built
+    // in the constructor — see buffer_plan.{h,cpp}. This function is a
+    // mechanical walk over the plan: any NEW sharing or sizing decision
+    // belongs in `BufferPlan::build`, not here. Re-reading `mRecomputeLevel`,
+    // `mLoraOnlyMode`, `mRuntimeConfig`, or `mSlotRegistry` directly inside
+    // the allocator would re-introduce the policy/mechanism split the plan
+    // was introduced to eliminate.
+    const auto& plan = mBufferPlan;
+    const long B = plan.B;
+    const long T = plan.T;
+    const long C = plan.C;
+    const long Hq = plan.Hq;
+    const long Hkv = plan.Hkv;
+    const long AttnDim = plan.AttnDim;  // max across hybrid layers
+    const long QKV = plan.QKV;          // max across hybrid layers
+    const long M = plan.M;              // max across hybrid layers
+    const long MUp = plan.MUp;          // max across hybrid layers
+    const long NumExperts = plan.NumExperts;
+    const long TopK = plan.TopK;
+    const long MoeM = plan.MoeM;
+    const long MoeMUp = plan.MoeMUp;
+    const bool use_qk_norm = plan.use_qk_norm;
+    const bool recompute_enabled = plan.recompute_enabled;
 
-    // For hybrid models, use max dims across all layers for shared buffers
-    const bool has_pld = mRuntimeConfig.has_per_layer_dims();
-    if (has_pld) {
-        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
-            QKV = std::max(QKV, pld.qkv_channels);
-            AttnDim = std::max(AttnDim, pld.attn_dim);
-            M = std::max(M, pld.intermediate);
-            MUp = std::max(MUp, pld.mlp_up);
-        }
-    }
-    const long NumExperts = mRuntimeConfig.num_experts;
-    const long TopK = (mRuntimeConfig.num_experts_per_tok > 0) ? mRuntimeConfig.num_experts_per_tok : 1;
-    const long MoeM =
-        (mRuntimeConfig.moe_intermediate_size > 0) ? mRuntimeConfig.moe_intermediate_size : cfg.IntermediateSize;
-    const long MoeMUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * MoeM;
-    const bool use_qk_norm = mRuntimeConfig.use_qk_norm;
-
-    const auto dtype = mActivationDtype;
+    const auto dtype = plan.act_dtype;
     const auto kind = EAllocationType::ON_DEVICE;
-
-    // =========================================================================
-    // DSL-driven activation sharing
-    // =========================================================================
-    // The sharing policy for each slot is now defined in the Python DSL
-    // (e.g., surogate/dsl/blocks/qwen3.py) via the share_policy attribute.
-    // This eliminates hardcoded rules and makes the DSL the single source of truth.
-    //
-    // The TensorSlotRegistry.should_share() method evaluates the share_policy:
-    // - PerLayer: Never share (always allocate per-layer)
-    // - WhenRecomputed: Share when recompute is enabled and will_recompute() is true
-    // - AlwaysShare: Always share across layers
-    // - FFTShare: Share only in FFT mode (not LoRA)
-    // - LoRAShare: Share only in LoRA mode (not FFT)
-    //
-    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
-    const bool lora_only = mLoraOnlyMode;
-    const bool has_layout = mSlotRegistry.has_dsl_layout();
-
-    // Helper to determine if a slot should be shared
-    auto should_share_slot = [&](const char* name) -> bool {
-        if (has_layout) {
-            return mSlotRegistry.should_share(name, lora_only, recompute_enabled);
-        }
-        // Legacy fallback when no DSL layout is available
-        return recompute_enabled && mSlotRegistry.will_recompute(name, lora_only);
-    };
-
-    // Query the DSL for sharing decisions. Use the slot enum's canonical-name
-    // reverse-mapping so the string literal only lives in `kSlotMappings`;
-    // renaming the canonical name there propagates here automatically.
-    const bool share_ln1 = should_share_slot(builtin_slot_name(TensorSlot::BlockLN1));
-    const bool share_ln2 = should_share_slot(builtin_slot_name(TensorSlot::BlockLN2));
-    const bool share_qkv = should_share_slot(builtin_slot_name(TensorSlot::BlockQKV));
-    const bool share_att = should_share_slot(builtin_slot_name(TensorSlot::BlockAtt));
-    const bool share_att_out = should_share_slot(builtin_slot_name(TensorSlot::BlockAttOut));
-    const bool share_mlp_up = should_share_slot(builtin_slot_name(TensorSlot::BlockMLPUp));
-    const bool share_swiglu = should_share_slot(builtin_slot_name(TensorSlot::BlockSwiGLU));
-    const bool share_residual_intermediates = should_share_slot(builtin_slot_name(TensorSlot::BlockResidualAtt));
-    const bool share_mlp_down = should_share_slot(builtin_slot_name(TensorSlot::BlockMLPDown));
-    const bool share_qk_rstd = use_qk_norm && should_share_slot(builtin_slot_name(TensorSlot::BlockQRSTD));
-
-    // FFN temps: Use stack-backed temps only when backward recompute can actually
-    // reconstruct them. For models without DSL recompute metadata (e.g. partially
-    // onboarded blocks), forcing stack-backed FFN temps causes large persistent
-    // save-buffer copies and severe memory pressure.
-    const bool can_recompute_ffn_temps =
-        mSlotRegistry.will_recompute(builtin_slot_name(TensorSlot::BlockMLPUp), lora_only) &&
-        mSlotRegistry.will_recompute(builtin_slot_name(TensorSlot::BlockSwiGLU), lora_only);
-    const bool ffn_temps_on_stack = recompute_enabled && lora_only && can_recompute_ffn_temps;
-    mFfnTempsOnStack = ffn_temps_on_stack;
-    if (mStackSimulate && ffn_temps_on_stack) {
-        const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
-        const long swiglu_bytes = B * T * M * get_dtype_size(dtype);
-        auto* sim_mlp_up = Stack.allocate(static_cast<std::size_t>(mlp_up_bytes), "mlp_up_simulate");
-        auto* sim_swiglu = Stack.allocate(static_cast<std::size_t>(swiglu_bytes), "swiglu_simulate");
-        Stack.free(sim_swiglu);
-        Stack.free(sim_mlp_up);
-    }
 
     Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_qkv_rope{};
     Tensor shared_att{}, shared_att_out{}, shared_lse{};
@@ -664,9 +594,11 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         return std::string(builtin_slot_name(s)) + "_shared";
     };
 
-    if (share_ln1) shared_ln1 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN1).c_str(), kind, {B, T, C});
-    if (share_ln2) shared_ln2 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN2).c_str(), kind, {B, T, C});
-    if (share_qkv) {
+    if (plan.share_ln1)
+        shared_ln1 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN1).c_str(), kind, {B, T, C});
+    if (plan.share_ln2)
+        shared_ln2 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN2).c_str(), kind, {B, T, C});
+    if (plan.share_qkv) {
         shared_qkv = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKV).c_str(), kind, {B, T, QKV});
     }
     // In LoRA mode with recompute, we still need a separate qkv_rope buffer when
@@ -675,42 +607,39 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // recompute the saved-tensor lookup returns this post-rope value as input to the
     // qk_norm_rope recompute op, causing norm+rope to be applied twice (→ NaN for MRoPE).
     // A single shared buffer is sufficient since recompute runs one layer at a time.
-    if (lora_only && recompute_enabled && use_qk_norm) {
+    if (plan.allocate_shared_qkv_rope) {
         shared_qkv_rope = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKVRoPE).c_str(), kind, {B, T, QKV});
     }
-    if (share_qk_rstd && use_qk_norm) {
+    if (plan.share_qk_rstd) {
+        // plan.share_qk_rstd already subsumes use_qk_norm (see BufferPlan::build).
         shared_q_rstd =
             mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockQRSTD).c_str(), kind, {B, T, Hq});
         shared_k_rstd =
             mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockKRSTD).c_str(), kind, {B, T, Hkv});
     }
     // LSE sharing: only in lora_only mode. FFT needs per-layer LSE for bit-exact gradients.
-    if (share_att) {
+    if (plan.share_att) {
         shared_lse =
             mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockLSE).c_str(), kind, {B, Hq, T});
     }
-    if (share_att) {
+    if (plan.share_att) {
         shared_att = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAtt).c_str(), kind, {B, T, AttnDim});
     }
-    if (share_att_out) {
+    if (plan.share_att_out) {
         shared_att_out = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAttOut).c_str(), kind, {B, T, C});
     }
     // att_out sharing is handled by share_att when recompute is enabled.
-    const bool has_mlp_up_slot_global =
-        has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockMLPUp)).has_value();
-    const bool has_swiglu_slot_global =
-        has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
-    if (share_mlp_up && !ffn_temps_on_stack && has_mlp_up_slot_global) {
+    if (plan.share_mlp_up && !plan.ffn_temps_on_stack && plan.has_mlp_up_slot) {
         shared_mlp_up = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPUp).c_str(), kind, {B, T, MUp});
     }
-    if (share_swiglu && !ffn_temps_on_stack && has_swiglu_slot_global) {
+    if (plan.share_swiglu && !plan.ffn_temps_on_stack && plan.has_swiglu_slot) {
         shared_swiglu = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockSwiGLU).c_str(), kind, {B, T, M});
     }
-    if (share_residual_intermediates) {
+    if (plan.share_residual_att) {
         shared_residual_att =
             mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockResidualAtt).c_str(), kind, {B, T, C});
     }
-    if (share_mlp_down) {
+    if (plan.share_mlp_down) {
         shared_mlp_down = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPDown).c_str(), kind, {B, T, C});
     }
 
@@ -718,19 +647,12 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     for (int i = 0; i < cfg.NumLayers; ++i) {
         auto& acts = mSimplifiedActivations[i];
 
-        // Per-layer dimensions for hybrid models
-        const long lQKV = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                              ? mRuntimeConfig.per_layer_dims[i].qkv_channels
-                              : QKV;
-        const long lAttnDim = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                                  ? mRuntimeConfig.per_layer_dims[i].attn_dim
-                                  : AttnDim;
-        const long lMUp = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                              ? mRuntimeConfig.per_layer_dims[i].mlp_up
-                              : MUp;
-        const long lM = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                            ? mRuntimeConfig.per_layer_dims[i].intermediate
-                            : M;
+        // Per-layer dimensions for hybrid models — accessors fall back to the
+        // shared (max) value for homogeneous models.
+        const long lQKV = plan.layer_qkv(i);
+        const long lAttnDim = plan.layer_attn_dim(i);
+        const long lMUp = plan.layer_mlp_up(i);
+        const long lM = plan.layer_intermediate(i);
 
         // Per-layer allocation tag = canonical slot name; shared buffers are
         // already created above with the `<slot>_shared` tag.
@@ -739,17 +661,19 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         };
 
         acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
-        acts.ln1 = share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
+        acts.ln1 =
+            plan.share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
 
         acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
-        acts.ln2 = share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
+        acts.ln2 =
+            plan.share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
 
         if (use_qk_norm) {
-            acts.q_rstd = share_qk_rstd
+            acts.q_rstd = plan.share_qk_rstd
                               ? shared_q_rstd
                               : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
             acts.k_rstd =
-                share_qk_rstd
+                plan.share_qk_rstd
                     ? shared_k_rstd
                     : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
         } else {
@@ -760,12 +684,11 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         // KV source layers (referenced by shared-KV attention in other layers)
         // MUST have their own non-shared QKV buffers so the data survives until
         // the consumer layer reads it.
-        const bool is_kv_src = mRuntimeConfig.is_kv_source(i);
-        acts.qkv = (share_qkv && !is_kv_src)
+        const bool is_kv_src = plan.is_kv_source(i);
+        acts.qkv = (plan.share_qkv && !is_kv_src)
                        ? shared_qkv
                        : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
-        const bool need_separate_qkv_rope = recompute_enabled && use_qk_norm;
-        if (need_separate_qkv_rope) {
+        if (plan.need_separate_qkv_rope) {
             acts.qkv_rope = (shared_qkv_rope.Data && !is_kv_src)
                                 ? shared_qkv_rope
                                 : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV});
@@ -773,38 +696,38 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.qkv_rope = {};
         }
 
-        acts.lse = share_att ? shared_lse
-                             : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
-        acts.att =
-            share_att ? shared_att : mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
-        acts.att_out =
-            share_att_out ? shared_att_out : mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
+        acts.lse = plan.share_att
+                       ? shared_lse
+                       : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
+        acts.att = plan.share_att ? shared_att
+                                  : mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
+        acts.att_out = plan.share_att_out ? shared_att_out
+                                          : mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
 
-        acts.residual_att = share_residual_intermediates
+        acts.residual_att = plan.share_residual_att
                                 ? shared_residual_att
                                 : mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
 
         // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
         // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
-        const bool has_mlp_up_slot =
-            has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockMLPUp)).has_value();
-        const bool has_swiglu_slot =
-            has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
-        if (ffn_temps_on_stack || !has_mlp_up_slot) {
+        if (plan.ffn_temps_on_stack || !plan.has_mlp_up_slot) {
             acts.mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
         } else {
-            acts.mlp_up = share_mlp_up ? shared_mlp_up
-                                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPUp), kind, {B, T, lMUp});
+            acts.mlp_up = plan.share_mlp_up
+                              ? shared_mlp_up
+                              : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPUp), kind, {B, T, lMUp});
         }
-        if (ffn_temps_on_stack || !has_swiglu_slot) {
+        if (plan.ffn_temps_on_stack || !plan.has_swiglu_slot) {
             acts.swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
         } else {
-            acts.swiglu = share_swiglu ? shared_swiglu
-                                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockSwiGLU), kind, {B, T, lM});
+            acts.swiglu = plan.share_swiglu
+                              ? shared_swiglu
+                              : mAllocator->allocate(dtype, tag(TensorSlot::BlockSwiGLU), kind, {B, T, lM});
         }
 
-        acts.mlp_down = share_mlp_down ? shared_mlp_down
-                                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
+        acts.mlp_down = plan.share_mlp_down
+                            ? shared_mlp_down
+                            : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
         // Dedicated per-layer block output slot used by Gemma4 (keeps the
         // block's final h_out separate from the MLP's mlp_down so the
         // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
@@ -860,88 +783,32 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
 }
 
 void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
-    const long B = this->B;
-    const long T = this->T;
-    const long C = cfg.HiddenSize;
-    const long D = cfg.head_size();
-    const long Hq = cfg.NumQueryHeads;
-    const long Hkv = cfg.NumKeyValHeads;
-    long AttnDim = Hq * D;
-    long QKV = D * (Hq + 2 * Hkv);
-    long M = cfg.IntermediateSize;
-    long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
+    // Like allocate_simplified_activations, this is a mechanical walk over
+    // the plan — new decisions belong in BufferPlan::build, not here.
+    const auto& plan = mBufferPlan;
+    const long B = plan.B;
+    const long T = plan.T;
+    const long C = plan.C;
+    const long AttnDim = plan.AttnDim;  // max across hybrid layers
+    const long QKV = plan.QKV;
+    const long M = plan.M;
+    const long MUp = plan.MUp;
 
-    // For hybrid models, use max dims for shared/stack buffers
-    const bool has_pld = mRuntimeConfig.has_per_layer_dims();
-    if (has_pld) {
-        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
-            QKV = std::max(QKV, pld.qkv_channels);
-            AttnDim = std::max(AttnDim, pld.attn_dim);
-            M = std::max(M, pld.intermediate);
-            MUp = std::max(MUp, pld.mlp_up);
-        }
-    }
-
-    const auto dtype = mGradDtype;
+    const auto dtype = plan.grad_dtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // =========================================================================
-    // Gradient buffer sharing
-    // =========================================================================
-    // Unlike activations, gradient sharing is more complex due to:
-    // 1. Backward hooks in LoRA mode that rely on per-layer gradients
-    // 2. Different backward graph structures in FFT vs LoRA modes
-    // 3. Risk of gradient corruption when sharing across layers
-    //
-    // For now, we keep gradient sharing disabled (per-layer allocation).
-    // In the future, this could be made DSL-driven via Gradient share_policy,
-    // but the benefit is smaller than activation sharing (gradients are typically
-    // computed and consumed immediately, not stored across layers).
-    //
-    const bool recompute_enabled = mRecomputeLevel >= RecomputeLevel::Enabled;
-    const bool share_grads = recompute_enabled;
-    const bool has_mlp_up_slot_global = mSlotRegistry.has_dsl_layout() && mSlotRegistry.lookup("mlp_up").has_value();
-    const bool has_swiglu_slot_global = mSlotRegistry.has_dsl_layout() && mSlotRegistry.lookup("swiglu").has_value();
-    // d_res_ffn cannot be shared with alternating buffers because zero_activation_gradients()
-    // zeroes all layers' d_res_ffn at backward start — with shared buffers, zeroing layer N-2
-    // destroys the loss gradient stored in layer N (same underlying buffer).
-    // TODO: fix zero_activation_gradients to handle shared buffers before enabling this.
-    const bool share_res_ffn = false;
-    const bool share_mlp_down = recompute_enabled;
-    const bool large_bwd_temps_on_stack = recompute_enabled;
-
-    if (mStackSimulate && large_bwd_temps_on_stack) {
-        const long d_qkv_bytes = B * T * QKV * get_dtype_size(dtype);
-        const long d_mlp_up_bytes = has_mlp_up_slot_global ? B * T * MUp * get_dtype_size(dtype) : 0;
-        const long d_swiglu_bytes = has_swiglu_slot_global ? B * T * M * get_dtype_size(dtype) : 0;
-        const long d_up_bytes = has_mlp_up_slot_global ? B * T * MUp * get_dtype_size(dtype) : 0;
-        auto* sim_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
-        auto* sim_d_mlp_up = d_mlp_up_bytes > 0
-                                 ? Stack.allocate(static_cast<std::size_t>(d_mlp_up_bytes), "d_mlp_up_simulate")
-                                 : nullptr;
-        auto* sim_d_swiglu = d_swiglu_bytes > 0
-                                 ? Stack.allocate(static_cast<std::size_t>(d_swiglu_bytes), "d_swiglu_simulate")
-                                 : nullptr;
-        auto* sim_d_up =
-            d_up_bytes > 0 ? Stack.allocate(static_cast<std::size_t>(d_up_bytes), "d_up_simulate") : nullptr;
-        if (sim_d_up) Stack.free(sim_d_up);
-        if (sim_d_swiglu) Stack.free(sim_d_swiglu);
-        if (sim_d_mlp_up) Stack.free(sim_d_mlp_up);
-        Stack.free(sim_d_qkv);
-    }
-
     // Allocate shared gradient buffers if recompute_block is enabled
-    if (share_grads && !mSharedDResAtt.Data) {
-        if (share_res_ffn) {
+    if (plan.share_grads && !mSharedDResAtt.Data) {
+        if (plan.share_res_ffn_grad) {
             mSharedDResFFN[0] = mAllocator->allocate(dtype, "d_res_ffn_a", kind, {B, T, C});
             mSharedDResFFN[1] = mAllocator->allocate(dtype, "d_res_ffn_b", kind, {B, T, C});
         }
-        if (share_mlp_down) {
+        if (plan.share_mlp_down_grad) {
             mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
             mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
         }
         mSharedDResAtt = mAllocator->allocate(dtype, "d_res_att_shared", kind, {B, T, C});
-        if (is_hybrid_architecture(cfg)) {
+        if (plan.is_hybrid) {
             mSharedDAttOut = mAllocator->allocate(dtype, "d_att_out_shared", kind, {B, T, C});
         } else {
             mSharedDAttOut = mSharedDResAtt;
@@ -951,58 +818,47 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
     }
 
-    const bool hybrid = is_hybrid_architecture(cfg);
-
     mSimplifiedGradients.resize(cfg.NumLayers);
     for (int i = 0; i < cfg.NumLayers; ++i) {
         auto& g = mSimplifiedGradients[i];
 
-        // Per-layer dimensions for hybrid models
-        const long lQKV = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                              ? mRuntimeConfig.per_layer_dims[i].qkv_channels
-                              : QKV;
-        const long lAttnDim = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                                  ? mRuntimeConfig.per_layer_dims[i].attn_dim
-                                  : AttnDim;
-        const long lMUp = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                              ? mRuntimeConfig.per_layer_dims[i].mlp_up
-                              : MUp;
-        const long lM = (has_pld && i < static_cast<int>(mRuntimeConfig.per_layer_dims.size()))
-                            ? mRuntimeConfig.per_layer_dims[i].intermediate
-                            : M;
+        const long lQKV = plan.layer_qkv(i);
+        const long lAttnDim = plan.layer_attn_dim(i);
+        const long lMUp = plan.layer_mlp_up(i);
+        const long lM = plan.layer_intermediate(i);
 
-        g.d_res_ffn = share_res_ffn ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
-                                    : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
-        g.d_res_att = share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        g.d_att_out = hybrid
-                          ? (share_grads ? mSharedDAttOut : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}))
-                          : g.d_res_att;
-        g.d_ln2 = share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
+        g.d_res_ffn = plan.share_res_ffn_grad ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
+                                              : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
+        g.d_res_att = plan.share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
+        g.d_att_out = plan.is_hybrid ? (plan.share_grads ? mSharedDAttOut
+                                                         : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}))
+                                     : g.d_res_att;
+        g.d_ln2 = plan.share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
 
-        if (large_bwd_temps_on_stack || !has_mlp_up_slot_global) {
+        if (plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot) {
             g.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
         } else {
             g.d_mlp_up = mAllocator->allocate(dtype, "d_mlp_up", kind, {B, T, lMUp});
         }
-        if (large_bwd_temps_on_stack || !has_swiglu_slot_global) {
+        if (plan.large_bwd_temps_on_stack || !plan.has_swiglu_slot) {
             g.d_swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
         } else {
             g.d_swiglu = mAllocator->allocate(dtype, "d_swiglu", kind, {B, T, lM});
         }
-        if (large_bwd_temps_on_stack) {
+        if (plan.large_bwd_temps_on_stack) {
             g.d_qkv = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lQKV});
         } else {
             g.d_qkv = mAllocator->allocate(dtype, "d_qkv", kind, {B, T, lQKV});
         }
 
-        g.d_mlp_down = share_mlp_down ? mSharedDMlpDown[static_cast<std::size_t>(i % 2)]
-                                      : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
+        g.d_mlp_down = plan.share_mlp_down_grad ? mSharedDMlpDown[static_cast<std::size_t>(i % 2)]
+                                                : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
         // Per-layer h_out gradient (Gemma4: block's final-output grad,
         // separate from MLP's d_mlp_down so the backward chain doesn't
         // collide across the MLP / _finalize split).
         g.d_h_out = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
-        g.d_att = share_grads ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
-        g.d_ln1 = share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
+        g.d_att = plan.share_grads ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
+        g.d_ln1 = plan.share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
 
     // Preserve the original buffer pointers so we can restore them if the
@@ -1283,15 +1139,6 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     } else {
         // Leave an empty descriptor; attention ops will fail later if invoked with invalid head size.
         mScratch.cudnn_workspace = Tensor::empty(ETensorDType::BYTE, {0});
-    }
-
-    // Note: Stack simulation no longer needed for workspace since it's persistently allocated
-    if (mStackSimulate) {
-        if (mRecomputeLevel >= RecomputeLevel::Enabled) {
-            const long d_qkv_bytes = B * T * QKV * get_dtype_size(mGradDtype);
-            auto* simulated_d_qkv = Stack.allocate(static_cast<std::size_t>(d_qkv_bytes), "d_qkv_simulate");
-            Stack.free(simulated_d_qkv);
-        }
     }
 }
 

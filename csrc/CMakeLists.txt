@@ -279,6 +279,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/dsl_param_store.cpp
     src/runtime/dsl/dsl_grad_store.cpp
     src/runtime/dsl/dsl_run_state.cpp
+    src/runtime/dsl/buffer_plan.cpp
     src/runtime/dsl/dsl_weight_manager.cpp
     src/runtime/executor/graph_executor.cpp
     src/runtime/executor/graph_executor_utils.cpp

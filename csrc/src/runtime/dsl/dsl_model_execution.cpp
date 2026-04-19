@@ -3,9 +3,11 @@
 //
 // DSL model execution functions (forward, backward, validation, run state allocation).
 
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/dsl_model.h"
 #include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "runtime/executor/graph_executor.h"
 #include "runtime/executor/graph_executor_helpers.h"
 
@@ -230,8 +232,49 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     if (qlora_enabled() && mQLoRAConfig.is_fp4()) {
         mOptions.UseCudaGraphs = false;
     }
-    const std::size_t dummy_stack_bytes = 1024ULL * 1024ULL * 1024ULL * 1024ULL;  // 1TB dummy stack
     const ActivationLayoutIR* layout = mModule->activation_layout.has_value() ? &*mModule->activation_layout : nullptr;
+
+    // ------------------------------------------------------------------
+    // Stack sizing — phase 1: plan-only estimate.
+    //
+    // Build a BufferPlan ahead of DslRunState so we can size the device
+    // stack before any allocations happen. The plan DslRunState builds
+    // internally from the same inputs is identical; this is two cheap
+    // pure-function calls, not a real duplication.
+    //
+    // The backward compiled graph doesn't exist yet (the executor hasn't
+    // been created), so the initial size is driven by `plan_stack_peak_bytes`
+    // + the legacy safety/MoE/arch slacks. A second sizing pass after the
+    // executor is ready resizes if the graph-walk peak is larger.
+    // ------------------------------------------------------------------
+    TensorSlotRegistry initial_registry;
+    if (layout) {
+        initial_registry.init_from_layout(*layout);
+    }
+    ETensorDType initial_act_dtype = mOptions.ModelType.value_or(mConfig->DType);
+    if (is_fp8_dtype(initial_act_dtype)) {
+        initial_act_dtype = ETensorDType::BF16;
+    }
+    const BufferPlan initial_plan = BufferPlan::build(mModelConfig,
+                                                      mRuntimeConfig,
+                                                      mOptions,
+                                                      initial_registry,
+                                                      lora_enabled(),
+                                                      static_cast<long>(B),
+                                                      static_cast<long>(T),
+                                                      initial_act_dtype,
+                                                      /*grad_dtype=*/initial_act_dtype);
+    long required_size = required_stack_bytes(initial_plan, /*bwd_graph=*/nullptr, mModelConfig, mOptions);
+
+    if (options.DebugMemoryBreakdown && comm.rank() == 0) {
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[DEBUG-STACK] plan_peak=" << initial_plan.plan_stack_peak_bytes() / (1024 * 1024) << " MiB"
+                  << ", initial_required=" << required_size / (1024 * 1024) << " MiB"
+                  << ", GPU used=" << (total_mem - free_mem) / (1024 * 1024) << " MiB"
+                  << ", free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
+    }
+
     mRunState = std::make_unique<DslRunState>(mModelConfig,
                                               mRuntimeConfig,
                                               mOptions,
@@ -240,8 +283,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                               mAllocator,
                                               lora_enabled(),
                                               mQLoRAConfig.is_prequantized(),
-                                              dummy_stack_bytes,
-                                              /*allocate_stack=*/false,
+                                              static_cast<std::size_t>(required_size),
                                               layout);
     mRunState->WorldSize = comm.world_size();
     if (mParams) {
@@ -250,120 +292,6 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             mParams->set_qlora_provider(mQLoRAProvider.get());
         }
     }
-
-    const long base_size = static_cast<long>(mRunState->Stack.max_utilization());
-    long moe_extra = 0;
-    if (mModelConfig.NumExperts > 0) {
-        const long moe_intermediate =
-            (mModelConfig.MoeIntermediateSize > 0) ? mModelConfig.MoeIntermediateSize : mModelConfig.IntermediateSize;
-        const long hidden = mModelConfig.HiddenSize;
-        const long num_experts = mModelConfig.NumExperts;
-        const long top_k = std::max(1, mModelConfig.NumExpertsPerTok);
-        const long dtype_bytes = 2;  // BF16 bytes (matches modular sizing heuristic)
-        const long up_factor = mModelConfig.mlp_up_factor();
-        const long expert_gate_up_tp = num_experts * up_factor * moe_intermediate * hidden * dtype_bytes;
-        const long expert_down_tp = num_experts * moe_intermediate * hidden * dtype_bytes;
-        const long permuted_tokens = 2L * B * T * top_k * hidden * dtype_bytes;
-        // MoE activation backward (gpt_oss_moe_act_backward) allocates d_inp buffers
-        // in intermediate dimension ({N, up_factor * intermediate}), not hidden dimension.
-        // Account for this larger BT-proportional backward buffer.
-        const long moe_bwd_act = 2L * B * T * top_k * up_factor * moe_intermediate * dtype_bytes;
-        moe_extra = expert_gate_up_tp + expert_down_tp + permuted_tokens + moe_bwd_act;
-    }
-    ETensorDType act_dtype = mOptions.ModelType.value_or(mConfig->DType);
-    if (is_fp8_dtype(act_dtype)) {
-        act_dtype = ETensorDType::BF16;
-    }
-    const long dtype_bytes = static_cast<long>(get_dtype_size(act_dtype));
-    const long BT = static_cast<long>(B) * static_cast<long>(T);
-    const long C = mModelConfig.HiddenSize;
-    long QKV = mModelConfig.head_size() * (mModelConfig.NumQueryHeads + 2 * mModelConfig.NumKeyValHeads);
-    long MUp = static_cast<long>(mModelConfig.mlp_up_rows());
-    // For hybrid models, use max dims across all block types
-    if (mRuntimeConfig.has_per_layer_dims()) {
-        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
-            QKV = std::max(QKV, pld.qkv_channels);
-            MUp = std::max(MUp, pld.mlp_up);
-        }
-    }
-    const long extra_tmp = std::max({BT * C, BT * QKV, BT * MUp}) * dtype_bytes;
-    long attn_fallback_bytes = 0;
-    const bool lora_stack_tight = lora_enabled();
-    const long safety_floor = lora_stack_tight ? (32L * 1024 * 1024) : (64L * 1024 * 1024);
-    const long safety_bytes = std::max(safety_floor, base_size / 8);
-    // The sizing simulation captures ~55% of actual backward peak (flash attention
-    // backward workspace and accumulated temps are not fully modeled), so we use
-    // base_multiplier=2 for both LoRA and full fine-tune.
-    // CPU-RAM centric: tighter multiplier since stack resets at each layer boundary.
-    const long base_multiplier = mOptions.CpuTraining ? 1L : 2L;
-    long required_size =
-        std::max(1024L * 1024,
-                 base_size * base_multiplier + moe_extra + safety_bytes + extra_tmp + attn_fallback_bytes);
-    const long slack_bytes = mOptions.CpuTraining ? (128L * 1024 * 1024)
-                             : lora_stack_tight   ? (256L * 1024 * 1024)
-                                                  : (512L * 1024 * 1024);
-    required_size += slack_bytes;  // extra slack for unmodeled temps
-    const bool is_qwen3_hybrid_lora = lora_stack_tight &&
-                                      (mModelConfig.architecture == modules::ArchitectureType::Hybrid) &&
-                                      (mModelConfig.Architecture == PretrainedConfig::QWEN3);
-    if (is_qwen3_hybrid_lora) {
-        // Qwen3.5 hybrid blocks can hit an additional transient peak around SwiGLU
-        // backward + LoRA hook temps that is not fully captured by the sizing simulation.
-        // Reserve one extra BT x MUp buffer plus fixed margin.
-        const long qwen35_swiglu_peak = BT * static_cast<long>(mModelConfig.mlp_up_rows()) * dtype_bytes;
-        const long qwen35_extra_slack = std::max(128L * 1024 * 1024, qwen35_swiglu_peak + 64L * 1024 * 1024);
-        required_size += qwen35_extra_slack;
-    }
-    long moe_stack_slack = 0;
-    if (mModelConfig.NumExperts > 0) {
-        moe_stack_slack = 2048L * 1024 * 1024;  // MoE backward temps can spike beyond simulated high-water mark
-    }
-    if (const char* env = std::getenv("SUROGATE_STACK_SLACK_MB")) {
-        const long mb = std::max(0L, std::atol(env));
-        moe_stack_slack = std::max(moe_stack_slack, mb * 1024 * 1024);
-    }
-    required_size += moe_stack_slack;
-    long min_stack_base = mOptions.CpuTraining ? (512L * 1024 * 1024)
-                          : lora_stack_tight   ? (512L * 1024 * 1024)
-                                               : (3L * 1024 * 1024 * 1024);
-    if (is_qwen3_hybrid_lora) {
-        min_stack_base = std::max(min_stack_base, 1024L * 1024 * 1024);
-    }
-    if (mOptions.UseCudaGraphs) {
-        // CUDA graph capture/replay requires stable temp addresses and tends to keep
-        // additional transient allocations live during capture. Reserve extra headroom
-        // to avoid capture-only stack OOMs.
-        const long graph_extra_slack = lora_stack_tight ? (512L * 1024 * 1024) : (1024L * 1024 * 1024);
-        required_size += graph_extra_slack;
-        min_stack_base = std::max(min_stack_base, lora_stack_tight ? (1024L * 1024 * 1024) : (4L * 1024 * 1024 * 1024));
-        if (is_qwen3_hybrid_lora) {
-            // Qwen3.5 hybrid + LoRA + CUDA graphs retains additional transient tensors
-            // during capture/replay that are not represented by simulation. Keep a
-            // dedicated margin so mamba_gated_rmsnorm/swiglu backward peaks fit.
-            required_size += 512L * 1024 * 1024;
-            min_stack_base = std::max(min_stack_base, 1536L * 1024 * 1024);
-        }
-    }
-    if (const char* env = std::getenv("SUROGATE_MIN_STACK_MB")) {
-        const long mb = std::max(64L, std::atol(env));
-        min_stack_base = mb * 1024 * 1024;
-    }
-    const long min_stack_bytes = min_stack_base + attn_fallback_bytes + moe_stack_slack;
-    required_size =
-        std::max(required_size, min_stack_bytes);  // Full fine-tune keeps 3GB+fallback; LoRA can use tighter floor.
-    const auto high_mark = mRunState->Stack.get_high_mark();
-    // DEBUG: Stack allocation size
-    if (options.DebugMemoryBreakdown && comm.rank() == 0) {
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[DEBUG-STACK] base_size=" << base_size / (1024 * 1024) << " MiB"
-                  << ", required_size=" << required_size / (1024 * 1024) << " MiB"
-                  << ", GPU used=" << (total_mem - free_mem) / (1024 * 1024) << " MiB"
-                  << ", free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
-    }
-    Tensor stack_buffer =
-        mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {required_size});
-    mRunState->set_stack_buffer(std::move(stack_buffer), high_mark);
     comm.barrier();
 
     // Configure gradient manager for multi-GPU overlapped reduction
@@ -402,31 +330,34 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
         mExecutor->set_rng_state(mRngState);
     }
 
-    // Estimate actual backward stack peak from the compiled graph and resize if needed.
-    // The heuristic sizing above may underestimate for architectures with heavy backward
-    // ops (e.g. Qwen3.5 gated delta rule) that allocate many internal temps on the stack.
+    // ------------------------------------------------------------------
+    // Stack sizing — phase 2: re-run with the compiled backward graph.
+    //
+    // `required_stack_bytes` combines the plan-level peak with the graph-
+    // walk peak and takes the larger. For architectures with heavy backward
+    // ops (e.g. Qwen3.5 gated delta rule) the graph-walk is the binding
+    // constraint — resize up if so. Shrinking is deliberately skipped to
+    // avoid churn on the allocator.
+    // ------------------------------------------------------------------
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
-        const long bwd_peak = exec->estimate_backward_stack_peak(B, T);
+        exec->ensure_graphs_compiled(B, T);
+        const long needed =
+            required_stack_bytes(mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions);
         if (options.DebugMemoryBreakdown && comm.rank() == 0) {
-            std::cerr << "[DEBUG-STACK] Backward peak estimate=" << bwd_peak / (1024 * 1024) << " MiB"
-                      << ", heuristic=" << required_size / (1024 * 1024) << " MiB" << std::endl;
+            const long graph_peak = graph_backward_stack_peak(exec->compiled_backward(), mRunState->buffer_plan());
+            std::cerr << "[DEBUG-STACK] graph_peak=" << graph_peak / (1024 * 1024) << " MiB"
+                      << ", final_required=" << needed / (1024 * 1024) << " MiB"
+                      << ", currently_allocated=" << required_size / (1024 * 1024) << " MiB" << std::endl;
         }
-        if (bwd_peak > 0) {
-            // Safety margin for dispatch-internal temps not in the graph.
-            // cpu_training: tighter margin since stack resets at each layer boundary.
-            const long safety = mOptions.CpuTraining ? std::max(64L * 1024 * 1024, bwd_peak / 8)
-                                                     : std::max(128L * 1024 * 1024, bwd_peak / 3);
-            const long needed = bwd_peak + safety;
-            if (needed > required_size) {
-                if (options.DebugMemoryBreakdown && comm.rank() == 0) {
-                    std::cerr << "[DEBUG-STACK] Resizing stack: " << required_size / (1024 * 1024) << " MiB" << " -> "
-                              << needed / (1024 * 1024) << " MiB" << std::endl;
-                }
-                Tensor new_stack =
-                    mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {needed});
-                mRunState->set_stack_buffer(std::move(new_stack), high_mark);
-                required_size = needed;
+        if (needed > required_size) {
+            if (options.DebugMemoryBreakdown && comm.rank() == 0) {
+                std::cerr << "[DEBUG-STACK] Resizing stack: " << required_size / (1024 * 1024) << " MiB" << " -> "
+                          << needed / (1024 * 1024) << " MiB" << std::endl;
             }
+            Tensor new_stack =
+                mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {needed});
+            mRunState->set_stack_buffer(std::move(new_stack));
+            required_size = needed;
         }
     }
 

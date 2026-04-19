@@ -40,8 +40,7 @@ DeviceMemoryStack::DeviceMemoryStack(std::byte* memory, std::size_t amount, int 
  * @throws std::bad_alloc   If the allocation would exceed the backing capacity.
  */
 std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
-    constexpr size_t alignment = 4096;
-    std::size_t aligned_amount = div_ceil(amount, alignment) * alignment;
+    std::size_t aligned_amount = div_ceil(amount, kStackAlign) * kStackAlign;
     std::byte* new_top = mTop + aligned_amount;
     if (new_top > mBackingMemory + mCapacity) {
         std::size_t used = mTop - mBackingMemory;

@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/dsl_runtime_config.h"
 #include "runtime/dsl/tensor_slot_registry.h"
 #include "utilities/stack.h"
@@ -32,7 +33,10 @@ namespace dsl {
 // DSL run state for graph execution (activation buffers, scratch, etc).
 class DslRunState final : public IRunState {
 public:
-    static constexpr std::size_t kDefaultStackBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2GB
+    /// Caller must size the stack via `dsl::required_stack_bytes(plan, ...)`;
+    /// this fallback only exists as a last-resort default and is never used
+    /// by the production allocation path (see `DslModel::allocate_run_state`).
+    static constexpr std::size_t kDefaultStackBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2 GiB
 
     DslRunState(const PretrainedConfig& config,
                 const DslRuntimeConfig& runtime_config,
@@ -43,10 +47,11 @@ public:
                 bool lora_only_mode = false,
                 bool prequantized = false,
                 std::size_t stack_bytes = kDefaultStackBytes,
-                bool allocate_stack = true,
                 const ActivationLayoutIR* activation_layout = nullptr);
     ~DslRunState();
 
+    /// Swap the backing stack buffer (used to resize the stack after the
+    /// backward graph is compiled and peak-modelled more accurately).
     void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
 
     modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) {
@@ -122,11 +127,18 @@ public:
         return mOffloadResiduals;
     }
 
+    /// Immutable buffer plan built at construction. Exposed for stack-sizing
+    /// helpers (`dsl::required_stack_bytes`, `dsl::graph_backward_stack_peak`)
+    /// and for tests that need to inspect the allocation decisions.
+    const BufferPlan& buffer_plan() const {
+        return mBufferPlan;
+    }
+
     bool ffn_temps_on_stack() const {
-        return mFfnTempsOnStack;
+        return mBufferPlan.ffn_temps_on_stack;
     }
     bool large_bwd_temps_on_stack() const {
-        return mRecomputeLevel >= RecomputeLevel::Enabled;
+        return mBufferPlan.large_bwd_temps_on_stack;
     }
     bool is_lora_only_mode() const {
         return mLoraOnlyMode;
@@ -286,12 +298,10 @@ private:
     std::shared_ptr<TensorAllocator> mAllocator;
     DslRuntimeConfig mRuntimeConfig;
     Tensor mStackBuffer{};
-    bool mStackSimulate = false;
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
     bool mPrequantized = false;
     bool mCpuTraining = false;
-    bool mFfnTempsOnStack = false;
     ETensorDType mActivationDtype = ETensorDType::BF16;
     ETensorDType mGradDtype = ETensorDType::BF16;
     ETensorDType mMatmulDtype = ETensorDType::BF16;
@@ -305,6 +315,10 @@ private:
     modules::NonBlockGradientBuffers mNonBlockGradients;
     modules::ScratchBuffers mScratch;
     TensorSlotRegistry mSlotRegistry;
+    /// Compile-time buffer-sharing plan. Built once in the constructor (after
+    /// the slot registry is initialized from the DSL layout) and consumed by
+    /// allocate_simplified_{activations,gradients}. See buffer_plan.h.
+    BufferPlan mBufferPlan;
     std::vector<Tensor> mPerLayerRopeFreqs;
 
     std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;

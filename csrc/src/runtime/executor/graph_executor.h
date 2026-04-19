@@ -266,8 +266,29 @@ public:
     /// pass.  This accounts for both graph-level Temporary-slot outputs and known
     /// op-internal temporaries (e.g. ChunkGatedDeltaRuleBackward).
     ///
+    /// Thin wrapper around `dsl::graph_backward_stack_peak` — prefer calling
+    /// that directly (via `compiled_backward()`) when you already have a
+    /// `BufferPlan` and want the unified `required_stack_bytes` result.
+    ///
     /// @return Estimated peak stack bytes (0 if no backward graph exists).
     long estimate_backward_stack_peak(long B, long T);
+
+    /// Access the compiled backward graph (nullptr if none exists).
+    ///
+    /// Use together with `dsl::required_stack_bytes` to get the final,
+    /// post-compile stack size. Caller must ensure `ensure_graphs_compiled`
+    /// (or `estimate_backward_stack_peak`) has been invoked for the desired
+    /// (B, T) before calling this.
+    const CompiledGraph* compiled_backward() const {
+        return mCompiledBackward.get();
+    }
+
+    /// Compile the forward + backward graph pair for the given (B, T) if
+    /// they aren't already compiled for those dimensions. Safe to call
+    /// multiple times. Public surface around the private `compile_graphs`.
+    void ensure_graphs_compiled(long B, long T) {
+        compile_graphs(B, T);
+    }
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.

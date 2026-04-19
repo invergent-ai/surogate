@@ -10,6 +10,18 @@
 #include <vector>
 #include "utilities/tensor.h"
 
+/// Alignment used by every `DeviceMemoryStack::allocate`. Exposed so
+/// static sizing code (e.g. `BufferPlan::plan_stack_peak_bytes`,
+/// `dsl::graph_backward_stack_peak`) can predict the stack bytes an
+/// allocation will consume without driving the stack itself.
+inline constexpr std::size_t kStackAlign = 4096;
+
+/// Round `bytes` up to the `DeviceMemoryStack` allocation quantum.
+inline constexpr long align_stack_bytes(long bytes) {
+    return ((bytes + static_cast<long>(kStackAlign) - 1) / static_cast<long>(kStackAlign)) *
+           static_cast<long>(kStackAlign);
+}
+
 class DeviceMemoryStack {
 public:
     DeviceMemoryStack() = default;

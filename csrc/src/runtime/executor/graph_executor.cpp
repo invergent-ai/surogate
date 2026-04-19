@@ -5,6 +5,7 @@
 
 #include "runtime/executor/graph_executor.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/compiled_ops.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
@@ -772,115 +773,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
 //      op input shapes for known heavy ops like ChunkGatedDeltaRuleBackward).
 // ---------------------------------------------------------------------------
 long GraphExecutor::estimate_backward_stack_peak(long B, long T) {
+    // Thin wrapper: compile the backward graph if needed, then delegate to
+    // `dsl::graph_backward_stack_peak`. The plan provides the stack-residency
+    // flags (`large_bwd_temps_on_stack`, `ffn_temps_on_stack`) that used to
+    // be queried via `mRunState`.
     compile_graphs(B, T);
-    if (!mCompiledBackward) {
-        return 0;
-    }
-
-    const auto& graph = *mCompiledBackward;
-    constexpr std::size_t kAlign = 4096;
-
-    auto aligned = [](long bytes) -> long {
-        return ((bytes + static_cast<long>(kAlign) - 1) / static_cast<long>(kAlign)) * static_cast<long>(kAlign);
-    };
-
-    auto tensor_bytes = [](ETensorDType dtype, const std::vector<long>& shape) -> long {
-        if (shape.empty()) return 0;
-        long elem_size = static_cast<long>(get_dtype_size(dtype));
-        long total = elem_size;
-        for (long d : shape) {
-            total *= d;
-        }
-        return total;
-    };
-
-    // Determine which non-Temporary slots also go on the stack.
-    // When recompute is enabled (LoRA default), backward gradient temps (d_qkv,
-    // d_mlp_up, d_swiglu) are lazily allocated on the stack via temp_acquire.
-    // Similarly, forward activation temps (mlp_up, swiglu) are re-allocated on
-    // the stack during recompute in the backward pass.
-    const bool bwd_on_stack = mRunState.large_bwd_temps_on_stack();
-    const bool ffn_on_stack = mRunState.ffn_temps_on_stack();
-
-    long peak = 0;
-    long current = 0;
-
-    for (const auto& op : graph.ops) {
-        // (1) Graph-level outputs that go on the stack
-        for (const auto& ref : op.outputs) {
-            if (ref.shape.empty()) continue;
-            bool on_stack = false;
-            switch (ref.slot) {
-                case TensorSlot::Temporary:
-                case TensorSlot::Mapped: on_stack = true; break;
-                case TensorSlot::BlockDQKV:
-                case TensorSlot::BlockDMLPUp:
-                case TensorSlot::BlockDSwiGLU: on_stack = bwd_on_stack; break;
-                case TensorSlot::BlockMLPUp:
-                case TensorSlot::BlockSwiGLU: on_stack = ffn_on_stack; break;
-                default: break;
-            }
-            if (on_stack) {
-                current += aligned(tensor_bytes(ref.dtype, ref.shape));
-            }
-        }
-
-        // (2) Op-internal temporaries for known heavy backward ops.
-        //     These are allocated inside dispatch functions and are NOT
-        //     represented in the compiled graph's output TensorRefs.
-        if (op.type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
-            // Extract dimensions from op inputs:
-            //   input[0] = q  [B, T, H, K]
-            //   input[2] = v  [B, T, H_v, V]  (H_v may differ from H for GQA)
-            long H = 0, K = 0, V = 0;
-            if (op.inputs.size() >= 1 && op.inputs[0].shape.size() == 4) {
-                H = op.inputs[0].shape[2];
-                K = op.inputs[0].shape[3];
-            }
-            if (op.inputs.size() >= 3 && op.inputs[2].shape.size() == 4) {
-                V = op.inputs[2].shape[3];
-            }
-            if (H > 0 && K > 0 && V > 0) {
-                const long chunk_size = op.attrs.chunk_size > 0 ? static_cast<long>(op.attrs.chunk_size) : 64L;
-                const long NT = (T + chunk_size - 1) / chunk_size;
-                const long BF16 = 2, FP32 = 4;
-                // Forward recompute temps
-                long internal = 0;
-                internal += aligned(B * T * H * FP32);               // g_cum
-                internal += aligned(B * T * H * chunk_size * FP32);  // A
-                internal += aligned(B * T * H * chunk_size * BF16);  // Ai
-                internal += aligned(B * T * H * K * BF16);           // w
-                internal += aligned(B * T * H * V * BF16);           // u
-                internal += aligned(B * NT * H * K * V * BF16);      // h
-                internal += aligned(B * H * K * V * FP32);           // ht_dummy
-                internal += aligned(B * T * H * V * BF16);           // v_new
-                internal += aligned(B * H * K * V * BF16);           // h0_buf
-                // L2-norm temps (forward + backward)
-                internal += aligned(B * T * H * K * BF16) * 4;  // q_norm, k_norm, dq_norm, dk_norm
-                internal += aligned(B * T * H * FP32) * 4;      // q_rstd, k_rstd (fwd+bwd)
-                // Backward-specific temps
-                internal += aligned(B * NT * H * K * V * BF16);  // dh
-                internal += aligned(B * T * H * V * BF16);       // dv2
-                internal += aligned(B * H * K * V * FP32);       // dht_zero
-                internal += aligned(B * T * H * K * BF16);       // dw
-                internal += aligned(B * T * H * FP32);           // dg_wy
-                internal += aligned(B * T * H * FP32);           // dg_out
-                // dg_nk: NK * B * T * H * FP32 (NK = K / chunk_size, at least 1)
-                const long NK = std::max(1L, K / chunk_size);
-                internal += aligned(NK * B * T * H * FP32);
-                current += internal;
-            }
-        }
-
-        peak = std::max(peak, current);
-
-        // At layer_end the runtime restores the stack to initial_checkpoint
-        if (op.layer_end >= 0) {
-            current = 0;
-        }
-    }
-
-    return peak;
+    return graph_backward_stack_peak(mCompiledBackward.get(), mRunState.buffer_plan());
 }
 
 void GraphExecutor::set_internal_graphs_enabled(bool enabled) {
