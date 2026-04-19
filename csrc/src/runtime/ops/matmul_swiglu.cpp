@@ -274,21 +274,16 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         d_inp_ptr = &ensure_output_tensor(op.outputs[0]);
     }
-    // Skip weight gradient if frozen (LoRA-only mode).
+    // Skip weight gradient if frozen (LoRA-only mode). Classifier-backed:
+    // ParamGrad tids carry the base param name via TensorMeta; other kinds
+    // return nullopt so non-parameter outputs correctly skip the grad store.
     bool skip_weight_grad = true;
-    if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-        std::string base_name;
-        if (auto base = base_param_from_grad(op.outputs[1].name)) {
-            base_name = *base;
-        } else {
-            base_name = op.outputs[1].name;
-            if (base_name.rfind("d_", 0) == 0) {
-                base_name = base_name.substr(2);
-            }
+    if (op.outputs.size() > 1 && !op.outputs[1].name.empty() && mCurrentGraph) {
+        if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
+            bool accum = false;
+            Tensor* grad = mGrads.get_param_grad(*base, accum);
+            skip_weight_grad = (grad == nullptr || !grad->Data);
         }
-        bool accum = false;
-        Tensor* grad = mGrads.get_param_grad(base_name, accum);
-        skip_weight_grad = (grad == nullptr || !grad->Data);
     }
     if (!skip_weight_grad && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
@@ -297,8 +292,8 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     bool do_accumulate = false;
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         do_accumulate = (mAccumulateTensors.count(op.outputs[1].name) > 0);
-        if (!do_accumulate) {
-            if (auto base = base_param_from_grad(op.outputs[1].name)) {
+        if (!do_accumulate && mCurrentGraph) {
+            if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
                 do_accumulate = mAccumulateTensors.count("d_" + *base) > 0;
             }
         }

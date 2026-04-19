@@ -51,6 +51,18 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"res_ffn", TensorSlot::BlockResidualFFN},
     {"residual_ffn", TensorSlot::BlockResidualFFN},
     {"res_in", TensorSlot::BlockResidualFFN},
+    // MoE activations
+    {"router_logits", TensorSlot::BlockRouterLogits},
+    {"router_probs", TensorSlot::BlockRouterProbs},
+    {"routing_weights", TensorSlot::BlockRoutingWeights},
+    {"routing_indices", TensorSlot::BlockRoutingIndices},
+    {"permuted_input", TensorSlot::BlockPermutedInput},
+    {"scatter_indices", TensorSlot::BlockScatterIndices},
+    {"expert_gate_up", TensorSlot::BlockExpertGateUp},
+    {"expert_act", TensorSlot::BlockExpertAct},
+    {"expert_down", TensorSlot::BlockExpertDown},
+    {"moe_out", TensorSlot::BlockMoeOut},
+    {"moe_out_flat", TensorSlot::BlockMoeOut},
     // Block gradients
     {"d_ln1", TensorSlot::BlockDLN1},
     {"d_ln", TensorSlot::BlockDLN1},  // Alias for single-norm blocks (Mamba, MLP)
@@ -108,6 +120,17 @@ const char* slot_to_name(TensorSlot slot) {
         case TensorSlot::BlockMLPDown: return "mlp_down";
         case TensorSlot::BlockHOut: return "h_out";
         case TensorSlot::BlockResidualFFN: return "res_ffn";
+        // MoE activations
+        case TensorSlot::BlockRouterLogits: return "router_logits";
+        case TensorSlot::BlockRouterProbs: return "router_probs";
+        case TensorSlot::BlockRoutingWeights: return "routing_weights";
+        case TensorSlot::BlockRoutingIndices: return "routing_indices";
+        case TensorSlot::BlockPermutedInput: return "permuted_input";
+        case TensorSlot::BlockScatterIndices: return "scatter_indices";
+        case TensorSlot::BlockExpertGateUp: return "expert_gate_up";
+        case TensorSlot::BlockExpertAct: return "expert_act";
+        case TensorSlot::BlockExpertDown: return "expert_down";
+        case TensorSlot::BlockMoeOut: return "moe_out";
         case TensorSlot::BlockDLN1: return "d_ln1";
         case TensorSlot::BlockDQKV: return "d_qkv";
         case TensorSlot::BlockDAtt: return "d_att";

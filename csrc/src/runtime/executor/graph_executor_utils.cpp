@@ -11,6 +11,7 @@
 #include <string>
 
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/core/matmul_context.h"
 #include "runtime/core/model_config.h"
@@ -45,8 +46,9 @@ bool env_enabled(const char* name) {
     return std::string_view(value) != "0" && std::string_view(value) != "false";
 }
 
-// Gradient name parsing
-std::optional<std::string> base_param_from_grad(std::string_view name) {
+// Gradient name parsing (compile-time heuristic, always followed by a
+// validation check against the parameter store). See header for details.
+std::optional<std::string> base_param_from_grad_heuristic(std::string_view name) {
     if (!starts_with(name, "d_")) {
         return std::nullopt;
     }
@@ -68,6 +70,41 @@ std::optional<std::string> base_param_from_grad(std::string_view name) {
         base = base.substr(0, pos);
     }
     return base;
+}
+
+// Classifier-backed resolution: consults TensorKind instead of guessing from
+// the name shape. Returns the param name ONLY when kind == ParamGrad AND
+// base_param_tid points to a tid in the tensor_name_to_id map. In every other
+// case — ActivationGrad, AccumTemp, Scratch, etc. — returns nullopt, which is
+// what callers that intend to route through the parameter-gradient store want.
+//
+// This is the non-guessing replacement for the heuristic `base_param_from_grad`
+// above. The heuristic should be migrated away from every call site that has
+// access to the compiled graph.
+std::optional<std::string> base_param_from_grad_kind(int tensor_id, const CompiledGraph& graph) {
+    if (tensor_id < 0 || static_cast<std::size_t>(tensor_id) >= graph.tensor_meta.size()) {
+        return std::nullopt;
+    }
+    const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tensor_id)];
+    if (meta.kind != TensorKind::ParamGrad || meta.base_param_tid < 0) {
+        return std::nullopt;
+    }
+    // O(1) reverse via the tid->name vector populated at compile time. Hot-path
+    // dispatchers (matmul_backward, add_backward, …) hit this on every op, so a
+    // scan of tensor_name_to_id would be a real regression.
+    std::string_view nm = graph.name_for_tensor_id(meta.base_param_tid);
+    if (nm.empty()) {
+        return std::nullopt;
+    }
+    return std::string(nm);
+}
+
+std::optional<std::string> base_param_from_grad_kind(std::string_view name, const CompiledGraph& graph) {
+    auto it = graph.tensor_name_to_id.find(std::string(name));
+    if (it == graph.tensor_name_to_id.end()) {
+        return std::nullopt;
+    }
+    return base_param_from_grad_kind(it->second, graph);
 }
 
 // Block parameter parsing (e.g., "blocks[0].qkv_weight" -> layer_idx=0, param_name="qkv_weight")

@@ -376,12 +376,16 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             d_input_ptr = &grads.d_mlp_down;
         }
     } else if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight")) {
-        // LN1/norm: canonical target is prev layer's d_mlp_down
-        if (op.outputs.size() > 1 && op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
+        // LN1/norm: gradient flows to the previous block's output. Gemma4 uses
+        // a dedicated d_h_out buffer for that connector; older architectures
+        // reuse d_mlp_down.
+        if (op.outputs.size() > 1) {
             const int prev_layer = op.outputs[1].layer_idx;
             if (prev_layer >= 0) {
                 auto& prev_grads = mRunState.simplified_grads(prev_layer);
-                if (prev_grads.d_mlp_down.Data) {
+                if (prev_grads.d_h_out.Data) {
+                    d_input_ptr = &prev_grads.d_h_out;
+                } else if (op.outputs[1].slot == TensorSlot::BlockDMLPDown && prev_grads.d_mlp_down.Data) {
                     d_input_ptr = &prev_grads.d_mlp_down;
                 }
             }
@@ -535,7 +539,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         const int prev_layer = op.outputs[1].layer_idx;
         if (prev_layer >= 0) {
             auto& prev_grads = mRunState.simplified_grads(prev_layer);
-            if (prev_grads.d_res_ffn.Data && prev_grads.d_res_ffn.Data != d_input.Data) {
+            if (!prev_grads.d_h_out.Data && prev_grads.d_res_ffn.Data && prev_grads.d_res_ffn.Data != d_input.Data) {
                 prev_grads.d_res_ffn.Data = d_input.Data;
             }
         }

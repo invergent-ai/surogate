@@ -481,7 +481,7 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
             }
 
             auto is_param_grad = [&](const std::string& name) {
-                if (auto base = base_param_from_grad(name)) {
+                if (auto base = base_param_from_grad_heuristic(name)) {
                     return mWeights.has(*base);
                 }
                 return false;

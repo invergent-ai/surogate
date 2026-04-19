@@ -55,8 +55,8 @@ void CompiledExecutor::dispatch_bias_add_backward(const CompiledOp& op) {
 
         Tensor& d_bias = ensure_output_tensor(op.outputs[1]);
         bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
-        if (!accumulate && !op.outputs[1].name.empty()) {
-            if (auto base = base_param_from_grad(op.outputs[1].name)) {
+        if (!accumulate && !op.outputs[1].name.empty() && mCurrentGraph) {
+            if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
                 accumulate = mAccumulateTensors.count("d_" + *base) > 0;
             }
         }

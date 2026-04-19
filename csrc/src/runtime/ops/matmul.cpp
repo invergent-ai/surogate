@@ -287,22 +287,18 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     const int layer_idx = op.attrs.layer_idx;
     const bool allow_quant = op.attrs.allow_quant;
 
-    // Check if weight gradient should be skipped BEFORE allocating (frozen weights in LoRA mode)
+    // Check if weight gradient should be skipped BEFORE allocating (frozen weights in LoRA mode).
+    // Classifier-backed: ParamGrad tids carry the base param name on TensorMeta, the single
+    // source of truth. ActivationGrad / AccumTemp / Scratch return nullopt, which correctly
+    // skips `mGrads.get_param_grad` for non-parameter outputs.
     bool skip_weight_grad = true;
     const std::string& dB_name = op.outputs.size() > 1 ? op.outputs[1].name : "";
-    if (!dB_name.empty()) {
-        std::string weight_name;
-        if (auto base = base_param_from_grad(dB_name)) {
-            weight_name = *base;
-        } else {
-            weight_name = dB_name;
-            if (weight_name.rfind("d_", 0) == 0) {
-                weight_name = weight_name.substr(2);
-            }
+    if (!dB_name.empty() && mCurrentGraph) {
+        if (auto weight_name = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
+            bool accum = false;
+            Tensor* grad = mGrads.get_param_grad(*weight_name, accum);
+            skip_weight_grad = (grad == nullptr || !grad->Data);
         }
-        bool accum = false;
-        Tensor* grad = mGrads.get_param_grad(weight_name, accum);
-        skip_weight_grad = (grad == nullptr || !grad->Data);
     }
 
     if (skip_lm_head) {
@@ -326,6 +322,10 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     // (backward compiler can't track saved tensor shapes). Derive from runtime inputs.
     auto ensure_backward_output =
         [&](const TensorRef& ref, const Tensor& shape_source, bool allow_shape_fallback) -> Tensor& {
+        const bool debug_mlp_bwd = []() {
+            const char* env = std::getenv("SUROGATE_DEBUG_MATMUL_BWD");
+            return env && std::string(env) != "0";
+        }();
         const auto expected_nelem = shape_source.nelem();
         const auto expected_dtype = shape_source.DType;
         const std::vector<long> expected_shape(shape_source.Sizes.begin(),
@@ -336,6 +336,16 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             fill_zero(t, mRunState.MainStream);
             mTemps.push_back(t);
             store_tensor(ref, t);
+            if (debug_mlp_bwd && ref.name.find("mlp_x_flat") != std::string::npos) {
+                std::fprintf(stderr,
+                             "[MATMUL_BWD_OUT] name=%s path=fallback ptr=%p shape=[%ld,%ld] shape_empty=%d tid=%d\n",
+                             ref.name.c_str(),
+                             static_cast<void*>(t.Data),
+                             expected_shape.size() > 0 ? expected_shape[0] : -1,
+                             expected_shape.size() > 1 ? expected_shape[1] : -1,
+                             ref.shape.empty() ? 1 : 0,
+                             ref.tensor_id);
+            }
             return mTensors[ref.tensor_id];
         };
 
@@ -344,12 +354,41 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         }
 
         Tensor& out_ref = ensure_output_tensor(ref);
-        if (out_ref.DType == expected_dtype && out_ref.nelem() == expected_nelem) {
+        // Require actual storage, not just matching metadata. `ensure_output_tensor`'s
+        // Mapped/fuzzy fallbacks can return a tensor with the right shape/dtype but a
+        // null `Data` pointer (e.g., when a slot is configured to be recomputed or
+        // shared-but-not-yet-populated). Running a cuBLAS GEMM on such a tensor aborts
+        // with CUBLAS_STATUS_INVALID_VALUE. Treat a null-storage result as "not ready"
+        // and fall through to the temp allocation path below.
+        if (out_ref.Data && out_ref.DType == expected_dtype && out_ref.nelem() == expected_nelem) {
+            if (debug_mlp_bwd && ref.name.find("mlp_x_flat") != std::string::npos) {
+                std::fprintf(stderr,
+                             "[MATMUL_BWD_OUT] name=%s path=ensure ptr=%p nelem=%ld shape_empty=%d tid=%d\n",
+                             ref.name.c_str(),
+                             static_cast<void*>(out_ref.Data),
+                             out_ref.nelem(),
+                             ref.shape.empty() ? 1 : 0,
+                             ref.tensor_id);
+            }
             return out_ref;
+        }
+        if (!out_ref.Data && allow_shape_fallback) {
+            return alloc_temp_fallback();
         }
 
         if (!allow_shape_fallback) {
             throw std::runtime_error("matmul_backward: weight-grad output tensor shape/dtype mismatch for " + ref.name);
+        }
+        if (debug_mlp_bwd && ref.name.find("mlp_x_flat") != std::string::npos) {
+            std::fprintf(stderr,
+                         "[MATMUL_BWD_OUT] name=%s path=shape_mismatch current_ptr=%p current_nelem=%ld expected=%ld "
+                         "shape_empty=%d tid=%d\n",
+                         ref.name.c_str(),
+                         static_cast<void*>(out_ref.Data),
+                         out_ref.nelem(),
+                         expected_nelem,
+                         ref.shape.empty() ? 1 : 0,
+                         ref.tensor_id);
         }
         return alloc_temp_fallback();
     };
@@ -368,9 +407,52 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         return;
     }
 
+    // Defensive invariant: matmul_backward's two outputs (dA = activation grad,
+    // dB = parameter grad) are written by a SINGLE cuBLAS GEMM and therefore
+    // MUST live in disjoint storage. Aliasing them — which previously occurred
+    // when `ensure_output_tensor`'s fuzzy fallback landed both on the same
+    // simplified-grads slot — produces a cuBLAS INVALID_VALUE at dispatch time
+    // on some shapes and silent gradient corruption on others. If we detect an
+    // alias here, reallocate dA into a fresh temp. This is a safety net —
+    // the root fix is classifier-driven routing (TensorKind) at resolution time
+    // so the aliasing can't be produced in the first place. Phase 1+ migrates
+    // callers to that path one at a time; this check catches anything that
+    // slipped through.
+    if (dA_ptr && dB_ptr && dA_ptr->Data && dA_ptr->Data == dB_ptr->Data) {
+        std::vector<long> a_shape(a.Sizes.begin(), a.Sizes.begin() + a.Rank);
+        Tensor dA_fresh = mRunState.temp_alloc(a.DType, a_shape, "matmul_bwd_dA_disalias");
+        fill_zero(dA_fresh, mRunState.MainStream);
+        mTemps.push_back(dA_fresh);
+        store_tensor(op.outputs[0], dA_fresh);
+        dA_ptr = &mTensors[static_cast<std::size_t>(op.outputs[0].tensor_id)];
+        std::fprintf(stderr,
+                     "[matmul_backward][disalias] %s and %s collided on %p — dA reallocated to %p\n",
+                     op.outputs[0].name.c_str(),
+                     op.outputs[1].name.c_str(),
+                     static_cast<void*>(dB_ptr->Data),
+                     static_cast<void*>(dA_ptr->Data));
+    }
+
+    // Bulk debug: log every matmul_backward's output pointers when requested.
+    if (const char* env = std::getenv("SUROGATE_DEBUG_MATMUL_BWD_ALL")) {
+        (void)env;
+        std::fprintf(stderr,
+                     "[matmul_backward] op=%s dA_name=%s dB_name=%s dA_ptr=%p dB_ptr=%p a=%p b=%p d_out=%p\n",
+                     op.op_id.c_str(),
+                     op.outputs.empty() ? "" : op.outputs[0].name.c_str(),
+                     op.outputs.size() < 2 ? "" : op.outputs[1].name.c_str(),
+                     static_cast<void*>(dA_ptr ? dA_ptr->Data : nullptr),
+                     static_cast<void*>(dB_ptr ? dB_ptr->Data : nullptr),
+                     static_cast<void*>(a.Data),
+                     static_cast<void*>(b.Data),
+                     static_cast<void*>(d_out.Data));
+    }
+
     bool do_accumulate = mAccumulateTensors.count(dB_name) > 0;
-    if (!do_accumulate && !dB_name.empty()) {
-        if (auto base = base_param_from_grad(dB_name)) {
+    if (!do_accumulate && !dB_name.empty() && mCurrentGraph) {
+        // Classifier-backed accum lookup: the name of the underlying parameter
+        // comes from TensorKind::ParamGrad's base_param_tid — never a string-strip.
+        if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
             do_accumulate = mAccumulateTensors.count("d_" + *base) > 0;
         }
     }

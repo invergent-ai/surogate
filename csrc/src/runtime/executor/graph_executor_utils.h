@@ -30,8 +30,32 @@ bool ends_with(std::string_view value, std::string_view suffix);
 // Environment variable check
 bool env_enabled(const char* name);
 
-// Gradient name parsing
-std::optional<std::string> base_param_from_grad(std::string_view name);
+// *** COMPILE-TIME HEURISTIC ONLY — DO NOT CALL FROM RUNTIME DISPATCHERS. ***
+//
+// Returns Some(base) for ANY name starting with `d_` (after stripping
+// `_from_N` / `_accum_N`). Does NOT verify the base is a real parameter — that
+// is the caller's job (e.g. `mWeights.has(*base)` after the call). This
+// pattern (heuristic + validate) is acceptable at compile time where we have
+// no compiled graph yet. Any runtime dispatcher that has access to the
+// compiled graph MUST use `base_param_from_grad_kind()` instead; the
+// classifier is the only source of truth for "is this a parameter gradient?".
+//
+// Named `_heuristic` so greps for "base_param_from_grad(" land on the
+// authoritative classifier overload first and nobody accidentally re-
+// introduces the misclassification bug class we retired.
+std::optional<std::string> base_param_from_grad_heuristic(std::string_view name);
+
+struct CompiledGraph;  // fwd
+
+// Classifier-backed resolution. Returns the parameter name ONLY when the
+// tensor has TensorKind::ParamGrad. For ActivationGrad / AccumTemp /
+// Scratch / etc. returns nullopt — which is the correct shape for callers
+// that want to route tensors through `mGrads.get_param_grad`.
+//
+// This is the blessed runtime API. Use it from every op dispatcher that
+// needs to ask "is this output a real parameter gradient?".
+std::optional<std::string> base_param_from_grad_kind(int tensor_id, const CompiledGraph& graph);
+std::optional<std::string> base_param_from_grad_kind(std::string_view name, const CompiledGraph& graph);
 
 // Block parameter parsing (e.g., "blocks[0].qkv_weight" -> layer_idx=0, param_name="qkv_weight")
 bool parse_block_param(std::string_view name, int& layer_idx, std::string& param_name);

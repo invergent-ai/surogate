@@ -264,6 +264,7 @@ Tensor* resolve_block_gradient_tensor(ExecState& st,
     if (field == "mlp_down" || field == "mlp_down_flat") {
         return map_tensor(grads.d_mlp_down);
     }
+    if (field == "h_out") return map_tensor(grads.d_h_out);
     if (field == "ln2" || field == "ln2_flat") return map_tensor(grads.d_ln2);
     if (field == "res_att") return map_tensor(grads.d_res_att);
     if (field == "res_ffn" || field == "res_in") return map_tensor(grads.d_res_ffn);
@@ -338,7 +339,7 @@ Tensor& ensure_tensor(ExecState& st, const std::string& name, ETensorDType dtype
 
 Tensor& resolve_param_tensor(ExecState& st, const std::string& name) {
     if (name.find("rope_freqs") != std::string::npos) {
-        auto& freqs = st.rs.non_block_activations().freq_cis;
+        auto& freqs = st.rs.rope_freqs(name);
         if (!freqs.Data) {
             throw std::runtime_error("DSL graph executor: RoPE frequencies not allocated");
         }

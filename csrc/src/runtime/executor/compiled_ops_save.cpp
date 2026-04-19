@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // CompiledExecutor: tensor save / persistence methods.
-// Extracted from compiled_ops.cpp to reduce file size; behavior unchanged.
 
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <algorithm>
 #include <array>
@@ -44,6 +44,16 @@
 #include "utilities/dtype.h"
 
 namespace dsl {
+
+// Historical note: `strip_autodiff_accum_suffix` and
+// `should_alias_autodiff_accum_name` lived here. Both were name-based
+// heuristics that attempted to detect autodiff accumulator variants
+// (`d_foo_from_N` / `d_foo_accum_N`) by string-matching and then alias them
+// to the base `d_foo` slot. The heuristic misclassified intermediate
+// gradients as parameter grads — exactly the bug class we retired — so both
+// helpers have been deleted. `ensure_output_tensor` now consults
+// `TensorMeta::kind == AccumTemp` directly; the classifier is authoritative
+// and accumulators always get their own buffer.
 
 void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
     // Copy MoE tensors from this layer to persistent storage before stack restore.
@@ -260,6 +270,18 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         }
     };
 
+    // A `_flat` suffix on a block-level field means "view the tensor as 2D by
+    // collapsing the first two dims" — this is just a reinterpretation of the
+    // same storage. `flatten_2d()` applies that view when needed; we collapse
+    // the field naming lookup into a single source of truth (the slot
+    // registry) and keep the flat-ness as a separate boolean.
+    auto flatten_2d = [&](Tensor t) -> Tensor {
+        if (t.Rank >= 3) {
+            return view_tensor(t, {t.Sizes[0] * t.Sizes[1], t.Sizes[2]});
+        }
+        return t;
+    };
+
     auto resolve_source = [&](const std::string& name) -> std::optional<Tensor> {
         if (mCurrentGraph) {
             int tid = mCurrentGraph->find_tensor_id(name);
@@ -267,75 +289,50 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
                 return mTensors[tid];
             }
         }
-        if (name == "token_ids") {
-            return mRunState.Inputs;
+
+        // Global / IO slots via the shared helper. `_flat` aliases aren't in
+        // the static name→slot table (they have distinct 2D shapes) — detect
+        // them by suffix and flatten after resolution.
+        TensorSlot glob_slot = builtin_slot_from_name(name);
+        bool name_is_flat = false;
+        if (glob_slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
+            TensorSlot base_slot = builtin_slot_from_name(name.substr(0, name.size() - 5));
+            if (global_activation_ptr(mRunState, base_slot)) {
+                glob_slot = base_slot;
+                name_is_flat = true;
+            }
         }
-        if (name == "position_ids") {
-            return mRunState.PositionIDs;
+        if (Tensor* t = global_activation_ptr(mRunState, glob_slot)) {
+            return name_is_flat ? flatten_2d(*t) : *t;
+        }
+        // FreqCis opts out of the helper because it depends on the original
+        // name (qualified or not) for multi-table models.
+        if (glob_slot == TensorSlot::FreqCis) {
+            return mRunState.rope_freqs(name);
+        }
+        // Qualified rope references (blocks[N].rope_freqs, …) still need the name.
+        if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+            return mRunState.rope_freqs(name);
         }
 
         int layer_idx = -1;
         std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
-                return std::nullopt;
-            }
-            const std::string base_field = strip_ssa_suffix(field);
-            auto& acts = mRunState.simplified_acts(layer_idx);
-            if (base_field == "ln1_rstd" || base_field == "ln_rstd") return acts.ln1_rstd;
-            if (base_field == "ln2_rstd") return acts.ln2_rstd;
-            if (base_field == "q_rstd") return acts.q_rstd;
-            if (base_field == "k_rstd") return acts.k_rstd;
-            if (base_field == "lse") return acts.lse;
-            if (base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat")
-                return acts.ln1;
-            if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
-            if (base_field == "qkv" || base_field == "qkv_norm") return acts.qkv;
-            if (base_field == "qkv_rope") {
-                Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                return src;
-            }
-            if (base_field == "qkv_flat") {
-                Tensor qkv = acts.qkv;
-                return view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
-            }
-            if (base_field == "att" || base_field == "att_flat") return acts.att;
-            if (base_field == "att_out" || base_field == "att_out_flat") return acts.att_out;
-            if (base_field == "mlp_up" || base_field == "mlp_up_flat") return acts.mlp_up;
-            if (base_field == "swiglu") return acts.swiglu;
-            if (base_field == "swiglu_flat") {
-                Tensor swiglu = acts.swiglu;
-                return view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
-            }
-            if (base_field == "mlp_down" || base_field == "mlp_down_flat") return acts.mlp_down;
-            if (base_field == "res_att" || base_field == "residual_att") return acts.residual_att;
-            if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
-                Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
-                return res;
-            }
-            if (base_field == "router_logits") return acts.router_logits;
-            if (base_field == "router_probs") return acts.router_probs;
-            if (base_field == "routing_weights") return acts.routing_weights;
-            if (base_field == "routing_indices") return acts.routing_indices;
-            if (base_field == "permuted_input") return acts.permuted_input;
-            if (base_field == "scatter_indices") return acts.scatter_indices;
-            if (base_field == "expert_gate_up") return acts.expert_gate_up;
-            if (base_field == "expert_act") return acts.expert_act;
-            if (base_field == "expert_down") return acts.expert_down;
-            if (base_field == "moe_out" || base_field == "moe_out_flat") return acts.moe_out;
-        } else if (name == "ln_final" || name == "xF") {
-            return mRunState.non_block_activations().ln_final;
-        } else if (name == "final_residual" || name == "residual_final") {
-            return mRunState.get_final_residual();
-        } else if (name == "xF_flat") {
-            Tensor ln_final = mRunState.non_block_activations().ln_final;
-            return view_tensor(ln_final, {ln_final.Sizes[0] * ln_final.Sizes[1], ln_final.Sizes[2]});
-        } else if (name == "ln_final_rstd") {
-            return mRunState.non_block_activations().ln_final_rstd;
-        } else if (name == "encoded" || name == "x0") {
-            return mRunState.non_block_activations().encoded;
-        } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
-            return mRunState.non_block_activations().freq_cis;
+        if (!parse_block_param(name, layer_idx, field)) {
+            return std::nullopt;
+        }
+        if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
+            return std::nullopt;
+        }
+        const std::string base_field = strip_ssa_suffix(field);
+        const bool is_flat = (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0);
+        const TensorSlot slot = builtin_slot_from_name(base_field);
+
+        // Block-scope activation (including MoE slots) via the shared helper.
+        // `is_flat` applies a 2D view when the caller requested `<field>_flat`
+        // on a 3D buffer. MoE slots like `moe_out` are already 2D, so
+        // flatten_2d is a no-op for them (guarded by Rank >= 3).
+        if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
+            return is_flat ? flatten_2d(*t) : *t;
         }
 
         return std::nullopt;
@@ -347,7 +344,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (!parse_block_param(name, layer_idx, field)) {
             return false;
         }
-        const std::string base_field = strip_ssa_suffix(field);
+        std::string base_field = strip_ssa_suffix(field);
         const long B = (mB > 0) ? mB : mRunState.B;
         const long T = (mT > 0) ? mT : mRunState.T;
         if (B <= 0 || T <= 0) {
@@ -362,53 +359,66 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         const long AttnDim = Hq * Hs;
         const long MUp = mConfig.mlp_up_rows();
 
-        std::vector<long> shape;
-        if (base_field == "qkv_flat" || base_field == "qkv_biased") {
-            shape = {B * T, QKV};
-        } else if (base_field == "ln1_flat" || base_field == "ln2_flat" || base_field == "ln_flat") {
-            shape = {B * T, C};
-        } else if (base_field == "att_out_flat") {
-            shape = {B * T, C};
-        } else if (base_field == "att_flat") {
-            shape = {B * T, AttnDim};
-        } else if (base_field == "mlp_up_flat") {
-            shape = {B * T, MUp};
-        } else if (base_field == "mlp_down_flat") {
-            shape = {B * T, C};
-        } else if (base_field == "swiglu_flat") {
-            shape = {B * T, D};
-        } else if (base_field == "ln1" || base_field == "ln2" || base_field == "ln" || base_field == "res_att" ||
-                   base_field == "residual_att" || base_field == "res_ffn" || base_field == "residual_ffn" ||
-                   base_field == "res_in" || base_field == "att_out" || base_field == "mlp_down") {
-            shape = {B, T, C};
-        } else if (base_field == "ln1_rstd" || base_field == "ln2_rstd" || base_field == "ln_rstd") {
-            shape = {B, T};
-        } else if (base_field == "mlp_up") {
-            shape = {B, T, MUp};
-        } else if (base_field == "swiglu") {
-            shape = {B, T, D};
-        } else if (base_field == "qkv" || base_field == "qkv_rope" || base_field == "qkv_norm") {
-            shape = {B, T, QKV};
-        } else if (base_field == "att") {
-            shape = {B, T, AttnDim};
-        } else if (base_field == "q_rstd") {
-            shape = {B, T, Hq};
-        } else if (base_field == "k_rstd") {
-            shape = {B, T, Hkv};
-        } else if (base_field == "lse") {
-            shape = {B, Hq, T};
-        } else {
-            return false;
+        // `_flat` fields share the backing buffer of their 3D counterpart but
+        // carry a 2D shape (B*T, innermost). Strip the suffix so the slot
+        // enum dispatch covers both variants in one table.
+        const bool is_flat = (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0);
+        if (is_flat) {
+            base_field = base_field.substr(0, base_field.size() - 5);
         }
 
+        std::vector<long> shape;
         ETensorDType dtype = ETensorDType::BF16;
         if (mConfig.NumLayers > 0) {
             dtype = mRunState.simplified_acts(0).ln1.DType;
         }
-        if (base_field == "ln1_rstd" || base_field == "ln2_rstd" || base_field == "ln_rstd" || base_field == "q_rstd" ||
-            base_field == "k_rstd" || base_field == "lse") {
-            dtype = ETensorDType::FP32;
+
+        // Dispatch the per-slot shape formula. `base_field` at this point has
+        // both the SSA suffix and any `_flat` suffix stripped, so a single
+        // `builtin_slot_from_name()` call covers every alias.
+        switch (builtin_slot_from_name(base_field)) {
+            case TensorSlot::BlockLN1:
+            case TensorSlot::BlockLN2:
+            case TensorSlot::BlockAttOut:
+            case TensorSlot::BlockMLPDown:
+            case TensorSlot::BlockResidualAtt:
+            case TensorSlot::BlockResidualFFN:
+            case TensorSlot::BlockHOut:
+                shape = is_flat ? std::vector<long>{B * T, C} : std::vector<long>{B, T, C};
+                break;
+            case TensorSlot::BlockMLPUp:
+                shape = is_flat ? std::vector<long>{B * T, MUp} : std::vector<long>{B, T, MUp};
+                break;
+            case TensorSlot::BlockSwiGLU:
+                shape = is_flat ? std::vector<long>{B * T, D} : std::vector<long>{B, T, D};
+                break;
+            case TensorSlot::BlockQKV:
+            case TensorSlot::BlockQKVRoPE:
+                shape = is_flat ? std::vector<long>{B * T, QKV} : std::vector<long>{B, T, QKV};
+                break;
+            case TensorSlot::BlockAtt:
+                shape = is_flat ? std::vector<long>{B * T, AttnDim} : std::vector<long>{B, T, AttnDim};
+                break;
+            case TensorSlot::BlockLN1RSTD:
+            case TensorSlot::BlockLN2RSTD:
+                shape = {B, T};
+                dtype = ETensorDType::FP32;
+                break;
+            case TensorSlot::BlockQRSTD:
+                shape = {B, T, Hq};
+                dtype = ETensorDType::FP32;
+                break;
+            case TensorSlot::BlockKRSTD:
+                shape = {B, T, Hkv};
+                dtype = ETensorDType::FP32;
+                break;
+            case TensorSlot::BlockLSE:
+                shape = {B, Hq, T};
+                dtype = ETensorDType::FP32;
+                break;
+            default: return false;  // unknown slot — can't infer bytes
         }
+
         const std::size_t nelem = shape_nelem(shape);
         out_bytes = nelem * static_cast<std::size_t>(get_dtype_size(dtype));
         return out_bytes > 0;
@@ -448,6 +458,9 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         return false;
     };
 
+    // Same predicates as save_tensors(), duplicated here because this function
+    // (prepare_saved_buffers_for_capture) runs in a different context. They
+    // share a slot-enum definition; names are NOT re-compared as strings.
     auto is_lora_hook_activation = [&](const std::string& tensor_name) -> bool {
         if (!mLoRAConfig) {
             return false;
@@ -457,8 +470,60 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (!parse_block_param(tensor_name, layer_idx, field)) {
             return false;
         }
-        const std::string base = strip_ssa_suffix(field);
-        return (base == "swiglu" || base == "swiglu_flat" || base == "att" || base == "att_flat");
+        const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+        return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
+    };
+    auto is_forced_persist_global = [&](const std::string& n) -> bool {
+        TensorSlot slot = builtin_slot_from_name(n);
+        if (slot == TensorSlot::Mapped && n.size() >= 5 && n.compare(n.size() - 5, 5, "_flat") == 0) {
+            slot = builtin_slot_from_name(n.substr(0, n.size() - 5));
+        }
+        switch (slot) {
+            case TensorSlot::LNFinal:
+            case TensorSlot::LNFinalRSTD:
+            case TensorSlot::FinalResidual: return true;
+            default: return false;
+        }
+    };
+    auto is_moe_tensor_name = [&](const std::string& n) -> bool {
+        // Per-block MoE slots (router_logits, routing_weights, permuted_input,
+        // expert_*, moe_out, …) all have dedicated TensorSlot enum values —
+        // dispatched via `builtin_slot_from_name(probe)` in one place.
+        //
+        // The name-based tail covers MoE side-channels that are deliberately
+        // NOT modelled as per-block TensorSlot values:
+        //
+        //   * `moe_expert_offsets`, `moe_gather_indices` — global host/device
+        //     scratch tensors shared across layers (see `register_external_names`
+        //     in graph_compiler). They have no per-block backing buffer in
+        //     SimplifiedLayerActivations, so they can't fit the block-slot
+        //     model. Kept name-based until the runtime either adds a
+        //     `GlobalMoeOffsets` / `GlobalMoeGather` slot group or migrates
+        //     them behind a dedicated MoE-metadata helper.
+        //   * `ep_*` — expert-parallel internal communication names produced
+        //     by runtime EP code. These never touch the slot registry; they
+        //     are pure C++ bookkeeping and don't need a TensorSlot.
+        //
+        // If a new MoE tensor shows up, decide first whether it's per-block
+        // (extend the TensorSlot enum + this switch) or global/EP (add to
+        // the name-based tail below, with the same reasoning).
+        int lid = -1;
+        std::string field;
+        const std::string probe = parse_block_param(n, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(n);
+        switch (builtin_slot_from_name(probe)) {
+            case TensorSlot::BlockRouterLogits:
+            case TensorSlot::BlockRouterProbs:
+            case TensorSlot::BlockRoutingWeights:
+            case TensorSlot::BlockRoutingIndices:
+            case TensorSlot::BlockPermutedInput:
+            case TensorSlot::BlockScatterIndices:
+            case TensorSlot::BlockExpertGateUp:
+            case TensorSlot::BlockExpertAct:
+            case TensorSlot::BlockExpertDown:
+            case TensorSlot::BlockMoeOut: return true;
+            default: break;
+        }
+        return probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
     };
 
     for (const auto& name : save_list) {
@@ -470,14 +535,8 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         // gradient computation — BUT only when forward replay is NOT active.
         // When replay regenerates these tensors, no persistent buffer is needed.
         const bool force_lora_hook = !forward_replay_active && is_lora_hook_activation(name);
-        const bool force_persist_name =
-            (name == "xF_flat" || name == "xF" || name == "ln_final" || name == "ln_final_rstd" ||
-             name == "residual_final" || name == "final_residual" || force_lora_hook);
-        const bool is_moe_tensor =
-            (name.find("moe_") != std::string::npos || name.find("scatter_indices") != std::string::npos ||
-             name.find("routing_weights") != std::string::npos || name.find("routing_indices") != std::string::npos ||
-             name.find("router_probs") != std::string::npos || name.find("router_logits") != std::string::npos ||
-             name.find("permuted_input") != std::string::npos || name.find("expert_") != std::string::npos);
+        const bool force_persist_name = is_forced_persist_global(name) || force_lora_hook;
+        const bool is_moe_tensor = is_moe_tensor_name(name);
         const bool prefer_live = prefer_live_tensor(name);
         const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
         const bool need_persist = should_persist(name, prefer_live, force_persist || force_persist_name);
@@ -509,24 +568,28 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             ensure_buffer(name, inferred_bytes);
             continue;
         }
-        // Infer sizes for non-block tensors (xF_flat, ln_final, etc.)
+        // Infer sizes for non-block tensors. Dispatch on the slot enum so
+        // every alias (including `_flat` suffixes not in the static name→slot
+        // table) resolves to the same shape formula in one place.
         {
             const long B = (mB > 0) ? mB : mRunState.B;
             const long T = (mT > 0) ? mT : mRunState.T;
             const long C = mConfig.HiddenSize;
             if (B > 0 && T > 0 && C > 0) {
-                const std::size_t elem_size = static_cast<std::size_t>(get_dtype_size(ETensorDType::BF16));
+                TensorSlot slot = builtin_slot_from_name(name);
+                if (slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
+                    slot = builtin_slot_from_name(name.substr(0, name.size() - 5));
+                }
+                const std::size_t elem_bf16 = static_cast<std::size_t>(get_dtype_size(ETensorDType::BF16));
                 std::size_t nbytes = 0;
-                if (name == "xF_flat") {
-                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
-                } else if (name == "ln_final" || name == "xF") {
-                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
-                } else if (name == "ln_final_rstd") {
-                    nbytes = static_cast<std::size_t>(B * T) * sizeof(float);
-                } else if (name == "encoded" || name == "x0") {
-                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
-                } else if (name == "final_residual" || name == "residual_final") {
-                    nbytes = static_cast<std::size_t>(B * T * C) * elem_size;
+                switch (slot) {
+                    case TensorSlot::LNFinal:        // xF, ln_final (+ xF_flat / ln_final_flat via suffix strip)
+                    case TensorSlot::FinalResidual:  // final_residual, residual_final
+                    case TensorSlot::Encoded:        // x0, encoded
+                        nbytes = static_cast<std::size_t>(B * T * C) * elem_bf16;
+                        break;
+                    case TensorSlot::LNFinalRSTD: nbytes = static_cast<std::size_t>(B * T) * sizeof(float); break;
+                    default: break;
                 }
                 if (nbytes > 0) {
                     ensure_buffer(name, nbytes);
@@ -615,12 +678,15 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             // When forward replay is active, ALL block tensors will be regenerated
             if (forward_replay_active) {
                 // Qwen3.5 replay drifts at LN1 if we drop the exact original normalized
-                // activation into metadata-only mode. Keep these tensors persistent so
-                // replay can consume the saved forward values instead of recomputing them.
-                if (is_qwen3_5_model &&
-                    (base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat" ||
-                     base_field == "ln1_rstd" || base_field == "ln_rstd")) {
-                    return false;
+                // activation into metadata-only mode. Keep those tensors persistent so
+                // replay consumes the saved forward values instead of recomputing them.
+                // Dispatch via slot enum so any alias (`ln1_flat`, `ln`, `ln_flat`,
+                // `ln1_rstd`, `ln_rstd`) maps to the same decision in one place.
+                if (is_qwen3_5_model) {
+                    const TensorSlot slot = builtin_slot_from_name(base_field);
+                    if (slot == TensorSlot::BlockLN1 || slot == TensorSlot::BlockLN1RSTD) {
+                        return false;
+                    }
                 }
                 return true;
             }
@@ -741,6 +807,10 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         (*mSaved)[name] = src;
     };
 
+    // LoRA-hook activations (att, swiglu) are the tensors the LoRA backward
+    // pass reads directly — they must survive forward→backward even when
+    // recompute is enabled. Dispatch on the slot enum: any block-scope slot
+    // that corresponds to a LoRA input qualifies.
     auto is_lora_hook_activation = [&](const std::string& tensor_name) -> bool {
         if (!mLoRAConfig) {
             return false;
@@ -750,8 +820,27 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (!parse_block_param(tensor_name, layer_idx, field)) {
             return false;
         }
-        const std::string base = strip_ssa_suffix(field);
-        return (base == "swiglu" || base == "swiglu_flat" || base == "att" || base == "att_flat");
+        const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+        return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
+    };
+
+    // The set of globals that must always be persisted (even when recompute
+    // is enabled) — the lm-head backward reads from these and can't replay
+    // them. Encoded here as slot-enum dispatch; `xF_flat` is the one name
+    // without a dedicated TensorSlot (it's a 2D view of LNFinal).
+    auto is_forced_persist_global = [&](const std::string& n) -> bool {
+        // Resolve the slot, honouring `_flat` suffix aliases that aren't in
+        // the static name→slot table (they carry their own 2D shape).
+        TensorSlot slot = builtin_slot_from_name(n);
+        if (slot == TensorSlot::Mapped && n.size() >= 5 && n.compare(n.size() - 5, 5, "_flat") == 0) {
+            slot = builtin_slot_from_name(n.substr(0, n.size() - 5));
+        }
+        switch (slot) {
+            case TensorSlot::LNFinal:  // covers xF, ln_final, xF_flat, ln_final_flat
+            case TensorSlot::LNFinalRSTD:
+            case TensorSlot::FinalResidual: return true;
+            default: return false;
+        }
     };
 
     for (const auto& name : save_list) {
@@ -759,9 +848,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         // gradient computation — BUT only when forward replay is NOT active.
         // When replay regenerates these tensors, no persistent buffer is needed.
         const bool force_lora_hook = !forward_replay_active && is_lora_hook_activation(name);
-        const bool force_persist_name =
-            (name == "xF_flat" || name == "xF" || name == "ln_final" || name == "ln_final_rstd" ||
-             name == "residual_final" || name == "final_residual" || force_lora_hook);
+        const bool force_persist_name = is_forced_persist_global(name) || force_lora_hook;
         const bool prefer_live = prefer_live_tensor(name);
         // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed),
         // unless we are forcing a persistent copy to replace metadata-only entries.
@@ -786,163 +873,116 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             }
         }
         if (found_tensor) {
-            const bool is_moe_tensor =
-                (name.find("moe_") != std::string::npos || name.find("ep_") != std::string::npos ||
-                 name.find("scatter_indices") != std::string::npos ||
-                 name.find("routing_weights") != std::string::npos ||
-                 name.find("routing_indices") != std::string::npos || name.find("router_probs") != std::string::npos ||
-                 name.find("router_logits") != std::string::npos || name.find("permuted_input") != std::string::npos ||
-                 name.find("expert_") != std::string::npos);
+            // Same MoE predicate as `is_moe_tensor_name` in the sibling
+            // prepare_saved_buffers_for_capture method — kept inline here
+            // instead of lifted to a shared helper because the two lambdas
+            // live in different scopes. See the commentary on
+            // `is_moe_tensor_name` for the MoE-side-channel deferral
+            // (moe_expert_offsets / moe_gather_indices / ep_* remain
+            // name-based by design; everything per-block is enum-driven).
+            int moe_lid = -1;
+            std::string moe_field;
+            const std::string moe_probe =
+                parse_block_param(name, moe_lid, moe_field) ? strip_ssa_suffix(moe_field) : strip_ssa_suffix(name);
+            bool is_moe_tensor = false;
+            switch (builtin_slot_from_name(moe_probe)) {
+                case TensorSlot::BlockRouterLogits:
+                case TensorSlot::BlockRouterProbs:
+                case TensorSlot::BlockRoutingWeights:
+                case TensorSlot::BlockRoutingIndices:
+                case TensorSlot::BlockPermutedInput:
+                case TensorSlot::BlockScatterIndices:
+                case TensorSlot::BlockExpertGateUp:
+                case TensorSlot::BlockExpertAct:
+                case TensorSlot::BlockExpertDown:
+                case TensorSlot::BlockMoeOut: is_moe_tensor = true; break;
+                default: break;
+            }
+            if (!is_moe_tensor) {
+                is_moe_tensor =
+                    moe_probe == "moe_expert_offsets" || moe_probe == "moe_gather_indices" || name.rfind("ep_", 0) == 0;
+            }
             const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
             save_tensor_with_policy(name, *found_tensor, prefer_live, force_persist || force_persist_name);
             continue;
         }
 
-        // Check special tensors
-        if (name == "token_ids") {
-            save_tensor_with_policy(name, mRunState.Inputs, prefer_live_tensor(name), force_persist_name);
+        // Route through the shared slot-dispatch helpers — every recognized
+        // name resolves via builtin_slot_from_name() → {block_activation_ptr,
+        // global_activation_ptr}, with the slot enum as the single source of
+        // truth. Per-name dispatch (the previous 130-line if/else ladder) lived
+        // in THIS file and drifted out of sync with the other resolvers; the
+        // shared helpers make every new slot a one-line change in ONE file.
+        // `prefer_live` already computed at loop top.
+
+        // Global-scope via the shared slot-dispatch helper. `_flat` aliases
+        // (xF_flat, ln_final_flat, …) carry their own 2D shape in the DSL
+        // layout so they're NOT added to the static name→slot table — that
+        // would clobber the 2D shape with the 3D parent's shape at compile
+        // time. Handle them here by stripping the suffix and flattening.
+        TensorSlot glob_slot = builtin_slot_from_name(name);
+        bool is_flat_view = false;
+        if (glob_slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
+            const std::string base_name = name.substr(0, name.size() - 5);
+            TensorSlot base_slot = builtin_slot_from_name(base_name);
+            if (global_activation_ptr(mRunState, base_slot)) {
+                glob_slot = base_slot;
+                is_flat_view = true;
+            }
+        }
+        if (Tensor* t = global_activation_ptr(mRunState, glob_slot)) {
+            if (is_flat_view && t->Rank >= 3) {
+                Tensor flat = view_tensor(*t, {t->Sizes[0] * t->Sizes[1], t->Sizes[2]});
+                save_tensor_with_policy(name, flat, prefer_live, force_persist_name);
+            } else {
+                save_tensor_with_policy(name, *t, prefer_live, force_persist_name);
+            }
             continue;
         }
-        if (name == "position_ids") {
-            save_tensor_with_policy(name, mRunState.PositionIDs, prefer_live_tensor(name), force_persist_name);
+        if (glob_slot == TensorSlot::FreqCis) {
+            save_tensor_with_policy(name, mRunState.rope_freqs(name), prefer_live, force_persist_name);
+            continue;
+        }
+        // Qualified rope references (blocks[N].rope_freqs, …) still need the name.
+        if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+            save_tensor_with_policy(name, mRunState.rope_freqs(name), prefer_live, force_persist_name);
             continue;
         }
 
-        // Try to look up as a pre-allocated activation by creating a TensorRef
-        // This handles tensors like "blocks[0].ln1_rstd" that map to slots
-        TensorRef ref;
-        ref.name = name;
+        // Block-scope fields.
         int layer_idx = -1;
         std::string field;
         if (parse_block_param(name, layer_idx, field)) {
-            ref.layer_idx = layer_idx;
-            // Map common saved fields
-            const bool prefer_live = prefer_live_tensor(name);
-            if (field == "ln1_rstd" || field == "ln_rstd") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).ln1_rstd,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "ln2_rstd") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).ln2_rstd,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "q_rstd") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).q_rstd,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "k_rstd") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).k_rstd,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "lse") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).lse,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "ln1" || field == "ln1_flat" || field == "ln" || field == "ln_flat") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).ln1,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "ln2" || field == "ln2_flat") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).ln2,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "qkv" || field == "qkv_norm") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).qkv,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "qkv_rope") {
-                // qkv_rope has RoPE applied - save it if available, otherwise fall back to qkv
-                auto& acts = mRunState.simplified_acts(layer_idx);
-                Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                save_tensor_with_policy(name, src, prefer_live, force_persist_name);
-            } else if (field == "qkv_flat") {
-                // Save the flattened version for matmul backward shape resolution
-                Tensor qkv = mRunState.simplified_acts(layer_idx).qkv;
-                Tensor flat = view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
-                save_tensor_with_policy(name, flat, prefer_live, force_persist_name);
-            } else if (field == "att" || field == "att_flat") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).att,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "att_out" || field == "att_out_flat") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).att_out,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "mlp_up" || field == "mlp_up_flat") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).mlp_up,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "swiglu") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).swiglu,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "swiglu_flat") {
-                Tensor swiglu = mRunState.simplified_acts(layer_idx).swiglu;
-                Tensor flat = view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
-                save_tensor_with_policy(name, flat, prefer_live, force_persist_name);
-            } else if (field == "mlp_down" || field == "mlp_down_flat") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).mlp_down,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "res_att" || field == "residual_att") {
-                save_tensor_with_policy(name,
-                                        mRunState.simplified_acts(layer_idx).residual_att,
-                                        prefer_live,
-                                        force_persist_name);
-            } else if (field == "res_ffn" || field == "residual_ffn" || field == "res_in") {
-                // res_ffn is the residual stream after FFN block (residual_att + mlp_down)
-                Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
-                save_tensor_with_policy(name, res, prefer_live, force_persist_name);
-            } else if (mWeights.has(name)) {
-                (*mSaved)[name] = mWeights.get(name);
-            } else {
-                throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
+            const std::string base_field = strip_ssa_suffix(field);
+            const bool is_flat = (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0);
+            const TensorSlot slot = builtin_slot_from_name(base_field);
+            if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
+                if (is_flat && t->Rank >= 3) {
+                    Tensor flat = view_tensor(*t, {t->Sizes[0] * t->Sizes[1], t->Sizes[2]});
+                    save_tensor_with_policy(name, flat, prefer_live, force_persist_name);
+                } else {
+                    save_tensor_with_policy(name, *t, prefer_live, force_persist_name);
+                }
+                continue;
             }
-        } else if (name == "ln_final" || name == "xF") {
-            save_tensor_with_policy(name,
-                                    mRunState.non_block_activations().ln_final,
-                                    prefer_live_tensor(name),
-                                    force_persist_name);
-        } else if (name == "final_residual" || name == "residual_final") {
-            save_tensor_with_policy(name, mRunState.get_final_residual(), prefer_live_tensor(name), force_persist_name);
-        } else if (name == "xF_flat") {
-            // Save the flattened version for matmul backward
-            Tensor ln_final = mRunState.non_block_activations().ln_final;
-            Tensor flat = view_tensor(ln_final, {ln_final.Sizes[0] * ln_final.Sizes[1], ln_final.Sizes[2]});
-            save_tensor_with_policy(name, flat, prefer_live_tensor(name), force_persist_name);
-        } else if (name == "ln_final_rstd") {
-            save_tensor_with_policy(name,
-                                    mRunState.non_block_activations().ln_final_rstd,
-                                    prefer_live_tensor(name),
-                                    force_persist_name);
-        } else if (name == "encoded" || name == "x0") {
-            save_tensor_with_policy(name,
-                                    mRunState.non_block_activations().encoded,
-                                    prefer_live_tensor(name),
-                                    force_persist_name);
-        } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
-            save_tensor_with_policy(name,
-                                    mRunState.non_block_activations().freq_cis,
-                                    prefer_live_tensor(name),
-                                    force_persist_name);
-        } else if (mWeights.has(name)) {
-            (*mSaved)[name] = mWeights.get(name);
-        } else {
+
+            // MoE slots now have dedicated TensorSlot enum values — the
+            // block_activation_ptr call above already covers them. If the
+            // helper returned nullptr, the field isn't a recognized block
+            // activation; fall through to the weight-store check.
+
+            if (mWeights.has(name)) {
+                (*mSaved)[name] = mWeights.get(name);
+                continue;
+            }
             throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
         }
+
+        if (mWeights.has(name)) {
+            (*mSaved)[name] = mWeights.get(name);
+            continue;
+        }
+        throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
     }
 
     // For MoE models, copy expert_offsets data to persistent storage for backward pass
@@ -996,26 +1036,18 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
         return &base;  // Can't cache view without tensor_id, return base
     };
 
-    if (name == "token_ids") {
-        return map_view(mRunState.Inputs);
+    // Global / IO slots via the shared helper. `_flat` aliases resolve to the
+    // same slot as their 3D counterpart; `map_view` already applies a shape
+    // override when the saved shape is 2D, so no explicit flatten here.
+    const TensorSlot glob_slot = builtin_slot_from_name(name);
+    if (Tensor* t = global_activation_ptr(mRunState, glob_slot)) {
+        return map_view(*t);
     }
-    if (name == "position_ids") {
-        return map_view(mRunState.PositionIDs);
-    }
-    if (name == "encoded" || name == "x0") {
-        return map_view(mRunState.non_block_activations().encoded);
-    }
-    if (name == "ln_final" || name == "xF" || name == "xF_flat") {
-        return map_view(mRunState.non_block_activations().ln_final);
-    }
-    if (name == "ln_final_rstd") {
-        return map_view(mRunState.non_block_activations().ln_final_rstd);
-    }
-    if (name == "final_residual" || name == "residual_final") {
-        return map_view(mRunState.get_final_residual());
+    if (glob_slot == TensorSlot::FreqCis) {
+        return map_view(mRunState.rope_freqs(name));
     }
     if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
-        return map_view(mRunState.non_block_activations().freq_cis);
+        return map_view(mRunState.rope_freqs(name));
     }
 
     int layer_idx = -1;
@@ -1024,42 +1056,17 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
         if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
             return nullptr;
         }
-        auto& acts = mRunState.simplified_acts(layer_idx);
-        if (field == "ln1" || field == "ln1_flat") return map_view(acts.ln1);
-        if (field == "ln1_rstd") return map_view(acts.ln1_rstd);
-        if (field == "ln2" || field == "ln2_flat") return map_view(acts.ln2);
-        if (field == "ln2_rstd") return map_view(acts.ln2_rstd);
-        if (field == "q_rstd") return map_view(acts.q_rstd);
-        if (field == "k_rstd") return map_view(acts.k_rstd);
-        if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased" || field == "qkv_norm")
-            return map_view(acts.qkv);
-        if (field == "qkv_rope") {
-            Tensor* base = acts.qkv_rope.Data ? &acts.qkv_rope : &acts.qkv;
-            return map_view(*base);
+        const std::string base_field = strip_ssa_suffix(field);
+        const TensorSlot slot = builtin_slot_from_name(base_field);
+        if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
+            return map_view(*t);
         }
-        if (field == "lse") return map_view(acts.lse);
-        if (field == "att" || field == "att_flat") return map_view(acts.att);
-        if (field == "att_out" || field == "att_out_flat") return map_view(acts.att_out);
-        if (field == "res_att" || field == "residual_att") return map_view(acts.residual_att);
-        if (field == "mlp_up" || field == "mlp_up_flat") return map_view(acts.mlp_up);
-        if (field == "swiglu" || field == "swiglu_flat") return map_view(acts.swiglu);
-        if (field == "mlp_down" || field == "mlp_down_flat") return map_view(acts.mlp_down);
-        if (field == "router_logits") return map_view(acts.router_logits);
-        if (field == "router_probs") return map_view(acts.router_probs);
-        if (field == "routing_weights") return map_view(acts.routing_weights);
-        if (field == "routing_indices") return map_view(acts.routing_indices);
-        if (field == "permuted_input") return map_view(acts.permuted_input);
-        if (field == "scatter_indices") return map_view(acts.scatter_indices);
-        if (field == "expert_gate_up") return map_view(acts.expert_gate_up);
-        if (field == "expert_act") return map_view(acts.expert_act);
-        if (field == "expert_down") return map_view(acts.expert_down);
-        if (field == "moe_out" || field == "moe_out_flat") return map_view(acts.moe_out);
-        if (field == "res_ffn" || field == "residual_ffn" || field == "res_in") {
-            Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
-            return map_view(res);
-        }
-        if (field == "rope_freqs" || field == "freq_cis") {
-            return map_view(mRunState.non_block_activations().freq_cis);
+
+        // MoE slots are handled by block_activation_ptr above (via enum
+        // dispatch) — no separate MoE branch needed here.
+
+        if (base_field == "rope_freqs" || base_field == "freq_cis") {
+            return map_view(mRunState.rope_freqs(name));
         }
     }
 
@@ -1092,11 +1099,12 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }
 
-    // Only check gradient resolution for tensors flagged as gradients at compile time.
-    // This avoids calling base_param_from_grad() (string substr + find) for the ~80%
-    // of tensors that are activations/weights, not gradients.
-    if (ref.is_gradient && !ref.name.empty()) {
-        if (auto base = base_param_from_grad(ref.name)) {
+    // Only resolve gradient tensors via the parameter-grad store when the
+    // classifier says kind == ParamGrad. For ActivationGrad / AccumTemp the
+    // classifier returns nullopt, correctly skipping this path so the
+    // gradient lands in its own per-layer slot / temp.
+    if (ref.is_gradient && !ref.name.empty() && mCurrentGraph) {
+        if (auto base = base_param_from_grad_kind(ref.tensor_id, *mCurrentGraph)) {
             bool accum = false;
             if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
                 if (grad->Data) {
@@ -1135,6 +1143,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             case TensorSlot::Targets: base = &rs.Targets; break;
             case TensorSlot::Losses: base = &rs.Losses; break;
             case TensorSlot::DLoss: base = &rs.scratch().cross_entropy_dloss; break;
+            case TensorSlot::FreqCis: base = &rs.rope_freqs(ref.name); break;
             case TensorSlot::BlockDLN1: base = &rs.simplified_grads(ref.layer_idx).d_ln1; break;
             case TensorSlot::BlockDQKV: base = &rs.simplified_grads(ref.layer_idx).d_qkv; break;
             case TensorSlot::BlockDAtt: base = &rs.simplified_grads(ref.layer_idx).d_att; break;
@@ -1183,7 +1192,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         case TensorSlot::LNFinal: return rs.non_block_activations().ln_final;
         case TensorSlot::LNFinalRSTD: return rs.non_block_activations().ln_final_rstd;
         case TensorSlot::FinalResidual: return rs.get_final_residual();
-        case TensorSlot::FreqCis: return rs.non_block_activations().freq_cis;
+        case TensorSlot::FreqCis: return rs.rope_freqs(ref.name);
         case TensorSlot::BlockLN1: return rs.simplified_acts(ref.layer_idx).ln1;
         case TensorSlot::BlockLN1RSTD: return rs.simplified_acts(ref.layer_idx).ln1_rstd;
         case TensorSlot::BlockLN2: return rs.simplified_acts(ref.layer_idx).ln2;
@@ -1295,6 +1304,32 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     const int tid = ref.tensor_id;
+    // `normalized_name` exists for historical compatibility with the old
+    // accumulator-alias path (strip `_from_N` / `_accum_N`, then look up the
+    // base name's buffer). The classifier now tags every such tensor as
+    // AccumTemp at compile time, and we ALWAYS refuse to collapse an accum
+    // temp onto its base — they're live simultaneously by construction, so
+    // aliasing corrupts gradients. Non-accum tensors never have the suffix,
+    // so there's nothing left to strip: normalized_name == ref.name always.
+    const std::string& normalized_name = ref.name;
+    const bool debug_mlp_ensure = []() {
+        const char* env = std::getenv("SUROGATE_DEBUG_ENSURE_OUT");
+        return env && std::string(env) != "0";
+    }();
+    auto log_mlp_ensure = [&](const char* path, const Tensor* t = nullptr) {
+        if (!debug_mlp_ensure || ref.name.find("mlp_x_flat") == std::string::npos) {
+            return;
+        }
+        std::fprintf(stderr,
+                     "[ENSURE_OUT] name=%s normalized=%s path=%s tid=%d slot=%d ptr=%p shape_empty=%d\n",
+                     ref.name.c_str(),
+                     normalized_name.c_str(),
+                     path,
+                     tid,
+                     static_cast<int>(ref.slot),
+                     t ? static_cast<void*>(t->Data) : nullptr,
+                     ref.shape.empty() ? 1 : 0);
+    };
     const bool debug_dtype = []() {
         const char* env = std::getenv("SUROGATE_DEBUG_DTYPE_RUNTIME");
         return env && std::string(env) == "1";
@@ -1328,8 +1363,55 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         // No data — fall through to slow path for alias resolution or temp allocation
     }
 
-    if (!ref.name.empty()) {
-        if (auto base = base_param_from_grad(ref.name)) {
+    // `ref.is_gradient` is set at compile time on every tensor whose name starts
+    // with `d_` — consult it directly instead of re-matching the prefix here.
+    if (!normalized_name.empty() && ref.is_gradient) {
+        if (const Tensor* base = try_get_tensor(normalized_name)) {
+            // try_get_tensor already filters by `base->Data != nullptr`, so
+            // we know this path has real storage. Still, guard defensively.
+            if (base->Data) {
+                Tensor resolved = *base;
+                if (!ref.shape.empty() && shape_nelem(ref.shape) == static_cast<std::size_t>(base->nelem())) {
+                    resolved = view_tensor(*base, ref.shape);
+                }
+                if (tid >= 0) {
+                    mTensors[static_cast<std::size_t>(tid)] = resolved;
+                    log_mlp_ensure("grad_exact", &mTensors[static_cast<std::size_t>(tid)]);
+                    return mTensors[static_cast<std::size_t>(tid)];
+                }
+                throw std::runtime_error("CompiledExecutor: ensure_output_tensor requires valid tensor_id for: " +
+                                         ref.name);
+            }
+        }
+        if (const Tensor* base = try_get_tensor_fuzzy(normalized_name)) {
+            // try_get_tensor_fuzzy can legitimately return a pointer to a Tensor
+            // with `Data == nullptr` — e.g., a simplified_grads slot that was
+            // allocated lazily / configured for recompute and isn't populated
+            // yet. Running an op against such a tensor silently corrupts
+            // memory (illegal access at kernel dispatch). Only accept this
+            // resolution when the buffer is real; otherwise fall through to
+            // fresh allocation.
+            if (base->Data) {
+                Tensor resolved = *base;
+                if (!ref.shape.empty() && shape_nelem(ref.shape) == static_cast<std::size_t>(base->nelem())) {
+                    resolved = view_tensor(*base, ref.shape);
+                }
+                if (tid >= 0) {
+                    mTensors[static_cast<std::size_t>(tid)] = resolved;
+                    log_mlp_ensure("grad_fuzzy", &mTensors[static_cast<std::size_t>(tid)]);
+                    return mTensors[static_cast<std::size_t>(tid)];
+                }
+                throw std::runtime_error("CompiledExecutor: ensure_output_tensor requires valid tensor_id for: " +
+                                         ref.name);
+            }
+        }
+    }
+
+    if (!normalized_name.empty() && mCurrentGraph) {
+        // Classifier-backed param-grad routing. Falls through for
+        // ActivationGrad / AccumTemp / Scratch — those land in their own
+        // storage via the Mapped path below.
+        if (auto base = base_param_from_grad_kind(tid, *mCurrentGraph)) {
             bool accum = false;
             if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
                 if (grad->Data) {
@@ -1339,6 +1421,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                     }
                     if (tid >= 0) {
                         mTensors[static_cast<std::size_t>(tid)] = resolved;
+                        log_mlp_ensure("param_grad", &mTensors[static_cast<std::size_t>(tid)]);
                         return mTensors[static_cast<std::size_t>(tid)];
                     }
                     return *grad;
@@ -1349,7 +1432,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
 
     // DSL-driven aliasing: allow gradients to reuse existing activation buffers.
     if (mSlotRegistry && mSlotRegistry->has_dsl_layout() && !ref.name.empty()) {
-        std::string base_name = strip_ssa_suffix(ref.name);
+        std::string base_name = strip_ssa_suffix(normalized_name);
         const bool is_grad_name = starts_with(base_name, "d_");
         std::string parse_name = is_grad_name ? base_name.substr(2) : base_name;
         int layer_idx = -1;
@@ -1390,6 +1473,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                         Tensor view = ref.shape.empty() ? base : view_tensor(base, ref.shape);
                         if (tid >= 0) {
                             mTensors[static_cast<std::size_t>(tid)] = view;
+                            log_mlp_ensure("slot_alias", &mTensors[static_cast<std::size_t>(tid)]);
                             return mTensors[static_cast<std::size_t>(tid)];
                         }
                         return base;
@@ -1412,10 +1496,12 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
             Tensor view = view_tensor(t, ref.shape);
             if (tid >= 0) {
                 mTensors[static_cast<std::size_t>(tid)] = view;
+                log_mlp_ensure("prealloc_view", &mTensors[static_cast<std::size_t>(tid)]);
                 return mTensors[static_cast<std::size_t>(tid)];
             }
             return t;  // tid < 0 should not happen for pre-allocated slots
         }
+        log_mlp_ensure("prealloc_base", &t);
         return t;
     }
 
@@ -1425,6 +1511,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
             const auto& t = mTensors[static_cast<std::size_t>(tid)];
             fprintf(stderr, "[DEBUG_DTYPE_RUNTIME] reuse tid=%d dtype=%s\n", tid, dtype_to_str(t.DType));
         }
+        log_mlp_ensure("mapped_cached", &mTensors[static_cast<std::size_t>(tid)]);
         return mTensors[static_cast<std::size_t>(tid)];
     }
 
@@ -1441,6 +1528,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         if (debug_name) {
             fprintf(stderr, "[DEBUG_DTYPE_RUNTIME] alloc tid=%d dtype=%s\n", tid, dtype_to_str(t.DType));
         }
+        log_mlp_ensure("mapped_alloc", &mTensors[static_cast<std::size_t>(tid)]);
         return mTensors[static_cast<std::size_t>(tid)];
     }
     throw std::runtime_error("CompiledExecutor: ensure_output_tensor requires valid tensor_id for: " + ref.name);

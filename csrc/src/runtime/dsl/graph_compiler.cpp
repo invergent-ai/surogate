@@ -88,6 +88,75 @@ inline bool is_capture_unsafe_op_type(CompiledOpType type) {
     }
 }
 
+// ============================================================================
+// Global tensor role table (single source of truth for "special" names)
+// ============================================================================
+//
+// Names like "xF", "encoded", "h_out", "xN", "residualN", "freq_cis" are a
+// contract between the Python DSL and the C++ runtime: the Python side emits
+// these names at specific points in the graph, and the compiler needs to
+// recognize them to assign the right shape/dtype/slot. Historically each
+// function that cared did its own `name == "xF"` string comparison, and those
+// lists drifted out of sync — renaming a tensor in Python silently broke
+// whichever compiler site forgot to update.
+//
+// This enum + `global_role_for_name()` consolidate every such check into ONE
+// place. Downstream sites dispatch on the enum. To add a new global tensor,
+// add a role below AND register it in `global_role_for_name()`; there is no
+// other place to update.
+//
+// Where possible we defer to `builtin_slot_from_name()` (the slot-registry
+// table in tensor_slot_registry.cpp); only names that don't have a dedicated
+// TensorSlot enum value (xN, residualN, flat aliases) live in the fallback
+// block below.
+enum class GlobalRole {
+    None,
+    Encoded,           // x0 / encoded — embedding output, {B, T, C}
+    StackOutput,       // xN — block stack top-of-column, {B, T, C}
+    StackResidual,     // residualN / residual0 — block stack residual, {B, T, C}
+    FinalNormOutput,   // xF / ln_final — final-norm output, {B, T, C}
+    FinalNormOutFlat,  // xF_flat — {B*T, C}
+    FinalResidual,     // final_residual / residual_final — {B, T, C}
+    FinalNormRstd,     // ln_final_rstd — {B, T}
+    TokenIds,          // token_ids / position_ids — {B, T} (int32)
+    LossBatch,         // loss / losses / targets / labels / d_loss — {B * T}
+    RopeFreqs,         // freq_cis / rope_freqs — handled specially elsewhere
+};
+
+GlobalRole global_role_for_name(std::string_view name) {
+    // Prefer the slot registry's built-in mapping. Any name registered there
+    // has already been classified; we only need to translate the TensorSlot
+    // to a GlobalRole.
+    const TensorSlot slot = builtin_slot_from_name(std::string(name));
+    switch (slot) {
+        case TensorSlot::Encoded: return GlobalRole::Encoded;
+        case TensorSlot::LNFinal: return GlobalRole::FinalNormOutput;
+        case TensorSlot::LNFinalRSTD: return GlobalRole::FinalNormRstd;
+        case TensorSlot::FinalResidual: return GlobalRole::FinalResidual;
+        case TensorSlot::FreqCis: return GlobalRole::RopeFreqs;
+        case TensorSlot::TokenIDs:
+        case TensorSlot::PositionIDs: return GlobalRole::TokenIds;
+        case TensorSlot::Targets:
+        case TensorSlot::Losses:
+        case TensorSlot::DLoss: return GlobalRole::LossBatch;
+        default: break;
+    }
+
+    // Fallback: names that have no dedicated TensorSlot enum value.
+    // Keep this list tight; add new roles above rather than inflating it.
+    if (name == "xN") return GlobalRole::StackOutput;
+    if (name == "residualN" || name == "residual0") return GlobalRole::StackResidual;
+    if (name == "xF_flat") return GlobalRole::FinalNormOutFlat;
+    if (name == "ln_final_flat") return GlobalRole::FinalNormOutput;
+    if (name == "labels") return GlobalRole::LossBatch;
+    // Substring matches for rope frequencies (handles qualified names like
+    // "blocks[0].rope_freqs" when they surface at the global level).
+    if (name.find("rope_freqs") != std::string_view::npos || name.find("freq_cis") != std::string_view::npos) {
+        return GlobalRole::RopeFreqs;
+    }
+    return GlobalRole::None;
+}
+
 bool infer_known_tensor_shape(std::string_view name,
                               const modules::ModelConfig& config,
                               long B,
@@ -197,22 +266,20 @@ bool infer_known_tensor_shape(std::string_view name,
         }
     }
 
-    if (name == "x0" || name == "encoded" || name == "ln_final" || name == "xF" || name == "final_residual" ||
-        name == "residual_final") {
-        shape = {B, T, config.HiddenSize};
-        return true;
-    }
-    if (name == "ln_final_rstd") {
-        shape = {B, T};
-        return true;
-    }
-    if (name == "token_ids" || name == "position_ids") {
-        shape = {B, T};
-        return true;
-    }
-    if (name == "targets" || name == "labels" || name == "loss" || name == "losses" || name == "d_loss") {
-        shape = {B * T};
-        return true;
+    // Global tensor names are routed through the single GlobalRole table above
+    // — add new globals there, not here.
+    switch (global_role_for_name(name)) {
+        case GlobalRole::Encoded:
+        case GlobalRole::StackOutput:
+        case GlobalRole::StackResidual:
+        case GlobalRole::FinalNormOutput:
+        case GlobalRole::FinalResidual: shape = {B, T, config.HiddenSize}; return true;
+        case GlobalRole::FinalNormOutFlat: shape = {B * T, config.HiddenSize}; return true;
+        case GlobalRole::FinalNormRstd:
+        case GlobalRole::TokenIds: shape = {B, T}; return true;
+        case GlobalRole::LossBatch: shape = {B * T}; return true;
+        case GlobalRole::RopeFreqs:
+        case GlobalRole::None: break;
     }
 
     return false;
@@ -742,8 +809,9 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
         if (slot_entry->dtype.has_value()) {
             ref.dtype = *slot_entry->dtype;
         }
-    } else if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
-        // Substring match for rope frequencies (handles qualified names)
+    } else if (global_role_for_name(name) == GlobalRole::RopeFreqs) {
+        // Rope frequencies — recognized via the centralized GlobalRole table
+        // so qualified names like "blocks[0].rope_freqs" also resolve here.
         ref.slot = TensorSlot::FreqCis;
     } else if (mWeights.has(name)) {
         ref.slot = TensorSlot::Parameter;
@@ -1379,6 +1447,7 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
             case TensorSlot::BlockDSwiGLU:
             case TensorSlot::BlockDMLPUp:
             case TensorSlot::BlockDMLPDown:
+            case TensorSlot::BlockDHOut:
             case TensorSlot::BlockDLN2:
             case TensorSlot::BlockDResAtt:
             case TensorSlot::BlockDResFFN:
@@ -2459,6 +2528,16 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
     graph.num_tensors = mNextTensorId;
     graph.tensor_name_to_id = mTensorIdMap;
     graph.tensor_meta.resize(static_cast<std::size_t>(mNextTensorId));
+    // Build the reverse (tid -> name) vector so hot-path lookups (e.g.
+    // `base_param_from_grad_kind` recovering a param name from `base_param_tid`)
+    // are O(1) instead of scanning tensor_name_to_id. Names are copied once
+    // here; CompiledGraph lifetime dominates dispatcher calls.
+    graph.tensor_id_to_name.assign(static_cast<std::size_t>(mNextTensorId), std::string{});
+    for (const auto& [name, id] : mTensorIdMap) {
+        if (id >= 0 && static_cast<std::size_t>(id) < graph.tensor_id_to_name.size()) {
+            graph.tensor_id_to_name[static_cast<std::size_t>(id)] = name;
+        }
+    }
 
     for (const auto& [name, id] : mTensorIdMap) {
         TensorMeta meta;
@@ -2545,6 +2624,374 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
             if (id > it->second) {
                 it->second = id;
             }
+        }
+    }
+}
+
+// ============================================================================
+// Tensor classification (Phase 0 of the TensorKind rollout)
+// ============================================================================
+//
+// Populates TensorMeta::kind and the base_*_tid fields once at compile time
+// using authoritative lookups (parameter store + per-tid op producers). This
+// replaces runtime string predicates (base_param_from_grad,
+// should_alias_autodiff_accum_name, etc.) that historically misclassified
+// intermediate gradients as parameter gradients, causing accumulator temps
+// to collide with their base tensor's buffer. Phase 0 only populates data;
+// callers still use the legacy string predicates until Phase 1 flips them.
+
+const char* tensor_kind_name(TensorKind k) {
+    switch (k) {
+        case TensorKind::Unknown: return "Unknown";
+        case TensorKind::ForwardParam: return "ForwardParam";
+        case TensorKind::ForwardActivation: return "ForwardActivation";
+        case TensorKind::ParamGrad: return "ParamGrad";
+        case TensorKind::ActivationGrad: return "ActivationGrad";
+        case TensorKind::AccumTemp: return "AccumTemp";
+        case TensorKind::LossInput: return "LossInput";
+        case TensorKind::Scratch: return "Scratch";
+    }
+    return "Unknown";
+}
+
+namespace {
+
+// Strip a trailing `_from_<N>` or `_accum_<N>` tag (autodiff accumulator
+// variants). Returns (stripped_name, had_tag). Only strips when the tag is
+// followed by digits and nothing else, so we don't accidentally chop a
+// legitimate op id that happens to contain "_from_".
+std::pair<std::string, bool> strip_autodiff_accum_tag(const std::string& name) {
+    for (const char* tag : {"_from_", "_accum_"}) {
+        const std::size_t taglen = std::strlen(tag);
+        auto pos = name.find(tag);
+        if (pos == std::string::npos) continue;
+        const std::size_t after = pos + taglen;
+        if (after >= name.size()) continue;
+        bool all_digits = true;
+        for (std::size_t i = after; i < name.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) {
+            return {name.substr(0, pos), true};
+        }
+    }
+    return {name, false};
+}
+
+}  // namespace
+
+void GraphCompiler::classify_tensors(CompiledGraph& graph) {
+    // Build a tid -> producing op index map from the ops in this graph. We use
+    // this to confirm that a tensor classified as ForwardActivation is indeed
+    // produced by a forward op in the current compile (forward graphs only).
+    // For backward graphs this map covers backward op outputs; we still run
+    // the classifier over every tid, and fall back to name-based rules for
+    // tids whose producer isn't visible in the current graph (cross-graph
+    // references — forward activations referenced by backward).
+    std::vector<int> producer_op(static_cast<std::size_t>(graph.num_tensors), -1);
+    for (std::size_t op_idx = 0; op_idx < graph.ops.size(); ++op_idx) {
+        for (const auto& ref : graph.ops[op_idx].outputs) {
+            if (ref.tensor_id >= 0 && ref.tensor_id < graph.num_tensors) {
+                producer_op[static_cast<std::size_t>(ref.tensor_id)] = static_cast<int>(op_idx);
+            }
+        }
+    }
+
+    auto tid_for = [&](const std::string& name) -> int {
+        auto it = graph.tensor_name_to_id.find(name);
+        return (it != graph.tensor_name_to_id.end()) ? it->second : -1;
+    };
+
+    // Pass 1: forward-side classification. A tid is a ForwardParam iff the
+    // parameter store owns it. A tid is a ForwardActivation iff it's produced
+    // by a non-gradient op in this graph AND isn't a parameter.
+    for (const auto& [name, id] : graph.tensor_name_to_id) {
+        if (id < 0 || static_cast<std::size_t>(id) >= graph.tensor_meta.size()) continue;
+        auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
+
+        const bool is_grad_name = starts_with(name, "d_");
+
+        if (!is_grad_name && mWeights.has(name)) {
+            meta.kind = TensorKind::ForwardParam;
+            continue;
+        }
+
+        if (!is_grad_name && producer_op[static_cast<std::size_t>(id)] >= 0) {
+            // Produced by an op in this (forward) graph and not a parameter.
+            meta.kind = TensorKind::ForwardActivation;
+            meta.base_producer_tid = id;  // self-reference; its own op is the producer
+        }
+    }
+
+    // Pass 2: gradient-side classification. For every tid whose name starts
+    // with "d_", try to resolve the base it points at.
+    for (const auto& [name, id] : graph.tensor_name_to_id) {
+        if (id < 0 || static_cast<std::size_t>(id) >= graph.tensor_meta.size()) continue;
+        auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
+        if (!starts_with(name, "d_")) continue;
+
+        // Special-case loss inputs.
+        if (name == "d_loss") {
+            meta.kind = TensorKind::LossInput;
+            continue;
+        }
+
+        // Check for _from_N / _accum_N accumulator suffix first. These are
+        // ALWAYS distinct tensors from their base — the whole point of this
+        // classification is to prevent them from collapsing onto the base.
+        auto [base_grad_name, has_accum_tag] = strip_autodiff_accum_tag(name);
+        if (has_accum_tag) {
+            const int base_grad_tid = tid_for(base_grad_name);
+            meta.kind = TensorKind::AccumTemp;
+            meta.base_grad_tid = base_grad_tid;  // -1 if base isn't in this graph
+            // Still record the ultimate param/activation it targets, if resolvable.
+            // (We don't need it for correctness — AccumTemp is enough — but it's
+            // useful telemetry.)
+            const std::string stripped = base_grad_name.substr(2);  // strip "d_"
+            if (mWeights.has(stripped)) {
+                meta.base_param_tid = tid_for(stripped);
+            }
+            continue;
+        }
+
+        // Plain d_<name>: resolve what <name> refers to.
+        const std::string stripped = name.substr(2);
+
+        if (mWeights.has(stripped)) {
+            meta.kind = TensorKind::ParamGrad;
+            meta.base_param_tid = tid_for(stripped);
+            continue;
+        }
+
+        // Forward activation grad. We prefer to verify via a tid whose kind
+        // is ForwardActivation, but in a pure backward graph that tid may
+        // not exist here. Fall back to: "name exists as a tid" OR
+        // "producer_op unknown but name starts with common forward prefix".
+        const int fwd_tid = tid_for(stripped);
+        if (fwd_tid >= 0) {
+            const auto& fwd_meta = graph.tensor_meta[static_cast<std::size_t>(fwd_tid)];
+            if (fwd_meta.kind == TensorKind::ForwardActivation || fwd_meta.kind == TensorKind::ForwardParam) {
+                // ForwardParam fallthrough handled above; if we get here the
+                // forward-side classifier missed it (e.g. weight not in
+                // mWeights yet). Treat conservatively.
+                meta.kind =
+                    (fwd_meta.kind == TensorKind::ForwardParam) ? TensorKind::ParamGrad : TensorKind::ActivationGrad;
+                if (meta.kind == TensorKind::ParamGrad) {
+                    meta.base_param_tid = fwd_tid;
+                } else {
+                    meta.base_producer_tid = fwd_tid;
+                }
+                continue;
+            }
+        }
+
+        // No forward tid visible in this graph. Consult authoritative sources:
+        //   (1) GlobalRole table — recognized global tensors (xF, encoded, xN, …).
+        //   (2) Slot registry — recognized block-level slot (ln1, qkv, mlp_up, …).
+        // Anything else stays Scratch. This replaces the earlier hardcoded
+        // prefix list — new global tensors are added to global_role_for_name()
+        // (single place), and new block slots are added to the slot registry.
+        const GlobalRole role = global_role_for_name(stripped);
+        bool recognized = (role != GlobalRole::None);
+        if (!recognized) {
+            // Strip block prefix to probe slot registry by field name.
+            int lid = -1;
+            std::string field;
+            const std::string field_name =
+                parse_block_param(stripped, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(stripped);
+            auto slot_entry = mSlotRegistry.lookup(field_name);
+            if (slot_entry.has_value() && slot_entry->slot != TensorSlot::Mapped &&
+                slot_entry->slot != TensorSlot::Temporary && slot_entry->slot != TensorSlot::Saved &&
+                slot_entry->slot != TensorSlot::Parameter) {
+                recognized = true;
+            }
+        }
+        meta.kind = recognized ? TensorKind::ActivationGrad : TensorKind::Scratch;
+    }
+
+    // Pass 3: everything still Unknown that's neither a gradient nor a param
+    // producer gets classified as Scratch (constants, zeros, masks, etc.).
+    for (std::size_t i = 0; i < graph.tensor_meta.size(); ++i) {
+        if (graph.tensor_meta[i].kind == TensorKind::Unknown) {
+            graph.tensor_meta[i].kind = TensorKind::Scratch;
+        }
+    }
+
+    // Optional: dump classification on demand for debugging and for comparing
+    // against the legacy string predicates during the rollout.
+    const char* dump_env = std::getenv("SUROGATE_DEBUG_TENSOR_KIND");
+    const bool dump_enabled = dump_env && std::string_view(dump_env) != "0";
+    if (dump_enabled) {
+        std::size_t counts[8] = {0};
+        for (const auto& meta : graph.tensor_meta) {
+            counts[static_cast<std::size_t>(meta.kind)]++;
+        }
+        std::fprintf(stderr,
+                     "[classify_tensors] %s: Unknown=%zu Param=%zu Act=%zu "
+                     "ParamGrad=%zu ActGrad=%zu AccumTemp=%zu Loss=%zu Scratch=%zu\n",
+                     graph.name.c_str(),
+                     counts[static_cast<std::size_t>(TensorKind::Unknown)],
+                     counts[static_cast<std::size_t>(TensorKind::ForwardParam)],
+                     counts[static_cast<std::size_t>(TensorKind::ForwardActivation)],
+                     counts[static_cast<std::size_t>(TensorKind::ParamGrad)],
+                     counts[static_cast<std::size_t>(TensorKind::ActivationGrad)],
+                     counts[static_cast<std::size_t>(TensorKind::AccumTemp)],
+                     counts[static_cast<std::size_t>(TensorKind::LossInput)],
+                     counts[static_cast<std::size_t>(TensorKind::Scratch)]);
+    }
+
+    // Cross-check: the legacy `base_param_from_grad_heuristic(name)` predicate returns
+    // Some(base) for ANY name starting with `d_` (after stripping
+    // `_from_N`/`_accum_N`). Our classifier returns ParamGrad ONLY when the
+    // base is a real parameter. For every tid where the legacy predicate says
+    // "this is a param grad" but the classifier disagrees, report it — those
+    // are the latent bugs (intermediate gradients misread as param grads).
+    // Callers that switch to the classifier in Phase 1 will see those cases
+    // routed correctly.
+    const char* check_env = std::getenv("SUROGATE_CHECK_TENSOR_KIND");
+    const bool check_enabled = dump_enabled || (check_env && std::string_view(check_env) != "0");
+    if (check_enabled) {
+        std::size_t disagreements = 0;
+        for (const auto& [name, id] : graph.tensor_name_to_id) {
+            if (id < 0 || static_cast<std::size_t>(id) >= graph.tensor_meta.size()) continue;
+            const auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
+            auto legacy = base_param_from_grad_heuristic(name);
+            if (!legacy.has_value()) {
+                // Legacy says "not a gradient name" — classifier should agree
+                // (no ParamGrad without a `d_` prefix).
+                if (meta.kind == TensorKind::ParamGrad) {
+                    std::fprintf(stderr,
+                                 "[classify_tensors][DISAGREE] %s tid=%d kind=ParamGrad "
+                                 "but legacy base_param_from_grad_heuristic returned nullopt\n",
+                                 name.c_str(),
+                                 id);
+                    disagreements++;
+                }
+                continue;
+            }
+            // Legacy says "this is some d_<base>". The classifier agrees IFF
+            // kind == ParamGrad AND base_param_tid resolves to <base>.
+            const bool legacy_is_param_grad_guess = true;  // legacy always assumes this
+            const bool classifier_says_param_grad = (meta.kind == TensorKind::ParamGrad);
+            if (legacy_is_param_grad_guess && !classifier_says_param_grad) {
+                // Most common case: legacy returns a base string for an
+                // intermediate / activation gradient / accum temp. Classifier
+                // correctly refuses to call it a ParamGrad. This is exactly
+                // the bug class we're eliminating.
+                disagreements++;
+                if (disagreements <= 10) {
+                    std::fprintf(stderr,
+                                 "[classify_tensors][LEGACY_OVERREACH] %s tid=%d "
+                                 "legacy_base=%s but classifier says kind=%s "
+                                 "(would-be silent misroute fixed by Phase 1)\n",
+                                 name.c_str(),
+                                 id,
+                                 legacy->c_str(),
+                                 tensor_kind_name(meta.kind));
+                }
+            }
+        }
+        if (disagreements > 0) {
+            std::fprintf(stderr,
+                         "[classify_tensors] %s: %zu legacy/classifier disagreements "
+                         "(legacy would have misclassified these as ParamGrad)\n",
+                         graph.name.c_str(),
+                         disagreements);
+        }
+    }
+
+    // Cross-check vs DSL slot registry: for every tensor that our hardcoded
+    // `global_role_for_name()` table claims is a known global (xF, x0, xN,
+    // residualN, ln_final_rstd, freq_cis, …), verify the DSL already declares
+    // it at Global scope in the slot registry. The DSL IS the source of truth;
+    // the C++ hardcoded table is a compatibility shim that should be empty in
+    // steady state. Any miss here is a DSL site that forgot to emit
+    // `model._register_activation(name, ..., scope=GLOBAL)`.
+    //
+    // When all miss counts reach zero across every supported model, the
+    // hardcoded fallback table inside global_role_for_name() can be deleted
+    // and C++ can query the registry directly for everything.
+    const char* coverage_env = std::getenv("SUROGATE_CHECK_GLOBAL_COVERAGE");
+    const bool coverage_enabled = dump_enabled || (coverage_env && std::string_view(coverage_env) != "0");
+    if (coverage_enabled && mSlotRegistry.has_dsl_layout()) {
+        std::size_t hardcoded_count = 0;
+        std::size_t registry_hits = 0;
+        std::size_t registry_misses = 0;
+        std::size_t scope_mismatches = 0;
+        std::unordered_map<std::string, std::size_t> missing_summary;  // unqualified name -> count
+        for (const auto& [name, id] : graph.tensor_name_to_id) {
+            if (id < 0) continue;
+            if (starts_with(name, "d_")) continue;
+            const GlobalRole role = global_role_for_name(name);
+            if (role == GlobalRole::None) continue;
+            hardcoded_count++;
+
+            // Try the qualified name first, then the unqualified form: a
+            // block-qualified reference like `blocks[N].rope_freqs` points at
+            // the same global slot as its unqualified counterpart. The DSL
+            // registers the global ONCE; the block stack inliner produces
+            // per-layer qualified references to it — they shouldn't count as
+            // separate "missing" entries.
+            auto entry = mSlotRegistry.lookup(name);
+            std::string probe_name = name;
+            if (!entry.has_value()) {
+                int lid = -1;
+                std::string field;
+                if (parse_block_param(name, lid, field)) {
+                    probe_name = strip_ssa_suffix(field);
+                    entry = mSlotRegistry.lookup(probe_name);
+                }
+            }
+
+            if (!entry.has_value()) {
+                registry_misses++;
+                missing_summary[probe_name]++;
+                if (registry_misses <= 10) {
+                    std::fprintf(stderr,
+                                 "[classify_tensors][DSL_GAP] %s (role=%d) — registry has no "
+                                 "entry for %s. DSL needs model._register_activation(%s, ..., "
+                                 "scope=GLOBAL).\n",
+                                 name.c_str(),
+                                 static_cast<int>(role),
+                                 probe_name.c_str(),
+                                 probe_name.c_str());
+                }
+                continue;
+            }
+            if (entry->scope != ActivationScope::Global) {
+                scope_mismatches++;
+                if (scope_mismatches <= 10) {
+                    std::fprintf(stderr,
+                                 "[classify_tensors][DSL_SCOPE] %s: expected Global, "
+                                 "registry has scope=%d\n",
+                                 name.c_str(),
+                                 static_cast<int>(entry->scope));
+                }
+                continue;
+            }
+            registry_hits++;
+        }
+        std::fprintf(stderr,
+                     "[classify_tensors] %s: DSL coverage: %zu/%zu global-name references "
+                     "resolved (%zu missing, %zu scope-mismatched). ",
+                     graph.name.c_str(),
+                     registry_hits,
+                     hardcoded_count,
+                     registry_misses,
+                     scope_mismatches);
+        if (!missing_summary.empty()) {
+            std::fprintf(stderr, "Distinct missing names: [");
+            bool first = true;
+            for (const auto& [n, cnt] : missing_summary) {
+                std::fprintf(stderr, "%s%s×%zu", first ? "" : ", ", n.c_str(), cnt);
+                first = false;
+            }
+            std::fprintf(stderr, "]\n");
+        } else {
+            std::fprintf(stderr, "(no gaps)\n");
         }
     }
 }
@@ -3551,7 +3998,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             // If an explicit gradient dtype override is configured, apply it to parameter gradients.
             if (mOptions.GradientType.has_value() && ref.is_gradient) {
                 const std::string grad_name = strip_ssa_suffix(ref.name);
-                if (auto base = base_param_from_grad(grad_name)) {
+                if (auto base = base_param_from_grad_heuristic(grad_name)) {
                     if (mWeights.has(*base)) {
                         ref.dtype = *mOptions.GradientType;
                         if (const char* env = std::getenv("SUROGATE_DEBUG_GRAD_DTYPE")) {
@@ -3562,7 +4009,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             }
 
             if (const char* env = std::getenv("SUROGATE_DEBUG_DTYPES")) {
-                if (ref.name.find("xF") != std::string::npos) {
+                const GlobalRole dbg_role = global_role_for_name(strip_ssa_suffix(ref.name));
+                if (dbg_role == GlobalRole::FinalNormOutput || dbg_role == GlobalRole::FinalNormOutFlat) {
                     fprintf(stderr,
                             "[DEBUG_DTYPES] op=%s output=%s dtype=%s\n",
                             op.id.c_str(),
@@ -3637,6 +4085,14 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             }
         }
     }
+
+    // Classify every tensor (ForwardParam / ForwardActivation / ParamGrad /
+    // ActivationGrad / AccumTemp / LossInput / Scratch) using authoritative
+    // lookups against the parameter store and op producer map. Runtime code
+    // will read TensorMeta::kind instead of string-matching names.
+    // (Phase 0: data-only; callers still use legacy string predicates until
+    // Phase 1 flips them.)
+    classify_tensors(result);
 
     // ========================================================================
     // Detect MLP tile groups for long-context tiled execution

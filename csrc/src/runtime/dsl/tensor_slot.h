@@ -30,6 +30,17 @@ enum class TensorSlot : std::uint8_t {
     BlockMLPDown,
     BlockResidualFFN,
     BlockHOut,  ///< Block final output (post layer_scalar); used by Gemma4 to avoid mlp_down collision
+    // MoE activation slots (layer-indexed, populated only when NumExperts > 0)
+    BlockRouterLogits,
+    BlockRouterProbs,
+    BlockRoutingWeights,
+    BlockRoutingIndices,
+    BlockPermutedInput,
+    BlockScatterIndices,
+    BlockExpertGateUp,
+    BlockExpertAct,
+    BlockExpertDown,
+    BlockMoeOut,  ///< View of mlp_down as flat (B*T, C) for MoE models
     // Gradient slots (layer-indexed)
     BlockDLN1,
     BlockDQKV,

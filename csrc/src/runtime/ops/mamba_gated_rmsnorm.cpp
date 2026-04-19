@@ -463,8 +463,8 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
         bool accumulate = false;
         if (allow_accumulate) {
             accumulate = mAccumulateTensors.count(out_ref.name) > 0;
-            if (!accumulate) {
-                if (auto base = base_param_from_grad(out_ref.name)) {
+            if (!accumulate && mCurrentGraph) {
+                if (auto base = base_param_from_grad_kind(out_ref.tensor_id, *mCurrentGraph)) {
                     accumulate = mAccumulateTensors.count("d_" + *base) > 0;
                 }
             }

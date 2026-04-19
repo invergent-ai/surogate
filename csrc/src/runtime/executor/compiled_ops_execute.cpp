@@ -5,6 +5,7 @@
 // Extracted from compiled_ops.cpp to reduce file size; behavior unchanged.
 
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include "runtime/ep/ep_strategy.h"
 
@@ -162,78 +163,60 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // Already bound?
             if (static_cast<std::size_t>(inp.tensor_id) < mTensors.size() && mTensors[inp.tensor_id].Data) continue;
 
-            // Try to resolve from known sources
+            // Try to resolve from known sources. The two routing paths
+            // (slot-by-enum on the compiled TensorRef, and name-based
+            // fallbacks for refs whose slot is Mapped) both go through
+            // the shared `global_activation_ptr` / `block_activation_ptr`
+            // helpers so new slots are picked up automatically.
             Tensor resolved{};
 
-            // Check slot type first
-            switch (inp.slot) {
-                case TensorSlot::FreqCis: resolved = mRunState.non_block_activations().freq_cis; break;
-                case TensorSlot::Encoded: resolved = mRunState.non_block_activations().encoded; break;
-                case TensorSlot::TokenIDs: resolved = mRunState.Inputs; break;
-                case TensorSlot::PositionIDs: resolved = mRunState.PositionIDs; break;
-                default: break;
+            // (1) TensorRef already carries the slot — use it directly.
+            if (Tensor* gp = global_activation_ptr(mRunState, inp.slot)) {
+                resolved = *gp;
+            } else if (inp.slot == TensorSlot::FreqCis) {
+                resolved = mRunState.rope_freqs(inp.name);
             }
 
-            // If not resolved by slot, try by name
+            // (2) Mapped refs: parse name → slot and reuse the block/global helpers.
             if (!resolved.Data && !inp.name.empty()) {
+                // Blocks-qualified: `blocks[N].<field>`
                 int lyr = -1;
                 std::string field;
                 if (parse_block_param(inp.name, lyr, field)) {
                     const std::string base = strip_ssa_suffix(field);
-                    if (base == "res_ffn" || base == "residual_ffn" || base == "res_in") {
-                        resolved = mRunState.get_residual(lyr, mRunState.MainStream);
-                    } else {
-                        auto& acts = mRunState.simplified_acts(lyr);
-                        if (base == "mlp_down" || base == "mlp_down_flat")
-                            resolved = acts.mlp_down;
-                        else if (base == "res_att" || base == "residual_att")
-                            resolved = acts.residual_att;
-                        else if (base == "att_out" || base == "att_out_flat")
-                            resolved = acts.att_out;
+                    const TensorSlot slot = builtin_slot_from_name(base);
+                    if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
+                        resolved = *bp;
                     }
                 } else {
-                    // Global tensors by name
-                    if (inp.name.find("freq_cis") != std::string::npos ||
-                        inp.name.find("rope_freqs") != std::string::npos) {
-                        resolved = mRunState.non_block_activations().freq_cis;
+                    // Unqualified global-level reference — try slot table first.
+                    const TensorSlot slot = builtin_slot_from_name(inp.name);
+                    if (Tensor* gp = global_activation_ptr(mRunState, slot)) {
+                        resolved = *gp;
+                    } else if (inp.name.find("freq_cis") != std::string::npos ||
+                               inp.name.find("rope_freqs") != std::string::npos) {
+                        resolved = mRunState.rope_freqs(inp.name);
                     }
                 }
 
-                // Cross-layer connector tensors: "layerN.field" (used by HybridStackedBlocks)
-                // These are inter-block connectors with a neutral naming prefix to avoid
-                // the block-activation resolver. Resolve them the same way as blocks[N].field.
+                // Cross-layer connector tensors: `layerN.<field>` (used by
+                // HybridStackedBlocks to avoid the block-activation resolver).
+                // Resolve via the block helper — same field vocabulary,
+                // different name prefix.
                 if (!resolved.Data && inp.name.rfind("layer", 0) == 0) {
                     auto dot = inp.name.find('.');
                     if (dot != std::string::npos) {
                         try {
                             int cross_lyr = std::stoi(inp.name.substr(5, dot - 5));
                             std::string cross_field = strip_ssa_suffix(inp.name.substr(dot + 1));
-                            if (cross_field == "res_ffn" || cross_field == "residual_ffn" || cross_field == "res_in") {
-                                resolved = mRunState.get_residual(cross_lyr, mRunState.MainStream);
-                            } else {
-                                auto& acts = mRunState.simplified_acts(cross_lyr);
-                                if (cross_field == "out" || cross_field == "out_flat" || cross_field == "mlp_down" ||
-                                    cross_field == "mlp_down_flat")
-                                    resolved = acts.mlp_down;
-                                else if (cross_field == "res_att" || cross_field == "residual_att")
-                                    resolved = acts.residual_att;
-                                else if (cross_field == "att_out" || cross_field == "att_out_flat")
-                                    resolved = acts.att_out;
-                                else if (cross_field == "ln1" || cross_field == "ln1_flat" || cross_field == "ln" ||
-                                         cross_field == "ln_flat")
-                                    resolved = acts.ln1;
-                                else if (cross_field == "ln2" || cross_field == "ln2_flat")
-                                    resolved = acts.ln2;
-                                else if (cross_field == "qkv" || cross_field == "qkv_norm")
-                                    resolved = acts.qkv;
-                                else if (cross_field == "qkv_rope")
-                                    resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                                else if (cross_field == "att" || cross_field == "att_flat")
-                                    resolved = acts.att;
-                                else if (cross_field == "mlp_up" || cross_field == "mlp_up_flat")
-                                    resolved = acts.mlp_up;
-                                else if (cross_field == "swiglu")
-                                    resolved = acts.swiglu;
+                            TensorSlot slot = builtin_slot_from_name(cross_field);
+                            // `out` is a connector-specific alias for the block's
+                            // final output (mlp_down slot in legacy models).
+                            if (slot == TensorSlot::Mapped && (cross_field == "out" || cross_field == "out_flat")) {
+                                slot = TensorSlot::BlockMLPDown;
+                            }
+                            if (Tensor* bp = block_activation_ptr(mRunState, cross_lyr, slot)) {
+                                resolved = *bp;
                             }
                         } catch (...) {
                         }
@@ -241,17 +224,23 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                 }
             }
 
-            // For layer 0 input: the "zeros" residual
+            // For layer 0 input: the "zeros" residual — allocate a fresh
+            // zero tensor on the stack. This is a Gemma4 / hybrid-stack
+            // idiom: the first layer's residual is initialized from an
+            // explicit zeros op whose name contains "zeros".
             if (!resolved.Data && !inp.name.empty() && inp.name.find("zeros") != std::string::npos) {
-                // Allocate a zeros tensor on stack for the initial residual
                 long C = static_cast<long>(mConfig.HiddenSize);
                 resolved = mRunState.temp_alloc(ETensorDType::BF16, {mB, mT, C}, "zeros");
                 fill_zero(resolved, mRunState.MainStream);
             }
 
-            // Embedding output (embed_1, embed_0, etc.)
+            // Embedding output (embed_1, embed_0, …) — substring match because
+            // this family of names isn't (yet) in the slot registry. Routes to
+            // the Encoded slot buffer.
             if (!resolved.Data && !inp.name.empty() && inp.name.find("embed") != std::string::npos) {
-                resolved = mRunState.non_block_activations().encoded;
+                if (Tensor* gp = global_activation_ptr(mRunState, TensorSlot::Encoded)) {
+                    resolved = *gp;
+                }
             }
 
             // Last resort: check mSaved (forward saved tensors)
@@ -369,48 +358,20 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                     continue;
                 }
             }
-            // Fallback: resolve from simplified_acts (for tensors that live in pre-allocated buffers)
+            // Fallback: resolve from simplified_acts via the shared block-activation
+            // dispatch. `builtin_slot_from_name()` maps every alias (`ln`, `ln_flat`,
+            // `qkv_rope`, `res_att`, …) to a TensorSlot; the helper routes it to
+            // the right RunState buffer. New slots are added in ONE place
+            // (tensor_slot_dispatch.cpp) rather than duplicated here.
             int lyr = -1;
             std::string field;
             if (parse_block_param(name, lyr, field)) {
                 const std::string base = strip_ssa_suffix(field);
-                auto& acts = mRunState.simplified_acts(lyr);
-                Tensor resolved{};
-                if (base == "ln1_rstd" || base == "ln_rstd")
-                    resolved = acts.ln1_rstd;
-                else if (base == "ln2_rstd")
-                    resolved = acts.ln2_rstd;
-                else if (base == "q_rstd")
-                    resolved = acts.q_rstd;
-                else if (base == "k_rstd")
-                    resolved = acts.k_rstd;
-                else if (base == "lse")
-                    resolved = acts.lse;
-                else if (base == "att" || base == "att_flat")
-                    resolved = acts.att;
-                else if (base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat")
-                    resolved = acts.ln1;
-                else if (base == "ln2" || base == "ln2_flat")
-                    resolved = acts.ln2;
-                else if (base == "qkv" || base == "qkv_norm")
-                    resolved = acts.qkv;
-                else if (base == "qkv_rope")
-                    resolved = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                else if (base == "att_out" || base == "att_out_flat")
-                    resolved = acts.att_out;
-                else if (base == "mlp_up" || base == "mlp_up_flat")
-                    resolved = acts.mlp_up;
-                else if (base == "swiglu")
-                    resolved = acts.swiglu;
-                else if (base == "mlp_down" || base == "mlp_down_flat")
-                    resolved = acts.mlp_down;
-                else if (base == "res_att" || base == "residual_att")
-                    resolved = acts.residual_att;
-                else if (base == "res_ffn" || base == "residual_ffn" || base == "res_in") {
-                    resolved = mRunState.get_residual(lyr, mRunState.MainStream);
-                }
-                if (resolved.Data) {
-                    (*mSaved)[name] = resolved;
+                const TensorSlot slot = builtin_slot_from_name(base);
+                if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
+                    if (bp->Data) {
+                        (*mSaved)[name] = *bp;
+                    }
                 }
             }
         }
@@ -1453,6 +1414,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
     mMicroStep = micro_step;
+    if (!mPersistedBackwardTensors.empty()) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        for (auto* ptr : mPersistedBackwardTensors) {
+            if (ptr) {
+                cudaFree(ptr);
+            }
+        }
+        mPersistedBackwardTensors.clear();
+    }
 
     // Clear activation/non-block gradients for each micro-step.
     // When called from GraphExecutor::backward_with_hook(), the caller already zeroes these
@@ -1561,18 +1531,27 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     Tensor d_ln_final_flat = view_tensor(d_ln_final_buf, {mB * mT, static_cast<long>(mConfig.HiddenSize)});
 
-    // Helper to determine target buffer based on gradient_of field
+    // Helper: map a `gradient_of` field (the forward tensor this gradient
+    // targets) to its persistent buffer. Dispatches on the slot enum so
+    // every alias (`xF`/`ln_final`/`xF_flat`, `x0`/`encoded`) resolves in one
+    // place. `embeddings` is a DSL gradient_of name for the embedding table's
+    // output gradient; it has no slot enum entry so we keep it explicit.
+    // `d_xN` / `d_residualN` are intentionally not mapped here — those are
+    // the backward-input stubs that get computed on-the-fly.
     auto get_target_buffer = [&](const std::string& grad_of) -> Tensor* {
-        // Final norm gradients (xF, ln_final, residual_final)
-        if (grad_of == "xF" || grad_of == "ln_final" || grad_of == "xF_flat" || grad_of == "residual_final" ||
-            grad_of == "final_residual") {
-            return &d_ln_final_buf;
+        TensorSlot slot = builtin_slot_from_name(grad_of);
+        if (slot == TensorSlot::Mapped && grad_of.size() >= 5 && grad_of.compare(grad_of.size() - 5, 5, "_flat") == 0) {
+            slot = builtin_slot_from_name(grad_of.substr(0, grad_of.size() - 5));
         }
-        // Embedding output gradients (x0, encoded) — always bind to persistent buffer
-        if (grad_of == "x0" || grad_of == "encoded" || grad_of == "embeddings") {
+        switch (slot) {
+            case TensorSlot::LNFinal:
+            case TensorSlot::FinalResidual: return &d_ln_final_buf;
+            case TensorSlot::Encoded: return &d_embeddings_buf;
+            default: break;
+        }
+        if (grad_of == "embeddings") {
             return &d_embeddings_buf;
         }
-        // Note: d_xN, d_residualN don't map to persistent buffers - they're computed on-the-fly
         return nullptr;
     };
 
@@ -1608,35 +1587,55 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     // Ensure global block outputs (xN/residualN) map to the last block's gradients.
     // These gradients must survive layer-boundary stack restores in recompute mode.
+    // Gemma4 routes the block output through a dedicated h_out slot, so the top
+    // of the backward chain must seed d_h_out rather than the MLP/down or
+    // residual-attention buffers.
     if (mConfig.NumLayers > 0) {
         const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
         auto& last_grads = mRunState.simplified_grads(last_layer);
-        if (last_grads.d_mlp_down.Data) {
-            bind_tensor("d_xN", last_grads.d_mlp_down);
-        }
-        if (last_grads.d_res_att.Data) {
-            bind_tensor("d_residualN", last_grads.d_res_att);
+        const bool has_h_out_grad = last_grads.d_h_out.Data != nullptr;
+        if (has_h_out_grad) {
+            bind_tensor("d_xN", last_grads.d_h_out);
+            bind_tensor("d_residualN", last_grads.d_h_out);
+            bind_tensor(fmt::format("d_blocks[{}].h_out", last_layer), last_grads.d_h_out);
+        } else {
+            if (last_grads.d_mlp_down.Data) {
+                bind_tensor("d_xN", last_grads.d_mlp_down);
+            }
+            if (last_grads.d_res_att.Data) {
+                bind_tensor("d_residualN", last_grads.d_res_att);
+            }
         }
 
-        // Heuristic aliasing for non-inlined StackedBlocks outputs (e.g., "StackedBlocks_4").
+        // Heuristic aliasing for non-inlined StackedBlocks outputs
+        // (e.g., "StackedBlocks_4" or "HybridStackedBlocks_10").
         if (mSaved) {
             std::vector<std::pair<int, std::string>> stacked;
             stacked.reserve(2);
-            for (const auto& kv : *mSaved) {
-                const std::string& name = kv.first;
-                if (name.rfind("StackedBlocks_", 0) != 0) {
-                    continue;
-                }
-                int idx = -1;
-                const char* s = name.c_str() + std::strlen("StackedBlocks_");
-                if (*s) {
+            auto parse_stacked_output_index = [](const std::string& name, int& idx) -> bool {
+                constexpr std::array<const char*, 2> prefixes = {"StackedBlocks_", "HybridStackedBlocks_"};
+                for (const char* prefix : prefixes) {
+                    if (name.rfind(prefix, 0) != 0) {
+                        continue;
+                    }
+                    const char* s = name.c_str() + std::strlen(prefix);
+                    if (!*s) {
+                        return false;
+                    }
                     char* end = nullptr;
                     long parsed = std::strtol(s, &end, 10);
-                    if (end != s) {
-                        idx = static_cast<int>(parsed);
+                    if (end == s) {
+                        return false;
                     }
+                    idx = static_cast<int>(parsed);
+                    return true;
                 }
-                if (idx >= 0) {
+                return false;
+            };
+            for (const auto& kv : *mSaved) {
+                const std::string& name = kv.first;
+                int idx = -1;
+                if (parse_stacked_output_index(name, idx)) {
                     stacked.emplace_back(idx, name);
                 }
             }
@@ -1644,7 +1643,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 std::sort(stacked.begin(), stacked.end(), [](const auto& a, const auto& b) {
                     return a.first < b.first;
                 });
-                if (stacked.size() == 1) {
+                if (has_h_out_grad) {
+                    for (const auto& [_, name] : stacked) {
+                        bind_tensor("d_" + name, last_grads.d_h_out);
+                    }
+                } else if (stacked.size() == 1) {
                     if (last_grads.d_res_att.Data) {
                         bind_tensor("d_" + stacked[0].second, last_grads.d_res_att);
                     }
@@ -1749,6 +1752,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             case TensorSlot::BlockDSwiGLU:
             case TensorSlot::BlockDMLPUp:
             case TensorSlot::BlockDMLPDown:
+            case TensorSlot::BlockDHOut:
             case TensorSlot::BlockDLN2:
             case TensorSlot::BlockDResAtt:
             case TensorSlot::BlockDResFFN:
@@ -1856,6 +1860,55 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Use pre-computed last-use data from graph compilation (avoids rebuilding every backward).
     const auto& last_use_names = graph.last_use_names;
     const auto& last_use = graph.last_use_index;
+    std::unordered_map<int, std::byte*> persisted_backward_by_tid;
+    std::unordered_map<std::byte*, int> persisted_backward_refcount;
+    auto release_persisted_backward_ptr = [&](std::byte* ptr) {
+        if (!ptr) {
+            return;
+        }
+        for (auto& [tid, active_ptr] : persisted_backward_by_tid) {
+            if (active_ptr == ptr) {
+                active_ptr = nullptr;
+            }
+        }
+        for (auto& tensor : mTensors) {
+            if (tensor.Data == ptr) {
+                tensor = Tensor{};
+            }
+        }
+        for (auto it = mNamedTensors.begin(); it != mNamedTensors.end();) {
+            if (it->second.Data == ptr) {
+                it = mNamedTensors.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto& active_ptr : mPersistedBackwardTensors) {
+            if (active_ptr == ptr) {
+                active_ptr = nullptr;
+            }
+        }
+        CUDA_CHECK(cudaFreeAsync(ptr, mRunState.MainStream));
+        persisted_backward_refcount.erase(ptr);
+    };
+    auto release_persisted_backward_tid = [&](int tid) {
+        auto it = persisted_backward_by_tid.find(tid);
+        if (it == persisted_backward_by_tid.end()) {
+            return;
+        }
+        std::byte* ptr = it->second;
+        persisted_backward_by_tid.erase(it);
+        if (!ptr) {
+            return;
+        }
+        auto ref_it = persisted_backward_refcount.find(ptr);
+        if (ref_it == persisted_backward_refcount.end()) {
+            return;
+        }
+        if (--ref_it->second == 0) {
+            release_persisted_backward_ptr(ptr);
+        }
+    };
     auto prune_by_last_use = [&](std::size_t idx) {
         if (idx >= last_use_names.size()) {
             return;
@@ -1864,15 +1917,21 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mCurrentGraph) {
                 int tid = mCurrentGraph->find_tensor_id(name);
                 if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+                    release_persisted_backward_tid(tid);
                     mTensors[tid] = Tensor{};
                 }
             }
+            mNamedTensors.erase(name);
         }
     };
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const char* bwd_filter_env = std::getenv("SUROGATE_DEBUG_BWD_FILTER");
+    const std::string bwd_filter = bwd_filter_env ? std::string(bwd_filter_env) : std::string();
+    const bool bwd_filter_enabled = !bwd_filter.empty();
+    const bool bwd_filter_dump = env_int("SUROGATE_DEBUG_BWD_FILTER_DUMP", 0) != 0;
     const char* op_profile_env = std::getenv("SUROGATE_OP_PROFILE");
     const bool op_profile = op_profile_env && std::string(op_profile_env) != "0";
     const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
@@ -2040,6 +2099,40 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             continue;
         }
 
+        bool bwd_filter_matched = false;
+        if (bwd_filter_enabled) {
+            for (const auto& ref : op.inputs) {
+                if (ref.name.find(bwd_filter) != std::string::npos) {
+                    bwd_filter_matched = true;
+                    break;
+                }
+            }
+            if (!bwd_filter_matched) {
+                for (const auto& ref : op.outputs) {
+                    if (ref.name.find(bwd_filter) != std::string::npos) {
+                        bwd_filter_matched = true;
+                        break;
+                    }
+                }
+            }
+            if (bwd_filter_matched) {
+                auto dump_refs = [](const std::vector<TensorRef>& refs) {
+                    std::ostringstream oss;
+                    for (std::size_t i = 0; i < refs.size(); ++i) {
+                        if (i > 0) oss << ", ";
+                        const auto& ref = refs[i];
+                        oss << ref.name << "{slot=" << static_cast<int>(ref.slot) << ",layer=" << ref.layer_idx
+                            << ",tid=" << ref.tensor_id << "}";
+                    }
+                    return oss.str();
+                };
+                std::cerr << "[BWD_FILTER] idx=" << idx << " op_id=" << op.op_id
+                          << " type=" << op_type_to_string(op.type) << " layer_start=" << op.layer_start
+                          << " layer_end=" << op.layer_end << " inputs=[" << dump_refs(op.inputs) << "]"
+                          << " outputs=[" << dump_refs(op.outputs) << "]" << std::endl;
+            }
+        }
+
         // Check if this op starts a backward tiled MLP group
         if (!bwd_tile_group_starts.empty()) {
             auto tg_it = bwd_tile_group_starts.find(idx);
@@ -2151,6 +2244,61 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 throw std::runtime_error(oss.str());
             }
             op.fn(*this, op, static_cast<const void*>(hook));
+            if (bwd_filter_matched && bwd_filter_dump && mDebugDumpFn) {
+                std::vector<std::string> dump_names;
+                dump_names.reserve(op.inputs.size() + op.outputs.size());
+                for (const auto& ref : op.inputs) {
+                    if (!ref.name.empty()) {
+                        dump_names.push_back(ref.name);
+                    }
+                }
+                for (const auto& ref : op.outputs) {
+                    if (!ref.name.empty()) {
+                        dump_names.push_back(ref.name);
+                    }
+                }
+                mDebugDumpFn(dump_names, op_layer_any);
+            }
+            if (bwd_filter_matched) {
+                auto log_live_refs = [&](const char* label, const std::vector<TensorRef>& refs) {
+                    std::ostringstream oss;
+                    for (std::size_t ri = 0; ri < refs.size(); ++ri) {
+                        if (ri > 0) {
+                            oss << ", ";
+                        }
+                        const auto& ref = refs[ri];
+                        const Tensor* t = nullptr;
+                        if (ref.tensor_id >= 0 && static_cast<std::size_t>(ref.tensor_id) < mTensors.size() &&
+                            mTensors[static_cast<std::size_t>(ref.tensor_id)].Data) {
+                            t = &mTensors[static_cast<std::size_t>(ref.tensor_id)];
+                        }
+                        if (!t) {
+                            t = try_get_tensor(ref.name);
+                        }
+                        if (!t) {
+                            t = try_get_tensor_fuzzy(ref.name);
+                        }
+                        oss << ref.name << "{tid=" << ref.tensor_id;
+                        if (t && t->Data) {
+                            oss << ",ptr=" << t->Data << ",dtype=" << dtype_to_str(t->DType) << ",shape=[";
+                            for (int di = 0; di < t->Rank; ++di) {
+                                if (di > 0) {
+                                    oss << ",";
+                                }
+                                oss << t->Sizes[di];
+                            }
+                            oss << "]";
+                        } else {
+                            oss << ",missing";
+                        }
+                        oss << "}";
+                    }
+                    std::cerr << "[BWD_FILTER_LIVE] idx=" << idx << " op_id=" << op.op_id << " label=" << label
+                              << " refs=[" << oss.str() << "]" << std::endl;
+                };
+                log_live_refs("inputs", op.inputs);
+                log_live_refs("outputs", op.outputs);
+            }
 
             // Post-dispatch side effect: after the first matmul_backward
             // (LM-head backward) free the output tensor to reclaim the
@@ -2194,24 +2342,101 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     // Persist any cross-layer tensors that still live on the stack.
                     // These tensors (e.g., d_blocks[N].router_logits for MoE aux loss) have
                     // last_use beyond the current layer, so they must survive stack restore.
+                    struct PendingBackwardPersist {
+                        std::string name;
+                        int tensor_id = -1;
+                        std::byte* original_ptr = nullptr;
+                        std::size_t bytes = 0;
+                    };
+
+                    std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
+                    std::unordered_map<std::uintptr_t, std::string> label_by_ptr;
+                    std::vector<PendingBackwardPersist> pending_persists;
+
                     for (const auto& [name, use_idx] : last_use) {
                         if (use_idx <= idx) continue;
                         int tid = graph.find_tensor_id(name);
                         if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-                        auto& tensor = mTensors[static_cast<std::size_t>(tid)];
+                        const auto& tensor = mTensors[static_cast<std::size_t>(tid)];
                         if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
-                            // Copy to persistent GPU memory
-                            const std::size_t nbytes = tensor.bytes();
+                            PendingBackwardPersist pending;
+                            pending.name = name;
+                            pending.tensor_id = tid;
+                            pending.original_ptr = tensor.Data;
+                            pending.bytes = tensor.bytes();
+                            pending_persists.push_back(pending);
+                            const auto key = reinterpret_cast<std::uintptr_t>(tensor.Data);
+                            auto it = max_bytes_by_ptr.find(key);
+                            if (it == max_bytes_by_ptr.end()) {
+                                max_bytes_by_ptr.emplace(key, pending.bytes);
+                                label_by_ptr.emplace(key, name);
+                            } else {
+                                it->second = std::max(it->second, pending.bytes);
+                            }
+                        }
+                    }
+
+                    if (!pending_persists.empty()) {
+                        if (env_enabled("SUROGATE_DEBUG_BACKWARD_PERSIST")) {
+                            std::vector<std::pair<std::string, std::size_t>> debug_entries;
+                            debug_entries.reserve(max_bytes_by_ptr.size());
+                            std::size_t total_bytes = 0;
+                            for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
+                                total_bytes += nbytes;
+                                auto it = label_by_ptr.find(ptr_key);
+                                debug_entries.emplace_back(it != label_by_ptr.end() ? it->second : "<unknown>", nbytes);
+                            }
+                            std::sort(debug_entries.begin(), debug_entries.end(), [](const auto& a, const auto& b) {
+                                return a.second > b.second;
+                            });
+                            std::cerr << "[BWD_PERSIST] layer=" << op.layer_end
+                                      << " unique_ptrs=" << debug_entries.size() << " total_bytes=" << total_bytes
+                                      << std::endl;
+                            const std::size_t limit = std::min<std::size_t>(debug_entries.size(), 16);
+                            for (std::size_t i = 0; i < limit; ++i) {
+                                std::cerr << "  [" << i << "] " << debug_entries[i].first
+                                          << " bytes=" << debug_entries[i].second << std::endl;
+                            }
+                        }
+
+                        std::unordered_map<std::uintptr_t, std::byte*> persistent_by_ptr;
+                        persistent_by_ptr.reserve(max_bytes_by_ptr.size());
+
+                        for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
+                            if (nbytes == 0) {
+                                continue;
+                            }
                             std::byte* persistent = nullptr;
+                            auto* original = reinterpret_cast<const std::byte*>(ptr_key);
                             CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&persistent), nbytes));
                             CUDA_CHECK(cudaMemcpyAsync(persistent,
-                                                       tensor.Data,
+                                                       original,
                                                        nbytes,
                                                        cudaMemcpyDeviceToDevice,
                                                        mRunState.MainStream));
-                            tensor.Data = persistent;
-                            // Track for cleanup at end of backward
+                            persistent_by_ptr.emplace(ptr_key, persistent);
                             mPersistedBackwardTensors.push_back(persistent);
+                        }
+
+                        for (const PendingBackwardPersist& pending : pending_persists) {
+                            auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(pending.original_ptr));
+                            if (it == persistent_by_ptr.end()) {
+                                continue;
+                            }
+                            release_persisted_backward_tid(pending.tensor_id);
+                            persisted_backward_by_tid[pending.tensor_id] = it->second;
+                            persisted_backward_refcount[it->second] += 1;
+                            mTensors[static_cast<std::size_t>(pending.tensor_id)].Data = it->second;
+                        }
+
+                        for (auto& [name, tensor] : mNamedTensors) {
+                            if (!tensor.Data) {
+                                continue;
+                            }
+                            auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(tensor.Data));
+                            if (it != persistent_by_ptr.end()) {
+                                tensor.Data = it->second;
+                            }
                         }
                     }
 
@@ -2342,7 +2567,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     if (!mPersistedBackwardTensors.empty()) {
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         for (auto* ptr : mPersistedBackwardTensors) {
-            cudaFree(ptr);
+            if (ptr) {
+                cudaFree(ptr);
+            }
         }
         mPersistedBackwardTensors.clear();
     }

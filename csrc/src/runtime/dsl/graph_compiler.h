@@ -338,6 +338,23 @@ struct CompiledOp {
 // Tensor metadata for integer-indexed pruning (replaces runtime string parsing)
 // ============================================================================
 
+/// First-class tensor classification, resolved once at compile time by
+/// authoritative lookup (against the parameter store / ops / slot registry).
+/// Runtime code queries this instead of string-matching names — which is
+/// ambiguous and has caused silent clobber bugs when a name like
+/// `d_blocks[N].mlp_x_flat_from_7` was mistaken for a parameter-gradient
+/// accumulator and collapsed onto the base tensor's buffer.
+enum class TensorKind : uint8_t {
+    Unknown = 0,
+    ForwardParam,       ///< Present in DslParamStore
+    ForwardActivation,  ///< Produced by a forward op (base_producer_op_idx set)
+    ParamGrad,          ///< d_<param>; base_param_tid set
+    ActivationGrad,     ///< d_<activation>; base_producer_tid set
+    AccumTemp,          ///< _from_N / _accum_N variant; base_grad_tid set
+    LossInput,          ///< d_loss (and its views)
+    Scratch,            ///< Everything else (zeros, constants, unknown intermediates)
+};
+
 struct TensorMeta {
     static constexpr uint8_t kCrossLayer = 1 << 0;  // name starts with "layer"
     static constexpr uint8_t kMoeOffsets = 1 << 1;  // name == "moe_expert_offsets"
@@ -347,6 +364,12 @@ struct TensorMeta {
 
     uint8_t flags = 0;
     int block_layer_idx = -1;  // For "blocks[N].*" or "d_blocks[N].*", the parsed N
+
+    // Classification (populated by classify_tensors() after build_tensor_metadata).
+    TensorKind kind = TensorKind::Unknown;
+    int base_param_tid = -1;     ///< ParamGrad -> tid of the parameter
+    int base_producer_tid = -1;  ///< ActivationGrad -> tid of the forward activation
+    int base_grad_tid = -1;      ///< AccumTemp -> tid of the non-accum parent gradient
 
     bool is_cross_layer() const {
         return flags & kCrossLayer;
@@ -363,7 +386,15 @@ struct TensorMeta {
     bool is_moe_gather() const {
         return flags & kMoeGather;
     }
+    bool is_param_grad() const {
+        return kind == TensorKind::ParamGrad;
+    }
+    bool is_accum_temp() const {
+        return kind == TensorKind::AccumTemp;
+    }
 };
+
+const char* tensor_kind_name(TensorKind k);
 
 // ============================================================================
 // Graph Segment (for split-attention CUDA graph capture)
@@ -413,6 +444,7 @@ struct CompiledGraph {
     // during compilation. At runtime, tensors are stored in a flat vector indexed by these IDs.
     int num_tensors = 0;
     std::unordered_map<std::string, int> tensor_name_to_id;  // name -> tensor_id (for init bindings + debug)
+    std::vector<std::string> tensor_id_to_name;              // O(1) reverse of tensor_name_to_id (hot-path friendly)
     std::vector<TensorMeta> tensor_meta;                     // per-ID pruning metadata
     std::unordered_map<std::string, int> ssa_base_to_id;     // SSA-stripped name -> highest-suffix tensor_id
 
@@ -420,6 +452,16 @@ struct CompiledGraph {
     int find_tensor_id(const std::string& name) const {
         auto it = tensor_name_to_id.find(name);
         return (it != tensor_name_to_id.end()) ? it->second : -1;
+    }
+
+    /// O(1) reverse lookup: tensor_id -> canonical name. Returns empty string_view
+    /// if `tid` is out of range. Preferred over scanning `tensor_name_to_id` on
+    /// dispatcher hot paths (used by e.g. `base_param_from_grad_kind`).
+    std::string_view name_for_tensor_id(int tid) const {
+        if (tid < 0 || static_cast<std::size_t>(tid) >= tensor_id_to_name.size()) {
+            return {};
+        }
+        return tensor_id_to_name[static_cast<std::size_t>(tid)];
     }
 
     // MLP tile groups for long-context tiled execution.
@@ -535,6 +577,13 @@ private:
 
     // Build per-ID metadata for pruning (flags, block_layer_idx, ssa_base_to_id)
     void build_tensor_metadata(CompiledGraph& graph);
+
+    // Classify every tensor (kind + base_*_tid) by authoritative lookup against
+    // the parameter store and the op producer map. Called after
+    // build_tensor_metadata. Replaces ad-hoc string predicates like
+    // base_param_from_grad / should_alias_autodiff_accum_name (Phase 0: data
+    // only; callers still use the legacy predicates until Phase 1 flips them).
+    void classify_tensors(CompiledGraph& graph);
 };
 
 }  // namespace dsl

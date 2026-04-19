@@ -71,9 +71,14 @@ std::string to_lower(std::string s) {
     return s;
 }
 
+RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, const RoPEConfig& rope, int head_size, int seq_len);
+
 RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, int seq_len) {
+    return compute_rope_inv_freq(cfg, cfg.Rope, head_size, seq_len);
+}
+
+RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, const RoPEConfig& rope, int head_size, int seq_len) {
     RopeInvFreq out;
-    const auto& rope = cfg.Rope;
     int dim = rope.rotary_dim(head_size);
     dim = (dim / 2) * 2;
     out.dim = dim;
@@ -95,6 +100,26 @@ RopeInvFreq compute_rope_inv_freq(const PretrainedConfig& cfg, int head_size, in
 
     if (rope_type == "linear") {
         compute_default(base);
+        if (factor != 0.0) {
+            for (auto& v : out.inv_freq)
+                v = static_cast<float>(v / factor);
+        }
+        return out;
+    }
+
+    if (rope_type == "proportional") {
+        const double rope_proportion = static_cast<double>(rope.partial_factor);
+        const int rope_angles = static_cast<int>((rope_proportion * static_cast<double>(head_size)) / 2.0);
+        // HF Gemma4 proportional RoPE returns a full head-width frequency
+        // vector with trailing zero frequencies, then applies rotate_half()
+        // across the full head. This is not equivalent to rotating a
+        // contiguous prefix only.
+        out.dim = head_size;
+        out.inv_freq.assign(static_cast<std::size_t>(std::max(0, head_size / 2)), 0.0f);
+        for (int i = 0; i < rope_angles; ++i) {
+            const double exponent = (2.0 * i) / static_cast<double>(head_size);
+            out.inv_freq[static_cast<std::size_t>(i)] = static_cast<float>(1.0 / std::pow(base, exponent));
+        }
         if (factor != 0.0) {
             for (auto& v : out.inv_freq)
                 v = static_cast<float>(v / factor);
@@ -402,6 +427,24 @@ Tensor& DslRunState::get_final_residual() {
     return mResidualManager->get_final_residual();
 }
 
+Tensor& DslRunState::rope_freqs(std::string_view name) {
+    int layer_idx = -1;
+    std::string field;
+    if (!mPerLayerRopeFreqs.empty() && parse_block_param(name, layer_idx, field) && layer_idx >= 0 &&
+        static_cast<std::size_t>(layer_idx) < mPerLayerRopeFreqs.size() &&
+        mPerLayerRopeFreqs[static_cast<std::size_t>(layer_idx)].Data) {
+        return mPerLayerRopeFreqs[static_cast<std::size_t>(layer_idx)];
+    }
+    if (!mNonBlockActivations.freq_cis.Data) {
+        throw std::runtime_error("DslRunState: RoPE frequencies not allocated");
+    }
+    return mNonBlockActivations.freq_cis;
+}
+
+const Tensor& DslRunState::rope_freqs(std::string_view name) const {
+    return const_cast<DslRunState*>(this)->rope_freqs(name);
+}
+
 void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     const long B = this->B;
     const long T = this->T;
@@ -461,6 +504,46 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
             mNonBlockActivations.freq_cis =
                 mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
             fill_zero(mNonBlockActivations.freq_cis, MainStream);
+        }
+
+        if (mRuntimeConfig.has_per_layer_rope()) {
+            mPerLayerRopeFreqs.resize(mRuntimeConfig.per_layer_rope.size());
+            for (std::size_t i = 0; i < mRuntimeConfig.per_layer_rope.size(); ++i) {
+                const auto& layer_rope = mRuntimeConfig.per_layer_rope[i];
+                const RopeInvFreq layer_params =
+                    compute_rope_inv_freq(cfg, layer_rope.rope, layer_rope.head_size, max_seq_len);
+                if (layer_params.dim <= 0) {
+                    continue;
+                }
+
+                const std::vector<long> shape = {max_seq_len, layer_params.dim / 2, 2};
+                const std::string name = "rope_freqs_layer" + std::to_string(i);
+                if (dtype == ETensorDType::BF16) {
+                    Tensor freqs = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
+                    std::vector<nv_bfloat16> freq_cpu(static_cast<std::size_t>(max_seq_len) *
+                                                      static_cast<std::size_t>(layer_params.dim));
+                    fill_rope_freqs(freq_cpu, layer_params, static_cast<int>(layer_rope.head_size), max_seq_len);
+                    CUDA_CHECK(cudaMemcpy(freqs.Data,
+                                          freq_cpu.data(),
+                                          freq_cpu.size() * sizeof(nv_bfloat16),
+                                          cudaMemcpyHostToDevice));
+                    mPerLayerRopeFreqs[i] = freqs;
+                } else if (dtype == ETensorDType::FP32) {
+                    Tensor freqs = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
+                    std::vector<float> freq_cpu(static_cast<std::size_t>(max_seq_len) *
+                                                static_cast<std::size_t>(layer_params.dim));
+                    fill_rope_freqs(freq_cpu, layer_params, static_cast<int>(layer_rope.head_size), max_seq_len);
+                    CUDA_CHECK(cudaMemcpy(freqs.Data,
+                                          freq_cpu.data(),
+                                          freq_cpu.size() * sizeof(float),
+                                          cudaMemcpyHostToDevice));
+                    mPerLayerRopeFreqs[i] = freqs;
+                } else {
+                    Tensor freqs = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
+                    fill_zero(freqs, MainStream);
+                    mPerLayerRopeFreqs[i] = freqs;
+                }
+            }
         }
     }
 
@@ -537,24 +620,27 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         return recompute_enabled && mSlotRegistry.will_recompute(name, lora_only);
     };
 
-    // Query the DSL for sharing decisions
-    const bool share_ln1 = should_share_slot("ln1");
-    const bool share_ln2 = should_share_slot("ln2");
-    const bool share_qkv = should_share_slot("qkv");
-    const bool share_att = should_share_slot("att");
-    const bool share_att_out = should_share_slot("att_out");
-    const bool share_mlp_up = should_share_slot("mlp_up");
-    const bool share_swiglu = should_share_slot("swiglu");
-    const bool share_residual_intermediates = should_share_slot("res_att");
-    const bool share_mlp_down = should_share_slot("mlp_down");
-    const bool share_qk_rstd = use_qk_norm && should_share_slot("q_rstd");
+    // Query the DSL for sharing decisions. Use the slot enum's canonical-name
+    // reverse-mapping so the string literal only lives in `kSlotMappings`;
+    // renaming the canonical name there propagates here automatically.
+    const bool share_ln1 = should_share_slot(builtin_slot_name(TensorSlot::BlockLN1));
+    const bool share_ln2 = should_share_slot(builtin_slot_name(TensorSlot::BlockLN2));
+    const bool share_qkv = should_share_slot(builtin_slot_name(TensorSlot::BlockQKV));
+    const bool share_att = should_share_slot(builtin_slot_name(TensorSlot::BlockAtt));
+    const bool share_att_out = should_share_slot(builtin_slot_name(TensorSlot::BlockAttOut));
+    const bool share_mlp_up = should_share_slot(builtin_slot_name(TensorSlot::BlockMLPUp));
+    const bool share_swiglu = should_share_slot(builtin_slot_name(TensorSlot::BlockSwiGLU));
+    const bool share_residual_intermediates = should_share_slot(builtin_slot_name(TensorSlot::BlockResidualAtt));
+    const bool share_mlp_down = should_share_slot(builtin_slot_name(TensorSlot::BlockMLPDown));
+    const bool share_qk_rstd = use_qk_norm && should_share_slot(builtin_slot_name(TensorSlot::BlockQRSTD));
 
     // FFN temps: Use stack-backed temps only when backward recompute can actually
     // reconstruct them. For models without DSL recompute metadata (e.g. partially
     // onboarded blocks), forcing stack-backed FFN temps causes large persistent
     // save-buffer copies and severe memory pressure.
     const bool can_recompute_ffn_temps =
-        mSlotRegistry.will_recompute("mlp_up", lora_only) && mSlotRegistry.will_recompute("swiglu", lora_only);
+        mSlotRegistry.will_recompute(builtin_slot_name(TensorSlot::BlockMLPUp), lora_only) &&
+        mSlotRegistry.will_recompute(builtin_slot_name(TensorSlot::BlockSwiGLU), lora_only);
     const bool ffn_temps_on_stack = recompute_enabled && lora_only && can_recompute_ffn_temps;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
@@ -571,10 +657,17 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     Tensor shared_q_rstd{}, shared_k_rstd{};
     Tensor shared_mlp_up{}, shared_swiglu{}, shared_residual_att{}, shared_mlp_down{};
 
-    if (share_ln1) shared_ln1 = mAllocator->allocate(dtype, "ln1_shared", kind, {B, T, C});
-    if (share_ln2) shared_ln2 = mAllocator->allocate(dtype, "ln2_shared", kind, {B, T, C});
+    // Allocation tag = `<canonical_slot_name>_shared`. The canonical name
+    // comes from `builtin_slot_name()` (reverse of `kSlotMappings`) so
+    // renaming a slot propagates to every alloc tag automatically.
+    auto shared_tag = [](TensorSlot s) -> std::string {
+        return std::string(builtin_slot_name(s)) + "_shared";
+    };
+
+    if (share_ln1) shared_ln1 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN1).c_str(), kind, {B, T, C});
+    if (share_ln2) shared_ln2 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN2).c_str(), kind, {B, T, C});
     if (share_qkv) {
-        shared_qkv = mAllocator->allocate(dtype, "qkv_shared", kind, {B, T, QKV});
+        shared_qkv = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKV).c_str(), kind, {B, T, QKV});
     }
     // In LoRA mode with recompute, we still need a separate qkv_rope buffer when
     // QK-norm is used.  Without it, RoPE is applied in-place on the shared qkv buffer,
@@ -583,32 +676,42 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // qk_norm_rope recompute op, causing norm+rope to be applied twice (→ NaN for MRoPE).
     // A single shared buffer is sufficient since recompute runs one layer at a time.
     if (lora_only && recompute_enabled && use_qk_norm) {
-        shared_qkv_rope = mAllocator->allocate(dtype, "qkv_rope_shared", kind, {B, T, QKV});
+        shared_qkv_rope = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKVRoPE).c_str(), kind, {B, T, QKV});
     }
     if (share_qk_rstd && use_qk_norm) {
-        shared_q_rstd = mAllocator->allocate(ETensorDType::FP32, "q_rstd_shared", kind, {B, T, Hq});
-        shared_k_rstd = mAllocator->allocate(ETensorDType::FP32, "k_rstd_shared", kind, {B, T, Hkv});
+        shared_q_rstd =
+            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockQRSTD).c_str(), kind, {B, T, Hq});
+        shared_k_rstd =
+            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockKRSTD).c_str(), kind, {B, T, Hkv});
     }
     // LSE sharing: only in lora_only mode. FFT needs per-layer LSE for bit-exact gradients.
-    if (share_att) shared_lse = mAllocator->allocate(ETensorDType::FP32, "lse_shared", kind, {B, Hq, T});
     if (share_att) {
-        shared_att = mAllocator->allocate(dtype, "att_shared", kind, {B, T, AttnDim});
+        shared_lse =
+            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockLSE).c_str(), kind, {B, Hq, T});
+    }
+    if (share_att) {
+        shared_att = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAtt).c_str(), kind, {B, T, AttnDim});
     }
     if (share_att_out) {
-        shared_att_out = mAllocator->allocate(dtype, "att_out_shared", kind, {B, T, C});
+        shared_att_out = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAttOut).c_str(), kind, {B, T, C});
     }
     // att_out sharing is handled by share_att when recompute is enabled.
-    const bool has_mlp_up_slot_global = has_layout && mSlotRegistry.lookup("mlp_up").has_value();
-    const bool has_swiglu_slot_global = has_layout && mSlotRegistry.lookup("swiglu").has_value();
-    if (share_mlp_up && !ffn_temps_on_stack && has_mlp_up_slot_global)
-        shared_mlp_up = mAllocator->allocate(dtype, "mlp_up_shared", kind, {B, T, MUp});
-    if (share_swiglu && !ffn_temps_on_stack && has_swiglu_slot_global)
-        shared_swiglu = mAllocator->allocate(dtype, "swiglu_shared", kind, {B, T, M});
+    const bool has_mlp_up_slot_global =
+        has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockMLPUp)).has_value();
+    const bool has_swiglu_slot_global =
+        has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
+    if (share_mlp_up && !ffn_temps_on_stack && has_mlp_up_slot_global) {
+        shared_mlp_up = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPUp).c_str(), kind, {B, T, MUp});
+    }
+    if (share_swiglu && !ffn_temps_on_stack && has_swiglu_slot_global) {
+        shared_swiglu = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockSwiGLU).c_str(), kind, {B, T, M});
+    }
     if (share_residual_intermediates) {
-        shared_residual_att = mAllocator->allocate(dtype, "residual_att_shared", kind, {B, T, C});
+        shared_residual_att =
+            mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockResidualAtt).c_str(), kind, {B, T, C});
     }
     if (share_mlp_down) {
-        shared_mlp_down = mAllocator->allocate(dtype, "mlp_down_shared", kind, {B, T, C});
+        shared_mlp_down = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPDown).c_str(), kind, {B, T, C});
     }
 
     mSimplifiedActivations.resize(cfg.NumLayers);
@@ -629,17 +732,26 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
                             ? mRuntimeConfig.per_layer_dims[i].intermediate
                             : M;
 
-        acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, "ln1_rstd", kind, {B, T});
-        acts.ln1 = share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, "ln1", kind, {B, T, C});
+        // Per-layer allocation tag = canonical slot name; shared buffers are
+        // already created above with the `<slot>_shared` tag.
+        auto tag = [](TensorSlot s) {
+            return builtin_slot_name(s);
+        };
 
-        acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, "ln2_rstd", kind, {B, T});
-        acts.ln2 = share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, "ln2", kind, {B, T, C});
+        acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
+        acts.ln1 = share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
+
+        acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
+        acts.ln2 = share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
 
         if (use_qk_norm) {
-            acts.q_rstd =
-                share_qk_rstd ? shared_q_rstd : mAllocator->allocate(ETensorDType::FP32, "q_rstd", kind, {B, T, Hq});
+            acts.q_rstd = share_qk_rstd
+                              ? shared_q_rstd
+                              : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
             acts.k_rstd =
-                share_qk_rstd ? shared_k_rstd : mAllocator->allocate(ETensorDType::FP32, "k_rstd", kind, {B, T, Hkv});
+                share_qk_rstd
+                    ? shared_k_rstd
+                    : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
         } else {
             acts.q_rstd = {};
             acts.k_rstd = {};
@@ -649,58 +761,80 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         // MUST have their own non-shared QKV buffers so the data survives until
         // the consumer layer reads it.
         const bool is_kv_src = mRuntimeConfig.is_kv_source(i);
-        acts.qkv = (share_qkv && !is_kv_src) ? shared_qkv : mAllocator->allocate(dtype, "qkv", kind, {B, T, lQKV});
+        acts.qkv = (share_qkv && !is_kv_src)
+                       ? shared_qkv
+                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
         const bool need_separate_qkv_rope = recompute_enabled && use_qk_norm;
         if (need_separate_qkv_rope) {
             acts.qkv_rope = (shared_qkv_rope.Data && !is_kv_src)
                                 ? shared_qkv_rope
-                                : mAllocator->allocate(dtype, "qkv_rope", kind, {B, T, lQKV});
+                                : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV});
         } else {
             acts.qkv_rope = {};
         }
 
-        acts.lse = share_att ? shared_lse : mAllocator->allocate(ETensorDType::FP32, "lse", kind, {B, Hq, T});
-        acts.att = share_att ? shared_att : mAllocator->allocate(dtype, "att", kind, {B, T, lAttnDim});
-        acts.att_out = share_att_out ? shared_att_out : mAllocator->allocate(dtype, "att_out", kind, {B, T, C});
+        acts.lse = share_att ? shared_lse
+                             : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
+        acts.att =
+            share_att ? shared_att : mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
+        acts.att_out =
+            share_att_out ? shared_att_out : mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
 
-        acts.residual_att = share_residual_intermediates ? shared_residual_att
-                                                         : mAllocator->allocate(dtype, "residual_att", kind, {B, T, C});
+        acts.residual_att = share_residual_intermediates
+                                ? shared_residual_att
+                                : mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
 
         // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
         // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
-        const bool has_mlp_up_slot = has_layout && mSlotRegistry.lookup("mlp_up").has_value();
-        const bool has_swiglu_slot = has_layout && mSlotRegistry.lookup("swiglu").has_value();
+        const bool has_mlp_up_slot =
+            has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockMLPUp)).has_value();
+        const bool has_swiglu_slot =
+            has_layout && mSlotRegistry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
         if (ffn_temps_on_stack || !has_mlp_up_slot) {
             acts.mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
         } else {
-            acts.mlp_up = share_mlp_up ? shared_mlp_up : mAllocator->allocate(dtype, "mlp_up", kind, {B, T, lMUp});
+            acts.mlp_up = share_mlp_up ? shared_mlp_up
+                                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPUp), kind, {B, T, lMUp});
         }
         if (ffn_temps_on_stack || !has_swiglu_slot) {
             acts.swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
         } else {
-            acts.swiglu = share_swiglu ? shared_swiglu : mAllocator->allocate(dtype, "swiglu", kind, {B, T, lM});
+            acts.swiglu = share_swiglu ? shared_swiglu
+                                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockSwiGLU), kind, {B, T, lM});
         }
 
-        acts.mlp_down = share_mlp_down ? shared_mlp_down : mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
+        acts.mlp_down = share_mlp_down ? shared_mlp_down
+                                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
         // Dedicated per-layer block output slot used by Gemma4 (keeps the
         // block's final h_out separate from the MLP's mlp_down so the
         // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
         // dependency that drives MLP LoRA gradients).
-        acts.h_out = mAllocator->allocate(dtype, "h_out", kind, {B, T, C});
+        acts.h_out = mAllocator->allocate(dtype, tag(TensorSlot::BlockHOut), kind, {B, T, C});
 
         if (NumExperts > 0) {
             const long num_tokens = B * T;
             const long total_tokens = num_tokens * TopK;
-            acts.router_logits = mAllocator->allocate(dtype, "router_logits", kind, {num_tokens, NumExperts});
-            acts.router_probs = mAllocator->allocate(dtype, "router_probs", kind, {num_tokens, NumExperts});
-            acts.routing_weights = mAllocator->allocate(dtype, "routing_weights", kind, {num_tokens, TopK});
-            acts.routing_indices =
-                mAllocator->allocate(ETensorDType::INT32, "routing_indices", kind, {num_tokens, TopK});
-            acts.permuted_input = mAllocator->allocate(dtype, "permuted_input", kind, {total_tokens, C});
-            acts.scatter_indices = mAllocator->allocate(ETensorDType::INT32, "scatter_indices", kind, {total_tokens});
-            acts.expert_gate_up = mAllocator->allocate(dtype, "expert_gate_up", kind, {total_tokens, MoeMUp});
-            acts.expert_act = mAllocator->allocate(dtype, "expert_act", kind, {total_tokens, MoeM});
-            acts.expert_down = mAllocator->allocate(dtype, "expert_down", kind, {total_tokens, C});
+            // MoE slot tags now come from the TensorSlot enum — same reverse
+            // mapping used for every other block slot. Adding a new MoE slot
+            // is a one-line change in `kSlotMappings`/`slot_to_name`.
+            acts.router_logits =
+                mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterLogits), kind, {num_tokens, NumExperts});
+            acts.router_probs =
+                mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterProbs), kind, {num_tokens, NumExperts});
+            acts.routing_weights =
+                mAllocator->allocate(dtype, tag(TensorSlot::BlockRoutingWeights), kind, {num_tokens, TopK});
+            acts.routing_indices = mAllocator->allocate(ETensorDType::INT32,
+                                                        tag(TensorSlot::BlockRoutingIndices),
+                                                        kind,
+                                                        {num_tokens, TopK});
+            acts.permuted_input =
+                mAllocator->allocate(dtype, tag(TensorSlot::BlockPermutedInput), kind, {total_tokens, C});
+            acts.scatter_indices =
+                mAllocator->allocate(ETensorDType::INT32, tag(TensorSlot::BlockScatterIndices), kind, {total_tokens});
+            acts.expert_gate_up =
+                mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertGateUp), kind, {total_tokens, MoeMUp});
+            acts.expert_act = mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertAct), kind, {total_tokens, MoeM});
+            acts.expert_down = mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertDown), kind, {total_tokens, C});
             acts.moe_out = view_tensor(acts.mlp_down, {num_tokens, C});
         } else {
             acts.router_logits = {};

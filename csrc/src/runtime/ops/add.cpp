@@ -23,9 +23,16 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
     Tensor& out = ensure_output_tensor(op.outputs[0]);
 
     // Backward accumulation outputs (e.g. d_*_accum_N) should not reuse aliased
-    // buffers: they are reduction nodes and can become incorrect if out aliases an
-    // input or if stale mapped storage is reused across accumulation steps.
-    const bool is_accum_output = !op.outputs.empty() && op.outputs[0].name.find("_accum_") != std::string::npos;
+    // buffers: they are reduction nodes and can become incorrect if out aliases
+    // an input or if stale mapped storage is reused across accumulation steps.
+    // Classifier-backed: TensorKind::AccumTemp is set at compile time for every
+    // autodiff accumulator variant — no name string-matching required.
+    bool is_accum_output = false;
+    if (!op.outputs.empty() && mCurrentGraph && op.outputs[0].tensor_id >= 0 &&
+        static_cast<std::size_t>(op.outputs[0].tensor_id) < mCurrentGraph->tensor_meta.size()) {
+        is_accum_output =
+            mCurrentGraph->tensor_meta[static_cast<std::size_t>(op.outputs[0].tensor_id)].kind == TensorKind::AccumTemp;
+    }
     const bool aliases_input = out.Data && (out.Data == a.Data || out.Data == b.Data);
 
     // For element-wise add, output shape must match inputs. Reallocate when shape
@@ -53,8 +60,13 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // IMPORTANT: We must get the base tensor directly from simplified_grads(), not via
     // resolve_tensor(), because resolve_tensor() may return a cached view from mTensors.
     auto assign_output = [&](const TensorRef& ref) {
-        if (!ref.name.empty()) {
-            if (auto base = base_param_from_grad(ref.name)) {
+        if (!ref.name.empty() && mCurrentGraph) {
+            // Classifier-backed resolution: only route into the parameter-grad
+            // store when the tensor is classified as ParamGrad. For every
+            // other kind (ActivationGrad, AccumTemp, Scratch) this returns
+            // nullopt and the add-backward falls through to the pre-allocated
+            // block-grad slot path below.
+            if (auto base = base_param_from_grad_kind(ref.tensor_id, *mCurrentGraph)) {
                 bool accumulate = mAccumulateTensors.count(ref.name) > 0;
                 if (!accumulate) {
                     accumulate = mAccumulateTensors.count("d_" + *base) > 0;
@@ -107,6 +119,7 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                 case TensorSlot::BlockDQKV: base_grad = &grads.d_qkv; break;
                 case TensorSlot::BlockDMLPUp: base_grad = &grads.d_mlp_up; break;
                 case TensorSlot::BlockDMLPDown: base_grad = &grads.d_mlp_down; break;
+                case TensorSlot::BlockDHOut: base_grad = &grads.d_h_out; break;
                 default: break;
             }
         }

@@ -3,13 +3,18 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
@@ -64,6 +69,79 @@ void log_qkv_mismatch(const char* op_name,
     fprintf(stderr, "[QKV_DEBUG] aborting: qkv size does not match config and sharding is disabled\n");
 }
 
+std::string tensor_shape_debug(const Tensor& t) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int i = 0; i < t.Rank; ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << t.Sizes[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void debug_dump_runtime_tensor(const std::string& name, const Tensor& t, const char* dump_dir) {
+    if (!dump_dir || !*dump_dir || !t.Data || t.nelem() <= 0) {
+        return;
+    }
+    std::string safe;
+    safe.reserve(name.size());
+    for (char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.') {
+            safe += c;
+        } else {
+            safe += '_';
+        }
+    }
+    const std::size_t nelem = static_cast<std::size_t>(t.nelem());
+    std::vector<float> host_data(nelem);
+    if (t.DType == ETensorDType::FP32) {
+        CUDA_CHECK(cudaMemcpy(host_data.data(), t.Data, nelem * sizeof(float), cudaMemcpyDeviceToHost));
+    } else if (t.DType == ETensorDType::BF16) {
+        std::vector<uint16_t> bf16_data(nelem);
+        CUDA_CHECK(cudaMemcpy(bf16_data.data(), t.Data, nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < nelem; ++i) {
+            uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
+            float val;
+            std::memcpy(&val, &bits, sizeof(float));
+            host_data[i] = val;
+        }
+    } else {
+        return;
+    }
+    const std::string bin_path = std::string(dump_dir) + "/" + safe + ".bin";
+    FILE* bin_f = std::fopen(bin_path.c_str(), "wb");
+    if (bin_f) {
+        std::fwrite(host_data.data(), sizeof(float), nelem, bin_f);
+        std::fclose(bin_f);
+    }
+    const std::string json_path = std::string(dump_dir) + "/" + safe + ".json";
+    FILE* json_f = std::fopen(json_path.c_str(), "w");
+    if (json_f) {
+        std::fprintf(json_f, "{\"name\": \"%s\", \"dtype\": \"float32\", \"shape\": [", name.c_str());
+        for (int i = 0; i < t.Rank; ++i) {
+            std::fprintf(json_f, "%ld%s", t.Sizes[i], (i + 1 < t.Rank) ? ", " : "");
+        }
+        std::fprintf(json_f, "]}\n");
+        std::fclose(json_f);
+    }
+}
+
+bool should_dump_qkv_layer(int layer_idx) {
+    const char* layer_env = std::getenv("SUROGATE_DEBUG_QKV_DUMP_LAYER");
+    if (!layer_env || !*layer_env) {
+        return false;
+    }
+    char* end = nullptr;
+    const long requested = std::strtol(layer_env, &end, 10);
+    if (end == layer_env) {
+        return false;
+    }
+    return layer_idx == static_cast<int>(requested);
+}
+
 }  // namespace
 
 void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
@@ -72,6 +150,9 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     Tensor& k_norm = resolve_tensor(op.inputs[2]);
     Tensor& freqs = resolve_tensor(op.inputs[3]);
     Tensor& pos_ids = resolve_tensor(op.inputs[4]);
+    int dump_layer_idx = -1;
+    std::string dump_field;
+    const bool dump_layer = parse_block_param(op.inputs[0].name, dump_layer_idx, dump_field) && dump_layer_idx >= 0;
 
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -187,9 +268,12 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
     Tensor q_rstd_view = view_rstd(q_rstd, Hq);
     Tensor k_rstd_view = view_rstd(k_rstd, Hkv);
     int rotary_dim = op.attrs.rotary_dim;
+    const int freq_row_width = (freqs.Rank >= 3 && freqs.Sizes[2] == 2)
+                                   ? static_cast<int>(freqs.Sizes[1] * freqs.Sizes[2])
+                                   : (freqs.Rank >= 2 ? static_cast<int>(freqs.Sizes[1]) : 0);
 
     const bool rope_fusable = (rotary_dim > 0) && ((Hs % 2) == 0) && (((Hs / 2) % 32) == 0) && (freqs.Rank >= 2) &&
-                              (freqs.Sizes[1] >= Hs) && (qkv_view.Rank == 3);
+                              (freq_row_width >= rotary_dim) && (qkv_view.Rank == 3);
 
     if (mForwardPlan) {
         int layer_idx = -1;
@@ -206,6 +290,14 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
         }
     }
 
+    if (dump_layer && should_dump_qkv_layer(dump_layer_idx) && std::getenv("SUROGATE_DEBUG_DUMP_DIR")) {
+        std::cerr << "[QKV] layer=" << dump_layer_idx << " in_shape=" << tensor_shape_debug(qkv_in)
+                  << " out_shape=" << tensor_shape_debug(qkv_view) << " freqs_shape=" << tensor_shape_debug(freqs)
+                  << " rotary_dim=" << rotary_dim << std::endl;
+        const char* dump_dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        debug_dump_runtime_tensor(fmt::format("qkv_live.layer{}.in", dump_layer_idx), qkv_in, dump_dir);
+    }
+
     if (rope_fusable) {
         qkv_qk_norm_rope_forward(qkv_view,
                                  q_rstd_view,
@@ -220,6 +312,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
                                  Hq,
                                  Hkv,
                                  Hs,
+                                 rotary_dim,
                                  mRunState.MainStream);
     } else {
         const int q_rows = Hq * Hs;
@@ -257,6 +350,13 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
                      Hs,
                      rotary_dim,
                      mRunState.MainStream);
+    }
+
+    if (dump_layer && should_dump_qkv_layer(dump_layer_idx) && std::getenv("SUROGATE_DEBUG_DUMP_DIR")) {
+        const char* dump_dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        debug_dump_runtime_tensor(fmt::format("qkv_live.layer{}.out", dump_layer_idx), qkv_view, dump_dir);
+        debug_dump_runtime_tensor(fmt::format("qkv_live.layer{}.q_rstd", dump_layer_idx), q_rstd_view, dump_dir);
+        debug_dump_runtime_tensor(fmt::format("qkv_live.layer{}.k_rstd", dump_layer_idx), k_rstd_view, dump_dir);
     }
 
     store_tensor(op.outputs[0], qkv_out);
@@ -399,6 +499,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
                                                         qkv_channels,
                                                         Hq,
                                                         Hs,
+                                                        op.attrs.rotary_dim,
                                                         0,
                                                         accum_q,
                                                         mRunState.MainStream);
@@ -414,6 +515,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
                                                    qkv_channels,
                                                    Hq,
                                                    Hs,
+                                                   op.attrs.rotary_dim,
                                                    0,
                                                    accum_q,
                                                    mRunState.MainStream);
@@ -432,6 +534,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
                                                         qkv_channels,
                                                         Hkv,
                                                         Hs,
+                                                        op.attrs.rotary_dim,
                                                         q_rows,
                                                         accum_k,
                                                         mRunState.MainStream);
@@ -447,6 +550,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
                                                    qkv_channels,
                                                    Hkv,
                                                    Hs,
+                                                   op.attrs.rotary_dim,
                                                    q_rows,
                                                    accum_k,
                                                    mRunState.MainStream);
@@ -473,6 +577,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
                                       qkv_channels,
                                       Hq,
                                       Hs,
+                                      op.attrs.rotary_dim,
                                       0,
                                       mRunState.MainStream,
                                       nullptr);
@@ -488,6 +593,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
                                       qkv_channels,
                                       Hkv,
                                       Hs,
+                                      op.attrs.rotary_dim,
                                       q_rows,
                                       mRunState.MainStream,
                                       nullptr);

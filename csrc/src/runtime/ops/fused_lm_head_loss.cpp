@@ -241,23 +241,17 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
 
     Tensor* d_weight_ptr = nullptr;
     bool d_weight_accumulate = false;
-    if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-        std::string weight_name = op.outputs[1].name;
-        if (auto base = base_param_from_grad(weight_name)) {
-            weight_name = *base;
-        } else if (weight_name.rfind("d_", 0) == 0) {
-            weight_name = weight_name.substr(2);
-        }
-        bool accum = false;
-        Tensor* grad = mGrads.get_param_grad(weight_name, accum);
-        d_weight_accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
-        if (!d_weight_accumulate) {
-            if (auto base = base_param_from_grad(op.outputs[1].name)) {
-                d_weight_accumulate = mAccumulateTensors.count("d_" + *base) > 0;
+    if (op.outputs.size() > 1 && !op.outputs[1].name.empty() && mCurrentGraph) {
+        if (auto weight_name = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
+            bool accum = false;
+            Tensor* grad = mGrads.get_param_grad(*weight_name, accum);
+            d_weight_accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
+            if (!d_weight_accumulate) {
+                d_weight_accumulate = mAccumulateTensors.count("d_" + *weight_name) > 0;
             }
-        }
-        if (grad && grad->Data) {
-            d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
+            if (grad && grad->Data) {
+                d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
+            }
         }
     }
 

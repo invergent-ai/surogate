@@ -4,6 +4,7 @@
 // Compiled operation dispatch for DSL Graph executor.
 
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <algorithm>
 #include <array>
@@ -518,42 +519,37 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
         }
     }
 
+    std::string lookup_name = name;
+    const bool is_grad_block_name = starts_with(name, "d_blocks[");
+    if (is_grad_block_name) {
+        lookup_name = name.substr(2);
+    }
+
     int layer_idx = -1;
     std::string field;
-    if (!parse_block_param(name, layer_idx, field)) {
+    if (!parse_block_param(lookup_name, layer_idx, field)) {
         return nullptr;
     }
     const std::string base_field = strip_ssa_suffix(field);
     if (layer_idx < 0 || layer_idx >= mConfig.NumLayers) {
         return nullptr;
     }
-    auto& acts = mRunState.simplified_acts(layer_idx);
-    if (base_field == "ln1_rstd" || base_field == "ln_rstd") return &acts.ln1_rstd;
-    if (base_field == "ln2_rstd") return &acts.ln2_rstd;
-    if (base_field == "q_rstd") return &acts.q_rstd;
-    if (base_field == "k_rstd") return &acts.k_rstd;
-    if (base_field == "lse") return &acts.lse;
-    if (base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat")
-        return &acts.ln1;
-    if (base_field == "ln2" || base_field == "ln2_flat") return &acts.ln2;
-    if (base_field == "qkv" || base_field == "qkv_norm") return &acts.qkv;
-    if (base_field == "qkv_rope") {
-        Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-        return &src;
+
+    // Route through the shared slot-dispatch helpers: builtin_slot_from_name()
+    // is the single name->slot table, and block_activation_ptr/block_gradient_ptr
+    // are the single slot->RunState-buffer tables. Any new slot is added to
+    // tensor_slot_dispatch.cpp only; this function stays trivial.
+    const TensorSlot slot = builtin_slot_from_name(base_field);
+    if (is_grad_block_name) {
+        return block_gradient_ptr(mRunState, layer_idx, slot);
     }
-    if (base_field == "att" || base_field == "att_flat") return &acts.att;
-    if (base_field == "att_out" || base_field == "att_out_flat") return &acts.att_out;
-    if (base_field == "mlp_up" || base_field == "mlp_up_flat") return &acts.mlp_up;
-    if (base_field == "swiglu" || base_field == "swiglu_flat") return &acts.swiglu;
-    if (base_field == "mlp_down" || base_field == "mlp_down_flat") return &acts.mlp_down;
-    if (base_field == "h_out") return &acts.h_out;
-    if (base_field == "d_h_out") return &mRunState.simplified_grads(layer_idx).d_h_out;
-    if (base_field == "res_att" || base_field == "residual_att") return &acts.residual_att;
-    if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
-        Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);
-        return &res;
+    if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
+        return t;
     }
-    return nullptr;
+    // Forward-scope references to gradient slots (e.g., `blocks[N].d_h_out`)
+    // also resolve via the gradient helper — the enum is the source of truth
+    // regardless of whether the name has a top-level `d_` prefix.
+    return block_gradient_ptr(mRunState, layer_idx, slot);
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {

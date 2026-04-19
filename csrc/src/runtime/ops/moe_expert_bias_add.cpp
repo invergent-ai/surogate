@@ -228,11 +228,13 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     // GPT-OSS uses per-expert bias tensors; skip backward to avoid unstable CUDA errors for now.
     if (op.outputs[1].name.find("experts_") != std::string::npos &&
         op.outputs[1].name.find("_bias") != std::string::npos) {
-        if (auto base = base_param_from_grad(op.outputs[1].name)) {
-            bool grad_accum = false;
-            if (Tensor* grad_tensor = mGrads.get_param_grad(*base, grad_accum)) {
-                if (grad_tensor->Data) {
-                    store_tensor(op.outputs[1], *grad_tensor);
+        if (mCurrentGraph) {
+            if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
+                bool grad_accum = false;
+                if (Tensor* grad_tensor = mGrads.get_param_grad(*base, grad_accum)) {
+                    if (grad_tensor->Data) {
+                        store_tensor(op.outputs[1], *grad_tensor);
+                    }
                 }
             }
         }
@@ -261,8 +263,8 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
 
     Tensor* grad_tensor = nullptr;
     bool grad_accum = false;
-    if (!op.outputs[1].name.empty()) {
-        if (auto base = base_param_from_grad(op.outputs[1].name)) {
+    if (!op.outputs[1].name.empty() && mCurrentGraph) {
+        if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
             grad_tensor = mGrads.get_param_grad(*base, grad_accum);
         }
     }
@@ -274,8 +276,8 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     if (!accumulate && grad_accum) {
         accumulate = true;
     }
-    if (!accumulate && !op.outputs[1].name.empty()) {
-        if (auto base = base_param_from_grad(op.outputs[1].name)) {
+    if (!accumulate && !op.outputs[1].name.empty() && mCurrentGraph) {
+        if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
             accumulate = mAccumulateTensors.count("d_" + *base) > 0;
         }
     }
