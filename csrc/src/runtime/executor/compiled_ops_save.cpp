@@ -1088,7 +1088,8 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // rstd slots — all same-layer producer/consumer, FP32, small shape.
     const bool bypass_named_for_rstd = [&]() {
         if (ref.slot != TensorSlot::BlockLN1RSTD && ref.slot != TensorSlot::BlockLN2RSTD &&
-            ref.slot != TensorSlot::BlockQRSTD && ref.slot != TensorSlot::BlockKRSTD) {
+            ref.slot != TensorSlot::BlockQRSTD && ref.slot != TensorSlot::BlockKRSTD &&
+            ref.slot != TensorSlot::BlockLSE) {
             return false;
         }
         static const bool enabled = []() {

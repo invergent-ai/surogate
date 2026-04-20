@@ -799,9 +799,13 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.qkv_rope = {};
         }
 
-        acts.lse = plan.share_att
-                       ? shared_lse
-                       : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
+        if (rstd_on_stack) {
+            acts.lse = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, Hq, T});
+        } else {
+            acts.lse = plan.share_att
+                           ? shared_lse
+                           : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
+        }
         acts.att = plan.share_att ? shared_att
                                   : mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
         acts.att_out = plan.share_att_out ? shared_att_out

@@ -505,6 +505,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             persist_stack_slot(acts.ln2_rstd, prefix + "ln2_rstd");
             persist_stack_slot(acts.q_rstd, prefix + "q_rstd");
             persist_stack_slot(acts.k_rstd, prefix + "k_rstd");
+            persist_stack_slot(acts.lse, prefix + "lse");
         }
     }
     // Now safe to restore — stack-resident data has been copied
@@ -1289,6 +1290,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                 acts.ln2_rstd.Data = nullptr;
                                 acts.q_rstd.Data = nullptr;
                                 acts.k_rstd.Data = nullptr;
+                                acts.lse.Data = nullptr;
                             }
                             layer_active[static_cast<std::size_t>(L)] = 0;
                         }
@@ -1585,6 +1587,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     acts.ln2_rstd.Data = nullptr;
                     acts.q_rstd.Data = nullptr;
                     acts.k_rstd.Data = nullptr;
+                    acts.lse.Data = nullptr;
                 }
                 // Note: cudnn_workspace is persistently allocated, don't clear
                 layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
@@ -2457,6 +2460,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             acts.ln2_rstd.Data = nullptr;
             acts.q_rstd.Data = nullptr;
             acts.k_rstd.Data = nullptr;
+            acts.lse.Data = nullptr;
         }
         if (mRunState.ffn_temps_on_stack()) {
             auto& acts = mRunState.simplified_acts(L);
@@ -2988,6 +2992,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     acts.ln2_rstd.Data = nullptr;
                     acts.q_rstd.Data = nullptr;
                     acts.k_rstd.Data = nullptr;
+                    acts.lse.Data = nullptr;
                 }
                 if (mRunState.large_bwd_temps_on_stack()) {
                     auto& grads_to_clear = mRunState.simplified_grads(op.layer_end);
