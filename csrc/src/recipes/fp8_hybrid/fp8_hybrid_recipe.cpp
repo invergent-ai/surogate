@@ -101,7 +101,8 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
                     rs.DeviceProp,
                     ctx.stream);
             } else {
-                // Fallback to JIT scaling
+                // Fallback to JIT scaling — compute abs_max first.
+                abs_max(inp_fp8.abs_max(), *ctx.inp, num_elements, rs.DeviceProp, ctx.stream);
                 quantize_with_abs_max(inp_fp8,
                                       inp_fp8.scale(),
                                       *ctx.inp,
@@ -111,7 +112,8 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
                                       ctx.stream);
             }
         } else {
-            // JIT scaling: compute abs_max and scale on-the-fly
+            // JIT scaling: compute abs_max and scale on-the-fly.
+            abs_max(inp_fp8.abs_max(), *ctx.inp, num_elements, rs.DeviceProp, ctx.stream);
             quantize_with_abs_max(inp_fp8,
                                   inp_fp8.scale(),
                                   *ctx.inp,
@@ -377,7 +379,12 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
                                  dtype_to_str(ctx.dout->DType));
     }
 
-    // Step 1: Quantize upstream gradient to E5M2 (larger dynamic range for gradients)
+    // Step 1: Quantize upstream gradient to E5M2 (larger dynamic range for gradients).
+    // The kernel READS abs_max to compute its inverse-scale, so we must populate
+    // it first — otherwise we'd use stale (often ~0) memory and produce
+    // inv_scale ≈ 1e-15, which silently zeros the entire backward chain for
+    // every FP8 matmul_backward call (caught on Gemma4: grad_norm 0.45 vs bf16 20).
+    abs_max(dout_e5m2.abs_max(), *ctx.dout, static_cast<long>(M) * N, rs.DeviceProp, ctx.stream);
     quantize_with_abs_max(dout_e5m2,
                           dout_e5m2.scale(),
                           *ctx.dout,
@@ -627,7 +634,7 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
                                             ctx.stream);
             }
         } else {
-            // JIT scaling
+            // JIT scaling — compute abs_max first (kernel READS it).
             Tensor inp_bf16{};
             inp_bf16.Data = reinterpret_cast<std::byte*>(const_cast<nv_bfloat16*>(ctx.inp));
             inp_bf16.DType = ETensorDType::BF16;
@@ -635,6 +642,7 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
             inp_bf16.Sizes[0] = ctx.total_tokens;
             inp_bf16.Sizes[1] = ctx.K;
 
+            abs_max(inp_fp8.abs_max(), inp_bf16, num_elements, rs.DeviceProp, ctx.stream);
             quantize_with_abs_max(inp_fp8,
                                   inp_fp8.scale(),
                                   inp_bf16,
@@ -731,7 +739,8 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
         Tensor& dout_e5m2 = *ctx.dout_quant;
         const long num_elements = static_cast<long>(ctx.total_tokens) * ctx.N;
 
-        // Step 1: Quantize upstream gradient to E5M2
+        // Step 1: Quantize upstream gradient to E5M2. Compute abs_max first —
+        // see dense backward for why (quantize_with_abs_max READS abs_max).
         Tensor dout_bf16{};
         dout_bf16.Data = reinterpret_cast<std::byte*>(const_cast<nv_bfloat16*>(ctx.dout));
         dout_bf16.DType = ETensorDType::BF16;
@@ -739,6 +748,7 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
         dout_bf16.Sizes[0] = ctx.total_tokens;
         dout_bf16.Sizes[1] = ctx.N;
 
+        abs_max(dout_e5m2.abs_max(), dout_bf16, num_elements, rs.DeviceProp, ctx.stream);
         quantize_with_abs_max(dout_e5m2,
                               dout_e5m2.scale(),
                               dout_bf16,

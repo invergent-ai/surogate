@@ -1029,10 +1029,27 @@ void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg,
     const long D = cfg.head_size();
     const long Hq = cfg.NumQueryHeads;
     const long Hkv = cfg.NumKeyValHeads;
-    const long AttnDim = Hq * D;
-    const long QKV = D * (Hq + 2 * Hkv);
-    const long M = cfg.IntermediateSize;
-    const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
+    long AttnDim = Hq * D;
+    long QKV = D * (Hq + 2 * Hkv);
+    long M = cfg.IntermediateSize;
+    long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
+
+    // Hybrid-architecture safety: on models like Gemma4 where different layer
+    // types carry different attention dims (full uses global_head_dim, sliding
+    // uses head_size) or MLP intermediate widths (e.g. shared-KV blocks with
+    // `use_double_wide_mlp`), the shared FP8 forward/quant buffers must be
+    // sized to the MAX across all layers. Without this, a layer with larger
+    // dims writes past the end of the buffer and triggers
+    // `cudaErrorIllegalAddress` inside `quantize_with_delayed_scale` or the
+    // quantized-grad matmul_backward.
+    if (mRuntimeConfig.has_per_layer_dims()) {
+        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
+            AttnDim = std::max(AttnDim, static_cast<long>(pld.attn_dim));
+            QKV = std::max(QKV, static_cast<long>(pld.qkv_channels));
+            M = std::max(M, static_cast<long>(pld.intermediate));
+            MUp = std::max(MUp, static_cast<long>(pld.mlp_up));
+        }
+    }
 
     if (mEnableFp8Forward) {
         modules::allocate_fp8_forward_buffers(mFP8ForwardQuants,
