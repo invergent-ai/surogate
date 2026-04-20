@@ -53,10 +53,11 @@ struct BufferPlan {
     // ---------------- Gradient sharing decisions ----------------
     // Single-buffer sharing (share_grads, share_d_att) was removed as part
     // of the Phase 4 M5 cleanup — every layer now allocates its own
-    // d_ln1/d_ln2/d_res_att/d_att_out/d_att. The alternating-pair cases
-    // stay because their cross-layer lifetimes (layer N reads layer N-2)
-    // don't fit the single-buffer-overwrite model.
-    bool share_res_ffn_grad = false;   ///< alternating d_res_ffn[0/1]
+    // d_ln1/d_ln2/d_res_att/d_att_out/d_att. share_res_ffn_grad also went
+    // away (zero_activation_gradients() zeroes each layer independently,
+    // which would clobber an alternating pair). d_mlp_down alternating
+    // pair stays for now — layer N+1's LN1 backward writes into layer N's
+    // d_mlp_down buffer, and sharing keeps peak memory low under recompute.
     bool share_mlp_down_grad = false;  ///< alternating d_mlp_down[0/1]
 
     // ---------------- Stack-based temps ----------------

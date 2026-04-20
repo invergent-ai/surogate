@@ -837,19 +837,13 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const auto dtype = plan.grad_dtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Allocate alternating-pair shared buffers (d_res_ffn / d_mlp_down)
-    // used to model cross-layer residual-chain gradients. Single-buffer
-    // sharing for d_ln1/d_ln2/d_res_att/d_att_out/d_att was removed as
-    // part of Phase 4 M5 cleanup — those are per-layer now.
-    if ((plan.share_res_ffn_grad || plan.share_mlp_down_grad) && !mSharedDMlpDown[0].Data) {
-        if (plan.share_res_ffn_grad) {
-            mSharedDResFFN[0] = mAllocator->allocate(dtype, "d_res_ffn_a", kind, {B, T, C});
-            mSharedDResFFN[1] = mAllocator->allocate(dtype, "d_res_ffn_b", kind, {B, T, C});
-        }
-        if (plan.share_mlp_down_grad) {
-            mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
-            mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
-        }
+    // Alternating-pair shared buffers for d_mlp_down (only). Layer N+1's
+    // LN1 backward writes to layer N's d_mlp_down, so neighbouring layers
+    // need independent buffers; the alternation (i % 2) keeps peak memory
+    // at 2 buffers instead of L.
+    if (plan.share_mlp_down_grad && !mSharedDMlpDown[0].Data) {
+        mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
+        mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
     }
 
     mSimplifiedGradients.resize(cfg.NumLayers);
@@ -861,8 +855,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         const long lMUp = plan.layer_mlp_up(i);
         const long lM = plan.layer_intermediate(i);
 
-        g.d_res_ffn = plan.share_res_ffn_grad ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
-                                              : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
+        g.d_res_ffn = mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
         g.d_res_att = mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
         g.d_att_out = plan.is_hybrid ? mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}) : g.d_res_att;
         g.d_ln2 = mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});

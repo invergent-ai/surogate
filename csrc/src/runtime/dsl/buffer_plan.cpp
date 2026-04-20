@@ -106,14 +106,9 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
 
     // ---------------- Gradient sharing ----------------
     // Single-buffer sharing (d_ln1/d_ln2/d_res_att/d_att_out/d_att) removed
-    // — every layer allocates its own now. The alternating-pair cases for
-    // d_res_ffn / d_mlp_down stay because they model cross-layer residual
-    // chain lifetimes that single-buffer-overwrite can't handle.
-    //
-    // d_res_ffn sharing stays off: zero_activation_gradients() zeroes every
-    // layer's d_res_ffn at backward start, so an alternating shared pair
-    // would destroy the loss gradient of layer N when zeroing layer N-2.
-    p.share_res_ffn_grad = false;
+    // — every layer allocates its own now. Only the alternating-pair
+    // d_mlp_down remains, because layer N+1's LN1 backward writes into
+    // layer N's d_mlp_down; sharing keeps peak memory low under recompute.
     p.share_mlp_down_grad = p.recompute_enabled;
     p.large_bwd_temps_on_stack = p.recompute_enabled;
 
