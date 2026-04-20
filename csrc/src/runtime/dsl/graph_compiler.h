@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -418,6 +419,35 @@ struct MlpTileGroup {
 };
 
 // ============================================================================
+// Phase Tree (design/buffer-runtime-v4.md)
+// ============================================================================
+
+/// Structural phase kinds. A phase bounds a contiguous op range
+/// [op_start, op_end). Children are nested scopes (e.g., FwdBlockSeq contains
+/// FwdBlock[i]).
+enum class PhaseKind : std::uint8_t {
+    Custom,       ///< Generic scope (prologue/epilogue; root wrapper)
+    FwdBlockSeq,  ///< Forward block sequence; fwd arena root
+    BwdBlockSeq,  ///< Backward block sequence; bwd arena root
+    FwdBlock,     ///< Single forward block; block_index set
+    BwdBlock,     ///< Single backward block; block_index set
+};
+
+const char* phase_kind_name(PhaseKind k);
+
+struct PhaseNode {
+    PhaseKind kind = PhaseKind::Custom;
+    std::size_t op_start = 0;         ///< Inclusive op index
+    std::size_t op_end = 0;           ///< Exclusive op index
+    int block_index = -1;             ///< FwdBlock/BwdBlock only; -1 otherwise
+    std::vector<PhaseNode> children;  ///< Nested scopes; op ranges are sub-ranges of parent
+    std::string label;                ///< Debug label (e.g., "FwdBlock[3]")
+};
+
+/// Pretty-print a phase tree for shadow-mode validation.
+std::string dump_phase_tree(const PhaseNode& root);
+
+// ============================================================================
 // Compiled Graph
 // ============================================================================
 
@@ -480,6 +510,13 @@ struct CompiledGraph {
     /// Call after annotate_layer_boundaries().
     void compute_layer_segments();
 
+    /// Shadow-mode phase tree (design/buffer-runtime-v4.md). Built post-hoc by
+    /// GraphCompiler::build_phase_tree() after annotate_layer_boundaries().
+    /// Not consulted at runtime in milestone M1; exists to validate the phase
+    /// reconstruction covers every op and nests cleanly. Empty optional if the
+    /// graph has no layer boundaries (e.g., non-block-stacked compiles).
+    std::optional<PhaseNode> phase_tree;
+
     // Statistics
     std::size_t total_ops = 0;
     std::size_t matmul_ops = 0;
@@ -531,6 +568,13 @@ private:
     CompiledAttrs resolve_attrs(const Operation& op, CompiledOpType type, const ShapeEnv& env, const Graph& graph);
 
     void annotate_layer_boundaries(CompiledGraph& graph);
+
+    /// Build the shadow-mode phase tree from layer boundary indices.
+    /// Must be called after annotate_layer_boundaries(). The tree wraps a
+    /// prologue (ops before the first layer), a FwdBlockSeq/BwdBlockSeq
+    /// containing per-layer FwdBlock/BwdBlock nodes, and an epilogue. When
+    /// `SUROGATE_DEBUG_PHASE_TREE=1` is set, the tree is dumped to stderr.
+    void build_phase_tree(CompiledGraph& graph, bool is_backward);
 
     // Shape validation methods
     struct TensorShape {

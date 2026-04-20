@@ -1565,6 +1565,142 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
     }
 }
 
+// ============================================================================
+// Phase Tree (design/buffer-runtime-v4.md) — shadow-mode build
+// ============================================================================
+
+const char* phase_kind_name(PhaseKind k) {
+    switch (k) {
+        case PhaseKind::Custom: return "Custom";
+        case PhaseKind::FwdBlockSeq: return "FwdBlockSeq";
+        case PhaseKind::BwdBlockSeq: return "BwdBlockSeq";
+        case PhaseKind::FwdBlock: return "FwdBlock";
+        case PhaseKind::BwdBlock: return "BwdBlock";
+    }
+    return "?";
+}
+
+namespace {
+
+void dump_phase_tree_rec(std::ostringstream& os, const PhaseNode& node, int indent) {
+    for (int i = 0; i < indent; ++i)
+        os << "  ";
+    const char* kind_str = phase_kind_name(node.kind);
+    os << kind_str;
+    if (!node.label.empty() && node.label != kind_str) {
+        os << " " << node.label;
+    }
+    os << " ops=[" << node.op_start << ".." << node.op_end << ") n=" << (node.op_end - node.op_start);
+    if (node.block_index >= 0) {
+        os << " block=" << node.block_index;
+    }
+    os << "\n";
+    for (const auto& child : node.children) {
+        dump_phase_tree_rec(os, child, indent + 1);
+    }
+}
+
+}  // namespace
+
+std::string dump_phase_tree(const PhaseNode& root) {
+    std::ostringstream os;
+    dump_phase_tree_rec(os, root, 0);
+    return os.str();
+}
+
+void GraphCompiler::build_phase_tree(CompiledGraph& graph, bool is_backward) {
+    const std::size_t num_layers = graph.layer_start_indices.size();
+    const std::size_t num_ops = graph.ops.size();
+
+    struct BlockRange {
+        int layer_idx;
+        std::size_t start;
+        std::size_t end;
+    };
+    std::vector<BlockRange> blocks;
+    blocks.reserve(num_layers);
+
+    // annotate_layer_boundaries uses SIZE_MAX as a "layer not seen" sentinel.
+    // For backward, layer_start_indices[L] decreases with L (layer N-1 runs
+    // first), so we sort by start-op to get execution order uniformly.
+    for (std::size_t L = 0; L < num_layers; ++L) {
+        auto s = graph.layer_start_indices[L];
+        auto e = graph.layer_end_indices[L];
+        if (s != SIZE_MAX && e != SIZE_MAX && s < e && e <= num_ops) {
+            blocks.push_back({static_cast<int>(L), s, e});
+        }
+    }
+    std::sort(blocks.begin(), blocks.end(), [](const BlockRange& a, const BlockRange& b) { return a.start < b.start; });
+
+    if (blocks.empty()) {
+        graph.phase_tree.reset();
+        return;
+    }
+
+    const std::size_t first_op = blocks.front().start;
+    const std::size_t last_op = blocks.back().end;
+
+    PhaseNode root;
+    root.kind = PhaseKind::Custom;
+    root.op_start = 0;
+    root.op_end = num_ops;
+    root.label = is_backward ? "BackwardCompile" : "ForwardCompile";
+
+    if (first_op > 0) {
+        PhaseNode prologue;
+        prologue.kind = PhaseKind::Custom;
+        prologue.op_start = 0;
+        prologue.op_end = first_op;
+        prologue.label = "Prologue";
+        root.children.push_back(std::move(prologue));
+    }
+
+    PhaseNode seq;
+    seq.kind = is_backward ? PhaseKind::BwdBlockSeq : PhaseKind::FwdBlockSeq;
+    seq.op_start = first_op;
+    seq.op_end = last_op;
+    seq.label = phase_kind_name(seq.kind);
+    seq.children.reserve(blocks.size());
+
+    // Grow each block's end to meet the next block's start so every op in
+    // [first_op, last_op) belongs to exactly one block (absorbs inter-block
+    // glue ops in hybrid architectures).
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        PhaseNode block;
+        block.kind = is_backward ? PhaseKind::BwdBlock : PhaseKind::FwdBlock;
+        block.block_index = blocks[i].layer_idx;
+        block.op_start = blocks[i].start;
+        block.op_end = (i + 1 < blocks.size()) ? blocks[i + 1].start : blocks[i].end;
+        {
+            std::ostringstream lbl;
+            lbl << phase_kind_name(block.kind) << "[" << block.block_index << "]";
+            block.label = lbl.str();
+        }
+        seq.children.push_back(std::move(block));
+    }
+
+    root.children.push_back(std::move(seq));
+
+    if (last_op < num_ops) {
+        PhaseNode epilogue;
+        epilogue.kind = PhaseKind::Custom;
+        epilogue.op_start = last_op;
+        epilogue.op_end = num_ops;
+        epilogue.label = "Epilogue";
+        root.children.push_back(std::move(epilogue));
+    }
+
+    graph.phase_tree = std::move(root);
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_TREE")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[phase-tree] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name
+                      << "):\n"
+                      << dump_phase_tree(*graph.phase_tree);
+        }
+    }
+}
+
 void CompiledGraph::compute_layer_segments() {
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
@@ -4053,6 +4189,11 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
 
     // Annotate layer boundaries for prefetch
     annotate_layer_boundaries(result);
+
+    // Build shadow-mode phase tree (design/buffer-runtime-v4.md, milestone M1).
+    // Runs after annotate_layer_boundaries so layer_{start,end}_indices are
+    // populated. Not consulted at runtime yet.
+    build_phase_tree(result, is_backward);
 
     // Register external tensor names (init bindings, MoE side-channel, param gradients)
     // that may not appear in any op's TensorRef but are used at runtime.
