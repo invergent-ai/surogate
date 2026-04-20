@@ -67,7 +67,6 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             uniform_attn = uniform_attn && pld.attn_dim == first.attn_dim;
         }
     }
-    p.kv_source_layers = runtime_config.kv_source_layers;
 
     p.NumExperts = runtime_config.num_experts;
     p.TopK = (runtime_config.num_experts_per_tok > 0) ? runtime_config.num_experts_per_tok : 1;

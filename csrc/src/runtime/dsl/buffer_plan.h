@@ -101,8 +101,6 @@ struct BufferPlan {
 
     /// Empty for homogeneous models.
     std::vector<BlockTypeDims> per_layer_dims;
-    /// KV-source layers whose QKV must be persisted (not shared).
-    std::unordered_set<int> kv_source_layers;
 
     ETensorDType act_dtype = ETensorDType::BF16;
     ETensorDType grad_dtype = ETensorDType::BF16;
@@ -110,9 +108,6 @@ struct BufferPlan {
     // ---------------- Accessors ----------------
     [[nodiscard]] bool has_per_layer_dims() const {
         return !per_layer_dims.empty();
-    }
-    [[nodiscard]] bool is_kv_source(int layer_idx) const {
-        return kv_source_layers.count(layer_idx) > 0;
     }
     [[nodiscard]] bool has_moe() const {
         return NumExperts > 0;
