@@ -105,11 +105,8 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.need_separate_qkv_rope = p.recompute_enabled && p.use_qk_norm;
 
     // ---------------- Gradient sharing ----------------
-    // Single-buffer sharing (d_ln1/d_ln2/d_res_att/d_att_out/d_att) removed
-    // — every layer allocates its own now. Only the alternating-pair
-    // d_mlp_down remains, because layer N+1's LN1 backward writes into
-    // layer N's d_mlp_down; sharing keeps peak memory low under recompute.
-    p.share_mlp_down_grad = p.recompute_enabled;
+    // All gradient-sharing removed as part of Phase 4 M5 cleanup — every
+    // layer allocates its own d_* buffer.
     p.large_bwd_temps_on_stack = p.recompute_enabled;
 
     return p;

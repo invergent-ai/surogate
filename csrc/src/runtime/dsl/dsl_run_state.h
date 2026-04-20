@@ -378,9 +378,7 @@ private:
     Tensor mActGradZeroSizes{};
     int mActGradZeroCount = 0;
 
-    // Shared gradient buffers — d_mlp_down alternating pair only. Single-
-    // buffer and d_res_ffn sharing removed as part of Phase 4 M5 cleanup.
-    std::array<Tensor, 2> mSharedDMlpDown{};  ///< Alternating buffers for d_mlp_down
+    // Shared gradient buffers removed entirely (Phase 4 M5 cleanup).
     modules::SimplifiedQuantGradients mSimplifiedQuantGrads;
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     uint8_t mFP8BufferReadyFlags = 0;

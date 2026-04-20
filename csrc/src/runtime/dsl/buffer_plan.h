@@ -51,14 +51,13 @@ struct BufferPlan {
     // its own per-slot buffer. See commit d3ec195.
 
     // ---------------- Gradient sharing decisions ----------------
-    // Single-buffer sharing (share_grads, share_d_att) was removed as part
-    // of the Phase 4 M5 cleanup — every layer now allocates its own
-    // d_ln1/d_ln2/d_res_att/d_att_out/d_att. share_res_ffn_grad also went
-    // away (zero_activation_gradients() zeroes each layer independently,
-    // which would clobber an alternating pair). d_mlp_down alternating
-    // pair stays for now — layer N+1's LN1 backward writes into layer N's
-    // d_mlp_down buffer, and sharing keeps peak memory low under recompute.
-    bool share_mlp_down_grad = false;  ///< alternating d_mlp_down[0/1]
+    // All gradient-sharing booleans (share_grads, share_d_att,
+    // share_res_ffn_grad, share_mlp_down_grad) were removed as part of
+    // Phase 4 M5 cleanup — every layer now allocates its own d_* buffer.
+    // Cross-layer write patterns (layer N+1's LN1 backward writing into
+    // layer N's d_mlp_down) are correct against dedicated per-layer
+    // buffers — the buffer the writer aims at is independent of any
+    // other layer's.
 
     // ---------------- Stack-based temps ----------------
     bool ffn_temps_on_stack = false;

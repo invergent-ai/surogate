@@ -837,15 +837,6 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const auto dtype = plan.grad_dtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Alternating-pair shared buffers for d_mlp_down (only). Layer N+1's
-    // LN1 backward writes to layer N's d_mlp_down, so neighbouring layers
-    // need independent buffers; the alternation (i % 2) keeps peak memory
-    // at 2 buffers instead of L.
-    if (plan.share_mlp_down_grad && !mSharedDMlpDown[0].Data) {
-        mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
-        mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
-    }
-
     mSimplifiedGradients.resize(cfg.NumLayers);
     for (int i = 0; i < cfg.NumLayers; ++i) {
         auto& g = mSimplifiedGradients[i];
@@ -876,8 +867,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
             g.d_qkv = mAllocator->allocate(dtype, "d_qkv", kind, {B, T, lQKV});
         }
 
-        g.d_mlp_down = plan.share_mlp_down_grad ? mSharedDMlpDown[static_cast<std::size_t>(i % 2)]
-                                                : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
+        g.d_mlp_down = mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
         // Per-layer h_out gradient (Gemma4: block's final-output grad,
         // separate from MLP's d_mlp_down so the backward chain doesn't
         // collide across the MLP / _finalize split).
