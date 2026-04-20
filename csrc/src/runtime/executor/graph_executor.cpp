@@ -704,15 +704,17 @@ void GraphExecutor::init_compiled_execution() {
                 return std::nullopt;
             }
             const int last_layer = mConfig.NumLayers - 1;
-            const auto& acts = mRunState.simplified_acts(last_layer);
-            if (acts.h_out.Data) {
-                return acts.h_out;
+            if (Tensor* h_out = block_activation_ptr(mRunState, last_layer, TensorSlot::BlockHOut);
+                h_out && h_out->Data) {
+                return *h_out;
             }
-            if (acts.mlp_down.Data) {
-                return acts.mlp_down;
+            if (Tensor* mlp_down = block_activation_ptr(mRunState, last_layer, TensorSlot::BlockMLPDown);
+                mlp_down && mlp_down->Data) {
+                return *mlp_down;
             }
-            if (acts.residual_att.Data) {
-                return acts.residual_att;
+            if (Tensor* res_att = block_activation_ptr(mRunState, last_layer, TensorSlot::BlockResidualAtt);
+                res_att && res_att->Data) {
+                return *res_att;
             }
             return std::nullopt;
         };
@@ -1601,7 +1603,9 @@ void GraphExecutor::backward(Tensor inputs,
         fill_zero(rs.non_block_gradients().d_embeddings, rs.MainStream);
     }
     if (config.NumLayers > 0) {
-        fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
+        if (Tensor* d_res_ffn = block_gradient_ptr(rs, config.NumLayers - 1, TensorSlot::BlockDResFFN)) {
+            fill_zero(*d_res_ffn, rs.MainStream);
+        }
     }
 
     // Zero all activation gradient buffers to prevent stale gradients from accumulating.
@@ -1931,7 +1935,9 @@ void GraphExecutor::backward_with_hook(Tensor inputs,
         fill_zero(rs.non_block_gradients().d_embeddings, rs.MainStream);
     }
     if (config.NumLayers > 0) {
-        fill_zero(rs.simplified_grads(config.NumLayers - 1).d_res_ffn, rs.MainStream);
+        if (Tensor* d_res_ffn = block_gradient_ptr(rs, config.NumLayers - 1, TensorSlot::BlockDResFFN)) {
+            fill_zero(*d_res_ffn, rs.MainStream);
+        }
     }
 
     // Zero all activation gradient buffers to prevent stale gradients from accumulating.
