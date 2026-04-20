@@ -468,6 +468,40 @@ struct PhaseNode {
 std::string dump_phase_tree(const PhaseNode& root);
 
 // ============================================================================
+// Instruction Stream (design/buffer-runtime-v4.md, M4)
+// ============================================================================
+
+/// Flat-stream primitives emitted from the phase tree. Subsumes today's
+/// implicit layer-boundary behavior (stack checkpoint/restore, save-list
+/// prep, last-use pruning). Shadow-only in M4: emitted into CompiledGraph
+/// but not yet consumed at runtime. The interpreter in M5 will execute
+/// these instructions against baked offsets.
+enum class InstKind : std::uint8_t {
+    PhaseEnter,       ///< Enter a phase (stack checkpoint if FwdBlock/BwdBlock).
+    PhaseExit,        ///< Exit a phase (stack restore if FwdBlock/BwdBlock).
+    SegmentDispatch,  ///< Execute ops [op_start, op_end); graph-captured or eager.
+    PruneByLastUse,   ///< Release tensors whose last-use falls in [op_start, op_end).
+};
+
+const char* inst_kind_name(InstKind k);
+
+struct Instruction {
+    InstKind kind = InstKind::PhaseEnter;
+
+    // PhaseEnter / PhaseExit payload:
+    PhaseKind phase_kind = PhaseKind::Custom;
+    int block_index = -1;  ///< >= 0 for FwdBlock/BwdBlock
+
+    // SegmentDispatch / PruneByLastUse payload:
+    std::size_t op_start = 0;
+    std::size_t op_end = 0;
+    bool eager = false;  ///< SegmentDispatch only: true = eager, false = graph-captured
+};
+
+/// Pretty-print an instruction stream for shadow-mode validation.
+std::string dump_instruction_stream(const std::vector<Instruction>& stream);
+
+// ============================================================================
 // Compiled Graph
 // ============================================================================
 
@@ -536,6 +570,11 @@ struct CompiledGraph {
     /// reconstruction covers every op and nests cleanly. Empty optional if the
     /// graph has no layer boundaries (e.g., non-block-stacked compiles).
     std::optional<PhaseNode> phase_tree;
+
+    /// Shadow-mode instruction stream emitted from the phase tree (M4).
+    /// Flat linear sequence of primitives that would drive the M5 interpreter.
+    /// Empty if phase_tree is empty.
+    std::vector<Instruction> instruction_stream;
 
     // Statistics
     std::size_t total_ops = 0;
@@ -610,6 +649,13 @@ private:
     /// No offsets are materialized; M4+ will bake them when the layout is
     /// actually consumed. Dump gated on `SUROGATE_DEBUG_LAYOUT=1`.
     void compute_layout(CompiledGraph& graph, bool is_backward);
+
+    /// Flatten the phase tree to a linear instruction stream (M4). Emits
+    /// PhaseEnter/PhaseExit around each phase, plus SegmentDispatch +
+    /// PruneByLastUse for leaf phases (ops live at leaves). Shadow-only;
+    /// M5's interpreter consumes this stream. Dump gated on
+    /// `SUROGATE_DEBUG_INSTR_STREAM=1`.
+    void emit_instruction_stream(CompiledGraph& graph);
 
     // Shape validation methods
     struct TensorShape {

@@ -1771,6 +1771,81 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
 }
 
 // ============================================================================
+// Instruction Stream (design/buffer-runtime-v4.md, M4) — shadow-mode emit
+// ============================================================================
+
+const char* inst_kind_name(InstKind k) {
+    switch (k) {
+        case InstKind::PhaseEnter: return "PhaseEnter";
+        case InstKind::PhaseExit: return "PhaseExit";
+        case InstKind::SegmentDispatch: return "SegmentDispatch";
+        case InstKind::PruneByLastUse: return "PruneByLastUse";
+    }
+    return "?";
+}
+
+namespace {
+
+void emit_phase(std::vector<Instruction>& out, const PhaseNode& node) {
+    out.push_back({InstKind::PhaseEnter, node.kind, node.block_index, node.op_start, node.op_end, false});
+
+    if (node.children.empty()) {
+        // Leaf phase: the ops in [op_start, op_end) are executed here. For M4
+        // we emit a single synthetic graph-captured segment; a later milestone
+        // will subdivide per CompiledGraph::layer_segments (split-attention
+        // mode around FlashAttention / capture-unsafe ops).
+        if (node.op_end > node.op_start) {
+            out.push_back({InstKind::SegmentDispatch, node.kind, node.block_index, node.op_start, node.op_end, false});
+            out.push_back({InstKind::PruneByLastUse, node.kind, node.block_index, node.op_start, node.op_end, false});
+        }
+    } else {
+        for (const auto& child : node.children) {
+            emit_phase(out, child);
+        }
+    }
+
+    out.push_back({InstKind::PhaseExit, node.kind, node.block_index, node.op_start, node.op_end, false});
+}
+
+}  // namespace
+
+std::string dump_instruction_stream(const std::vector<Instruction>& stream) {
+    std::ostringstream os;
+    int depth = 0;
+    for (const auto& inst : stream) {
+        if (inst.kind == InstKind::PhaseExit && depth > 0) --depth;
+        for (int i = 0; i < depth; ++i)
+            os << "  ";
+        os << inst_kind_name(inst.kind);
+        if (inst.kind == InstKind::PhaseEnter || inst.kind == InstKind::PhaseExit) {
+            os << " " << phase_kind_name(inst.phase_kind);
+            if (inst.block_index >= 0) os << "[" << inst.block_index << "]";
+        } else {
+            os << " ops=[" << inst.op_start << ".." << inst.op_end << ")";
+            if (inst.kind == InstKind::SegmentDispatch) {
+                os << " mode=" << (inst.eager ? "eager" : "graph");
+            }
+        }
+        os << "\n";
+        if (inst.kind == InstKind::PhaseEnter) ++depth;
+    }
+    return os.str();
+}
+
+void GraphCompiler::emit_instruction_stream(CompiledGraph& graph) {
+    graph.instruction_stream.clear();
+    if (!graph.phase_tree.has_value()) return;
+    emit_phase(graph.instruction_stream, *graph.phase_tree);
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_INSTR_STREAM")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[instr-stream] (" << graph.name << "):\n"
+                      << dump_instruction_stream(graph.instruction_stream);
+        }
+    }
+}
+
+// ============================================================================
 // Shadow-mode Layout (design/buffer-runtime-v4.md, M3)
 // ============================================================================
 
@@ -4452,6 +4527,10 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Shadow-mode layout peaks (design/buffer-runtime-v4.md, M3). Uses regions
     // from M2 plus per-tid lifetimes to compute per-region peak bytes.
     compute_layout(result, is_backward);
+
+    // Flatten the phase tree to a linear instruction stream (M4). The M5
+    // interpreter will consume this stream; for now it is shadow-only.
+    emit_instruction_stream(result);
 
     // ========================================================================
     // Detect MLP tile groups for long-context tiled execution
