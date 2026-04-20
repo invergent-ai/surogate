@@ -667,66 +667,15 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const auto dtype = plan.act_dtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_qkv_rope{};
-    Tensor shared_att{}, shared_att_out{}, shared_lse{};
-    Tensor shared_q_rstd{}, shared_k_rstd{};
-    Tensor shared_mlp_up{}, shared_swiglu{}, shared_residual_att{}, shared_mlp_down{};
-
-    // Allocation tag = `<canonical_slot_name>_shared`. The canonical name
-    // comes from `builtin_slot_name()` (reverse of `kSlotMappings`) so
-    // renaming a slot propagates to every alloc tag automatically.
-    auto shared_tag = [](TensorSlot s) -> std::string {
-        return std::string(builtin_slot_name(s)) + "_shared";
-    };
-
-    if (plan.share_ln1)
-        shared_ln1 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN1).c_str(), kind, {B, T, C});
-    if (plan.share_ln2)
-        shared_ln2 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN2).c_str(), kind, {B, T, C});
-    if (plan.share_qkv) {
-        shared_qkv = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKV).c_str(), kind, {B, T, QKV});
-    }
-    // In LoRA mode with recompute, we still need a separate qkv_rope buffer when
-    // QK-norm is used.  Without it, RoPE is applied in-place on the shared qkv buffer,
-    // so the persisted "qkv" actually contains post-rope values.  During backward
-    // recompute the saved-tensor lookup returns this post-rope value as input to the
-    // qk_norm_rope recompute op, causing norm+rope to be applied twice (→ NaN for MRoPE).
-    // A single shared buffer is sufficient since recompute runs one layer at a time.
-    if (plan.allocate_shared_qkv_rope) {
-        shared_qkv_rope = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKVRoPE).c_str(), kind, {B, T, QKV});
-    }
-    if (plan.share_qk_rstd) {
-        // plan.share_qk_rstd already subsumes use_qk_norm (see BufferPlan::build).
-        shared_q_rstd =
-            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockQRSTD).c_str(), kind, {B, T, Hq});
-        shared_k_rstd =
-            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockKRSTD).c_str(), kind, {B, T, Hkv});
-    }
-    // LSE sharing: only in lora_only mode. FFT needs per-layer LSE for bit-exact gradients.
-    if (plan.share_att) {
-        shared_lse =
-            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockLSE).c_str(), kind, {B, Hq, T});
-    }
-    if (plan.share_att) {
-        shared_att = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAtt).c_str(), kind, {B, T, AttnDim});
-    }
-    if (plan.share_att_out) {
-        shared_att_out = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAttOut).c_str(), kind, {B, T, C});
-    }
-    // att_out sharing is handled by share_att when recompute is enabled.
-    if (plan.share_mlp_up && !plan.ffn_temps_on_stack && plan.has_mlp_up_slot) {
-        shared_mlp_up = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPUp).c_str(), kind, {B, T, MUp});
-    }
-    if (plan.share_swiglu && !plan.ffn_temps_on_stack && plan.has_swiglu_slot) {
-        shared_swiglu = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockSwiGLU).c_str(), kind, {B, T, M});
-    }
-    if (plan.share_residual_att) {
-        shared_residual_att =
-            mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockResidualAtt).c_str(), kind, {B, T, C});
-    }
-    if (plan.share_mlp_down) {
-        shared_mlp_down = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPDown).c_str(), kind, {B, T, C});
-    }
+    // Phase 4 M5 preamble: remove upfront `shared_*` buffer allocations.
+    // The legacy share pattern coalesced all layers' <slot> onto one
+    // buffer under recompute, relying on forward replay to regenerate
+    // per-layer values before each backward reads. That broke the LoRA
+    // dispatch's captured input pointers when Phase A's per-layer
+    // Stack migration changed the storage. Always allocate per-layer
+    // now; LoRA naturally sees per-layer pointers and Phase A
+    // migration can proceed slot-by-slot without special-casing share.
+    // Memory cost: (NumLayers - 1) * <slot size> per shared slot.
 
     mSimplifiedActivations.resize(cfg.NumLayers);
     for (int i = 0; i < cfg.NumLayers; ++i) {
@@ -754,47 +703,31 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         } else {
             acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
         }
-        acts.ln1 =
-            plan.share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
+        acts.ln1 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
 
         if (rstd_on_stack) {
             acts.ln2_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T});
         } else {
             acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
         }
-        acts.ln2 =
-            plan.share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
+        acts.ln2 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
 
         if (use_qk_norm) {
             if (rstd_on_stack) {
                 acts.q_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T, Hq});
                 acts.k_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T, Hkv});
             } else {
-                acts.q_rstd =
-                    plan.share_qk_rstd
-                        ? shared_q_rstd
-                        : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
-                acts.k_rstd =
-                    plan.share_qk_rstd
-                        ? shared_k_rstd
-                        : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
+                acts.q_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
+                acts.k_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
             }
         } else {
             acts.q_rstd = {};
             acts.k_rstd = {};
         }
 
-        // KV source layers (referenced by shared-KV attention in other layers)
-        // MUST have their own non-shared QKV buffers so the data survives until
-        // the consumer layer reads it.
-        const bool is_kv_src = plan.is_kv_source(i);
-        acts.qkv = (plan.share_qkv && !is_kv_src)
-                       ? shared_qkv
-                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
+        acts.qkv = mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
         if (plan.need_separate_qkv_rope) {
-            acts.qkv_rope = (shared_qkv_rope.Data && !is_kv_src)
-                                ? shared_qkv_rope
-                                : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV});
+            acts.qkv_rope = mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV});
         } else {
             acts.qkv_rope = {};
         }
@@ -802,44 +735,31 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         if (rstd_on_stack) {
             acts.lse = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, Hq, T});
         } else {
-            acts.lse = plan.share_att
-                           ? shared_lse
-                           : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
+            acts.lse = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
         }
-        acts.att = plan.share_att ? shared_att
-                                  : mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
+        acts.att = mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
         if (rstd_on_stack) {
             acts.att_out = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
         } else {
-            acts.att_out = plan.share_att_out
-                               ? shared_att_out
-                               : mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
+            acts.att_out = mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
         }
 
-        acts.residual_att = plan.share_residual_att
-                                ? shared_residual_att
-                                : mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
+        acts.residual_att = mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
 
         // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
         // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
         if (plan.ffn_temps_on_stack || !plan.has_mlp_up_slot) {
             acts.mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
         } else {
-            acts.mlp_up = plan.share_mlp_up
-                              ? shared_mlp_up
-                              : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPUp), kind, {B, T, lMUp});
+            acts.mlp_up = mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPUp), kind, {B, T, lMUp});
         }
         if (plan.ffn_temps_on_stack || !plan.has_swiglu_slot) {
             acts.swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
         } else {
-            acts.swiglu = plan.share_swiglu
-                              ? shared_swiglu
-                              : mAllocator->allocate(dtype, tag(TensorSlot::BlockSwiGLU), kind, {B, T, lM});
+            acts.swiglu = mAllocator->allocate(dtype, tag(TensorSlot::BlockSwiGLU), kind, {B, T, lM});
         }
 
-        acts.mlp_down = plan.share_mlp_down
-                            ? shared_mlp_down
-                            : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
+        acts.mlp_down = mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
         // Dedicated per-layer block output slot used by Gemma4 (keeps the
         // block's final h_out separate from the MLP's mlp_down so the
         // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
