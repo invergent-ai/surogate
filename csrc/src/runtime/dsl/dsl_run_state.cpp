@@ -891,15 +891,6 @@ void DslRunState::reset_simplified_gradients() {
         dst.d_att.Data = src.d_att.Data;
         dst.d_qkv.Data = src.d_qkv.Data;
         dst.d_ln1.Data = src.d_ln1.Data;
-
-        dst.d_mamba_normed.Data = src.d_mamba_normed.Data;
-        dst.d_mamba_gated.Data = src.d_mamba_gated.Data;
-        dst.d_mamba_scan_out.Data = src.d_mamba_scan_out.Data;
-        dst.d_mamba_u.Data = src.d_mamba_u.Data;
-        dst.d_mamba_delta.Data = src.d_mamba_delta.Data;
-        dst.d_mamba_B.Data = src.d_mamba_B.Data;
-        dst.d_mamba_C.Data = src.d_mamba_C.Data;
-        dst.d_mamba_conv_out.Data = src.d_mamba_conv_out.Data;
     }
 }
 

@@ -35,7 +35,6 @@ struct SimplifiedLayerActivations {
     Tensor residual_att;  ///< (B, T, C) - residual + attention
     Tensor mlp_up;        ///< (B, T, 2*D) - gate+up projection
     Tensor swiglu;        ///< (B, T, D) - SwiGLU output
-    Tensor swiglu_scale;  ///< (B*T,) - per-row scale from scaled SwiGLU (nvfp4-simple recipe)
     Tensor mlp_down;      ///< (B, T, C) - down projection
     Tensor
         h_out;  ///< (B, T, C) - final block output (post layer_scalar); used by Gemma4 to avoid mlp_down collision in autodiff
@@ -52,18 +51,10 @@ struct SimplifiedLayerActivations {
     Tensor expert_down;      ///< (B*T*K, C) - expert down output
     Tensor moe_out;          ///< (B*T, C) - combined MoE output (view of mlp_down)
 
-    // Mamba / SSM activations (Nemotron-H)
-    Tensor mamba_gate;      ///< (B, T, D) - gate projection
-    Tensor mamba_conv_in;   ///< (B, conv_dim, T) - input to conv1d (channel-first)
-    Tensor mamba_u;         ///< (B, D, T) - selective scan input (hidden, transposed)
-    Tensor mamba_delta;     ///< (B, D, T) - expanded dt (transposed)
-    Tensor mamba_B;         ///< (B, G, N, T) - B parameters (packed)
-    Tensor mamba_C;         ///< (B, G, N, T) - C parameters (packed)
-    Tensor mamba_scan_out;  ///< (B, T, D) - scan output (transposed back)
-    Tensor mamba_gated;     ///< (B, T, D) - scan_out * silu(gate)
-    Tensor mamba_normed;    ///< (B, T, D) - RMSNorm output (input to out_proj)
-    Tensor mamba_rstd;      ///< (B, T, G) - group RMSNorm rstd (float)
-    Tensor mamba_x;         ///< (B, D, n_chunks, N*2) - scan intermediates (float)
+    // Mamba / SSM ops route their per-layer tensors through resolve_tensor
+    // (named "blocks[N].mamba_*") — they do not use per-field struct members
+    // here. The previous mamba_gate / mamba_u / ... fields were declared but
+    // never allocated or accessed; removed as dead storage (Phase 4 M5).
 };
 
 /**
@@ -97,15 +88,10 @@ struct SimplifiedLayerGradients {
     Tensor d_qkv;       ///< (B, T, QKV_C) gradient w.r.t. QKV (post RoPE)
     Tensor d_ln1;       ///< (B, T, C) gradient w.r.t. LN1 output
 
-    // Mamba / SSM gradients (Nemotron-H)
-    Tensor d_mamba_normed;    ///< (B, T, D) gradient w.r.t. normed output
-    Tensor d_mamba_gated;     ///< (B, T, D) gradient w.r.t. gated input to RMSNorm
-    Tensor d_mamba_scan_out;  ///< (B, T, D) gradient w.r.t. scan output
-    Tensor d_mamba_u;         ///< (B, D, T) gradient w.r.t. selective scan input
-    Tensor d_mamba_delta;     ///< (B, D, T) gradient w.r.t. expanded dt
-    Tensor d_mamba_B;         ///< (B, G, N, T) - FP32 (selective scan backward)
-    Tensor d_mamba_C;         ///< (B, G, N, T) - FP32 (selective scan backward)
-    Tensor d_mamba_conv_out;  ///< (B, conv_dim, T) gradient w.r.t. conv1d output
+    // Mamba / SSM gradients (d_mamba_*) used to live here but were never
+    // allocated or accessed — Mamba backward ops route per-layer gradients
+    // through resolve_tensor on "d_blocks[N].mamba_*" names. Removed as
+    // dead storage (Phase 4 M5).
 };
 
 /**
