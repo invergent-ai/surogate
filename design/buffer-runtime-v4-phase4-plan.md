@@ -420,6 +420,32 @@ migration (named fields → `std::array<Tensor, N>` indexed by
 allocation loop plus the member-pointer tables; no consumer code
 needs to change.
 
+### Storage migration (0493595)
+
+Replaced the ~25 named Tensor fields on each struct with a
+`std::array<Tensor, kSize>` indexed by `dsl::TensorSlot` (kSize =
+`TensorSlot::Mapped + 1`), plus `operator[](TensorSlot)` for
+ergonomic access. The struct's layout is now driven entirely by
+the `TensorSlot` enum — they are the same data.
+
+- `tensor_slot_dispatch.cpp`: member-pointer tables replaced with
+  `is_block_activation_slot` / `is_block_gradient_slot` predicates
+  + direct `acts[slot]` / `grads[slot]` lookups.
+- `dsl_run_state.cpp` allocation: helper lambdas collapse the
+  repeated if/else stack_or_alloc ternaries; `acts.field = ...`
+  sites become `acts[TensorSlot::BlockField] = ...`.
+- `dsl_run_state.cpp` reset: 10 per-field `.Data = .Data` lines
+  collapsed into a loop over a slot-enum list.
+
+Adding a new block slot is now a one-line enum addition + one-line
+allocation site. No struct field, no member-pointer table entry,
+no switch case. Storage footprint grows ~120 KB per model (Tensor{}
+padding for unused enum indices on 28 layers × 2 structs);
+negligible vs total memory.
+
+Verified bit-identical on all four architectures (Qwen3 / Qwen3.5 /
+Gemma4 hybrid / GPT-OSS MoE).
+
 Net impact: `shared_tag()` + per-layer activation allocator loop +
 all gradient-sharing from the design's M5 kill-list is gone.
 `builtin_slot_from_name` direct callers dropped from ~35 to ~10
