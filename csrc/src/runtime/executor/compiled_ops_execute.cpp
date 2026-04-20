@@ -1261,14 +1261,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // flat ops list + op.layer_start/end flags. Phase 3 subsystem #1 flip:
     // SegmentDispatch honors graph.layer_segments when mSplitAttentionGraphs
     // is on, replicating today's per-segment graph-capture-or-eager dispatch.
-    // Phase 4: stream-driven interpreter is now the default. Set
-    // SUROGATE_LEGACY_EXECUTOR=1 to fall back to the flat-ops path
-    // (kept for one release cycle as an escape hatch for regressions).
-    const bool legacy_escape = [] {
-        const char* e = std::getenv("SUROGATE_LEGACY_EXECUTOR");
-        return e && std::string(e) == "1";
-    }();
-    const bool stream_driven = !legacy_escape && !graph.instruction_stream.empty() && !mCapturing;
+    // The flat-ops loop below remains the path when capturing (CUDA graph
+    // capture needs the single-pass op walk) or when the compiler did not
+    // emit an instruction stream.
+    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing;
     if (stream_driven) {
         if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
             if (std::string(env) == "1") {
@@ -2422,13 +2418,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Stream-driven backward execution (M5.d, flag-gated pass-through mode).
     // Minimal: no tiled MLP, no capture, no recompute, no bwd_filter / watch /
     // op_profile — matches the Llama-only scope of the forward stream path.
-    // Phase 4: stream-driven backward default-on. Same SUROGATE_LEGACY_EXECUTOR=1 escape.
-    const bool bwd_legacy_escape = [] {
-        const char* e = std::getenv("SUROGATE_LEGACY_EXECUTOR");
-        return e && std::string(e) == "1";
-    }();
-    const bool bwd_stream_driven = !bwd_legacy_escape && !graph.instruction_stream.empty() && !bwd_stream_capturing &&
-                                   bwd_tile_group_starts.empty();
+    const bool bwd_stream_driven =
+        !graph.instruction_stream.empty() && !bwd_stream_capturing && bwd_tile_group_starts.empty();
 
     // Per-op layer-end cleanup (shared between SegmentDispatch inline and
     // PhaseExit BwdBlock). Mirrors the flat-ops layer-end handler at lines

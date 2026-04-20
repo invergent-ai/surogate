@@ -980,14 +980,7 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // would need the original TensorAllocator-backed buffer, which was
         // freed after the adopt — see below).
         dsl::release_phase_arenas(mPhaseArenas);
-        // Phase 4: phase-tree arenas default-on. Set SUROGATE_LEGACY_EXECUTOR=1
-        // to skip allocation; phase-tree flips also fall back to flat-ops in
-        // that case (see stream_driven guards in compiled_ops_execute.cpp).
-        const bool legacy_escape_arena = [] {
-            const char* e = std::getenv("SUROGATE_LEGACY_EXECUTOR");
-            return e && std::string(e) == "1";
-        }();
-        if (!legacy_escape_arena && mCompiledForward && mCompiledBackward) {
+        if (mCompiledForward && mCompiledBackward) {
             {
                 const std::size_t stack_bytes = mRunState.Stack.capacity();
                 // Phase 3 subsystem #4: bwd_cross_layer arena. Fixed 64 MiB;

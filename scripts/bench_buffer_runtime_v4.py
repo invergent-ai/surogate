@@ -67,10 +67,11 @@ def poll_peak_memory(device_ids: list, stop_event: threading.Event, out: dict, i
 def run_benchmark(config: str, mode: str, warmup: int = 3) -> dict:
     env = os.environ.copy()
     if mode == "legacy":
-        env["SUROGATE_LEGACY_EXECUTOR"] = "1"
-    elif mode == "stream":
-        env.pop("SUROGATE_LEGACY_EXECUTOR", None)
-    else:
+        raise ValueError(
+            "legacy mode was removed after Phase 4: the stream-driven interpreter is now "
+            "unconditional (SUROGATE_LEGACY_EXECUTOR env gate deleted). Use --mode stream."
+        )
+    elif mode != "stream":
         raise ValueError(f"unknown mode: {mode}")
 
     cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "0")

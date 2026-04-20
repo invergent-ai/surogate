@@ -4,7 +4,7 @@
 **Branch:** `buffer-runtime-v4-prototype`
 **Hardware:** 1× RTX 5090 (32 GiB, SM120), single-node, single GPU
 **Harness:** [scripts/bench_buffer_runtime_v4.py](../scripts/bench_buffer_runtime_v4.py) — runs `surogate sft`, drops 3 warmup steps, averages remaining 17
-**Toggle:** `SUROGATE_LEGACY_EXECUTOR=1` for legacy, unset for stream-driven (current default)
+**Toggle:** `SUROGATE_LEGACY_EXECUTOR=1` for legacy, unset for stream-driven (current default). *Post–Phase 4 M5: flag deleted; the stream-driven interpreter is unconditional and legacy mode is no longer reachable.*
 
 ## Verdict: **Pass. Proceed to Phase 4.**
 
