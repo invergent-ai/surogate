@@ -2256,14 +2256,24 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             mTemps.clear();
                             initial_checkpoint = mRunState.Stack.checkpoint();
                         }
-                        prune_by_last_use(i);
                     }
+                    // Phase 3 subsystem #5 flip: pruning moved out of the
+                    // dispatch loop. The next PruneByLastUse instruction
+                    // (emitted immediately after this SegmentDispatch for the
+                    // same op range) iterates prune_by_last_use per op.
                     break;
 
                 case dsl::InstKind::PruneByLastUse:
-                    // Pass-through mode: per-op pruning already happened inside
-                    // SegmentDispatch to match today's backward semantics. The
-                    // phase-level PruneByLastUse is a no-op here.
+                    // Phase 3 subsystem #5: explicit per-op pruning driven by
+                    // the instruction stream. Iterates in op-index order so
+                    // last-use semantics match the pre-flip inline-in-dispatch
+                    // timing exactly (each prune sees the same state it would
+                    // have under the original interleaved loop, because ops
+                    // between two consecutive prunes don't read tids whose
+                    // last_use sits in that gap).
+                    for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
+                        prune_by_last_use(i);
+                    }
                     break;
 
                 case dsl::InstKind::PhaseExit:
