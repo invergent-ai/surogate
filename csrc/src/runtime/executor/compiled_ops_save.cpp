@@ -53,6 +53,45 @@ namespace {
 // per-block slots: `moe_expert_offsets` / `moe_gather_indices` (global
 // scratch) and `ep_*` (expert-parallel internal comms). To add a new MoE
 // tensor, extend the TensorSlot enum or update the tail list here.
+// Slot-registry predicates shared by prepare_saved_buffers_for_capture and
+// save_tensors. Both need to know whether a tensor's declared slot is
+// `Shared` (memory hint) or `Mapped` (no backing buffer in the registry,
+// so saves must be copied). Collapsed into free functions here because
+// both call sites had byte-identical lambdas.
+std::optional<bool> is_shared_slot(const TensorSlotRegistry* registry, const std::string& name) {
+    if (!registry) return std::nullopt;
+    int layer_idx = -1;
+    std::string base_field;
+    resolve_block_slot(name, &layer_idx, nullptr, &base_field);
+    if (layer_idx >= 0) {
+        if (auto entry = registry->lookup(base_field)) {
+            return entry->memory_hint == ActivationMemoryHint::Shared;
+        }
+        return std::nullopt;
+    }
+    if (auto entry = registry->lookup(strip_ssa_suffix(name))) {
+        return entry->memory_hint == ActivationMemoryHint::Shared;
+    }
+    return std::nullopt;
+}
+
+std::optional<bool> is_mapped_slot(const TensorSlotRegistry* registry, const std::string& name) {
+    if (!registry) return std::nullopt;
+    int layer_idx = -1;
+    std::string base_field;
+    resolve_block_slot(name, &layer_idx, nullptr, &base_field);
+    if (layer_idx >= 0) {
+        if (auto entry = registry->lookup(base_field)) {
+            return entry->slot == TensorSlot::Mapped;
+        }
+        return std::nullopt;
+    }
+    if (auto entry = registry->lookup(strip_ssa_suffix(name))) {
+        return entry->slot == TensorSlot::Mapped;
+    }
+    return std::nullopt;
+}
+
 bool is_moe_tensor_name(const std::string& n) {
     switch (resolve_block_slot(n)) {
         case TensorSlot::BlockRouterLogits:
@@ -211,41 +250,6 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
 
-    auto is_shared_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
-                return entry->memory_hint == ActivationMemoryHint::Shared;
-            }
-            return std::nullopt;
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->memory_hint == ActivationMemoryHint::Shared;
-        }
-        return std::nullopt;
-    };
-
-    auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int lid = -1;
-        std::string fld;
-        if (parse_block_param(name, lid, fld)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(fld))) {
-                return entry->slot == TensorSlot::Mapped;
-            }
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->slot == TensorSlot::Mapped;
-        }
-        return std::nullopt;
-    };
-
     auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist) -> bool {
         if (force_persist) {
             return true;
@@ -253,11 +257,11 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (!recompute_enabled || prefer_live) {
             return false;
         }
-        auto mapped = is_mapped_slot(name);
+        auto mapped = is_mapped_slot(mSlotRegistry, name);
         if (mapped.has_value() && mapped.value()) {
             return true;
         }
-        auto shared = is_shared_slot(name);
+        auto shared = is_shared_slot(mSlotRegistry, name);
         if (shared.has_value()) {
             return shared.value();
         }
@@ -651,43 +655,6 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
 
-    // Helper to copy tensor to persistent buffer when needed in recompute mode.
-    // Returns true if tensor was copied to persistent storage, false if metadata-only save.
-    auto is_shared_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
-                return entry->memory_hint == ActivationMemoryHint::Shared;
-            }
-            return std::nullopt;
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->memory_hint == ActivationMemoryHint::Shared;
-        }
-        return std::nullopt;
-    };
-
-    auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
-                return entry->slot == TensorSlot::Mapped;
-            }
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->slot == TensorSlot::Mapped;
-        }
-        return std::nullopt;
-    };
-
     auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist_name) -> bool {
         if (force_persist || force_persist_name) {
             return true;
@@ -695,12 +662,12 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (!recompute_enabled || prefer_live) {
             return false;
         }
-        auto mapped = is_mapped_slot(name);
+        auto mapped = is_mapped_slot(mSlotRegistry, name);
         if (mapped.has_value() && mapped.value()) {
             // Slot resolves to Mapped: no persistent buffer, so saved data must be copied.
             return true;
         }
-        auto shared = is_shared_slot(name);
+        auto shared = is_shared_slot(mSlotRegistry, name);
         if (shared.has_value()) {
             return shared.value();
         }
