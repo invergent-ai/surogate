@@ -1291,9 +1291,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                 auto& acts = mRunState.simplified_acts(L);
                                 acts.ln1_rstd.Data = nullptr;
                                 acts.ln2_rstd.Data = nullptr;
-                                const std::string prefix = "blocks[" + std::to_string(L) + "].";
-                                invalidate_cached_slot(prefix + "ln1_rstd");
-                                invalidate_cached_slot(prefix + "ln2_rstd");
                             }
                             layer_active[static_cast<std::size_t>(L)] = 0;
                         }
@@ -1588,9 +1585,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     auto& acts = mRunState.simplified_acts(op.layer_end);
                     acts.ln1_rstd.Data = nullptr;
                     acts.ln2_rstd.Data = nullptr;
-                    const std::string prefix = "blocks[" + std::to_string(op.layer_end) + "].";
-                    invalidate_cached_slot(prefix + "ln1_rstd");
-                    invalidate_cached_slot(prefix + "ln2_rstd");
                 }
                 // Note: cudnn_workspace is persistently allocated, don't clear
                 layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
@@ -2461,9 +2455,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             auto& acts = mRunState.simplified_acts(L);
             acts.ln1_rstd.Data = nullptr;
             acts.ln2_rstd.Data = nullptr;
-            const std::string prefix = "blocks[" + std::to_string(L) + "].";
-            invalidate_cached_slot(prefix + "ln1_rstd");
-            invalidate_cached_slot(prefix + "ln2_rstd");
         }
         if (mRunState.ffn_temps_on_stack()) {
             auto& acts = mRunState.simplified_acts(L);
@@ -2993,9 +2984,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     auto& acts = mRunState.simplified_acts(op.layer_end);
                     acts.ln1_rstd.Data = nullptr;
                     acts.ln2_rstd.Data = nullptr;
-                    const std::string prefix = "blocks[" + std::to_string(op.layer_end) + "].";
-                    invalidate_cached_slot(prefix + "ln1_rstd");
-                    invalidate_cached_slot(prefix + "ln2_rstd");
                 }
                 if (mRunState.large_bwd_temps_on_stack()) {
                     auto& grads_to_clear = mRunState.simplified_grads(op.layer_end);
