@@ -1081,14 +1081,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         tile_group_starts[tg.start_op_idx] = &tg;
     }
 
-    // Stream-driven forward execution (M5.d, flag-gated pass-through mode).
-    // Minimal: no split-attention, no watch tensor, no MLP tiling — intended
-    // as a bit-identical proof for 1-layer Llama. Reuses today's allocator,
-    // stack, and op dispatch; drives them from graph.instruction_stream
-    // instead of the flat ops list + op.layer_start/end flags.
+    // Stream-driven forward execution. Reuses today's allocator, stack, and
+    // op dispatch; drives them from graph.instruction_stream instead of the
+    // flat ops list + op.layer_start/end flags. Phase 3 subsystem #1 flip:
+    // SegmentDispatch honors graph.layer_segments when mSplitAttentionGraphs
+    // is on, replicating today's per-segment graph-capture-or-eager dispatch.
     const char* stream_env = std::getenv("SUROGATE_USE_PHASE_INTERPRETER");
-    const bool stream_driven = stream_env && std::string(stream_env) == "1" && !graph.instruction_stream.empty() &&
-                               !mSplitAttentionGraphs && !mCapturing;
+    const bool stream_driven =
+        stream_env && std::string(stream_env) == "1" && !graph.instruction_stream.empty() && !mCapturing;
     if (stream_driven) {
         if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
             if (std::string(env) == "1") {
@@ -1110,18 +1110,99 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                         mCurrentLayer = L;
                     }
                     break;
-                case dsl::InstKind::SegmentDispatch:
-                    for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
-                        if (!full && !graph.required_mask.empty() && !graph.required_mask[i]) continue;
-                        const auto& op = graph.ops[i];
-                        if (!op.fn) continue;
-                        op.fn(*this, op, static_cast<const void*>(hook));
+                case dsl::InstKind::SegmentDispatch: {
+                    // Phase 3 subsystem #1 flip: honor graph.layer_segments when
+                    // split-attention is active. Each layer's ops are dispatched
+                    // as an ordered list of graph-captured / eager segments
+                    // (replicates compiled_ops_execute.cpp:1228-1325 semantics
+                    // in the stream-driven path).
+                    const int L = inst.block_index;
+                    const bool use_splits = mSplitAttentionGraphs && inst.phase_kind == dsl::PhaseKind::FwdBlock &&
+                                            L >= 0 && static_cast<std::size_t>(L) < graph.layer_segments.size() &&
+                                            !graph.layer_segments[static_cast<std::size_t>(L)].empty();
+                    if (use_splits) {
+                        const auto& segs = graph.layer_segments[static_cast<std::size_t>(L)];
+                        for (std::size_t s = 0; s < segs.size(); ++s) {
+                            const auto& seg = segs[s];
+                            if (seg.eager) {
+                                const MlpTileGroup* tile_group = nullptr;
+                                for (const auto& tg : graph.mlp_tile_groups) {
+                                    if (tg.start_op_idx == seg.start_op) {
+                                        tile_group = &tg;
+                                        break;
+                                    }
+                                }
+                                if (tile_group) {
+                                    execute_tiled_mlp(graph, *tile_group, mB, mT, hook);
+                                } else {
+                                    for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                        dispatch_forward_op(graph.ops[i], hook);
+                                    }
+                                }
+                            } else {
+                                auto& sg = mFwdSegGraphs[static_cast<std::size_t>(L)][s];
+                                const bool is_capture = (sg.exec == nullptr);
+                                std::size_t saved_before = mSaved ? mSaved->size() : 0;
+                                auto run = [&]() {
+                                    for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                        dispatch_forward_op(graph.ops[i], hook);
+                                    }
+                                };
+                                trace_or_execute_cuda_graph_with_stack(run,
+                                                                       mRunState.MainStream,
+                                                                       sg.exec,
+                                                                       true,
+                                                                       mRunState.Stack,
+                                                                       sg.checkpoint);
+                                if (is_capture) {
+                                    sg.post_checkpoint = mRunState.Stack.checkpoint();
+                                    sg.tensor_snapshot.clear();
+                                    sg.named_snapshot.clear();
+                                    sg.saved_snapshot.clear();
+                                    for (int tid = 0; tid < static_cast<int>(mTensors.size()); ++tid) {
+                                        if (mTensors[tid].Data) sg.tensor_snapshot.emplace_back(tid, mTensors[tid]);
+                                    }
+                                    for (const auto& [name, t] : mNamedTensors) {
+                                        if (t.Data) sg.named_snapshot.emplace_back(name, t);
+                                    }
+                                    if (mSaved && mSaved->size() > saved_before) {
+                                        for (const auto& [name, t] : *mSaved) {
+                                            sg.saved_snapshot.emplace_back(name, t);
+                                        }
+                                    }
+                                } else {
+                                    mRunState.Stack.restore(sg.post_checkpoint);
+                                    for (const auto& [tid, t] : sg.tensor_snapshot) {
+                                        if (static_cast<std::size_t>(tid) < mTensors.size()) mTensors[tid] = t;
+                                    }
+                                    for (const auto& [name, t] : sg.named_snapshot)
+                                        mNamedTensors[name] = t;
+                                    if (mSaved) {
+                                        for (const auto& [name, t] : sg.saved_snapshot) {
+                                            if (mSaved->find(name) == mSaved->end()) (*mSaved)[name] = t;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
+                            if (!full && !graph.required_mask.empty() && !graph.required_mask[i]) continue;
+                            const auto& op = graph.ops[i];
+                            if (!op.fn) continue;
+                            op.fn(*this, op, static_cast<const void*>(hook));
+                        }
                     }
                     break;
+                }
                 case dsl::InstKind::PruneByLastUse:
                     // Pass-through mode: pruning happens at PhaseExit for FwdBlock,
                     // matching today's layer_end semantics. Per-segment pruning is
                     // a future optimization.
+                    break;
+                case dsl::InstKind::RecomputeBlock:
+                    // Forward direction: no-op. Recompute fires in backward
+                    // PhaseEnter BwdBlock via subsystem #7's handler.
                     break;
                 case dsl::InstKind::PhaseExit:
                     if (inst.phase_kind == dsl::PhaseKind::FwdBlock && inst.block_index >= 0) {
