@@ -2477,6 +2477,46 @@ void release_phase_arenas(PhaseArenas& arenas) {
     arenas.allocated = false;
 }
 
+// ============================================================================
+// Debuggability surface (design/buffer-runtime-v4.md, P4.7)
+// ============================================================================
+
+std::string CompiledGraph::describe_tensor_id(int tid) const {
+    if (tid < 0 || static_cast<std::size_t>(tid) >= tensor_meta.size()) {
+        std::ostringstream oss;
+        oss << "<tid=" << tid << " unknown>";
+        return oss.str();
+    }
+    const auto& meta = tensor_meta[static_cast<std::size_t>(tid)];
+    const auto name = name_for_tensor_id(tid);
+    std::ostringstream oss;
+    oss << "tid=" << tid;
+    if (!name.empty()) oss << " name='" << name << "'";
+    oss << " kind=" << tensor_kind_name(meta.kind);
+    oss << " region=" << region_kind_name(meta.region);
+    if (meta.block_layer_idx >= 0) oss << " block=" << meta.block_layer_idx;
+    if (meta.offset != SIZE_MAX) {
+        oss << " offset=" << meta.offset;
+    }
+    if (meta.bytes > 0) {
+        oss << " bytes=" << meta.bytes;
+    }
+    return oss.str();
+}
+
+/// Env-gated full tid-table dump (SUROGATE_DEBUG_TID_TABLE=1). Emits one line
+/// per tid so a user can grep for a specific tensor's region/offset/size after
+/// compile. Tids without a name (external-only references) still emit their
+/// meta so they can be diagnosed when they surface in error messages.
+static void maybe_dump_tid_table(const CompiledGraph& graph) {
+    const char* env = std::getenv("SUROGATE_DEBUG_TID_TABLE");
+    if (!env || std::string(env) != "1") return;
+    std::cerr << "[tid-table] " << graph.name << " (" << graph.num_tensors << " tids):\n";
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        std::cerr << "  " << graph.describe_tensor_id(tid) << "\n";
+    }
+}
+
 void CompiledGraph::compute_layer_segments() {
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
@@ -5024,6 +5064,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Flatten the phase tree to a linear instruction stream (M4). The M5
     // interpreter will consume this stream; for now it is shadow-only.
     emit_instruction_stream(result);
+
+    // Debuggability dump (P4.7). Runs after every compile for inspection.
+    maybe_dump_tid_table(result);
 
     // ========================================================================
     // Detect MLP tile groups for long-context tiled execution

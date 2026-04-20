@@ -570,6 +570,27 @@ struct CompiledGraph {
         return tensor_id_to_name[static_cast<std::size_t>(tid)];
     }
 
+    /// Debuggability (P4.7): tid -> TensorMeta with region/offset/bytes
+    /// pre-resolved. Pair with name_for_tensor_id() for error messages and
+    /// debug dumps. Returns nullptr when tid is out of range.
+    const TensorMeta* meta_for_tensor_id(int tid) const {
+        if (tid < 0 || static_cast<std::size_t>(tid) >= tensor_meta.size()) {
+            return nullptr;
+        }
+        return &tensor_meta[static_cast<std::size_t>(tid)];
+    }
+
+    /// Debuggability (P4.7): name -> TensorMeta via name_to_id + meta_for_tensor_id.
+    const TensorMeta* meta_for_name(const std::string& name) const {
+        int tid = find_tensor_id(name);
+        return tid >= 0 ? meta_for_tensor_id(tid) : nullptr;
+    }
+
+    /// Debuggability (P4.7): format "tid=5 name='blocks[3].ln1' region=FwdStack
+    /// block=3 offset=0x1000 bytes=32768". Intended for error messages and
+    /// exception rewrites. Returns "<tid=N unknown>" when tid is invalid.
+    std::string describe_tensor_id(int tid) const;
+
     // MLP tile groups for long-context tiled execution.
     // When non-empty, the executor processes these op ranges in T-chunks.
     // Forward groups: view → matmul_up → view → swiglu → view → matmul_down → view

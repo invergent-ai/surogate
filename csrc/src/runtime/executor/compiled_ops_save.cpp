@@ -1311,7 +1311,17 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
         case TensorSlot::Temporary: throw std::runtime_error("CompiledExecutor: temporary slot requires allocation");
     }
-    throw std::runtime_error("CompiledExecutor: invalid tensor slot");
+    // P4.7 error rewriter: include tid context when available, so users see
+    // "invalid tensor slot for tid=12 name='blocks[3].att' region=FwdStack"
+    // instead of the bare "invalid tensor slot".
+    std::ostringstream oss;
+    oss << "CompiledExecutor: invalid tensor slot";
+    if (mCurrentGraph && ref.tensor_id >= 0) {
+        oss << " (" << mCurrentGraph->describe_tensor_id(ref.tensor_id) << ")";
+    } else if (!ref.name.empty()) {
+        oss << " (name='" << ref.name << "')";
+    }
+    throw std::runtime_error(oss.str());
 }
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
