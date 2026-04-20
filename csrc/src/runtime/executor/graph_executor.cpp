@@ -950,27 +950,25 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // would need the original TensorAllocator-backed buffer, which was
         // freed after the adopt — see below).
         dsl::release_phase_arenas(mPhaseArenas);
-        if (const char* env = std::getenv("SUROGATE_USE_PHASE_ARENAS")) {
-            if (std::string(env) == "1" && mCompiledForward && mCompiledBackward) {
-                const bool want_stack_flip = [] {
-                    const char* e = std::getenv("SUROGATE_USE_PHASE_STACK");
-                    return e && std::string(e) == "1";
-                }();
-                const std::size_t stack_bytes = want_stack_flip ? mRunState.Stack.capacity() : 0;
+        // Phase 4: phase-tree arenas default-on. Set SUROGATE_LEGACY_EXECUTOR=1
+        // to skip allocation; phase-tree flips also fall back to flat-ops in
+        // that case (see stream_driven guards in compiled_ops_execute.cpp).
+        const bool legacy_escape_arena = [] {
+            const char* e = std::getenv("SUROGATE_LEGACY_EXECUTOR");
+            return e && std::string(e) == "1";
+        }();
+        if (!legacy_escape_arena && mCompiledForward && mCompiledBackward) {
+            {
+                const std::size_t stack_bytes = mRunState.Stack.capacity();
                 // Phase 3 subsystem #4: bwd_cross_layer arena. Fixed 64 MiB;
                 // the per-step bump resets at backward start. 0 bytes for dense
                 // transformers (typical), < 16 MiB for small-MoE aux-loss.
                 // Interpreter falls back to cudaMalloc if arena is insufficient.
                 const std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
-                // Phase 3 subsystem #6: moe_saved arena. Gated on
-                // SUROGATE_USE_PHASE_MOE=1; sized 256 MiB for MoE models.
-                // Cross-step monotonic bump; cudaMalloc fallback on exhaustion.
-                const bool want_moe_flip = [] {
-                    const char* e = std::getenv("SUROGATE_USE_PHASE_MOE");
-                    return e && std::string(e) == "1";
-                }();
-                const std::size_t moe_saved_bytes =
-                    (want_moe_flip && mConfig.NumExperts > 0) ? 256ULL * 1024 * 1024 : 0;
+                // Phase 3 subsystem #6: moe_saved arena sized 256 MiB when
+                // NumExperts > 0. Cross-step monotonic bump; cudaMalloc
+                // fallback on exhaustion.
+                const std::size_t moe_saved_bytes = mConfig.NumExperts > 0 ? 256ULL * 1024 * 1024 : 0;
                 dsl::compute_arena_sizes(mPhaseArenas,
                                          *mCompiledForward,
                                          *mCompiledBackward,
@@ -989,12 +987,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     mCompiledExecutor->set_phase_arenas(&mPhaseArenas);
                 }
                 // Rebase Stack onto the unified_stack arena on the first
-                // (B,T) where the flag is on. Stack must be empty here
-                // (post-compile, pre-step boundary). Transfer ownership to
-                // DslRunState and free the original Stack buffer so total
-                // memory doesn't double. On subsequent recompiles the
-                // adopted buffer persists — no re-rebase needed.
-                if (want_stack_flip && !mStackRebasedToArena && mPhaseArenas.unified_stack_ptr != nullptr) {
+                // (B,T). Stack must be empty here (post-compile, pre-step
+                // boundary). Transfer ownership to DslRunState and free the
+                // original Stack buffer so total memory doesn't double. On
+                // subsequent recompiles the adopted buffer persists — no
+                // re-rebase needed.
+                if (!mStackRebasedToArena && mPhaseArenas.unified_stack_ptr != nullptr) {
                     mRunState.rebase_stack_to_external(mPhaseArenas.unified_stack_ptr,
                                                        mPhaseArenas.unified_stack_bytes);
                     mRunState.adopt_external_stack(mPhaseArenas.unified_stack_ptr, mPhaseArenas.unified_stack_bytes);
@@ -1003,8 +1001,6 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     mRunState.free_allocator_stack_buffer();
                     mStackRebasedToArena = true;
                 }
-            } else if (mCompiledExecutor) {
-                mCompiledExecutor->set_phase_arenas(nullptr);
             }
         } else if (mCompiledExecutor) {
             mCompiledExecutor->set_phase_arenas(nullptr);
