@@ -158,7 +158,6 @@ const char* slot_to_name(TensorSlot slot) {
         case TensorSlot::Losses: return "loss";
         case TensorSlot::DLoss: return "d_loss";
         case TensorSlot::Parameter: return "parameter";
-        case TensorSlot::Temporary: return "temporary";
         case TensorSlot::Saved: return "saved";
         case TensorSlot::Mapped: return "mapped";
     }

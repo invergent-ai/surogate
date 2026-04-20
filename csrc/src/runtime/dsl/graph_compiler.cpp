@@ -3855,8 +3855,7 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
                 parse_block_param(stripped, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(stripped);
             auto slot_entry = mSlotRegistry.lookup(field_name);
             if (slot_entry.has_value() && slot_entry->slot != TensorSlot::Mapped &&
-                slot_entry->slot != TensorSlot::Temporary && slot_entry->slot != TensorSlot::Saved &&
-                slot_entry->slot != TensorSlot::Parameter) {
+                slot_entry->slot != TensorSlot::Saved && slot_entry->slot != TensorSlot::Parameter) {
                 recognized = true;
             }
         }

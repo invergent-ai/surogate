@@ -189,7 +189,6 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
             if (ref.shape.empty()) continue;
             bool on_stack = false;
             switch (ref.slot) {
-                case TensorSlot::Temporary:
                 case TensorSlot::Mapped: on_stack = true; break;
                 case TensorSlot::BlockDQKV:
                 case TensorSlot::BlockDMLPUp:

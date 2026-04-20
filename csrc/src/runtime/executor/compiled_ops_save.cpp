@@ -1077,7 +1077,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
-        ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
+        ref.slot != TensorSlot::Parameter) {
         // Need to create a view from the base tensor
         if (ref.name.find("att_flat") != std::string::npos && ref.layer_idx == 4) {
             fprintf(stderr,
@@ -1270,7 +1270,6 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             }
             throw std::runtime_error("CompiledExecutor: tensor not found: " + ref.name);
         }
-        case TensorSlot::Temporary: throw std::runtime_error("CompiledExecutor: temporary slot requires allocation");
     }
     // P4.7 error rewriter: include tid context when available, so users see
     // "invalid tensor slot for tid=12 name='blocks[3].att' region=FwdStack"
@@ -1328,9 +1327,8 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
 
     // Fast path: pre-allocated block slots with existing data bypass string parsing.
     // This covers most activation and gradient outputs during forward/backward.
-    // Only Mapped/Temporary/Parameter/Saved slots need the string-heavy resolution below.
-    if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Temporary && ref.slot != TensorSlot::Parameter &&
-        ref.slot != TensorSlot::Saved) {
+    // Only Mapped/Parameter/Saved slots need the string-heavy resolution below.
+    if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Saved) {
         Tensor& t = resolve_tensor(ref);
         if (t.Data) {
             Tensor resolved = t;
@@ -1469,7 +1467,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     }
 
     // For pre-allocated slots, just return the tensor
-    if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Temporary) {
+    if (ref.slot != TensorSlot::Mapped) {
         Tensor& t = resolve_tensor(ref);
         if (!t.Data) {
             mRunState.temp_acquire(t);

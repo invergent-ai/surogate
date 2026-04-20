@@ -438,7 +438,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     if (op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
         d_weight_ptr = &ensure_output_tensor(op.outputs[2]);
         skip_weight_grad = false;
-        if (op.outputs[2].slot == TensorSlot::Mapped || op.outputs[2].slot == TensorSlot::Temporary) {
+        if (op.outputs[2].slot == TensorSlot::Mapped) {
             fill_zero(*d_weight_ptr, mRunState.MainStream);
         }
     } else {
