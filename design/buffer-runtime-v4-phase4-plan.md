@@ -343,11 +343,23 @@ M5 progress.
 | `f771b03` | `share_ln1/ln2/qkv/att/att_out/mlp_up/swiglu/residual_att/mlp_down/qk_rstd` + `allocate_shared_qkv_rope` from `BufferPlan` + the `share_for` lambda + uniformity booleans gated on sharing |
 | `43293fe` | Dead `kv_source_layers` / `is_kv_source()` from `BufferPlan` (only read to disable sharing) |
 | `10d5362` | `TensorSlotRegistry::should_share` (zero callers after f771b03) |
+| `7db3691` | Introduced `resolve_slot_with_flat()`; collapsed six `_flat`-fallback name→slot dispatches into single helper |
+| `3ab876e` | Hoisted `is_moe_tensor_name` to file-scope helper (two identical lambdas collapsed) |
+| `8d51cda` | Migrated graph_executor global slot fallback to `resolve_slot_with_flat` |
+| `790e76e` | Added `resolve_block_slot()` helper; migrated four `parse_block + strip_ssa + builtin_slot_from_name` dances |
+| `db8669a` | Migrated compiled_ops.cpp block resolver to `resolve_block_slot` |
+| `164aa37` | Removed dead `kv_source_layers` populator + `is_kv_source()` accessor (and the O(N·M) graph-scan that populated the set) |
+| `bb1a635` | Hoisted `is_shared_slot` / `is_mapped_slot` predicates (2 × 2 identical lambdas collapsed) |
+| `1ef850f` | Removed single-buffer gradient sharing: `share_grads`/`share_d_att` + `mSharedDResAtt`/`mSharedDAttOut`/`mSharedDLn1`/`mSharedDLn2`/`mSharedDAtt` |
+| `e887196` | Removed dead `share_res_ffn_grad` + `mSharedDResFFN` (flag was hardcoded false) |
+| `a59df06` | Removed `share_mlp_down_grad` + `mSharedDMlpDown` alternating pair (last gradient-sharing case) |
+| `193acf5` | Removed dead `mRecomputeRstd` / `mRecomputeLSE` buffers (getters had zero callers) |
 
-Net impact: `shared_tag()` + per-layer activation allocator loop from
-the design's M5 kill-list is gone. Under-the-hood: legacy allocator
-now matches the per-layer semantics Phase A Stack migration assumes,
-which unblocked ln1/ln2/h_out migration (commit `d421a80`).
+Net impact: `shared_tag()` + per-layer activation allocator loop +
+all gradient-sharing from the design's M5 kill-list is gone.
+`builtin_slot_from_name` direct callers dropped from ~35 to ~10
+legitimate remaining sites (string-match dispatch consolidated
+behind `resolve_slot_with_flat` / `resolve_block_slot`).
 
 Baseline backward norm shifted as a consequence (3.8749 → 3.4387 on
 Qwen3-bf16). Loss unchanged. The old sharing was silently
@@ -356,32 +368,42 @@ readable by layers whose replay hadn't re-populated it; the new
 value is the one where every layer's backward reads its own
 replay-regenerated data.
 
+Verified bit-identical step 0 across: Qwen3-0.6B dense bf16 LoRA,
+Qwen3.5 dense, GPT-OSS 20B MoE bf16 LoRA, Gemma4 hybrid LoRA.
+
 ### M5 remaining targets
 
 Still on the kill-list from `design/buffer-runtime-v4.md §Phase 4`:
 
 - `TensorSlot::Block*/MoE*/SSM*` enumerators — widely used (hot-path
-  dispatch), multi-session to eliminate
+  dispatch), multi-session to eliminate; blocking their removal is
+  the `SimplifiedLayerActivations` struct and every op's `acts.X`
+  reads
 - `SimplifiedLayerActivations` struct — every op reads `acts.X`;
   cannot delete without op-level refactor
-- `builtin_slot_from_name` string table + its ~30 callers across
-  `compiled_ops_save.cpp`, `compiled_ops_execute.cpp`,
-  `graph_executor.cpp` — largest remaining string-match dispatch
-  surface; needs tensor-id-based replacement strategy
-- `layer_start`/`layer_end` index flags on ops — used in the
-  executor's dispatch loop for Stack.checkpoint/restore
-- String-match dispatch branches in
-  `compiled_ops_execute.cpp:180-224,707-740` — go together with the
-  name-lookup removal
+- `builtin_slot_from_name` string table + ~10 remaining legitimate
+  callers (each is structurally different: unqualified global
+  names, `layerN.X` cross-layer refs, `d_`-prefix gradient lookups,
+  already-extracted base_field, registry init). Further reduction
+  requires `TensorRef.slot` baking at compile time for all name
+  forms.
+- `layer_start`/`layer_end` index flags on ops — 89 occurrences in
+  executor dispatch loop and graph compilation; load-bearing for
+  Stack.checkpoint/restore
 - Ad-hoc backward cross-layer cudaMalloc path in
-  `compiled_ops_execute.cpp:2337-2429` — already replaced by
-  `BwdCrossLayer` arena in Phase 3 work; deletion is pure
-  follow-through if no callers remain
+  `compiled_ops.cpp:486-491` — genuinely a fallback for
+  `BwdCrossLayer` arena miss, not dead
 - `MatmulOp` enum alias — confirmed not dead (actively switched on);
-  scratch from the kill-list
-- Gradient-sharing (`share_grads`/`share_d_att`/`share_res_ffn_grad`/
-  `share_mlp_down_grad`) — mirror of the forward-activation
-  sharing we just removed; same treatment recommended
+  scratched from the kill-list
+
+Memory cost bookkeeping from gradient-sharing removal: ~1.3 GB added
+to recompute-enabled peak on Qwen3-0.6B bf16 LoRA (5 single-buffer
+slots × 27 extra layers × 8 MB + ~208 MB from d_mlp_down alternating
+pair going per-layer). Acceptable on current training configs;
+small-GPU large-model users would want a Stack-arena migration for
+these per-layer gradients — the mechanism parallels
+`large_bwd_temps_on_stack` which already stacks
+d_qkv/d_mlp_up/d_swiglu.
 
 ### Phase A breakthrough: instrumented trace finds the root cause, step 0 ships
 
