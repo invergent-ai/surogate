@@ -2175,8 +2175,12 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
     const std::size_t persistent_bytes = bump_assign(persistent_tids);
     const std::size_t accumulator_bytes = bump_assign(accumulator_tids);
     std::size_t save_for_bwd_bytes = 0;
-    for (const auto& v : save_for_bwd)
-        save_for_bwd_bytes += bump_assign(v);
+    std::vector<std::size_t> save_for_bwd_block_bytes(num_layers, 0);
+    for (std::size_t L = 0; L < num_layers; ++L) {
+        const std::size_t block_sz = bump_assign(save_for_bwd[L]);
+        save_for_bwd_block_bytes[L] = block_sz;
+        save_for_bwd_bytes += block_sz;
+    }
 
     // Per-frame coloring. The region's peak is the max over frames (frames
     // don't coexist — nested-stack semantics).
@@ -2201,6 +2205,14 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
 
     auto [fwd_naive, fwd_colored] = color_frames(fwd_frame);
     auto [bwd_naive, bwd_colored] = color_frames(bwd_frame);
+
+    // Expose peaks for compute_arena_sizes (M5.d).
+    graph.persistent_bytes = persistent_bytes;
+    graph.accumulator_bytes = accumulator_bytes;
+    graph.fwd_stack_peak = fwd_colored;
+    graph.bwd_stack_peak = bwd_colored;
+    graph.save_for_bwd_bytes = save_for_bwd_bytes;
+    graph.save_for_bwd_block_bytes = std::move(save_for_bwd_block_bytes);
 
     // Compute optimal peak per frame (max-clique-sum) for comparison vs our
     // first-fit-by-offset coloring. Reports how close the greedy is to the
@@ -2230,6 +2242,110 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
                       << ", optimal " << fmt_bytes(bwd_optimal) << ")\n";
         }
     }
+}
+
+// ============================================================================
+// Phase Arenas (design/buffer-runtime-v4.md, M5.d) — allocation skeleton
+// ============================================================================
+
+void compute_arena_sizes(PhaseArenas& arenas, const CompiledGraph& fwd, const CompiledGraph& bwd, int num_layers) {
+    // Persistent, Accumulator: max across fwd+bwd (they hold weights/grads
+    // that outlive both compiles).
+    arenas.persistent_bytes = std::max(fwd.persistent_bytes, bwd.persistent_bytes);
+    arenas.accumulator_bytes = std::max(fwd.accumulator_bytes, bwd.accumulator_bytes);
+
+    // FwdStack, BwdStack: taken from their respective compile's peak. Frames
+    // within each direction don't coexist; the two directions also don't
+    // coexist (fwd runs, then bwd runs), so we only need max per-direction.
+    arenas.fwd_stack_bytes = fwd.fwd_stack_peak;  // bwd's fwd_stack_peak is 0
+    arenas.bwd_stack_bytes = bwd.bwd_stack_peak;  // fwd's bwd_stack_peak is 0
+
+    // SaveForBwd: per-block slots persist across the fwd-exit / bwd-entry
+    // boundary. finalize_save_for_bwd populates the same tids in both
+    // compiles, so per-block sizes should match; take max as a safety.
+    arenas.save_for_bwd_block_bases.assign(static_cast<std::size_t>(num_layers), 0);
+    std::size_t total = 0;
+    for (int L = 0; L < num_layers; ++L) {
+        const auto idx = static_cast<std::size_t>(L);
+        const std::size_t fwd_bytes = idx < fwd.save_for_bwd_block_bytes.size() ? fwd.save_for_bwd_block_bytes[idx] : 0;
+        const std::size_t bwd_bytes = idx < bwd.save_for_bwd_block_bytes.size() ? bwd.save_for_bwd_block_bytes[idx] : 0;
+        arenas.save_for_bwd_block_bases[idx] = total;
+        total += std::max(fwd_bytes, bwd_bytes);
+    }
+    arenas.save_for_bwd_bytes = total;
+}
+
+namespace {
+
+void cuda_malloc_or_die(std::byte** out, std::size_t bytes, const char* label) {
+    if (bytes == 0) {
+        *out = nullptr;
+        return;
+    }
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(out), bytes);
+    if (err != cudaSuccess) {
+        std::ostringstream oss;
+        oss << "allocate_phase_arenas: cudaMalloc(" << bytes << ") for " << label
+            << " failed: " << cudaGetErrorString(err);
+        throw std::runtime_error(oss.str());
+    }
+}
+
+}  // namespace
+
+void allocate_phase_arenas(PhaseArenas& arenas) {
+    if (arenas.allocated) return;
+    cuda_malloc_or_die(&arenas.persistent_ptr, arenas.persistent_bytes, "persistent");
+    cuda_malloc_or_die(&arenas.accumulator_ptr, arenas.accumulator_bytes, "accumulator");
+    cuda_malloc_or_die(&arenas.fwd_stack_ptr, arenas.fwd_stack_bytes, "fwd_stack");
+    cuda_malloc_or_die(&arenas.bwd_stack_ptr, arenas.bwd_stack_bytes, "bwd_stack");
+    cuda_malloc_or_die(&arenas.save_for_bwd_ptr, arenas.save_for_bwd_bytes, "save_for_bwd");
+    arenas.allocated = true;
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
+        if (std::string(env) == "1") {
+            auto mb = [](std::size_t b) {
+                return b / double(1ULL << 20);
+            };
+            std::cerr << "[arena] allocated:\n"
+                      << "  Persistent   = " << mb(arenas.persistent_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.persistent_ptr) << "\n"
+                      << "  Accumulator  = " << mb(arenas.accumulator_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.accumulator_ptr) << "\n"
+                      << "  FwdStack     = " << mb(arenas.fwd_stack_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.fwd_stack_ptr) << "\n"
+                      << "  BwdStack     = " << mb(arenas.bwd_stack_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.bwd_stack_ptr) << "\n"
+                      << "  SaveForBwd   = " << mb(arenas.save_for_bwd_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.save_for_bwd_ptr) << "\n"
+                      << "  TOTAL        = "
+                      << mb(arenas.persistent_bytes + arenas.accumulator_bytes + arenas.fwd_stack_bytes +
+                            arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes)
+                      << " MB\n";
+        }
+    }
+}
+
+void release_phase_arenas(PhaseArenas& arenas) {
+    if (!arenas.allocated) return;
+    auto free_ptr = [](std::byte*& p) {
+        if (p) {
+            cudaFree(p);
+            p = nullptr;
+        }
+    };
+    free_ptr(arenas.persistent_ptr);
+    free_ptr(arenas.accumulator_ptr);
+    free_ptr(arenas.fwd_stack_ptr);
+    free_ptr(arenas.bwd_stack_ptr);
+    free_ptr(arenas.save_for_bwd_ptr);
+    arenas.persistent_bytes = 0;
+    arenas.accumulator_bytes = 0;
+    arenas.fwd_stack_bytes = 0;
+    arenas.bwd_stack_bytes = 0;
+    arenas.save_for_bwd_bytes = 0;
+    arenas.save_for_bwd_block_bases.clear();
+    arenas.allocated = false;
 }
 
 void CompiledGraph::compute_layer_segments() {

@@ -315,6 +315,8 @@ GraphExecutor::GraphExecutor(const Module& module,
 }
 
 GraphExecutor::~GraphExecutor() {
+    // Release phase-tree arenas (M5.d), if allocated.
+    dsl::release_phase_arenas(mPhaseArenas);
     // Clean up CUDA graphs
     if (mForwardGraph) {
         cudaGraphExecDestroy(mForwardGraph);
@@ -927,6 +929,21 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // both compiles. Shadow-only; runtime still uses today's save-list.
         if (mCompiledForward && mCompiledBackward) {
             dsl::finalize_save_for_bwd(*mCompiledForward, *mCompiledBackward);
+        }
+
+        // Phase-tree arena allocation (M5.d). Sized from baked offsets;
+        // gated on SUROGATE_USE_PHASE_ARENAS=1 because it adds a second copy
+        // of persistent+accumulator memory (no consumer yet). Re-allocate on
+        // each (B, T) recompile — sizes may change if shapes change.
+        dsl::release_phase_arenas(mPhaseArenas);
+        if (const char* env = std::getenv("SUROGATE_USE_PHASE_ARENAS")) {
+            if (std::string(env) == "1" && mCompiledForward && mCompiledBackward) {
+                dsl::compute_arena_sizes(mPhaseArenas,
+                                         *mCompiledForward,
+                                         *mCompiledBackward,
+                                         static_cast<int>(mConfig.NumLayers));
+                dsl::allocate_phase_arenas(mPhaseArenas);
+            }
         }
 
         mCompiledB = B;

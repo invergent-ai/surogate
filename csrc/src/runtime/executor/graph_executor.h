@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include "runtime/executor/graph_executor_internal.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/core/forward_hooks.h"
@@ -427,6 +428,13 @@ private:
     std::unique_ptr<CompiledGraph> mCompiledBackward;
     long mCompiledB = 0;
     long mCompiledT = 0;
+
+    // Phase-tree arena allocator (design/buffer-runtime-v4.md, M5.d).
+    // Gated on SUROGATE_USE_PHASE_ARENAS=1. Holds 5 cudaMalloc'd device buffers
+    // sized from the baked layout in mCompiledForward / mCompiledBackward. No
+    // runtime consumer yet; future work (tensor resolution override) will
+    // redirect mTensors[tid] pointers to arena_base + TensorMeta::offset.
+    dsl::PhaseArenas mPhaseArenas;
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);

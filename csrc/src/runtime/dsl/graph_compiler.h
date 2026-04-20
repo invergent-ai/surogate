@@ -588,6 +588,15 @@ struct CompiledGraph {
     /// graph has no layer boundaries (e.g., non-block-stacked compiles).
     std::optional<PhaseNode> phase_tree;
 
+    /// Per-region peak bytes populated by compute_layout() (M3 / M5.b).
+    /// Consumed by compute_arena_sizes() to size the 5 phase arenas.
+    std::size_t persistent_bytes = 0;
+    std::size_t accumulator_bytes = 0;
+    std::size_t fwd_stack_peak = 0;  // max over frames
+    std::size_t bwd_stack_peak = 0;  // max over frames
+    std::size_t save_for_bwd_bytes = 0;
+    std::vector<std::size_t> save_for_bwd_block_bytes;  // per-block sizes
+
     /// Shadow-mode instruction stream emitted from the phase tree (M4).
     /// Flat linear sequence of primitives that would drive the M5 interpreter.
     /// Empty if phase_tree is empty.
@@ -726,6 +735,46 @@ private:
 /// Writes TensorMeta::offset for every live tid. Dump gated on
 /// `SUROGATE_DEBUG_LAYOUT=1`.
 void compute_layout(CompiledGraph& graph, bool is_backward);
+
+/// Phase-tree arena allocator (design/buffer-runtime-v4.md, M5.d).
+/// Allocates one flat device buffer per region family. Sizes computed from
+/// TensorMeta::offset + bytes across both fwd and bwd compiles — the union
+/// size, since fwd and bwd frames reuse the same stack arenas at different
+/// times. Shadow-mode in M5.d: no ops consume these pointers yet. Future
+/// work (tensor resolution override) wires them into mTensors[tid].
+struct PhaseArenas {
+    std::byte* persistent_ptr = nullptr;
+    std::size_t persistent_bytes = 0;
+
+    std::byte* accumulator_ptr = nullptr;
+    std::size_t accumulator_bytes = 0;
+
+    // FwdStack / BwdStack: peak across all block frames (frames don't coexist).
+    std::byte* fwd_stack_ptr = nullptr;
+    std::size_t fwd_stack_bytes = 0;
+
+    std::byte* bwd_stack_ptr = nullptr;
+    std::size_t bwd_stack_bytes = 0;
+
+    // SaveForBwd: concatenated per-block slots. Block i's save slot starts at
+    // save_for_bwd_ptr + save_for_bwd_block_bases[i].
+    std::byte* save_for_bwd_ptr = nullptr;
+    std::size_t save_for_bwd_bytes = 0;
+    std::vector<std::size_t> save_for_bwd_block_bases;
+
+    bool allocated = false;
+};
+
+/// Compute arena sizes from baked offsets in both graphs. Must be called after
+/// finalize_save_for_bwd(). Does NOT cudaMalloc — just populates sizes.
+void compute_arena_sizes(PhaseArenas& arenas, const CompiledGraph& fwd, const CompiledGraph& bwd, int num_layers);
+
+/// cudaMalloc all arenas at their computed sizes. arenas.allocated is set to
+/// true on success. Safe to call only after compute_arena_sizes().
+void allocate_phase_arenas(PhaseArenas& arenas);
+
+/// cudaFree all arenas and reset pointers.
+void release_phase_arenas(PhaseArenas& arenas);
 
 /// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a).
 /// derive_regions() runs per-direction and cannot see across the pair, so
