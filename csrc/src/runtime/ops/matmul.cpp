@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <algorithm>
 #include <cctype>
@@ -248,13 +249,18 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     // Rebind the per-layer activation slot to the just-produced buffer so
     // backward replays read the live tensor rather than a stale one.
     if (op.attrs.forward_hook_point.has_value() && op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
-        auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
+        TensorSlot slot = TensorSlot::Mapped;
         switch (*op.attrs.forward_hook_point) {
-            case modules::ForwardHookPoint::AfterQKVProjection: acts.qkv.Data = out.Data; break;
-            case modules::ForwardHookPoint::AfterAttnOutProjection: acts.att_out.Data = out.Data; break;
-            case modules::ForwardHookPoint::AfterMLPUpProjection: acts.mlp_up.Data = out.Data; break;
-            case modules::ForwardHookPoint::AfterMLPDownProjection: acts.mlp_down.Data = out.Data; break;
+            case modules::ForwardHookPoint::AfterQKVProjection: slot = TensorSlot::BlockQKV; break;
+            case modules::ForwardHookPoint::AfterAttnOutProjection: slot = TensorSlot::BlockAttOut; break;
+            case modules::ForwardHookPoint::AfterMLPUpProjection: slot = TensorSlot::BlockMLPUp; break;
+            case modules::ForwardHookPoint::AfterMLPDownProjection: slot = TensorSlot::BlockMLPDown; break;
             default: break;
+        }
+        if (slot != TensorSlot::Mapped) {
+            if (Tensor* t = block_activation_ptr(mRunState, op.attrs.layer_idx, slot)) {
+                t->Data = out.Data;
+            }
         }
     }
 

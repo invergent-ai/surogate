@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -128,24 +129,7 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
             }
         }
 
-        Tensor* base_grad = nullptr;
-        if (ref.layer_idx >= 0) {
-            auto& grads = mRunState.simplified_grads(ref.layer_idx);
-            switch (ref.slot) {
-                case TensorSlot::BlockDResFFN: base_grad = &grads.d_res_ffn; break;
-                case TensorSlot::BlockDResAtt: base_grad = &grads.d_res_att; break;
-                case TensorSlot::BlockDAttOut: base_grad = &grads.d_att_out; break;
-                case TensorSlot::BlockDLN1: base_grad = &grads.d_ln1; break;
-                case TensorSlot::BlockDLN2: base_grad = &grads.d_ln2; break;
-                case TensorSlot::BlockDSwiGLU: base_grad = &grads.d_swiglu; break;
-                case TensorSlot::BlockDAtt: base_grad = &grads.d_att; break;
-                case TensorSlot::BlockDQKV: base_grad = &grads.d_qkv; break;
-                case TensorSlot::BlockDMLPUp: base_grad = &grads.d_mlp_up; break;
-                case TensorSlot::BlockDMLPDown: base_grad = &grads.d_mlp_down; break;
-                case TensorSlot::BlockDHOut: base_grad = &grads.d_h_out; break;
-                default: break;
-            }
-        }
+        Tensor* base_grad = block_gradient_ptr(mRunState, ref.layer_idx, ref.slot);
 
         if (base_grad) {
             if (base_grad->Data) {

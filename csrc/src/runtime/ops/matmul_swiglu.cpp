@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -116,8 +117,9 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
     // Rebind the per-layer mlp_up activation slot to the live buffer so
     // backward replays read the fresh tensor.
     if (op.attrs.forward_hook_point.has_value() && op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
-        auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
-        acts.mlp_up.Data = up_out.Data;
+        if (Tensor* mlp_up = block_activation_ptr(mRunState, op.attrs.layer_idx, TensorSlot::BlockMLPUp)) {
+            mlp_up->Data = up_out.Data;
+        }
     }
 
     // Apply DSL-declared LoRA adapters (up/gate/...) to ``up_out`` before
@@ -227,8 +229,9 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
 
         mlp_up = view_tensor(mlp_up_flat, {mB, mT, D2});
         if (layer_idx >= 0) {
-            auto& acts = mRunState.simplified_acts(layer_idx);
-            acts.mlp_up.Data = mlp_up.Data;
+            if (Tensor* mlp_up_slot = block_activation_ptr(mRunState, layer_idx, TensorSlot::BlockMLPUp)) {
+                mlp_up_slot->Data = mlp_up.Data;
+            }
         }
         recomputed_mlp_up = true;
     }
@@ -236,9 +239,8 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     // First: swiglu backward
     Tensor* d_mlp_up_ptr = nullptr;
     if (layer_idx >= 0) {
-        auto& grads = mRunState.simplified_grads(layer_idx);
-        d_mlp_up_ptr = &grads.d_mlp_up;
-        if (!d_mlp_up_ptr->Data) {
+        d_mlp_up_ptr = block_gradient_ptr(mRunState, layer_idx, TensorSlot::BlockDMLPUp);
+        if (d_mlp_up_ptr && !d_mlp_up_ptr->Data) {
             mRunState.temp_acquire(*d_mlp_up_ptr);
             mTemps.push_back(*d_mlp_up_ptr);
         }
@@ -454,8 +456,9 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     }
 
     if (layer_idx >= 0 && d_inp_ptr) {
-        auto& grads = mRunState.simplified_grads(layer_idx);
-        grads.d_ln2.Data = d_inp_ptr->Data;
+        if (Tensor* d_ln2 = block_gradient_ptr(mRunState, layer_idx, TensorSlot::BlockDLN2)) {
+            d_ln2->Data = d_inp_ptr->Data;
+        }
     }
 
     (void)hook;
