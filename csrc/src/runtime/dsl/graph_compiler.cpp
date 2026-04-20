@@ -1822,6 +1822,18 @@ void finalize_save_for_bwd(CompiledGraph& fwd, CompiledGraph& bwd) {
             std::cerr << "[regions] SaveForBwd promotion: " << promoted << " tids\n";
         }
     }
+
+    // Re-run layout now that regions are finalized. The first pass in
+    // compile() baked offsets under stale regions (SaveForBwd candidates sat
+    // in FwdStack / BwdStack frames); re-running fixes them.
+    if (promoted > 0) {
+        for (auto& m : fwd.tensor_meta)
+            m.offset = SIZE_MAX;
+        for (auto& m : bwd.tensor_meta)
+            m.offset = SIZE_MAX;
+        compute_layout(fwd, /*is_backward=*/false);
+        compute_layout(bwd, /*is_backward=*/true);
+    }
 }
 
 // ============================================================================
@@ -1886,6 +1898,77 @@ std::string dump_instruction_stream(const std::vector<Instruction>& stream) {
     return os.str();
 }
 
+std::string validate_instruction_stream(const std::vector<Instruction>& stream, std::size_t num_ops) {
+    std::ostringstream errs;
+
+    // 1) Phase nesting: stack-tracked; each PhaseExit must match the
+    // most-recent PhaseEnter by kind + block_index.
+    std::vector<Instruction> nesting;
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        const auto& inst = stream[i];
+        if (inst.kind == InstKind::PhaseEnter) {
+            nesting.push_back(inst);
+        } else if (inst.kind == InstKind::PhaseExit) {
+            if (nesting.empty()) {
+                errs << "  unmatched PhaseExit at index " << i << "\n";
+                continue;
+            }
+            const auto& top = nesting.back();
+            if (top.phase_kind != inst.phase_kind || top.block_index != inst.block_index) {
+                errs << "  PhaseExit at " << i << " does not match enclosing PhaseEnter "
+                     << phase_kind_name(top.phase_kind) << "[" << top.block_index << "]\n";
+            }
+            nesting.pop_back();
+        }
+    }
+    if (!nesting.empty()) {
+        errs << "  " << nesting.size() << " unclosed PhaseEnter(s)\n";
+    }
+
+    // 2) SegmentDispatch coverage: exactly one per op.
+    std::vector<char> covered(num_ops, 0);
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        const auto& inst = stream[i];
+        if (inst.kind != InstKind::SegmentDispatch) continue;
+        if (inst.op_start > inst.op_end || inst.op_end > num_ops) {
+            errs << "  SegmentDispatch at " << i << " has invalid range [" << inst.op_start << ".." << inst.op_end
+                 << ")\n";
+            continue;
+        }
+        for (std::size_t op = inst.op_start; op < inst.op_end; ++op) {
+            if (covered[op]) {
+                errs << "  op " << op << " covered by multiple SegmentDispatches (second at " << i << ")\n";
+                break;  // report once per instruction
+            }
+            covered[op] = 1;
+        }
+    }
+    std::size_t uncovered = 0;
+    for (char c : covered) {
+        if (!c) ++uncovered;
+    }
+    if (uncovered > 0) {
+        errs << "  " << uncovered << " op(s) not covered by any SegmentDispatch\n";
+    }
+
+    // 3) PruneByLastUse ranges must be disjoint.
+    std::vector<char> pruned(num_ops, 0);
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        const auto& inst = stream[i];
+        if (inst.kind != InstKind::PruneByLastUse) continue;
+        if (inst.op_start > inst.op_end || inst.op_end > num_ops) continue;
+        for (std::size_t op = inst.op_start; op < inst.op_end; ++op) {
+            if (pruned[op]) {
+                errs << "  op " << op << " pruned by multiple PruneByLastUse ranges (second at " << i << ")\n";
+                break;
+            }
+            pruned[op] = 1;
+        }
+    }
+
+    return errs.str();
+}
+
 void GraphCompiler::emit_instruction_stream(CompiledGraph& graph) {
     graph.instruction_stream.clear();
     if (!graph.phase_tree.has_value()) return;
@@ -1895,6 +1978,13 @@ void GraphCompiler::emit_instruction_stream(CompiledGraph& graph) {
         if (std::string(env) == "1") {
             std::cerr << "[instr-stream] (" << graph.name << "):\n"
                       << dump_instruction_stream(graph.instruction_stream);
+            const std::string errs = validate_instruction_stream(graph.instruction_stream, graph.ops.size());
+            if (errs.empty()) {
+                std::cerr << "[instr-stream] validator: OK (" << graph.instruction_stream.size()
+                          << " instructions over " << graph.ops.size() << " ops)\n";
+            } else {
+                std::cerr << "[instr-stream] validator: ERRORS\n" << errs;
+            }
         }
     }
 }
@@ -1944,6 +2034,58 @@ std::size_t frame_optimal_peak(const std::vector<int>& tids,
     return peak;
 }
 
+/// First-fit-by-offset greedy for 1D-interval coloring. Returns per-tid
+/// frame-local byte offsets; sets peak_out to the bytes consumed. Non-optimal
+/// but correct (no two live tensors share bytes) and close to the max-clique
+/// peak for typical transformer-block activation patterns.
+std::vector<std::size_t>
+color_frame(const std::vector<int>& tids, const std::vector<LayoutInfo>& info, std::size_t& peak_out) {
+    std::vector<std::size_t> offsets(tids.size(), SIZE_MAX);
+    if (tids.empty()) {
+        peak_out = 0;
+        return offsets;
+    }
+
+    std::vector<std::size_t> order(tids.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        const auto& ia = info[static_cast<std::size_t>(tids[a])];
+        const auto& ib = info[static_cast<std::size_t>(tids[b])];
+        if (ia.first_use != ib.first_use) return ia.first_use < ib.first_use;
+        return ia.bytes > ib.bytes;  // prefer larger tensors first at same first_use
+    });
+
+    struct Slot {
+        std::size_t off, size, last;
+    };
+    std::vector<Slot> live;
+    std::size_t peak = 0;
+
+    for (std::size_t idx : order) {
+        const auto& ti = info[static_cast<std::size_t>(tids[idx])];
+
+        // Expire slots freed strictly before ti.first_use.
+        live.erase(std::remove_if(live.begin(), live.end(), [&](const Slot& s) { return s.last < ti.first_use; }),
+                   live.end());
+
+        std::sort(live.begin(), live.end(), [](const Slot& a, const Slot& b) { return a.off < b.off; });
+
+        // Find smallest gap of size >= ti.bytes.
+        std::size_t off = 0;
+        for (const auto& s : live) {
+            if (off + ti.bytes <= s.off) break;
+            off = std::max(off, s.off + s.size);
+        }
+
+        offsets[idx] = off;
+        live.push_back({off, ti.bytes, ti.last_use});
+        peak = std::max(peak, off + ti.bytes);
+    }
+
+    peak_out = peak;
+    return offsets;
+}
+
 std::string fmt_bytes(std::size_t b) {
     std::ostringstream os;
     if (b >= (1ULL << 30)) {
@@ -1960,7 +2102,7 @@ std::string fmt_bytes(std::size_t b) {
 
 }  // namespace
 
-void GraphCompiler::compute_layout(CompiledGraph& graph, bool is_backward) {
+void compute_layout(CompiledGraph& graph, bool is_backward) {
     const std::size_t num_tids = static_cast<std::size_t>(graph.num_tensors);
     std::vector<LayoutInfo> info(num_tids);
 
@@ -1983,59 +2125,109 @@ void GraphCompiler::compute_layout(CompiledGraph& graph, bool is_backward) {
     }
 
     const std::size_t num_layers = graph.layer_start_indices.size();
+
+    // Bucket live tids by (region, block). SaveForBwd is treated per-block
+    // (each block has its own persistent slot); FwdStack / BwdStack coloring
+    // is per-frame (frames don't coexist, so offsets are frame-local).
+    std::vector<int> persistent_tids;
+    std::vector<int> accumulator_tids;
     std::vector<std::vector<int>> fwd_frame(num_layers);
     std::vector<std::vector<int>> bwd_frame(num_layers);
-
-    std::size_t persistent_bytes = 0;
-    std::size_t accumulator_bytes = 0;
+    std::vector<std::vector<int>> save_for_bwd(num_layers);
 
     for (std::size_t tid = 0; tid < num_tids; ++tid) {
         const auto& meta = graph.tensor_meta[tid];
         const auto& ti = info[tid];
         if (!ti.live || ti.bytes == 0) continue;
+        auto block_bucket = [&](std::vector<std::vector<int>>& buckets) {
+            if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
+                buckets[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
+            }
+        };
         switch (meta.region) {
-            case RegionKind::Persistent: persistent_bytes += ti.bytes; break;
-            case RegionKind::Accumulator: accumulator_bytes += ti.bytes; break;
-            case RegionKind::FwdStack:
-                if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
-                    fwd_frame[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
-                }
-                break;
-            case RegionKind::BwdStack:
-                if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
-                    bwd_frame[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
-                }
-                break;
+            case RegionKind::Persistent: persistent_tids.push_back(static_cast<int>(tid)); break;
+            case RegionKind::Accumulator: accumulator_tids.push_back(static_cast<int>(tid)); break;
+            case RegionKind::FwdStack: block_bucket(fwd_frame); break;
+            case RegionKind::BwdStack: block_bucket(bwd_frame); break;
+            case RegionKind::SaveForBwd: block_bucket(save_for_bwd); break;
             default: break;
         }
     }
 
-    auto frame_peaks = [&](const std::vector<std::vector<int>>& frames) -> std::pair<std::size_t, std::size_t> {
+    // Bump: sort by tid for deterministic ordering across ranks.
+    auto bump_sort = [](std::vector<int>& tids) {
+        std::sort(tids.begin(), tids.end());
+    };
+    bump_sort(persistent_tids);
+    bump_sort(accumulator_tids);
+    for (auto& v : save_for_bwd)
+        bump_sort(v);
+
+    auto bump_assign = [&](const std::vector<int>& tids) -> std::size_t {
+        std::size_t offset = 0;
+        for (int tid : tids) {
+            graph.tensor_meta[static_cast<std::size_t>(tid)].offset = offset;
+            offset += info[static_cast<std::size_t>(tid)].bytes;
+        }
+        return offset;
+    };
+
+    const std::size_t persistent_bytes = bump_assign(persistent_tids);
+    const std::size_t accumulator_bytes = bump_assign(accumulator_tids);
+    std::size_t save_for_bwd_bytes = 0;
+    for (const auto& v : save_for_bwd)
+        save_for_bwd_bytes += bump_assign(v);
+
+    // Per-frame coloring. The region's peak is the max over frames (frames
+    // don't coexist — nested-stack semantics).
+    auto color_frames = [&](const std::vector<std::vector<int>>& frames) -> std::pair<std::size_t, std::size_t> {
         std::size_t naive_max = 0;
-        std::size_t optimal_max = 0;
+        std::size_t coloring_max = 0;
+        for (const auto& tids : frames) {
+            std::size_t naive = 0;
+            for (int tid : tids)
+                naive += info[static_cast<std::size_t>(tid)].bytes;
+            naive_max = std::max(naive_max, naive);
+
+            std::size_t peak = 0;
+            auto offs = color_frame(tids, info, peak);
+            coloring_max = std::max(coloring_max, peak);
+            for (std::size_t i = 0; i < tids.size(); ++i) {
+                graph.tensor_meta[static_cast<std::size_t>(tids[i])].offset = offs[i];
+            }
+        }
+        return {naive_max, coloring_max};
+    };
+
+    auto [fwd_naive, fwd_colored] = color_frames(fwd_frame);
+    auto [bwd_naive, bwd_colored] = color_frames(bwd_frame);
+
+    // Compute optimal peak per frame (max-clique-sum) for comparison vs our
+    // first-fit-by-offset coloring. Reports how close the greedy is to the
+    // theoretical bound.
+    auto frame_optimal = [&](const std::vector<std::vector<int>>& frames) -> std::size_t {
+        std::size_t best = 0;
         for (std::size_t L = 0; L < frames.size(); ++L) {
             const auto s = graph.layer_start_indices[L];
             const auto e = graph.layer_end_indices[L];
             if (s == SIZE_MAX || e == SIZE_MAX || s >= e) continue;
-            std::size_t naive = 0;
-            for (int tid : frames[L])
-                naive += info[static_cast<std::size_t>(tid)].bytes;
-            naive_max = std::max(naive_max, naive);
-            optimal_max = std::max(optimal_max, frame_optimal_peak(frames[L], info, s, e - 1));
+            best = std::max(best, frame_optimal_peak(frames[L], info, s, e - 1));
         }
-        return {naive_max, optimal_max};
+        return best;
     };
-
-    auto [fwd_naive, fwd_optimal] = frame_peaks(fwd_frame);
-    auto [bwd_naive, bwd_optimal] = frame_peaks(bwd_frame);
+    const std::size_t fwd_optimal = frame_optimal(fwd_frame);
+    const std::size_t bwd_optimal = frame_optimal(bwd_frame);
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
         if (std::string(env) == "1") {
             std::cerr << "[layout] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):\n"
                       << "  Persistent   = " << fmt_bytes(persistent_bytes) << "\n"
                       << "  Accumulator  = " << fmt_bytes(accumulator_bytes) << "\n"
-                      << "  FwdStack     = " << fmt_bytes(fwd_optimal) << " (naive " << fmt_bytes(fwd_naive) << ")\n"
-                      << "  BwdStack     = " << fmt_bytes(bwd_optimal) << " (naive " << fmt_bytes(bwd_naive) << ")\n";
+                      << "  SaveForBwd   = " << fmt_bytes(save_for_bwd_bytes) << "\n"
+                      << "  FwdStack     = " << fmt_bytes(fwd_colored) << " (naive " << fmt_bytes(fwd_naive)
+                      << ", optimal " << fmt_bytes(fwd_optimal) << ")\n"
+                      << "  BwdStack     = " << fmt_bytes(bwd_colored) << " (naive " << fmt_bytes(bwd_naive)
+                      << ", optimal " << fmt_bytes(bwd_optimal) << ")\n";
         }
     }
 }
@@ -4578,8 +4770,10 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Runs after classify_tensors so TensorMeta::kind is populated.
     derive_regions(result, is_backward);
 
-    // Shadow-mode layout peaks (design/buffer-runtime-v4.md, M3). Uses regions
-    // from M2 plus per-tid lifetimes to compute per-region peak bytes.
+    // Shadow-mode layout (design/buffer-runtime-v4.md, M3 / M5.b). Uses
+    // regions from M2 plus per-tid lifetimes to compute per-region peak
+    // bytes and bake TensorMeta::offset. Re-run by finalize_save_for_bwd()
+    // once cross-graph region promotion is applied.
     compute_layout(result, is_backward);
 
     // Flatten the phase tree to a linear instruction stream (M4). The M5

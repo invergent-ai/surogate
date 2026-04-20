@@ -392,6 +392,14 @@ struct TensorMeta {
     // Region assignment (populated by derive_regions() after classify_tensors).
     RegionKind region = RegionKind::Unknown;
 
+    // Shadow-mode baked offset (populated by compute_layout()). Interpretation
+    // depends on region:
+    //   - Persistent / Accumulator: byte offset in the respective arena
+    //   - FwdStack / BwdStack:      frame-local offset (runtime adds frame base)
+    //   - SaveForBwd:               byte offset within SaveForBwd[block_layer_idx]
+    // SIZE_MAX means "not assigned" (no bytes, or not in current graph).
+    std::size_t offset = SIZE_MAX;
+
     bool is_cross_layer() const {
         return flags & kCrossLayer;
     }
@@ -500,6 +508,15 @@ struct Instruction {
 
 /// Pretty-print an instruction stream for shadow-mode validation.
 std::string dump_instruction_stream(const std::vector<Instruction>& stream);
+
+/// Static invariant check for a shadow-mode instruction stream. Verifies:
+///   - PhaseEnter and PhaseExit are balanced and properly nested.
+///   - SegmentDispatch op ranges cover [0, num_ops) exactly once (no gaps or
+///     overlaps) — i.e., the flat-stream partitioning is complete.
+///   - PruneByLastUse ranges are disjoint (no double-prune).
+/// Returns empty string on success; otherwise a human-readable error list.
+/// Used by M5.c to prove the emitted stream is structurally executable.
+std::string validate_instruction_stream(const std::vector<Instruction>& stream, std::size_t num_ops);
 
 // ============================================================================
 // Compiled Graph
@@ -641,15 +658,6 @@ private:
     /// read TensorMeta::region to bake buffer offsets.
     void derive_regions(CompiledGraph& graph, bool is_backward);
 
-    /// Shadow-mode layout peaks (design/buffer-runtime-v4.md, M3). For each
-    /// region, computes how many bytes the phase-tree layout would consume:
-    ///   - Persistent, Accumulator: sum of tensor bytes
-    ///   - FwdStack, BwdStack: per-block-frame max-clique-sum (the optimal
-    ///     peak achievable by 1D-interval coloring), then max over frames
-    /// No offsets are materialized; M4+ will bake them when the layout is
-    /// actually consumed. Dump gated on `SUROGATE_DEBUG_LAYOUT=1`.
-    void compute_layout(CompiledGraph& graph, bool is_backward);
-
     /// Flatten the phase tree to a linear instruction stream (M4). Emits
     /// PhaseEnter/PhaseExit around each phase, plus SegmentDispatch +
     /// PruneByLastUse for leaf phases (ops live at leaves). Shadow-only;
@@ -711,12 +719,22 @@ private:
     void classify_tensors(CompiledGraph& graph);
 };
 
+/// Shadow-mode layout peaks + offset baking (design/buffer-runtime-v4.md, M3
+/// / M5.b). For each region, computes offsets and peak bytes:
+///   - Persistent, Accumulator, SaveForBwd: bump (sum of tensor bytes)
+///   - FwdStack, BwdStack: per-block-frame first-fit-by-offset coloring
+/// Writes TensorMeta::offset for every live tid. Dump gated on
+/// `SUROGATE_DEBUG_LAYOUT=1`.
+void compute_layout(CompiledGraph& graph, bool is_backward);
+
 /// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a).
 /// derive_regions() runs per-direction and cannot see across the pair, so
 /// block activations that are produced in forward and consumed in backward
 /// land in FwdStack / BwdStack. This pass walks both graphs, identifies
-/// shared tids, and promotes their region to SaveForBwd in both compiles.
-/// Safe to call once per (forward, backward) compile pair; idempotent.
+/// shared tids, and promotes their region to SaveForBwd in both compiles,
+/// then re-runs compute_layout() on both so offsets reflect the final
+/// region assignment. Safe to call once per (forward, backward) compile
+/// pair; idempotent.
 void finalize_save_for_bwd(CompiledGraph& fwd, CompiledGraph& bwd);
 
 }  // namespace dsl
