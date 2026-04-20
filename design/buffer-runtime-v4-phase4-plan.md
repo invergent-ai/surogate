@@ -603,6 +603,51 @@ session.
 Flag kept as `SUROGATE_RSTD_ON_STACK=1` default off. Merge-gate on
 the step-1 crash fix.
 
+### Phase A shipped: shrink-stack invalidates cached Stack pointers
+
+The residual step-1 crash under CUDA graphs had a straightforward
+root cause: `DslRunState::shrink_stack_to_high_water_mark()` runs once
+after warmup (step 0) and calls `resize_stack_to()`, which `free()`s
+the old Stack buffer and allocates a new one at a (usually different)
+base pointer. Any `simplified_acts[].Data` still pointing into the
+old Stack range is now dangling — and when the new cudaMalloc reuses
+overlapping memory, step 1 replay reads garbage or faults.
+
+The classic `SUROGATE_DISABLE_SPLIT_SEG=1` run pinned the fault at
+`rmsnorm.cu:452` with `cudaErrorIllegalAddress` on step 1, and a
+one-line `SUROGATE_SKIP_STACK_SHRINK=1` probe confirmed the trigger —
+disabling the shrink made flag-on bit-identical-within-noise through
+5 steps.
+
+**Fix shipped** ([48111be](../csrc/src/runtime/dsl/dsl_run_state.cpp)):
+`resize_stack_to()` now snapshots the old Stack `[base, base+capacity)`
+before freeing, walks every layer's `simplified_acts` / `simplified_grads`
+slot array, and nulls any `.Data` that falls in the old range. A
+`SUROGATE_DEBUG_STACK_RESIZE=1` env prints per-slot scrubs for
+diagnosis. On Qwen3-0.6B the scrub catches 54 slots (27 layers × the
+stack-resident `BlockLN1` + `BlockLN1RSTD` pair) that
+`clear_rstd_stack_slots` fails to null at backward layer_end — a
+latent bug that the scrub masks, worth tracking down in M5 but
+immaterial for Phase A correctness.
+
+**Flag removed** ([dc712ab](../csrc/src/runtime/executor/compiled_ops_execute.cpp)):
+with the scrub in place, `SUROGATE_RSTD_ON_STACK` is unconditionally
+on. The env var, the static `rstd_on_stack_enabled()` guard, and
+every `if (rstd_on_stack_enabled())` gate are gone. `persist_stack_slot`
+in `replay_layer_forward` fires for every layer; `clear_rstd_stack_slots`
+runs at every fwd/bwd layer_end; the `bypass_named_for_rstd` path in
+`resolve_tensor` is unconditional for the 9 stack-resident slots.
+
+**Validation** (all fresh output dirs, bf16 LoRA recompute):
+- **Qwen3-0.6B** (dense, 5 steps): loss envelope 1.6161–1.6176 at
+  step 1 vs pre-change 1.6162–1.6173 — overlapping, no drift.
+- **Qwen3.5-0.8B** (dense, 3 steps): 1.9893 → 1.6714 → 1.3969, no
+  faults, no illegal access warnings.
+- **GPT-OSS-20B** (MoE + MXFP4 QLoRA, 3 steps): loss 1.7916 → 2.1277
+  → 1.9984 with aux-loss + imbalance metrics tracking cleanly.
+- **Gemma4** remains a separate WIP blocker (pre-existing matmul rank
+  mismatch; not introduced by this change).
+
 ### Phase A third attempt: narrowing further, same symptom
 
 Re-applied rstd null-init + resolve_tensor bypass + layer_end
