@@ -2394,85 +2394,93 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // 2767-2895. Idempotent via last_layer_restored - safe to call multiple
     // times for the same layer. `idx` is the op index that triggered the
     // cleanup (used by BwdCrossLayer persist to decide which tids survive).
-    auto bwd_layer_end_cleanup = [&](int L, std::size_t idx) {
+    auto bwd_layer_end_cleanup = [&](int L, std::size_t idx, bool capturing = false) {
         if (L < 0 || L == last_layer_restored) return;
-        // BwdCrossLayer persist (Phase 3 #4 arena-backed).
-        std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
-        struct PendingPersist {
-            int tid;
-            std::byte* ptr;
-            std::size_t bytes;
-        };
-        std::vector<PendingPersist> pending;
-        for (const auto& [name, use_idx] : last_use) {
-            if (use_idx <= idx) continue;
-            int tid = graph.find_tensor_id(name);
-            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-            const auto& t = mTensors[static_cast<std::size_t>(tid)];
-            if (t.Data && mRunState.Stack.owns(t.Data)) {
-                pending.push_back({tid, t.Data, t.bytes()});
-                auto key = reinterpret_cast<std::uintptr_t>(t.Data);
-                auto it = max_bytes_by_ptr.find(key);
-                if (it == max_bytes_by_ptr.end())
-                    max_bytes_by_ptr.emplace(key, t.bytes());
-                else
-                    it->second = std::max(it->second, t.bytes());
+        // Capture-unsafe work (BwdCrossLayer persist, handle_layer_end,
+        // debug dump, grad reduce/offload/notify) is skipped during CUDA
+        // stream capture — those APIs invalidate the capture. Stack.restore
+        // + slot clears still run so peak memory stays bounded.
+        if (!capturing) {
+            // BwdCrossLayer persist (Phase 3 #4 arena-backed).
+            std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
+            struct PendingPersist {
+                int tid;
+                std::byte* ptr;
+                std::size_t bytes;
+            };
+            std::vector<PendingPersist> pending;
+            for (const auto& [name, use_idx] : last_use) {
+                if (use_idx <= idx) continue;
+                int tid = graph.find_tensor_id(name);
+                if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+                const auto& t = mTensors[static_cast<std::size_t>(tid)];
+                if (t.Data && mRunState.Stack.owns(t.Data)) {
+                    pending.push_back({tid, t.Data, t.bytes()});
+                    auto key = reinterpret_cast<std::uintptr_t>(t.Data);
+                    auto it = max_bytes_by_ptr.find(key);
+                    if (it == max_bytes_by_ptr.end())
+                        max_bytes_by_ptr.emplace(key, t.bytes());
+                    else
+                        it->second = std::max(it->second, t.bytes());
+                }
             }
-        }
-        if (!pending.empty()) {
-            std::unordered_map<std::uintptr_t, std::byte*> persistent_by_ptr;
-            persistent_by_ptr.reserve(max_bytes_by_ptr.size());
-            for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
-                if (nbytes == 0) continue;
-                auto a = allocate_bwd_cross_layer(nbytes);
-                auto* original = reinterpret_cast<const std::byte*>(ptr_key);
-                CUDA_CHECK(cudaMemcpyAsync(a.ptr, original, nbytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
-                persistent_by_ptr.emplace(ptr_key, a.ptr);
-                if (!a.arena_backed) mPersistedBackwardTensors.push_back(a.ptr);
+            if (!pending.empty()) {
+                if (env_enabled("SUROGATE_DEBUG_BACKWARD_PERSIST")) {
+                    std::size_t total_bytes = 0;
+                    for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr)
+                        total_bytes += nbytes;
+                    std::cerr << "[BWD_PERSIST] layer=" << L << " unique_ptrs=" << max_bytes_by_ptr.size()
+                              << " total_bytes=" << total_bytes << std::endl;
+                }
+                std::unordered_map<std::uintptr_t, std::byte*> persistent_by_ptr;
+                persistent_by_ptr.reserve(max_bytes_by_ptr.size());
+                for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
+                    if (nbytes == 0) continue;
+                    auto a = allocate_bwd_cross_layer(nbytes);
+                    auto* original = reinterpret_cast<const std::byte*>(ptr_key);
+                    CUDA_CHECK(
+                        cudaMemcpyAsync(a.ptr, original, nbytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                    persistent_by_ptr.emplace(ptr_key, a.ptr);
+                    if (!a.arena_backed) mPersistedBackwardTensors.push_back(a.ptr);
+                }
+                for (const auto& p : pending) {
+                    auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(p.ptr));
+                    if (it == persistent_by_ptr.end()) continue;
+                    release_persisted_backward_tid(p.tid);
+                    persisted_backward_by_tid[p.tid] = it->second;
+                    persisted_backward_refcount[it->second] += 1;
+                    mTensors[static_cast<std::size_t>(p.tid)].Data = it->second;
+                }
+                for (auto& [name, tensor] : mNamedTensors) {
+                    if (!tensor.Data) continue;
+                    auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(tensor.Data));
+                    if (it != persistent_by_ptr.end()) tensor.Data = it->second;
+                }
             }
-            for (const auto& p : pending) {
-                auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(p.ptr));
-                if (it == persistent_by_ptr.end()) continue;
-                release_persisted_backward_tid(p.tid);
-                persisted_backward_by_tid[p.tid] = it->second;
-                persisted_backward_refcount[it->second] += 1;
-                mTensors[static_cast<std::size_t>(p.tid)].Data = it->second;
-            }
-            for (auto& [name, tensor] : mNamedTensors) {
-                if (!tensor.Data) continue;
-                auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(tensor.Data));
-                if (it != persistent_by_ptr.end()) tensor.Data = it->second;
-            }
-        }
 
-        handle_layer_end(L);
-        if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
+            handle_layer_end(L);
+            if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
 
-        if (mGrads.is_streaming_grads()) {
-            if (mComm && mComm->world_size() > 1) {
+            if (mGrads.is_streaming_grads()) {
+                if (mComm && mComm->world_size() > 1) {
+                    CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                    CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                    mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
+                }
+                mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
+            } else if (mComm && mComm->world_size() > 1) {
                 CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                 CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-                mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
+                mGrads.notify_block(L, mRunState.side_stream(), *mComm);
             }
-            mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
-        } else if (mComm && mComm->world_size() > 1) {
-            CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
-            CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-            mGrads.notify_block(L, mRunState.side_stream(), *mComm);
         }
 
         mRunState.Stack.restore(initial_checkpoint);
         mTemps.clear();
         prune_stack_tensors(L);
-        if (rstd_on_stack_enabled()) {
-            clear_rstd_stack_slots(mRunState, L);
-        }
-        if (mRunState.ffn_temps_on_stack()) {
-            clear_ffn_temp_stack_slots(mRunState, L);
-        }
-        if (mRunState.large_bwd_temps_on_stack()) {
-            clear_large_bwd_grad_stack_slots(mRunState, L);
-        }
+        if (rstd_on_stack_enabled()) clear_rstd_stack_slots(mRunState, L);
+        if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
+        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
         last_layer_restored = L;
     };
     if (bwd_stream_driven) {
@@ -2846,151 +2854,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // If live cross-layer tensors exist on the stack, persist them to allocated memory first.
             prune_by_last_use(idx);
             if (op.layer_end >= 0 && op.layer_end != last_layer_restored) {
-                if (!bwd_stream_capturing) {
-                    // Persist any cross-layer tensors that still live on the stack.
-                    // These tensors (e.g., d_blocks[N].router_logits for MoE aux loss) have
-                    // last_use beyond the current layer, so they must survive stack restore.
-                    struct PendingBackwardPersist {
-                        std::string name;
-                        int tensor_id = -1;
-                        std::byte* original_ptr = nullptr;
-                        std::size_t bytes = 0;
-                    };
-
-                    std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
-                    std::unordered_map<std::uintptr_t, std::string> label_by_ptr;
-                    std::vector<PendingBackwardPersist> pending_persists;
-
-                    for (const auto& [name, use_idx] : last_use) {
-                        if (use_idx <= idx) continue;
-                        int tid = graph.find_tensor_id(name);
-                        if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-                        const auto& tensor = mTensors[static_cast<std::size_t>(tid)];
-                        if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
-                            PendingBackwardPersist pending;
-                            pending.name = name;
-                            pending.tensor_id = tid;
-                            pending.original_ptr = tensor.Data;
-                            pending.bytes = tensor.bytes();
-                            pending_persists.push_back(pending);
-                            const auto key = reinterpret_cast<std::uintptr_t>(tensor.Data);
-                            auto it = max_bytes_by_ptr.find(key);
-                            if (it == max_bytes_by_ptr.end()) {
-                                max_bytes_by_ptr.emplace(key, pending.bytes);
-                                label_by_ptr.emplace(key, name);
-                            } else {
-                                it->second = std::max(it->second, pending.bytes);
-                            }
-                        }
-                    }
-
-                    if (!pending_persists.empty()) {
-                        if (env_enabled("SUROGATE_DEBUG_BACKWARD_PERSIST")) {
-                            std::vector<std::pair<std::string, std::size_t>> debug_entries;
-                            debug_entries.reserve(max_bytes_by_ptr.size());
-                            std::size_t total_bytes = 0;
-                            for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
-                                total_bytes += nbytes;
-                                auto it = label_by_ptr.find(ptr_key);
-                                debug_entries.emplace_back(it != label_by_ptr.end() ? it->second : "<unknown>", nbytes);
-                            }
-                            std::sort(debug_entries.begin(), debug_entries.end(), [](const auto& a, const auto& b) {
-                                return a.second > b.second;
-                            });
-                            std::cerr << "[BWD_PERSIST] layer=" << op.layer_end
-                                      << " unique_ptrs=" << debug_entries.size() << " total_bytes=" << total_bytes
-                                      << std::endl;
-                            const std::size_t limit = std::min<std::size_t>(debug_entries.size(), 16);
-                            for (std::size_t i = 0; i < limit; ++i) {
-                                std::cerr << "  [" << i << "] " << debug_entries[i].first
-                                          << " bytes=" << debug_entries[i].second << std::endl;
-                            }
-                        }
-
-                        std::unordered_map<std::uintptr_t, std::byte*> persistent_by_ptr;
-                        persistent_by_ptr.reserve(max_bytes_by_ptr.size());
-
-                        for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
-                            if (nbytes == 0) {
-                                continue;
-                            }
-                            // Phase 3 subsystem #4: arena bump alloc + cudaMalloc fallback.
-                            auto a = allocate_bwd_cross_layer(nbytes);
-                            auto* original = reinterpret_cast<const std::byte*>(ptr_key);
-                            CUDA_CHECK(cudaMemcpyAsync(a.ptr,
-                                                       original,
-                                                       nbytes,
-                                                       cudaMemcpyDeviceToDevice,
-                                                       mRunState.MainStream));
-                            persistent_by_ptr.emplace(ptr_key, a.ptr);
-                            if (!a.arena_backed) mPersistedBackwardTensors.push_back(a.ptr);
-                        }
-
-                        for (const PendingBackwardPersist& pending : pending_persists) {
-                            auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(pending.original_ptr));
-                            if (it == persistent_by_ptr.end()) {
-                                continue;
-                            }
-                            release_persisted_backward_tid(pending.tensor_id);
-                            persisted_backward_by_tid[pending.tensor_id] = it->second;
-                            persisted_backward_refcount[it->second] += 1;
-                            mTensors[static_cast<std::size_t>(pending.tensor_id)].Data = it->second;
-                        }
-
-                        for (auto& [name, tensor] : mNamedTensors) {
-                            if (!tensor.Data) {
-                                continue;
-                            }
-                            auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(tensor.Data));
-                            if (it != persistent_by_ptr.end()) {
-                                tensor.Data = it->second;
-                            }
-                        }
-                    }
-
-                    // Release this layer's offloaded weights (if applicable)
-                    handle_layer_end(op.layer_end);
-
-                    // Dump backward-phase tensors for this layer before the stack
-                    // gets pruned or rebound. Runtime names are "d_blocks[N].<base>"
-                    // (e.g. d_blocks[3].qkv) — distinct from forward "blocks[N].<base>"
-                    // so the two phases write to separate files.
-                    if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(op.layer_end);
-
-                    if (mGrads.is_streaming_grads()) {
-                        // CPU-RAM centric: reduce (multi-GPU) then D2H to CPU
-                        if (mComm && mComm->world_size() > 1) {
-                            CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
-                            CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-                            mGrads.reduce_layer_grads(op.layer_end, mRunState.side_stream(), *mComm);
-                        }
-                        mGrads.offload_layer_grads(op.layer_end, mRunState.MainStream, mRunState.side_stream());
-                    } else if (mComm && mComm->world_size() > 1) {
-                        // Existing path: async gradient reduction on side_stream
-                        CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
-                        CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-                        mGrads.notify_block(op.layer_end, mRunState.side_stream(), *mComm);
-                    }
-                }
-
-                // During CUDA graph capture, we must still restore stack at each layer boundary
-                // to bound peak memory; only capture-unsafe work above is skipped.
-                mRunState.Stack.restore(initial_checkpoint);
-                mTemps.clear();
-                prune_stack_tensors(op.layer_end);
-                // Note: cudnn_workspace is persistently allocated, no need to clear
-                // Clear stack-allocated tensor pointers in simplified_acts/grads for this layer.
-                // These pointers become stale after checkpoint restore.
-                if (mRunState.ffn_temps_on_stack()) {
-                    clear_ffn_temp_stack_slots(mRunState, op.layer_end);
-                }
-                if (rstd_on_stack_enabled()) {
-                    clear_rstd_stack_slots(mRunState, op.layer_end);
-                }
-                if (mRunState.large_bwd_temps_on_stack()) {
-                    clear_large_bwd_grad_stack_slots(mRunState, op.layer_end);
-                }
-                last_layer_restored = op.layer_end;
+                bwd_layer_end_cleanup(op.layer_end, idx, bwd_stream_capturing);
             }
             // Every N ops as fallback (catches non-annotated layers)
             // NOTE: When recompute is disabled, we cannot aggressively prune tensors because
