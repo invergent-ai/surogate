@@ -40,24 +40,28 @@ STEP_LINE_RE = re.compile(
 )
 
 
-def poll_peak_memory(device_id: int, stop_event: threading.Event, out: dict, interval_s: float = 0.25):
-    peak = 0
+def poll_peak_memory(device_ids: list, stop_event: threading.Event, out: dict, interval_s: float = 0.25):
+    peak_per_dev = {d: 0 for d in device_ids}
     smi = [
         "nvidia-smi",
-        f"--id={device_id}",
-        "--query-gpu=memory.used",
+        f"--id={','.join(str(d) for d in device_ids)}",
+        "--query-gpu=index,memory.used",
         "--format=csv,noheader,nounits",
     ]
     while not stop_event.is_set():
         try:
             r = subprocess.run(smi, capture_output=True, text=True, timeout=5)
-            used = int(r.stdout.strip().splitlines()[0])
-            if used > peak:
-                peak = used
+            for line in r.stdout.strip().splitlines():
+                idx_str, used_str = [s.strip() for s in line.split(",")]
+                idx = int(idx_str)
+                used = int(used_str)
+                if used > peak_per_dev.get(idx, 0):
+                    peak_per_dev[idx] = used
         except Exception:
             pass
         stop_event.wait(interval_s)
-    out["peak_mib"] = peak
+    out["peak_per_device_mib"] = peak_per_dev
+    out["peak_mib"] = max(peak_per_dev.values()) if peak_per_dev else 0
 
 
 def run_benchmark(config: str, mode: str, warmup: int = 3) -> dict:
@@ -70,11 +74,11 @@ def run_benchmark(config: str, mode: str, warmup: int = 3) -> dict:
         raise ValueError(f"unknown mode: {mode}")
 
     cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "0")
-    device_id = int(cuda_visible.split(",")[0])
+    device_ids = [int(x) for x in cuda_visible.split(",") if x.strip()]
 
     mem_out = {}
     stop_event = threading.Event()
-    poller = threading.Thread(target=poll_peak_memory, args=(device_id, stop_event, mem_out), daemon=True)
+    poller = threading.Thread(target=poll_peak_memory, args=(device_ids, stop_event, mem_out), daemon=True)
     poller.start()
 
     cmd = [".venv/bin/surogate", "sft", config]
@@ -143,6 +147,7 @@ def run_benchmark(config: str, mode: str, warmup: int = 3) -> dict:
         "tokens_per_step": tokens_per_step,
         "tokens_per_s": tps,
         "peak_mib": mem_out.get("peak_mib", 0),
+        "peak_per_device_mib": mem_out.get("peak_per_device_mib", {}),
         "durations_ms": durations,
     }
 
