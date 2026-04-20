@@ -367,6 +367,12 @@ CompiledExecutor::~CompiledExecutor() {
         mMoEExpertOffsetsGPU = nullptr;
         mMoEExpertOffsetsGPUSize = 0;
     }
+    if (mReplayPersistArena) {
+        cudaFree(mReplayPersistArena);
+        mReplayPersistArena = nullptr;
+        mReplayPersistCapacity = 0;
+        mReplayPersistOffset = 0;
+    }
 
     // Free persistent MoE saved tensor buffers (Phase 3 #6 flip: skip
     // arena-backed entries; their storage is owned by mPhaseArenas).
@@ -386,18 +392,19 @@ CompiledExecutor::~CompiledExecutor() {
 }
 
 void CompiledExecutor::clear_replay_copied_refs() {
-    if (mReplayCopiedBuffers.empty()) {
-        return;
-    }
+    // Arena-backed replay persists: bump offset reset so the next replay
+    // overwrites this layer's persistent copies. The arena pointer stays
+    // stable, matching captured-graph expectations. References to those
+    // pointers in mTensors / mNamedTensors / mSaved are scrubbed below.
+    const std::byte* arena_begin = mReplayPersistArena;
+    const std::byte* arena_end = arena_begin + mReplayPersistOffset;
+    mReplayPersistOffset = 0;
 
     auto points_to_replay_copy = [&](const std::byte* data) -> bool {
-        if (!data) {
-            return false;
-        }
+        if (!data) return false;
+        if (arena_begin && data >= arena_begin && data < arena_end) return true;
         for (void* ptr : mReplayCopiedBuffers) {
-            if (data == static_cast<const std::byte*>(ptr)) {
-                return true;
-            }
+            if (data == static_cast<const std::byte*>(ptr)) return true;
         }
         return false;
     };
@@ -471,6 +478,31 @@ CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t
     result.ptr = static_cast<std::byte*>(raw);
     result.arena_backed = false;
     return result;
+}
+
+std::byte* CompiledExecutor::allocate_replay_persist(std::size_t bytes) {
+    if (bytes == 0) return nullptr;
+    // Lazy-allocate the arena on first use. 256 MiB is a conservative upper
+    // bound — one layer's worth of stack-backed replay persistence (typically
+    // 9 slots × up to 8 MiB for (B, T, C) bf16 ≈ 40 MiB) plus margin for
+    // larger models. Too-large requests fall back to caller's cudaMallocAsync.
+    if (!mReplayPersistArena) {
+        constexpr std::size_t kArenaBytes = 256ull * 1024 * 1024;
+        void* raw = nullptr;
+        CUDA_CHECK(cudaMalloc(&raw, kArenaBytes));
+        mReplayPersistArena = static_cast<std::byte*>(raw);
+        mReplayPersistCapacity = kArenaBytes;
+    }
+    // 16-byte alignment for the next bump (matches CUDA alignment expectations).
+    constexpr std::size_t kAlign = 16;
+    const std::size_t aligned_offset = (mReplayPersistOffset + kAlign - 1) & ~(kAlign - 1);
+    if (aligned_offset + bytes > mReplayPersistCapacity) {
+        // Arena exhausted — caller will fall back to cudaMallocAsync.
+        return nullptr;
+    }
+    std::byte* p = mReplayPersistArena + aligned_offset;
+    mReplayPersistOffset = aligned_offset + bytes;
+    return p;
 }
 
 CompiledExecutor::BwdXLayerAlloc CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {

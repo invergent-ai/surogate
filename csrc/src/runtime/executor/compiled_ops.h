@@ -520,6 +520,23 @@ private:
     std::size_t mDeferredReplayTempMark = 0;
     std::vector<void*> mReplayCopiedBuffers;  // persistent copies of stack-resident saved tensors
 
+    // Pre-allocated arena used by replay_layer_forward's stack-to-persistent
+    // copies. The arena's base pointer is stable across CUDA graph captures
+    // and replays (unlike cudaMallocAsync inside a captured graph, which
+    // bakes a capture-time pointer that's re-allocated at replay, yielding
+    // stale pointers in captured kernels). Bump-allocated; offset reset at
+    // each replay-layer entry so only the current layer's copies occupy
+    // the arena.
+    std::byte* mReplayPersistArena = nullptr;
+    std::size_t mReplayPersistCapacity = 0;
+    std::size_t mReplayPersistOffset = 0;
+
+    /// Bump-allocate `bytes` from the replay-persist arena. Allocates the
+    /// arena lazily on first call, rounded up to at least 256 MiB. Returns
+    /// nullptr if the request is larger than what the arena can provide
+    /// (caller falls back to cudaMallocAsync).
+    std::byte* allocate_replay_persist(std::size_t bytes);
+
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;
 

@@ -480,11 +480,19 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // before backward consumes the saved value.
             const std::size_t bytes = tensor.bytes();
             if (bytes == 0) continue;
-            void* persistent = nullptr;
-            CUDA_CHECK(cudaMallocAsync(&persistent, bytes, mRunState.MainStream));
+            // Prefer the replay-persist arena (stable pointer across CUDA graph
+            // captures/replays). Fall back to cudaMallocAsync for over-size
+            // requests — arena-exhausted fallback keeps the legacy semantics
+            // on the rare path where a single tensor exceeds the arena.
+            std::byte* persistent = allocate_replay_persist(bytes);
+            if (!persistent) {
+                void* raw = nullptr;
+                CUDA_CHECK(cudaMallocAsync(&raw, bytes, mRunState.MainStream));
+                persistent = static_cast<std::byte*>(raw);
+                mReplayCopiedBuffers.push_back(persistent);
+            }
             CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
-            tensor.Data = static_cast<std::byte*>(persistent);
-            mReplayCopiedBuffers.push_back(persistent);
+            tensor.Data = persistent;
         }
 
         // Phase 4 M3 Phase A: rstd slots (ln*_rstd, q_rstd, k_rstd) are
@@ -500,13 +508,19 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                 if (!mRunState.Stack.owns(slot.Data)) return;
                 const std::size_t bytes = slot.bytes();
                 std::byte* stack_ptr = slot.Data;
-                void* persistent = nullptr;
-                CUDA_CHECK(cudaMallocAsync(&persistent, bytes, mRunState.MainStream));
-                CUDA_CHECK(
-                    cudaMemcpyAsync(persistent, stack_ptr, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
-                auto* persistent_bytes_ptr = static_cast<std::byte*>(persistent);
+                std::byte* persistent_bytes_ptr = allocate_replay_persist(bytes);
+                if (!persistent_bytes_ptr) {
+                    void* raw = nullptr;
+                    CUDA_CHECK(cudaMallocAsync(&raw, bytes, mRunState.MainStream));
+                    persistent_bytes_ptr = static_cast<std::byte*>(raw);
+                    mReplayCopiedBuffers.push_back(persistent_bytes_ptr);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(persistent_bytes_ptr,
+                                           stack_ptr,
+                                           bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           mRunState.MainStream));
                 slot.Data = persistent_bytes_ptr;
-                mReplayCopiedBuffers.push_back(persistent);
 
                 if (mSaved) {
                     auto it = mSaved->find(slot_name);
