@@ -357,6 +357,7 @@ M5 progress.
 | `d8ef2e7` | Added between-step Stack-owned mSaved scrub (defensive; closes latent stale-ptr bug class) |
 | `9656ce3` | Dropped stale recomputation comment on mFP8ScalingState |
 | `70243c6` | Removed dead `TensorSlot::Temporary` enum value + its 6 dead checks across buffer_plan, graph_compiler, compiled_ops_save, fused_residual_rmsnorm |
+| `6530ace` | Consolidated `resolve_tensor`'s 40-case slot switch to delegate Block*/MoE*/BlockD*/global cases through `block_activation_ptr` / `block_gradient_ptr` / `global_activation_ptr` helpers. Struct-field indirection now referenced in exactly one place (`tensor_slot_dispatch.cpp`), groundwork for future SimplifiedLayerActivations replacement |
 
 Net impact: `shared_tag()` + per-layer activation allocator loop +
 all gradient-sharing from the design's M5 kill-list is gone.
@@ -380,12 +381,18 @@ Still on the kill-list from `design/buffer-runtime-v4.md §Phase 4`
 — each is blocked on architectural changes larger than this
 session's scope:
 
-- `TensorSlot::Block*/MoE*/SSM*` enumerators — widely used (hot-path
-  dispatch), multi-session to eliminate; blocking their removal is
-  the `SimplifiedLayerActivations` struct and every op's `acts.X`
-  reads
-- `SimplifiedLayerActivations` struct — every op reads `acts.X`;
-  cannot delete without op-level refactor
+- `TensorSlot::Block*/MoE*` enumerators — after `6530ace` the
+  struct-field indirection is consolidated to one place (the
+  `block_activation_ptr` / `block_gradient_ptr` switches), but the
+  enumerators themselves are still load-bearing for that dispatch.
+  Removing them requires replacing the switch with an indexed
+  lookup (e.g., `std::array<Tensor, kNumBlockSlots>` per layer) AND
+  updating the 17 direct `acts.X` ops-side accesses that bypass the
+  helpers.
+- `SimplifiedLayerActivations` struct — also holds Mamba/SSM
+  fields that have no TensorSlot enum equivalent (mamba_gate,
+  mamba_u, etc.). Removal is not 1:1 with the Block* enum — those
+  Mamba ops need a parallel dispatch mechanism first.
 - `builtin_slot_from_name` string table + ~10 remaining legitimate
   callers (each is structurally different: unqualified global
   names, `layerN.X` cross-layer refs, `d_`-prefix gradient lookups,
