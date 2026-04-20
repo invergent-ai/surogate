@@ -816,14 +816,6 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts.moe_out = {};
         }
     }
-
-    // Allocate temporary buffers for recomputation
-    // This prevents overwriting saved values when recomputing forward activations
-    if (recompute_enabled) {
-        mRecomputeRstd = mAllocator->allocate(ETensorDType::FP32, "recompute_rstd", kind, {B, T});
-        // LSE buffer for attention recomputation - same shape as acts.lse [B, Hq, T]
-        mRecomputeLSE = mAllocator->allocate(ETensorDType::FP32, "recompute_lse", kind, {B, Hq, T});
-    }
 }
 
 void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {

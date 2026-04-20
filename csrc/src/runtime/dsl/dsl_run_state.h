@@ -202,16 +202,6 @@ public:
         return mRecomputeLevel != RecomputeLevel::None;
     }
 
-    /// @brief Get temporary rstd buffer for recomputation (avoids overwriting saved values)
-    Tensor& recompute_rstd() {
-        return mRecomputeRstd;
-    }
-
-    /// @brief Get temporary LSE buffer for recomputation (avoids overwriting saved values)
-    Tensor& recompute_lse() {
-        return mRecomputeLSE;
-    }
-
     cudaStream_t side_stream() const {
         return mSideStream;
     }
@@ -386,8 +376,6 @@ private:
     Tensor mGradQuantStats{};
 
     // Temporary buffers for recomputation (to avoid overwriting saved activations)
-    Tensor mRecomputeRstd{};  ///< Temp buffer for rstd during recomputation [B, T]
-    Tensor mRecomputeLSE{};   ///< Temp buffer for LSE during recomputation [B, Hq, T]
     std::unique_ptr<modules::FP8ScalingState> mFP8ScalingState;
 
     std::unique_ptr<modules::ResidualManager> mResidualManager;
