@@ -1701,6 +1701,75 @@ void GraphCompiler::build_phase_tree(CompiledGraph& graph, bool is_backward) {
     }
 }
 
+// ============================================================================
+// Region Derivation (design/buffer-runtime-v4.md, M2) — shadow-mode compat
+// ============================================================================
+
+const char* region_kind_name(RegionKind k) {
+    switch (k) {
+        case RegionKind::Unknown: return "Unknown";
+        case RegionKind::FwdStack: return "FwdStack";
+        case RegionKind::BwdStack: return "BwdStack";
+        case RegionKind::SaveForBwd: return "SaveForBwd";
+        case RegionKind::Accumulator: return "Accumulator";
+        case RegionKind::Persistent: return "Persistent";
+        case RegionKind::Recomputed: return "Recomputed";
+        case RegionKind::GatheredWeight: return "GatheredWeight";
+        case RegionKind::BwdCrossLayer: return "BwdCrossLayer";
+    }
+    return "?";
+}
+
+void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
+    // Map TensorKind (populated by classify_tensors) to a region, consulting
+    // block_layer_idx to distinguish block-scoped from global tensors. M2
+    // intentionally stops at this coarse classification; SaveForBwd detection
+    // (save-list integration) and Recomputed (recompute-plan integration)
+    // arrive in later milestones.
+    for (auto& meta : graph.tensor_meta) {
+        switch (meta.kind) {
+            case TensorKind::ForwardParam: meta.region = RegionKind::Persistent; break;
+            case TensorKind::ForwardActivation:
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::FwdStack : RegionKind::Persistent;
+                break;
+            case TensorKind::ActivationGrad:
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::BwdStack : RegionKind::Persistent;
+                break;
+            case TensorKind::ParamGrad:
+            case TensorKind::AccumTemp: meta.region = RegionKind::Accumulator; break;
+            case TensorKind::LossInput: meta.region = RegionKind::Persistent; break;
+            case TensorKind::Scratch:
+                // Pessimistic default for un-typed intermediates (views,
+                // zeros, constants). Correct when the scratch dies within a
+                // block; M3 will re-verify against last-use spans.
+                meta.region = is_backward ? RegionKind::BwdStack : RegionKind::FwdStack;
+                break;
+            case TensorKind::Unknown:
+                // Includes cross-graph references (e.g., forward activations
+                // read by backward). Left as Unknown for now; save-list
+                // integration in a later milestone will promote these to
+                // SaveForBwd.
+                break;
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
+        if (std::string(env) == "1") {
+            std::array<int, 9> counts{};  // Indexed by RegionKind.
+            for (const auto& meta : graph.tensor_meta) {
+                counts[static_cast<std::size_t>(meta.region)]++;
+            }
+            std::cerr << "[regions] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):";
+            for (std::size_t i = 0; i < counts.size(); ++i) {
+                if (counts[i] > 0) {
+                    std::cerr << " " << region_kind_name(static_cast<RegionKind>(i)) << "=" << counts[i];
+                }
+            }
+            std::cerr << "\n";
+        }
+    }
+}
+
 void CompiledGraph::compute_layer_segments() {
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
@@ -4234,6 +4303,10 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // (Phase 0: data-only; callers still use legacy string predicates until
     // Phase 1 flips them.)
     classify_tensors(result);
+
+    // Derive shadow-mode region assignment (design/buffer-runtime-v4.md, M2).
+    // Runs after classify_tensors so TensorMeta::kind is populated.
+    derive_regions(result, is_backward);
 
     // ========================================================================
     // Detect MLP tile groups for long-context tiled execution

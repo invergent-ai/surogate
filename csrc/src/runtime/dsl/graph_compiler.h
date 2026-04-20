@@ -356,6 +356,23 @@ enum class TensorKind : uint8_t {
     Scratch,            ///< Everything else (zeros, constants, unknown intermediates)
 };
 
+/// Typed memory region (design/buffer-runtime-v4.md, M2). Each tensor is
+/// assigned to exactly one region by derive_regions(). Shadow-only in M2; the
+/// layout pass (M3) consumes region + block_layer_idx to bake buffer offsets.
+enum class RegionKind : std::uint8_t {
+    Unknown = 0,     ///< Not yet classified (includes cross-graph forward activations in backward)
+    FwdStack,        ///< Block-scoped forward activation (bump arena; nested FwdBlock frames)
+    BwdStack,        ///< Block-scoped backward gradient / temporary (bump arena)
+    SaveForBwd,      ///< Forward activation persisted across block boundary for backward
+    Accumulator,     ///< Gradient accumulator (parameter grad + autodiff accum temps)
+    Persistent,      ///< Training-wide (parameters, token ids, losses, FP8 amax history)
+    Recomputed,      ///< Forward activation replayed during backward (reuses FwdStack arena)
+    GatheredWeight,  ///< ZeRO-3 all-gathered weight shards (unused in Llama prototype)
+    BwdCrossLayer,   ///< Backward-produced tensor consumed by a later backward block (MoE aux-loss; unused in Llama)
+};
+
+const char* region_kind_name(RegionKind k);
+
 struct TensorMeta {
     static constexpr uint8_t kCrossLayer = 1 << 0;  // name starts with "layer"
     static constexpr uint8_t kMoeOffsets = 1 << 1;  // name == "moe_expert_offsets"
@@ -371,6 +388,9 @@ struct TensorMeta {
     int base_param_tid = -1;     ///< ParamGrad -> tid of the parameter
     int base_producer_tid = -1;  ///< ActivationGrad -> tid of the forward activation
     int base_grad_tid = -1;      ///< AccumTemp -> tid of the non-accum parent gradient
+
+    // Region assignment (populated by derive_regions() after classify_tensors).
+    RegionKind region = RegionKind::Unknown;
 
     bool is_cross_layer() const {
         return flags & kCrossLayer;
@@ -575,6 +595,12 @@ private:
     /// containing per-layer FwdBlock/BwdBlock nodes, and an epilogue. When
     /// `SUROGATE_DEBUG_PHASE_TREE=1` is set, the tree is dumped to stderr.
     void build_phase_tree(CompiledGraph& graph, bool is_backward);
+
+    /// Assign each tid a RegionKind based on TensorMeta::kind + block_layer_idx
+    /// (populated by classify_tensors). Shadow-only in M2: consumed only by the
+    /// debug dump gated on `SUROGATE_DEBUG_REGIONS=1`. M3's layout pass will
+    /// read TensorMeta::region to bake buffer offsets.
+    void derive_regions(CompiledGraph& graph, bool is_backward);
 
     // Shape validation methods
     struct TensorShape {
