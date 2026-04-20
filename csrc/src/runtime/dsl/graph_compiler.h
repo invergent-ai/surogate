@@ -783,6 +783,14 @@ struct PhaseArenas {
     std::byte* bwd_cross_layer_ptr = nullptr;
     std::size_t bwd_cross_layer_bytes = 0;
 
+    // MoE-saved arena (Phase 3 subsystem #6 flip). Cross-step monotonic bump
+    // allocator for the name-keyed persistent buffers MoE routing saves at
+    // layer boundaries (compiled_ops_save.cpp save_moe_layer_tensors +
+    // prepare_saved_buffers_for_capture + persist_saved_source_now). Replaces
+    // the per-name cudaMalloc that fires on size grow.
+    std::byte* moe_saved_ptr = nullptr;
+    std::size_t moe_saved_bytes = 0;
+
     bool allocated = false;
 };
 
@@ -793,7 +801,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          const CompiledGraph& bwd,
                          int num_layers,
                          std::size_t stack_bytes = 0,
-                         std::size_t bwd_cross_layer_bytes = 0);
+                         std::size_t bwd_cross_layer_bytes = 0,
+                         std::size_t moe_saved_bytes = 0);
 
 /// cudaMalloc all arenas at their computed sizes. arenas.allocated is set to
 /// true on success. Safe to call only after compute_arena_sizes().

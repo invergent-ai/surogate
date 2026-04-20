@@ -962,12 +962,22 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // transformers (typical), < 16 MiB for small-MoE aux-loss.
                 // Interpreter falls back to cudaMalloc if arena is insufficient.
                 const std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
+                // Phase 3 subsystem #6: moe_saved arena. Gated on
+                // SUROGATE_USE_PHASE_MOE=1; sized 256 MiB for MoE models.
+                // Cross-step monotonic bump; cudaMalloc fallback on exhaustion.
+                const bool want_moe_flip = [] {
+                    const char* e = std::getenv("SUROGATE_USE_PHASE_MOE");
+                    return e && std::string(e) == "1";
+                }();
+                const std::size_t moe_saved_bytes =
+                    (want_moe_flip && mConfig.NumExperts > 0) ? 256ULL * 1024 * 1024 : 0;
                 dsl::compute_arena_sizes(mPhaseArenas,
                                          *mCompiledForward,
                                          *mCompiledBackward,
                                          static_cast<int>(mConfig.NumLayers),
                                          stack_bytes,
-                                         bwd_cross_layer_bytes);
+                                         bwd_cross_layer_bytes,
+                                         moe_saved_bytes);
                 dsl::allocate_phase_arenas(mPhaseArenas);
                 // Shadow coverage report: of the tids the arena plan claims,
                 // how many actually fit (offset+bytes <= region capacity).

@@ -2269,14 +2269,20 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          const CompiledGraph& bwd,
                          int num_layers,
                          std::size_t stack_bytes,
-                         std::size_t bwd_cross_layer_bytes) {
+                         std::size_t bwd_cross_layer_bytes,
+                         std::size_t moe_saved_bytes) {
     arenas.unified_stack_bytes = stack_bytes;
     arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
+    arenas.moe_saved_bytes = moe_saved_bytes;
 
     // Persistent, Accumulator: max across fwd+bwd (they hold weights/grads
-    // that outlive both compiles).
-    arenas.persistent_bytes = std::max(fwd.persistent_bytes, bwd.persistent_bytes);
-    arenas.accumulator_bytes = std::max(fwd.accumulator_bytes, bwd.accumulator_bytes);
+    // that outlive both compiles). Shadow-only until ops consume them; gated
+    // on SUROGATE_USE_PHASE_PERSISTENT=1 so we don't waste the weight-sized
+    // allocation (can be tens of GiB on large models).
+    const char* persistent_env = std::getenv("SUROGATE_USE_PHASE_PERSISTENT");
+    const bool want_persistent = persistent_env && std::string(persistent_env) == "1";
+    arenas.persistent_bytes = want_persistent ? std::max(fwd.persistent_bytes, bwd.persistent_bytes) : 0;
+    arenas.accumulator_bytes = want_persistent ? std::max(fwd.accumulator_bytes, bwd.accumulator_bytes) : 0;
 
     // FwdStack, BwdStack: taken from their respective compile's peak. Frames
     // within each direction don't coexist; the two directions also don't
@@ -2326,6 +2332,7 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
     cuda_malloc_or_die(&arenas.save_for_bwd_ptr, arenas.save_for_bwd_bytes, "save_for_bwd");
     cuda_malloc_or_die(&arenas.unified_stack_ptr, arenas.unified_stack_bytes, "unified_stack");
     cuda_malloc_or_die(&arenas.bwd_cross_layer_ptr, arenas.bwd_cross_layer_bytes, "bwd_cross_layer");
+    cuda_malloc_or_die(&arenas.moe_saved_ptr, arenas.moe_saved_bytes, "moe_saved");
     arenas.allocated = true;
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
@@ -2457,6 +2464,7 @@ void release_phase_arenas(PhaseArenas& arenas) {
     free_ptr(arenas.save_for_bwd_ptr);
     free_ptr(arenas.unified_stack_ptr);
     free_ptr(arenas.bwd_cross_layer_ptr);
+    free_ptr(arenas.moe_saved_ptr);
     arenas.persistent_bytes = 0;
     arenas.accumulator_bytes = 0;
     arenas.fwd_stack_bytes = 0;
@@ -2464,6 +2472,7 @@ void release_phase_arenas(PhaseArenas& arenas) {
     arenas.save_for_bwd_bytes = 0;
     arenas.unified_stack_bytes = 0;
     arenas.bwd_cross_layer_bytes = 0;
+    arenas.moe_saved_bytes = 0;
     arenas.save_for_bwd_block_bases.clear();
     arenas.allocated = false;
 }

@@ -1117,8 +1117,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     // (replicates compiled_ops_execute.cpp:1228-1325 semantics
                     // in the stream-driven path).
                     const int L = inst.block_index;
-                    const bool use_splits = mSplitAttentionGraphs && inst.phase_kind == dsl::PhaseKind::FwdBlock &&
-                                            L >= 0 && static_cast<std::size_t>(L) < graph.layer_segments.size() &&
+                    const bool splits_disabled = std::getenv("SUROGATE_DISABLE_SPLIT_SEG") != nullptr;
+                    const bool use_splits = !splits_disabled && mSplitAttentionGraphs &&
+                                            inst.phase_kind == dsl::PhaseKind::FwdBlock && L >= 0 &&
+                                            static_cast<std::size_t>(L) < graph.layer_segments.size() &&
                                             !graph.layer_segments[static_cast<std::size_t>(L)].empty();
                     if (use_splits) {
                         const auto& segs = graph.layer_segments[static_cast<std::size_t>(L)];
@@ -2075,12 +2077,20 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 ++it;
             }
         }
+        // Phase 3 #4: arena-backed pointers live in the bwd_cross_layer arena,
+        // not in mPersistedBackwardTensors. Only cudaFree pointers we actually
+        // cudaMalloc'd. Nulling the slot in mPersistedBackwardTensors is also
+        // the signal that it was cudaMalloc-backed.
+        bool was_cudamalloc_backed = false;
         for (auto& active_ptr : mPersistedBackwardTensors) {
             if (active_ptr == ptr) {
                 active_ptr = nullptr;
+                was_cudamalloc_backed = true;
             }
         }
-        CUDA_CHECK(cudaFreeAsync(ptr, mRunState.MainStream));
+        if (was_cudamalloc_backed) {
+            CUDA_CHECK(cudaFreeAsync(ptr, mRunState.MainStream));
+        }
         persisted_backward_refcount.erase(ptr);
     };
     auto release_persisted_backward_tid = [&](int tid) {

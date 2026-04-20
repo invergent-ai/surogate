@@ -114,18 +114,19 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
             continue;
         }
 
-        // Allocate or resize persistent buffer if needed
+        // Allocate or resize persistent buffer if needed (Phase 3 subsystem #6
+        // flip: arena bump + cudaMalloc fallback).
         auto buf_it = mMoeSavedBuffers.find(name);
         if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-            // Free old buffer if exists
             if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                CUDA_CHECK(cudaFree(buf_it->second));
+                auto ab_it = mMoeSavedArenaBacked.find(name);
+                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
             }
-            // Allocate new buffer
-            void* new_buffer = nullptr;
-            CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-            mMoeSavedBuffers[name] = new_buffer;
+            auto a = allocate_moe_saved(bytes);
+            mMoeSavedBuffers[name] = a.ptr;
             mMoeSavedSizes[name] = bytes;
+            mMoeSavedArenaBacked[name] = a.arena_backed;
         }
 
         // Copy data to persistent buffer
@@ -249,24 +250,14 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
                           << std::endl;
             }
             if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                CUDA_CHECK(cudaFree(buf_it->second));
+                auto ab_it = mMoeSavedArenaBacked.find(name);
+                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
             }
-            void* new_buffer = nullptr;
-            cudaError_t alloc_err = cudaMalloc(&new_buffer, bytes);
-            if (alloc_err != cudaSuccess) {
-                std::size_t free_bytes = 0;
-                std::size_t total_bytes = 0;
-                (void)cudaMemGetInfo(&free_bytes, &total_bytes);
-                std::ostringstream oss;
-                oss << "CompiledExecutor::prepare_saved_buffers_for_capture: cudaMalloc failed for saved tensor '"
-                    << name << "' (" << bytes << " bytes, " << static_cast<double>(bytes) / (1024.0 * 1024.0) << " MiB)"
-                    << ", free=" << static_cast<double>(free_bytes) / (1024.0 * 1024.0) << " MiB"
-                    << ", total=" << static_cast<double>(total_bytes) / (1024.0 * 1024.0) << " MiB"
-                    << ", error=" << cudaGetErrorString(alloc_err);
-                throw std::runtime_error(oss.str());
-            }
-            mMoeSavedBuffers[name] = new_buffer;
+            auto a = allocate_moe_saved(bytes);
+            mMoeSavedBuffers[name] = a.ptr;
             mMoeSavedSizes[name] = bytes;
+            mMoeSavedArenaBacked[name] = a.arena_backed;
         }
     };
 
@@ -782,12 +773,14 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                     return;
                 }
                 if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                    CUDA_CHECK(cudaFree(buf_it->second));
+                    auto ab_it = mMoeSavedArenaBacked.find(name);
+                    const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+                    if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
                 }
-                void* new_buffer = nullptr;
-                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoeSavedBuffers[name] = new_buffer;
+                auto a = allocate_moe_saved(bytes);
+                mMoeSavedBuffers[name] = a.ptr;
                 mMoeSavedSizes[name] = bytes;
+                mMoeSavedArenaBacked[name] = a.arena_backed;
             }
             void* dst_buffer = mMoeSavedBuffers[name];
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));

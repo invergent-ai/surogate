@@ -465,6 +465,13 @@ private:
     // Reset at the start of each backward call; advanced by allocate_bwd_cross_layer.
     std::size_t mBwdCrossLayerBumpOffset = 0;
 
+    // Phase 3 subsystem #6: cross-step monotonic bump cursor into moe_saved
+    // arena. Never reset - MoE save buffers are keyed by name + persist for the
+    // executor's lifetime. Size growth re-bumps (same semantics as today's
+    // cudaFree+cudaMalloc cycle, which also wastes the old buffer).
+    std::size_t mMoeSavedBumpOffset = 0;
+    std::unordered_map<std::string, bool> mMoeSavedArenaBacked;
+
     /// Allocate `nbytes` for a backward cross-layer persistence. Uses
     /// mPhaseArenas.bwd_cross_layer_ptr when bound and sufficient space remains,
     /// else falls back to cudaMalloc. Returns the buffer pointer via `out` and
@@ -475,6 +482,15 @@ private:
         bool arena_backed = false;
     };
     BwdXLayerAlloc allocate_bwd_cross_layer(std::size_t nbytes);
+
+    /// Allocate `nbytes` for an MoE save buffer. Cross-step monotonic bump in
+    /// mPhaseArenas.moe_saved_ptr; cudaMalloc fallback when arena exhausted or
+    /// unbound. Caller owns cudaFree of non-arena_backed pointers.
+    struct MoeSavedAlloc {
+        std::byte* ptr = nullptr;
+        bool arena_backed = false;
+    };
+    MoeSavedAlloc allocate_moe_saved(std::size_t nbytes);
     std::unordered_set<std::string> mSaveSet;  // Fast lookup for save list
     std::vector<LayerForwardPlan>* mForwardPlan = nullptr;
     std::function<void(const std::vector<std::string>&, int)> mDebugDumpFn;

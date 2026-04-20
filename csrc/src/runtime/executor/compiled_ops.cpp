@@ -368,14 +368,17 @@ CompiledExecutor::~CompiledExecutor() {
         mMoEExpertOffsetsGPUSize = 0;
     }
 
-    // Free persistent MoE saved tensor buffers
+    // Free persistent MoE saved tensor buffers (Phase 3 #6 flip: skip
+    // arena-backed entries; their storage is owned by mPhaseArenas).
     for (auto& [name, buffer] : mMoeSavedBuffers) {
-        if (buffer) {
-            cudaFree(buffer);
-        }
+        if (!buffer) continue;
+        auto ab_it = mMoeSavedArenaBacked.find(name);
+        const bool arena_backed = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+        if (!arena_backed) cudaFree(buffer);
     }
     mMoeSavedBuffers.clear();
     mMoeSavedSizes.clear();
+    mMoeSavedArenaBacked.clear();
 
     // EP per-layer state, LLEP state, shared buffers, buffer pool, and
     // the weight-transfer stream are all owned by mEpStrategy and released
@@ -451,6 +454,23 @@ void CompiledExecutor::set_recompute_fn(std::function<void(int, long, long, bool
 void CompiledExecutor::set_recompute_enabled(bool enabled) {
     mRecomputeEnabled = enabled;
     mLastRecomputeLayer = -1;
+}
+
+CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t nbytes) {
+    MoeSavedAlloc result;
+    if (nbytes == 0) return result;
+    if (mPhaseArenas && mPhaseArenas->allocated && mPhaseArenas->moe_saved_ptr &&
+        mMoeSavedBumpOffset + nbytes <= mPhaseArenas->moe_saved_bytes) {
+        result.ptr = mPhaseArenas->moe_saved_ptr + mMoeSavedBumpOffset;
+        result.arena_backed = true;
+        mMoeSavedBumpOffset += nbytes;
+        return result;
+    }
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, nbytes));
+    result.ptr = static_cast<std::byte*>(raw);
+    result.arena_backed = false;
+    return result;
 }
 
 CompiledExecutor::BwdXLayerAlloc CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
