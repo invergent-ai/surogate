@@ -808,8 +808,13 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         }
         acts.att = plan.share_att ? shared_att
                                   : mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
-        acts.att_out = plan.share_att_out ? shared_att_out
-                                          : mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
+        if (rstd_on_stack) {
+            acts.att_out = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
+        } else {
+            acts.att_out = plan.share_att_out
+                               ? shared_att_out
+                               : mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
+        }
 
         acts.residual_att = plan.share_residual_att
                                 ? shared_residual_att
