@@ -2489,6 +2489,65 @@ ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledG
     return cov;
 }
 
+std::optional<BakedOperand> baked_view(const CompiledGraph& graph, const TensorRef& ref) {
+    const int tid = ref.tensor_id;
+    if (tid < 0 || tid >= graph.num_tensors) return std::nullopt;
+    const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.region == RegionKind::Unknown) return std::nullopt;
+    if (meta.offset == SIZE_MAX) return std::nullopt;
+    return BakedOperand{meta.region, meta.block_layer_idx, meta.offset, meta.bytes, ref.dtype};
+}
+
+OpOperandCoverage validate_op_operand_coverage(const PhaseArenas& arenas, const CompiledGraph& graph) {
+    OpOperandCoverage cov{};
+
+    auto region_allocated = [&](RegionKind k) {
+        switch (k) {
+            case RegionKind::Persistent: return arenas.persistent_ptr != nullptr;
+            case RegionKind::Accumulator: return arenas.accumulator_ptr != nullptr;
+            case RegionKind::FwdStack: return arenas.fwd_stack_ptr != nullptr;
+            case RegionKind::BwdStack: return arenas.bwd_stack_ptr != nullptr;
+            case RegionKind::SaveForBwd: return arenas.save_for_bwd_ptr != nullptr;
+            case RegionKind::BwdCrossLayer: return arenas.bwd_cross_layer_ptr != nullptr;
+            default: return false;
+        }
+    };
+
+    auto score = [&](const TensorRef& ref, std::size_t& total, std::size_t& covered) {
+        ++total;
+        auto bv = baked_view(graph, ref);
+        if (!bv) return;
+        if (!region_allocated(bv->region)) return;
+        ++covered;
+        const auto region_idx = static_cast<std::size_t>(bv->region);
+        if (region_idx < cov.by_region.size()) ++cov.by_region[region_idx];
+    };
+
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.inputs)
+            score(ref, cov.total_inputs, cov.covered_inputs);
+        for (const auto& ref : op.outputs)
+            score(ref, cov.total_outputs, cov.covered_outputs);
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_OPERAND_COVERAGE")) {
+        if (std::string(env) == "1") {
+            const std::size_t total = cov.total_inputs + cov.total_outputs;
+            const std::size_t covered = cov.covered_inputs + cov.covered_outputs;
+            const double pct = total > 0 ? (100.0 * static_cast<double>(covered) / static_cast<double>(total)) : 0.0;
+            std::cerr << "[operand-coverage] " << graph.name << ": " << covered << "/" << total << " operands (" << pct
+                      << "%) in=" << cov.covered_inputs << "/" << cov.total_inputs << " out=" << cov.covered_outputs
+                      << "/" << cov.total_outputs;
+            for (std::size_t r = 0; r < cov.by_region.size(); ++r) {
+                if (cov.by_region[r] == 0) continue;
+                std::cerr << " " << region_kind_name(static_cast<RegionKind>(r)) << "=" << cov.by_region[r];
+            }
+            std::cerr << "\n";
+        }
+    }
+    return cov;
+}
+
 void release_phase_arenas(PhaseArenas& arenas) {
     if (!arenas.allocated) return;
     auto free_ptr = [](std::byte*& p) {

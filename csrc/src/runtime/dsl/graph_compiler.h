@@ -855,6 +855,40 @@ struct ArenaCoverage {
 };
 ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledGraph& graph);
 
+/// Phase 4 M1: op-operand coverage audit. Counts how many TensorRef uses
+/// (across all ops' inputs + outputs) index a tid that would be served by
+/// a baked arena read — i.e. meta.region != Unknown AND the corresponding
+/// arena is allocated. This is the metric Phase 4 drives toward 100%; as
+/// op dispatch switches from legacy TensorSlot lookup to arena-backed
+/// reads, coverage climbs and the legacy machinery can be deleted.
+///
+/// Distinct from ArenaCoverage, which counts distinct tids. Operands are
+/// the reads that actually matter at dispatch time: one tid consumed by N
+/// ops contributes N here.
+struct OpOperandCoverage {
+    std::size_t covered_inputs = 0;   ///< op.inputs entries with an arena-served tid
+    std::size_t covered_outputs = 0;  ///< op.outputs entries with an arena-served tid
+    std::size_t total_inputs = 0;
+    std::size_t total_outputs = 0;
+    std::array<std::size_t, 10> by_region{};  ///< per-RegionKind count of covered operands
+};
+OpOperandCoverage validate_op_operand_coverage(const PhaseArenas& arenas, const CompiledGraph& graph);
+
+/// Phase 4 M1: hot-path accessor for the baked (region, offset, bytes,
+/// dtype) operand view used by M2+ dispatch. Resolves `ref.tensor_id`
+/// against `graph.tensor_meta` without touching the legacy lookup paths.
+/// `dtype` comes from the ref (per-use overrides are legal), everything
+/// else from the tid. Returns nullopt if the tid is out of range, the
+/// region is Unknown, or the offset is unassigned.
+struct BakedOperand {
+    RegionKind region;
+    int block_layer_idx;
+    std::size_t offset;
+    std::size_t bytes;
+    ETensorDType dtype;
+};
+std::optional<BakedOperand> baked_view(const CompiledGraph& graph, const TensorRef& ref);
+
 /// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a).
 /// derive_regions() runs per-direction and cannot see across the pair, so
 /// block activations that are produced in forward and consumed in backward

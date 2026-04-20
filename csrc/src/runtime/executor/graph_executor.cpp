@@ -1015,6 +1015,14 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // how many actually fit (offset+bytes <= region capacity).
                 dsl::validate_arena_coverage(mPhaseArenas, *mCompiledForward);
                 dsl::validate_arena_coverage(mPhaseArenas, *mCompiledBackward);
+                // Phase 4 M1: op-operand coverage baseline. Counts TensorRef
+                // uses (inputs + outputs across all ops) whose tid resolves to
+                // an arena-backed (region, offset) pair. Drives the deletion
+                // sequence: M2/M3/M4 widen coverage; once at 100%, legacy
+                // TensorSlot / SimplifiedLayerActivations / shared_tag /
+                // builtin_slot_from_name / string-match dispatch can be cut.
+                dsl::validate_op_operand_coverage(mPhaseArenas, *mCompiledForward);
+                dsl::validate_op_operand_coverage(mPhaseArenas, *mCompiledBackward);
                 // Bind the arena for in-executor consumption (e.g., SaveForBwd
                 // persist writing straight to arena slot instead of cudaMalloc).
                 if (mCompiledExecutor) {
