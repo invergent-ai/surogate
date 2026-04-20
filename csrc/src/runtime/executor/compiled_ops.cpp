@@ -565,20 +565,15 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     }
 
     int layer_idx = -1;
-    std::string field;
-    if (!parse_block_param(lookup_name, layer_idx, field)) {
-        return nullptr;
-    }
-    const std::string base_field = strip_ssa_suffix(field);
+    const TensorSlot slot = resolve_block_slot(lookup_name, &layer_idx);
     if (layer_idx < 0 || layer_idx >= mConfig.NumLayers) {
         return nullptr;
     }
 
-    // Route through the shared slot-dispatch helpers: builtin_slot_from_name()
-    // is the single name->slot table, and block_activation_ptr/block_gradient_ptr
-    // are the single slot->RunState-buffer tables. Any new slot is added to
-    // tensor_slot_dispatch.cpp only; this function stays trivial.
-    const TensorSlot slot = builtin_slot_from_name(base_field);
+    // Route through the shared slot-dispatch helpers: resolve_block_slot()
+    // covers name parsing + slot lookup; block_activation_ptr /
+    // block_gradient_ptr are the single slot->RunState-buffer tables. Any new
+    // slot is added to tensor_slot_dispatch.cpp only; this function stays trivial.
     if (is_grad_block_name) {
         return block_gradient_ptr(mRunState, layer_idx, slot);
     }
