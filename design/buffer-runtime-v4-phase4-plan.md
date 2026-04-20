@@ -138,9 +138,52 @@ pointer swaps. Either:
 as a frame-reusable scratch pad" — a smaller conceptual leap from the
 current world. (a-proper) is the design's intended end-state but needs
 the executor-level frame plumbing before the per-slot pointers can be
-trusted. Next session will pick between them based on whether the
-full design-intended memory savings are worth the executor-side work
-today, or if we want to land a bit-identical parity first.
+trusted.
+
+**Offset-level diagnostic (`SUROGATE_DEBUG_ACT_OFFSETS=1`) confirms the
+failure mode on Qwen3 layer 0:**
+
+| slot          | offset    | bytes   | reused with                              |
+|---------------|----------:|--------:|:-----------------------------------------|
+| `ln1`         | 0         | 8 MiB   | —                                        |
+| `q_rstd`      | 0         | 256 KiB | overlaps `ln1`                           |
+| `lse`         | 0         | 128 KiB | overlaps `ln1` + `q_rstd`                |
+| `ln1_rstd`    | 16 MiB    | 16 KiB  | —                                        |
+| `qkv_rope`    | 16 MiB    | 32 MiB  | overlaps `ln1_rstd` + `att_out` + `mlp_down` |
+| `swiglu`      | 8 MiB     | 24 MiB  | overlaps `ln2`                           |
+
+The coloring is doing exactly what the design wants — reuse offsets
+whose live ranges don't intersect. Legacy `mAllocator` gave each slot
+its own dedicated buffer (wasteful but safe); the arena packs them.
+A simple `.Data` override treats the arena as if slots had
+dedicated ranges, which they don't. Every pair of slots that shares
+an offset in the table above writes to the same bytes concurrently
+from the runtime's perspective — explaining the NaN.
+
+**Concrete M3(a) approach for next session — the `ffn_temps_on_stack`
+pattern extended:** the codebase already has precedent for putting
+per-layer activations on the Stack via
+`BufferPlan::ffn_temps_on_stack` — in that mode `acts.mlp_up.Data`
+starts null and ops fill it via `Stack.temp_alloc` at layer time,
+with `Stack.restore` at layer_end freeing. The Stack bump + checkpoint
+discipline naturally respects live ranges: a slot lives until the
+Stack cursor rewinds, and per-op `temp_alloc` never overlaps concurrent
+slots. Extending this pattern to every simplified-activation slot
+achieves the (a-proper) end-state without needing a separate
+frame-discipline mechanism for the FwdStack arena.
+
+Scope estimate:
+- Extend `BufferPlan` flags to `stack`-ify every slot (new `acts_on_stack`
+  bool, or per-slot booleans).
+- Teach every op that currently reads `acts.ln1` / `acts.qkv` /... to
+  check `.Data` and `Stack.temp_alloc` into it if null.
+- Delete the `mAllocator->allocate(shared_tag...)` per-slot loop in
+  `allocate_simplified_activations`.
+- Validate 3-model bit-identical + benchmark.
+
+Memory win: the Stack already grows `fwd_stack_peak`-tight via coloring;
+we get the full design-intended reuse for free. No separate FwdStack
+arena needed at all — Stack IS the arena.
 
 ### M4 — Persistent & Accumulator arenas
 

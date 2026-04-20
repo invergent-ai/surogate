@@ -1043,6 +1043,15 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     mRunState.free_allocator_stack_buffer();
                     mStackRebasedToArena = true;
                 }
+                // Phase 4 M3 groundwork: dump per-layer per-slot
+                // (offset, bytes, region) for the simplified-activation
+                // slots. Lets us sanity-check the coloring before designing
+                // the runtime frame discipline that full migration needs.
+                if (const char* dbg = std::getenv("SUROGATE_DEBUG_ACT_OFFSETS")) {
+                    if (std::string(dbg) == "1" && mCompiledForward) {
+                        dump_simplified_activation_offsets();
+                    }
+                }
             }
         } else if (mCompiledExecutor) {
             mCompiledExecutor->set_phase_arenas(nullptr);
@@ -1054,6 +1063,48 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // Resize split-attention segment graph storage when dimensions change
         if (mCompiledForward && mCompiledBackward) {
             mCompiledExecutor->resize_segment_graphs(*mCompiledForward, *mCompiledBackward);
+        }
+    }
+}
+
+void GraphExecutor::dump_simplified_activation_offsets() {
+    if (!mCompiledForward) return;
+
+    static constexpr const char* kSlotNames[] = {
+        "ln1_rstd",
+        "ln1",
+        "ln2_rstd",
+        "ln2",
+        "q_rstd",
+        "k_rstd",
+        "qkv",
+        "qkv_rope",
+        "lse",
+        "att",
+        "att_out",
+        "residual_att",
+        "mlp_up",
+        "swiglu",
+        "mlp_down",
+        "h_out",
+    };
+
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+    std::cerr << "[act-offsets] fwd_stack_arena_bytes=" << mPhaseArenas.fwd_stack_bytes << "\n";
+    for (int L = 0; L < num_layers; ++L) {
+        const std::string prefix = "blocks[" + std::to_string(L) + "].";
+        for (const char* slot : kSlotNames) {
+            const std::string name = prefix + slot;
+            const int tid = mCompiledForward->find_tensor_id(name);
+            if (tid < 0) continue;
+            const auto& meta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
+            std::cerr << "[act-offsets] L=" << L << " slot=" << slot << " tid=" << tid
+                      << " region=" << dsl::region_kind_name(meta.region);
+            if (meta.offset != SIZE_MAX)
+                std::cerr << " offset=" << meta.offset;
+            else
+                std::cerr << " offset=UNASSIGNED";
+            std::cerr << " bytes=" << meta.bytes << "\n";
         }
     }
 }

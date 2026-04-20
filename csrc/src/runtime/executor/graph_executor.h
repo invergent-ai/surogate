@@ -443,6 +443,14 @@ private:
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);
+
+    /// Phase 4 M3 groundwork. Dumps per-layer (slot, tid, region, offset,
+    /// bytes) for the simplified-activation canonical names. Consumed
+    /// when SUROGATE_DEBUG_ACT_OFFSETS=1. Runs once per (B,T) recompile.
+    /// Intent: let us see exactly how the per-frame coloring colors
+    /// the slots we'd need to migrate, before designing the runtime
+    /// frame discipline.
+    void dump_simplified_activation_offsets();
     void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);
     void execute_backward(long B,
                           long T,
