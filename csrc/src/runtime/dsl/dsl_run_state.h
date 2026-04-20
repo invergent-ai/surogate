@@ -375,7 +375,6 @@ private:
     Tensor mFP8ForwardStats{};
     Tensor mGradQuantStats{};
 
-    // Temporary buffers for recomputation (to avoid overwriting saved activations)
     std::unique_ptr<modules::FP8ScalingState> mFP8ScalingState;
 
     std::unique_ptr<modules::ResidualManager> mResidualManager;
