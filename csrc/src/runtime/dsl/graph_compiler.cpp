@@ -1770,6 +1770,147 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
     }
 }
 
+// ============================================================================
+// Shadow-mode Layout (design/buffer-runtime-v4.md, M3)
+// ============================================================================
+
+namespace {
+
+struct LayoutInfo {
+    std::size_t bytes = 0;
+    std::size_t first_use = SIZE_MAX;
+    std::size_t last_use = 0;
+    bool live = false;  ///< Produced or consumed by an op in this graph
+};
+
+std::size_t bytes_for_ref(const TensorRef& ref) {
+    if (ref.shape.empty()) return 0;
+    std::size_t elems = 1;
+    for (long d : ref.shape) {
+        if (d <= 0) return 0;  // unresolved / placeholder
+        elems *= static_cast<std::size_t>(d);
+    }
+    return elems * static_cast<std::size_t>(get_dtype_size(ref.dtype));
+}
+
+/// Max-clique-sum over a frame's tids: at each op index, sum bytes of tids
+/// whose lifetime covers that index. For 1D interval graphs this IS the
+/// optimal peak achievable by any coloring.
+std::size_t frame_optimal_peak(const std::vector<int>& tids,
+                               const std::vector<LayoutInfo>& info,
+                               std::size_t frame_first,
+                               std::size_t frame_last) {
+    if (tids.empty() || frame_last < frame_first) return 0;
+    std::size_t peak = 0;
+    for (std::size_t t = frame_first; t <= frame_last; ++t) {
+        std::size_t live = 0;
+        for (int tid : tids) {
+            const auto& ti = info[static_cast<std::size_t>(tid)];
+            if (ti.first_use <= t && t <= ti.last_use) {
+                live += ti.bytes;
+            }
+        }
+        peak = std::max(peak, live);
+    }
+    return peak;
+}
+
+std::string fmt_bytes(std::size_t b) {
+    std::ostringstream os;
+    if (b >= (1ULL << 30)) {
+        os << (b / double(1ULL << 30)) << "GB";
+    } else if (b >= (1ULL << 20)) {
+        os << (b / double(1ULL << 20)) << "MB";
+    } else if (b >= (1ULL << 10)) {
+        os << (b / double(1ULL << 10)) << "KB";
+    } else {
+        os << b << "B";
+    }
+    return os.str();
+}
+
+}  // namespace
+
+void GraphCompiler::compute_layout(CompiledGraph& graph, bool is_backward) {
+    const std::size_t num_tids = static_cast<std::size_t>(graph.num_tensors);
+    std::vector<LayoutInfo> info(num_tids);
+
+    for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+        const auto& op = graph.ops[i];
+        auto visit = [&](const TensorRef& ref) {
+            if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
+            auto& ti = info[static_cast<std::size_t>(ref.tensor_id)];
+            ti.first_use = std::min(ti.first_use, i);
+            ti.last_use = std::max(ti.last_use, i);
+            ti.live = true;
+            if (ti.bytes == 0) {
+                ti.bytes = bytes_for_ref(ref);
+            }
+        };
+        for (const auto& ref : op.inputs)
+            visit(ref);
+        for (const auto& ref : op.outputs)
+            visit(ref);
+    }
+
+    const std::size_t num_layers = graph.layer_start_indices.size();
+    std::vector<std::vector<int>> fwd_frame(num_layers);
+    std::vector<std::vector<int>> bwd_frame(num_layers);
+
+    std::size_t persistent_bytes = 0;
+    std::size_t accumulator_bytes = 0;
+
+    for (std::size_t tid = 0; tid < num_tids; ++tid) {
+        const auto& meta = graph.tensor_meta[tid];
+        const auto& ti = info[tid];
+        if (!ti.live || ti.bytes == 0) continue;
+        switch (meta.region) {
+            case RegionKind::Persistent: persistent_bytes += ti.bytes; break;
+            case RegionKind::Accumulator: accumulator_bytes += ti.bytes; break;
+            case RegionKind::FwdStack:
+                if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
+                    fwd_frame[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
+                }
+                break;
+            case RegionKind::BwdStack:
+                if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
+                    bwd_frame[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
+                }
+                break;
+            default: break;
+        }
+    }
+
+    auto frame_peaks = [&](const std::vector<std::vector<int>>& frames) -> std::pair<std::size_t, std::size_t> {
+        std::size_t naive_max = 0;
+        std::size_t optimal_max = 0;
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            const auto s = graph.layer_start_indices[L];
+            const auto e = graph.layer_end_indices[L];
+            if (s == SIZE_MAX || e == SIZE_MAX || s >= e) continue;
+            std::size_t naive = 0;
+            for (int tid : frames[L])
+                naive += info[static_cast<std::size_t>(tid)].bytes;
+            naive_max = std::max(naive_max, naive);
+            optimal_max = std::max(optimal_max, frame_optimal_peak(frames[L], info, s, e - 1));
+        }
+        return {naive_max, optimal_max};
+    };
+
+    auto [fwd_naive, fwd_optimal] = frame_peaks(fwd_frame);
+    auto [bwd_naive, bwd_optimal] = frame_peaks(bwd_frame);
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[layout] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):\n"
+                      << "  Persistent   = " << fmt_bytes(persistent_bytes) << "\n"
+                      << "  Accumulator  = " << fmt_bytes(accumulator_bytes) << "\n"
+                      << "  FwdStack     = " << fmt_bytes(fwd_optimal) << " (naive " << fmt_bytes(fwd_naive) << ")\n"
+                      << "  BwdStack     = " << fmt_bytes(bwd_optimal) << " (naive " << fmt_bytes(bwd_naive) << ")\n";
+        }
+    }
+}
+
 void CompiledGraph::compute_layer_segments() {
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
@@ -4307,6 +4448,10 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Derive shadow-mode region assignment (design/buffer-runtime-v4.md, M2).
     // Runs after classify_tensors so TensorMeta::kind is populated.
     derive_regions(result, is_backward);
+
+    // Shadow-mode layout peaks (design/buffer-runtime-v4.md, M3). Uses regions
+    // from M2 plus per-tid lifetimes to compute per-region peak bytes.
+    compute_layout(result, is_backward);
 
     // ========================================================================
     // Detect MLP tile groups for long-context tiled execution

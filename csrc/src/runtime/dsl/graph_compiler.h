@@ -602,6 +602,15 @@ private:
     /// read TensorMeta::region to bake buffer offsets.
     void derive_regions(CompiledGraph& graph, bool is_backward);
 
+    /// Shadow-mode layout peaks (design/buffer-runtime-v4.md, M3). For each
+    /// region, computes how many bytes the phase-tree layout would consume:
+    ///   - Persistent, Accumulator: sum of tensor bytes
+    ///   - FwdStack, BwdStack: per-block-frame max-clique-sum (the optimal
+    ///     peak achievable by 1D-interval coloring), then max over frames
+    /// No offsets are materialized; M4+ will bake them when the layout is
+    /// actually consumed. Dump gated on `SUROGATE_DEBUG_LAYOUT=1`.
+    void compute_layout(CompiledGraph& graph, bool is_backward);
+
     // Shape validation methods
     struct TensorShape {
         std::vector<long> dims;
