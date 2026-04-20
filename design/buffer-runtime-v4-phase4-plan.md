@@ -511,6 +511,26 @@ went from cudaMalloc fallback to arena-first). Flag stays
 default-off; step 0 bit-identical under it but step 1+
 train_step_graphed replay breaks.
 
+**Fix shipped** (`4da0ae2`): 256 MiB replay-persist arena
+replaces `cudaMallocAsync` in both persist loops. Base pointer
+is stable across captures/replays; bump offset resets at each
+replay entry (via `clear_replay_copied_refs`) and at each
+`execute_forward` start. Eliminates the capture-time
+cudaMallocAsync pointer-baking issue. Step 0 under the flag
+stays bit-identical on all 4 architectures.
+
+**Remaining step-1 drift (separate correctness bug)**: even with
+CUDA graphs disabled (`use_cuda_graphs: false`), `SUROGATE_RSTD_ON_STACK=1`
+produces correct step 0 but drifts at step 1+ (loss 1.6168 vs
+default 1.6171, norm 2.2963 vs 2.3032). Step 0 weights update
+differently from the default path — implies the backward pass
+is seeing subtly wrong rstd values. Likely forward-replay
+regeneration doesn't exactly match the original forward. This is
+a deeper correctness issue independent of the graph-capture
+mechanism; needs instrumented tracing of replay-regenerated rstd
+values vs default-path mAllocator-held values to diagnose. Flag
+stays default-off.
+
 Memory cost bookkeeping from gradient-sharing removal: ~1.3 GB added
 to recompute-enabled peak on Qwen3-0.6B bf16 LoRA (5 single-buffer
 slots × 27 extra layers × 8 MB + ~208 MB from d_mlp_down alternating
