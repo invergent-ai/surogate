@@ -62,8 +62,20 @@ public:
     void rebase_stack_to_external(std::byte* ptr, std::size_t bytes);
 
     /// Restore Stack to the previously-owned mStackBuffer. Inverse of
-    /// rebase_stack_to_external. Stack must be empty.
+    /// rebase_stack_to_external. Stack must be empty. Fails if the original
+    /// was freed via free_allocator_stack_buffer.
     void unbind_external_stack();
+
+    /// Free the TensorAllocator-owned Stack buffer allocated at construction.
+    /// After this call, unbind_external_stack is invalid — Stack must stay on
+    /// the external buffer for the rest of this DslRunState's lifetime.
+    /// Typically called right after rebase_stack_to_external + adopt_external_stack.
+    void free_allocator_stack_buffer();
+
+    /// Take ownership of an externally-rebased Stack buffer. The buffer is
+    /// cudaFree'd in ~DslRunState, outliving any GraphExecutor that handed it
+    /// over. Only call after rebase_stack_to_external.
+    void adopt_external_stack(std::byte* ptr, std::size_t bytes);
 
     /// Reallocate the DSL stack at `new_size_bytes`, freeing the old buffer
     /// first so VRAM is actually reclaimed (otherwise `TensorAllocator`
@@ -328,6 +340,11 @@ private:
     std::shared_ptr<TensorAllocator> mAllocator;
     DslRuntimeConfig mRuntimeConfig;
     Tensor mStackBuffer{};
+
+    // If non-null, DslRunState owns this buffer and cudaFree's it in ~dtor.
+    // Set by adopt_external_stack when GraphExecutor transfers the Stack arena.
+    std::byte* mOwnedExternalStack = nullptr;
+    std::size_t mOwnedExternalStackBytes = 0;
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
     bool mPrequantized = false;

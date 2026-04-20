@@ -315,18 +315,10 @@ GraphExecutor::GraphExecutor(const Module& module,
 }
 
 GraphExecutor::~GraphExecutor() {
-    // If Stack was rebased to the arena, restore it before releasing the
-    // arena so mRunState's Stack doesn't end up with a dangling pointer.
-    if (mStackRebasedToArena) {
-        try {
-            mRunState.unbind_external_stack();
-        } catch (...) {
-            // best-effort: if Stack has live allocations we can't unbind,
-            // better to skip and accept a dangling pointer than to crash.
-        }
-        mStackRebasedToArena = false;
-    }
-    // Release phase-tree arenas (M5.d), if allocated.
+    // Stack arena (if rebased) is owned by DslRunState — adopted buffer
+    // persists past this destructor and is cudaFree'd in ~DslRunState.
+    // release_phase_arenas below skips unified_stack_ptr because ownership
+    // was transferred (the pointer is null in mPhaseArenas after adopt).
     dsl::release_phase_arenas(mPhaseArenas);
     // Clean up CUDA graphs
     if (mForwardGraph) {
@@ -952,12 +944,11 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // the existing Stack capacity). This is the first subsystem flip to
         // actually route Qwen3's runtime allocations through an arena buffer.
 
-        // Unbind Stack from arena before releasing (arena may be about to
-        // shrink/grow; holding a dangling pointer is unsafe).
-        if (mStackRebasedToArena) {
-            mRunState.unbind_external_stack();
-            mStackRebasedToArena = false;
-        }
+        // Stack was rebased + adopted by DslRunState in a prior compile; keep
+        // it there across (B,T) recompiles. The adopted buffer is owned by
+        // DslRunState and survives arena release. We do NOT unbind (that
+        // would need the original TensorAllocator-backed buffer, which was
+        // freed after the adopt — see below).
         dsl::release_phase_arenas(mPhaseArenas);
         if (const char* env = std::getenv("SUROGATE_USE_PHASE_ARENAS")) {
             if (std::string(env) == "1" && mCompiledForward && mCompiledBackward) {
@@ -981,11 +972,19 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mCompiledExecutor) {
                     mCompiledExecutor->set_phase_arenas(&mPhaseArenas);
                 }
-                // Rebase Stack onto the unified_stack arena. Stack must be
-                // empty here (post-compile, pre-step boundary).
-                if (want_stack_flip && mPhaseArenas.unified_stack_ptr != nullptr) {
+                // Rebase Stack onto the unified_stack arena on the first
+                // (B,T) where the flag is on. Stack must be empty here
+                // (post-compile, pre-step boundary). Transfer ownership to
+                // DslRunState and free the original Stack buffer so total
+                // memory doesn't double. On subsequent recompiles the
+                // adopted buffer persists — no re-rebase needed.
+                if (want_stack_flip && !mStackRebasedToArena && mPhaseArenas.unified_stack_ptr != nullptr) {
                     mRunState.rebase_stack_to_external(mPhaseArenas.unified_stack_ptr,
                                                        mPhaseArenas.unified_stack_bytes);
+                    mRunState.adopt_external_stack(mPhaseArenas.unified_stack_ptr, mPhaseArenas.unified_stack_bytes);
+                    mPhaseArenas.unified_stack_ptr = nullptr;
+                    mPhaseArenas.unified_stack_bytes = 0;
+                    mRunState.free_allocator_stack_buffer();
                     mStackRebasedToArena = true;
                 }
             } else if (mCompiledExecutor) {

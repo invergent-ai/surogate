@@ -395,6 +395,12 @@ DslRunState::~DslRunState() {
         (void)cudaFreeHost(mMoEStatsHost);
         mMoEStatsHost = nullptr;
     }
+    // Free any phase-arena Stack buffer we adopted ownership of.
+    if (mOwnedExternalStack) {
+        (void)cudaFree(mOwnedExternalStack);
+        mOwnedExternalStack = nullptr;
+        mOwnedExternalStackBytes = 0;
+    }
 }
 
 void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark) {
@@ -426,6 +432,26 @@ void DslRunState::unbind_external_stack() {
         throw std::runtime_error("DslRunState::unbind_external_stack: no original stack buffer");
     }
     Stack = DeviceMemoryStack(mStackBuffer.Data, static_cast<std::size_t>(mStackBuffer.bytes()), DeviceId);
+}
+
+void DslRunState::free_allocator_stack_buffer() {
+    if (!mStackBuffer.Data) return;
+    mAllocator->free(mStackBuffer);
+    mStackBuffer = Tensor{};
+}
+
+void DslRunState::adopt_external_stack(std::byte* ptr, std::size_t bytes) {
+    if (!ptr || bytes == 0) {
+        throw std::runtime_error("DslRunState::adopt_external_stack: invalid buffer");
+    }
+    // Free any previously-adopted buffer first.
+    if (mOwnedExternalStack) {
+        cudaFree(mOwnedExternalStack);
+        mOwnedExternalStack = nullptr;
+        mOwnedExternalStackBytes = 0;
+    }
+    mOwnedExternalStack = ptr;
+    mOwnedExternalStackBytes = bytes;
 }
 
 void DslRunState::resize_stack_to(long new_size_bytes) {
