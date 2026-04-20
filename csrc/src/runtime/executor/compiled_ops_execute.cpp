@@ -1049,7 +1049,76 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     for (const auto& tg : graph.mlp_tile_groups) {
         tile_group_starts[tg.start_op_idx] = &tg;
     }
-    for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
+
+    // Stream-driven forward execution (M5.d, flag-gated pass-through mode).
+    // Minimal: no split-attention, no watch tensor, no MLP tiling — intended
+    // as a bit-identical proof for 1-layer Llama. Reuses today's allocator,
+    // stack, and op dispatch; drives them from graph.instruction_stream
+    // instead of the flat ops list + op.layer_start/end flags.
+    const char* stream_env = std::getenv("SUROGATE_USE_PHASE_INTERPRETER");
+    const bool stream_driven = stream_env && std::string(stream_env) == "1" && !graph.instruction_stream.empty() &&
+                               !mSplitAttentionGraphs && !mCapturing;
+    if (stream_driven) {
+        if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
+            if (std::string(env) == "1") {
+                std::cerr << "[phase-interp] forward: stream-driven (" << graph.instruction_stream.size()
+                          << " instructions)\n";
+            }
+        }
+        for (const auto& inst : graph.instruction_stream) {
+            switch (inst.kind) {
+                case dsl::InstKind::PhaseEnter:
+                    if (inst.phase_kind == dsl::PhaseKind::FwdBlock && inst.block_index >= 0) {
+                        const int L = inst.block_index;
+                        if (L < num_layers && !layer_active[static_cast<std::size_t>(L)]) {
+                            layer_checkpoints[static_cast<std::size_t>(L)] = mRunState.Stack.checkpoint();
+                            layer_temp_marks[static_cast<std::size_t>(L)] = mTemps.size();
+                            layer_active[static_cast<std::size_t>(L)] = 1;
+                        }
+                        handle_layer_start(L);
+                        mCurrentLayer = L;
+                    }
+                    break;
+                case dsl::InstKind::SegmentDispatch:
+                    for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
+                        if (!full && !graph.required_mask.empty() && !graph.required_mask[i]) continue;
+                        const auto& op = graph.ops[i];
+                        if (!op.fn) continue;
+                        op.fn(*this, op, static_cast<const void*>(hook));
+                    }
+                    break;
+                case dsl::InstKind::PruneByLastUse:
+                    // Pass-through mode: pruning happens at PhaseExit for FwdBlock,
+                    // matching today's layer_end semantics. Per-segment pruning is
+                    // a future optimization.
+                    break;
+                case dsl::InstKind::PhaseExit:
+                    if (inst.phase_kind == dsl::PhaseKind::FwdBlock && inst.block_index >= 0) {
+                        const int L = inst.block_index;
+                        if (L < num_layers && layer_active[static_cast<std::size_t>(L)]) {
+                            if (mDebugDumpLayerFn) mDebugDumpLayerFn(L);
+                            if (mConfig.NumExperts > 0) save_moe_layer_tensors(L);
+                            persist_saved_layer_tensors(L);
+                            mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
+                            if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
+                                mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
+                            }
+                            prune_stack_tensors();
+                            if (mRunState.ffn_temps_on_stack()) {
+                                auto& acts = mRunState.simplified_acts(L);
+                                acts.mlp_up.Data = nullptr;
+                                acts.swiglu.Data = nullptr;
+                            }
+                            layer_active[static_cast<std::size_t>(L)] = 0;
+                        }
+                        handle_layer_end(L);
+                    }
+                    break;
+            }
+        }
+    }
+
+    for (std::size_t idx = 0; !stream_driven && idx < graph.ops.size(); ++idx) {
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
             continue;
         }
