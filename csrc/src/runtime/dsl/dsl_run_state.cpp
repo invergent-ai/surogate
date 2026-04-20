@@ -703,14 +703,22 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         } else {
             acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
         }
-        acts.ln1 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
+        if (rstd_on_stack) {
+            acts.ln1 = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
+        } else {
+            acts.ln1 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
+        }
 
         if (rstd_on_stack) {
             acts.ln2_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T});
         } else {
             acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
         }
-        acts.ln2 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
+        if (rstd_on_stack) {
+            acts.ln2 = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
+        } else {
+            acts.ln2 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
+        }
 
         if (use_qk_norm) {
             if (rstd_on_stack) {
@@ -764,7 +772,11 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         // block's final h_out separate from the MLP's mlp_down so the
         // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
         // dependency that drives MLP LoRA gradients).
-        acts.h_out = mAllocator->allocate(dtype, tag(TensorSlot::BlockHOut), kind, {B, T, C});
+        if (rstd_on_stack) {
+            acts.h_out = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
+        } else {
+            acts.h_out = mAllocator->allocate(dtype, tag(TensorSlot::BlockHOut), kind, {B, T, C});
+        }
 
         if (NumExperts > 0) {
             const long num_tokens = B * T;

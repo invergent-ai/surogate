@@ -1087,10 +1087,17 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // slots under SUROGATE_RSTD_ON_STACK. Covers ln1, ln2, and qk-norm
     // rstd slots — all same-layer producer/consumer, FP32, small shape.
     const bool bypass_named_for_rstd = [&]() {
-        if (ref.slot != TensorSlot::BlockLN1RSTD && ref.slot != TensorSlot::BlockLN2RSTD &&
-            ref.slot != TensorSlot::BlockQRSTD && ref.slot != TensorSlot::BlockKRSTD &&
-            ref.slot != TensorSlot::BlockLSE && ref.slot != TensorSlot::BlockAttOut) {
-            return false;
+        switch (ref.slot) {
+            case TensorSlot::BlockLN1RSTD:
+            case TensorSlot::BlockLN2RSTD:
+            case TensorSlot::BlockQRSTD:
+            case TensorSlot::BlockKRSTD:
+            case TensorSlot::BlockLSE:
+            case TensorSlot::BlockLN1:
+            case TensorSlot::BlockLN2:
+            case TensorSlot::BlockAttOut:
+            case TensorSlot::BlockHOut: break;
+            default: return false;
         }
         static const bool enabled = []() {
             const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
