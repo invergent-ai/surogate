@@ -790,13 +790,7 @@ void GraphExecutor::init_compiled_execution() {
                     return resolved;
                 }
             }
-            TensorSlot slot = builtin_slot_from_name(base_name);
-            if (slot == TensorSlot::Mapped && base_name.size() >= 5 &&
-                base_name.compare(base_name.size() - 5, 5, "_flat") == 0) {
-                base_name = base_name.substr(0, base_name.size() - 5);
-                slot = builtin_slot_from_name(base_name);
-                is_flat = true;
-            }
+            TensorSlot slot = resolve_slot_with_flat(base_name, &is_flat);
             if (slot != TensorSlot::Mapped && slot != TensorSlot::FreqCis) {
                 if (Tensor* base = global_activation_ptr(mRunState, slot); base && base->Data) {
                     Tensor resolved = *base;
