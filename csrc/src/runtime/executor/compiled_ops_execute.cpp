@@ -2358,7 +2358,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         // recompute trigger misses them. Detect the op's
                         // effective layer from its inputs/outputs and fire
                         // recompute there. Idempotent via mLastRecomputeLayer.
-                        if (mRecomputeEnabled && mRecomputeFn) {
+                        if (std::getenv("SUROGATE_DISABLE_PEROP_RECOMPUTE") == nullptr && mRecomputeEnabled &&
+                            mRecomputeFn) {
                             const int non_grad_layer = op_layer_idx(op);
                             const int any_layer = op_layer_idx_any(op);
                             const int effective_layer_idx = (non_grad_layer >= 0) ? non_grad_layer : any_layer;
