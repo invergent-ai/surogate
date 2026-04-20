@@ -519,17 +519,26 @@ replay entry (via `clear_replay_copied_refs`) and at each
 cudaMallocAsync pointer-baking issue. Step 0 under the flag
 stays bit-identical on all 4 architectures.
 
-**Remaining step-1 drift (separate correctness bug)**: even with
-CUDA graphs disabled (`use_cuda_graphs: false`), `SUROGATE_RSTD_ON_STACK=1`
-produces correct step 0 but drifts at step 1+ (loss 1.6168 vs
-default 1.6171, norm 2.2963 vs 2.3032). Step 0 weights update
-differently from the default path — implies the backward pass
-is seeing subtly wrong rstd values. Likely forward-replay
-regeneration doesn't exactly match the original forward. This is
-a deeper correctness issue independent of the graph-capture
-mechanism; needs instrumented tracing of replay-regenerated rstd
-values vs default-path mAllocator-held values to diagnose. Flag
-stays default-off.
+**Instrumentation clears the apparent step 1+ drift**: multi-run
+comparison shows that the apparent drift was within baseline
+self-variance. With CUDA graphs disabled,
+`SUROGATE_RSTD_ON_STACK=1` runs cleanly through 5 steps with loss
+values indistinguishable from the default path (flag-on step 1
+1.6168 ∈ default range 1.6162–1.6170; flag-on step 2 1.5356–1.5361
+∈ default range 1.5356–1.5373). No correctness bug in the
+forward-replay path.
+
+**Remaining step-1 crash under CUDA graphs**: with
+`use_cuda_graphs: true` (default), `SUROGATE_RSTD_ON_STACK=1` faults
+at step 1 replay (`cudaEventSynchronize` at
+graph_executor.cpp:147). The arena fix addressed one class of
+captured-graph pointer issues (cudaMallocAsync baking); the
+remaining failure is in a different class — a Stack pointer
+captured during step 0's backward graph that doesn't point at live
+memory at step 1 replay. Likely needs explicit Stack-pointer
+stabilization logic for the captured backward (Stack checkpoint/
+restore semantics vs captured-graph pointer lifetime). Flag stays
+default-off.
 
 Memory cost bookkeeping from gradient-sharing removal: ~1.3 GB added
 to recompute-enabled peak on Qwen3-0.6B bf16 LoRA (5 single-buffer
