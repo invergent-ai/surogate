@@ -2349,6 +2349,30 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         const auto& op = graph.ops[i];
                         if (skip_logits_grad && is_logits_grad_op(op)) continue;
                         if (!op.fn) continue;
+
+                        // Per-op recompute trigger (MoE fix): mirrors the
+                        // flat-ops backward at lines 2600-2621. Some backward
+                        // ops live OUTSIDE any BwdBlock phase-tree bucket
+                        // (e.g., GPT-OSS's LM-head + MoE EP dispatch path in
+                        // the backward Prologue), so a PhaseEnter-only
+                        // recompute trigger misses them. Detect the op's
+                        // effective layer from its inputs/outputs and fire
+                        // recompute there. Idempotent via mLastRecomputeLayer.
+                        if (mRecomputeEnabled && mRecomputeFn) {
+                            const int non_grad_layer = op_layer_idx(op);
+                            const int any_layer = op_layer_idx_any(op);
+                            const int effective_layer_idx = (non_grad_layer >= 0) ? non_grad_layer : any_layer;
+                            if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
+                                if (effective_layer_idx < num_layers &&
+                                    !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
+                                    clear_shared_grads(effective_layer_idx);
+                                    layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;
+                                }
+                                mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
+                                mLastRecomputeLayer = effective_layer_idx;
+                            }
+                        }
+
                         op.fn(*this, op, static_cast<const void*>(hook));
                         // LM-head post-dispatch cleanup: free the d_logits payload
                         // after the first matmul_backward (see line ~2372 comment).
