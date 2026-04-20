@@ -493,6 +493,7 @@ enum class InstKind : std::uint8_t {
     PhaseExit,        ///< Exit a phase (stack restore if FwdBlock/BwdBlock).
     SegmentDispatch,  ///< Execute ops [op_start, op_end); graph-captured or eager.
     PruneByLastUse,   ///< Release tensors whose last-use falls in [op_start, op_end).
+    RecomputeBlock,   ///< Replay forward block (block_index) into FwdStack before backward dispatch.
 };
 
 const char* inst_kind_name(InstKind k);

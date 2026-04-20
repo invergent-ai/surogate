@@ -2236,10 +2236,20 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             clear_shared_grads(L);
                             layer_seen_any[static_cast<std::size_t>(L)] = true;
                         }
-                        if (mRecomputeEnabled && mRecomputeFn && L != mLastRecomputeLayer) {
-                            mRecomputeFn(L, mB, mT, mRecomputeUseGraphs);
-                            mLastRecomputeLayer = L;
-                        }
+                        // Phase 3 subsystem #7 flip: recompute moved out of
+                        // PhaseEnter into the explicit RecomputeBlock
+                        // instruction emitted immediately after.
+                    }
+                    break;
+
+                case dsl::InstKind::RecomputeBlock:
+                    // Phase 3 subsystem #7: explicit forward-block replay for
+                    // gradient-checkpointed backward. No-op when recompute is
+                    // off. Idempotent per block via mLastRecomputeLayer.
+                    if (mRecomputeEnabled && mRecomputeFn && inst.block_index >= 0 &&
+                        inst.block_index != mLastRecomputeLayer) {
+                        mRecomputeFn(inst.block_index, mB, mT, mRecomputeUseGraphs);
+                        mLastRecomputeLayer = inst.block_index;
                     }
                     break;
 

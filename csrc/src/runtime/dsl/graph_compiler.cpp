@@ -1846,6 +1846,7 @@ const char* inst_kind_name(InstKind k) {
         case InstKind::PhaseExit: return "PhaseExit";
         case InstKind::SegmentDispatch: return "SegmentDispatch";
         case InstKind::PruneByLastUse: return "PruneByLastUse";
+        case InstKind::RecomputeBlock: return "RecomputeBlock";
     }
     return "?";
 }
@@ -1854,6 +1855,13 @@ namespace {
 
 void emit_phase(std::vector<Instruction>& out, const PhaseNode& node) {
     out.push_back({InstKind::PhaseEnter, node.kind, node.block_index, node.op_start, node.op_end, false});
+
+    // Phase 3 subsystem #7: emit RecomputeBlock inside BwdBlock leaves so the
+    // forward-replay dispatch is explicit rather than inlined in PhaseEnter.
+    // Always emitted; the interpreter no-ops when mRecomputeEnabled is false.
+    if (node.kind == PhaseKind::BwdBlock && node.block_index >= 0) {
+        out.push_back({InstKind::RecomputeBlock, node.kind, node.block_index, node.op_start, node.op_end, false});
+    }
 
     if (node.children.empty()) {
         // Leaf phase: the ops in [op_start, op_end) are executed here. For M4
@@ -1886,6 +1894,8 @@ std::string dump_instruction_stream(const std::vector<Instruction>& stream) {
         if (inst.kind == InstKind::PhaseEnter || inst.kind == InstKind::PhaseExit) {
             os << " " << phase_kind_name(inst.phase_kind);
             if (inst.block_index >= 0) os << "[" << inst.block_index << "]";
+        } else if (inst.kind == InstKind::RecomputeBlock) {
+            os << " block=" << inst.block_index;
         } else {
             os << " ops=[" << inst.op_start << ".." << inst.op_end << ")";
             if (inst.kind == InstKind::SegmentDispatch) {
