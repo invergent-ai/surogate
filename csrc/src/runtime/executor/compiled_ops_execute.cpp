@@ -664,6 +664,19 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
     }
 
+    // Layer-boundary bookkeeping. on_fwd_layer_start checkpoints the Stack
+    // and records the temp watermark so layer_end can restore both. Called
+    // from PhaseEnter / flat-ops-loop / tiled-MLP-start paths. The tiled-MLP
+    // end path has simpler cleanup (no MoE save, no stack-slot clears) and
+    // stays inline.
+    auto on_fwd_layer_start = [&](int L) {
+        if (L >= 0 && L < num_layers && !layer_active[static_cast<std::size_t>(L)]) {
+            layer_checkpoints[static_cast<std::size_t>(L)] = mRunState.Stack.checkpoint();
+            layer_temp_marks[static_cast<std::size_t>(L)] = mTemps.size();
+            layer_active[static_cast<std::size_t>(L)] = 1;
+        }
+        if (L >= 0) handle_layer_start(L);
+    };
     auto prune_stack_tensors = [&]() {
         // Prune flat tensor vector using pre-computed metadata (no string parsing)
         for (int id = 0; id < graph.num_tensors; ++id) {
@@ -687,6 +700,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
         }
     };
+
     // Detect if the stream is being captured (either by internal graphs via mCapturing,
     // or by an outer full-step graph from train_step_graphed in py_train.cpp).
     cudaStreamCaptureStatus fwd_capture_status = cudaStreamCaptureStatusNone;
@@ -947,6 +961,30 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
     };
 
+    // Layer-end bookkeeping shared by PhaseExit-FwdBlock and the flat-ops
+    // loop. Persists stack-backed saves before Stack.restore, prunes dead
+    // tensors, clears the per-layer stack-backed slots (rstd / ffn_temps).
+    // Defined here (after persist_saved_layer_tensors) so the capture
+    // resolves. The tiled-MLP path uses a simpler inline variant — no MoE
+    // save, no stack-slot clears — and is intentionally not routed through
+    // this helper.
+    auto on_fwd_layer_end = [&](int L) {
+        if (L >= 0 && L < num_layers && layer_active[static_cast<std::size_t>(L)]) {
+            if (mDebugDumpLayerFn) mDebugDumpLayerFn(L);
+            if (mConfig.NumExperts > 0) save_moe_layer_tensors(L);
+            persist_saved_layer_tensors(L);
+            mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
+            if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
+                mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
+            }
+            prune_stack_tensors();
+            if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
+            if (rstd_on_stack_enabled()) clear_rstd_stack_slots(mRunState, L);
+            layer_active[static_cast<std::size_t>(L)] = 0;
+        }
+        if (L >= 0) handle_layer_end(L);
+    };
+
     // Bind known inputs (into both flat vector and write-through mirror)
     bind_tensor("token_ids", mRunState.Inputs);
     bind_tensor("position_ids", mRunState.PositionIDs);
@@ -1201,14 +1239,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             switch (inst.kind) {
                 case dsl::InstKind::PhaseEnter:
                     if (inst.phase_kind == dsl::PhaseKind::FwdBlock && inst.block_index >= 0) {
-                        const int L = inst.block_index;
-                        if (L < num_layers && !layer_active[static_cast<std::size_t>(L)]) {
-                            layer_checkpoints[static_cast<std::size_t>(L)] = mRunState.Stack.checkpoint();
-                            layer_temp_marks[static_cast<std::size_t>(L)] = mTemps.size();
-                            layer_active[static_cast<std::size_t>(L)] = 1;
-                        }
-                        handle_layer_start(L);
-                        mCurrentLayer = L;
+                        on_fwd_layer_start(inst.block_index);
+                        mCurrentLayer = inst.block_index;
                     }
                     break;
                 case dsl::InstKind::SegmentDispatch: {
@@ -1309,25 +1341,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     break;
                 case dsl::InstKind::PhaseExit:
                     if (inst.phase_kind == dsl::PhaseKind::FwdBlock && inst.block_index >= 0) {
-                        const int L = inst.block_index;
-                        if (L < num_layers && layer_active[static_cast<std::size_t>(L)]) {
-                            if (mDebugDumpLayerFn) mDebugDumpLayerFn(L);
-                            if (mConfig.NumExperts > 0) save_moe_layer_tensors(L);
-                            persist_saved_layer_tensors(L);
-                            mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
-                            if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
-                                mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
-                            }
-                            prune_stack_tensors();
-                            if (mRunState.ffn_temps_on_stack()) {
-                                clear_ffn_temp_stack_slots(mRunState, L);
-                            }
-                            if (rstd_on_stack_enabled()) {
-                                clear_rstd_stack_slots(mRunState, L);
-                            }
-                            layer_active[static_cast<std::size_t>(L)] = 0;
-                        }
-                        handle_layer_end(L);
+                        on_fwd_layer_end(inst.block_index);
                     }
                     break;
             }
@@ -1347,14 +1361,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 // Handle layer start if the first op has one
                 const auto& first_op = graph.ops[tg.start_op_idx];
                 if (first_op.layer_start >= 0) {
-                    if (first_op.layer_start < num_layers &&
-                        !layer_active[static_cast<std::size_t>(first_op.layer_start)]) {
-                        layer_checkpoints[static_cast<std::size_t>(first_op.layer_start)] =
-                            mRunState.Stack.checkpoint();
-                        layer_temp_marks[static_cast<std::size_t>(first_op.layer_start)] = mTemps.size();
-                        layer_active[static_cast<std::size_t>(first_op.layer_start)] = 1;
-                    }
-                    handle_layer_start(first_op.layer_start);
+                    on_fwd_layer_start(first_op.layer_start);
                 }
                 execute_tiled_mlp(graph, tg, mB, mT, hook);
                 // Handle layer end if the last op has one
@@ -1398,12 +1405,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
         // Handle layer boundaries
         if (op.layer_start >= 0) {
-            if (op.layer_start < num_layers && !layer_active[static_cast<std::size_t>(op.layer_start)]) {
-                layer_checkpoints[static_cast<std::size_t>(op.layer_start)] = mRunState.Stack.checkpoint();
-                layer_temp_marks[static_cast<std::size_t>(op.layer_start)] = mTemps.size();
-                layer_active[static_cast<std::size_t>(op.layer_start)] = 1;
-            }
-            handle_layer_start(op.layer_start);
+            on_fwd_layer_start(op.layer_start);
 
             // Split-attention graph mode: pre-dispatch all layer ops via segments.
             // Non-attention segments are captured/replayed as CUDA graphs;
@@ -1594,31 +1596,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
         // Handle layer end
         if (op.layer_end >= 0) {
-            if (op.layer_end < num_layers && layer_active[static_cast<std::size_t>(op.layer_end)]) {
-                // Debug dump per-layer tensors before shared buffers are overwritten.
-                if (mDebugDumpLayerFn) {
-                    mDebugDumpLayerFn(op.layer_end);
-                }
-                if (mConfig.NumExperts > 0) {
-                    save_moe_layer_tensors(op.layer_end);
-                }
-                // Persist stack-backed saved tensors for this layer before the stack is restored.
-                persist_saved_layer_tensors(op.layer_end);
-                mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
-                if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
-                    mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
-                }
-                prune_stack_tensors();
-                if (mRunState.ffn_temps_on_stack()) {
-                    clear_ffn_temp_stack_slots(mRunState, op.layer_end);
-                }
-                if (rstd_on_stack_enabled()) {
-                    clear_rstd_stack_slots(mRunState, op.layer_end);
-                }
-                // Note: cudnn_workspace is persistently allocated, don't clear
-                layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
-            }
-            handle_layer_end(op.layer_end);
+            on_fwd_layer_end(op.layer_end);
         }
     }
 
