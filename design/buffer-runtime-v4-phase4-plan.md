@@ -237,6 +237,53 @@ Each sub-phase lands as its own commit with Qwen3-bf16 bit-identical
 validation before moving on. Phase A should close ~60% of the tids in
 the ceiling-coverage table (the simple per-layer activations).
 
+### Phase A first attempt: ln1_rstd / ln2_rstd — cache-invalidation gap
+
+Attempted the narrowest Phase A slice (ln1_rstd + ln2_rstd only) by
+extending the ffn_temps_on_stack pattern: null-init the slots in
+`allocate_simplified_activations`, rely on `ensure_output_tensor`'s
+`temp_acquire` path to `Stack.allocate` on first access, null the
+`.Data` at every layer_end right after `Stack.restore`. Four layer_end
+cleanup sites patched. Build clean.
+
+Runtime on Qwen3 bf16 under `SUROGATE_RSTD_ON_STACK=1`:
+- Step 0 loss matched baseline (2.0251) — forward pass OK.
+- Step 0 grad norm 0.8512 vs baseline 3.8751 — backward corrupted.
+- Follow-on steps hit `cudaErrorIllegalAddress` from the tensor
+  allocator freeing dangling pointers.
+
+**Root cause.** `store_tensor(ref, buf)` caches the live Tensor
+(pointer and all) into `mTensors[tid]` AND `mNamedTensors[name]`.
+When the Stack-allocated rstd temp is freed at forward end via
+`mTemps.clear` + `Stack.restore`, the cached pointers dangle.
+Forward-replay does re-run the producer op which calls
+`store_tensor` again, but backward's
+`resolve_tensor(op.inputs[4])` hits the stale `mNamedTensors` entry
+BEFORE the cache-refresh runs — `resolve_tensor`'s first branch is
+the named-cache lookup. So backward reads dangling / garbage memory.
+
+`ffn_temps_on_stack` for `mlp_up`/`swiglu` doesn't trip this because
+those slots' backward consumers go through `ensure_output_tensor` on
+the output list (which re-resolves fresh) rather than a stale
+`mNamedTensors` read on the input list. `ln1_rstd`/`ln2_rstd` have
+explicit input refs in `fused_residual_rmsnorm_backward` and hit the
+cache path.
+
+**Phase A prerequisite, therefore:** before migrating any slot whose
+backward consumer reads it via `op.inputs[...]`, the
+`mNamedTensors` and `mTensors[tid]` entries for a Stack-backed slot
+must be INVALIDATED at layer_end — not just `acts.X.Data`. Easiest
+fix: extend each of the four layer_end cleanup blocks to erase the
+cached entries by name/tid before the slot is re-allocated by next
+fwd / forward-replay.
+
+Next session lands the cache-invalidation prerequisite, then
+re-attempts the rstd slice. With that cleared, Phase A proceeds
+slot-by-slot.
+
+Reverted this iteration's code; findings captured here. No code
+shipped.
+
 ### M4 — Persistent & Accumulator arenas
 
 Weights in Persistent, gradients in Accumulator. Replaces `mWeights` / `mGrads` backing. Flip `SUROGATE_USE_PHASE_PERSISTENT=1` on.
