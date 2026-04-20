@@ -7,7 +7,6 @@
 #define SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
 
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "config/rope_config.h"
@@ -45,11 +44,6 @@ struct DslRuntimeConfig {
     /// different head sizes or rope formulas (e.g. Gemma4 full vs sliding).
     std::vector<LayerRoPEConfig> per_layer_rope;
 
-    /// Layer indices whose QKV/qkv_rope activations must be persisted across
-    /// layer boundaries (not shared) because other layers read them as
-    /// kv_source for shared-KV attention.
-    std::unordered_set<int> kv_source_layers;
-
     [[nodiscard]] bool is_moe() const {
         return num_experts > 0;
     }
@@ -58,9 +52,6 @@ struct DslRuntimeConfig {
     }
     [[nodiscard]] bool has_per_layer_rope() const {
         return !per_layer_rope.empty();
-    }
-    [[nodiscard]] bool is_kv_source(int layer_idx) const {
-        return kv_source_layers.count(layer_idx) > 0;
     }
 };
 

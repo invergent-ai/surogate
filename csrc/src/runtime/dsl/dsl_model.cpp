@@ -455,31 +455,6 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
         }
     }
 
-    // Detect KV source layers: scan forward graph ops for cross-layer
-    // qkv_rope references (shared-KV attention reading from a source layer).
-    if (module.forward.has_value()) {
-        const auto& graph = module.forward.value();
-        for (const auto& op : graph.operations) {
-            for (const auto& inp : op.inputs) {
-                int inp_layer = -1;
-                std::string inp_field;
-                if (!internal::parse_block_param(inp, inp_layer, inp_field)) continue;
-                // Match qkv_rope or qkv_rope_N (SSA suffix)
-                if (inp_field.rfind("qkv_rope", 0) != 0 && inp_field != "qkv") continue;
-
-                // Check if this op belongs to a different layer
-                for (const auto& out : op.outputs) {
-                    int out_layer = -1;
-                    std::string out_field;
-                    if (internal::parse_block_param(out, out_layer, out_field) && out_layer != inp_layer) {
-                        runtime.kv_source_layers.insert(inp_layer);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     return runtime;
 }
 
