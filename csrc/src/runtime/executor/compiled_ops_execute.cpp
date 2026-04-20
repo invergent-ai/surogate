@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/core.h>
@@ -649,6 +650,13 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // handles the eager (non-replay) forward path too, preventing monotonic
     // arena growth on runs that never hit the backward-replay path.
     mReplayPersistOffset = 0;
+    // Eagerly allocate the arena BEFORE any CUDA graph capture begins. If we
+    // let allocate_replay_persist() cudaMalloc lazily during backward, the
+    // first cudaMalloc happens inside the captured backward graph — CUDA
+    // stream capture doesn't allow synchronous host allocations, and the
+    // captured graph ends up with a stale pointer. Allocating here (outside
+    // any capture) gives a stable base pointer for all subsequent captures.
+    ensure_replay_persist_arena();
     mCurrentLayer = -1;
     mSegmentDispatchedUntil = 0;
 
@@ -800,15 +808,20 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (!src.Data) {
                 return false;
             }
+            // Skip under forward-stream capture: the cudaMemcpyAsync below
+            // captures src.Data at capture time, but the source lives on the
+            // Stack arena whose contents are regenerated per-step in ways
+            // that can drift the captured pointer. Meta-only save + replay
+            // regen in backward is the capture-safe path.
+            if (fwd_stream_capturing) {
+                return false;
+            }
             const size_t bytes = src.bytes();
             if (bytes == 0) {
                 return false;
             }
             auto buf_it = mMoeSavedBuffers.find(name);
             if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-                if (fwd_stream_capturing) {
-                    return false;
-                }
                 if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }

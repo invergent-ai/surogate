@@ -480,19 +480,23 @@ CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t
     return result;
 }
 
+void CompiledExecutor::ensure_replay_persist_arena() {
+    // 256 MiB is a conservative upper bound — one layer's worth of
+    // stack-backed replay persistence (typically 9 slots × up to 8 MiB for
+    // (B, T, C) bf16 ≈ 40 MiB) plus margin for larger models. Too-large
+    // single requests fall back to caller's cudaMallocAsync. Must be called
+    // OUTSIDE any CUDA stream capture — cudaMalloc during capture is illegal.
+    if (mReplayPersistArena) return;
+    constexpr std::size_t kArenaBytes = 256ull * 1024 * 1024;
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, kArenaBytes));
+    mReplayPersistArena = static_cast<std::byte*>(raw);
+    mReplayPersistCapacity = kArenaBytes;
+}
+
 std::byte* CompiledExecutor::allocate_replay_persist(std::size_t bytes) {
     if (bytes == 0) return nullptr;
-    // Lazy-allocate the arena on first use. 256 MiB is a conservative upper
-    // bound — one layer's worth of stack-backed replay persistence (typically
-    // 9 slots × up to 8 MiB for (B, T, C) bf16 ≈ 40 MiB) plus margin for
-    // larger models. Too-large requests fall back to caller's cudaMallocAsync.
-    if (!mReplayPersistArena) {
-        constexpr std::size_t kArenaBytes = 256ull * 1024 * 1024;
-        void* raw = nullptr;
-        CUDA_CHECK(cudaMalloc(&raw, kArenaBytes));
-        mReplayPersistArena = static_cast<std::byte*>(raw);
-        mReplayPersistCapacity = kArenaBytes;
-    }
+    ensure_replay_persist_arena();
     // 16-byte alignment for the next bump (matches CUDA alignment expectations).
     constexpr std::size_t kAlign = 16;
     const std::size_t aligned_offset = (mReplayPersistOffset + kAlign - 1) & ~(kAlign - 1);

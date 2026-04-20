@@ -537,6 +537,12 @@ private:
     /// (caller falls back to cudaMallocAsync).
     std::byte* allocate_replay_persist(std::size_t bytes);
 
+    /// Pre-allocate the replay-persist arena if not yet allocated. Must be
+    /// called outside any CUDA stream capture (cudaMalloc during capture
+    /// is illegal). Called by execute_forward at step entry so subsequent
+    /// backward capture sees a stable arena base pointer.
+    void ensure_replay_persist_arena();
+
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;
 
