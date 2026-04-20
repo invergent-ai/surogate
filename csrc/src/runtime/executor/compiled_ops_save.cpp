@@ -988,51 +988,16 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     }();
 
     // Phase 4 M2: baked-view shortcut for SaveForBwd tids.
-    //
     // persist_saved_layer_tensors() writes the arena-backed Tensor into
-    // both mNamedTensors[name] (string-keyed) and mTensors[tid] (via
-    // bind_tensor). For tids classified as SaveForBwd we skip the string
-    // hashmap lookup and read from mTensors[tid] directly — the backward
-    // op's first operand resolution no longer pays for a string compare.
-    //
-    // Modes (SUROGATE_BAKED_SAVES, default on):
-    //   unset / "1" / "on"  — baked shortcut, skip mNamedTensors for
-    //                         SaveForBwd tids
-    //   "0" / "off"         — legacy path, mNamedTensors first (rollback)
-    //   "verify"            — shadow: take legacy path, but sanity-check
-    //                         that mTensors[tid].Data == mNamedTensors[name].Data
-    //                         for every SaveForBwd hit; log first mismatch.
-    static const int baked_saves_mode = []() {
-        const char* e = std::getenv("SUROGATE_BAKED_SAVES");
-        if (!e) return 1;  // default: on
-        const std::string v(e);
-        if (v == "1" || v == "on") return 1;
-        if (v == "0" || v == "off") return 0;
-        if (v == "verify") return 2;
-        return 1;
-    }();
-    if (baked_saves_mode != 0 && tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
+    // mTensors[tid] via bind_tensor; reading directly from there skips a
+    // string-keyed hashmap lookup on the backward hot path.
+    if (tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
         const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
         if (meta.region == dsl::RegionKind::SaveForBwd) {
             Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
             if (cached.Data) {
-                if (baked_saves_mode == 2 && !ref.name.empty()) {
-                    auto nit = mNamedTensors.find(ref.name);
-                    if (nit != mNamedTensors.end() && nit->second.Data && nit->second.Data != cached.Data) {
-                        static int mismatch_count = 0;
-                        if (++mismatch_count <= 5) {
-                            fprintf(stderr,
-                                    "[baked-saves verify] MISMATCH %s tid=%d name=%p tid=%p\n",
-                                    ref.name.c_str(),
-                                    tid,
-                                    static_cast<void*>(nit->second.Data),
-                                    static_cast<void*>(cached.Data));
-                        }
-                    }
-                } else if (baked_saves_mode == 1) {
-                    log_tensor(cached, "baked_save");
-                    return cached;
-                }
+                log_tensor(cached, "baked_save");
+                return cached;
             }
         }
     }
