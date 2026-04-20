@@ -577,6 +577,18 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mNamedTensors.clear();
+    // Scrub mSaved entries pointing into the Stack arena. Between steps the
+    // Stack top is reset; any saved Tensor whose Data lived in the Stack is
+    // now a dangling pointer. Persistent (cudaMalloc-backed) saves are
+    // preserved. Without this scrub, replay-layer persistence iterates over
+    // step N-1's stack saves at step N and faults.
+    if (mSaved) {
+        for (auto& [name, tensor] : *mSaved) {
+            if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
+                tensor.Data = nullptr;
+            }
+        }
+    }
     mCurrentLayer = -1;
     mSegmentDispatchedUntil = 0;
 
