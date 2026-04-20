@@ -68,6 +68,35 @@ This is the **big** milestone. Most ops touch activations; all need to read thro
 
 **Validation:** 3-model bit-identical + full benchmark re-run.
 
+**M3 first-strike attempt (not shipped):** Tried narrowly overriding just
+`simplified_acts(L).ln1_rstd.Data` with `fwd_stack_ptr + meta.offset` at
+the end of `ensure_compiled_graphs`, leaving the legacy `mAllocator`
+slot in place. Under `SUROGATE_USE_PHASE_STACK_ARENAS=1 SUROGATE_BAKED_LN1_RSTD=1`:
+
+- Override fired for 28/28 layers on Qwen3, ran end-to-end (no crashes).
+- Step 0 loss matched baseline (2.0251) but gradient norm diverged
+  immediately (2.63 vs 3.87). Training still descended, but the path
+  clearly differed.
+- Under `recompute=false` the override didn't fire: `finalize_save_for_bwd`
+  promoted ln1_rstd from `FwdStack` to `SaveForBwd` (save list includes
+  it), and the override's `region == FwdStack` guard filtered it out.
+
+The divergence is most likely frame-reuse plus forward-replay interaction:
+per-frame coloring gives each layer's ln1_rstd tid its own offset within
+the same 64 MiB arena, so all layers' ln1_rstd writes alias. Legacy
+`mAllocator` gave each layer a distinct buffer. Under forward-replay
+backward, replay runs layer N's forward before layer N backward reads
+ln1_rstd — intended to make the aliasing invisible. Something about
+that interleaving with the specific capture/replay path went wrong; the
+first-strike wasn't enough to diagnose which.
+
+**Takeaway:** M3 can't be a one-slot override with legacy allocator still
+active — the two storage paths coexisting drift. M3 needs to be holistic
+either (a) adopt UnifiedStack for the full simplified activation set in
+one pass, OR (b) route the legacy allocator to allocate INTO the arena
+at the baked offset, so both paths point to the same memory. Option (b)
+has smaller blast radius and is a better first step.
+
 ### M4 — Persistent & Accumulator arenas
 
 Weights in Persistent, gradients in Accumulator. Replaces `mWeights` / `mGrads` backing. Flip `SUROGATE_USE_PHASE_PERSISTENT=1` on.
