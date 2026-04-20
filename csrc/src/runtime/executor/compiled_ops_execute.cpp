@@ -2161,7 +2161,172 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
+    // Stream-driven backward execution (M5.d, flag-gated pass-through mode).
+    // Minimal: no tiled MLP, no capture, no recompute, no bwd_filter / watch /
+    // op_profile — matches the Llama-only scope of the forward stream path.
+    const char* bwd_stream_env = std::getenv("SUROGATE_USE_PHASE_INTERPRETER");
+    const bool bwd_stream_driven = bwd_stream_env && std::string(bwd_stream_env) == "1" &&
+                                   !graph.instruction_stream.empty() && !bwd_stream_capturing &&
+                                   bwd_tile_group_starts.empty();
+    if (bwd_stream_driven) {
+        if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
+            if (std::string(env) == "1") {
+                std::cerr << "[phase-interp] backward: stream-driven (" << graph.instruction_stream.size()
+                          << " instructions)\n";
+            }
+        }
+        for (const auto& inst : graph.instruction_stream) {
+            switch (inst.kind) {
+                case dsl::InstKind::PhaseEnter:
+                    if (inst.phase_kind == dsl::PhaseKind::BwdBlock && inst.block_index >= 0) {
+                        const int L = inst.block_index;
+                        handle_layer_start(L);
+                        if (mGrads.is_streaming_grads()) {
+                            mGrads.prepare_layer_grads(L, mRunState.MainStream);
+                            for (const auto& pname : mGrads.layer_grad_names(L)) {
+                                std::string gname = "d_" + pname;
+                                bool dummy = false;
+                                Tensor* grad = mGrads.get_param_grad(pname, dummy);
+                                if (grad) bind_tensor(gname, *grad);
+                            }
+                        }
+                        if (L < num_layers && !layer_seen_any[static_cast<std::size_t>(L)]) {
+                            clear_shared_grads(L);
+                            layer_seen_any[static_cast<std::size_t>(L)] = true;
+                        }
+                        if (mRecomputeEnabled && mRecomputeFn && L != mLastRecomputeLayer) {
+                            mRecomputeFn(L, mB, mT, mRecomputeUseGraphs);
+                            mLastRecomputeLayer = L;
+                        }
+                    }
+                    break;
+
+                case dsl::InstKind::SegmentDispatch:
+                    for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
+                        const auto& op = graph.ops[i];
+                        if (skip_logits_grad && is_logits_grad_op(op)) continue;
+                        if (!op.fn) continue;
+                        op.fn(*this, op, static_cast<const void*>(hook));
+                        // LM-head post-dispatch cleanup: free the d_logits payload
+                        // after the first matmul_backward (see line ~2372 comment).
+                        if (op.type == CompiledOpType::MatmulBackward && i == 1) {
+                            mRunState.temp_free(mRunState.non_block_activations().output);
+                            mTemps.clear();
+                            initial_checkpoint = mRunState.Stack.checkpoint();
+                        }
+                        prune_by_last_use(i);
+                    }
+                    break;
+
+                case dsl::InstKind::PruneByLastUse:
+                    // Pass-through mode: per-op pruning already happened inside
+                    // SegmentDispatch to match today's backward semantics. The
+                    // phase-level PruneByLastUse is a no-op here.
+                    break;
+
+                case dsl::InstKind::PhaseExit:
+                    if (inst.phase_kind == dsl::PhaseKind::BwdBlock && inst.block_index >= 0) {
+                        const int L = inst.block_index;
+
+                        // BwdCrossLayer persist: for any tid whose last_use is
+                        // past this block but lives on the stack, cudaMalloc +
+                        // memcpy so it survives Stack.restore below. Lifted
+                        // verbatim from the flat-ops loop (~line 2410).
+                        std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
+                        struct PendingPersist {
+                            int tid;
+                            std::byte* ptr;
+                            std::size_t bytes;
+                        };
+                        std::vector<PendingPersist> pending;
+                        const std::size_t block_end = (L < static_cast<int>(graph.layer_end_indices.size()))
+                                                          ? graph.layer_end_indices[static_cast<std::size_t>(L)]
+                                                          : graph.ops.size();
+                        for (const auto& [name, use_idx] : last_use) {
+                            if (use_idx < block_end) continue;
+                            int tid = graph.find_tensor_id(name);
+                            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+                            const auto& t = mTensors[static_cast<std::size_t>(tid)];
+                            if (t.Data && mRunState.Stack.owns(t.Data)) {
+                                pending.push_back({tid, t.Data, t.bytes()});
+                                auto key = reinterpret_cast<std::uintptr_t>(t.Data);
+                                auto it = max_bytes_by_ptr.find(key);
+                                if (it == max_bytes_by_ptr.end())
+                                    max_bytes_by_ptr.emplace(key, t.bytes());
+                                else
+                                    it->second = std::max(it->second, t.bytes());
+                            }
+                        }
+                        if (!pending.empty()) {
+                            std::unordered_map<std::uintptr_t, std::byte*> persistent_by_ptr;
+                            persistent_by_ptr.reserve(max_bytes_by_ptr.size());
+                            for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
+                                if (nbytes == 0) continue;
+                                std::byte* persistent = nullptr;
+                                auto* original = reinterpret_cast<const std::byte*>(ptr_key);
+                                CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&persistent), nbytes));
+                                CUDA_CHECK(cudaMemcpyAsync(persistent,
+                                                           original,
+                                                           nbytes,
+                                                           cudaMemcpyDeviceToDevice,
+                                                           mRunState.MainStream));
+                                persistent_by_ptr.emplace(ptr_key, persistent);
+                                mPersistedBackwardTensors.push_back(persistent);
+                            }
+                            for (const auto& p : pending) {
+                                auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(p.ptr));
+                                if (it == persistent_by_ptr.end()) continue;
+                                release_persisted_backward_tid(p.tid);
+                                persisted_backward_by_tid[p.tid] = it->second;
+                                persisted_backward_refcount[it->second] += 1;
+                                mTensors[static_cast<std::size_t>(p.tid)].Data = it->second;
+                            }
+                            for (auto& [name, tensor] : mNamedTensors) {
+                                if (!tensor.Data) continue;
+                                auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(tensor.Data));
+                                if (it != persistent_by_ptr.end()) tensor.Data = it->second;
+                            }
+                        }
+
+                        handle_layer_end(L);
+                        if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
+
+                        if (mGrads.is_streaming_grads()) {
+                            if (mComm && mComm->world_size() > 1) {
+                                CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                                CUDA_CHECK(
+                                    cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                                mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
+                            }
+                            mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
+                        } else if (mComm && mComm->world_size() > 1) {
+                            CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                            CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                            mGrads.notify_block(L, mRunState.side_stream(), *mComm);
+                        }
+
+                        mRunState.Stack.restore(initial_checkpoint);
+                        mTemps.clear();
+                        prune_stack_tensors(L);
+                        if (mRunState.ffn_temps_on_stack()) {
+                            auto& acts = mRunState.simplified_acts(L);
+                            acts.mlp_up.Data = nullptr;
+                            acts.swiglu.Data = nullptr;
+                        }
+                        if (mRunState.large_bwd_temps_on_stack()) {
+                            auto& gs = mRunState.simplified_grads(L);
+                            gs.d_qkv.Data = nullptr;
+                            gs.d_mlp_up.Data = nullptr;
+                            gs.d_swiglu.Data = nullptr;
+                        }
+                        last_layer_restored = L;
+                    }
+                    break;
+            }
+        }
+    }
+
+    for (std::size_t idx = 0; !bwd_stream_driven && idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
         if (skip_logits_grad && is_logits_grad_op(op)) {
