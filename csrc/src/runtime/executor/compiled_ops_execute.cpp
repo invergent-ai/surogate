@@ -61,9 +61,20 @@ namespace dsl {
 // These patterns repeat 4+ times in the dispatch loop (flat-ops path,
 // SegmentDispatch path, PhaseExit BwdBlock); hoist to file-scope so the
 // slot list stays in sync.
-static void clear_rstd_stack_slots(DslRunState& rs, int L) {
+static void clear_rstd_stack_slots(DslRunState& rs, int L, const char* phase) {
+    static const bool debug = std::getenv("SUROGATE_DEBUG_RSTD_CLEAR") != nullptr;
     auto clear = [&](TensorSlot s) {
-        if (Tensor* t = block_activation_ptr(rs, L, s)) t->Data = nullptr;
+        if (Tensor* t = block_activation_ptr(rs, L, s)) {
+            if (debug && t->Data) {
+                fprintf(stderr,
+                        "[rstd-clear] %s layer=%d slot=%d ptr=%p\n",
+                        phase,
+                        L,
+                        static_cast<int>(s),
+                        static_cast<void*>(t->Data));
+            }
+            t->Data = nullptr;
+        }
     };
     clear(TensorSlot::BlockLN1RSTD);
     clear(TensorSlot::BlockLN2RSTD);
@@ -1009,7 +1020,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             prune_stack_tensors();
             if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
-            clear_rstd_stack_slots(mRunState, L);
+            clear_rstd_stack_slots(mRunState, L, "fwd_end");
             layer_active[static_cast<std::size_t>(L)] = 0;
         }
         if (L >= 0) handle_layer_end(L);
@@ -2508,7 +2519,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mRunState.Stack.restore(initial_checkpoint);
         mTemps.clear();
         prune_stack_tensors(L);
-        clear_rstd_stack_slots(mRunState, L);
+        clear_rstd_stack_slots(mRunState, L, "bwd_end");
         if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
         if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
         last_layer_restored = L;
@@ -2961,6 +2972,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mRunState.Stack.restore(initial_checkpoint);
     prune_stack_tensors(-1);
     mTemps.clear();
+
+    // Per-layer bwd_layer_end_cleanup nulls layer L's Stack-resident slots,
+    // but replay_layer_forward(L) writes blocks[L+1].ln1 / ln1_rstd via the
+    // end-of-layer fused residual+rmsnorm — a cross-layer side effect that
+    // the per-layer clear can't see. Since we process backward in reverse
+    // (27→0), layer L+1's cleanup has already run by the time layer L's
+    // replay pollutes blocks[L+1]. Sweep every layer here so no Stack-range
+    // pointer survives into the optimizer / next step.
+    for (int L = 0; L < static_cast<int>(mConfig.NumLayers); ++L) {
+        clear_rstd_stack_slots(mRunState, L, "bwd_final");
+        if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
+        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
+    }
 
     // Free persisted cross-layer backward tensors
     // Sync main stream first to ensure all consumers have completed
