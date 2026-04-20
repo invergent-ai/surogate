@@ -1083,9 +1083,14 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     };
 
-    // Phase 4 M3 Phase A: bypass mNamedTensors for rstd slots under flag.
+    // Phase 4 M3 Phase A: bypass mNamedTensors for Stack-backed rstd
+    // slots under SUROGATE_RSTD_ON_STACK. Covers ln1, ln2, and qk-norm
+    // rstd slots — all same-layer producer/consumer, FP32, small shape.
     const bool bypass_named_for_rstd = [&]() {
-        if (ref.slot != TensorSlot::BlockLN1RSTD && ref.slot != TensorSlot::BlockLN2RSTD) return false;
+        if (ref.slot != TensorSlot::BlockLN1RSTD && ref.slot != TensorSlot::BlockLN2RSTD &&
+            ref.slot != TensorSlot::BlockQRSTD && ref.slot != TensorSlot::BlockKRSTD) {
+            return false;
+        }
         static const bool enabled = []() {
             const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
             return e && std::string(e) == "1";

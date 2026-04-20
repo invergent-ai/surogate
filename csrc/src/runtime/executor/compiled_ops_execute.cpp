@@ -461,15 +461,15 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             mReplayCopiedBuffers.push_back(persistent);
         }
 
-        // Phase 4 M3 Phase A: rstd slots are Stack-backed under the flag.
-        // The save-capture loop above copies live .Data into mSaved; without
-        // the persist below, that .Data is the Stack pointer which
-        // Stack.restore invalidates. Copy into a persistent cudaMalloc
-        // buffer and rebind BOTH acts.ln{1,2}_rstd AND any mSaved /
-        // mNamedTensors / mTensors entries that captured the old Stack
-        // ptr during the save-capture loop.
+        // Phase 4 M3 Phase A: rstd slots (ln*_rstd, q_rstd, k_rstd) are
+        // Stack-backed under SUROGATE_RSTD_ON_STACK. The save-capture
+        // loop above copies live .Data into mSaved; without the persist
+        // below, that .Data is the Stack pointer which Stack.restore
+        // invalidates. Copy into a persistent cudaMalloc buffer and
+        // rebind BOTH the slot AND any mSaved / mNamedTensors /
+        // mTensors entries that captured the old Stack ptr.
         if (rstd_on_stack_enabled() && layer_idx >= 0) {
-            auto persist_rstd_slot = [&](Tensor& slot, const std::string& slot_name) {
+            auto persist_stack_slot = [&](Tensor& slot, const std::string& slot_name) {
                 if (!slot.Data || slot.bytes() == 0) return;
                 if (!mRunState.Stack.owns(slot.Data)) return;
                 const std::size_t bytes = slot.bytes();
@@ -482,12 +482,6 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                 slot.Data = persistent_bytes_ptr;
                 mReplayCopiedBuffers.push_back(persistent);
 
-                // The save-capture loop above may have written the now-
-                // stale Stack ptr into mSaved / mNamedTensors / mTensors
-                // via block_activation_ptr fallback or direct mTensors
-                // copy. Rebind anything that still points at stack_ptr
-                // to the persistent copy so Stack.restore doesn't strand
-                // them.
                 if (mSaved) {
                     auto it = mSaved->find(slot_name);
                     if (it != mSaved->end() && it->second.Data == stack_ptr) {
@@ -507,8 +501,10 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             };
             auto& acts = mRunState.simplified_acts(layer_idx);
             const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
-            persist_rstd_slot(acts.ln1_rstd, prefix + "ln1_rstd");
-            persist_rstd_slot(acts.ln2_rstd, prefix + "ln2_rstd");
+            persist_stack_slot(acts.ln1_rstd, prefix + "ln1_rstd");
+            persist_stack_slot(acts.ln2_rstd, prefix + "ln2_rstd");
+            persist_stack_slot(acts.q_rstd, prefix + "q_rstd");
+            persist_stack_slot(acts.k_rstd, prefix + "k_rstd");
         }
     }
     // Now safe to restore — stack-resident data has been copied
@@ -1291,6 +1287,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                 auto& acts = mRunState.simplified_acts(L);
                                 acts.ln1_rstd.Data = nullptr;
                                 acts.ln2_rstd.Data = nullptr;
+                                acts.q_rstd.Data = nullptr;
+                                acts.k_rstd.Data = nullptr;
                             }
                             layer_active[static_cast<std::size_t>(L)] = 0;
                         }
@@ -1585,6 +1583,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     auto& acts = mRunState.simplified_acts(op.layer_end);
                     acts.ln1_rstd.Data = nullptr;
                     acts.ln2_rstd.Data = nullptr;
+                    acts.q_rstd.Data = nullptr;
+                    acts.k_rstd.Data = nullptr;
                 }
                 // Note: cudnn_workspace is persistently allocated, don't clear
                 layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
@@ -2455,6 +2455,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             auto& acts = mRunState.simplified_acts(L);
             acts.ln1_rstd.Data = nullptr;
             acts.ln2_rstd.Data = nullptr;
+            acts.q_rstd.Data = nullptr;
+            acts.k_rstd.Data = nullptr;
         }
         if (mRunState.ffn_temps_on_stack()) {
             auto& acts = mRunState.simplified_acts(L);
@@ -2984,6 +2986,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     auto& acts = mRunState.simplified_acts(op.layer_end);
                     acts.ln1_rstd.Data = nullptr;
                     acts.ln2_rstd.Data = nullptr;
+                    acts.q_rstd.Data = nullptr;
+                    acts.k_rstd.Data = nullptr;
                 }
                 if (mRunState.large_bwd_temps_on_stack()) {
                     auto& grads_to_clear = mRunState.simplified_grads(op.layer_end);

@@ -766,13 +766,19 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             plan.share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
 
         if (use_qk_norm) {
-            acts.q_rstd = plan.share_qk_rstd
-                              ? shared_q_rstd
-                              : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
-            acts.k_rstd =
-                plan.share_qk_rstd
-                    ? shared_k_rstd
-                    : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
+            if (rstd_on_stack) {
+                acts.q_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T, Hq});
+                acts.k_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T, Hkv});
+            } else {
+                acts.q_rstd =
+                    plan.share_qk_rstd
+                        ? shared_q_rstd
+                        : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
+                acts.k_rstd =
+                    plan.share_qk_rstd
+                        ? shared_k_rstd
+                        : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
+            }
         } else {
             acts.q_rstd = {};
             acts.k_rstd = {};
