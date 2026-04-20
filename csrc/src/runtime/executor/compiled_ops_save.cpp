@@ -1083,6 +1083,16 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     };
 
+    // Phase 4 M3 Phase A: bypass mNamedTensors for rstd slots under flag.
+    const bool bypass_named_for_rstd = [&]() {
+        if (ref.slot != TensorSlot::BlockLN1RSTD && ref.slot != TensorSlot::BlockLN2RSTD) return false;
+        static const bool enabled = []() {
+            const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
+            return e && std::string(e) == "1";
+        }();
+        return enabled;
+    }();
+
     // Phase 4 M2: baked-view shortcut for SaveForBwd tids.
     //
     // persist_saved_layer_tensors() writes the arena-backed Tensor into
@@ -1137,7 +1147,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }
 
-    if (!ref.name.empty()) {
+    if (!ref.name.empty() && !bypass_named_for_rstd) {
         auto name_it = mNamedTensors.find(ref.name);
         if (name_it != mNamedTensors.end() && name_it->second.Data) {
             log_tensor(name_it->second, "named");

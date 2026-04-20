@@ -745,11 +745,23 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             return builtin_slot_name(s);
         };
 
-        acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
+        const bool rstd_on_stack = []() {
+            const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
+            return e && std::string(e) == "1";
+        }();
+        if (rstd_on_stack) {
+            acts.ln1_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T});
+        } else {
+            acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
+        }
         acts.ln1 =
             plan.share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
 
-        acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
+        if (rstd_on_stack) {
+            acts.ln2_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T});
+        } else {
+            acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
+        }
         acts.ln2 =
             plan.share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
 

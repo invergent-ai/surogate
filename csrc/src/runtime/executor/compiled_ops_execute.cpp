@@ -55,6 +55,15 @@ namespace dsl {
 // regenerate activations. The data lives on the stack; the caller (backward)
 // must restore the stack checkpoint after consuming the data.
 // ---------------------------------------------------------------------------
+
+static bool rstd_on_stack_enabled() {
+    static const bool enabled = []() {
+        const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
+        return e && std::string(e) == "1";
+    }();
+    return enabled;
+}
+
 void CompiledExecutor::replay_layer_forward(int layer_idx,
                                             long B,
                                             long T,
@@ -450,6 +459,56 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             tensor.Data = static_cast<std::byte*>(persistent);
             mReplayCopiedBuffers.push_back(persistent);
+        }
+
+        // Phase 4 M3 Phase A: rstd slots are Stack-backed under the flag.
+        // The save-capture loop above copies live .Data into mSaved; without
+        // the persist below, that .Data is the Stack pointer which
+        // Stack.restore invalidates. Copy into a persistent cudaMalloc
+        // buffer and rebind BOTH acts.ln{1,2}_rstd AND any mSaved /
+        // mNamedTensors / mTensors entries that captured the old Stack
+        // ptr during the save-capture loop.
+        if (rstd_on_stack_enabled() && layer_idx >= 0) {
+            auto persist_rstd_slot = [&](Tensor& slot, const std::string& slot_name) {
+                if (!slot.Data || slot.bytes() == 0) return;
+                if (!mRunState.Stack.owns(slot.Data)) return;
+                const std::size_t bytes = slot.bytes();
+                std::byte* stack_ptr = slot.Data;
+                void* persistent = nullptr;
+                CUDA_CHECK(cudaMallocAsync(&persistent, bytes, mRunState.MainStream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(persistent, stack_ptr, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                auto* persistent_bytes_ptr = static_cast<std::byte*>(persistent);
+                slot.Data = persistent_bytes_ptr;
+                mReplayCopiedBuffers.push_back(persistent);
+
+                // The save-capture loop above may have written the now-
+                // stale Stack ptr into mSaved / mNamedTensors / mTensors
+                // via block_activation_ptr fallback or direct mTensors
+                // copy. Rebind anything that still points at stack_ptr
+                // to the persistent copy so Stack.restore doesn't strand
+                // them.
+                if (mSaved) {
+                    auto it = mSaved->find(slot_name);
+                    if (it != mSaved->end() && it->second.Data == stack_ptr) {
+                        it->second.Data = persistent_bytes_ptr;
+                    }
+                }
+                if (auto nit = mNamedTensors.find(slot_name); nit != mNamedTensors.end()) {
+                    if (nit->second.Data == stack_ptr) nit->second.Data = persistent_bytes_ptr;
+                }
+                if (mCurrentGraph) {
+                    const int tid = mCurrentGraph->find_tensor_id(slot_name);
+                    if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() &&
+                        mTensors[static_cast<std::size_t>(tid)].Data == stack_ptr) {
+                        mTensors[static_cast<std::size_t>(tid)].Data = persistent_bytes_ptr;
+                    }
+                }
+            };
+            auto& acts = mRunState.simplified_acts(layer_idx);
+            const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+            persist_rstd_slot(acts.ln1_rstd, prefix + "ln1_rstd");
+            persist_rstd_slot(acts.ln2_rstd, prefix + "ln2_rstd");
         }
     }
     // Now safe to restore — stack-resident data has been copied
@@ -1228,6 +1287,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                 acts.mlp_up.Data = nullptr;
                                 acts.swiglu.Data = nullptr;
                             }
+                            if (rstd_on_stack_enabled()) {
+                                auto& acts = mRunState.simplified_acts(L);
+                                acts.ln1_rstd.Data = nullptr;
+                                acts.ln2_rstd.Data = nullptr;
+                                const std::string prefix = "blocks[" + std::to_string(L) + "].";
+                                invalidate_cached_slot(prefix + "ln1_rstd");
+                                invalidate_cached_slot(prefix + "ln2_rstd");
+                            }
                             layer_active[static_cast<std::size_t>(L)] = 0;
                         }
                         handle_layer_end(L);
@@ -1516,6 +1583,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     auto& acts = mRunState.simplified_acts(op.layer_end);
                     acts.mlp_up.Data = nullptr;
                     acts.swiglu.Data = nullptr;
+                }
+                if (rstd_on_stack_enabled()) {
+                    auto& acts = mRunState.simplified_acts(op.layer_end);
+                    acts.ln1_rstd.Data = nullptr;
+                    acts.ln2_rstd.Data = nullptr;
+                    const std::string prefix = "blocks[" + std::to_string(op.layer_end) + "].";
+                    invalidate_cached_slot(prefix + "ln1_rstd");
+                    invalidate_cached_slot(prefix + "ln2_rstd");
                 }
                 // Note: cudnn_workspace is persistently allocated, don't clear
                 layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
@@ -2382,6 +2457,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mRunState.Stack.restore(initial_checkpoint);
         mTemps.clear();
         prune_stack_tensors(L);
+        if (rstd_on_stack_enabled()) {
+            auto& acts = mRunState.simplified_acts(L);
+            acts.ln1_rstd.Data = nullptr;
+            acts.ln2_rstd.Data = nullptr;
+            const std::string prefix = "blocks[" + std::to_string(L) + "].";
+            invalidate_cached_slot(prefix + "ln1_rstd");
+            invalidate_cached_slot(prefix + "ln2_rstd");
+        }
         if (mRunState.ffn_temps_on_stack()) {
             auto& acts = mRunState.simplified_acts(L);
             acts.mlp_up.Data = nullptr;
@@ -2905,6 +2988,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     auto& acts = mRunState.simplified_acts(op.layer_end);
                     acts.mlp_up.Data = nullptr;
                     acts.swiglu.Data = nullptr;
+                }
+                if (rstd_on_stack_enabled()) {
+                    auto& acts = mRunState.simplified_acts(op.layer_end);
+                    acts.ln1_rstd.Data = nullptr;
+                    acts.ln2_rstd.Data = nullptr;
+                    const std::string prefix = "blocks[" + std::to_string(op.layer_end) + "].";
+                    invalidate_cached_slot(prefix + "ln1_rstd");
+                    invalidate_cached_slot(prefix + "ln2_rstd");
                 }
                 if (mRunState.large_bwd_temps_on_stack()) {
                     auto& grads_to_clear = mRunState.simplified_grads(op.layer_end);
