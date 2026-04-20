@@ -461,7 +461,21 @@ private:
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
     const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
     dsl::PhaseArenas* mPhaseArenas = nullptr;             // Non-owning; set via set_phase_arenas
-    std::unordered_set<std::string> mSaveSet;             // Fast lookup for save list
+    // Phase 3 subsystem #4: per-step bump cursor into the bwd_cross_layer arena.
+    // Reset at the start of each backward call; advanced by allocate_bwd_cross_layer.
+    std::size_t mBwdCrossLayerBumpOffset = 0;
+
+    /// Allocate `nbytes` for a backward cross-layer persistence. Uses
+    /// mPhaseArenas.bwd_cross_layer_ptr when bound and sufficient space remains,
+    /// else falls back to cudaMalloc. Returns the buffer pointer via `out` and
+    /// sets `arena_backed` true if the arena was used; caller must add
+    /// cudaMalloc-backed buffers to mPersistedBackwardTensors for later free.
+    struct BwdXLayerAlloc {
+        std::byte* ptr = nullptr;
+        bool arena_backed = false;
+    };
+    BwdXLayerAlloc allocate_bwd_cross_layer(std::size_t nbytes);
+    std::unordered_set<std::string> mSaveSet;  // Fast lookup for save list
     std::vector<LayerForwardPlan>* mForwardPlan = nullptr;
     std::function<void(const std::vector<std::string>&, int)> mDebugDumpFn;
     std::function<void(int)> mDebugDumpLayerFn;

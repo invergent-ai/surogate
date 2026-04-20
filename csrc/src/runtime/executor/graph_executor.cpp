@@ -957,11 +957,17 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     return e && std::string(e) == "1";
                 }();
                 const std::size_t stack_bytes = want_stack_flip ? mRunState.Stack.capacity() : 0;
+                // Phase 3 subsystem #4: bwd_cross_layer arena. Fixed 64 MiB;
+                // the per-step bump resets at backward start. 0 bytes for dense
+                // transformers (typical), < 16 MiB for small-MoE aux-loss.
+                // Interpreter falls back to cudaMalloc if arena is insufficient.
+                const std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
                 dsl::compute_arena_sizes(mPhaseArenas,
                                          *mCompiledForward,
                                          *mCompiledBackward,
                                          static_cast<int>(mConfig.NumLayers),
-                                         stack_bytes);
+                                         stack_bytes,
+                                         bwd_cross_layer_bytes);
                 dsl::allocate_phase_arenas(mPhaseArenas);
                 // Shadow coverage report: of the tids the arena plan claims,
                 // how many actually fit (offset+bytes <= region capacity).

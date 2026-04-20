@@ -1510,6 +1510,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentGraph = &graph;
     mRunState.reset_simplified_gradients();
     mTemps.clear();
+    // Phase 3 subsystem #4: reset per-step bump cursor for bwd_cross_layer arena.
+    mBwdCrossLayerBumpOffset = 0;
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward
@@ -2302,16 +2304,17 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             persistent_by_ptr.reserve(max_bytes_by_ptr.size());
                             for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
                                 if (nbytes == 0) continue;
-                                std::byte* persistent = nullptr;
+                                // Phase 3 subsystem #4: arena-backed bump alloc, falls
+                                // back to cudaMalloc if arena exhausted / unbound.
+                                auto a = allocate_bwd_cross_layer(nbytes);
                                 auto* original = reinterpret_cast<const std::byte*>(ptr_key);
-                                CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&persistent), nbytes));
-                                CUDA_CHECK(cudaMemcpyAsync(persistent,
+                                CUDA_CHECK(cudaMemcpyAsync(a.ptr,
                                                            original,
                                                            nbytes,
                                                            cudaMemcpyDeviceToDevice,
                                                            mRunState.MainStream));
-                                persistent_by_ptr.emplace(ptr_key, persistent);
-                                mPersistedBackwardTensors.push_back(persistent);
+                                persistent_by_ptr.emplace(ptr_key, a.ptr);
+                                if (!a.arena_backed) mPersistedBackwardTensors.push_back(a.ptr);
                             }
                             for (const auto& p : pending) {
                                 auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(p.ptr));
@@ -2680,16 +2683,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             if (nbytes == 0) {
                                 continue;
                             }
-                            std::byte* persistent = nullptr;
+                            // Phase 3 subsystem #4: arena bump alloc + cudaMalloc fallback.
+                            auto a = allocate_bwd_cross_layer(nbytes);
                             auto* original = reinterpret_cast<const std::byte*>(ptr_key);
-                            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&persistent), nbytes));
-                            CUDA_CHECK(cudaMemcpyAsync(persistent,
+                            CUDA_CHECK(cudaMemcpyAsync(a.ptr,
                                                        original,
                                                        nbytes,
                                                        cudaMemcpyDeviceToDevice,
                                                        mRunState.MainStream));
-                            persistent_by_ptr.emplace(ptr_key, persistent);
-                            mPersistedBackwardTensors.push_back(persistent);
+                            persistent_by_ptr.emplace(ptr_key, a.ptr);
+                            if (!a.arena_backed) mPersistedBackwardTensors.push_back(a.ptr);
                         }
 
                         for (const PendingBackwardPersist& pending : pending_persists) {

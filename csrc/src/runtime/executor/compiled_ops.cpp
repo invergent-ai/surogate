@@ -453,6 +453,25 @@ void CompiledExecutor::set_recompute_enabled(bool enabled) {
     mLastRecomputeLayer = -1;
 }
 
+CompiledExecutor::BwdXLayerAlloc CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
+    BwdXLayerAlloc result;
+    if (nbytes == 0) return result;
+    if (mPhaseArenas && mPhaseArenas->allocated && mPhaseArenas->bwd_cross_layer_ptr &&
+        mBwdCrossLayerBumpOffset + nbytes <= mPhaseArenas->bwd_cross_layer_bytes) {
+        result.ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
+        result.arena_backed = true;
+        mBwdCrossLayerBumpOffset += nbytes;
+        return result;
+    }
+    // Fallback: per-step cudaMalloc (today's behavior). Caller pushes to
+    // mPersistedBackwardTensors for free on cleanup.
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, nbytes));
+    result.ptr = static_cast<std::byte*>(raw);
+    result.arena_backed = false;
+    return result;
+}
+
 void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache) {
     mFP8Cache = cache;
 }

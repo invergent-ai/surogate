@@ -774,6 +774,14 @@ struct PhaseArenas {
     std::byte* unified_stack_ptr = nullptr;
     std::size_t unified_stack_bytes = 0;
 
+    // BwdCrossLayer arena (Phase 3 subsystem #4 flip). Bump-allocator destination
+    // for tids produced during backward that survive past their block's layer_end
+    // (d_router_logits for MoE aux-loss, cross-layer d_residuals). Replaces the
+    // per-tid cudaMalloc in today's executor at compiled_ops_execute.cpp:2480 /
+    // my interpreter's PhaseExit BwdBlock handler.
+    std::byte* bwd_cross_layer_ptr = nullptr;
+    std::size_t bwd_cross_layer_bytes = 0;
+
     bool allocated = false;
 };
 
@@ -783,7 +791,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          const CompiledGraph& fwd,
                          const CompiledGraph& bwd,
                          int num_layers,
-                         std::size_t stack_bytes = 0);
+                         std::size_t stack_bytes = 0,
+                         std::size_t bwd_cross_layer_bytes = 0);
 
 /// cudaMalloc all arenas at their computed sizes. arenas.allocated is set to
 /// true on success. Safe to call only after compute_arena_sizes().
