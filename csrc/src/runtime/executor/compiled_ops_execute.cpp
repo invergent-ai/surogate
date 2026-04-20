@@ -625,18 +625,30 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mNamedTensors.clear();
-    // Scrub mSaved entries pointing into the Stack arena. Between steps the
-    // Stack top is reset; any saved Tensor whose Data lived in the Stack is
-    // now a dangling pointer. Persistent (cudaMalloc-backed) saves are
-    // preserved. Without this scrub, replay-layer persistence iterates over
-    // step N-1's stack saves at step N and faults.
+    // Scrub mSaved entries pointing into the Stack arena or the
+    // replay-persist arena. Between steps both are reset — Stack top rolls
+    // back, replay-persist offset rewinds — so any saved Tensor whose Data
+    // lived in either region is now a dangling pointer. Persistent
+    // (cudaMalloc-backed) saves are preserved. Without this scrub, the
+    // next step's replay-layer persistence or backward dispatch iterates
+    // over step N-1's stale pointers and faults / silently reads garbage.
     if (mSaved) {
+        const std::byte* rp_begin = mReplayPersistArena;
+        const std::byte* rp_end = rp_begin + mReplayPersistCapacity;
         for (auto& [name, tensor] : *mSaved) {
-            if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
+            if (!tensor.Data) continue;
+            const bool in_stack = mRunState.Stack.owns(tensor.Data);
+            const bool in_replay_persist = rp_begin && tensor.Data >= rp_begin && tensor.Data < rp_end;
+            if (in_stack || in_replay_persist) {
                 tensor.Data = nullptr;
             }
         }
     }
+    // Reset replay-persist arena bump so step N's replays overwrite step N-1's
+    // slots. clear_replay_copied_refs resets during backward replay; this
+    // handles the eager (non-replay) forward path too, preventing monotonic
+    // arena growth on runs that never hit the backward-replay path.
+    mReplayPersistOffset = 0;
     mCurrentLayer = -1;
     mSegmentDispatchedUntil = 0;
 
