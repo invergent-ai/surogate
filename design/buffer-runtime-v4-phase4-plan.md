@@ -94,8 +94,53 @@ first-strike wasn't enough to diagnose which.
 active — the two storage paths coexisting drift. M3 needs to be holistic
 either (a) adopt UnifiedStack for the full simplified activation set in
 one pass, OR (b) route the legacy allocator to allocate INTO the arena
-at the baked offset, so both paths point to the same memory. Option (b)
-has smaller blast radius and is a better first step.
+at the baked offset, so both paths point to the same memory.
+
+**M3(a) full-slot override attempt (not shipped):** Added
+`migrate_simplified_activations_to_arena()` that walks all 16 dense
+Qwen3 slots × 28 layers and swaps `simplified_acts[L].X.Data` to
+`fwd_stack_ptr + meta.offset`. Under `SUROGATE_USE_PHASE_STACK_ARENAS=1
+SUROGATE_MIGRATE_SIMPLIFIED_ACTS=1`:
+
+- Override fired for 336/392 slot instances (56 missing =
+  non-existent slots for this model, e.g. `qkv_rope` when separate
+  buffer not required). `non_fwd_stack` = 0 (all refs were FwdStack).
+- **Loss was NaN from step 0.** Forward pass itself corrupted.
+
+The failure mode confirms the design's layered contract: per-frame
+coloring colors each frame independently, so same-slot tids across
+layers get offsets that alias in the arena. That aliasing is only
+safe if frames are **sequential + isolated** — the stack-save /
+stack-restore discipline at block boundaries. The legacy `mAllocator`
+gives each layer its own cudaMalloc buffer, so forward accumulates
+N layers' activations into N distinct buffers with no aliasing.
+Simply overriding `.Data` doesn't introduce the stack-save/restore
+discipline, so layer 1's writes clobber layer 0's in-flight data
+while CUDA graph capture still expects per-layer isolated storage.
+
+The correct M3 therefore requires coordinated changes — not just
+pointer swaps. Either:
+
+- **(a-proper) full migration**: add a per-block `Stack.save()` /
+  `Stack.restore()` bracket in `SimplifiedLayerActivations` consumption
+  so arena reuse matches the frame discipline the coloring was built
+  around. Requires touching the executor's block-boundary handling,
+  not just dsl_run_state.
+- **(b-proper) route mAllocator to arena**: less invasive on the
+  executor side — the allocator returns pointers that happen to live
+  inside the arena at baked offsets, but each layer still has its own
+  distinct offset (no aliasing). Memory footprint rises to per-layer
+  × per-slot (not the per-frame-max the arena design gives us), but
+  correctness is free because the legacy allocator invariants stay
+  intact.
+
+(b-proper) reads like "use the arena as an allocator backing store, not
+as a frame-reusable scratch pad" — a smaller conceptual leap from the
+current world. (a-proper) is the design's intended end-state but needs
+the executor-level frame plumbing before the per-slot pointers can be
+trusted. Next session will pick between them based on whether the
+full design-intended memory savings are worth the executor-side work
+today, or if we want to land a bit-identical parity first.
 
 ### M4 — Persistent & Accumulator arenas
 
