@@ -381,7 +381,9 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         std::vector<long> shape;
         ETensorDType dtype = ETensorDType::BF16;
         if (mConfig.NumLayers > 0) {
-            dtype = mRunState.simplified_acts(0).ln1.DType;
+            if (Tensor* ln1 = block_activation_ptr(mRunState, 0, TensorSlot::BlockLN1)) {
+                dtype = ln1->DType;
+            }
         }
 
         // Dispatch the per-slot shape formula. `base_field` at this point has
@@ -1089,43 +1091,20 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
                     ref.shape.size() > 1 ? ref.shape[1] : -1,
                     tid);
         }
-        Tensor* base = nullptr;
-        switch (ref.slot) {
-            case TensorSlot::TokenIDs: base = &rs.Inputs; break;
-            case TensorSlot::PositionIDs: base = &rs.PositionIDs; break;
-            case TensorSlot::Targets: base = &rs.Targets; break;
-            case TensorSlot::Losses: base = &rs.Losses; break;
-            case TensorSlot::DLoss: base = &rs.scratch().cross_entropy_dloss; break;
-            case TensorSlot::FreqCis: base = &rs.rope_freqs(ref.name); break;
-            case TensorSlot::BlockDLN1: base = &rs.simplified_grads(ref.layer_idx).d_ln1; break;
-            case TensorSlot::BlockDQKV: base = &rs.simplified_grads(ref.layer_idx).d_qkv; break;
-            case TensorSlot::BlockDAtt: base = &rs.simplified_grads(ref.layer_idx).d_att; break;
-            case TensorSlot::BlockDSwiGLU: base = &rs.simplified_grads(ref.layer_idx).d_swiglu; break;
-            case TensorSlot::BlockDMLPUp: base = &rs.simplified_grads(ref.layer_idx).d_mlp_up; break;
-            case TensorSlot::BlockDMLPDown: base = &rs.simplified_grads(ref.layer_idx).d_mlp_down; break;
-            case TensorSlot::BlockDLN2: base = &rs.simplified_grads(ref.layer_idx).d_ln2; break;
-            case TensorSlot::BlockDResAtt: base = &rs.simplified_grads(ref.layer_idx).d_res_att; break;
-            case TensorSlot::BlockDAttOut: base = &rs.simplified_grads(ref.layer_idx).d_att_out; break;
-            case TensorSlot::BlockDResFFN: base = &rs.simplified_grads(ref.layer_idx).d_res_ffn; break;
-            case TensorSlot::BlockLN1: base = &rs.simplified_acts(ref.layer_idx).ln1; break;
-            case TensorSlot::BlockLN2: base = &rs.simplified_acts(ref.layer_idx).ln2; break;
-            case TensorSlot::BlockQKV: base = &rs.simplified_acts(ref.layer_idx).qkv; break;
-            case TensorSlot::BlockAtt: base = &rs.simplified_acts(ref.layer_idx).att; break;
-            case TensorSlot::BlockAttOut: base = &rs.simplified_acts(ref.layer_idx).att_out; break;
-            case TensorSlot::BlockMLPUp: base = &rs.simplified_acts(ref.layer_idx).mlp_up; break;
-            case TensorSlot::BlockSwiGLU: base = &rs.simplified_acts(ref.layer_idx).swiglu; break;
-            case TensorSlot::BlockMLPDown: base = &rs.simplified_acts(ref.layer_idx).mlp_down; break;
-            case TensorSlot::BlockRouterLogits: base = &rs.simplified_acts(ref.layer_idx).router_logits; break;
-            case TensorSlot::BlockRouterProbs: base = &rs.simplified_acts(ref.layer_idx).router_probs; break;
-            case TensorSlot::BlockRoutingWeights: base = &rs.simplified_acts(ref.layer_idx).routing_weights; break;
-            case TensorSlot::BlockRoutingIndices: base = &rs.simplified_acts(ref.layer_idx).routing_indices; break;
-            case TensorSlot::BlockPermutedInput: base = &rs.simplified_acts(ref.layer_idx).permuted_input; break;
-            case TensorSlot::BlockScatterIndices: base = &rs.simplified_acts(ref.layer_idx).scatter_indices; break;
-            case TensorSlot::BlockExpertGateUp: base = &rs.simplified_acts(ref.layer_idx).expert_gate_up; break;
-            case TensorSlot::BlockExpertAct: base = &rs.simplified_acts(ref.layer_idx).expert_act; break;
-            case TensorSlot::BlockExpertDown: base = &rs.simplified_acts(ref.layer_idx).expert_down; break;
-            case TensorSlot::BlockMoeOut: base = &rs.simplified_acts(ref.layer_idx).moe_out; break;
-            default: break;
+        // Delegate Block*/MoE*/BlockD*/global slot dispatch to the shared
+        // helpers (same pattern as resolve_tensor at the call site below).
+        // Only Targets / Losses / DLoss / FreqCis need inline handling.
+        Tensor* base = block_activation_ptr(rs, ref.layer_idx, ref.slot);
+        if (!base) base = block_gradient_ptr(rs, ref.layer_idx, ref.slot);
+        if (!base) base = global_activation_ptr(rs, ref.slot);
+        if (!base) {
+            switch (ref.slot) {
+                case TensorSlot::Targets: base = &rs.Targets; break;
+                case TensorSlot::Losses: base = &rs.Losses; break;
+                case TensorSlot::DLoss: base = &rs.scratch().cross_entropy_dloss; break;
+                case TensorSlot::FreqCis: base = &rs.rope_freqs(ref.name); break;
+                default: break;
+            }
         }
         if (base && base->Data) {
             Tensor view = view_for_shape(*base, ref.shape, ref.name);
