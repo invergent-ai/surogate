@@ -185,6 +185,58 @@ Memory win: the Stack already grows `fwd_stack_peak`-tight via coloring;
 we get the full design-intended reuse for free. No separate FwdStack
 arena needed at all — Stack IS the arena.
 
+### Per-slot producer/consumer audit
+
+Audit of `modules::SimplifiedLayerActivations` slots. Drives the staging
+order for the migration — cross-layer slots need `Stack.checkpoint` /
+`Stack.restore` at the right boundary, same-layer slots can use the
+direct `ffn_temps_on_stack` pattern as-is.
+
+| slot           | producer                                  | consumer                            | cross-layer? | migration risk |
+|----------------|-------------------------------------------|-------------------------------------|--------------|----------------|
+| `ln1_rstd`     | fused_residual_rmsnorm                    | fused_residual_rmsnorm (bwd)        | No           | Low            |
+| `ln1`          | fused_residual_rmsnorm output             | —                                   | No           | Low            |
+| `ln2_rstd`     | fused_residual_rmsnorm                    | fused_residual_rmsnorm (bwd)        | No           | Low            |
+| `ln2`          | fused_residual_rmsnorm output             | —                                   | No           | Low            |
+| `q_rstd`       | qkv_qk_norm_rope                          | qkv_qk_norm_rope (bwd)              | No           | Low            |
+| `k_rstd`       | qkv_qk_norm_rope                          | qkv_qk_norm_rope (bwd)              | No           | Low            |
+| `qkv`          | matmul (`AfterQKVProjection` hook)        | attention; qkv_qk_norm_rope         | No           | Low            |
+| `qkv_rope`     | rope / qkv_qk_norm_rope                   | attention; saved for bwd replay     | No           | Low            |
+| `lse`          | attention fwd                             | attention bwd                       | No           | Low            |
+| `att`          | attention fwd                             | att_out matmul; attention bwd       | No           | **Medium**     |
+| `att_out`      | matmul (`AfterAttnOutProjection`)         | residual add; bwd                   | No           | Low            |
+| `residual_att` | fused_residual_rmsnorm (LN2 path)         | LN1[L+1] residual input (bwd)       | **Yes**      | **High**       |
+| `mlp_up`       | matmul_swiglu / matmul hook               | swiglu fwd; bwd recompute           | No           | **Already done** (ffn_temps_on_stack) |
+| `swiglu`       | swiglu kernel                             | mlp_down matmul                     | No           | **Already done** (ffn_temps_on_stack) |
+| `mlp_down`     | matmul (`AfterMLPDownProjection`) / MoE   | bwd grad; Gemma4 `h_out` assign     | Conditional  | Medium (dense), High (MoE) |
+| `h_out`        | Gemma4 block output (post layer_scalar)   | bwd grad                            | No           | Low (Gemma4-only)|
+| MoE group¹     | moe_topk, moe_permute, moe_grouped_gemm_* | moe bwd ops                         | Yes (token permutation) | High |
+
+¹ MoE slots: `router_logits`, `router_probs`, `routing_weights`,
+`routing_indices`, `permuted_input`, `scatter_indices`,
+`expert_gate_up`, `expert_act`, `expert_down`, `moe_out`. Their
+cross-token permutation means they behave differently from
+per-token activations; migrate last.
+
+### Staging order
+
+1. **Phase A (low risk, large payoff):** `ln1_rstd`, `ln1`, `ln2_rstd`,
+   `ln2`, `q_rstd`, `k_rstd`, `qkv`, `qkv_rope`, `lse`, `att_out`, `h_out`.
+   Same-layer only; direct `ffn_temps_on_stack`-style migration.
+2. **Phase B (one cross-layer hop):** `att`, `mlp_down` (dense).
+   Same-layer logically but may have capture-mode quirks. Validate
+   bit-identical per slot before progressing.
+3. **Phase C (true cross-layer):** `residual_att`. Needs
+   `Stack.checkpoint` to survive into the next layer's rmsnorm — this
+   is the first slot that forces the "frame discipline" infrastructure
+   work rather than riding on what exists.
+4. **Phase D (MoE):** all MoE slots together; their token permutation
+   has its own lifetime model distinct from per-token dense activations.
+
+Each sub-phase lands as its own commit with Qwen3-bf16 bit-identical
+validation before moving on. Phase A should close ~60% of the tids in
+the ceiling-coverage table (the simple per-layer activations).
+
 ### M4 — Persistent & Accumulator arenas
 
 Weights in Persistent, gradients in Accumulator. Replaces `mWeights` / `mGrads` backing. Flip `SUROGATE_USE_PHASE_PERSISTENT=1` on.
