@@ -57,14 +57,6 @@ namespace dsl {
 // must restore the stack checkpoint after consuming the data.
 // ---------------------------------------------------------------------------
 
-static bool rstd_on_stack_enabled() {
-    static const bool enabled = []() {
-        const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
-        return e && std::string(e) == "1";
-    }();
-    return enabled;
-}
-
 // Clear-.Data helpers for Stack-backed slots that Stack.restore invalidates.
 // These patterns repeat 4+ times in the dispatch loop (flat-ops path,
 // SegmentDispatch path, PhaseExit BwdBlock); hoist to file-scope so the
@@ -496,14 +488,13 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             tensor.Data = persistent;
         }
 
-        // Phase 4 M3 Phase A: rstd slots (ln*_rstd, q_rstd, k_rstd) are
-        // Stack-backed under SUROGATE_RSTD_ON_STACK. The save-capture
-        // loop above copies live .Data into mSaved; without the persist
-        // below, that .Data is the Stack pointer which Stack.restore
-        // invalidates. Copy into a persistent cudaMalloc buffer and
-        // rebind BOTH the slot AND any mSaved / mNamedTensors /
-        // mTensors entries that captured the old Stack ptr.
-        if (rstd_on_stack_enabled() && layer_idx >= 0) {
+        // Phase 4 M3 Phase A: rstd / ln / attn_out / h_out slots live on
+        // the Stack. The save-capture loop above copies live .Data into
+        // mSaved; without the persist below, that .Data is the Stack
+        // pointer which Stack.restore invalidates. Copy into a persistent
+        // cudaMalloc buffer and rebind BOTH the slot AND any mSaved /
+        // mNamedTensors / mTensors entries that captured the old Stack ptr.
+        if (layer_idx >= 0) {
             auto persist_stack_slot = [&](Tensor& slot, const std::string& slot_name) {
                 if (!slot.Data || slot.bytes() == 0) return;
                 if (!mRunState.Stack.owns(slot.Data)) return;
@@ -1018,7 +1009,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             prune_stack_tensors();
             if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
-            if (rstd_on_stack_enabled()) clear_rstd_stack_slots(mRunState, L);
+            clear_rstd_stack_slots(mRunState, L);
             layer_active[static_cast<std::size_t>(L)] = 0;
         }
         if (L >= 0) handle_layer_end(L);
@@ -2517,7 +2508,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mRunState.Stack.restore(initial_checkpoint);
         mTemps.clear();
         prune_stack_tensors(L);
-        if (rstd_on_stack_enabled()) clear_rstd_stack_slots(mRunState, L);
+        clear_rstd_stack_slots(mRunState, L);
         if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
         if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
         last_layer_restored = L;

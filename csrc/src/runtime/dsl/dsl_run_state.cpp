@@ -462,7 +462,7 @@ void DslRunState::resize_stack_to(long new_size_bytes) {
     // Scrub any simplified_acts / simplified_grads slot whose .Data still
     // points into the old Stack range. The typical shrink-after-warmup path
     // reallocates the Stack buffer at a new cudaMalloc address; cached Stack
-    // pointers from step 0 (e.g., rstd slots under SUROGATE_RSTD_ON_STACK)
+    // pointers from step 0 (e.g., the stack-resident rstd / ln / h_out slots)
     // would dangle otherwise, and faulting code paths (illegal access at step
     // 1 replay) arise whenever the new allocation overlaps the freed region.
     std::byte* const old_base = static_cast<std::byte*>(mStackBuffer.Data);
@@ -737,10 +737,6 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             return builtin_slot_name(s);
         };
 
-        const bool rstd_on_stack = []() {
-            const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
-            return e && std::string(e) == "1";
-        }();
         // Helper: allocate on Stack (via metadata-only Tensor that the
         // executor fills in) or through mAllocator, depending on flag.
         auto stack_or_alloc = [&](TensorSlot slot, bool on_stack, ETensorDType t, std::vector<long> shape) {
@@ -748,14 +744,14 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
                                   : mAllocator->allocate(t, tag(slot), kind, shape);
         };
 
-        stack_or_alloc(TensorSlot::BlockLN1RSTD, rstd_on_stack, ETensorDType::FP32, {B, T});
-        stack_or_alloc(TensorSlot::BlockLN1, rstd_on_stack, dtype, {B, T, C});
-        stack_or_alloc(TensorSlot::BlockLN2RSTD, rstd_on_stack, ETensorDType::FP32, {B, T});
-        stack_or_alloc(TensorSlot::BlockLN2, rstd_on_stack, dtype, {B, T, C});
+        stack_or_alloc(TensorSlot::BlockLN1RSTD, true, ETensorDType::FP32, {B, T});
+        stack_or_alloc(TensorSlot::BlockLN1, true, dtype, {B, T, C});
+        stack_or_alloc(TensorSlot::BlockLN2RSTD, true, ETensorDType::FP32, {B, T});
+        stack_or_alloc(TensorSlot::BlockLN2, true, dtype, {B, T, C});
 
         if (use_qk_norm) {
-            stack_or_alloc(TensorSlot::BlockQRSTD, rstd_on_stack, ETensorDType::FP32, {B, T, Hq});
-            stack_or_alloc(TensorSlot::BlockKRSTD, rstd_on_stack, ETensorDType::FP32, {B, T, Hkv});
+            stack_or_alloc(TensorSlot::BlockQRSTD, true, ETensorDType::FP32, {B, T, Hq});
+            stack_or_alloc(TensorSlot::BlockKRSTD, true, ETensorDType::FP32, {B, T, Hkv});
         } else {
             acts[TensorSlot::BlockQRSTD] = {};
             acts[TensorSlot::BlockKRSTD] = {};
@@ -766,9 +762,9 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             plan.need_separate_qkv_rope ? mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV})
                                         : Tensor{};
 
-        stack_or_alloc(TensorSlot::BlockLSE, rstd_on_stack, ETensorDType::FP32, {B, Hq, T});
+        stack_or_alloc(TensorSlot::BlockLSE, true, ETensorDType::FP32, {B, Hq, T});
         acts[TensorSlot::BlockAtt] = mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
-        stack_or_alloc(TensorSlot::BlockAttOut, rstd_on_stack, dtype, {B, T, C});
+        stack_or_alloc(TensorSlot::BlockAttOut, true, dtype, {B, T, C});
         acts[TensorSlot::BlockResidualAtt] =
             mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
 
@@ -782,7 +778,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         // block's final h_out separate from the MLP's mlp_down so the
         // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
         // dependency that drives MLP LoRA gradients).
-        stack_or_alloc(TensorSlot::BlockHOut, rstd_on_stack, dtype, {B, T, C});
+        stack_or_alloc(TensorSlot::BlockHOut, true, dtype, {B, T, C});
 
         if (NumExperts > 0) {
             const long num_tokens = B * T;

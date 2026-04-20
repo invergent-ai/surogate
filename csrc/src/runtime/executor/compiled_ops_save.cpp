@@ -969,9 +969,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     };
 
-    // Phase 4 M3 Phase A: bypass mNamedTensors for Stack-backed rstd
-    // slots under SUROGATE_RSTD_ON_STACK. Covers ln1, ln2, and qk-norm
-    // rstd slots — all same-layer producer/consumer, FP32, small shape.
+    // Phase 4 M3 Phase A: bypass mNamedTensors for Stack-backed slots.
+    // Covers ln1, ln2, qk-norm rstd, LSE, attn_out and h_out — all
+    // same-layer producer/consumer, FP32/dtype, small shape.
     const bool bypass_named_for_rstd = [&]() {
         switch (ref.slot) {
             case TensorSlot::BlockLN1RSTD:
@@ -982,14 +982,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             case TensorSlot::BlockLN1:
             case TensorSlot::BlockLN2:
             case TensorSlot::BlockAttOut:
-            case TensorSlot::BlockHOut: break;
+            case TensorSlot::BlockHOut: return true;
             default: return false;
         }
-        static const bool enabled = []() {
-            const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
-            return e && std::string(e) == "1";
-        }();
-        return enabled;
     }();
 
     // Phase 4 M2: baked-view shortcut for SaveForBwd tids.
