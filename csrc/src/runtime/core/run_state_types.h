@@ -59,18 +59,6 @@ struct SimplifiedLayerActivations {
 };
 
 /**
- * @brief Optional quantized forward activations used by FP8/int8 matmuls.
- *
- * When matmul_dtype == activation_dtype, these tensors are left empty (Data == nullptr).
- */
-struct SimplifiedLayerQuantActivations {
-    Tensor ln1;     ///< (B, T, C) in matmul_dtype
-    Tensor ln2;     ///< (B, T, C) in matmul_dtype
-    Tensor att;     ///< (B, T, Hq*Hs) in matmul_dtype (shared across layers)
-    Tensor swiglu;  ///< (B, T, D) in matmul_dtype
-};
-
-/**
  * @brief Simplified per-layer activation gradients (for simplified backward path)
  *
  * Mirrors the legacy LLamaRunState per-layer gradient buffers closely enough
