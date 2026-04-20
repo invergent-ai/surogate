@@ -187,6 +187,13 @@ public:
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
     void set_save_list(const std::vector<std::string>* save_list);
+
+    /// Bind phase-tree arenas (M5.d). When set and arenas are allocated,
+    /// persist_saved_layer_tensors writes SaveForBwd tids directly into the
+    /// pre-allocated arena slot instead of cudaMalloc'ing per-name buffers.
+    void set_phase_arenas(dsl::PhaseArenas* arenas) {
+        mPhaseArenas = arenas;
+    }
     void set_forward_plan(std::vector<LayerForwardPlan>* plan) {
         mForwardPlan = plan;
     }
@@ -453,6 +460,7 @@ private:
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4CacheT = nullptr;
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
     const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
+    dsl::PhaseArenas* mPhaseArenas = nullptr;             // Non-owning; set via set_phase_arenas
     std::unordered_set<std::string> mSaveSet;             // Fast lookup for save list
     std::vector<LayerForwardPlan>* mForwardPlan = nullptr;
     std::function<void(const std::vector<std::string>&, int)> mDebugDumpFn;

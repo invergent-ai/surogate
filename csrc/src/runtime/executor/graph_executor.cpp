@@ -947,7 +947,16 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // how many actually fit (offset+bytes <= region capacity).
                 dsl::validate_arena_coverage(mPhaseArenas, *mCompiledForward);
                 dsl::validate_arena_coverage(mPhaseArenas, *mCompiledBackward);
+                // Bind the arena for in-executor consumption (e.g., SaveForBwd
+                // persist writing straight to arena slot instead of cudaMalloc).
+                if (mCompiledExecutor) {
+                    mCompiledExecutor->set_phase_arenas(&mPhaseArenas);
+                }
+            } else if (mCompiledExecutor) {
+                mCompiledExecutor->set_phase_arenas(nullptr);
             }
+        } else if (mCompiledExecutor) {
+            mCompiledExecutor->set_phase_arenas(nullptr);
         }
 
         mCompiledB = B;

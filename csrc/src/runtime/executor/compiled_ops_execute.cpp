@@ -633,6 +633,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                                  contains_ci_local(mConfig.ArchitectureName, "qwen3_5") ||
                                                  contains_ci_local(mConfig.ArchitectureName, "qwen3.5");
 
+    int arena_persists = 0;
+    int cudaMalloc_persists = 0;
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
             return;
@@ -794,29 +796,58 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (bytes == 0) {
                 continue;
             }
-            auto buf_it = mMoeSavedBuffers.find(name);
-            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-                if (fwd_stream_capturing) {
-                    // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
-                    // Skip this tensor — the outer capture warmup or
-                    // prepare_saved_buffers_for_capture should have pre-allocated it.
-                    continue;
+
+            // Arena-backed persist (M5.d): when the phase-tree arenas are
+            // bound and the tid is classified as SaveForBwd, copy directly
+            // into the pre-allocated arena slot instead of cudaMalloc'ing a
+            // per-name persistent buffer. Skips cudaMalloc on the hot path.
+            void* dst_buffer = nullptr;
+            bool used_arena = false;
+            if (mPhaseArenas && mPhaseArenas->allocated && mCurrentGraph) {
+                const int tid = mCurrentGraph->find_tensor_id(name);
+                if (tid >= 0) {
+                    std::byte* arena_ptr = dsl::resolve_tid_in_arena(*mPhaseArenas, *mCurrentGraph, tid);
+                    if (arena_ptr != nullptr) {
+                        const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
+                        if (meta.region == dsl::RegionKind::SaveForBwd && meta.bytes >= bytes) {
+                            dst_buffer = arena_ptr;
+                            used_arena = true;
+                        }
+                    }
                 }
-                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                    CUDA_CHECK(cudaFree(buf_it->second));
-                }
-                void* new_buffer = nullptr;
-                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoeSavedBuffers[name] = new_buffer;
-                mMoeSavedSizes[name] = bytes;
             }
-            void* dst_buffer = mMoeSavedBuffers[name];
+
+            if (!used_arena) {
+                auto buf_it = mMoeSavedBuffers.find(name);
+                if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+                    if (fwd_stream_capturing) {
+                        // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
+                        // Skip this tensor — the outer capture warmup or
+                        // prepare_saved_buffers_for_capture should have pre-allocated it.
+                        continue;
+                    }
+                    if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
+                        CUDA_CHECK(cudaFree(buf_it->second));
+                    }
+                    void* new_buffer = nullptr;
+                    CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+                    mMoeSavedBuffers[name] = new_buffer;
+                    mMoeSavedSizes[name] = bytes;
+                }
+                dst_buffer = mMoeSavedBuffers[name];
+            }
+
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor = src;
             saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
             (*mSaved)[name] = saved_tensor;
             bind_tensor(name, saved_tensor);
             saved_count++;
+            if (used_arena) {
+                ++arena_persists;
+            } else {
+                ++cudaMalloc_persists;
+            }
         }
     };
 
@@ -1410,6 +1441,15 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         mRunState.temp_free(*it);
     }
     mTemps.clear();
+
+    if (arena_persists > 0 || cudaMalloc_persists > 0) {
+        if (const char* env = std::getenv("SUROGATE_DEBUG_ARENA_COVERAGE")) {
+            if (std::string(env) == "1") {
+                std::cerr << "[arena-persist] arena=" << arena_persists << " cudaMalloc=" << cudaMalloc_persists
+                          << "\n";
+            }
+        }
+    }
 
     // Dump requested non-block tensors (e.g. xF/residual_final) after forward.
     // Per-layer block dumps are handled in the layer_end callback above.
