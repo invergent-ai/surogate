@@ -315,6 +315,17 @@ GraphExecutor::GraphExecutor(const Module& module,
 }
 
 GraphExecutor::~GraphExecutor() {
+    // If Stack was rebased to the arena, restore it before releasing the
+    // arena so mRunState's Stack doesn't end up with a dangling pointer.
+    if (mStackRebasedToArena) {
+        try {
+            mRunState.unbind_external_stack();
+        } catch (...) {
+            // best-effort: if Stack has live allocations we can't unbind,
+            // better to skip and accept a dangling pointer than to crash.
+        }
+        mStackRebasedToArena = false;
+    }
     // Release phase-tree arenas (M5.d), if allocated.
     dsl::release_phase_arenas(mPhaseArenas);
     // Clean up CUDA graphs
@@ -935,13 +946,31 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // gated on SUROGATE_USE_PHASE_ARENAS=1 because it adds a second copy
         // of persistent+accumulator memory (no consumer yet). Re-allocate on
         // each (B, T) recompile — sizes may change if shapes change.
+        //
+        // Phase 3 subsystem #3: if SUROGATE_USE_PHASE_STACK=1, additionally
+        // rebase mRunState.Stack onto the unified_stack arena (sized to match
+        // the existing Stack capacity). This is the first subsystem flip to
+        // actually route Qwen3's runtime allocations through an arena buffer.
+
+        // Unbind Stack from arena before releasing (arena may be about to
+        // shrink/grow; holding a dangling pointer is unsafe).
+        if (mStackRebasedToArena) {
+            mRunState.unbind_external_stack();
+            mStackRebasedToArena = false;
+        }
         dsl::release_phase_arenas(mPhaseArenas);
         if (const char* env = std::getenv("SUROGATE_USE_PHASE_ARENAS")) {
             if (std::string(env) == "1" && mCompiledForward && mCompiledBackward) {
+                const bool want_stack_flip = [] {
+                    const char* e = std::getenv("SUROGATE_USE_PHASE_STACK");
+                    return e && std::string(e) == "1";
+                }();
+                const std::size_t stack_bytes = want_stack_flip ? mRunState.Stack.capacity() : 0;
                 dsl::compute_arena_sizes(mPhaseArenas,
                                          *mCompiledForward,
                                          *mCompiledBackward,
-                                         static_cast<int>(mConfig.NumLayers));
+                                         static_cast<int>(mConfig.NumLayers),
+                                         stack_bytes);
                 dsl::allocate_phase_arenas(mPhaseArenas);
                 // Shadow coverage report: of the tids the arena plan claims,
                 // how many actually fit (offset+bytes <= region capacity).
@@ -951,6 +980,13 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // persist writing straight to arena slot instead of cudaMalloc).
                 if (mCompiledExecutor) {
                     mCompiledExecutor->set_phase_arenas(&mPhaseArenas);
+                }
+                // Rebase Stack onto the unified_stack arena. Stack must be
+                // empty here (post-compile, pre-step boundary).
+                if (want_stack_flip && mPhaseArenas.unified_stack_ptr != nullptr) {
+                    mRunState.rebase_stack_to_external(mPhaseArenas.unified_stack_ptr,
+                                                       mPhaseArenas.unified_stack_bytes);
+                    mStackRebasedToArena = true;
                 }
             } else if (mCompiledExecutor) {
                 mCompiledExecutor->set_phase_arenas(nullptr);

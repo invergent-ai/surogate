@@ -766,12 +766,24 @@ struct PhaseArenas {
     std::size_t save_for_bwd_bytes = 0;
     std::vector<std::size_t> save_for_bwd_block_bases;
 
+    // Unified stack arena (Phase 3 subsystem #3 flip). Sized to match today's
+    // DeviceMemoryStack capacity so DslRunState.Stack can be rebased onto this
+    // buffer via set_stack_buffer(). Separate from fwd_stack_bytes /
+    // bwd_stack_bytes because those are block-local coloring peaks and don't
+    // cover non-block ops (LM-head d_logits, embeddings, prologue temps).
+    std::byte* unified_stack_ptr = nullptr;
+    std::size_t unified_stack_bytes = 0;
+
     bool allocated = false;
 };
 
 /// Compute arena sizes from baked offsets in both graphs. Must be called after
 /// finalize_save_for_bwd(). Does NOT cudaMalloc — just populates sizes.
-void compute_arena_sizes(PhaseArenas& arenas, const CompiledGraph& fwd, const CompiledGraph& bwd, int num_layers);
+void compute_arena_sizes(PhaseArenas& arenas,
+                         const CompiledGraph& fwd,
+                         const CompiledGraph& bwd,
+                         int num_layers,
+                         std::size_t stack_bytes = 0);
 
 /// cudaMalloc all arenas at their computed sizes. arenas.allocated is set to
 /// true on success. Safe to call only after compute_arena_sizes().

@@ -436,6 +436,11 @@ private:
     // redirect mTensors[tid] pointers to arena_base + TensorMeta::offset.
     dsl::PhaseArenas mPhaseArenas;
 
+    // Phase 3 subsystem #3 (Stack checkpoint/restore flip): when true,
+    // mRunState.Stack was rebased to mPhaseArenas.unified_stack_ptr and must
+    // be unbound before the arena is released.
+    bool mStackRebasedToArena = false;
+
     void init_compiled_execution();
     void compile_graphs(long B, long T);
     void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);

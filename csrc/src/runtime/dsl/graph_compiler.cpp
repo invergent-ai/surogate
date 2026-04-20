@@ -2254,7 +2254,13 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
 // Phase Arenas (design/buffer-runtime-v4.md, M5.d) — allocation skeleton
 // ============================================================================
 
-void compute_arena_sizes(PhaseArenas& arenas, const CompiledGraph& fwd, const CompiledGraph& bwd, int num_layers) {
+void compute_arena_sizes(PhaseArenas& arenas,
+                         const CompiledGraph& fwd,
+                         const CompiledGraph& bwd,
+                         int num_layers,
+                         std::size_t stack_bytes) {
+    arenas.unified_stack_bytes = stack_bytes;
+
     // Persistent, Accumulator: max across fwd+bwd (they hold weights/grads
     // that outlive both compiles).
     arenas.persistent_bytes = std::max(fwd.persistent_bytes, bwd.persistent_bytes);
@@ -2306,6 +2312,7 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
     cuda_malloc_or_die(&arenas.fwd_stack_ptr, arenas.fwd_stack_bytes, "fwd_stack");
     cuda_malloc_or_die(&arenas.bwd_stack_ptr, arenas.bwd_stack_bytes, "bwd_stack");
     cuda_malloc_or_die(&arenas.save_for_bwd_ptr, arenas.save_for_bwd_bytes, "save_for_bwd");
+    cuda_malloc_or_die(&arenas.unified_stack_ptr, arenas.unified_stack_bytes, "unified_stack");
     arenas.allocated = true;
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
@@ -2314,19 +2321,21 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
                 return b / double(1ULL << 20);
             };
             std::cerr << "[arena] allocated:\n"
-                      << "  Persistent   = " << mb(arenas.persistent_bytes) << " MB @ "
+                      << "  Persistent    = " << mb(arenas.persistent_bytes) << " MB @ "
                       << static_cast<void*>(arenas.persistent_ptr) << "\n"
-                      << "  Accumulator  = " << mb(arenas.accumulator_bytes) << " MB @ "
+                      << "  Accumulator   = " << mb(arenas.accumulator_bytes) << " MB @ "
                       << static_cast<void*>(arenas.accumulator_ptr) << "\n"
-                      << "  FwdStack     = " << mb(arenas.fwd_stack_bytes) << " MB @ "
+                      << "  FwdStack      = " << mb(arenas.fwd_stack_bytes) << " MB @ "
                       << static_cast<void*>(arenas.fwd_stack_ptr) << "\n"
-                      << "  BwdStack     = " << mb(arenas.bwd_stack_bytes) << " MB @ "
+                      << "  BwdStack      = " << mb(arenas.bwd_stack_bytes) << " MB @ "
                       << static_cast<void*>(arenas.bwd_stack_ptr) << "\n"
-                      << "  SaveForBwd   = " << mb(arenas.save_for_bwd_bytes) << " MB @ "
+                      << "  SaveForBwd    = " << mb(arenas.save_for_bwd_bytes) << " MB @ "
                       << static_cast<void*>(arenas.save_for_bwd_ptr) << "\n"
-                      << "  TOTAL        = "
+                      << "  UnifiedStack  = " << mb(arenas.unified_stack_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.unified_stack_ptr) << "\n"
+                      << "  TOTAL         = "
                       << mb(arenas.persistent_bytes + arenas.accumulator_bytes + arenas.fwd_stack_bytes +
-                            arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes)
+                            arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes + arenas.unified_stack_bytes)
                       << " MB\n";
         }
     }
@@ -2433,11 +2442,13 @@ void release_phase_arenas(PhaseArenas& arenas) {
     free_ptr(arenas.fwd_stack_ptr);
     free_ptr(arenas.bwd_stack_ptr);
     free_ptr(arenas.save_for_bwd_ptr);
+    free_ptr(arenas.unified_stack_ptr);
     arenas.persistent_bytes = 0;
     arenas.accumulator_bytes = 0;
     arenas.fwd_stack_bytes = 0;
     arenas.bwd_stack_bytes = 0;
     arenas.save_for_bwd_bytes = 0;
+    arenas.unified_stack_bytes = 0;
     arenas.save_for_bwd_block_bases.clear();
     arenas.allocated = false;
 }

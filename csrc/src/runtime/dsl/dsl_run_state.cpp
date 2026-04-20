@@ -408,6 +408,26 @@ void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::Alloc
     }
 }
 
+void DslRunState::rebase_stack_to_external(std::byte* ptr, std::size_t bytes) {
+    if (!ptr || bytes == 0) {
+        throw std::runtime_error("DslRunState::rebase_stack_to_external: invalid buffer");
+    }
+    if (Stack.bytes_used() != 0) {
+        throw std::runtime_error("DslRunState::rebase_stack_to_external: Stack is not empty");
+    }
+    Stack = DeviceMemoryStack(ptr, bytes, DeviceId);
+}
+
+void DslRunState::unbind_external_stack() {
+    if (Stack.bytes_used() != 0) {
+        throw std::runtime_error("DslRunState::unbind_external_stack: Stack is not empty");
+    }
+    if (!mStackBuffer.Data) {
+        throw std::runtime_error("DslRunState::unbind_external_stack: no original stack buffer");
+    }
+    Stack = DeviceMemoryStack(mStackBuffer.Data, static_cast<std::size_t>(mStackBuffer.bytes()), DeviceId);
+}
+
 void DslRunState::resize_stack_to(long new_size_bytes) {
     if (new_size_bytes <= 0) {
         throw std::runtime_error("DslRunState::resize_stack_to: non-positive size");

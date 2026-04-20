@@ -54,6 +54,17 @@ public:
     /// backward graph is compiled and peak-modelled more accurately).
     void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
 
+    /// Redirect Stack to an externally-owned device buffer (Phase 3 subsystem
+    /// #3 flip: Stack-arena). Does not take ownership — caller must ensure the
+    /// buffer outlives this DslRunState or call unbind_external_stack() first.
+    /// mStackBuffer is unchanged, so unbinding restores the original backing.
+    /// Stack must be empty (no live allocations) at call time.
+    void rebase_stack_to_external(std::byte* ptr, std::size_t bytes);
+
+    /// Restore Stack to the previously-owned mStackBuffer. Inverse of
+    /// rebase_stack_to_external. Stack must be empty.
+    void unbind_external_stack();
+
     /// Reallocate the DSL stack at `new_size_bytes`, freeing the old buffer
     /// first so VRAM is actually reclaimed (otherwise `TensorAllocator`
     /// retains the old allocation until its own destructor runs).
