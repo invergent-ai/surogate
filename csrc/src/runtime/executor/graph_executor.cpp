@@ -943,6 +943,10 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                          *mCompiledBackward,
                                          static_cast<int>(mConfig.NumLayers));
                 dsl::allocate_phase_arenas(mPhaseArenas);
+                // Shadow coverage report: of the tids the arena plan claims,
+                // how many actually fit (offset+bytes <= region capacity).
+                dsl::validate_arena_coverage(mPhaseArenas, *mCompiledForward);
+                dsl::validate_arena_coverage(mPhaseArenas, *mCompiledBackward);
             }
         }
 

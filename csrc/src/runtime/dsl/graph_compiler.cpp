@@ -2124,6 +2124,12 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
             visit(ref);
     }
 
+    // Mirror the sizes onto TensorMeta so later passes (coverage validator,
+    // eventual interpreter) don't need LayoutInfo.
+    for (std::size_t tid = 0; tid < num_tids; ++tid) {
+        graph.tensor_meta[tid].bytes = info[tid].bytes;
+    }
+
     const std::size_t num_layers = graph.layer_start_indices.size();
 
     // Bucket live tids by (region, block). SaveForBwd is treated per-block
@@ -2324,6 +2330,94 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
                       << " MB\n";
         }
     }
+}
+
+std::byte* resolve_tid_in_arena(const PhaseArenas& arenas, const CompiledGraph& graph, int tid) {
+    if (!arenas.allocated || tid < 0 || tid >= graph.num_tensors) return nullptr;
+    const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.offset == SIZE_MAX) return nullptr;
+    switch (meta.region) {
+        case RegionKind::Persistent: return arenas.persistent_ptr + meta.offset;
+        case RegionKind::Accumulator: return arenas.accumulator_ptr + meta.offset;
+        case RegionKind::FwdStack: return arenas.fwd_stack_ptr + meta.offset;  // frame-local offset
+        case RegionKind::BwdStack: return arenas.bwd_stack_ptr + meta.offset;
+        case RegionKind::SaveForBwd:
+            if (meta.block_layer_idx < 0 ||
+                static_cast<std::size_t>(meta.block_layer_idx) >= arenas.save_for_bwd_block_bases.size()) {
+                return nullptr;
+            }
+            return arenas.save_for_bwd_ptr +
+                   arenas.save_for_bwd_block_bases[static_cast<std::size_t>(meta.block_layer_idx)] + meta.offset;
+        default: return nullptr;
+    }
+}
+
+ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledGraph& graph) {
+    ArenaCoverage cov;
+    if (!arenas.allocated) return cov;
+
+    auto region_capacity = [&](RegionKind k) -> std::size_t {
+        switch (k) {
+            case RegionKind::Persistent: return arenas.persistent_bytes;
+            case RegionKind::Accumulator: return arenas.accumulator_bytes;
+            case RegionKind::FwdStack: return arenas.fwd_stack_bytes;
+            case RegionKind::BwdStack: return arenas.bwd_stack_bytes;
+            case RegionKind::SaveForBwd: return arenas.save_for_bwd_bytes;
+            default: return 0;
+        }
+    };
+
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region == RegionKind::Unknown) continue;
+        ++cov.total;
+        if (meta.offset == SIZE_MAX || meta.bytes == 0) continue;
+        switch (meta.region) {
+            case RegionKind::Persistent:
+            case RegionKind::Accumulator:
+            case RegionKind::FwdStack:
+            case RegionKind::BwdStack: {
+                const std::size_t end = meta.offset + meta.bytes;
+                if (end > region_capacity(meta.region)) {
+                    ++cov.size_exceeded;
+                } else {
+                    ++cov.covered;
+                }
+                break;
+            }
+            case RegionKind::SaveForBwd: {
+                if (meta.block_layer_idx < 0) break;
+                const auto L = static_cast<std::size_t>(meta.block_layer_idx);
+                if (L >= arenas.save_for_bwd_block_bases.size()) break;
+                const std::size_t slot_base = arenas.save_for_bwd_block_bases[L];
+                const std::size_t slot_end = (L + 1 < arenas.save_for_bwd_block_bases.size())
+                                                 ? arenas.save_for_bwd_block_bases[L + 1]
+                                                 : arenas.save_for_bwd_bytes;
+                const std::size_t slot_size = slot_end - slot_base;
+                if (meta.offset + meta.bytes > slot_size) {
+                    ++cov.size_exceeded;
+                } else {
+                    ++cov.covered;
+                }
+                break;
+            }
+            default: break;
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_ARENA_COVERAGE")) {
+        if (std::string(env) == "1") {
+            const double pct =
+                cov.total > 0 ? (100.0 * static_cast<double>(cov.covered) / static_cast<double>(cov.total)) : 0.0;
+            std::cerr << "[arena-coverage] " << graph.name << ": " << cov.covered << "/" << cov.total << " tids ("
+                      << pct << "%)";
+            if (cov.size_exceeded > 0) {
+                std::cerr << "  size_exceeded=" << cov.size_exceeded;
+            }
+            std::cerr << "\n";
+        }
+    }
+    return cov;
 }
 
 void release_phase_arenas(PhaseArenas& arenas) {

@@ -400,6 +400,10 @@ struct TensorMeta {
     // SIZE_MAX means "not assigned" (no bytes, or not in current graph).
     std::size_t offset = SIZE_MAX;
 
+    /// Size in bytes of the tid's storage (populated by compute_layout). Zero
+    /// for unassigned / dtype-unresolved tids.
+    std::size_t bytes = 0;
+
     bool is_cross_layer() const {
         return flags & kCrossLayer;
     }
@@ -775,6 +779,28 @@ void allocate_phase_arenas(PhaseArenas& arenas);
 
 /// cudaFree all arenas and reset pointers.
 void release_phase_arenas(PhaseArenas& arenas);
+
+/// Resolve a tid to its arena-backed device pointer (what the pointer WOULD
+/// be if the arena was consumed for this region). Returns nullptr if:
+///   - arenas is not allocated
+///   - tid is out of range
+///   - TensorMeta::region is not an arena-backed region
+///   - TensorMeta::offset is SIZE_MAX (unassigned)
+///   - region is FwdStack/BwdStack but the block_layer_idx is invalid
+/// Caller supplies the block contexts so block-scoped regions resolve to the
+/// correct frame base; pass -1 when outside a block.
+std::byte* resolve_tid_in_arena(const PhaseArenas& arenas, const CompiledGraph& graph, int tid);
+
+/// Shadow-mode validator reporting how well the arena plan covers the graph's
+/// live tids. Self-contained — uses TensorMeta::{region, offset, bytes}
+/// populated by compute_layout(); no runtime state required. Logs when
+/// `SUROGATE_DEBUG_ARENA_COVERAGE=1`.
+struct ArenaCoverage {
+    std::size_t covered = 0;        // tids whose region has an allocated arena slot
+    std::size_t total = 0;          // tids with region != Unknown
+    std::size_t size_exceeded = 0;  // offset+bytes past the arena's capacity
+};
+ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledGraph& graph);
 
 /// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a).
 /// derive_regions() runs per-direction and cannot see across the pair, so
