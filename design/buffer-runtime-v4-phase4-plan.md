@@ -354,6 +354,9 @@ M5 progress.
 | `e887196` | Removed dead `share_res_ffn_grad` + `mSharedDResFFN` (flag was hardcoded false) |
 | `a59df06` | Removed `share_mlp_down_grad` + `mSharedDMlpDown` alternating pair (last gradient-sharing case) |
 | `193acf5` | Removed dead `mRecomputeRstd` / `mRecomputeLSE` buffers (getters had zero callers) |
+| `d8ef2e7` | Added between-step Stack-owned mSaved scrub (defensive; closes latent stale-ptr bug class) |
+| `9656ce3` | Dropped stale recomputation comment on mFP8ScalingState |
+| `70243c6` | Removed dead `TensorSlot::Temporary` enum value + its 6 dead checks across buffer_plan, graph_compiler, compiled_ops_save, fused_residual_rmsnorm |
 
 Net impact: `shared_tag()` + per-layer activation allocator loop +
 all gradient-sharing from the design's M5 kill-list is gone.
@@ -373,7 +376,9 @@ Qwen3.5 dense, GPT-OSS 20B MoE bf16 LoRA, Gemma4 hybrid LoRA.
 
 ### M5 remaining targets
 
-Still on the kill-list from `design/buffer-runtime-v4.md §Phase 4`:
+Still on the kill-list from `design/buffer-runtime-v4.md §Phase 4`
+— each is blocked on architectural changes larger than this
+session's scope:
 
 - `TensorSlot::Block*/MoE*/SSM*` enumerators — widely used (hot-path
   dispatch), multi-session to eliminate; blocking their removal is
@@ -395,6 +400,22 @@ Still on the kill-list from `design/buffer-runtime-v4.md §Phase 4`:
   `BwdCrossLayer` arena miss, not dead
 - `MatmulOp` enum alias — confirmed not dead (actively switched on);
   scratched from the kill-list
+
+### Step-1 crash under `SUROGATE_RSTD_ON_STACK=1`
+
+With `CUDA_LAUNCH_BLOCKING=1` the crash pinpoints to
+`cudaGraphLaunch` at
+[graph_executor_utils.h:144](../csrc/src/runtime/executor/graph_executor_utils.h#L144).
+Root cause is the persist_stack_slot path calling
+`cudaMallocAsync` inside what becomes a captured CUDA graph:
+captured graphs bake the pointer at capture time, but the
+allocation is re-done on each replay — so later captured nodes
+read a stale pointer. This is architectural: the rstd-on-stack
+flag cannot ship until `persist_stack_slot` switches to a
+pre-allocated scratch arena (analogous to how `BwdCrossLayer`
+went from cudaMalloc fallback to arena-first). Flag stays
+default-off; step 0 bit-identical under it but step 1+
+train_step_graphed replay breaks.
 
 Memory cost bookkeeping from gradient-sharing removal: ~1.3 GB added
 to recompute-enabled peak on Qwen3-0.6B bf16 LoRA (5 single-buffer
