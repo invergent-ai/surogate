@@ -395,4 +395,17 @@ TensorSlot builtin_slot_from_name(const std::string& name) {
     return TensorSlot::Mapped;
 }
 
+TensorSlot resolve_slot_with_flat(const std::string& name, bool* out_is_flat_view) {
+    if (out_is_flat_view) *out_is_flat_view = false;
+    TensorSlot slot = builtin_slot_from_name(name);
+    if (slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
+        const TensorSlot base = builtin_slot_from_name(name.substr(0, name.size() - 5));
+        if (base != TensorSlot::Mapped) {
+            if (out_is_flat_view) *out_is_flat_view = true;
+            return base;
+        }
+    }
+    return slot;
+}
+
 }  // namespace dsl

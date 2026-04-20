@@ -282,17 +282,10 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         }
 
         // Global / IO slots via the shared helper. `_flat` aliases aren't in
-        // the static name→slot table (they have distinct 2D shapes) — detect
-        // them by suffix and flatten after resolution.
-        TensorSlot glob_slot = builtin_slot_from_name(name);
+        // the static name→slot table (they have distinct 2D shapes);
+        // `resolve_slot_with_flat` handles the suffix stripping centrally.
         bool name_is_flat = false;
-        if (glob_slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
-            TensorSlot base_slot = builtin_slot_from_name(name.substr(0, name.size() - 5));
-            if (global_activation_ptr(mRunState, base_slot)) {
-                glob_slot = base_slot;
-                name_is_flat = true;
-            }
-        }
+        TensorSlot glob_slot = resolve_slot_with_flat(name, &name_is_flat);
         if (Tensor* t = global_activation_ptr(mRunState, glob_slot)) {
             return name_is_flat ? flatten_2d(*t) : *t;
         }
@@ -464,11 +457,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
     };
     auto is_forced_persist_global = [&](const std::string& n) -> bool {
-        TensorSlot slot = builtin_slot_from_name(n);
-        if (slot == TensorSlot::Mapped && n.size() >= 5 && n.compare(n.size() - 5, 5, "_flat") == 0) {
-            slot = builtin_slot_from_name(n.substr(0, n.size() - 5));
-        }
-        switch (slot) {
+        switch (resolve_slot_with_flat(n)) {
             case TensorSlot::LNFinal:
             case TensorSlot::LNFinalRSTD:
             case TensorSlot::FinalResidual: return true;
@@ -566,10 +555,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             const long T = (mT > 0) ? mT : mRunState.T;
             const long C = mConfig.HiddenSize;
             if (B > 0 && T > 0 && C > 0) {
-                TensorSlot slot = builtin_slot_from_name(name);
-                if (slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
-                    slot = builtin_slot_from_name(name.substr(0, name.size() - 5));
-                }
+                TensorSlot slot = resolve_slot_with_flat(name);
                 const std::size_t elem_bf16 = static_cast<std::size_t>(get_dtype_size(ETensorDType::BF16));
                 std::size_t nbytes = 0;
                 switch (slot) {
@@ -823,11 +809,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     auto is_forced_persist_global = [&](const std::string& n) -> bool {
         // Resolve the slot, honouring `_flat` suffix aliases that aren't in
         // the static name→slot table (they carry their own 2D shape).
-        TensorSlot slot = builtin_slot_from_name(n);
-        if (slot == TensorSlot::Mapped && n.size() >= 5 && n.compare(n.size() - 5, 5, "_flat") == 0) {
-            slot = builtin_slot_from_name(n.substr(0, n.size() - 5));
-        }
-        switch (slot) {
+        switch (resolve_slot_with_flat(n)) {
             case TensorSlot::LNFinal:  // covers xF, ln_final, xF_flat, ln_final_flat
             case TensorSlot::LNFinalRSTD:
             case TensorSlot::FinalResidual: return true;
@@ -911,17 +893,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         // (xF_flat, ln_final_flat, …) carry their own 2D shape in the DSL
         // layout so they're NOT added to the static name→slot table — that
         // would clobber the 2D shape with the 3D parent's shape at compile
-        // time. Handle them here by stripping the suffix and flattening.
-        TensorSlot glob_slot = builtin_slot_from_name(name);
+        // time. `resolve_slot_with_flat` handles the suffix stripping.
         bool is_flat_view = false;
-        if (glob_slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
-            const std::string base_name = name.substr(0, name.size() - 5);
-            TensorSlot base_slot = builtin_slot_from_name(base_name);
-            if (global_activation_ptr(mRunState, base_slot)) {
-                glob_slot = base_slot;
-                is_flat_view = true;
-            }
-        }
+        TensorSlot glob_slot = resolve_slot_with_flat(name, &is_flat_view);
         if (Tensor* t = global_activation_ptr(mRunState, glob_slot)) {
             if (is_flat_view && t->Rank >= 3) {
                 Tensor flat = view_tensor(*t, {t->Sizes[0] * t->Sizes[1], t->Sizes[2]});

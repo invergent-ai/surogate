@@ -1819,11 +1819,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // `d_xN` / `d_residualN` are intentionally not mapped here — those are
     // the backward-input stubs that get computed on-the-fly.
     auto get_target_buffer = [&](const std::string& grad_of) -> Tensor* {
-        TensorSlot slot = builtin_slot_from_name(grad_of);
-        if (slot == TensorSlot::Mapped && grad_of.size() >= 5 && grad_of.compare(grad_of.size() - 5, 5, "_flat") == 0) {
-            slot = builtin_slot_from_name(grad_of.substr(0, grad_of.size() - 5));
-        }
-        switch (slot) {
+        switch (resolve_slot_with_flat(grad_of)) {
             case TensorSlot::LNFinal:
             case TensorSlot::FinalResidual: return &d_ln_final_buf;
             case TensorSlot::Encoded: return &d_embeddings_buf;

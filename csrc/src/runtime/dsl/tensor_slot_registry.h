@@ -137,6 +137,17 @@ const char* builtin_slot_name(TensorSlot slot);
 /// @return TensorSlot::Mapped if not a known slot (will use dynamic lookup)
 TensorSlot builtin_slot_from_name(const std::string& name);
 
+/// Resolve `name` to a TensorSlot, treating a `_flat` suffix as an alias of
+/// the underlying (non-flat) slot when the suffixed name isn't registered
+/// directly. Names like `xF_flat`/`ln_final_flat` carry their own 2D shape in
+/// the DSL layout and aren't in the static name→slot table; this helper makes
+/// them route to the parent slot (LNFinal) while telling the caller via
+/// `*out_is_flat_view` that a 2D view is required.
+///
+/// Returns `TensorSlot::Mapped` if neither the suffixed nor the base name
+/// resolves.
+TensorSlot resolve_slot_with_flat(const std::string& name, bool* out_is_flat_view = nullptr);
+
 }  // namespace dsl
 
 #endif  // SUROGATE_SRC_DSL_TENSOR_SLOT_REGISTRY_H
