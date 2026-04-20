@@ -3,6 +3,8 @@
 
 #include "runtime/dsl/tensor_slot_dispatch.h"
 
+#include <array>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -35,70 +37,103 @@ resolve_block_slot(const std::string& name, int* out_layer_idx, bool* out_is_fla
     return slot;
 }
 
+namespace {
+
+// Member-pointer tables: one entry per TensorSlot enum value. `nullptr` means
+// the slot isn't a block-activation / block-gradient field (globals, params,
+// MoE side-channels, etc.). Member pointers are compile-time constants and
+// survive struct copies — the table doesn't need re-initialization when
+// DslRunState resizes or copies its per-layer vectors.
+//
+// kSlotCount is sized to fit every enum value; must be updated if the enum
+// grows. The static_assert below catches mismatches at compile time.
+constexpr std::size_t kSlotCount = static_cast<std::size_t>(TensorSlot::Mapped) + 1;
+
+using ActMemberPtr = Tensor modules::SimplifiedLayerActivations::*;
+using GradMemberPtr = Tensor modules::SimplifiedLayerGradients::*;
+
+constexpr auto make_activation_table() {
+    std::array<ActMemberPtr, kSlotCount> t{};
+    t[static_cast<std::size_t>(TensorSlot::BlockLN1)] = &modules::SimplifiedLayerActivations::ln1;
+    t[static_cast<std::size_t>(TensorSlot::BlockLN1RSTD)] = &modules::SimplifiedLayerActivations::ln1_rstd;
+    t[static_cast<std::size_t>(TensorSlot::BlockLN2)] = &modules::SimplifiedLayerActivations::ln2;
+    t[static_cast<std::size_t>(TensorSlot::BlockLN2RSTD)] = &modules::SimplifiedLayerActivations::ln2_rstd;
+    t[static_cast<std::size_t>(TensorSlot::BlockQRSTD)] = &modules::SimplifiedLayerActivations::q_rstd;
+    t[static_cast<std::size_t>(TensorSlot::BlockKRSTD)] = &modules::SimplifiedLayerActivations::k_rstd;
+    t[static_cast<std::size_t>(TensorSlot::BlockQKV)] = &modules::SimplifiedLayerActivations::qkv;
+    // BlockQKVRoPE handled specially (conditional fallback to acts.qkv).
+    t[static_cast<std::size_t>(TensorSlot::BlockLSE)] = &modules::SimplifiedLayerActivations::lse;
+    t[static_cast<std::size_t>(TensorSlot::BlockAtt)] = &modules::SimplifiedLayerActivations::att;
+    t[static_cast<std::size_t>(TensorSlot::BlockAttOut)] = &modules::SimplifiedLayerActivations::att_out;
+    t[static_cast<std::size_t>(TensorSlot::BlockResidualAtt)] = &modules::SimplifiedLayerActivations::residual_att;
+    t[static_cast<std::size_t>(TensorSlot::BlockMLPUp)] = &modules::SimplifiedLayerActivations::mlp_up;
+    t[static_cast<std::size_t>(TensorSlot::BlockSwiGLU)] = &modules::SimplifiedLayerActivations::swiglu;
+    t[static_cast<std::size_t>(TensorSlot::BlockMLPDown)] = &modules::SimplifiedLayerActivations::mlp_down;
+    t[static_cast<std::size_t>(TensorSlot::BlockHOut)] = &modules::SimplifiedLayerActivations::h_out;
+    // BlockResidualFFN handled specially (managed residual, not a raw field).
+    t[static_cast<std::size_t>(TensorSlot::BlockRouterLogits)] = &modules::SimplifiedLayerActivations::router_logits;
+    t[static_cast<std::size_t>(TensorSlot::BlockRouterProbs)] = &modules::SimplifiedLayerActivations::router_probs;
+    t[static_cast<std::size_t>(TensorSlot::BlockRoutingWeights)] =
+        &modules::SimplifiedLayerActivations::routing_weights;
+    t[static_cast<std::size_t>(TensorSlot::BlockRoutingIndices)] =
+        &modules::SimplifiedLayerActivations::routing_indices;
+    t[static_cast<std::size_t>(TensorSlot::BlockPermutedInput)] = &modules::SimplifiedLayerActivations::permuted_input;
+    t[static_cast<std::size_t>(TensorSlot::BlockScatterIndices)] =
+        &modules::SimplifiedLayerActivations::scatter_indices;
+    t[static_cast<std::size_t>(TensorSlot::BlockExpertGateUp)] = &modules::SimplifiedLayerActivations::expert_gate_up;
+    t[static_cast<std::size_t>(TensorSlot::BlockExpertAct)] = &modules::SimplifiedLayerActivations::expert_act;
+    t[static_cast<std::size_t>(TensorSlot::BlockExpertDown)] = &modules::SimplifiedLayerActivations::expert_down;
+    t[static_cast<std::size_t>(TensorSlot::BlockMoeOut)] = &modules::SimplifiedLayerActivations::moe_out;
+    return t;
+}
+
+constexpr auto make_gradient_table() {
+    std::array<GradMemberPtr, kSlotCount> t{};
+    t[static_cast<std::size_t>(TensorSlot::BlockDLN1)] = &modules::SimplifiedLayerGradients::d_ln1;
+    t[static_cast<std::size_t>(TensorSlot::BlockDLN2)] = &modules::SimplifiedLayerGradients::d_ln2;
+    t[static_cast<std::size_t>(TensorSlot::BlockDQKV)] = &modules::SimplifiedLayerGradients::d_qkv;
+    t[static_cast<std::size_t>(TensorSlot::BlockDAtt)] = &modules::SimplifiedLayerGradients::d_att;
+    t[static_cast<std::size_t>(TensorSlot::BlockDAttOut)] = &modules::SimplifiedLayerGradients::d_att_out;
+    t[static_cast<std::size_t>(TensorSlot::BlockDMLPUp)] = &modules::SimplifiedLayerGradients::d_mlp_up;
+    t[static_cast<std::size_t>(TensorSlot::BlockDSwiGLU)] = &modules::SimplifiedLayerGradients::d_swiglu;
+    t[static_cast<std::size_t>(TensorSlot::BlockDMLPDown)] = &modules::SimplifiedLayerGradients::d_mlp_down;
+    t[static_cast<std::size_t>(TensorSlot::BlockDHOut)] = &modules::SimplifiedLayerGradients::d_h_out;
+    t[static_cast<std::size_t>(TensorSlot::BlockDResAtt)] = &modules::SimplifiedLayerGradients::d_res_att;
+    t[static_cast<std::size_t>(TensorSlot::BlockDResFFN)] = &modules::SimplifiedLayerGradients::d_res_ffn;
+    return t;
+}
+
+constexpr auto kActivationSlotTable = make_activation_table();
+constexpr auto kGradientSlotTable = make_gradient_table();
+
+}  // namespace
+
 Tensor* block_activation_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
-    if (layer_idx < 0) {
-        return nullptr;
-    }
+    if (layer_idx < 0) return nullptr;
+    const auto idx = static_cast<std::size_t>(slot);
+    if (idx >= kSlotCount) return nullptr;
+
+    // Special cases: BlockQKVRoPE falls back to acts.qkv when qkv_rope isn't
+    // allocated (non-QK-norm path does in-place RoPE). BlockResidualFFN is
+    // owned by the managed residual stream, not a direct struct field.
     auto& acts = rs.simplified_acts(layer_idx);
-    switch (slot) {
-        case TensorSlot::BlockLN1: return &acts.ln1;
-        case TensorSlot::BlockLN1RSTD: return &acts.ln1_rstd;
-        case TensorSlot::BlockLN2: return &acts.ln2;
-        case TensorSlot::BlockLN2RSTD: return &acts.ln2_rstd;
-        case TensorSlot::BlockQRSTD: return &acts.q_rstd;
-        case TensorSlot::BlockKRSTD: return &acts.k_rstd;
-        case TensorSlot::BlockQKV: return &acts.qkv;
-        case TensorSlot::BlockQKVRoPE:
-            // Non-QK-norm attention applies RoPE in-place on acts.qkv, leaving
-            // acts.qkv_rope unallocated. Fall back to acts.qkv so the saved
-            // reference still resolves to the post-RoPE tensor.
-            return acts.qkv_rope.Data ? &acts.qkv_rope : &acts.qkv;
-        case TensorSlot::BlockLSE: return &acts.lse;
-        case TensorSlot::BlockAtt: return &acts.att;
-        case TensorSlot::BlockAttOut: return &acts.att_out;
-        case TensorSlot::BlockResidualAtt: return &acts.residual_att;
-        case TensorSlot::BlockMLPUp: return &acts.mlp_up;
-        case TensorSlot::BlockSwiGLU: return &acts.swiglu;
-        case TensorSlot::BlockMLPDown: return &acts.mlp_down;
-        case TensorSlot::BlockHOut: return &acts.h_out;
-        case TensorSlot::BlockResidualFFN: return &rs.get_residual(layer_idx, rs.MainStream);
-        // MoE activations — populated only when NumExperts > 0. When the
-        // model has no experts these return pointers to empty Tensors (their
-        // `.Data` is nullptr), which callers should treat as "unavailable"
-        // the same way they already do for any lazily-allocated slot.
-        case TensorSlot::BlockRouterLogits: return &acts.router_logits;
-        case TensorSlot::BlockRouterProbs: return &acts.router_probs;
-        case TensorSlot::BlockRoutingWeights: return &acts.routing_weights;
-        case TensorSlot::BlockRoutingIndices: return &acts.routing_indices;
-        case TensorSlot::BlockPermutedInput: return &acts.permuted_input;
-        case TensorSlot::BlockScatterIndices: return &acts.scatter_indices;
-        case TensorSlot::BlockExpertGateUp: return &acts.expert_gate_up;
-        case TensorSlot::BlockExpertAct: return &acts.expert_act;
-        case TensorSlot::BlockExpertDown: return &acts.expert_down;
-        case TensorSlot::BlockMoeOut: return &acts.moe_out;
-        default: return nullptr;
+    if (slot == TensorSlot::BlockQKVRoPE) {
+        return acts.qkv_rope.Data ? &acts.qkv_rope : &acts.qkv;
     }
+    if (slot == TensorSlot::BlockResidualFFN) {
+        return &rs.get_residual(layer_idx, rs.MainStream);
+    }
+    ActMemberPtr member = kActivationSlotTable[idx];
+    return member ? &(acts.*member) : nullptr;
 }
 
 Tensor* block_gradient_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
-    if (layer_idx < 0) {
-        return nullptr;
-    }
-    auto& grads = rs.simplified_grads(layer_idx);
-    switch (slot) {
-        case TensorSlot::BlockDLN1: return &grads.d_ln1;
-        case TensorSlot::BlockDLN2: return &grads.d_ln2;
-        case TensorSlot::BlockDQKV: return &grads.d_qkv;
-        case TensorSlot::BlockDAtt: return &grads.d_att;
-        case TensorSlot::BlockDAttOut: return &grads.d_att_out;
-        case TensorSlot::BlockDMLPUp: return &grads.d_mlp_up;
-        case TensorSlot::BlockDSwiGLU: return &grads.d_swiglu;
-        case TensorSlot::BlockDMLPDown: return &grads.d_mlp_down;
-        case TensorSlot::BlockDHOut: return &grads.d_h_out;
-        case TensorSlot::BlockDResAtt: return &grads.d_res_att;
-        case TensorSlot::BlockDResFFN: return &grads.d_res_ffn;
-        default: return nullptr;
-    }
+    if (layer_idx < 0) return nullptr;
+    const auto idx = static_cast<std::size_t>(slot);
+    if (idx >= kSlotCount) return nullptr;
+    GradMemberPtr member = kGradientSlotTable[idx];
+    if (!member) return nullptr;
+    return &(rs.simplified_grads(layer_idx).*member);
 }
 
 Tensor* global_activation_ptr(DslRunState& rs, TensorSlot slot) {
