@@ -5,7 +5,7 @@
 //
 // Historically, `DslRunState::allocate_simplified_{activations,gradients}`
 // computed per-slot sharing/sizing decisions inline at runtime-init time
-// (re-reading `RuntimeOptions`, querying `TensorSlotRegistry::should_share`,
+// (re-reading `RuntimeOptions`, querying the slot registry's share policy,
 // resolving hybrid dims, etc.). That made the decisions hard to reason about
 // in isolation and mixed policy with mechanism.
 //

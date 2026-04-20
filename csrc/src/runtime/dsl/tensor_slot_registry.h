@@ -106,19 +106,8 @@ public:
     /// @brief Get the share policy for a slot
     SharePolicy get_share_policy(const std::string& name) const;
 
-    /// @brief Determine if a slot should be shared across layers given the current mode
-    /// @param name Tensor name
-    /// @param lora_only_mode True if in LoRA-only mode (not FFT mode)
-    /// @param recompute_enabled True if recompute is enabled
-    /// @return True if the slot should use shared allocation across layers
-    ///
-    /// This method evaluates the slot's share_policy to determine if sharing is safe:
-    /// - PerLayer: Never share (return false)
-    /// - WhenRecomputed: Share only if will_recompute() returns true
-    /// - AlwaysShare: Always share (return true)
-    /// - FFTShare: Share only in FFT mode (when lora_only_mode is false)
-    /// - LoRAShare: Share only in LoRA mode (when lora_only_mode is true)
-    bool should_share(const std::string& name, bool lora_only_mode, bool recompute_enabled) const;
+    // should_share removed (Phase 4 M5): no callers after
+    // BufferPlan::build dropped its share_for lambda.
 
     /// @brief Check if the registry has been initialized from a DSL layout
     bool has_dsl_layout() const {

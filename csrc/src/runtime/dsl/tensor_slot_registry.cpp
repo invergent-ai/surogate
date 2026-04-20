@@ -375,38 +375,9 @@ SharePolicy TensorSlotRegistry::get_share_policy(const std::string& name) const 
     return SharePolicy::PerLayer;  // Default
 }
 
-bool TensorSlotRegistry::should_share(const std::string& name, bool lora_only_mode, bool recompute_enabled) const {
-    auto entry = lookup(name);
-    if (!entry) {
-        // Default: share when recompute is enabled and will_recompute says so
-        return recompute_enabled && will_recompute(name, lora_only_mode);
-    }
-
-    switch (entry->share_policy) {
-        case SharePolicy::PerLayer:
-            // Never share - always allocate per-layer
-            return false;
-
-        case SharePolicy::WhenRecomputed:
-            // Share only if recompute is enabled AND will_recompute returns true
-            // This ensures we don't share when the tensor needs to be saved per-layer
-            return recompute_enabled && will_recompute(name, lora_only_mode);
-
-        case SharePolicy::AlwaysShare:
-            // Always share regardless of mode (use with caution)
-            // The caller must ensure this is safe for their use case
-            return true;
-
-        case SharePolicy::FFTShare: return recompute_enabled && !lora_only_mode;
-
-        case SharePolicy::LoRAShare: return recompute_enabled && lora_only_mode;
-
-        case SharePolicy::AlwaysRecompute: return recompute_enabled;
-    }
-
-    // Fallback (should not reach here)
-    return recompute_enabled && will_recompute(name, lora_only_mode);
-}
+// should_share removed (Phase 4 M5): its only caller was the
+// share_for lambda in BufferPlan::build, which was deleted along
+// with all forward-activation share_* flags.
 
 // ============================================================================
 // Utility Functions
