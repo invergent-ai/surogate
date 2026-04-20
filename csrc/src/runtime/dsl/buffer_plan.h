@@ -44,17 +44,11 @@ struct CompiledGraph;  // fwd — defined in graph_compiler.h; used by stack-siz
 /// be sized and shared. Built once per (B, T, options) via `BufferPlan::build`,
 /// then consumed by `DslRunState` during allocation.
 struct BufferPlan {
-    // ---------------- Activation sharing decisions ----------------
-    bool share_ln1 = false;
-    bool share_ln2 = false;
-    bool share_qkv = false;
-    bool share_att = false;  ///< when true, also shares `lse`
-    bool share_att_out = false;
-    bool share_mlp_up = false;
-    bool share_swiglu = false;
-    bool share_residual_att = false;
-    bool share_mlp_down = false;
-    bool share_qk_rstd = false;  ///< only meaningful when `use_qk_norm`
+    // Forward-activation sharing (share_ln1, share_ln2, share_qkv,
+    // share_att, share_att_out, share_mlp_up, share_swiglu,
+    // share_residual_att, share_mlp_down, share_qk_rstd) was removed
+    // as part of the Phase 4 M5 cleanup — every layer now allocates
+    // its own per-slot buffer. See commit d3ec195.
 
     // ---------------- Gradient sharing decisions ----------------
     bool share_grads = false;          ///< d_ln1/d_ln2/d_res_att/d_att_out shared
@@ -68,8 +62,10 @@ struct BufferPlan {
     bool large_bwd_temps_on_stack = false;
 
     // ---------------- QKV / qkv_rope ----------------
-    bool allocate_shared_qkv_rope = false;  ///< lora_only && recompute && use_qk_norm
-    bool need_separate_qkv_rope = false;    ///< recompute && use_qk_norm
+    // allocate_shared_qkv_rope removed (was part of forward-activation
+    // sharing; the per-layer qkv_rope buffer is now always allocated
+    // when need_separate_qkv_rope is true).
+    bool need_separate_qkv_rope = false;  ///< recompute && use_qk_norm
 
     // ---------------- Slot availability ----------------
     bool has_mlp_up_slot = false;

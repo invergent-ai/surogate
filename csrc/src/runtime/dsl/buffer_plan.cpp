@@ -51,14 +51,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * p.M;
     p.NumLayers = cfg.NumLayers;
 
-    bool uniform_qkv = true;
+    // Hybrid dims: max dims across all layers drive max-buffer sizing.
+    // uniform_attn is still needed for the gradient-sharing decision
+    // (share_d_att) below. Other uniformity booleans were only used by
+    // forward-activation sharing, which is gone (Phase 4 M5 cleanup).
     bool uniform_attn = true;
-    bool uniform_intermediate = true;
-    bool uniform_mlp_up = true;
-
-    // Hybrid: max dims across all layers drive shared-buffer sizing, but
-    // shape-sharing is only safe when every participating layer agrees on the
-    // logical extent of the slot.
     p.per_layer_dims = runtime_config.per_layer_dims;
     if (!p.per_layer_dims.empty()) {
         const auto& first = p.per_layer_dims.front();
@@ -67,10 +64,7 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             p.AttnDim = std::max(p.AttnDim, pld.attn_dim);
             p.M = std::max(p.M, pld.intermediate);
             p.MUp = std::max(p.MUp, pld.mlp_up);
-            uniform_qkv = uniform_qkv && pld.qkv_channels == first.qkv_channels;
             uniform_attn = uniform_attn && pld.attn_dim == first.attn_dim;
-            uniform_intermediate = uniform_intermediate && pld.intermediate == first.intermediate;
-            uniform_mlp_up = uniform_mlp_up && pld.mlp_up == first.mlp_up;
         }
     }
     p.kv_source_layers = runtime_config.kv_source_layers;
@@ -95,45 +89,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.has_swiglu_slot =
         p.has_dsl_layout && slot_registry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
 
-    // ---------------- Activation sharing ----------------
-    // DSL-layout-aware `should_share`, with legacy fallback for partially-
-    // onboarded blocks. Matches the inline helper in
-    // dsl_run_state::allocate_simplified_activations.
-    auto share_for = [&](const char* name) -> bool {
-        if (p.has_dsl_layout) {
-            return slot_registry.should_share(name, p.lora_only, p.recompute_enabled);
-        }
-        return p.recompute_enabled && slot_registry.will_recompute(name, p.lora_only);
-    };
-
-    p.share_ln1 = share_for(builtin_slot_name(TensorSlot::BlockLN1));
-    p.share_ln2 = share_for(builtin_slot_name(TensorSlot::BlockLN2));
-    p.share_qkv = share_for(builtin_slot_name(TensorSlot::BlockQKV));
-    p.share_att = share_for(builtin_slot_name(TensorSlot::BlockAtt));
-    p.share_att_out = share_for(builtin_slot_name(TensorSlot::BlockAttOut));
-    p.share_mlp_up = share_for(builtin_slot_name(TensorSlot::BlockMLPUp));
-    p.share_swiglu = share_for(builtin_slot_name(TensorSlot::BlockSwiGLU));
-    p.share_residual_att = share_for(builtin_slot_name(TensorSlot::BlockResidualAtt));
-    p.share_mlp_down = share_for(builtin_slot_name(TensorSlot::BlockMLPDown));
-    p.share_qk_rstd = p.use_qk_norm && share_for(builtin_slot_name(TensorSlot::BlockQRSTD));
-
-    // Hybrid models may interleave blocks with different logical activation
-    // widths (Gemma4 sliding vs full attention, Nemotron-H variants, ...).
-    // Tensor views are contiguous-only, so a max-sized shared backing buffer
-    // cannot safely masquerade as a smaller [B,T,dim] tensor. Disable sharing
-    // for any slot whose per-layer trailing dimension varies.
-    if (!uniform_qkv) {
-        p.share_qkv = false;
-    }
-    if (!uniform_attn) {
-        p.share_att = false;
-    }
-    if (!uniform_mlp_up) {
-        p.share_mlp_up = false;
-    }
-    if (!uniform_intermediate) {
-        p.share_swiglu = false;
-    }
+    // Forward-activation sharing decisions removed as part of Phase 4
+    // M5 cleanup (commit d3ec195). Every layer now allocates its own
+    // per-slot buffer; the share_* booleans are gone. Per-slot
+    // hybrid-uniformity checks (uniform_qkv, uniform_attn, etc.) were
+    // only used to disable sharing — no longer relevant.
 
     // ---------------- FFN temps on stack ----------------
     // Only safe when both mlp_up and swiglu are recomputable — otherwise the
@@ -145,9 +105,9 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
 
     // ---------------- qkv_rope ----------------
     // Separate per-layer qkv_rope whenever recompute is on and QK-norm is
-    // used; the shared buffer exists only in LoRA mode (one layer at a time).
+    // used; allocate_shared_qkv_rope was part of forward-activation
+    // sharing and is gone (Phase 4 M5 cleanup).
     p.need_separate_qkv_rope = p.recompute_enabled && p.use_qk_norm;
-    p.allocate_shared_qkv_rope = p.lora_only && p.recompute_enabled && p.use_qk_norm && uniform_qkv;
 
     // ---------------- Gradient sharing ----------------
     p.share_grads = p.recompute_enabled;
