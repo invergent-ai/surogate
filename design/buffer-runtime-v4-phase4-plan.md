@@ -331,6 +331,58 @@ mis-sized view.
 
 Code reverted. Only the helper (ba7ffa2) ships.
 
+## M5 legacy cleanup progress
+
+Independent of Phase A slot migration, the share_* cleanup both
+unblocks Phase A (for non-LoRA-consumed slots) AND counts as direct
+M5 progress.
+
+| Commit | What was cut |
+|---|---|
+| `d3ec195` | Upfront `shared_*` forward-activation buffers + `shared_tag` lambda + per-slot share ternaries in `allocate_simplified_activations` |
+| `f771b03` | `share_ln1/ln2/qkv/att/att_out/mlp_up/swiglu/residual_att/mlp_down/qk_rstd` + `allocate_shared_qkv_rope` from `BufferPlan` + the `share_for` lambda + uniformity booleans gated on sharing |
+| `43293fe` | Dead `kv_source_layers` / `is_kv_source()` from `BufferPlan` (only read to disable sharing) |
+| `10d5362` | `TensorSlotRegistry::should_share` (zero callers after f771b03) |
+
+Net impact: `shared_tag()` + per-layer activation allocator loop from
+the design's M5 kill-list is gone. Under-the-hood: legacy allocator
+now matches the per-layer semantics Phase A Stack migration assumes,
+which unblocked ln1/ln2/h_out migration (commit `d421a80`).
+
+Baseline backward norm shifted as a consequence (3.8749 → 3.4387 on
+Qwen3-bf16). Loss unchanged. The old sharing was silently
+influencing backward by leaving cross-layer buffer contamination
+readable by layers whose replay hadn't re-populated it; the new
+value is the one where every layer's backward reads its own
+replay-regenerated data.
+
+### M5 remaining targets
+
+Still on the kill-list from `design/buffer-runtime-v4.md §Phase 4`:
+
+- `TensorSlot::Block*/MoE*/SSM*` enumerators — widely used (hot-path
+  dispatch), multi-session to eliminate
+- `SimplifiedLayerActivations` struct — every op reads `acts.X`;
+  cannot delete without op-level refactor
+- `builtin_slot_from_name` string table + its ~30 callers across
+  `compiled_ops_save.cpp`, `compiled_ops_execute.cpp`,
+  `graph_executor.cpp` — largest remaining string-match dispatch
+  surface; needs tensor-id-based replacement strategy
+- `layer_start`/`layer_end` index flags on ops — used in the
+  executor's dispatch loop for Stack.checkpoint/restore
+- String-match dispatch branches in
+  `compiled_ops_execute.cpp:180-224,707-740` — go together with the
+  name-lookup removal
+- Ad-hoc backward cross-layer cudaMalloc path in
+  `compiled_ops_execute.cpp:2337-2429` — already replaced by
+  `BwdCrossLayer` arena in Phase 3 work; deletion is pure
+  follow-through if no callers remain
+- `MatmulOp` enum alias — confirmed not dead (actively switched on);
+  scratch from the kill-list
+- Gradient-sharing (`share_grads`/`share_d_att`/`share_res_ffn_grad`/
+  `share_mlp_down_grad`) — mirror of the forward-activation
+  sharing we just removed; same treatment recommended
+
 ### Phase A breakthrough: instrumented trace finds the root cause, step 0 ships
 
 Added `SUROGATE_DEBUG_RSTD=1` printing pointer + first 4 values at
