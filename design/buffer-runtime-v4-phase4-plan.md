@@ -358,7 +358,12 @@ M5 progress.
 | `9656ce3` | Dropped stale recomputation comment on mFP8ScalingState |
 | `70243c6` | Removed dead `TensorSlot::Temporary` enum value + its 6 dead checks across buffer_plan, graph_compiler, compiled_ops_save, fused_residual_rmsnorm |
 | `6530ace` | Consolidated `resolve_tensor`'s 40-case slot switch to delegate Block*/MoE*/BlockD*/global cases through `block_activation_ptr` / `block_gradient_ptr` / `global_activation_ptr` helpers. Struct-field indirection now referenced in exactly one place (`tensor_slot_dispatch.cpp`), groundwork for future SimplifiedLayerActivations replacement |
-| `939a6f3` + `d0bfc0b` | Migrated 17 direct ops-side `simplified_acts(L).X` / `simplified_grads(L).X` accesses to `block_activation_ptr` / `block_gradient_ptr` helpers across fused_residual_rmsnorm, matmul, matmul_swiglu, add, moe_unpermute. Ops layer now has ZERO direct struct-field access — dispatch helpers are the only consumers outside dsl_run_state.cpp itself |
+| `939a6f3` + `d0bfc0b` | Migrated 17 direct ops-side `simplified_acts(L).X` / `simplified_grads(L).X` accesses to `block_activation_ptr` / `block_gradient_ptr` helpers across fused_residual_rmsnorm, matmul, matmul_swiglu, add, moe_unpermute |
+| `05c9b8c` | Migrated graph_executor + graph_executor_tensors to dispatch helpers. The four string-match dispatch functions in graph_executor_tensors (resolve_block_activation_tensor, block_activation_base_ptr, resolve_recomputed internals, resolve_block_gradient_tensor) each had 15-17 if-branches mapping field names to struct fields; replaced with single `builtin_slot_from_name → block_activation_ptr` calls. Net −90 lines |
+| `2969a2e` | Migrated compiled_ops_execute.cpp (14 sites). Introduced file-scope `clear_rstd_stack_slots` / `clear_ffn_temp_stack_slots` / `clear_large_bwd_grad_stack_slots` helpers; the 9-slot rstd + 2-slot ffn + 3-slot bwd clear patterns each appeared 4× verbatim in the dispatch loop. Net −12 lines plus massive deduplication |
+| `0f58c25` | Migrated compiled_ops_save.cpp. Collapsed the third clone of the 35-case Block*/MoE*/BlockD*/global dispatch switch — now delegated through the helpers. Net −21 lines |
+
+**Executor migration complete.** SimplifiedLayerActivations / SimplifiedLayerGradients struct fields are now accessed through dispatch helpers from every caller except dsl_run_state.cpp (where the storage lives). Struct storage can now be swapped without touching any consumer — the precondition for `TensorSlot::Block*` enum removal.
 
 Net impact: `shared_tag()` + per-layer activation allocator loop +
 all gradient-sharing from the design's M5 kill-list is gone.
