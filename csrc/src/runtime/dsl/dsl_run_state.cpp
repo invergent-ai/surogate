@@ -833,16 +833,15 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
     const long B = plan.B;
     const long T = plan.T;
     const long C = plan.C;
-    const long AttnDim = plan.AttnDim;  // max across hybrid layers
-    const long QKV = plan.QKV;
-    const long M = plan.M;
-    const long MUp = plan.MUp;
 
     const auto dtype = plan.grad_dtype;
     const auto kind = EAllocationType::ON_DEVICE;
 
-    // Allocate shared gradient buffers if recompute_block is enabled
-    if (plan.share_grads && !mSharedDResAtt.Data) {
+    // Allocate alternating-pair shared buffers (d_res_ffn / d_mlp_down)
+    // used to model cross-layer residual-chain gradients. Single-buffer
+    // sharing for d_ln1/d_ln2/d_res_att/d_att_out/d_att was removed as
+    // part of Phase 4 M5 cleanup — those are per-layer now.
+    if ((plan.share_res_ffn_grad || plan.share_mlp_down_grad) && !mSharedDMlpDown[0].Data) {
         if (plan.share_res_ffn_grad) {
             mSharedDResFFN[0] = mAllocator->allocate(dtype, "d_res_ffn_a", kind, {B, T, C});
             mSharedDResFFN[1] = mAllocator->allocate(dtype, "d_res_ffn_b", kind, {B, T, C});
@@ -851,17 +850,6 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
             mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
             mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
         }
-        mSharedDResAtt = mAllocator->allocate(dtype, "d_res_att_shared", kind, {B, T, C});
-        if (plan.is_hybrid) {
-            mSharedDAttOut = mAllocator->allocate(dtype, "d_att_out_shared", kind, {B, T, C});
-        } else {
-            mSharedDAttOut = mSharedDResAtt;
-        }
-        mSharedDLn2 = mAllocator->allocate(dtype, "d_ln2_shared", kind, {B, T, C});
-        if (plan.share_d_att) {
-            mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttnDim});
-        }
-        mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
     }
 
     mSimplifiedGradients.resize(cfg.NumLayers);
@@ -875,11 +863,9 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
 
         g.d_res_ffn = plan.share_res_ffn_grad ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
                                               : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
-        g.d_res_att = plan.share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        g.d_att_out = plan.is_hybrid ? (plan.share_grads ? mSharedDAttOut
-                                                         : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}))
-                                     : g.d_res_att;
-        g.d_ln2 = plan.share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
+        g.d_res_att = mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
+        g.d_att_out = plan.is_hybrid ? mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}) : g.d_res_att;
+        g.d_ln2 = mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
 
         if (plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot) {
             g.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
@@ -903,8 +889,8 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         // separate from MLP's d_mlp_down so the backward chain doesn't
         // collide across the MLP / _finalize split).
         g.d_h_out = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
-        g.d_att = plan.share_d_att ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
-        g.d_ln1 = plan.share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
+        g.d_att = mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
+        g.d_ln1 = mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
 
     // Preserve the original buffer pointers so we can restore them if the

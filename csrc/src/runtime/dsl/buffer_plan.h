@@ -51,8 +51,11 @@ struct BufferPlan {
     // its own per-slot buffer. See commit d3ec195.
 
     // ---------------- Gradient sharing decisions ----------------
-    bool share_grads = false;          ///< d_ln1/d_ln2/d_res_att/d_att_out shared
-    bool share_d_att = false;          ///< d_att shared only when attn dims are uniform
+    // Single-buffer sharing (share_grads, share_d_att) was removed as part
+    // of the Phase 4 M5 cleanup — every layer now allocates its own
+    // d_ln1/d_ln2/d_res_att/d_att_out/d_att. The alternating-pair cases
+    // stay because their cross-layer lifetimes (layer N reads layer N-2)
+    // don't fit the single-buffer-overwrite model.
     bool share_res_ffn_grad = false;   ///< alternating d_res_ffn[0/1]
     bool share_mlp_down_grad = false;  ///< alternating d_mlp_down[0/1]
 

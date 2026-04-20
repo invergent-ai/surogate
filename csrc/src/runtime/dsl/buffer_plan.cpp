@@ -52,19 +52,15 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.NumLayers = cfg.NumLayers;
 
     // Hybrid dims: max dims across all layers drive max-buffer sizing.
-    // uniform_attn is still needed for the gradient-sharing decision
-    // (share_d_att) below. Other uniformity booleans were only used by
-    // forward-activation sharing, which is gone (Phase 4 M5 cleanup).
-    bool uniform_attn = true;
+    // Uniformity booleans were only used by forward- and gradient-activation
+    // sharing, both gone (Phase 4 M5 cleanup).
     p.per_layer_dims = runtime_config.per_layer_dims;
     if (!p.per_layer_dims.empty()) {
-        const auto& first = p.per_layer_dims.front();
         for (const auto& pld : p.per_layer_dims) {
             p.QKV = std::max(p.QKV, pld.qkv_channels);
             p.AttnDim = std::max(p.AttnDim, pld.attn_dim);
             p.M = std::max(p.M, pld.intermediate);
             p.MUp = std::max(p.MUp, pld.mlp_up);
-            uniform_attn = uniform_attn && pld.attn_dim == first.attn_dim;
         }
     }
 
@@ -109,8 +105,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.need_separate_qkv_rope = p.recompute_enabled && p.use_qk_norm;
 
     // ---------------- Gradient sharing ----------------
-    p.share_grads = p.recompute_enabled;
-    p.share_d_att = p.share_grads && uniform_attn;
+    // Single-buffer sharing (d_ln1/d_ln2/d_res_att/d_att_out/d_att) removed
+    // — every layer allocates its own now. The alternating-pair cases for
+    // d_res_ffn / d_mlp_down stay because they model cross-layer residual
+    // chain lifetimes that single-buffer-overwrite can't handle.
+    //
     // d_res_ffn sharing stays off: zero_activation_gradients() zeroes every
     // layer's d_res_ffn at backward start, so an alternating shared pair
     // would destroy the loss gradient of layer N when zeroing layer N-2.
