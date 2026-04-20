@@ -1774,7 +1774,9 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
 // Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a)
 // ============================================================================
 
-void finalize_save_for_bwd(CompiledGraph& fwd, CompiledGraph& bwd) {
+void finalize_save_for_bwd(CompiledGraph& fwd,
+                           CompiledGraph& bwd,
+                           std::optional<std::unordered_set<std::string>> save_names) {
     // Tids are shared across the fwd+bwd pair (reset_tid_namespace contract).
     const int num_tids = std::max(fwd.num_tensors, bwd.num_tensors);
     if (num_tids <= 0) return;
@@ -1808,18 +1810,45 @@ void finalize_save_for_bwd(CompiledGraph& fwd, CompiledGraph& bwd) {
         }
     };
 
+    // When save_names is provided, a tid that crosses the fwd→bwd
+    // boundary but is NOT in the runtime save list is satisfied via
+    // Stack residency, recompute, or forward replay — none need a
+    // SaveForBwd slot. Leave those tids in FwdStack/BwdStack. An empty
+    // set promotes nothing (valid in recompute modes). Nullopt disables
+    // filtering entirely (all fwd∧bwd-crossing block activations
+    // promoted, prior behavior). Name lookup uses fwd first (SaveForBwd
+    // sources are fwd activations), then bwd.
+    const bool filter_by_save_names = save_names.has_value();
+    auto in_save_list = [&](int tid) {
+        if (!filter_by_save_names) return true;
+        const auto& set = *save_names;
+        auto name = fwd.name_for_tensor_id(tid);
+        if (!name.empty() && set.count(std::string(name))) return true;
+        name = bwd.name_for_tensor_id(tid);
+        if (!name.empty() && set.count(std::string(name))) return true;
+        return false;
+    };
+
     int promoted = 0;
+    int skipped_by_save_list = 0;
     for (int tid = 0; tid < num_tids; ++tid) {
-        if (produced_in_fwd[tid] && consumed_in_bwd[tid]) {
-            promote(fwd, tid);
-            promote(bwd, tid);
-            ++promoted;
+        if (!(produced_in_fwd[tid] && consumed_in_bwd[tid])) continue;
+        if (!in_save_list(tid)) {
+            ++skipped_by_save_list;
+            continue;
         }
+        promote(fwd, tid);
+        promote(bwd, tid);
+        ++promoted;
     }
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
         if (std::string(env) == "1") {
-            std::cerr << "[regions] SaveForBwd promotion: " << promoted << " tids\n";
+            std::cerr << "[regions] SaveForBwd promotion: " << promoted << " tids";
+            if (filter_by_save_names) {
+                std::cerr << " (skipped " << skipped_by_save_list << " not in save list)";
+            }
+            std::cerr << "\n";
         }
     }
 
@@ -2271,7 +2300,18 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          std::size_t stack_bytes,
                          std::size_t bwd_cross_layer_bytes,
                          std::size_t moe_saved_bytes) {
-    arenas.unified_stack_bytes = stack_bytes;
+    // UnifiedStack adoption allocates a second Stack-sized buffer and
+    // then transfers ownership, freeing the original. The overlap during
+    // allocation doubles Stack footprint transiently — enough to OOM on
+    // GPT-OSS-class models that run within a few GiB of the 32 GiB
+    // budget. Since no op consumes block activations via the arena path
+    // yet (tensor-id baking is Phase 3 step 4), the adoption is pure
+    // memory shuffling. Gate behind the same flag that controls the
+    // other premature arenas; default off until ops actually read
+    // through unified_stack offsets.
+    const char* stack_arena_env = std::getenv("SUROGATE_USE_PHASE_STACK_ARENAS");
+    const bool want_stack_arenas = stack_arena_env && std::string(stack_arena_env) == "1";
+    arenas.unified_stack_bytes = want_stack_arenas ? stack_bytes : 0;
     arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
     arenas.moe_saved_bytes = moe_saved_bytes;
 
@@ -2284,11 +2324,11 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.persistent_bytes = want_persistent ? std::max(fwd.persistent_bytes, bwd.persistent_bytes) : 0;
     arenas.accumulator_bytes = want_persistent ? std::max(fwd.accumulator_bytes, bwd.accumulator_bytes) : 0;
 
-    // FwdStack, BwdStack: taken from their respective compile's peak. Frames
-    // within each direction don't coexist; the two directions also don't
-    // coexist (fwd runs, then bwd runs), so we only need max per-direction.
-    arenas.fwd_stack_bytes = fwd.fwd_stack_peak;  // bwd's fwd_stack_peak is 0
-    arenas.bwd_stack_bytes = bwd.bwd_stack_peak;  // fwd's bwd_stack_peak is 0
+    // FwdStack, BwdStack: same gate as UnifiedStack — no op consumes
+    // these arenas yet; tensor-id baking (design §Phase 3 step 4) is
+    // the missing consumer.
+    arenas.fwd_stack_bytes = want_stack_arenas ? fwd.fwd_stack_peak : 0;  // bwd's fwd_stack_peak is 0
+    arenas.bwd_stack_bytes = want_stack_arenas ? bwd.bwd_stack_peak : 0;  // fwd's bwd_stack_peak is 0
 
     // SaveForBwd: per-block slots persist across the fwd-exit / bwd-entry
     // boundary. finalize_save_for_bwd populates the same tids in both

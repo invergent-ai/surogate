@@ -1530,12 +1530,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     }
     mTemps.clear();
 
-    if (arena_persists > 0 || cudaMalloc_persists > 0) {
-        if (const char* env = std::getenv("SUROGATE_DEBUG_ARENA_COVERAGE")) {
-            if (std::string(env) == "1") {
-                std::cerr << "[arena-persist] arena=" << arena_persists << " cudaMalloc=" << cudaMalloc_persists
-                          << "\n";
-            }
+    if (const char* env = std::getenv("SUROGATE_DEBUG_ARENA_COVERAGE")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[arena-persist] arena=" << arena_persists << " cudaMalloc=" << cudaMalloc_persists << "\n";
         }
     }
 

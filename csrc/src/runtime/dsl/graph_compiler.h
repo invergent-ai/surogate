@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "runtime/dsl/dsl_runtime_config.h"
@@ -862,7 +863,19 @@ ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledG
 /// then re-runs compute_layout() on both so offsets reflect the final
 /// region assignment. Safe to call once per (forward, backward) compile
 /// pair; idempotent.
-void finalize_save_for_bwd(CompiledGraph& fwd, CompiledGraph& bwd);
+///
+/// When `save_names` is provided, promotion is restricted to tids whose
+/// name appears in the set — matching the runtime save list used by
+/// legacy save-snapshot path (GraphExecutor::mSaveList). Tids that cross
+/// the fwd→bwd boundary but are NOT in the save list (handled via Stack
+/// or recompute at runtime) stay in FwdStack / BwdStack. Passing an
+/// empty set promotes zero tids (valid in recompute/forward-replay modes
+/// where the runtime never consumes arena-backed saves). Passing
+/// `std::nullopt` disables filtering entirely, preserving prior behavior
+/// for callers that haven't plumbed the save list.
+void finalize_save_for_bwd(CompiledGraph& fwd,
+                           CompiledGraph& bwd,
+                           std::optional<std::unordered_set<std::string>> save_names = std::nullopt);
 
 }  // namespace dsl
 
