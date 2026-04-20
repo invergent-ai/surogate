@@ -64,6 +64,36 @@ static bool rstd_on_stack_enabled() {
     return enabled;
 }
 
+// Clear-.Data helpers for Stack-backed slots that Stack.restore invalidates.
+// These patterns repeat 4+ times in the dispatch loop (flat-ops path,
+// SegmentDispatch path, PhaseExit BwdBlock); hoist to file-scope so the
+// slot list stays in sync.
+static void clear_rstd_stack_slots(DslRunState& rs, int L) {
+    auto clear = [&](TensorSlot s) {
+        if (Tensor* t = block_activation_ptr(rs, L, s)) t->Data = nullptr;
+    };
+    clear(TensorSlot::BlockLN1RSTD);
+    clear(TensorSlot::BlockLN2RSTD);
+    clear(TensorSlot::BlockQRSTD);
+    clear(TensorSlot::BlockKRSTD);
+    clear(TensorSlot::BlockLSE);
+    clear(TensorSlot::BlockAttOut);
+    clear(TensorSlot::BlockLN1);
+    clear(TensorSlot::BlockLN2);
+    clear(TensorSlot::BlockHOut);
+}
+
+static void clear_ffn_temp_stack_slots(DslRunState& rs, int L) {
+    if (Tensor* t = block_activation_ptr(rs, L, TensorSlot::BlockMLPUp)) t->Data = nullptr;
+    if (Tensor* t = block_activation_ptr(rs, L, TensorSlot::BlockSwiGLU)) t->Data = nullptr;
+}
+
+static void clear_large_bwd_grad_stack_slots(DslRunState& rs, int L) {
+    if (Tensor* t = block_gradient_ptr(rs, L, TensorSlot::BlockDQKV)) t->Data = nullptr;
+    if (Tensor* t = block_gradient_ptr(rs, L, TensorSlot::BlockDMLPUp)) t->Data = nullptr;
+    if (Tensor* t = block_gradient_ptr(rs, L, TensorSlot::BlockDSwiGLU)) t->Data = nullptr;
+}
+
 void CompiledExecutor::replay_layer_forward(int layer_idx,
                                             long B,
                                             long T,
@@ -495,17 +525,21 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                     }
                 }
             };
-            auto& acts = mRunState.simplified_acts(layer_idx);
             const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
-            persist_stack_slot(acts.ln1_rstd, prefix + "ln1_rstd");
-            persist_stack_slot(acts.ln2_rstd, prefix + "ln2_rstd");
-            persist_stack_slot(acts.q_rstd, prefix + "q_rstd");
-            persist_stack_slot(acts.k_rstd, prefix + "k_rstd");
-            persist_stack_slot(acts.lse, prefix + "lse");
-            persist_stack_slot(acts.att_out, prefix + "att_out");
-            persist_stack_slot(acts.ln1, prefix + "ln1");
-            persist_stack_slot(acts.ln2, prefix + "ln2");
-            persist_stack_slot(acts.h_out, prefix + "h_out");
+            auto persist_by_slot = [&](TensorSlot s, const char* field_name) {
+                if (Tensor* t = block_activation_ptr(mRunState, layer_idx, s)) {
+                    persist_stack_slot(*t, prefix + field_name);
+                }
+            };
+            persist_by_slot(TensorSlot::BlockLN1RSTD, "ln1_rstd");
+            persist_by_slot(TensorSlot::BlockLN2RSTD, "ln2_rstd");
+            persist_by_slot(TensorSlot::BlockQRSTD, "q_rstd");
+            persist_by_slot(TensorSlot::BlockKRSTD, "k_rstd");
+            persist_by_slot(TensorSlot::BlockLSE, "lse");
+            persist_by_slot(TensorSlot::BlockAttOut, "att_out");
+            persist_by_slot(TensorSlot::BlockLN1, "ln1");
+            persist_by_slot(TensorSlot::BlockLN2, "ln2");
+            persist_by_slot(TensorSlot::BlockHOut, "h_out");
         }
     }
     // Now safe to restore — stack-resident data has been copied
@@ -775,37 +809,31 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 return std::nullopt;
             }
             const std::string base_field = strip_ssa_suffix(field);
-            auto& acts = mRunState.simplified_acts(resolved_layer);
-            if (base_field == "ln1_rstd" || base_field == "ln_rstd") return acts.ln1_rstd;
-            if (base_field == "ln2_rstd") return acts.ln2_rstd;
-            if (base_field == "q_rstd") return acts.q_rstd;
-            if (base_field == "k_rstd") return acts.k_rstd;
-            if (base_field == "lse") return acts.lse;
-            if (base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat")
-                return acts.ln1;
-            if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
-            if (base_field == "qkv" || base_field == "qkv_norm") return acts.qkv;
-            if (base_field == "qkv_rope") {
-                Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                return src;
+            // Special cases with field aliases not in the name→slot table or
+            // that need a shape override (qkv_norm, qkv_flat, swiglu_flat).
+            if (base_field == "qkv_norm") {
+                if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, TensorSlot::BlockQKV)) return *t;
+                return std::nullopt;
             }
             if (base_field == "qkv_flat") {
-                Tensor qkv = acts.qkv;
-                return view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
+                if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, TensorSlot::BlockQKV)) {
+                    Tensor qkv = *t;
+                    return view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
+                }
+                return std::nullopt;
             }
-            if (base_field == "att" || base_field == "att_flat") return acts.att;
-            if (base_field == "att_out" || base_field == "att_out_flat") return acts.att_out;
-            if (base_field == "mlp_up" || base_field == "mlp_up_flat") return acts.mlp_up;
-            if (base_field == "swiglu") return acts.swiglu;
             if (base_field == "swiglu_flat") {
-                Tensor swiglu = acts.swiglu;
-                return view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
+                if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, TensorSlot::BlockSwiGLU)) {
+                    Tensor swiglu = *t;
+                    return view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
+                }
+                return std::nullopt;
             }
-            if (base_field == "mlp_down" || base_field == "mlp_down_flat") return acts.mlp_down;
-            if (base_field == "res_att" || base_field == "residual_att") return acts.residual_att;
-            if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
-                Tensor& res = mRunState.get_residual(resolved_layer, mRunState.MainStream);
-                return res;
+            // Primary dispatch: name→slot table covers every alias.
+            // block_activation_ptr handles the qkv_rope fallback to qkv and
+            // the BlockResidualFFN managed-residual acquisition.
+            if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, builtin_slot_from_name(base_field))) {
+                return *t;
             }
             return std::nullopt;
         };
@@ -1292,21 +1320,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             }
                             prune_stack_tensors();
                             if (mRunState.ffn_temps_on_stack()) {
-                                auto& acts = mRunState.simplified_acts(L);
-                                acts.mlp_up.Data = nullptr;
-                                acts.swiglu.Data = nullptr;
+                                clear_ffn_temp_stack_slots(mRunState, L);
                             }
                             if (rstd_on_stack_enabled()) {
-                                auto& acts = mRunState.simplified_acts(L);
-                                acts.ln1_rstd.Data = nullptr;
-                                acts.ln2_rstd.Data = nullptr;
-                                acts.q_rstd.Data = nullptr;
-                                acts.k_rstd.Data = nullptr;
-                                acts.lse.Data = nullptr;
-                                acts.att_out.Data = nullptr;
-                                acts.ln1.Data = nullptr;
-                                acts.ln2.Data = nullptr;
-                                acts.h_out.Data = nullptr;
+                                clear_rstd_stack_slots(mRunState, L);
                             }
                             layer_active[static_cast<std::size_t>(L)] = 0;
                         }
@@ -1593,21 +1610,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 }
                 prune_stack_tensors();
                 if (mRunState.ffn_temps_on_stack()) {
-                    auto& acts = mRunState.simplified_acts(op.layer_end);
-                    acts.mlp_up.Data = nullptr;
-                    acts.swiglu.Data = nullptr;
+                    clear_ffn_temp_stack_slots(mRunState, op.layer_end);
                 }
                 if (rstd_on_stack_enabled()) {
-                    auto& acts = mRunState.simplified_acts(op.layer_end);
-                    acts.ln1_rstd.Data = nullptr;
-                    acts.ln2_rstd.Data = nullptr;
-                    acts.q_rstd.Data = nullptr;
-                    acts.k_rstd.Data = nullptr;
-                    acts.lse.Data = nullptr;
-                    acts.att_out.Data = nullptr;
-                    acts.ln1.Data = nullptr;
-                    acts.ln2.Data = nullptr;
-                    acts.h_out.Data = nullptr;
+                    clear_rstd_stack_slots(mRunState, op.layer_end);
                 }
                 // Note: cudnn_workspace is persistently allocated, don't clear
                 layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
@@ -1721,8 +1727,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             fill_zero(mRunState.non_block_gradients().d_embeddings, mRunState.MainStream);
         }
         if (mConfig.NumLayers > 0) {
-            fill_zero(mRunState.simplified_grads(static_cast<int>(mConfig.NumLayers) - 1).d_res_ffn,
-                      mRunState.MainStream);
+            if (Tensor* d_res_ffn =
+                    block_gradient_ptr(mRunState, static_cast<int>(mConfig.NumLayers) - 1, TensorSlot::BlockDResFFN)) {
+                fill_zero(*d_res_ffn, mRunState.MainStream);
+            }
         }
         mRunState.zero_activation_gradients(mRunState.MainStream);
     }
@@ -1874,20 +1882,28 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Gemma4 routes the block output through a dedicated h_out slot, so the top
     // of the backward chain must seed d_h_out rather than the MLP/down or
     // residual-attention buffers.
+    // Declared outside the if/else chain so the StackedBlocks fallback below
+    // can reference them for d_<name> binding.
+    Tensor* d_h_out = nullptr;
+    Tensor* d_mlp_down = nullptr;
+    Tensor* d_res_att = nullptr;
+    bool has_h_out_grad = false;
     if (mConfig.NumLayers > 0) {
         const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
-        auto& last_grads = mRunState.simplified_grads(last_layer);
-        const bool has_h_out_grad = last_grads.d_h_out.Data != nullptr;
+        d_h_out = block_gradient_ptr(mRunState, last_layer, TensorSlot::BlockDHOut);
+        d_mlp_down = block_gradient_ptr(mRunState, last_layer, TensorSlot::BlockDMLPDown);
+        d_res_att = block_gradient_ptr(mRunState, last_layer, TensorSlot::BlockDResAtt);
+        has_h_out_grad = d_h_out && d_h_out->Data;
         if (has_h_out_grad) {
-            bind_tensor("d_xN", last_grads.d_h_out);
-            bind_tensor("d_residualN", last_grads.d_h_out);
-            bind_tensor(fmt::format("d_blocks[{}].h_out", last_layer), last_grads.d_h_out);
+            bind_tensor("d_xN", *d_h_out);
+            bind_tensor("d_residualN", *d_h_out);
+            bind_tensor(fmt::format("d_blocks[{}].h_out", last_layer), *d_h_out);
         } else {
-            if (last_grads.d_mlp_down.Data) {
-                bind_tensor("d_xN", last_grads.d_mlp_down);
+            if (d_mlp_down && d_mlp_down->Data) {
+                bind_tensor("d_xN", *d_mlp_down);
             }
-            if (last_grads.d_res_att.Data) {
-                bind_tensor("d_residualN", last_grads.d_res_att);
+            if (d_res_att && d_res_att->Data) {
+                bind_tensor("d_residualN", *d_res_att);
             }
         }
 
@@ -1929,18 +1945,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 });
                 if (has_h_out_grad) {
                     for (const auto& [_, name] : stacked) {
-                        bind_tensor("d_" + name, last_grads.d_h_out);
+                        bind_tensor("d_" + name, *d_h_out);
                     }
                 } else if (stacked.size() == 1) {
-                    if (last_grads.d_res_att.Data) {
-                        bind_tensor("d_" + stacked[0].second, last_grads.d_res_att);
+                    if (d_res_att && d_res_att->Data) {
+                        bind_tensor("d_" + stacked[0].second, *d_res_att);
                     }
                 } else {
-                    if (last_grads.d_mlp_down.Data) {
-                        bind_tensor("d_" + stacked[0].second, last_grads.d_mlp_down);
+                    if (d_mlp_down && d_mlp_down->Data) {
+                        bind_tensor("d_" + stacked[0].second, *d_mlp_down);
                     }
-                    if (last_grads.d_res_att.Data) {
-                        bind_tensor("d_" + stacked[1].second, last_grads.d_res_att);
+                    if (d_res_att && d_res_att->Data) {
+                        bind_tensor("d_" + stacked[1].second, *d_res_att);
                     }
                 }
             }
@@ -2471,27 +2487,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mTemps.clear();
         prune_stack_tensors(L);
         if (rstd_on_stack_enabled()) {
-            auto& acts = mRunState.simplified_acts(L);
-            acts.ln1_rstd.Data = nullptr;
-            acts.ln2_rstd.Data = nullptr;
-            acts.q_rstd.Data = nullptr;
-            acts.k_rstd.Data = nullptr;
-            acts.lse.Data = nullptr;
-            acts.att_out.Data = nullptr;
-            acts.ln1.Data = nullptr;
-            acts.ln2.Data = nullptr;
-            acts.h_out.Data = nullptr;
+            clear_rstd_stack_slots(mRunState, L);
         }
         if (mRunState.ffn_temps_on_stack()) {
-            auto& acts = mRunState.simplified_acts(L);
-            acts.mlp_up.Data = nullptr;
-            acts.swiglu.Data = nullptr;
+            clear_ffn_temp_stack_slots(mRunState, L);
         }
         if (mRunState.large_bwd_temps_on_stack()) {
-            auto& gs = mRunState.simplified_grads(L);
-            gs.d_qkv.Data = nullptr;
-            gs.d_mlp_up.Data = nullptr;
-            gs.d_swiglu.Data = nullptr;
+            clear_large_bwd_grad_stack_slots(mRunState, L);
         }
         last_layer_restored = L;
     };
@@ -3002,27 +3004,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 // Clear stack-allocated tensor pointers in simplified_acts/grads for this layer.
                 // These pointers become stale after checkpoint restore.
                 if (mRunState.ffn_temps_on_stack()) {
-                    auto& acts = mRunState.simplified_acts(op.layer_end);
-                    acts.mlp_up.Data = nullptr;
-                    acts.swiglu.Data = nullptr;
+                    clear_ffn_temp_stack_slots(mRunState, op.layer_end);
                 }
                 if (rstd_on_stack_enabled()) {
-                    auto& acts = mRunState.simplified_acts(op.layer_end);
-                    acts.ln1_rstd.Data = nullptr;
-                    acts.ln2_rstd.Data = nullptr;
-                    acts.q_rstd.Data = nullptr;
-                    acts.k_rstd.Data = nullptr;
-                    acts.lse.Data = nullptr;
-                    acts.att_out.Data = nullptr;
-                    acts.ln1.Data = nullptr;
-                    acts.ln2.Data = nullptr;
-                    acts.h_out.Data = nullptr;
+                    clear_rstd_stack_slots(mRunState, op.layer_end);
                 }
                 if (mRunState.large_bwd_temps_on_stack()) {
-                    auto& grads_to_clear = mRunState.simplified_grads(op.layer_end);
-                    grads_to_clear.d_qkv.Data = nullptr;
-                    grads_to_clear.d_mlp_up.Data = nullptr;
-                    grads_to_clear.d_swiglu.Data = nullptr;
+                    clear_large_bwd_grad_stack_slots(mRunState, op.layer_end);
                 }
                 last_layer_restored = op.layer_end;
             }
