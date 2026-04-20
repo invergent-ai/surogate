@@ -1145,58 +1145,20 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         return mTensors[static_cast<std::size_t>(tid)];
     }
 
+    // Delegate Block*/MoE*/BlockD* slot dispatch to the shared helpers in
+    // tensor_slot_dispatch.h — the switch below used to duplicate all of
+    // block_activation_ptr + block_gradient_ptr, drifting out of sync when
+    // new slots were added. Now each new Block* slot is a one-line change
+    // in tensor_slot_dispatch.cpp.
+    if (Tensor* bp = block_activation_ptr(rs, ref.layer_idx, ref.slot)) return *bp;
+    if (Tensor* bp = block_gradient_ptr(rs, ref.layer_idx, ref.slot)) return *bp;
+    if (Tensor* gp = global_activation_ptr(rs, ref.slot)) return *gp;
+
     switch (ref.slot) {
-        case TensorSlot::TokenIDs: return rs.Inputs;
-        case TensorSlot::PositionIDs: return rs.PositionIDs;
         case TensorSlot::Targets: return rs.Targets;
         case TensorSlot::Losses: return rs.Losses;
         case TensorSlot::DLoss: return rs.scratch().cross_entropy_dloss;
-        case TensorSlot::Encoded: return rs.non_block_activations().encoded;
-        case TensorSlot::LNFinal: return rs.non_block_activations().ln_final;
-        case TensorSlot::LNFinalRSTD: return rs.non_block_activations().ln_final_rstd;
-        case TensorSlot::FinalResidual: return rs.get_final_residual();
         case TensorSlot::FreqCis: return rs.rope_freqs(ref.name);
-        case TensorSlot::BlockLN1: return rs.simplified_acts(ref.layer_idx).ln1;
-        case TensorSlot::BlockLN1RSTD: return rs.simplified_acts(ref.layer_idx).ln1_rstd;
-        case TensorSlot::BlockLN2: return rs.simplified_acts(ref.layer_idx).ln2;
-        case TensorSlot::BlockLN2RSTD: return rs.simplified_acts(ref.layer_idx).ln2_rstd;
-        case TensorSlot::BlockQRSTD: return rs.simplified_acts(ref.layer_idx).q_rstd;
-        case TensorSlot::BlockKRSTD: return rs.simplified_acts(ref.layer_idx).k_rstd;
-        case TensorSlot::BlockQKV: return rs.simplified_acts(ref.layer_idx).qkv;
-        case TensorSlot::BlockQKVRoPE: {
-            auto& acts = rs.simplified_acts(ref.layer_idx);
-            return acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-        }
-        case TensorSlot::BlockLSE: return rs.simplified_acts(ref.layer_idx).lse;
-        case TensorSlot::BlockAtt: return rs.simplified_acts(ref.layer_idx).att;
-        case TensorSlot::BlockAttOut: return rs.simplified_acts(ref.layer_idx).att_out;
-        case TensorSlot::BlockResidualAtt: return rs.simplified_acts(ref.layer_idx).residual_att;
-        case TensorSlot::BlockMLPUp: return rs.simplified_acts(ref.layer_idx).mlp_up;
-        case TensorSlot::BlockSwiGLU: return rs.simplified_acts(ref.layer_idx).swiglu;
-        case TensorSlot::BlockMLPDown: return rs.simplified_acts(ref.layer_idx).mlp_down;
-        case TensorSlot::BlockHOut: return rs.simplified_acts(ref.layer_idx).h_out;
-        case TensorSlot::BlockResidualFFN: return rs.get_residual(ref.layer_idx, rs.MainStream);
-        case TensorSlot::BlockRouterLogits: return rs.simplified_acts(ref.layer_idx).router_logits;
-        case TensorSlot::BlockRouterProbs: return rs.simplified_acts(ref.layer_idx).router_probs;
-        case TensorSlot::BlockRoutingWeights: return rs.simplified_acts(ref.layer_idx).routing_weights;
-        case TensorSlot::BlockRoutingIndices: return rs.simplified_acts(ref.layer_idx).routing_indices;
-        case TensorSlot::BlockPermutedInput: return rs.simplified_acts(ref.layer_idx).permuted_input;
-        case TensorSlot::BlockScatterIndices: return rs.simplified_acts(ref.layer_idx).scatter_indices;
-        case TensorSlot::BlockExpertGateUp: return rs.simplified_acts(ref.layer_idx).expert_gate_up;
-        case TensorSlot::BlockExpertAct: return rs.simplified_acts(ref.layer_idx).expert_act;
-        case TensorSlot::BlockExpertDown: return rs.simplified_acts(ref.layer_idx).expert_down;
-        case TensorSlot::BlockMoeOut: return rs.simplified_acts(ref.layer_idx).moe_out;
-        case TensorSlot::BlockDLN1: return rs.simplified_grads(ref.layer_idx).d_ln1;
-        case TensorSlot::BlockDQKV: return rs.simplified_grads(ref.layer_idx).d_qkv;
-        case TensorSlot::BlockDAtt: return rs.simplified_grads(ref.layer_idx).d_att;
-        case TensorSlot::BlockDSwiGLU: return rs.simplified_grads(ref.layer_idx).d_swiglu;
-        case TensorSlot::BlockDMLPUp: return rs.simplified_grads(ref.layer_idx).d_mlp_up;
-        case TensorSlot::BlockDMLPDown: return rs.simplified_grads(ref.layer_idx).d_mlp_down;
-        case TensorSlot::BlockDHOut: return rs.simplified_grads(ref.layer_idx).d_h_out;
-        case TensorSlot::BlockDLN2: return rs.simplified_grads(ref.layer_idx).d_ln2;
-        case TensorSlot::BlockDResAtt: return rs.simplified_grads(ref.layer_idx).d_res_att;
-        case TensorSlot::BlockDAttOut: return rs.simplified_grads(ref.layer_idx).d_att_out;
-        case TensorSlot::BlockDResFFN: return rs.simplified_grads(ref.layer_idx).d_res_ffn;
         case TensorSlot::Parameter: return mWeights.get(ref.name);
         case TensorSlot::Saved:
             if (mSaved) {
