@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -457,6 +458,48 @@ void DslRunState::adopt_external_stack(std::byte* ptr, std::size_t bytes) {
 void DslRunState::resize_stack_to(long new_size_bytes) {
     if (new_size_bytes <= 0) {
         throw std::runtime_error("DslRunState::resize_stack_to: non-positive size");
+    }
+    // Scrub any simplified_acts / simplified_grads slot whose .Data still
+    // points into the old Stack range. The typical shrink-after-warmup path
+    // reallocates the Stack buffer at a new cudaMalloc address; cached Stack
+    // pointers from step 0 (e.g., rstd slots under SUROGATE_RSTD_ON_STACK)
+    // would dangle otherwise, and faulting code paths (illegal access at step
+    // 1 replay) arise whenever the new allocation overlaps the freed region.
+    std::byte* const old_base = static_cast<std::byte*>(mStackBuffer.Data);
+    const std::size_t old_capacity = mStackBuffer.bytes();
+    auto in_old_stack = [&](std::byte* p) -> bool {
+        return old_base && p >= old_base && p < old_base + old_capacity;
+    };
+    const bool debug = std::getenv("SUROGATE_DEBUG_STACK_RESIZE") != nullptr;
+    std::size_t scrubbed = 0;
+    auto scrub_slot_array = [&](auto& per_layer_array, const char* where) {
+        for (std::size_t L = 0; L < per_layer_array.size(); ++L) {
+            auto& slots = per_layer_array[L].slots;
+            for (std::size_t s = 0; s < slots.size(); ++s) {
+                if (slots[s].Data && in_old_stack(slots[s].Data)) {
+                    if (debug) {
+                        fprintf(stderr,
+                                "[stack-resize] scrub %s layer=%zu slot=%zu ptr=%p\n",
+                                where,
+                                L,
+                                s,
+                                static_cast<void*>(slots[s].Data));
+                    }
+                    slots[s].Data = nullptr;
+                    ++scrubbed;
+                }
+            }
+        }
+    };
+    scrub_slot_array(mSimplifiedActivations, "simplified_acts");
+    scrub_slot_array(mSimplifiedGradients, "simplified_grads");
+    if (debug) {
+        fprintf(stderr,
+                "[stack-resize] old=[%p, %p) new_size=%ld scrubbed=%zu\n",
+                static_cast<void*>(old_base),
+                static_cast<void*>(old_base + old_capacity),
+                new_size_bytes,
+                scrubbed);
     }
     // Free the old buffer *before* requesting the new one. The TensorAllocator
     // retains tracked allocations until its destructor runs, so a naive
