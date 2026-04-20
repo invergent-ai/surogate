@@ -1161,6 +1161,16 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             case TensorSlot::BlockMLPUp: base = &rs.simplified_acts(ref.layer_idx).mlp_up; break;
             case TensorSlot::BlockSwiGLU: base = &rs.simplified_acts(ref.layer_idx).swiglu; break;
             case TensorSlot::BlockMLPDown: base = &rs.simplified_acts(ref.layer_idx).mlp_down; break;
+            case TensorSlot::BlockRouterLogits: base = &rs.simplified_acts(ref.layer_idx).router_logits; break;
+            case TensorSlot::BlockRouterProbs: base = &rs.simplified_acts(ref.layer_idx).router_probs; break;
+            case TensorSlot::BlockRoutingWeights: base = &rs.simplified_acts(ref.layer_idx).routing_weights; break;
+            case TensorSlot::BlockRoutingIndices: base = &rs.simplified_acts(ref.layer_idx).routing_indices; break;
+            case TensorSlot::BlockPermutedInput: base = &rs.simplified_acts(ref.layer_idx).permuted_input; break;
+            case TensorSlot::BlockScatterIndices: base = &rs.simplified_acts(ref.layer_idx).scatter_indices; break;
+            case TensorSlot::BlockExpertGateUp: base = &rs.simplified_acts(ref.layer_idx).expert_gate_up; break;
+            case TensorSlot::BlockExpertAct: base = &rs.simplified_acts(ref.layer_idx).expert_act; break;
+            case TensorSlot::BlockExpertDown: base = &rs.simplified_acts(ref.layer_idx).expert_down; break;
+            case TensorSlot::BlockMoeOut: base = &rs.simplified_acts(ref.layer_idx).moe_out; break;
             default: break;
         }
         if (base && base->Data) {
@@ -1212,6 +1222,16 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         case TensorSlot::BlockMLPDown: return rs.simplified_acts(ref.layer_idx).mlp_down;
         case TensorSlot::BlockHOut: return rs.simplified_acts(ref.layer_idx).h_out;
         case TensorSlot::BlockResidualFFN: return rs.get_residual(ref.layer_idx, rs.MainStream);
+        case TensorSlot::BlockRouterLogits: return rs.simplified_acts(ref.layer_idx).router_logits;
+        case TensorSlot::BlockRouterProbs: return rs.simplified_acts(ref.layer_idx).router_probs;
+        case TensorSlot::BlockRoutingWeights: return rs.simplified_acts(ref.layer_idx).routing_weights;
+        case TensorSlot::BlockRoutingIndices: return rs.simplified_acts(ref.layer_idx).routing_indices;
+        case TensorSlot::BlockPermutedInput: return rs.simplified_acts(ref.layer_idx).permuted_input;
+        case TensorSlot::BlockScatterIndices: return rs.simplified_acts(ref.layer_idx).scatter_indices;
+        case TensorSlot::BlockExpertGateUp: return rs.simplified_acts(ref.layer_idx).expert_gate_up;
+        case TensorSlot::BlockExpertAct: return rs.simplified_acts(ref.layer_idx).expert_act;
+        case TensorSlot::BlockExpertDown: return rs.simplified_acts(ref.layer_idx).expert_down;
+        case TensorSlot::BlockMoeOut: return rs.simplified_acts(ref.layer_idx).moe_out;
         case TensorSlot::BlockDLN1: return rs.simplified_grads(ref.layer_idx).d_ln1;
         case TensorSlot::BlockDQKV: return rs.simplified_grads(ref.layer_idx).d_qkv;
         case TensorSlot::BlockDAtt: return rs.simplified_grads(ref.layer_idx).d_att;
