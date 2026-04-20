@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <algorithm>
 #include <atomic>
@@ -85,10 +86,10 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     // writes there without a post-kernel D2D copy.
     Tensor* residual_out_ptr = nullptr;
     if (is_ln2_fwd) {
-        auto& buf = mRunState.simplified_acts(fwd_layer_idx).residual_att;
-        if (buf.Data) {
-            residual_out_ptr = &buf;
-            store_tensor(op.outputs[0], buf);
+        if (Tensor* buf = block_activation_ptr(mRunState, fwd_layer_idx, TensorSlot::BlockResidualAtt);
+            buf && buf->Data) {
+            residual_out_ptr = buf;
+            store_tensor(op.outputs[0], *buf);
         }
     } else if (is_hybrid_norm) {
         Tensor& buf = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
@@ -107,10 +108,9 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     // Bind rstd to canonical buffer for Hybrid norm.
     Tensor* rstd_ptr = nullptr;
     if (is_hybrid_norm) {
-        Tensor& buf = mRunState.simplified_acts(fwd_layer_idx).ln1_rstd;
-        if (buf.Data) {
-            rstd_ptr = &buf;
-            store_tensor(op.outputs[2], buf);
+        if (Tensor* buf = block_activation_ptr(mRunState, fwd_layer_idx, TensorSlot::BlockLN1RSTD); buf && buf->Data) {
+            rstd_ptr = buf;
+            store_tensor(op.outputs[2], *buf);
         }
     }
     if (!rstd_ptr) {
@@ -333,18 +333,17 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             mRunState.fetch_residual(ln_layer_idx, mRunState.side_stream());
         }
         residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
-        rstd_ptr = &mRunState.simplified_acts(ln_layer_idx).ln1_rstd;
+        rstd_ptr = block_activation_ptr(mRunState, ln_layer_idx, TensorSlot::BlockLN1RSTD);
     } else if (ln_layer_idx >= 0 && ln_field == "norm_weight") {
         if (mRunState.has_residual_offloading()) {
             mRunState.fetch_residual(ln_layer_idx, mRunState.side_stream());
         }
         residual_out_ptr = &mRunState.get_residual(ln_layer_idx, mRunState.MainStream);
-        rstd_ptr = &mRunState.simplified_acts(ln_layer_idx).ln1_rstd;
+        rstd_ptr = block_activation_ptr(mRunState, ln_layer_idx, TensorSlot::BlockLN1RSTD);
     }
     if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
-        auto& acts = mRunState.simplified_acts(ln_layer_idx);
-        residual_out_ptr = &acts.residual_att;
-        rstd_ptr = &acts.ln2_rstd;
+        residual_out_ptr = block_activation_ptr(mRunState, ln_layer_idx, TensorSlot::BlockResidualAtt);
+        rstd_ptr = block_activation_ptr(mRunState, ln_layer_idx, TensorSlot::BlockLN2RSTD);
     }
     Tensor& residual_out = *residual_out_ptr;
 
@@ -371,9 +370,8 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     Tensor* d_input_ptr = nullptr;
     if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
         // LN2: canonical target is d_mlp_down (MLP backward reads this as d_out)
-        auto& grads = mRunState.simplified_grads(ln_layer_idx);
-        if (grads.d_mlp_down.Data) {
-            d_input_ptr = &grads.d_mlp_down;
+        if (Tensor* g = block_gradient_ptr(mRunState, ln_layer_idx, TensorSlot::BlockDMLPDown); g && g->Data) {
+            d_input_ptr = g;
         }
     } else if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight")) {
         // LN1/norm: gradient flows to the previous block's output. Gemma4 uses
@@ -382,11 +380,13 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         if (op.outputs.size() > 1) {
             const int prev_layer = op.outputs[1].layer_idx;
             if (prev_layer >= 0) {
-                auto& prev_grads = mRunState.simplified_grads(prev_layer);
-                if (prev_grads.d_h_out.Data) {
-                    d_input_ptr = &prev_grads.d_h_out;
-                } else if (op.outputs[1].slot == TensorSlot::BlockDMLPDown && prev_grads.d_mlp_down.Data) {
-                    d_input_ptr = &prev_grads.d_mlp_down;
+                if (Tensor* g = block_gradient_ptr(mRunState, prev_layer, TensorSlot::BlockDHOut); g && g->Data) {
+                    d_input_ptr = g;
+                } else if (op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
+                    if (Tensor* g2 = block_gradient_ptr(mRunState, prev_layer, TensorSlot::BlockDMLPDown);
+                        g2 && g2->Data) {
+                        d_input_ptr = g2;
+                    }
                 }
             }
         }
@@ -529,18 +529,20 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     // Alias related gradient buffers so code reading simplified_grads directly
     // (not via resolve_tensor/mTensors) sees the correct data.
     if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
-        auto& grads = mRunState.simplified_grads(ln_layer_idx);
-        if (grads.d_res_ffn.Data && grads.d_res_ffn.Data != d_input.Data) {
-            grads.d_res_ffn.Data = d_input.Data;
+        if (Tensor* d_res_ffn = block_gradient_ptr(mRunState, ln_layer_idx, TensorSlot::BlockDResFFN);
+            d_res_ffn && d_res_ffn->Data && d_res_ffn->Data != d_input.Data) {
+            d_res_ffn->Data = d_input.Data;
         }
     }
     if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight") && op.outputs.size() > 1 &&
         op.outputs[1].slot == TensorSlot::BlockDMLPDown) {
         const int prev_layer = op.outputs[1].layer_idx;
         if (prev_layer >= 0) {
-            auto& prev_grads = mRunState.simplified_grads(prev_layer);
-            if (!prev_grads.d_h_out.Data && prev_grads.d_res_ffn.Data && prev_grads.d_res_ffn.Data != d_input.Data) {
-                prev_grads.d_res_ffn.Data = d_input.Data;
+            Tensor* d_h_out = block_gradient_ptr(mRunState, prev_layer, TensorSlot::BlockDHOut);
+            Tensor* d_res_ffn = block_gradient_ptr(mRunState, prev_layer, TensorSlot::BlockDResFFN);
+            const bool d_h_out_empty = !d_h_out || !d_h_out->Data;
+            if (d_h_out_empty && d_res_ffn && d_res_ffn->Data && d_res_ffn->Data != d_input.Data) {
+                d_res_ffn->Data = d_input.Data;
             }
         }
     }
