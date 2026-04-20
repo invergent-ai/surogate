@@ -331,6 +331,48 @@ mis-sized view.
 
 Code reverted. Only the helper (ba7ffa2) ships.
 
+### Phase A third attempt: narrowing further, same symptom
+
+Re-applied rstd null-init + resolve_tensor bypass + layer_end
+invalidate_cached_slot together. Rebuilt and reran. Same
+deterministic `norm 0.8512` + `cudaErrorIllegalAddress`.
+
+Checked one more code path: the tensor-slot registry's
+`will_recompute("ln1_rstd")` governs whether the save path writes
+metadata-only or the actual value. Qwen3 config has
+`recompute=true` + `lora=true` so `forward_replay_active` is true,
+which SHOULD mean the save path is metadata-only and replay
+regenerates rstd before backward reads. The attempts assumed this
+but never verified empirically.
+
+**Conclusion of this session's attempts.** Three distinct
+mechanisms were added (cache invalidation, resolve_tensor bypass
+for BlockLN*RSTD, layer_end .Data nulling), all fail identically.
+This is strong evidence that there's another lifetime / binding
+mechanism — likely somewhere between `dispatch_fused_residual_rmsnorm`'s
+`store_tensor` call on the rstd view, the forward-replay's
+handling of that cache, and backward's tensor lookup — that we
+haven't pinpointed. The memo's earlier hypotheses (1) replay
+ordering, (2) view_for_shape early-exit, (3) store_tensor shape
+mismatch remain as candidates.
+
+**What a successful next session needs.** The debugging approach
+proposed earlier — instrumented prints in forward after rstd write,
+in forward-replay after re-write, in backward before rstd read,
+capturing (pointer, first 4 floats) — would surface which pointer
+backward actually reads from. Without that empirical data, further
+blind attempts will cycle through the same revert-investigate
+pattern we've seen for 3 attempts now.
+
+**Design-level alternative.** If the instrumented approach still
+doesn't unblock, the fallback is to accept that M3 requires the
+fuller design-intended executor-level frame discipline (per-block
+Stack.save/restore for simplified_acts specifically, not just
+temp-alloc), which is a genuinely multi-session structural change.
+Ship the cache-invalidation helper, the operand coverage metric,
+and the producer/consumer audit as the M3 groundwork for now;
+schedule the executor-level work as a separate focused effort.
+
 ### M4 — Persistent & Accumulator arenas
 
 Weights in Persistent, gradients in Accumulator. Replaces `mWeights` / `mGrads` backing. Flip `SUROGATE_USE_PHASE_PERSISTENT=1` on.
