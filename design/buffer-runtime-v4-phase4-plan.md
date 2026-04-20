@@ -395,6 +395,31 @@ Dispatch consolidation commits:
 - `5b70b77` Backward: legacy-path inline block replaced with
   `bwd_layer_end_cleanup(L, idx, capturing)` call (~137 lines removed)
 
+### Dead struct-field removal (Mamba / swiglu_scale)
+
+The Mamba / SSM fields on `SimplifiedLayerActivations`
+(`mamba_gate` / `mamba_conv_in` / `mamba_u` / `mamba_delta` /
+`mamba_B` / `mamba_C` / `mamba_scan_out` / `mamba_gated` /
+`mamba_normed` / `mamba_rstd` / `mamba_x`) and the matching
+`d_mamba_*` fields on `SimplifiedLayerGradients` plus `swiglu_scale`
+were declared in anticipation of per-field access patterns that
+never materialized. Mamba ops route per-layer tensors through
+`resolve_tensor` on `blocks[N].mamba_*` / `d_blocks[N].mamba_*`
+names — they never touch these struct members.
+
+Commit:
+- `e8fe8c8` Delete 11+1 activation fields, 8 gradient fields, and 8
+  `.Data = .Data` no-op lines from `reset_simplified_gradients`.
+  Struct-field footprint drops to exactly the slots that the
+  member-pointer tables in `tensor_slot_dispatch.cpp` cover.
+
+**The struct is now a minimal, closed set of fields that every
+caller reaches through the dispatch helpers.** Full storage
+migration (named fields → `std::array<Tensor, N>` indexed by
+`TensorSlot`) is a local change to `dsl_run_state.cpp`'s
+allocation loop plus the member-pointer tables; no consumer code
+needs to change.
+
 Net impact: `shared_tag()` + per-layer activation allocator loop +
 all gradient-sharing from the design's M5 kill-list is gone.
 `builtin_slot_from_name` direct callers dropped from ~35 to ~10
