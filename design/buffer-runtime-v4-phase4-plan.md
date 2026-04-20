@@ -358,6 +358,7 @@ M5 progress.
 | `9656ce3` | Dropped stale recomputation comment on mFP8ScalingState |
 | `70243c6` | Removed dead `TensorSlot::Temporary` enum value + its 6 dead checks across buffer_plan, graph_compiler, compiled_ops_save, fused_residual_rmsnorm |
 | `6530ace` | Consolidated `resolve_tensor`'s 40-case slot switch to delegate Block*/MoE*/BlockD*/global cases through `block_activation_ptr` / `block_gradient_ptr` / `global_activation_ptr` helpers. Struct-field indirection now referenced in exactly one place (`tensor_slot_dispatch.cpp`), groundwork for future SimplifiedLayerActivations replacement |
+| `939a6f3` + `d0bfc0b` | Migrated 17 direct ops-side `simplified_acts(L).X` / `simplified_grads(L).X` accesses to `block_activation_ptr` / `block_gradient_ptr` helpers across fused_residual_rmsnorm, matmul, matmul_swiglu, add, moe_unpermute. Ops layer now has ZERO direct struct-field access — dispatch helpers are the only consumers outside dsl_run_state.cpp itself |
 
 Net impact: `shared_tag()` + per-layer activation allocator loop +
 all gradient-sharing from the design's M5 kill-list is gone.
