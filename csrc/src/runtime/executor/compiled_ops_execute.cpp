@@ -190,10 +190,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             if (!resolved.Data && !inp.name.empty()) {
                 // Blocks-qualified: `blocks[N].<field>`
                 int lyr = -1;
-                std::string field;
-                if (parse_block_param(inp.name, lyr, field)) {
-                    const std::string base = strip_ssa_suffix(field);
-                    const TensorSlot slot = builtin_slot_from_name(base);
+                const TensorSlot slot = resolve_block_slot(inp.name, &lyr);
+                if (lyr >= 0) {
                     if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
                         resolved = *bp;
                     }
@@ -373,10 +371,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // the right RunState buffer. New slots are added in ONE place
             // (tensor_slot_dispatch.cpp) rather than duplicated here.
             int lyr = -1;
-            std::string field;
-            if (parse_block_param(name, lyr, field)) {
-                const std::string base = strip_ssa_suffix(field);
-                const TensorSlot slot = builtin_slot_from_name(base);
+            const TensorSlot slot = resolve_block_slot(name, &lyr);
+            if (lyr >= 0) {
                 if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
                     if (bp->Data) {
                         (*mSaved)[name] = *bp;

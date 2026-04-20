@@ -54,10 +54,7 @@ namespace {
 // scratch) and `ep_*` (expert-parallel internal comms). To add a new MoE
 // tensor, extend the TensorSlot enum or update the tail list here.
 bool is_moe_tensor_name(const std::string& n) {
-    int lid = -1;
-    std::string field;
-    const std::string probe = parse_block_param(n, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(n);
-    switch (builtin_slot_from_name(probe)) {
+    switch (resolve_block_slot(n)) {
         case TensorSlot::BlockRouterLogits:
         case TensorSlot::BlockRouterProbs:
         case TensorSlot::BlockRoutingWeights:
@@ -70,6 +67,8 @@ bool is_moe_tensor_name(const std::string& n) {
         case TensorSlot::BlockMoeOut: return true;
         default: break;
     }
+    // Global MoE side-channels (not modelled as per-block slots).
+    const std::string probe = strip_ssa_suffix(n);
     return probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
 }
 
@@ -330,16 +329,11 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         }
 
         int layer_idx = -1;
-        std::string field;
-        if (!parse_block_param(name, layer_idx, field)) {
-            return std::nullopt;
-        }
+        bool is_flat = false;
+        const TensorSlot slot = resolve_block_slot(name, &layer_idx, &is_flat);
         if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
             return std::nullopt;
         }
-        const std::string base_field = strip_ssa_suffix(field);
-        const bool is_flat = (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0);
-        const TensorSlot slot = builtin_slot_from_name(base_field);
 
         // Block-scope activation (including MoE slots) via the shared helper.
         // `is_flat` applies a 2D view when the caller requested `<field>_flat`
@@ -478,12 +472,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (!mLoRAConfig) {
             return false;
         }
-        int layer_idx = -1;
-        std::string field;
-        if (!parse_block_param(tensor_name, layer_idx, field)) {
-            return false;
-        }
-        const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+        const TensorSlot slot = resolve_block_slot(tensor_name);
         return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
     };
     auto is_forced_persist_global = [&](const std::string& n) -> bool {
@@ -784,12 +773,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (!mLoRAConfig) {
             return false;
         }
-        int layer_idx = -1;
-        std::string field;
-        if (!parse_block_param(tensor_name, layer_idx, field)) {
-            return false;
-        }
-        const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+        const TensorSlot slot = resolve_block_slot(tensor_name);
         return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
     };
 
@@ -879,11 +863,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
 
         // Block-scope fields.
         int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            const std::string base_field = strip_ssa_suffix(field);
-            const bool is_flat = (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0);
-            const TensorSlot slot = builtin_slot_from_name(base_field);
+        bool is_flat = false;
+        const TensorSlot slot = resolve_block_slot(name, &layer_idx, &is_flat);
+        if (layer_idx >= 0) {
             if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
                 if (is_flat && t->Rank >= 3) {
                     Tensor flat = view_tensor(*t, {t->Sizes[0] * t->Sizes[1], t->Sizes[2]});
@@ -979,13 +961,12 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
     }
 
     int layer_idx = -1;
-    std::string field;
-    if (parse_block_param(name, layer_idx, field)) {
-        if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
+    std::string base_field;
+    const TensorSlot slot = resolve_block_slot(name, &layer_idx, nullptr, &base_field);
+    if (layer_idx >= 0) {
+        if (layer_idx >= static_cast<int>(mConfig.NumLayers)) {
             return nullptr;
         }
-        const std::string base_field = strip_ssa_suffix(field);
-        const TensorSlot slot = builtin_slot_from_name(base_field);
         if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
             return map_view(*t);
         }

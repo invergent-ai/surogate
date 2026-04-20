@@ -148,6 +148,21 @@ TensorSlot builtin_slot_from_name(const std::string& name);
 /// resolves.
 TensorSlot resolve_slot_with_flat(const std::string& name, bool* out_is_flat_view = nullptr);
 
+/// Block-scope variant: parses `blocks[N].<field>` (or `blocks.N.field`,
+/// `layerN.field`), strips the SSA numeric suffix, and returns the resulting
+/// slot. Block `_flat` aliases (`ln1_flat`, `qkv_flat`, ...) are in the
+/// name→slot table directly and resolve to the same slot as their 3D base;
+/// `*out_is_flat_view` is set to true whenever the stripped field name ends
+/// in `_flat`, so callers that need a 2D view of the underlying 3D buffer
+/// can flatten accordingly.
+///
+/// Returns `TensorSlot::Mapped` (and leaves outputs untouched) when `name`
+/// is not block-qualified.
+TensorSlot resolve_block_slot(const std::string& name,
+                              int* out_layer_idx = nullptr,
+                              bool* out_is_flat_view = nullptr,
+                              std::string* out_base_field = nullptr);
+
 }  // namespace dsl
 
 #endif  // SUROGATE_SRC_DSL_TENSOR_SLOT_REGISTRY_H
