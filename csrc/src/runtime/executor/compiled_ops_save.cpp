@@ -45,6 +45,36 @@
 
 namespace dsl {
 
+namespace {
+
+// Per-block MoE slots (router_logits, routing_weights, permuted_input,
+// expert_*, moe_out, ...) have dedicated TensorSlot enum values. The
+// name-based tail covers MoE side-channels deliberately NOT modelled as
+// per-block slots: `moe_expert_offsets` / `moe_gather_indices` (global
+// scratch) and `ep_*` (expert-parallel internal comms). To add a new MoE
+// tensor, extend the TensorSlot enum or update the tail list here.
+bool is_moe_tensor_name(const std::string& n) {
+    int lid = -1;
+    std::string field;
+    const std::string probe = parse_block_param(n, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(n);
+    switch (builtin_slot_from_name(probe)) {
+        case TensorSlot::BlockRouterLogits:
+        case TensorSlot::BlockRouterProbs:
+        case TensorSlot::BlockRoutingWeights:
+        case TensorSlot::BlockRoutingIndices:
+        case TensorSlot::BlockPermutedInput:
+        case TensorSlot::BlockScatterIndices:
+        case TensorSlot::BlockExpertGateUp:
+        case TensorSlot::BlockExpertAct:
+        case TensorSlot::BlockExpertDown:
+        case TensorSlot::BlockMoeOut: return true;
+        default: break;
+    }
+    return probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
+}
+
+}  // namespace
+
 // Historical note: `strip_autodiff_accum_suffix` and
 // `should_alias_autodiff_accum_name` lived here. Both were name-based
 // heuristics that attempted to detect autodiff accumulator variants
@@ -464,46 +494,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             default: return false;
         }
     };
-    auto is_moe_tensor_name = [&](const std::string& n) -> bool {
-        // Per-block MoE slots (router_logits, routing_weights, permuted_input,
-        // expert_*, moe_out, …) all have dedicated TensorSlot enum values —
-        // dispatched via `builtin_slot_from_name(probe)` in one place.
-        //
-        // The name-based tail covers MoE side-channels that are deliberately
-        // NOT modelled as per-block TensorSlot values:
-        //
-        //   * `moe_expert_offsets`, `moe_gather_indices` — global host/device
-        //     scratch tensors shared across layers (see `register_external_names`
-        //     in graph_compiler). They have no per-block backing buffer in
-        //     SimplifiedLayerActivations, so they can't fit the block-slot
-        //     model. Kept name-based until the runtime either adds a
-        //     `GlobalMoeOffsets` / `GlobalMoeGather` slot group or migrates
-        //     them behind a dedicated MoE-metadata helper.
-        //   * `ep_*` — expert-parallel internal communication names produced
-        //     by runtime EP code. These never touch the slot registry; they
-        //     are pure C++ bookkeeping and don't need a TensorSlot.
-        //
-        // If a new MoE tensor shows up, decide first whether it's per-block
-        // (extend the TensorSlot enum + this switch) or global/EP (add to
-        // the name-based tail below, with the same reasoning).
-        int lid = -1;
-        std::string field;
-        const std::string probe = parse_block_param(n, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(n);
-        switch (builtin_slot_from_name(probe)) {
-            case TensorSlot::BlockRouterLogits:
-            case TensorSlot::BlockRouterProbs:
-            case TensorSlot::BlockRoutingWeights:
-            case TensorSlot::BlockRoutingIndices:
-            case TensorSlot::BlockPermutedInput:
-            case TensorSlot::BlockScatterIndices:
-            case TensorSlot::BlockExpertGateUp:
-            case TensorSlot::BlockExpertAct:
-            case TensorSlot::BlockExpertDown:
-            case TensorSlot::BlockMoeOut: return true;
-            default: break;
-        }
-        return probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
-    };
+    // is_moe_tensor_name hoisted to file-scope helper above.
 
     for (const auto& name : save_list) {
         if (mWeights.has(name)) {
@@ -847,36 +838,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             }
         }
         if (found_tensor) {
-            // Same MoE predicate as `is_moe_tensor_name` in the sibling
-            // prepare_saved_buffers_for_capture method — kept inline here
-            // instead of lifted to a shared helper because the two lambdas
-            // live in different scopes. See the commentary on
-            // `is_moe_tensor_name` for the MoE-side-channel deferral
-            // (moe_expert_offsets / moe_gather_indices / ep_* remain
-            // name-based by design; everything per-block is enum-driven).
-            int moe_lid = -1;
-            std::string moe_field;
-            const std::string moe_probe =
-                parse_block_param(name, moe_lid, moe_field) ? strip_ssa_suffix(moe_field) : strip_ssa_suffix(name);
-            bool is_moe_tensor = false;
-            switch (builtin_slot_from_name(moe_probe)) {
-                case TensorSlot::BlockRouterLogits:
-                case TensorSlot::BlockRouterProbs:
-                case TensorSlot::BlockRoutingWeights:
-                case TensorSlot::BlockRoutingIndices:
-                case TensorSlot::BlockPermutedInput:
-                case TensorSlot::BlockScatterIndices:
-                case TensorSlot::BlockExpertGateUp:
-                case TensorSlot::BlockExpertAct:
-                case TensorSlot::BlockExpertDown:
-                case TensorSlot::BlockMoeOut: is_moe_tensor = true; break;
-                default: break;
-            }
-            if (!is_moe_tensor) {
-                is_moe_tensor =
-                    moe_probe == "moe_expert_offsets" || moe_probe == "moe_gather_indices" || name.rfind("ep_", 0) == 0;
-            }
-            const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
+            const bool force_persist = is_moe_tensor_name(name) && mConfig.NumExperts > 0;
             save_tensor_with_policy(name, *found_tensor, prefer_live, force_persist || force_persist_name);
             continue;
         }
