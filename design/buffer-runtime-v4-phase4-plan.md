@@ -331,6 +331,60 @@ mis-sized view.
 
 Code reverted. Only the helper (ba7ffa2) ships.
 
+### Phase A breakthrough: instrumented trace finds the root cause, step 0 ships
+
+Added `SUROGATE_DEBUG_RSTD=1` printing pointer + first 4 values at
+every rstd forward-write, forward-replay, and backward-read site.
+Comparing baseline (legacy mAllocator) vs flag-on traces revealed the
+exact mechanism:
+
+**Baseline:**
+- Every layer's `FWD-REPLAY` writes rstd to a STABLE mAllocator-backed
+  ptr (same address across all iterations).
+- `BWD-LN*` reads from the same ptr, gets the just-written values.
+
+**Flag-on (before the fix):**
+- Every layer's `FWD-REPLAY` writes to a fresh Stack ptr (different
+  address each iteration).
+- `BWD-LN*` reads from the replay's ptr but gets **wrong values
+  (~0.001 instead of 3.8)** — the pointer is the same one replay
+  wrote but the memory contents changed.
+
+The clobber point: `replay_layer_forward` calls `Stack.restore` at
+[compiled_ops_execute.cpp:465](../csrc/src/runtime/executor/compiled_ops_execute.cpp#L465),
+freeing the Stack memory replay's kernel just wrote rstd values
+into. Backward runs immediately after and reads the freed memory.
+
+The existing `mSaved`-persist loop at
+[compiled_ops_execute.cpp:444+](../csrc/src/runtime/executor/compiled_ops_execute.cpp#L444)
+was designed to handle this for named saved tensors via
+`cudaMallocAsync` + `cudaMemcpyAsync` before the restore — but our
+rstd slots under `forward_replay_active` are metadata-only entries
+in `mSaved` (`Data == nullptr`), so they escape the persist loop.
+
+**The fix (committed at 879f790):** mirror the mSaved-persist pattern
+specifically for `acts.ln{1,2}_rstd` — cudaMallocAsync + D2D copy
+before `Stack.restore`, then rebind both `acts.X.Data` AND any
+captured `mSaved` / `mNamedTensors` / `mTensors` entries to the
+persistent buffer. This makes `Stack.restore` safe and backward
+reads correct values.
+
+Step 0 now bit-identical on Qwen3-bf16 (loss=2.0251, norm=3.876x
+matches baseline 3.874-3.877 noise envelope).
+
+**Remaining issue (step 1 cuBLAS crash):** step 0 completes cleanly,
+step 1 hits `cuBLAS status 14` at `matmul.cpp:431`. The
+`mSaved`-persist debug dump shows stale mSaved entries from step 0's
+replays (Stack ptrs into step-0 Stack ranges that have since been
+freed) are still iterated at step 1's layer 27 replay persist. Fix
+direction: `clear_replay_copied_refs` needs to also null mSaved
+entries whose Data points into freed Stack ranges between steps,
+not just the replay-copied cudaMalloc buffers. Not attempted this
+session.
+
+Flag kept as `SUROGATE_RSTD_ON_STACK=1` default off. Merge-gate on
+the step-1 crash fix.
+
 ### Phase A third attempt: narrowing further, same symptom
 
 Re-applied rstd null-init + resolve_tensor bypass + layer_end
