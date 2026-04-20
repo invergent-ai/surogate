@@ -6,8 +6,10 @@
 #define SUROGATE_SRC_MODULES_RUN_STATE_TYPES_H
 
 #include <cuda_runtime.h>
+#include <array>
 #include <cstddef>
 #include <vector>
+#include "runtime/dsl/tensor_slot.h"
 #include "utilities/tensor.h"
 #include "fp8_run_state.h"
 #include "fp4_run_state.h"
@@ -21,40 +23,39 @@ namespace modules {
  * Used for initial implementation - can be replaced with modular activations later.
  */
 struct SimplifiedLayerActivations {
-    Tensor ln1_rstd;      ///< (B, T) - RMSNorm reciprocal std
-    Tensor ln1;           ///< (B, T, C) - normalized input
-    Tensor ln2_rstd;      ///< (B, T) - RMSNorm reciprocal std
-    Tensor ln2;           ///< (B, T, C) - normalized input
-    Tensor q_rstd;        ///< (B, T, Hq) - optional Q head RMSNorm rstd (Qwen3)
-    Tensor k_rstd;        ///< (B, T, Hkv) - optional K head RMSNorm rstd (Qwen3)
-    Tensor qkv;           ///< (B, T, QKV_C) - after QKV projection (+ optional QK-norm); pre-RoPE if qkv_rope is used
-    Tensor qkv_rope;      ///< (B, T, QKV_C) - optional post-RoPE packed QKV (for faster QK-norm backward)
-    Tensor lse;           ///< (B, num_heads, T) - log-sum-exp from attention
-    Tensor att;           ///< (B, T, Hq*Hs) - attention output (pre out-proj)
-    Tensor att_out;       ///< (B, T, C) - after output projection
-    Tensor residual_att;  ///< (B, T, C) - residual + attention
-    Tensor mlp_up;        ///< (B, T, 2*D) - gate+up projection
-    Tensor swiglu;        ///< (B, T, D) - SwiGLU output
-    Tensor mlp_down;      ///< (B, T, C) - down projection
-    Tensor
-        h_out;  ///< (B, T, C) - final block output (post layer_scalar); used by Gemma4 to avoid mlp_down collision in autodiff
+    // Backing storage indexed by dsl::TensorSlot. Only block-activation
+    // slot indices (BlockLN1 .. BlockMoeOut) are written — the rest of the
+    // enum range is zero-initialized Tensor{} padding (~4 KiB per layer).
+    //
+    // Access: acts[TensorSlot::BlockLN1] = ... / acts[TensorSlot::BlockLN1].Data
+    //
+    // Slot documentation (see TensorSlot enum):
+    //   BlockLN1RSTD/LN2RSTD: (B, T) FP32 - RMSNorm reciprocal std
+    //   BlockLN1/LN2: (B, T, C) - normalized input
+    //   BlockQRSTD/KRSTD: (B, T, Hq|Hkv) FP32 - optional QK-norm rstd (Qwen3)
+    //   BlockQKV: (B, T, QKV_C) - after QKV projection; pre-RoPE if qkv_rope used
+    //   BlockQKVRoPE: (B, T, QKV_C) - optional post-RoPE packed QKV
+    //   BlockLSE: (B, num_heads, T) - log-sum-exp from attention
+    //   BlockAtt: (B, T, Hq*Hs) - attention output (pre out-proj)
+    //   BlockAttOut: (B, T, C) - after output projection
+    //   BlockResidualAtt: (B, T, C) - residual + attention
+    //   BlockMLPUp: (B, T, 2*D) - gate+up projection
+    //   BlockSwiGLU: (B, T, D) - SwiGLU output
+    //   BlockMLPDown: (B, T, C) - down projection
+    //   BlockHOut: (B, T, C) - final block output (Gemma4)
+    //   BlockRouter*/Routing*/Expert*/Permuted*/Scatter*/MoeOut: MoE slots
+    //
+    // Mamba / SSM ops route per-layer tensors through resolve_tensor
+    // ("blocks[N].mamba_*") — no per-field struct storage needed.
+    static constexpr std::size_t kSize = static_cast<std::size_t>(dsl::TensorSlot::Mapped) + 1;
+    std::array<Tensor, kSize> slots{};
 
-    // MoE activations
-    Tensor router_logits;    ///< (B*T, E) - router logits
-    Tensor router_probs;     ///< (B*T, E) - router probabilities
-    Tensor routing_weights;  ///< (B*T, K) - top-k routing weights
-    Tensor routing_indices;  ///< (B*T, K) - top-k expert indices (int32)
-    Tensor permuted_input;   ///< (B*T*K, C) - permuted inputs
-    Tensor scatter_indices;  ///< (B*T*K,) - scatter indices (int32)
-    Tensor expert_gate_up;   ///< (B*T*K, 2*MoeD) - expert gate+up output
-    Tensor expert_act;       ///< (B*T*K, MoeD) - expert activation output
-    Tensor expert_down;      ///< (B*T*K, C) - expert down output
-    Tensor moe_out;          ///< (B*T, C) - combined MoE output (view of mlp_down)
-
-    // Mamba / SSM ops route their per-layer tensors through resolve_tensor
-    // (named "blocks[N].mamba_*") — they do not use per-field struct members
-    // here. The previous mamba_gate / mamba_u / ... fields were declared but
-    // never allocated or accessed; removed as dead storage (Phase 4 M5).
+    Tensor& operator[](dsl::TensorSlot s) {
+        return slots[static_cast<std::size_t>(s)];
+    }
+    const Tensor& operator[](dsl::TensorSlot s) const {
+        return slots[static_cast<std::size_t>(s)];
+    }
 };
 
 /**
@@ -76,22 +77,36 @@ struct SimplifiedLayerQuantActivations {
  * for the modular "simplified" backward implementation in model/modular_model.h.
  */
 struct SimplifiedLayerGradients {
-    Tensor d_res_ffn;   ///< (B, T, C) gradient w.r.t. (residual_att + mlp_down)
-    Tensor d_res_att;   ///< (B, T, C) gradient w.r.t. residual input to attention
-    Tensor d_att_out;   ///< (B, T, C) gradient w.r.t. attention output projection (O-proj output)
-    Tensor d_ln2;       ///< (B, T, C) gradient w.r.t. LN2 output
-    Tensor d_mlp_up;    ///< (B, T, 2*D) gradient w.r.t. MLP up (gate+up) output
-    Tensor d_swiglu;    ///< (B, T, D) gradient w.r.t. SwiGLU output
-    Tensor d_mlp_down;  ///< (B, T, C) gradient w.r.t. MLP down output (block output)
-    Tensor d_h_out;     ///< (B, T, C) gradient w.r.t. block final output (Gemma4 h_out)
-    Tensor d_att;       ///< (B, T, Hq*Hs) gradient w.r.t. attention output (pre out-proj)
-    Tensor d_qkv;       ///< (B, T, QKV_C) gradient w.r.t. QKV (post RoPE)
-    Tensor d_ln1;       ///< (B, T, C) gradient w.r.t. LN1 output
+    // Backing storage indexed by dsl::TensorSlot. Only BlockD* slot indices
+    // (BlockDLN1 .. BlockDResFFN) are written — the rest of the enum range
+    // is zero-initialized Tensor{} padding.
+    //
+    // Access: grads[TensorSlot::BlockDLN1] = ... / grads[TensorSlot::BlockDLN1].Data
+    //
+    // Slot documentation:
+    //   BlockDResFFN: (B, T, C) gradient w.r.t. (residual_att + mlp_down)
+    //   BlockDResAtt: (B, T, C) gradient w.r.t. residual input to attention
+    //   BlockDAttOut: (B, T, C) gradient w.r.t. attention output projection
+    //   BlockDLN2: (B, T, C) gradient w.r.t. LN2 output
+    //   BlockDMLPUp: (B, T, 2*D) gradient w.r.t. MLP up output
+    //   BlockDSwiGLU: (B, T, D) gradient w.r.t. SwiGLU output
+    //   BlockDMLPDown: (B, T, C) gradient w.r.t. MLP down output
+    //   BlockDHOut: (B, T, C) gradient w.r.t. block final output (Gemma4)
+    //   BlockDAtt: (B, T, Hq*Hs) gradient w.r.t. attention output
+    //   BlockDQKV: (B, T, QKV_C) gradient w.r.t. QKV (post RoPE)
+    //   BlockDLN1: (B, T, C) gradient w.r.t. LN1 output
+    //
+    // Mamba / SSM gradients route through resolve_tensor
+    // ("d_blocks[N].mamba_*") — no per-field struct storage needed.
+    static constexpr std::size_t kSize = static_cast<std::size_t>(dsl::TensorSlot::Mapped) + 1;
+    std::array<Tensor, kSize> slots{};
 
-    // Mamba / SSM gradients (d_mamba_*) used to live here but were never
-    // allocated or accessed — Mamba backward ops route per-layer gradients
-    // through resolve_tensor on "d_blocks[N].mamba_*" names. Removed as
-    // dead storage (Phase 4 M5).
+    Tensor& operator[](dsl::TensorSlot s) {
+        return slots[static_cast<std::size_t>(s)];
+    }
+    const Tensor& operator[](dsl::TensorSlot s) const {
+        return slots[static_cast<std::size_t>(s)];
+    }
 };
 
 /**

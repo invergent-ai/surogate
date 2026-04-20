@@ -698,123 +698,75 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             const char* e = std::getenv("SUROGATE_RSTD_ON_STACK");
             return e && std::string(e) == "1";
         }();
-        if (rstd_on_stack) {
-            acts.ln1_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T});
-        } else {
-            acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
-        }
-        if (rstd_on_stack) {
-            acts.ln1 = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
-        } else {
-            acts.ln1 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
-        }
+        // Helper: allocate on Stack (via metadata-only Tensor that the
+        // executor fills in) or through mAllocator, depending on flag.
+        auto stack_or_alloc = [&](TensorSlot slot, bool on_stack, ETensorDType t, std::vector<long> shape) {
+            acts[slot] = on_stack ? Tensor::from_pointer(nullptr, DeviceId, t, shape)
+                                  : mAllocator->allocate(t, tag(slot), kind, shape);
+        };
 
-        if (rstd_on_stack) {
-            acts.ln2_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T});
-        } else {
-            acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
-        }
-        if (rstd_on_stack) {
-            acts.ln2 = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
-        } else {
-            acts.ln2 = mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
-        }
+        stack_or_alloc(TensorSlot::BlockLN1RSTD, rstd_on_stack, ETensorDType::FP32, {B, T});
+        stack_or_alloc(TensorSlot::BlockLN1, rstd_on_stack, dtype, {B, T, C});
+        stack_or_alloc(TensorSlot::BlockLN2RSTD, rstd_on_stack, ETensorDType::FP32, {B, T});
+        stack_or_alloc(TensorSlot::BlockLN2, rstd_on_stack, dtype, {B, T, C});
 
         if (use_qk_norm) {
-            if (rstd_on_stack) {
-                acts.q_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T, Hq});
-                acts.k_rstd = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, T, Hkv});
-            } else {
-                acts.q_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
-                acts.k_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
-            }
+            stack_or_alloc(TensorSlot::BlockQRSTD, rstd_on_stack, ETensorDType::FP32, {B, T, Hq});
+            stack_or_alloc(TensorSlot::BlockKRSTD, rstd_on_stack, ETensorDType::FP32, {B, T, Hkv});
         } else {
-            acts.q_rstd = {};
-            acts.k_rstd = {};
+            acts[TensorSlot::BlockQRSTD] = {};
+            acts[TensorSlot::BlockKRSTD] = {};
         }
 
-        acts.qkv = mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
-        if (plan.need_separate_qkv_rope) {
-            acts.qkv_rope = mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV});
-        } else {
-            acts.qkv_rope = {};
-        }
+        acts[TensorSlot::BlockQKV] = mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
+        acts[TensorSlot::BlockQKVRoPE] =
+            plan.need_separate_qkv_rope ? mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV})
+                                        : Tensor{};
 
-        if (rstd_on_stack) {
-            acts.lse = Tensor::from_pointer(nullptr, DeviceId, ETensorDType::FP32, std::vector<long>{B, Hq, T});
-        } else {
-            acts.lse = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
-        }
-        acts.att = mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
-        if (rstd_on_stack) {
-            acts.att_out = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
-        } else {
-            acts.att_out = mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
-        }
-
-        acts.residual_att = mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
+        stack_or_alloc(TensorSlot::BlockLSE, rstd_on_stack, ETensorDType::FP32, {B, Hq, T});
+        acts[TensorSlot::BlockAtt] = mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
+        stack_or_alloc(TensorSlot::BlockAttOut, rstd_on_stack, dtype, {B, T, C});
+        acts[TensorSlot::BlockResidualAtt] =
+            mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
 
         // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
         // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
-        if (plan.ffn_temps_on_stack || !plan.has_mlp_up_slot) {
-            acts.mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
-        } else {
-            acts.mlp_up = mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPUp), kind, {B, T, lMUp});
-        }
-        if (plan.ffn_temps_on_stack || !plan.has_swiglu_slot) {
-            acts.swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
-        } else {
-            acts.swiglu = mAllocator->allocate(dtype, tag(TensorSlot::BlockSwiGLU), kind, {B, T, lM});
-        }
+        stack_or_alloc(TensorSlot::BlockMLPUp, plan.ffn_temps_on_stack || !plan.has_mlp_up_slot, dtype, {B, T, lMUp});
+        stack_or_alloc(TensorSlot::BlockSwiGLU, plan.ffn_temps_on_stack || !plan.has_swiglu_slot, dtype, {B, T, lM});
 
-        acts.mlp_down = mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
+        acts[TensorSlot::BlockMLPDown] = mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
         // Dedicated per-layer block output slot used by Gemma4 (keeps the
         // block's final h_out separate from the MLP's mlp_down so the
         // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
         // dependency that drives MLP LoRA gradients).
-        if (rstd_on_stack) {
-            acts.h_out = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, C});
-        } else {
-            acts.h_out = mAllocator->allocate(dtype, tag(TensorSlot::BlockHOut), kind, {B, T, C});
-        }
+        stack_or_alloc(TensorSlot::BlockHOut, rstd_on_stack, dtype, {B, T, C});
 
         if (NumExperts > 0) {
             const long num_tokens = B * T;
             const long total_tokens = num_tokens * TopK;
-            // MoE slot tags now come from the TensorSlot enum — same reverse
-            // mapping used for every other block slot. Adding a new MoE slot
-            // is a one-line change in `kSlotMappings`/`slot_to_name`.
-            acts.router_logits =
+            acts[TensorSlot::BlockRouterLogits] =
                 mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterLogits), kind, {num_tokens, NumExperts});
-            acts.router_probs =
+            acts[TensorSlot::BlockRouterProbs] =
                 mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterProbs), kind, {num_tokens, NumExperts});
-            acts.routing_weights =
+            acts[TensorSlot::BlockRoutingWeights] =
                 mAllocator->allocate(dtype, tag(TensorSlot::BlockRoutingWeights), kind, {num_tokens, TopK});
-            acts.routing_indices = mAllocator->allocate(ETensorDType::INT32,
-                                                        tag(TensorSlot::BlockRoutingIndices),
-                                                        kind,
-                                                        {num_tokens, TopK});
-            acts.permuted_input =
+            acts[TensorSlot::BlockRoutingIndices] = mAllocator->allocate(ETensorDType::INT32,
+                                                                         tag(TensorSlot::BlockRoutingIndices),
+                                                                         kind,
+                                                                         {num_tokens, TopK});
+            acts[TensorSlot::BlockPermutedInput] =
                 mAllocator->allocate(dtype, tag(TensorSlot::BlockPermutedInput), kind, {total_tokens, C});
-            acts.scatter_indices =
+            acts[TensorSlot::BlockScatterIndices] =
                 mAllocator->allocate(ETensorDType::INT32, tag(TensorSlot::BlockScatterIndices), kind, {total_tokens});
-            acts.expert_gate_up =
+            acts[TensorSlot::BlockExpertGateUp] =
                 mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertGateUp), kind, {total_tokens, MoeMUp});
-            acts.expert_act = mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertAct), kind, {total_tokens, MoeM});
-            acts.expert_down = mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertDown), kind, {total_tokens, C});
-            acts.moe_out = view_tensor(acts.mlp_down, {num_tokens, C});
-        } else {
-            acts.router_logits = {};
-            acts.router_probs = {};
-            acts.routing_weights = {};
-            acts.routing_indices = {};
-            acts.permuted_input = {};
-            acts.scatter_indices = {};
-            acts.expert_gate_up = {};
-            acts.expert_act = {};
-            acts.expert_down = {};
-            acts.moe_out = {};
+            acts[TensorSlot::BlockExpertAct] =
+                mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertAct), kind, {total_tokens, MoeM});
+            acts[TensorSlot::BlockExpertDown] =
+                mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertDown), kind, {total_tokens, C});
+            acts[TensorSlot::BlockMoeOut] = view_tensor(acts[TensorSlot::BlockMLPDown], {num_tokens, C});
         }
+        // else: slots default-constructed by std::array{} init above.
     }
 }
 
@@ -838,34 +790,36 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         const long lMUp = plan.layer_mlp_up(i);
         const long lM = plan.layer_intermediate(i);
 
-        g.d_res_ffn = mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
-        g.d_res_att = mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        g.d_att_out = plan.is_hybrid ? mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}) : g.d_res_att;
-        g.d_ln2 = mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
+        auto stack_or_alloc_grad = [&](TensorSlot slot, bool on_stack, const char* name, std::vector<long> shape) {
+            g[slot] = on_stack ? Tensor::from_pointer(nullptr, DeviceId, dtype, shape)
+                               : mAllocator->allocate(dtype, name, kind, shape);
+        };
 
-        if (plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot) {
-            g.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
-        } else {
-            g.d_mlp_up = mAllocator->allocate(dtype, "d_mlp_up", kind, {B, T, lMUp});
-        }
-        if (plan.large_bwd_temps_on_stack || !plan.has_swiglu_slot) {
-            g.d_swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
-        } else {
-            g.d_swiglu = mAllocator->allocate(dtype, "d_swiglu", kind, {B, T, lM});
-        }
-        if (plan.large_bwd_temps_on_stack) {
-            g.d_qkv = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lQKV});
-        } else {
-            g.d_qkv = mAllocator->allocate(dtype, "d_qkv", kind, {B, T, lQKV});
-        }
+        g[TensorSlot::BlockDResFFN] = mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
+        g[TensorSlot::BlockDResAtt] = mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
+        // Hybrid (Nemotron-H) keeps d_att_out independent; standard transformers
+        // alias it to d_res_att (residual + attn share the same backward path).
+        g[TensorSlot::BlockDAttOut] =
+            plan.is_hybrid ? mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}) : g[TensorSlot::BlockDResAtt];
+        g[TensorSlot::BlockDLN2] = mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
 
-        g.d_mlp_down = mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
+        stack_or_alloc_grad(TensorSlot::BlockDMLPUp,
+                            plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot,
+                            "d_mlp_up",
+                            {B, T, lMUp});
+        stack_or_alloc_grad(TensorSlot::BlockDSwiGLU,
+                            plan.large_bwd_temps_on_stack || !plan.has_swiglu_slot,
+                            "d_swiglu",
+                            {B, T, lM});
+        stack_or_alloc_grad(TensorSlot::BlockDQKV, plan.large_bwd_temps_on_stack, "d_qkv", {B, T, lQKV});
+
+        g[TensorSlot::BlockDMLPDown] = mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
         // Per-layer h_out gradient (Gemma4: block's final-output grad,
         // separate from MLP's d_mlp_down so the backward chain doesn't
         // collide across the MLP / _finalize split).
-        g.d_h_out = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
-        g.d_att = mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
-        g.d_ln1 = mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
+        g[TensorSlot::BlockDHOut] = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
+        g[TensorSlot::BlockDAtt] = mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
+        g[TensorSlot::BlockDLN1] = mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
 
     // Preserve the original buffer pointers so we can restore them if the
@@ -880,17 +834,21 @@ void DslRunState::reset_simplified_gradients() {
     for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
         auto& dst = mSimplifiedGradients[i];
         const auto& src = mSimplifiedGradientsBase[i];
-
-        dst.d_res_ffn.Data = src.d_res_ffn.Data;
-        dst.d_res_att.Data = src.d_res_att.Data;
-        dst.d_att_out.Data = src.d_att_out.Data;
-        dst.d_ln2.Data = src.d_ln2.Data;
-        dst.d_mlp_up.Data = src.d_mlp_up.Data;
-        dst.d_swiglu.Data = src.d_swiglu.Data;
-        dst.d_mlp_down.Data = src.d_mlp_down.Data;
-        dst.d_att.Data = src.d_att.Data;
-        dst.d_qkv.Data = src.d_qkv.Data;
-        dst.d_ln1.Data = src.d_ln1.Data;
+        // Restore .Data of every BlockD* slot from the base snapshot. The
+        // executor may have aliased these to stack-backed buffers during
+        // backward; this resets them for the next step.
+        for (TensorSlot s : {TensorSlot::BlockDResFFN,
+                             TensorSlot::BlockDResAtt,
+                             TensorSlot::BlockDAttOut,
+                             TensorSlot::BlockDLN2,
+                             TensorSlot::BlockDMLPUp,
+                             TensorSlot::BlockDSwiGLU,
+                             TensorSlot::BlockDMLPDown,
+                             TensorSlot::BlockDAtt,
+                             TensorSlot::BlockDQKV,
+                             TensorSlot::BlockDLN1}) {
+            dst[s].Data = src[s].Data;
+        }
     }
 }
 
@@ -909,9 +867,11 @@ void DslRunState::zero_activation_gradients(cudaStream_t stream) {
     // Fallback: should not normally happen.
     for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
         auto& g = mSimplifiedGradients[i];
-        if (i < mSimplifiedGradients.size() - 1 && g.d_res_ffn.Data) fill_zero(g.d_res_ffn, stream);
-        if (g.d_res_att.Data) fill_zero(g.d_res_att, stream);
-        if (g.d_att_out.Data) fill_zero(g.d_att_out, stream);
+        if (i < mSimplifiedGradients.size() - 1 && g[TensorSlot::BlockDResFFN].Data) {
+            fill_zero(g[TensorSlot::BlockDResFFN], stream);
+        }
+        if (g[TensorSlot::BlockDResAtt].Data) fill_zero(g[TensorSlot::BlockDResAtt], stream);
+        if (g[TensorSlot::BlockDAttOut].Data) fill_zero(g[TensorSlot::BlockDAttOut], stream);
     }
 }
 
@@ -949,18 +909,18 @@ void DslRunState::build_activation_grad_zero_segments() {
         const auto& g = mSimplifiedGradientsBase[i];
         // d_res_ffn for the last layer is zeroed separately (it receives the loss gradient).
         if (i + 1 < n_layers) {
-            add(g.d_res_ffn);
+            add(g[TensorSlot::BlockDResFFN]);
         }
         // Residual gradients can be used as accumulation targets (multiple branches).
         // Other activation gradients are expected to be overwritten (beta=0 / memcpy) within
         // the backward graph and don't need blanket zeroing.
-        add(g.d_res_att);
-        add(g.d_att_out);
+        add(g[TensorSlot::BlockDResAtt]);
+        add(g[TensorSlot::BlockDAttOut]);
         // d_h_out is an accumulation target for the next block's backward
         // (gemma4 routes block output through a dedicated h_out slot to
         // avoid mlp_down collision). Without zeroing, garbage in d_h_out
         // leaks into the first backward that reads it (→ NaN cascade).
-        add(g.d_h_out);
+        add(g[TensorSlot::BlockDHOut]);
     }
 
     mActGradZeroCount = static_cast<int>(ptrs.size());
