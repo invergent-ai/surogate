@@ -921,6 +921,14 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 std::make_unique<CompiledGraph>(mCompiler->compile(*mBackward, B, T, /*is_backward=*/true));
             mCompiledBackward->compute_layer_segments();
         }
+
+        // Cross-graph region fixup (design/buffer-runtime-v4.md, M5.a):
+        // promote forward activations consumed by backward to SaveForBwd in
+        // both compiles. Shadow-only; runtime still uses today's save-list.
+        if (mCompiledForward && mCompiledBackward) {
+            dsl::finalize_save_for_bwd(*mCompiledForward, *mCompiledBackward);
+        }
+
         mCompiledB = B;
         mCompiledT = T;
 

@@ -711,6 +711,14 @@ private:
     void classify_tensors(CompiledGraph& graph);
 };
 
+/// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a).
+/// derive_regions() runs per-direction and cannot see across the pair, so
+/// block activations that are produced in forward and consumed in backward
+/// land in FwdStack / BwdStack. This pass walks both graphs, identifies
+/// shared tids, and promotes their region to SaveForBwd in both compiles.
+/// Safe to call once per (forward, backward) compile pair; idempotent.
+void finalize_save_for_bwd(CompiledGraph& fwd, CompiledGraph& bwd);
+
 }  // namespace dsl
 
 #endif  // SUROGATE_SRC_DSL_GRAPH_COMPILER_H

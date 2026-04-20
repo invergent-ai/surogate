@@ -1771,6 +1771,60 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
 }
 
 // ============================================================================
+// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a)
+// ============================================================================
+
+void finalize_save_for_bwd(CompiledGraph& fwd, CompiledGraph& bwd) {
+    // Tids are shared across the fwd+bwd pair (reset_tid_namespace contract).
+    const int num_tids = std::max(fwd.num_tensors, bwd.num_tensors);
+    if (num_tids <= 0) return;
+
+    std::vector<char> produced_in_fwd(num_tids, 0);
+    std::vector<char> consumed_in_bwd(num_tids, 0);
+
+    for (const auto& op : fwd.ops) {
+        for (const auto& ref : op.outputs) {
+            if (ref.tensor_id >= 0 && ref.tensor_id < num_tids) {
+                produced_in_fwd[ref.tensor_id] = 1;
+            }
+        }
+    }
+    for (const auto& op : bwd.ops) {
+        for (const auto& ref : op.inputs) {
+            if (ref.tensor_id >= 0 && ref.tensor_id < num_tids) {
+                consumed_in_bwd[ref.tensor_id] = 1;
+            }
+        }
+    }
+
+    auto promote = [](CompiledGraph& g, int tid) {
+        if (tid < 0 || tid >= g.num_tensors) return;
+        auto& meta = g.tensor_meta[static_cast<std::size_t>(tid)];
+        // Only block activations are SaveForBwd candidates. Guard rules out
+        // globals like TokenIDs that are consumed in bwd but stay Persistent.
+        if (!meta.is_blocks()) return;
+        if (meta.region == RegionKind::FwdStack || meta.region == RegionKind::BwdStack) {
+            meta.region = RegionKind::SaveForBwd;
+        }
+    };
+
+    int promoted = 0;
+    for (int tid = 0; tid < num_tids; ++tid) {
+        if (produced_in_fwd[tid] && consumed_in_bwd[tid]) {
+            promote(fwd, tid);
+            promote(bwd, tid);
+            ++promoted;
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[regions] SaveForBwd promotion: " << promoted << " tids\n";
+        }
+    }
+}
+
+// ============================================================================
 // Instruction Stream (design/buffer-runtime-v4.md, M4) — shadow-mode emit
 // ============================================================================
 
