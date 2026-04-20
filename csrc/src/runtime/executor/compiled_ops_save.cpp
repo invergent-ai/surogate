@@ -1083,6 +1083,60 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     };
 
+    // Phase 4 M2: baked-view shortcut for SaveForBwd tids.
+    //
+    // persist_saved_layer_tensors() writes the arena-backed Tensor into
+    // both mNamedTensors[name] (string-keyed) and mTensors[tid] (via
+    // bind_tensor). The mNamedTensors path below works — but the hashmap
+    // lookup is the first operation a backward op hits when reading a
+    // saved activation. For tids classified as SaveForBwd we can go
+    // straight to mTensors[tid] and skip the string hash, proving the
+    // end-to-end baked operand path works before M3 migrates the full
+    // FwdStack/BwdStack activation set.
+    //
+    // Modes (SUROGATE_BAKED_SAVES):
+    //   "off"    (default)  — legacy path, mNamedTensors first
+    //   "on"                — baked shortcut, skip mNamedTensors for
+    //                         SaveForBwd tids
+    //   "verify"            — shadow: take legacy path, but sanity-check
+    //                         that mTensors[tid].Data == mNamedTensors[name].Data
+    //                         for every SaveForBwd hit; log first
+    //                         mismatch. Proves equivalence under
+    //                         live-traffic without changing behavior.
+    static const int baked_saves_mode = []() {
+        const char* e = std::getenv("SUROGATE_BAKED_SAVES");
+        if (!e) return 0;
+        const std::string v(e);
+        if (v == "1" || v == "on") return 1;
+        if (v == "verify") return 2;
+        return 0;
+    }();
+    if (baked_saves_mode != 0 && tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
+        const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region == dsl::RegionKind::SaveForBwd) {
+            Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
+            if (cached.Data) {
+                if (baked_saves_mode == 2 && !ref.name.empty()) {
+                    auto nit = mNamedTensors.find(ref.name);
+                    if (nit != mNamedTensors.end() && nit->second.Data && nit->second.Data != cached.Data) {
+                        static int mismatch_count = 0;
+                        if (++mismatch_count <= 5) {
+                            fprintf(stderr,
+                                    "[baked-saves verify] MISMATCH %s tid=%d name=%p tid=%p\n",
+                                    ref.name.c_str(),
+                                    tid,
+                                    static_cast<void*>(nit->second.Data),
+                                    static_cast<void*>(cached.Data));
+                        }
+                    }
+                } else if (baked_saves_mode == 1) {
+                    log_tensor(cached, "baked_save");
+                    return cached;
+                }
+            }
+        }
+    }
+
     if (!ref.name.empty()) {
         auto name_it = mNamedTensors.find(ref.name);
         if (name_it != mNamedTensors.end() && name_it->second.Data) {
