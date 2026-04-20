@@ -365,6 +365,36 @@ M5 progress.
 
 **Executor migration complete.** SimplifiedLayerActivations / SimplifiedLayerGradients struct fields are now accessed through dispatch helpers from every caller except dsl_run_state.cpp (where the storage lives). Struct storage can now be swapped without touching any consumer — the precondition for `TensorSlot::Block*` enum removal.
 
+### Layer-boundary bookkeeping consolidation
+
+Separate from struct-field access cleanup: the layer-boundary
+`Stack.checkpoint` / `Stack.restore` / stack-slot clear sequence was
+duplicated across multiple dispatch paths. Consolidated:
+
+- **Forward** (`on_fwd_layer_start` / `on_fwd_layer_end` helpers in
+  execute_forward): PhaseEnter stream-driven path + flat-ops-loop path
+  (start+end) now route through two lambdas. Tiled-MLP path stays
+  inline (deliberately simpler: no MoE save, no stack-slot clears —
+  those conditions never fire on tiled-MLP configs).
+- **Backward** (`bwd_layer_end_cleanup` helper): legacy
+  non-stream-driven backward path's ~146-line inline block collapsed
+  into a single call. Added `capturing` parameter so the helper
+  handles both the stream-driven (never capturing by construction)
+  and legacy (may be capturing) paths. Capture-unsafe work
+  (BwdCrossLayer persist, handle_layer_end, grad reduce/offload)
+  is skipped when `capturing=true`; the capture-safe tail
+  (Stack.restore, slot clears) always runs.
+
+Net effect: layer-boundary bookkeeping has a single source of truth
+per direction. Adding a new stack-backed slot category (or changing
+the order of cleanups) is a one-place change.
+
+Dispatch consolidation commits:
+- `f6dc9a7` Forward: `on_fwd_layer_start` / `on_fwd_layer_end`
+  extracted; 3 call sites migrated (~50 lines removed)
+- `5b70b77` Backward: legacy-path inline block replaced with
+  `bwd_layer_end_cleanup(L, idx, capturing)` call (~137 lines removed)
+
 Net impact: `shared_tag()` + per-layer activation allocator loop +
 all gradient-sharing from the design's M5 kill-list is gone.
 `builtin_slot_from_name` direct callers dropped from ~35 to ~10
