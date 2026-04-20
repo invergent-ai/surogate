@@ -557,6 +557,27 @@ private:
         }
     }
 
+    /// Phase 4 M3 prerequisite. Invalidate cached Tensor entries for a slot
+    /// whose backing storage is about to be freed (e.g. a Stack-allocated
+    /// simplified-activation slot at layer_end). Erases mNamedTensors[name]
+    /// AND nulls mTensors[tid].Data so resolve_tensor / ensure_output_tensor
+    /// on the next access re-resolve rather than returning a dangling
+    /// pointer. Safe on unknown names. Required before extending the
+    /// ffn_temps_on_stack pattern to slots whose backward consumers read
+    /// them via resolve_tensor(op.inputs[...]) — otherwise the
+    /// mNamedTensors cache survives Stack.restore with a stale pointer.
+    void invalidate_cached_slot(const std::string& name) {
+        if (!name.empty()) {
+            mNamedTensors.erase(name);
+        }
+        if (mCurrentGraph) {
+            const int id = mCurrentGraph->find_tensor_id(name);
+            if (id >= 0 && id < static_cast<int>(mTensors.size())) {
+                mTensors[static_cast<std::size_t>(id)].Data = nullptr;
+            }
+        }
+    }
+
     // Gradient accumulation tracking (set of gradient tensor names that need accumulation)
     std::unordered_set<std::string> mAccumulateTensors;
 
