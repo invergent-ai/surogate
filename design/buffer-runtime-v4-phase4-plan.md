@@ -284,6 +284,53 @@ slot-by-slot.
 Reverted this iteration's code; findings captured here. No code
 shipped.
 
+### Phase A second attempt: cache-invalidation + resolve_tensor bypass
+
+Landed the cache-invalidation helper (see commit ba7ffa2), combined
+with a targeted `resolve_tensor` bypass of `mNamedTensors` for
+`BlockLN1RSTD`/`BlockLN2RSTD` under the same flag, then re-ran the
+rstd migration.
+
+Same symptom: step 0 loss matches baseline (2.0251), step 0 grad
+norm 0.8512 vs baseline 3.8751, followed by
+`cudaErrorIllegalAddress`. The **deterministic** wrong-but-not-random
+norm indicates backward is reading valid memory with wrong *values*
+— not garbage.
+
+Paths checked and still wrong after the fixes:
+- `mNamedTensors` cache — bypassed under flag.
+- `mTensors[tid]` cache — nulled at every layer_end; would fall
+  through to the slot switch which returns live simplified_acts.
+- The `acts.ln*_rstd.Data` pointer itself — nulled at every
+  layer_end; forward-replay's temp_acquire rebinds before backward
+  reads.
+
+Remaining suspect (not yet validated): legacy `mAllocator` may
+provide a semantic we haven't replicated. Hypotheses:
+1. Replay's temp_acquire ordering vs backward's read — if replay
+   pushes its stack temps AFTER backward has already resolved
+   refs via an even earlier cache we haven't invalidated.
+2. ln1_rstd / ln2_rstd have some aliasing / binding in the
+   `view_for_shape` early-exit at compiled_ops_save.cpp:1240
+   (`if (base && base->Data)`) that we didn't hit because
+   `base->Data = null` post-invalidation, but legacy had it set.
+3. The `store_tensor` call inside fused_residual_rmsnorm forward
+   binding the resulting view back into both caches — maybe the
+   view's shape mis-matches what legacy sets and backward's
+   shape-interpretation diverges.
+
+Further progress needs instrumentation: instead of more
+blind swaps, next session should ADD a debug path that:
+(a) prints the rstd pointer under each resolution path during
+forward vs backward, and (b) dumps the first 8 floats of rstd at
+both write time (forward) and read time (backward), compared to
+a legacy baseline. The deterministic wrong value will then pin
+down whether the read hits (1) stale-cached pointer, (2)
+different-but-valid live pointer, or (3) correct pointer but
+mis-sized view.
+
+Code reverted. Only the helper (ba7ffa2) ships.
+
 ### M4 — Persistent & Accumulator arenas
 
 Weights in Persistent, gradients in Accumulator. Replaces `mWeights` / `mGrads` backing. Flip `SUROGATE_USE_PHASE_PERSISTENT=1` on.
