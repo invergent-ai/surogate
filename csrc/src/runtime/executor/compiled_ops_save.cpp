@@ -951,6 +951,71 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
     return nullptr;
 }
 
+Tensor* CompiledExecutor::bind_from_region(int tid, const TensorRef& ref) {
+    if (tid < 0 || !mCurrentGraph) return nullptr;
+    if (static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+
+    Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
+    if (cached.Data) return &cached;  // already bound by a prior op or helper
+
+    const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.offset == SIZE_MAX) return nullptr;
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return nullptr;
+
+    std::byte* base = nullptr;
+    switch (meta.region) {
+        case dsl::RegionKind::Persistent:
+            if (mPhaseArenas->persistent_ptr) {
+                base = mPhaseArenas->persistent_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::Accumulator:
+            if (mPhaseArenas->accumulator_ptr) {
+                base = mPhaseArenas->accumulator_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::FwdStack:
+            if (mPhaseArenas->fwd_stack_ptr) {
+                base = mPhaseArenas->fwd_stack_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::BwdStack:
+            if (mPhaseArenas->bwd_stack_ptr) {
+                base = mPhaseArenas->bwd_stack_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::SaveForBwd: {
+            if (!mPhaseArenas->save_for_bwd_ptr) break;
+            if (meta.block_layer_idx < 0) break;
+            const auto L = static_cast<std::size_t>(meta.block_layer_idx);
+            if (L >= mPhaseArenas->save_for_bwd_block_bases.size()) break;
+            base = mPhaseArenas->save_for_bwd_ptr + mPhaseArenas->save_for_bwd_block_bases[L] + meta.offset;
+            break;
+        }
+        default:
+            // BwdCrossLayer / MoeSaved / Unknown: not migrated to tid-baked
+            // access yet; caller falls back to existing name/slot dispatch.
+            break;
+    }
+
+    if (!base) return nullptr;
+
+    cached.Data = base;
+    cached.DType = ref.dtype;
+    cached.Stats = nullptr;
+    const int rank = static_cast<int>(ref.shape.size());
+    cached.Rank = rank;
+    for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+        cached.Sizes[i] = (i < rank) ? ref.shape[i] : 1;
+    }
+    // Device inherited from the current CUDA context; every arena pointer
+    // was cudaMalloc'd on the executor's device.
+    int device = 0;
+    (void)cudaGetDevice(&device);
+    cached.Device = device;
+    return &cached;
+}
+
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
     const int tid = ref.tensor_id;
@@ -990,7 +1055,10 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // Phase 4 M2: baked-view shortcut for SaveForBwd tids.
     // persist_saved_layer_tensors() writes the arena-backed Tensor into
     // mTensors[tid] via bind_tensor; reading directly from there skips a
-    // string-keyed hashmap lookup on the backward hot path.
+    // string-keyed hashmap lookup on the backward hot path. The M5.0
+    // `bind_from_region()` infrastructure (below) consolidates the
+    // arena-offset math for later milestones; this call site keeps the
+    // cached-only behavior for M5.0 (no change from pre-M5.0).
     if (tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
         const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
         if (meta.region == dsl::RegionKind::SaveForBwd) {

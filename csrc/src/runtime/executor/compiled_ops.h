@@ -386,6 +386,28 @@ private:
     ///       routed to one offset) and a scope bug let one tid's write
     ///       overwrite another's still-live data.
     void check_op_io_aliasing(const CompiledOp& op, std::size_t op_idx, const char* phase);
+
+    /// Phase 4 M5.0 — tid-baked operand binder. Returns the Tensor in
+    /// `mTensors[tid]` after ensuring it points at the arena-backed
+    /// storage for this tid. Handles the arena-backed regions
+    /// (Persistent, Accumulator, FwdStack, BwdStack, SaveForBwd) by
+    /// materializing `{arena_ptr + meta.offset, ref.shape, ref.dtype}`
+    /// into `mTensors[tid]` on first access. Returns nullptr for tids
+    /// that:
+    ///   - have no assigned region (Unknown) or offset (SIZE_MAX);
+    ///   - live in a region not yet migrated (BwdCrossLayer, MoeSaved —
+    ///     those use name-keyed bookkeeping that can't be tid-baked
+    ///     from a simple offset);
+    ///   - have a SaveForBwd slot but `block_layer_idx < 0` (malformed).
+    /// Subsequent calls for the same tid return the cached Tensor without
+    /// re-constructing it. Caller must fall through to existing dispatch
+    /// (mNamedTensors, slot helpers) when this returns nullptr.
+    ///
+    /// Initially wired only as a shortcut inside `resolve_tensor()`; the
+    /// design doc at `design/tid-baked-dispatch.md` sequences the
+    /// follow-on milestones that make this the authoritative path.
+    Tensor* bind_from_region(int tid, const TensorRef& ref);
+
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 
