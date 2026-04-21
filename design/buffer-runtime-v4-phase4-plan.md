@@ -1060,34 +1060,31 @@ If a feature passes validation, make it default and remove the env
 gate — features-behind-gates that validate clean are legacy-in-waiting.
 Conversely, features that fail validation: revert, document the gap,
 ship only the infra pieces that are independently correct.
-10. ✅ Persistent arena for base weights (M4a) + LoRA adapters (M4b) +
-    DslWeightManager master/work pairs (M4c) + streaming prefetch
-    buffers (M4c2). M4a: `DslParamStore::rebind_to_persistent_arena`
-    rebinds locally-allocated base weights post-compile; clamp via
-    `rebindable_persistent_bytes` auto-skips QLoRA / weight-manager
-    configs. M4b: `ModularLoRAWeightsManager::rebind_to_persistent_arena`
-    reserves a bump-allocated slab for every LoRA leaf tensor (master
-    + work, attention / MLP / MoE-experts / MoE-grouped / router). M4c:
-    `DslWeightManager::rebind_to_persistent_arena` routes device-
-    resident master/work pairs (mixed-precision, streaming-sharded
-    masters) into a middle slab between base and LoRA. M4c2: same
-    walker extends to `mPrefetchBuffers[slot]` so each prefetch slot's
-    per-base-name device buffer lands in the arena; aliased entries
-    across layers share a slot via pointer-dedup. Offloaded pinned-CPU
-    masters stay outside by design (arena is device-only). Gated on
-    `SUROGATE_USE_PHASE_PERSISTENT=1`, default off. Bit-identical on
-    Qwen3 (227 base + 784 LoRA), Qwen3.5 (261 base + 384 LoRA), GPT-OSS
-    (0 base + 576 LoRA), fp32-master mixed-precision Qwen3 (0 base + 227
-    WM-master + 227 WM-work + 784 LoRA, 5-step loss Δ ≤ 0.03%), and
-    offload_master Qwen3 (3 WM-master + 3 WM-work + 448 prefetch + 784
-    LoRA, 5-step loss 2.0251 → 1.3369). **M4d** ships quantized base
-    weights via a self-managed arena on the QLoRA provider — walks
-    `GenericWeightManager::mWeights[...]` quantized storage + dequant
-    buffers + full-precision entries, dedicated `cudaMalloc` allocated
-    after `import_and_quantize` completes (same env gate, auto-skipped
-    when the 2× transient peak wouldn't fit). Validated on Qwen3 BnB /
-    FP4 QLoRA; GPT-OSS MXFP4 auto-skipped on a 32 GB GPU
-    (requested 13 GiB, free 9 GiB after LoRA slab).
+10. ✅ Persistent arena routing for every weight owner —
+    `DslParamStore::rebind_to_persistent_arena` for locally-allocated
+    base weights (clamp via `rebindable_persistent_bytes` auto-skips
+    QLoRA / weight-manager configs);
+    `ModularLoRAWeightsManager::rebind_to_persistent_arena` reserves a
+    bump slab for every LoRA leaf (master + work, attention / MLP /
+    MoE-experts / MoE-grouped / router);
+    `DslWeightManager::rebind_to_persistent_arena` covers device-
+    resident master/work pairs plus `mPrefetchBuffers[slot]` (aliased
+    entries across layers share a slot via pointer-dedup, offloaded
+    pinned-CPU masters stay outside — arena is device-only); and
+    `GenericWeightManager::consume_self_arena` gives the QLoRA provider
+    its own dedicated arena (quantized storage + dequant buffers +
+    full-precision), called post-`import_and_quantize` because the
+    provider isn't wired until then. **All default-on** after the
+    `SUROGATE_USE_PHASE_PERSISTENT` gate was removed — the auto-skip
+    logic protects the one failure mode (gpt-oss-20B-class configs
+    where 2× the quantized bytes exceed free GPU memory). Bit-identical
+    on Qwen3 (227 base + 784 LoRA), Qwen3.5 (261 base + 384 LoRA),
+    GPT-OSS (0 base + 576 LoRA + QLoRA-self-arena auto-skipped),
+    fp32-master mixed-precision Qwen3 (0 base + 227 WM-master + 227
+    WM-work + 784 LoRA), offload_master Qwen3 (3 non-block WM-master
+    + 3 WM-work + 448 prefetch + 784 LoRA), and Qwen3 QLoRA-BnB/FP4
+    (448/336 quant + 115 full-precision + 784 LoRA into
+    ~810-830 MiB self-arenas).
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
     complications. **Not started.** Env-gate now split:
     `SUROGATE_USE_PHASE_ACCUMULATOR=1` (shadow; no op consumes it yet).

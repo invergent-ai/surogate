@@ -910,11 +910,9 @@ std::size_t DslWeightManager::total_persistent_bytes() const {
         count_if_eligible(entry.master);
         count_if_eligible(entry.work);
     }
-    // M4c2: include streaming prefetch buffers. Entries within a slot
-    // alias a shared per-base-name device buffer — the seen-set dedup
-    // ensures each distinct buffer is counted once across both slots
-    // even when base-buffer pointers happen to repeat (they don't, but
-    // the invariant is cheap).
+    // Include streaming prefetch buffers. Entries within a slot alias a
+    // shared per-base-name device buffer — the seen-set dedup counts
+    // each distinct buffer once across both slots.
     for (const auto& slot_map : mPrefetchBuffers) {
         for (const auto& kv : slot_map) {
             count_if_eligible(kv.second);
@@ -996,11 +994,10 @@ DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t 
         }
     }
 
-    // M4c2: prefetch slots. Each slot holds one Tensor per base-param
-    // name (aliased across layers within the slot). Rebind once per
-    // unique buffer; the dedup map handles the aliasing so every
-    // entry.second.Data ends up pointing at the same arena slot it
-    // resolved to on the first encounter.
+    // Prefetch slots. Each slot holds one Tensor per base-param name
+    // (aliased across layers within the slot). The dedup map ensures
+    // one memcpy+free per unique buffer; repeat entries repoint .Data
+    // to the slot they first landed in.
     std::size_t rebound_prefetch = 0;
     for (auto& slot_map : mPrefetchBuffers) {
         for (auto& kv : slot_map) {

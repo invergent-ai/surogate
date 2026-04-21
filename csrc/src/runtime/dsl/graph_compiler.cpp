@@ -2666,16 +2666,14 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
     arenas.moe_saved_bytes = moe_saved_bytes;
 
-    // Persistent (weights) + Accumulator (grads): decoupled gates, since
-    // M4a enables only the weight path. Each holds training-wide state
-    // that outlives both compiles; the executor further clamps Persistent
-    // to what the param store will actually rebind (QLoRA / weight-manager
-    // configs keep the arena at zero even when the flag is set).
-    const char* persistent_env = std::getenv("SUROGATE_USE_PHASE_PERSISTENT");
-    const bool want_persistent = persistent_env && std::string(persistent_env) == "1";
+    // Persistent (weights): default-on after M4 validation. The executor
+    // clamps to what the param store will actually rebind (QLoRA /
+    // weight-manager configs that have no locally-allocated params size
+    // the slab to zero). Accumulator remains shadow under a separate gate
+    // until an op consumes it.
+    arenas.persistent_bytes = std::max(fwd.persistent_bytes, bwd.persistent_bytes);
     const char* accumulator_env = std::getenv("SUROGATE_USE_PHASE_ACCUMULATOR");
     const bool want_accumulator = accumulator_env && std::string(accumulator_env) == "1";
-    arenas.persistent_bytes = want_persistent ? std::max(fwd.persistent_bytes, bwd.persistent_bytes) : 0;
     arenas.accumulator_bytes = want_accumulator ? std::max(fwd.accumulator_bytes, bwd.accumulator_bytes) : 0;
 
     // FwdStack, BwdStack: consumed by simplified_acts slot routing (Phase 3

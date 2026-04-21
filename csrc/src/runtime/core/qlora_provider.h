@@ -105,11 +105,12 @@ public:
     virtual void auto_tune_offloading() {
     }
 
-    /// Phase 4 M4d: self-managed Persistent arena. Called after
-    /// `import_and_quantize` completes — the provider allocates a dedicated
-    /// arena sized to its device-resident quantized storage + dequant
-    /// buffers, memcpys each tensor in, frees the originals, and rebinds
-    /// `.Data` pointers. Gated inside the implementation; no-op by default.
+    /// Self-managed Persistent arena. Called after `import_and_quantize`
+    /// completes — the provider allocates a dedicated arena sized to its
+    /// device-resident quantized storage + dequant buffers, memcpys each
+    /// tensor in, frees the originals, and rebinds `.Data` pointers.
+    /// Default implementation is a no-op for providers that don't
+    /// participate in the arena.
     virtual void consume_self_arena(cudaStream_t stream) {
         (void)stream;
     }

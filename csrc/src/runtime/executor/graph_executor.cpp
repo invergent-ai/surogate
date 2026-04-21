@@ -999,31 +999,29 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                          stack_bytes,
                                          bwd_cross_layer_bytes,
                                          moe_saved_bytes);
-                // Phase 4 M4a: clamp Persistent arena size to the bytes a
-                // locally-allocated param can actually consume. `compute_arena_sizes`
-                // estimates from every ForwardParam tid in the graph, but
-                // QLoRA-external and weight-manager-managed params are
-                // stored elsewhere — sizing for them would waste tens of
-                // GiB on quantized-weight configs. Zero if nothing local.
+                // Persistent arena is sized in three slabs:
+                //   [0, base)                = base-weight region (layout offsets)
+                //   [base, base+wm)          = DslWeightManager master/work/prefetch
+                //   [base+wm, base+wm+lora)  = LoRA adapter master/work
+                // Base-weight bytes clamp to what DslParamStore can actually
+                // rebind — layout estimates over every ForwardParam tid, but
+                // QLoRA-external and weight-manager-managed params live in
+                // their own storage, so sizing for them would waste tens of
+                // GiB. Each slab stays 0 when its owner is absent. QLoRA
+                // quantized storage has its own provider-side self-arena
+                // (GenericWeightManager::consume_self_arena) — not part of
+                // this slab layout because the provider isn't wired until
+                // after compile_graphs runs.
                 std::size_t lora_slab_bytes = 0;
                 std::size_t wm_slab_bytes = 0;
                 std::size_t base_persistent_bytes = 0;
                 if (mPhaseArenas.persistent_bytes > 0) {
                     base_persistent_bytes = mWeights.rebindable_persistent_bytes(*mCompiledForward);
                     mPhaseArenas.persistent_bytes = base_persistent_bytes;
-                    // Phase 4 M4c: DslWeightManager-owned tensors (mixed-
-                    // precision master/work pairs, streaming-sharded masters)
-                    // get a slab after the base-weight region. Storage lives
-                    // outside the compile-time layout so we bump-allocate
-                    // within the slab at rebind time.
                     if (mWeightManager) {
                         wm_slab_bytes = mWeightManager->total_persistent_bytes();
                         mPhaseArenas.persistent_bytes += wm_slab_bytes;
                     }
-                    // Phase 4 M4b: when LoRA is enabled, reserve a slab at
-                    // the tail of the Persistent arena for LoRA adapter
-                    // storage. The slab follows the base-weight region,
-                    // sized from `mLoRAWeights->total_persistent_bytes()`.
                     if (mLoRAWeights) {
                         lora_slab_bytes = mLoRAWeights->total_persistent_bytes();
                         mPhaseArenas.persistent_bytes += lora_slab_bytes;
@@ -1082,25 +1080,14 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mPhaseArenas.fwd_stack_ptr != nullptr) {
                     consume_fwdstack_arena();
                 }
-                // Phase 4 M4a: route base parameter storage through the
-                // Persistent arena when requested. Gated on
-                // SUROGATE_USE_PHASE_PERSISTENT=1 inside the method. Only
-                // covers the simple DslParamStore path (single-GPU, no
-                // streaming, no offload, no QLoRA, no DslWeightManager).
+                // Rebind each slab into its reserved region of the
+                // Persistent arena. Each call is a no-op when its owner
+                // is absent or has nothing device-resident to rebind.
                 mWeights.rebind_to_persistent_arena(*mCompiledForward, mPhaseArenas, mRunState.MainStream);
-                // Phase 4 M4c: DslWeightManager slab after the base region.
-                // Only fires when the weight manager is wired AND the env
-                // gate is on. Handles mixed-precision master/work pairs and
-                // streaming-sharded masters; streaming work buffers (prefetch
-                // slots) remain outside the arena.
                 if (mWeightManager && wm_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
                     std::byte* wm_base = mPhaseArenas.persistent_ptr + base_persistent_bytes;
                     mWeightManager->rebind_to_persistent_arena(wm_base, wm_slab_bytes, mRunState.MainStream);
                 }
-                // Phase 4 M4b: LoRA adapter slab sits at the tail of the
-                // Persistent arena, sized at allocation time. Same env gate
-                // as M4a — no-op unless the Persistent arena was sized with
-                // the LoRA reservation above.
                 if (mLoRAWeights && lora_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
                     std::byte* lora_base = mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes;
                     mLoRAWeights->rebind_to_persistent_arena(lora_base, lora_slab_bytes, mRunState.MainStream);

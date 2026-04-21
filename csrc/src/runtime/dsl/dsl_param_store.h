@@ -85,15 +85,16 @@ public:
         return mParamOrder;
     }
 
-    /// Phase 4 M4a: route locally-allocated parameter storage through the
-    /// Persistent arena. For each mParams entry whose tid has
-    /// `RegionKind::Persistent` with a baked offset, copies the tensor's
-    /// bytes to `arenas.persistent_ptr + meta.offset`, frees the original
-    /// per-weight allocation, and rebinds `entry.tensor.Data` to the arena
-    /// offset. Skips external (QLoRA) and weight-manager-managed entries
-    /// (M4b/c territory). No-op unless `SUROGATE_USE_PHASE_PERSISTENT=1`.
-    /// Must be called after arenas are allocated and parameter tensors
-    /// contain their final values (i.e., after `import_weights`).
+    /// Route locally-allocated parameter storage through the Persistent
+    /// arena. For each mParams entry whose tid has `RegionKind::Persistent`
+    /// with a baked offset, copies the tensor's bytes to
+    /// `arenas.persistent_ptr + meta.offset`, frees the original per-weight
+    /// allocation, and rebinds `entry.tensor.Data` to the arena offset.
+    /// External (QLoRA) and weight-manager-managed entries are skipped —
+    /// their rebinds live on `QLoRAWeightProvider` / `DslWeightManager` /
+    /// `ModularLoRAWeightsManager` respectively. Must be called after
+    /// arenas are allocated and parameter tensors contain their final
+    /// values (i.e., after `import_weights`).
     void rebind_to_persistent_arena(const CompiledGraph& graph, const PhaseArenas& arenas, cudaStream_t stream);
 
     /// Bytes actually needed in the Persistent arena given the set of

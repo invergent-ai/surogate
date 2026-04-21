@@ -157,10 +157,9 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         cudaStream_t quant_stream = nullptr;
         CUDA_CHECK(cudaStreamCreate(&quant_stream));
         mQLoRAProvider->import_and_quantize(file_name, comm, quant_stream);
-        // Phase 4 M4d: with import_and_quantize complete, the provider's
-        // quantized storage + dequant buffers are fully allocated. Let it
-        // consolidate onto a self-managed Persistent arena (env-gated,
-        // skipped when 2× transient peak wouldn't fit).
+        // import_and_quantize done: provider's device-resident storage
+        // is finalized. Consolidate it onto a self-managed arena
+        // (skipped automatically when the 2× transient peak wouldn't fit).
         mQLoRAProvider->consume_self_arena(quant_stream);
         CUDA_CHECK(cudaStreamSynchronize(quant_stream));
         CUDA_CHECK(cudaStreamDestroy(quant_stream));

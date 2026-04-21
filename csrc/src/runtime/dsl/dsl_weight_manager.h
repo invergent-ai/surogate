@@ -153,21 +153,21 @@ public:
     // ITensorContainer interface (for checkpointing)
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 
-    /// Phase 4 M4c: total bytes of DslWeightManager-owned tensors that are
-    /// eligible to live in the Persistent arena. Only counts entries whose
-    /// master AND (optionally) work buffers are device-local and already
-    /// allocated. Skips offloaded master (pinned CPU), streaming work
-    /// (prefetch-buffer backed, `.Data==nullptr` at construction), and any
-    /// `Tensor` whose storage is shared with another entry (alias detected
-    /// by pointer equality across mWeights). Returns 0 when no eligible
-    /// tensor exists (e.g. pure streaming/offload configs).
+    /// Total bytes of DslWeightManager-owned tensors that are eligible to
+    /// live in the Persistent arena. Only counts entries whose master /
+    /// work / prefetch buffers are device-local and already allocated.
+    /// Skips offloaded masters (pinned CPU) and streaming work
+    /// (`.Data==nullptr` until first `gather_block`); dedups aliased
+    /// pointers. Returns 0 when no eligible tensor exists.
     [[nodiscard]] std::size_t total_persistent_bytes() const;
 
-    /// Phase 4 M4c: route eligible master/work tensors through a slab of
-    /// the Persistent arena. Walks mWeights, bump-allocates each eligible
-    /// tensor's bytes inside `[arena_base, arena_base + max_bytes)`,
-    /// `cudaMemcpyAsync` copies live bytes, `mAllocator->free`s the
-    /// original, and rebinds `.Data`. Returns bytes consumed (<= max_bytes).
+    /// Route eligible master/work/prefetch tensors through a slab of the
+    /// Persistent arena. Walks `mWeights` + `mPrefetchBuffers`, bump-
+    /// allocates each eligible tensor's bytes inside
+    /// `[arena_base, arena_base + max_bytes)`, `cudaMemcpyAsync` copies
+    /// live bytes, `mAllocator->free`s the original, and rebinds `.Data`.
+    /// Aliased buffers share one slot. Returns bytes consumed
+    /// (<= max_bytes).
     std::size_t rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream);
 
 private:

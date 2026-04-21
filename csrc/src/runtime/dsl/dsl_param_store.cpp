@@ -295,10 +295,10 @@ std::size_t DslParamStore::rebindable_persistent_bytes(const CompiledGraph& grap
     // weight manager, that set intersperses offsets with the locally-
     // allocated set, so clamping to only the local-set high-water mark
     // isn't sound — the compiler placed local tids at their global offsets,
-    // which include the unused external ranges. For M4a we therefore
-    // disable the arena whenever any param is not locally allocated;
-    // M4c/d widen this once the non-local paths grow their own arena-
-    // backed storage.
+    // which include the unused external ranges. Whole-or-nothing: return 0
+    // as soon as any param is external or weight-manager-managed. Those
+    // non-local paths have their own arena-backed storage (handled by
+    // `QLoRAWeightProvider` / `DslWeightManager` / the LoRA manager).
     for (const auto& kv : mParams) {
         const Entry& entry = kv.second;
         if (entry.external || entry.managed_by_weight_manager) {
@@ -323,8 +323,6 @@ std::size_t DslParamStore::rebindable_persistent_bytes(const CompiledGraph& grap
 void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
                                                const PhaseArenas& arenas,
                                                cudaStream_t stream) {
-    const char* env = std::getenv("SUROGATE_USE_PHASE_PERSISTENT");
-    if (!env || std::string(env) != "1") return;
     if (!arenas.allocated || arenas.persistent_ptr == nullptr || arenas.persistent_bytes == 0) return;
 
     std::size_t rebound = 0;

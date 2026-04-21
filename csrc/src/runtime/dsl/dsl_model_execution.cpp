@@ -339,11 +339,11 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     // constraint — resize up if so. Shrinking is deliberately skipped to
     // avoid churn on the allocator.
     // ------------------------------------------------------------------
-    // Phase 4 M4b/M4c: wire LoRA weights and weight manager to executor
-    // BEFORE compile so the Persistent arena sizing can include LoRA and
-    // DslWeightManager slab bytes. set_lora_state / set_weight_manager
-    // are idempotent setters — pass the managers here (grads/run_state
-    // not yet allocated) and re-call below with full LoRA state.
+    // Wire LoRA weights and weight manager onto the executor BEFORE
+    // compile, so compile_graphs can size the Persistent arena's LoRA
+    // and DslWeightManager slabs upfront. set_lora_state /
+    // set_weight_manager are idempotent pointer-setters — LoRA's full
+    // state (grads / run_state) is populated with a second call below.
     if (lora_enabled()) {
         mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
                                   mLoRAWeights.get(),

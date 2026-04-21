@@ -199,10 +199,10 @@ GenericWeightManager::~GenericWeightManager() {
         mTransposeTemp = Tensor{};
     }
 
-    // Phase 4 M4d: release the self-managed Persistent arena (if any).
-    // Must run after the allocator-tracked buffers above, since owned
-    // tensors hold pointers into this arena and the allocator's own
-    // destruction would otherwise attempt to free them.
+    // Release the self-managed arena (if any). Must run after the
+    // allocator-tracked buffers above, since owned tensors hold pointers
+    // into this arena and the allocator's own destruction would otherwise
+    // attempt to free them.
     release_self_arena();
 }
 
@@ -659,7 +659,7 @@ int GenericWeightManager::num_active_dequant_buffers() const {
 }
 
 // =============================================================================
-// Phase 4 M4d — Persistent arena rebind
+// Persistent arena rebind
 // =============================================================================
 
 namespace {
@@ -772,8 +772,6 @@ GenericWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::siz
 }
 
 void GenericWeightManager::consume_self_arena(cudaStream_t stream) {
-    const char* env = std::getenv("SUROGATE_USE_PHASE_PERSISTENT");
-    if (!env || std::string(env) != "1") return;
     if (mSelfArena != nullptr) return;  // already consumed
 
     const std::size_t bytes = total_persistent_bytes();
