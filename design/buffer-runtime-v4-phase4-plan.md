@@ -723,9 +723,22 @@ Big but less cross-cutting than M3 — weights/grads are fewer ops.
 - **Accumulator arena for grads.** `DslGradStore` has a similar
   allocate-per-grad pattern; ZeRO-2 sharding + per-layer reduce add
   complexity.
-- **FwdStack / BwdStack shadows.** Blocked on M3 per-frame coloring
-  work — a naive flip aliases each layer's same-slot tid into one arena
-  offset and corrupts forward accumulation (see M3 first-strike memo).
+
+### M4 dropped: FwdStack / BwdStack
+
+Per-frame coloring would pack block-scoped activations into <200 MiB
+peak on Qwen3, but consuming those offsets at runtime requires a
+parallel frame-discipline mechanism (per-block `Stack.save`/`restore`
+bracketing) that the existing unified `DeviceMemoryStack` already
+provides with better coverage of non-block tids. The payoff (<1% of a
+32 GiB card on typical configs) doesn't justify the multi-session
+refactor + ongoing maintenance.
+
+Shipped as a separate commit dropping the arena storage, allocation,
+resolution, validation, and `SUROGATE_USE_PHASE_STACK_ARENAS` env gate.
+`RegionKind::FwdStack` / `BwdStack` remain as telemetry labels and the
+per-frame coloring still writes offsets into `tensor_meta` in case the
+decision is revisited.
 
 ### M5 — Delete legacy machinery
 
