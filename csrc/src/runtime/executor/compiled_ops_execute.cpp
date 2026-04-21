@@ -213,7 +213,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
 
     // Collect tensor IDs produced within this layer's op range
     std::unordered_set<int> produced_ids;
-    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+    for (std::size_t idx = start; idx < end && idx < fwd_graph.ops.size(); ++idx) {
         for (const auto& out : fwd_graph.ops[idx].outputs) {
             if (out.tensor_id >= 0) {
                 produced_ids.insert(out.tensor_id);
@@ -223,7 +223,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
 
     // Pre-bind external inputs: tensors consumed by this layer but produced before it.
     // These include the layer's input residual, previous block outputs, RoPE freqs, etc.
-    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+    for (std::size_t idx = start; idx < end && idx < fwd_graph.ops.size(); ++idx) {
         for (const auto& inp : fwd_graph.ops[idx].inputs) {
             if (inp.tensor_id < 0) continue;
             if (produced_ids.count(inp.tensor_id)) continue;
@@ -340,8 +340,30 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             replay_tile_groups[tg.start_op_idx] = &tg;
         }
     }
-    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+    for (std::size_t idx = start; idx < end && idx < fwd_graph.ops.size(); ++idx) {
         const auto& op = fwd_graph.ops[idx];
+
+        // Scope assertion: replay_layer_forward(L) must only execute ops
+        // belonging to layer L. An op whose `layer_start` field is set to a
+        // different layer's index means the loop bounds disagree with the
+        // compiler's layer-membership tagging — historically this happened
+        // when `idx <= end` (inclusive) pulled layer L+1's deferred-residual
+        // fused_residual_rmsnorm into L's replay, clobbering L's activations
+        // under shared-FwdStack-arena routing. Gated on SUROGATE_CHECK_REPLAY_SCOPE
+        // to stay out of the hot path by default.
+        if (op.layer_start >= 0 && op.layer_start != layer_idx) {
+            if (const char* e = std::getenv("SUROGATE_CHECK_REPLAY_SCOPE"); e && (*e == '1' || *e == 'a')) {
+                std::fprintf(stderr,
+                             "[replay-scope] layer=%d replay running op idx=%zu with layer_start=%d (type=%s)\n",
+                             layer_idx,
+                             idx,
+                             op.layer_start,
+                             op_type_to_string(op.type));
+                if (*e == 'a') {
+                    throw std::runtime_error("SUROGATE_CHECK_REPLAY_SCOPE=abort: replay-scope violation");
+                }
+            }
+        }
 
         // Skip loss ops — these should never be replayed
         if (op.type == CompiledOpType::CrossEntropyLoss || op.type == CompiledOpType::FusedLMHeadLoss) {

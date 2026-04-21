@@ -372,15 +372,19 @@ private:
     Tensor& resolve_tensor(const TensorRef& ref);
     Tensor& ensure_output_tensor(const TensorRef& ref);
 
-    /// Runtime check: for the op about to dispatch (or just dispatched),
-    /// resolve every input and output to its current (Data, bytes) pair and
-    /// assert no input/output byte range overlaps. cuBLAS GEMM and similar
-    /// kernels have undefined behavior when input and output aliasing —
-    /// this check catches such bugs early (e.g., compile-time arena
-    /// coloring that didn't account for runtime slot-alias view resolution).
-    /// No-op unless SUROGATE_CHECK_OP_IO_ALIASING=1. Runs before op.fn;
-    /// logs the offending (input, output) pair and, if the env is set to
-    /// "abort", throws to halt execution.
+    /// Runtime check gated on SUROGATE_CHECK_OP_IO_ALIASING. Two independent
+    /// validators, both logged and (when the env is set to "abort") fatal:
+    ///   (1) Within-op aliasing. cuBLAS GEMM and similar kernels have
+    ///       undefined behavior when input and output share bytes; this
+    ///       catches compile-time coloring that under-reserves a tid.
+    ///   (2) Read-after-write provenance. Tracks the tid that last wrote
+    ///       each (Data, bytes) range in a provenance map; when a later
+    ///       op reads a range whose last-write tid differs from its own
+    ///       input tid, flag. Catches cross-op/cross-layer clobbers
+    ///       where the address is structurally shared by multiple tids
+    ///       (e.g., single-arena FwdStack with all layers' BlockLN1
+    ///       routed to one offset) and a scope bug let one tid's write
+    ///       overwrite another's still-live data.
     void check_op_io_aliasing(const CompiledOp& op, std::size_t op_idx, const char* phase);
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
@@ -556,6 +560,27 @@ private:
 
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;
+
+    // Provenance map for SUROGATE_CHECK_OP_IO_ALIASING's read-after-write
+    // validator. Keys are byte-range start pointers; values are the
+    // (slot, layer_idx) pair of the last output written there plus
+    // diagnostic metadata. Reads compare (slot, layer_idx) — not tid —
+    // so legitimate slot-alias views (e.g., `blocks[0].x_flat` reading a
+    // buffer just written as `blocks[0].ln1`, both resolving to
+    // BlockLN1) don't trigger. A genuine violation is same address, same
+    // slot, but DIFFERENT layer — under shared-arena routing that means
+    // layer M's write landed where layer N still expected its own data.
+    // Populated only when the env flag is active.
+    struct ProvenanceEntry {
+        int slot = 0;
+        int layer_idx = -1;
+        int tid = -1;
+        std::size_t op_idx = 0;
+        std::size_t bytes = 0;
+        std::string name;
+        std::string phase;
+    };
+    std::unordered_map<const std::byte*, ProvenanceEntry> mProvenance;
 
     // Integer-indexed tensor storage (flat vector indexed by compile-time tensor IDs).
     // Indexed by TensorRef::tensor_id assigned during graph compilation.

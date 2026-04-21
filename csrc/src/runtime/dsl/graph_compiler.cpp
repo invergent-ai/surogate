@@ -2502,29 +2502,21 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
         return {naive_max, total_bytes};
     };
 
-    // FwdStack: per-layer sectioning in the prototype. The plan's design
-    // (design/buffer-runtime-v4.md, Recomputed[i] row) calls for a single
-    // arena that the layer's BwdBlock re-enters each time — peak = max
-    // over layers, not sum — but an empirical test showed shared-arena
-    // under qwen3 recompute reads a different bf16 first-byte at the qkv
-    // matmul_backward (0x3ef6 vs baseline 0x3d32) despite RecomputeBlock
-    // firing before the read. Likely cause: qwen3's ln1-backward reads
-    // residual_out via `mRunState.get_residual(L)` (ResidualManager
-    // buffer), but the forward path writes residual_out to the
-    // BlockResidualAtt slot rather than ResidualManager; the two buffers
-    // are distinct cudaMallocs. Under per-frame+retain coloring, LN1's
-    // replay output in the arena is derived from ResidualManager's
-    // (possibly uninitialized?) buffer via the mInReplay=true
-    // zero-input path, and under shared arena the stale state is
-    // visible. Per-layer sectioning masks this because each layer's
-    // distinct arena slice preserves whatever replay writes for that
-    // specific layer without cross-layer contamination. Root-causing
-    // the ResidualManager wiring is the next step; until then we pay
-    // the num_layers × peak memory cost for correctness.
+    // FwdStack and BwdStack: per-frame coloring, single shared arena per
+    // region. Matches design/buffer-runtime-v4.md §Region vocabulary:
+    // FwdStack is a nested phase scope re-entered fresh per block;
+    // recompute's `Recomputed[i]` lands in the same arena just-in-time
+    // during BwdBlock[i] replay. Peak = max over layers, not sum.
     //
-    // BwdStack: fully eager (no captured segment graphs), so per-frame
-    // coloring is both correct and memory-efficient.
-    auto [fwd_naive, fwd_colored] = color_frames(fwd_frame, fwd_alias_groups, /*section_per_layer=*/true);
+    // Correctness prerequisite: replay_layer_forward must iterate ops
+    // with a half-open [start, end) range so it doesn't execute layer
+    // L+1's first op (qwen3's deferred-residual fused_residual_rmsnorm
+    // computes layer L+1's LN1 from layer L's residual and MLP-down
+    // outputs) as part of layer L's replay. Under shared arena, that
+    // extra op overwrote layer L's just-replayed LN1 before layer L's
+    // backward ops read it. See the `idx < end` bound in
+    // compiled_ops_execute.cpp.
+    auto [fwd_naive, fwd_colored] = color_frames(fwd_frame, fwd_alias_groups, /*section_per_layer=*/false);
     auto [bwd_naive, bwd_colored] = color_frames(bwd_frame, bwd_alias_groups, /*section_per_layer=*/false);
 
     // Expose peaks for compute_arena_sizes (M5.d).

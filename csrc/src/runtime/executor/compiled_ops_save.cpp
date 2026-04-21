@@ -1277,8 +1277,107 @@ void CompiledExecutor::check_op_io_aliasing(const CompiledOp& op, std::size_t op
                          o.bytes);
         }
     }
-    if (any_alias && mode == 2) {
-        throw std::runtime_error("SUROGATE_CHECK_OP_IO_ALIASING=abort: input/output aliased — see [op-io-alias] log");
+
+    // Read-after-write provenance. Before the op runs, check each input
+    // against the map: if the buffer was last written with a DIFFERENT
+    // (slot, layer_idx) than the input declares, a prior op clobbered
+    // this tid's still-needed data. Comparing on (slot, layer_idx) not
+    // tid avoids false positives on slot aliases (e.g., `x_flat` is a
+    // different tid than `ln1` but both resolve to BlockLN1). Then
+    // publish this op's outputs into the map.
+    bool raw_violation = false;
+    auto is_activation_slot = [](TensorSlot s) {
+        // Forward-activation block slots only. Gradient chain slots
+        // (BlockD*) intentionally share storage at different backward
+        // stages — `d_mlp_down` → `d_att_out` → `d_res_ffn` reusing
+        // the same physical buffer is by-design. Parameters / Mapped
+        // don't route via the arena-shared pointer either.
+        switch (s) {
+            case TensorSlot::BlockLN1:
+            case TensorSlot::BlockLN1RSTD:
+            case TensorSlot::BlockLN2:
+            case TensorSlot::BlockLN2RSTD:
+            case TensorSlot::BlockQRSTD:
+            case TensorSlot::BlockKRSTD:
+            case TensorSlot::BlockQKV:
+            case TensorSlot::BlockQKVRoPE:
+            case TensorSlot::BlockLSE:
+            case TensorSlot::BlockAtt:
+            case TensorSlot::BlockAttOut:
+            case TensorSlot::BlockMLPUp:
+            case TensorSlot::BlockSwiGLU:
+            case TensorSlot::BlockMLPDown:
+            case TensorSlot::BlockHOut: return true;
+            default: return false;
+        }
+    };
+    // For `slot == Saved` refs (backward reads of forward activations
+    // via the save list), parse the name to recover the real slot.
+    // Without this, backward-graph reads look like Saved and slip past
+    // the activation-slot filter.
+    auto effective_slot = [&](const TensorRef& ref, int& out_layer) -> TensorSlot {
+        out_layer = ref.layer_idx;
+        if (ref.slot != TensorSlot::Saved) return ref.slot;
+        int lyr = -1;
+        const TensorSlot s = resolve_block_slot(ref.name, &lyr, nullptr, nullptr);
+        if (lyr >= 0) out_layer = lyr;
+        return s;
+    };
+    for (const auto& i : inputs) {
+        if (i.ref->tensor_id < 0) continue;
+        if (i.ref->is_gradient) continue;
+        int i_layer = -1;
+        const TensorSlot i_slot = effective_slot(*i.ref, i_layer);
+        if (!is_activation_slot(i_slot)) continue;
+        auto it = mProvenance.find(i.data);
+        if (it == mProvenance.end()) continue;
+        const auto& prov = it->second;
+        const bool same_slot = (prov.slot == static_cast<int>(i_slot)) && (prov.layer_idx == i_layer);
+        if (same_slot) continue;
+        // Different (slot, layer) wrote here last — genuine clobber
+        // under shared-arena routing. Require prior write bytes to
+        // fully cover this input's range (avoid partial-overlap noise).
+        if (prov.bytes < i.bytes) continue;
+        raw_violation = true;
+        std::fprintf(stderr,
+                     "[op-io-alias] RAW %s op_idx=%zu type=%s input='%s'#%d slot=%d L=%d ptr=%p bytes=%zu "
+                     "last-written by '%s' slot=%d L=%d (tid=%d op_idx=%zu phase=%s bytes=%zu)\n",
+                     phase,
+                     op_idx,
+                     op_type_to_string(op.type),
+                     i.ref->name.c_str(),
+                     i.ref->tensor_id,
+                     static_cast<int>(i_slot),
+                     i_layer,
+                     static_cast<void*>(i.data),
+                     i.bytes,
+                     prov.name.c_str(),
+                     prov.slot,
+                     prov.layer_idx,
+                     prov.tid,
+                     prov.op_idx,
+                     prov.phase.c_str(),
+                     prov.bytes);
+    }
+    for (const auto& o : outputs) {
+        if (o.ref->tensor_id < 0) continue;
+        if (o.ref->is_gradient) continue;
+        int o_layer = -1;
+        const TensorSlot o_slot = effective_slot(*o.ref, o_layer);
+        if (!is_activation_slot(o_slot)) continue;
+        ProvenanceEntry entry;
+        entry.slot = static_cast<int>(o_slot);
+        entry.layer_idx = o_layer;
+        entry.tid = o.ref->tensor_id;
+        entry.op_idx = op_idx;
+        entry.bytes = o.bytes;
+        entry.name = o.ref->name;
+        entry.phase = phase ? phase : "";
+        mProvenance[o.data] = entry;
+    }
+
+    if ((any_alias || raw_violation) && mode == 2) {
+        throw std::runtime_error("SUROGATE_CHECK_OP_IO_ALIASING=abort: see [op-io-alias] log");
     }
 }
 
