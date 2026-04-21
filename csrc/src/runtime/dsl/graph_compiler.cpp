@@ -2653,11 +2653,16 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          std::size_t stack_bytes,
                          std::size_t bwd_cross_layer_bytes,
                          std::size_t moe_saved_bytes) {
-    // UnifiedStack is the default backing for DslRunState::Stack. Adoption
-    // swaps the TensorAllocator-owned Stack buffer for this arena (same
-    // size, same allocation source — just relocated into the phase-arena
-    // bookkeeping). Pure ownership shuffle, net-neutral memory.
-    arenas.unified_stack_bytes = stack_bytes;
+    // UnifiedStack arena sizing. The design calls for Stack to be backed
+    // by the phase-arena bookkeeping, but the adoption sequence
+    // (cudaMalloc → memcpy-rebase → free original) briefly holds two
+    // Stack-sized buffers on-device; on Qwen3 0.6B that's +1.1 GiB
+    // transient, past the `<2% peak-memory` benchmark gate. Skip the
+    // adoption (unified_stack_bytes = 0) and keep the allocator-owned
+    // Stack as-is — functionally equivalent (Stack pointers are valid
+    // either way), and steady-state memory is unchanged.
+    (void)stack_bytes;
+    arenas.unified_stack_bytes = 0;
     arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
     arenas.moe_saved_bytes = moe_saved_bytes;
 

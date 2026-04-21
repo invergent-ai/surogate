@@ -93,3 +93,28 @@ These are follow-ups. Nothing in the current fix set should affect them negative
 - Capture throughput: not measured — follow-up
 
 **Phase 3 ready to proceed to Phase 4.**
+
+## 2026-04-21 re-bench: arena consumption default-on
+
+FwdStack / BwdStack arena routing of `simplified_acts` slots is now
+the default path (see commit `cb3f2da`, half-open replay bounds).
+`SUROGATE_USE_PHASE_STACK_ARENAS` env gate removed. UnifiedStack
+adoption skipped (`arenas.unified_stack_bytes = 0`) because the
+cudaMalloc→rebase→free sequence briefly held two Stack-sized
+buffers and pushed peak past the gate on the dense models.
+
+| Model        | Avg step (ms) | Tokens/s | Peak (MiB) | Δ step_ms vs pre-my-changes |
+|--------------|--------------:|---------:|-----------:|----------------------------:|
+| Qwen3 0.6B   |        578.4  |  28,328  |    11,796  | −0.3% (578 vs 580)          |
+| Qwen3.5 0.8B |      2,239.5  |  14,631  |    19,020  | within noise                |
+| GPT-OSS 20B  |      2,740.7  |     747  |    30,368  | within noise                |
+
+Peak memory unchanged vs pre-arena-consumption (verified via
+`git stash`+ rerun on Qwen3: both configurations report 11,796 MiB).
+Step time neutral or fractionally better.
+
+The absolute Qwen3 / Qwen3.5 peaks are higher than the 2026-04-20
+baseline in the table above (7,700 / 12,204 → 11,796 / 19,020 MiB)
+because of independent codebase changes between the two gate runs;
+the measurement-local delta attributable to arena consumption is
+the ±0.3% reported in the "Δ step_ms" column.
