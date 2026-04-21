@@ -727,6 +727,60 @@ Big but less cross-cutting than M3 — weights/grads are fewer ops.
   work — a naive flip aliases each layer's same-slot tid into one arena
   offset and corrupts forward accumulation (see M3 first-strike memo).
 
+### Direction reset: commit to full Phase 1–3 of design/buffer-runtime-v4.md
+
+The M5 cleanup track (kill TensorSlot/shared_tag/builtin_slot_from_name)
+is *gated on* the phase-tree runtime being in place — per the design,
+legacy machinery can only be retired once ops read from baked
+`(region, offset)` operands instead of named slot lookups. Previous
+sessions treated the arena scaffolding as dead-when-unused and
+trimmed it (FwdStack/BwdStack purge, commits `96d7f18` / `fdd5a5a` /
+`a2038b6`); those were reverted in `156c1c8` / `766329e` / `bf8954f`
+because the scaffolding is load-bearing for the design, not dead code.
+
+Current state vs design phases:
+- **Phase 1 (IR + regions, role unification):** IR + region derivation +
+  layout + instruction stream all shadow-live. `MatmulRole` typed enum
+  not started (still `modules::MatmulOp` on hot paths).
+- **Phase 2 (compile-time layout + coloring):** bump + per-frame
+  coloring shadow-live for all five populated regions. Alignment
+  constraints not modeled. Determinism hash not implemented.
+- **Phase 3 (runtime migration):** stream interpreter default-on.
+  Handles `PhaseEnter` / `PhaseExit` / `SegmentDispatch`; `PruneByLastUse`
+  is pass-through, `RecomputeBlock` is forward-no-op. SaveForBwd tid
+  baking shipped (`66a69c0`). UnifiedStack adopted as Stack backing
+  (`30cd8c3`). Ops still largely use legacy `resolve_tensor` named
+  lookups for FwdStack/BwdStack/Accumulator operands.
+- **Consumers of arenas:** SaveForBwd, BwdCrossLayer, MoeSaved,
+  UnifiedStack all live. Persistent / Accumulator allocated under env
+  gate, no op reads them. FwdStack / BwdStack shadow.
+
+Concrete remaining commits toward Phase 3 completion:
+
+1. Layout determinism hash (Phase 2 step 5) — single-rank invariant now,
+   `MPI_Allreduce` check in distributed runs.
+2. `MatmulRole` typed enum (Phase 1 step 4) — either rename+expand
+   `modules::MatmulOp` or introduce a parallel enum and migrate callers
+   one hot path at a time.
+3. `PruneByLastUse` real dispatch — move per-op `prune_by_last_use` out
+   of the legacy backward loop into the instruction stream.
+4. `RecomputeBlock` real dispatch — consume the instruction in backward
+   instead of the current `mRecomputeFn` on op.layer_start.
+5. **Frame-discipline arena consumption** (Phase 3 step 4, the hard one):
+   per-block `Stack.save` / `Stack.restore` bracketing around activation
+   writes, then route ops to `resolve_tid_in_arena(...FwdStack, tid)`
+   for block-scoped reads. First-strike attempts aliased cross-layer
+   writes — this session's revert preserves the coloring infrastructure
+   needed to try again with discipline.
+6. Persistent arena for weights — either reorder init so compile runs
+   before weight load, or post-compile rebind.
+7. Accumulator arena for grads — same shape as (6), with ZeRO-2
+   complications.
+8. Benchmark gate against `buffer-runtime-v4-benchmark.md` after (5)
+   lands. Decision matrix in design doc.
+9. Phase 4 (cleanup) — only after (5) is in and the benchmark gate
+   passes can the M5 kill-list actually delete the legacy backings.
+
 ### M5 — Delete legacy machinery
 
 With all arenas backing everything ops read:
