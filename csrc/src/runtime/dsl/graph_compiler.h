@@ -624,6 +624,13 @@ struct CompiledGraph {
     std::size_t save_for_bwd_bytes = 0;
     std::vector<std::size_t> save_for_bwd_block_bytes;  // per-block sizes
 
+    /// FNV-1a 64-bit hash of the fully-baked layout (populated by
+    /// compute_layout). Mixes every tid's (region, block_layer_idx, offset,
+    /// bytes) plus the per-region peaks. Intended for distributed
+    /// determinism checks — all ranks running the same compile should
+    /// produce byte-identical hashes. `0` if compute_layout has not run.
+    std::uint64_t layout_hash = 0;
+
     /// Shadow-mode instruction stream emitted from the phase tree (M4).
     /// Flat linear sequence of primitives that would drive the M5 interpreter.
     /// Empty if phase_tree is empty.
@@ -759,9 +766,17 @@ private:
 /// / M5.b). For each region, computes offsets and peak bytes:
 ///   - Persistent, Accumulator, SaveForBwd: bump (sum of tensor bytes)
 ///   - FwdStack, BwdStack: per-block-frame first-fit-by-offset coloring
-/// Writes TensorMeta::offset for every live tid. Dump gated on
+/// Writes TensorMeta::offset for every live tid and populates
+/// graph.layout_hash for distributed determinism checks. Dump gated on
 /// `SUROGATE_DEBUG_LAYOUT=1`.
 void compute_layout(CompiledGraph& graph, bool is_backward);
+
+/// Recompute the FNV-1a 64-bit layout hash from tensor_meta + peaks. Called
+/// internally by compute_layout(); exposed so distributed init can
+/// cross-check graph.layout_hash across ranks (NCCL/MPI allreduce on the
+/// 64-bit value; any mismatch means coloring / region assignment diverged
+/// and the ranks would run incompatible buffer plans).
+std::uint64_t compute_layout_hash(const CompiledGraph& graph);
 
 /// Phase-tree arena allocator (design/buffer-runtime-v4.md, M5.d).
 /// Allocates one flat device buffer per region family. Sizes computed from

@@ -2125,6 +2125,21 @@ color_frame(const std::vector<int>& tids, const std::vector<LayoutInfo>& info, s
     return offsets;
 }
 
+/// FNV-1a 64-bit. Mixed in a stable, platform-independent way so all ranks
+/// produce the same hash for the same graph — prerequisite for the
+/// cross-rank layout determinism assertion in design/buffer-runtime-v4.md.
+constexpr std::uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
+constexpr std::uint64_t kFnvPrime = 0x100000001b3ULL;
+
+std::uint64_t fnv1a_mix(std::uint64_t h, std::uint64_t v) {
+    // Little-endian byte order so the hash is portable across ranks.
+    for (int i = 0; i < 8; ++i) {
+        h ^= static_cast<std::uint64_t>((v >> (i * 8)) & 0xff);
+        h *= kFnvPrime;
+    }
+    return h;
+}
+
 std::string fmt_bytes(std::size_t b) {
     std::ostringstream os;
     if (b >= (1ULL << 30)) {
@@ -2140,6 +2155,30 @@ std::string fmt_bytes(std::size_t b) {
 }
 
 }  // namespace
+
+std::uint64_t compute_layout_hash(const CompiledGraph& graph) {
+    std::uint64_t h = kFnvOffset;
+    // Per-tid (region, block_layer_idx, offset, bytes) quadruple. Tids are
+    // indexed positionally and assigned deterministically by the compiler,
+    // so iterating in order is rank-identical.
+    for (const auto& meta : graph.tensor_meta) {
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.region));
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.block_layer_idx + 1));
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.offset));
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.bytes));
+    }
+    // Per-region peaks: any drift here shows up even if tid sets happened to
+    // match (unlikely but cheap to guard against).
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.persistent_bytes));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.accumulator_bytes));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.fwd_stack_peak));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.bwd_stack_peak));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.save_for_bwd_bytes));
+    for (std::size_t b : graph.save_for_bwd_block_bytes) {
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(b));
+    }
+    return h;
+}
 
 void compute_layout(CompiledGraph& graph, bool is_backward) {
     const std::size_t num_tids = static_cast<std::size_t>(graph.num_tensors);
@@ -2275,6 +2314,11 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
     const std::size_t fwd_optimal = frame_optimal(fwd_frame);
     const std::size_t bwd_optimal = frame_optimal(bwd_frame);
 
+    // Layout hash — determinism check point for distributed runs (Phase 2
+    // step 5). Every rank running the same compile must produce the same
+    // 64-bit value; callers can cross-rank-compare via NCCL/MPI allreduce.
+    graph.layout_hash = compute_layout_hash(graph);
+
     if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
         if (std::string(env) == "1") {
             std::cerr << "[layout] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):\n"
@@ -2284,7 +2328,8 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
                       << "  FwdStack     = " << fmt_bytes(fwd_colored) << " (naive " << fmt_bytes(fwd_naive)
                       << ", optimal " << fmt_bytes(fwd_optimal) << ")\n"
                       << "  BwdStack     = " << fmt_bytes(bwd_colored) << " (naive " << fmt_bytes(bwd_naive)
-                      << ", optimal " << fmt_bytes(bwd_optimal) << ")\n";
+                      << ", optimal " << fmt_bytes(bwd_optimal) << ")\n"
+                      << "  layout_hash  = 0x" << std::hex << graph.layout_hash << std::dec << "\n";
         }
     }
 }
