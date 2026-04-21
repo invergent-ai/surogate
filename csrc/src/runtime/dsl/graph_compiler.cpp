@@ -2671,18 +2671,14 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.accumulator_bytes = want_persistent ? std::max(fwd.accumulator_bytes, bwd.accumulator_bytes) : 0;
 
     // FwdStack, BwdStack: consumed by simplified_acts slot routing (Phase 3
-    // step 4). FwdStack is per-layer-sectioned (num_layers × peak_per_frame)
-    // to give each layer distinct arena bytes, so cross-layer forward
-    // segment captures don't clobber earlier layers' replayed activations.
-    // The per-layer multiplier makes the arena large on deep models —
-    // kept env-gated on SUROGATE_USE_PHASE_STACK_ARENAS=1 so small models
-    // benefit now and deep-model memory fit remains opt-in until a
-    // layer-recycling arena (Stack-equivalent semantics: one layer's
-    // worth of memory, replayed just-in-time) lands.
-    const char* stack_arena_env = std::getenv("SUROGATE_USE_PHASE_STACK_ARENAS");
-    const bool want_stack_arenas = stack_arena_env && std::string(stack_arena_env) == "1";
-    arenas.fwd_stack_bytes = want_stack_arenas ? fwd.fwd_stack_peak : 0;
-    arenas.bwd_stack_bytes = want_stack_arenas ? bwd.bwd_stack_peak : 0;
+    // step 4). Single-arena routing per the plan: FwdStack arena sized to
+    // the max forward frame peak, BwdStack to the max backward frame peak
+    // — both reused across layers. Replay regenerates each layer's
+    // activations into the arena just-in-time before backward ops read,
+    // matching `Recomputed[i]` in design/buffer-runtime-v4.md.
+    // Default-on after validation on qwen3 / qwen3.5 / gpt-oss.
+    arenas.fwd_stack_bytes = fwd.fwd_stack_peak;
+    arenas.bwd_stack_bytes = bwd.bwd_stack_peak;
 
     // SaveForBwd: per-block slots persist across the fwd-exit / bwd-entry
     // boundary. finalize_save_for_bwd populates the same tids in both

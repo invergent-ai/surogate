@@ -777,61 +777,45 @@ Concrete remaining commits toward Phase 3 completion:
    of the legacy backward loop into the instruction stream.
 8. `RecomputeBlock` real dispatch — consume the instruction in backward
    instead of the current `mRecomputeFn` on op.layer_start.
-9. **Actual FwdStack/BwdStack arena consumption** — now unblocked by
-   (5). Override `simplified_acts[L][SLOT].Data` to `arena_ptr + meta.offset`
-   at arena-alloc time, teach `clear_rstd_stack_slots` and siblings to
-   preserve arena-backed slots instead of nulling, verify with (3)
-   + (4) checks enabled. Multi-session — does the Qwen3.5 replay path
-   interact cleanly, do stream-captured kernel args survive, etc.
+9. ✅ **Actual FwdStack/BwdStack arena consumption — shipped default-on**
+   (`cb3f2da`). Single arena per region, peak = max over layers, not
+   sum. Route every stack-backed `simplified_acts[L][SLOT].Data` to
+   `fwd_stack_ptr + meta.offset` and set `persist_across_layer_end`
+   so layer-end clears preserve the arena-baked pointer. FwdStack for
+   qwen3: 200MB (vs 5.8GB under the earlier per-layer-sectioning
+   attempt). GPT-OSS: 124MB (vs 2.9GB). Step-0 grad norms match
+   baseline on qwen3 / qwen3.5 / gpt-oss within FP noise.
 
-   **Attempted this session, reverted.** Changed `clear_rstd_stack_slots`
-   to only null when `rs.Stack.owns(slot.Data)`, expecting arena-backed
-   pointers to pass through. Broke the normal flow: `clear_*` does more
-   than Stack-invalidation — it's also the handshake that tells the
-   NEXT layer's `ensure_output_tensor` to `temp_acquire` fresh storage.
-   Skipping the null leaves last-layer's arena pointer (from the
-   replay-persist path) live; the next layer reuses it instead of
-   allocating fresh, and either reads stale data or races with the
-   replay-persist memcpy. Qwen3 bwd norm drifted (2.80 vs 3.44), Qwen3.5
-   + GPT-OSS surfaced runtime op-io aliasing.
+   **Root cause (validated by 1080 `[op-io-alias] RAW ...` messages
+   on the broken code, silent on the fix):**
+   `replay_layer_forward`'s op loop used `idx <= end` but
+   `annotate_layer_boundaries` defines `layer_end_indices[L]` as the
+   START of layer L+1 (half-open). Under qwen3's deferred-residual
+   pattern, layer L+1's first forward op is a `fused_residual_rmsnorm`
+   computing L+1's LN1 from L's residual+mlp_down — so layer L's
+   replay was also executing L+1's LN1 op, and under the plan's
+   shared-arena routing that write lands in the same byte range as
+   layer L's BlockLN1 and clobbered L's replayed activations before
+   L's backward ops read them. Per-layer sectioning had masked this
+   by giving every layer its own arena slice (num_layers× memory).
+   Fix: half-open `idx < end` in all three op-range loops.
 
-   Real fix requires distinguishing three states: (a) Stack-owned slot
-   that layer_end invalidates, (b) replay-persist-arena-owned slot that
-   layer_end should null (next layer starts fresh), (c) FwdStack-arena-owned
-   slot that layer_end should preserve (arena is the persistent source
-   of truth). A flag field on the simplified_acts slot — `persist_across_layer_end`
-   — is the cleanest fit; gates the null.
+   **Also extended `SUROGATE_CHECK_OP_IO_ALIASING`** with a read-
+   after-write provenance validator: tracks the `(slot, layer_idx)`
+   of the last write to each arena byte-range; a later op reading
+   the same range with a different `(slot, layer_idx)` is flagged
+   with reader + writer identities and op indices. The within-op
+   aliasing and RAW checks share one env flag. Slot-alias false
+   positives (e.g., `blocks[0].x_flat` is a different tid but same
+   slot as `blocks[0].ln1`) handled by resolving the ref's effective
+   slot from its name — including for `Saved` refs backward uses.
+   Backward-chain gradient slots (`BlockD*`) excluded by slot filter
+   because they intentionally share buffers across backward stages.
 
-   **Infra shipped** (subsequent commit): `persist_across_layer_end`
-   bitmap on `SimplifiedLayerActivations` / `SimplifiedLayerGradients`.
-   clear_* helpers consult the bit. Default false → legacy behavior
-   preserved (bit-identical on Qwen3-0.6B). Setter to be wired by the
-   arena-consumption pass.
-
-   **Arena-consumption wiring attempted, failed validation.** Added
-   a helper that walks every block-scope FwdStack slot, overrides
-   `.Data = fwd_stack_ptr + meta.offset`, and sets the persist bit.
-   Results under `SUROGATE_CHECK_OP_IO_ALIASING=1`:
-   - Qwen3-0.6B: 0 op-io aliases, step-0 forward loss **2.0251
-     (matches)**, but backward gradient norm **78412.88** vs baseline
-     3.44 — ~23000× divergence.
-   - Qwen3.5-0.8B: 66 op-io aliases, loss 5.45 vs baseline 1.99.
-   - GPT-OSS-20B: 1728 op-io aliases, loss 3.78 vs baseline 1.78.
-
-   Gap identified: the coloring validates FORWARD live ranges. swiglu
-   dies at op 17 (forward-only analysis); mlp_down first_use at op 18.
-   Their arena bytes overlap at [16M, 24M) per the coloring's "disjoint
-   live ranges" rule. Safe under forward. **But backward with recompute
-   reads swiglu for `d_w_down = swiglu^T @ d_mlp_down`** — and by then
-   mlp_down's forward write has clobbered swiglu's middle bytes in the
-   arena. Forward loss is correct (intra-forward liveness honored);
-   backward gradient is garbage.
-
-   Per the rule below: validation fails → neither default nor commit.
-   Held. Real fix requires either (a) coloring that accounts for
-   backward reads of forward tids (treat them as cross-graph-live =
-   SaveForBwd-like), or (b) broad promotion of backward-read tids
-   to SaveForBwd for recompute configs. Multi-session.
+   **Also added `SUROGATE_CHECK_REPLAY_SCOPE`**: replay_layer_forward(L)
+   must not dispatch ops whose `layer_start != L`. Directly catches
+   the loop-bound class of bug and would have short-circuited the
+   multi-session investigation.
 
 ### Rule (going forward)
 
