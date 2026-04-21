@@ -800,7 +800,45 @@ Concrete remaining commits toward Phase 3 completion:
    layer_end should null (next layer starts fresh), (c) FwdStack-arena-owned
    slot that layer_end should preserve (arena is the persistent source
    of truth). A flag field on the simplified_acts slot — `persist_across_layer_end`
-   — is the cleanest fit; gates the null. Leaving for a dedicated session.
+   — is the cleanest fit; gates the null.
+
+   **Infra shipped** (subsequent commit): `persist_across_layer_end`
+   bitmap on `SimplifiedLayerActivations` / `SimplifiedLayerGradients`.
+   clear_* helpers consult the bit. Default false → legacy behavior
+   preserved (bit-identical on Qwen3-0.6B). Setter to be wired by the
+   arena-consumption pass.
+
+   **Arena-consumption wiring attempted, failed validation.** Added
+   a helper that walks every block-scope FwdStack slot, overrides
+   `.Data = fwd_stack_ptr + meta.offset`, and sets the persist bit.
+   Results under `SUROGATE_CHECK_OP_IO_ALIASING=1`:
+   - Qwen3-0.6B: 0 op-io aliases, step-0 forward loss **2.0251
+     (matches)**, but backward gradient norm **78412.88** vs baseline
+     3.44 — ~23000× divergence.
+   - Qwen3.5-0.8B: 66 op-io aliases, loss 5.45 vs baseline 1.99.
+   - GPT-OSS-20B: 1728 op-io aliases, loss 3.78 vs baseline 1.78.
+
+   Gap identified: the coloring validates FORWARD live ranges. swiglu
+   dies at op 17 (forward-only analysis); mlp_down first_use at op 18.
+   Their arena bytes overlap at [16M, 24M) per the coloring's "disjoint
+   live ranges" rule. Safe under forward. **But backward with recompute
+   reads swiglu for `d_w_down = swiglu^T @ d_mlp_down`** — and by then
+   mlp_down's forward write has clobbered swiglu's middle bytes in the
+   arena. Forward loss is correct (intra-forward liveness honored);
+   backward gradient is garbage.
+
+   Per the rule below: validation fails → neither default nor commit.
+   Held. Real fix requires either (a) coloring that accounts for
+   backward reads of forward tids (treat them as cross-graph-live =
+   SaveForBwd-like), or (b) broad promotion of backward-read tids
+   to SaveForBwd for recompute configs. Multi-session.
+
+### Rule (going forward)
+
+If a feature passes validation, make it default and remove the env
+gate — features-behind-gates that validate clean are legacy-in-waiting.
+Conversely, features that fail validation: revert, document the gap,
+ship only the infra pieces that are independently correct.
 10. Persistent arena for weights — either reorder init so compile runs
     before weight load, or post-compile rebind.
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
