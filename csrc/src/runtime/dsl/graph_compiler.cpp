@@ -2051,28 +2051,6 @@ std::size_t bytes_for_ref(const TensorRef& ref) {
     return elems * static_cast<std::size_t>(get_dtype_size(ref.dtype));
 }
 
-/// Max-clique-sum over a frame's tids: at each op index, sum bytes of tids
-/// whose lifetime covers that index. For 1D interval graphs this IS the
-/// optimal peak achievable by any coloring.
-std::size_t frame_optimal_peak(const std::vector<int>& tids,
-                               const std::vector<LayoutInfo>& info,
-                               std::size_t frame_first,
-                               std::size_t frame_last) {
-    if (tids.empty() || frame_last < frame_first) return 0;
-    std::size_t peak = 0;
-    for (std::size_t t = frame_first; t <= frame_last; ++t) {
-        std::size_t live = 0;
-        for (int tid : tids) {
-            const auto& ti = info[static_cast<std::size_t>(tid)];
-            if (ti.first_use <= t && t <= ti.last_use) {
-                live += ti.bytes;
-            }
-        }
-        peak = std::max(peak, live);
-    }
-    return peak;
-}
-
 /// First-fit-by-offset greedy for 1D-interval coloring. Returns per-tid
 /// frame-local byte offsets; sets peak_out to the bytes consumed. Non-optimal
 /// but correct (no two live tensors share bytes) and close to the max-clique
@@ -2248,43 +2226,26 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
         return {naive_max, coloring_max};
     };
 
-    auto [fwd_naive, fwd_colored] = color_frames(fwd_frame);
-    auto [bwd_naive, bwd_colored] = color_frames(bwd_frame);
+    // FwdStack / BwdStack tids keep their coloring here (offsets written into
+    // tensor_meta for telemetry + future reconsideration), but the per-region
+    // arena that was going to consume them has been dropped — DslRunState's
+    // unified Stack does the per-block bump/restore bookkeeping with better
+    // coverage of non-block tids at comparable or lower peak.
+    (void)color_frames(fwd_frame);
+    (void)color_frames(bwd_frame);
 
-    // Expose peaks for compute_arena_sizes (M5.d).
+    // Expose peaks for compute_arena_sizes.
     graph.persistent_bytes = persistent_bytes;
     graph.accumulator_bytes = accumulator_bytes;
-    graph.fwd_stack_peak = fwd_colored;
-    graph.bwd_stack_peak = bwd_colored;
     graph.save_for_bwd_bytes = save_for_bwd_bytes;
     graph.save_for_bwd_block_bytes = std::move(save_for_bwd_block_bytes);
-
-    // Compute optimal peak per frame (max-clique-sum) for comparison vs our
-    // first-fit-by-offset coloring. Reports how close the greedy is to the
-    // theoretical bound.
-    auto frame_optimal = [&](const std::vector<std::vector<int>>& frames) -> std::size_t {
-        std::size_t best = 0;
-        for (std::size_t L = 0; L < frames.size(); ++L) {
-            const auto s = graph.layer_start_indices[L];
-            const auto e = graph.layer_end_indices[L];
-            if (s == SIZE_MAX || e == SIZE_MAX || s >= e) continue;
-            best = std::max(best, frame_optimal_peak(frames[L], info, s, e - 1));
-        }
-        return best;
-    };
-    const std::size_t fwd_optimal = frame_optimal(fwd_frame);
-    const std::size_t bwd_optimal = frame_optimal(bwd_frame);
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
         if (std::string(env) == "1") {
             std::cerr << "[layout] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):\n"
                       << "  Persistent   = " << fmt_bytes(persistent_bytes) << "\n"
                       << "  Accumulator  = " << fmt_bytes(accumulator_bytes) << "\n"
-                      << "  SaveForBwd   = " << fmt_bytes(save_for_bwd_bytes) << "\n"
-                      << "  FwdStack     = " << fmt_bytes(fwd_colored) << " (naive " << fmt_bytes(fwd_naive)
-                      << ", optimal " << fmt_bytes(fwd_optimal) << ")\n"
-                      << "  BwdStack     = " << fmt_bytes(bwd_colored) << " (naive " << fmt_bytes(bwd_naive)
-                      << ", optimal " << fmt_bytes(bwd_optimal) << ")\n";
+                      << "  SaveForBwd   = " << fmt_bytes(save_for_bwd_bytes) << "\n";
         }
     }
 }
@@ -2316,15 +2277,6 @@ void compute_arena_sizes(PhaseArenas& arenas,
     const bool want_persistent = persistent_env && std::string(persistent_env) == "1";
     arenas.persistent_bytes = want_persistent ? std::max(fwd.persistent_bytes, bwd.persistent_bytes) : 0;
     arenas.accumulator_bytes = want_persistent ? std::max(fwd.accumulator_bytes, bwd.accumulator_bytes) : 0;
-
-    // FwdStack, BwdStack: shadow only — no op consumes these arenas yet
-    // (tensor-id baking, design §Phase 3 step 4, is the missing consumer).
-    // Gated on SUROGATE_USE_PHASE_STACK_ARENAS=1 so the per-frame coloring
-    // peak doesn't waste memory on the default path.
-    const char* stack_arena_env = std::getenv("SUROGATE_USE_PHASE_STACK_ARENAS");
-    const bool want_stack_arenas = stack_arena_env && std::string(stack_arena_env) == "1";
-    arenas.fwd_stack_bytes = want_stack_arenas ? fwd.fwd_stack_peak : 0;  // bwd's fwd_stack_peak is 0
-    arenas.bwd_stack_bytes = want_stack_arenas ? bwd.bwd_stack_peak : 0;  // fwd's bwd_stack_peak is 0
 
     // SaveForBwd: per-block slots persist across the fwd-exit / bwd-entry
     // boundary. finalize_save_for_bwd populates the same tids in both
@@ -2363,8 +2315,6 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
     if (arenas.allocated) return;
     cuda_malloc_or_die(&arenas.persistent_ptr, arenas.persistent_bytes, "persistent");
     cuda_malloc_or_die(&arenas.accumulator_ptr, arenas.accumulator_bytes, "accumulator");
-    cuda_malloc_or_die(&arenas.fwd_stack_ptr, arenas.fwd_stack_bytes, "fwd_stack");
-    cuda_malloc_or_die(&arenas.bwd_stack_ptr, arenas.bwd_stack_bytes, "bwd_stack");
     cuda_malloc_or_die(&arenas.save_for_bwd_ptr, arenas.save_for_bwd_bytes, "save_for_bwd");
     cuda_malloc_or_die(&arenas.unified_stack_ptr, arenas.unified_stack_bytes, "unified_stack");
     cuda_malloc_or_die(&arenas.bwd_cross_layer_ptr, arenas.bwd_cross_layer_bytes, "bwd_cross_layer");
@@ -2381,17 +2331,13 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
                       << static_cast<void*>(arenas.persistent_ptr) << "\n"
                       << "  Accumulator   = " << mb(arenas.accumulator_bytes) << " MB @ "
                       << static_cast<void*>(arenas.accumulator_ptr) << "\n"
-                      << "  FwdStack      = " << mb(arenas.fwd_stack_bytes) << " MB @ "
-                      << static_cast<void*>(arenas.fwd_stack_ptr) << "\n"
-                      << "  BwdStack      = " << mb(arenas.bwd_stack_bytes) << " MB @ "
-                      << static_cast<void*>(arenas.bwd_stack_ptr) << "\n"
                       << "  SaveForBwd    = " << mb(arenas.save_for_bwd_bytes) << " MB @ "
                       << static_cast<void*>(arenas.save_for_bwd_ptr) << "\n"
                       << "  UnifiedStack  = " << mb(arenas.unified_stack_bytes) << " MB @ "
                       << static_cast<void*>(arenas.unified_stack_ptr) << "\n"
                       << "  TOTAL         = "
-                      << mb(arenas.persistent_bytes + arenas.accumulator_bytes + arenas.fwd_stack_bytes +
-                            arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes + arenas.unified_stack_bytes)
+                      << mb(arenas.persistent_bytes + arenas.accumulator_bytes + arenas.save_for_bwd_bytes +
+                            arenas.unified_stack_bytes)
                       << " MB\n";
         }
     }
@@ -2404,8 +2350,6 @@ std::byte* resolve_tid_in_arena(const PhaseArenas& arenas, const CompiledGraph& 
     switch (meta.region) {
         case RegionKind::Persistent: return arenas.persistent_ptr + meta.offset;
         case RegionKind::Accumulator: return arenas.accumulator_ptr + meta.offset;
-        case RegionKind::FwdStack: return arenas.fwd_stack_ptr + meta.offset;  // frame-local offset
-        case RegionKind::BwdStack: return arenas.bwd_stack_ptr + meta.offset;
         case RegionKind::SaveForBwd:
             if (meta.block_layer_idx < 0 ||
                 static_cast<std::size_t>(meta.block_layer_idx) >= arenas.save_for_bwd_block_bases.size()) {
@@ -2425,8 +2369,6 @@ ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledG
         switch (k) {
             case RegionKind::Persistent: return arenas.persistent_bytes;
             case RegionKind::Accumulator: return arenas.accumulator_bytes;
-            case RegionKind::FwdStack: return arenas.fwd_stack_bytes;
-            case RegionKind::BwdStack: return arenas.bwd_stack_bytes;
             case RegionKind::SaveForBwd: return arenas.save_for_bwd_bytes;
             default: return 0;
         }
@@ -2435,13 +2377,15 @@ ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledG
     for (int tid = 0; tid < graph.num_tensors; ++tid) {
         const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
         if (meta.region == RegionKind::Unknown) continue;
+        // FwdStack / BwdStack tids are block-scoped and live on
+        // DslRunState.Stack (unified arena); skip them here — they have no
+        // dedicated region arena to validate against.
+        if (meta.region == RegionKind::FwdStack || meta.region == RegionKind::BwdStack) continue;
         ++cov.total;
         if (meta.offset == SIZE_MAX || meta.bytes == 0) continue;
         switch (meta.region) {
             case RegionKind::Persistent:
-            case RegionKind::Accumulator:
-            case RegionKind::FwdStack:
-            case RegionKind::BwdStack: {
+            case RegionKind::Accumulator: {
                 const std::size_t end = meta.offset + meta.bytes;
                 if (end > region_capacity(meta.region)) {
                     ++cov.size_exceeded;
@@ -2501,8 +2445,6 @@ OpOperandCoverage validate_op_operand_coverage(const PhaseArenas& arenas, const 
         switch (k) {
             case RegionKind::Persistent: return arenas.persistent_ptr != nullptr;
             case RegionKind::Accumulator: return arenas.accumulator_ptr != nullptr;
-            case RegionKind::FwdStack: return arenas.fwd_stack_ptr != nullptr;
-            case RegionKind::BwdStack: return arenas.bwd_stack_ptr != nullptr;
             case RegionKind::SaveForBwd: return arenas.save_for_bwd_ptr != nullptr;
             case RegionKind::BwdCrossLayer: return arenas.bwd_cross_layer_ptr != nullptr;
             default: return false;
@@ -2554,16 +2496,12 @@ void release_phase_arenas(PhaseArenas& arenas) {
     };
     free_ptr(arenas.persistent_ptr);
     free_ptr(arenas.accumulator_ptr);
-    free_ptr(arenas.fwd_stack_ptr);
-    free_ptr(arenas.bwd_stack_ptr);
     free_ptr(arenas.save_for_bwd_ptr);
     free_ptr(arenas.unified_stack_ptr);
     free_ptr(arenas.bwd_cross_layer_ptr);
     free_ptr(arenas.moe_saved_ptr);
     arenas.persistent_bytes = 0;
     arenas.accumulator_bytes = 0;
-    arenas.fwd_stack_bytes = 0;
-    arenas.bwd_stack_bytes = 0;
     arenas.save_for_bwd_bytes = 0;
     arenas.unified_stack_bytes = 0;
     arenas.bwd_cross_layer_bytes = 0;
