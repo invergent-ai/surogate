@@ -2238,6 +2238,115 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
         }
     }
 
+    // Build tid → (slot, layer_idx) map so coloring can collapse aliased
+    // views (e.g., blocks[L].swiglu + blocks[L].swiglu_flat share
+    // TensorSlot::BlockSwiGLU). Runtime resolves all such refs through one
+    // simplified_acts[SLOT].Data pointer, so the coloring must treat them
+    // as a single allocation or arena consumption will corrupt.
+    auto is_block_scope_slot = [](TensorSlot s) {
+        switch (s) {
+            case TensorSlot::Mapped:
+            case TensorSlot::Parameter:
+            case TensorSlot::Saved:
+            case TensorSlot::TokenIDs:
+            case TensorSlot::PositionIDs:
+            case TensorSlot::Targets:
+            case TensorSlot::Losses:
+            case TensorSlot::DLoss:
+            case TensorSlot::Encoded:
+            case TensorSlot::LNFinal:
+            case TensorSlot::LNFinalRSTD:
+            case TensorSlot::FinalResidual:
+            case TensorSlot::FreqCis: return false;
+            default: return true;
+        }
+    };
+    struct TidSlotInfo {
+        TensorSlot slot = TensorSlot::Mapped;
+        int layer_idx = -1;
+        bool set = false;
+    };
+    std::vector<TidSlotInfo> tid_slot(num_tids);
+    auto record_ref = [&](const TensorRef& ref, bool is_output) {
+        if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
+        auto& rec = tid_slot[static_cast<std::size_t>(ref.tensor_id)];
+        if (!rec.set || (is_output && is_block_scope_slot(ref.slot))) {
+            rec.slot = ref.slot;
+            rec.layer_idx = ref.layer_idx;
+            rec.set = true;
+        }
+    };
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.outputs)
+            record_ref(ref, true);
+        for (const auto& ref : op.inputs)
+            record_ref(ref, false);
+    }
+
+    // Collapse slot-aliased tids within each FwdStack/BwdStack frame into
+    // coloring groups. Each group contributes ONE entry to the coloring
+    // input — its representative tid — with bytes = max across members
+    // and live range = union across members. The resulting offset is
+    // propagated to every member after coloring.
+    struct AliasGroup {
+        int representative_tid = -1;
+        std::vector<int> member_tids;  // includes representative
+    };
+    auto collapse_frame_aliases = [&](std::vector<std::vector<int>>& frames) -> std::vector<std::vector<AliasGroup>> {
+        std::vector<std::vector<AliasGroup>> per_layer_groups(frames.size());
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            auto& tids = frames[L];
+            std::unordered_map<int, std::size_t> slot_to_group_idx;
+            std::vector<AliasGroup>& groups = per_layer_groups[L];
+            std::vector<int> collapsed_tids;
+            for (int tid : tids) {
+                const auto& rec = tid_slot[static_cast<std::size_t>(tid)];
+                if (rec.set && is_block_scope_slot(rec.slot) && rec.layer_idx == static_cast<int>(L)) {
+                    const int key = static_cast<int>(rec.slot);
+                    auto it = slot_to_group_idx.find(key);
+                    if (it == slot_to_group_idx.end()) {
+                        slot_to_group_idx[key] = groups.size();
+                        AliasGroup g;
+                        g.representative_tid = tid;
+                        g.member_tids.push_back(tid);
+                        groups.push_back(std::move(g));
+                        collapsed_tids.push_back(tid);
+                    } else {
+                        groups[it->second].member_tids.push_back(tid);
+                    }
+                } else {
+                    // Not slot-aliased — keep as a one-tid "group" so the
+                    // post-coloring propagation loop is uniform.
+                    AliasGroup g;
+                    g.representative_tid = tid;
+                    g.member_tids.push_back(tid);
+                    groups.push_back(std::move(g));
+                    collapsed_tids.push_back(tid);
+                }
+            }
+            tids = std::move(collapsed_tids);
+            // Update the representative's coloring info to reflect the union
+            // of member live ranges and max bytes.
+            for (auto& g : groups) {
+                if (g.member_tids.size() <= 1) continue;
+                auto& rep_info = info[static_cast<std::size_t>(g.representative_tid)];
+                for (int member : g.member_tids) {
+                    if (member == g.representative_tid) continue;
+                    const auto& mi = info[static_cast<std::size_t>(member)];
+                    rep_info.first_use = std::min(rep_info.first_use, mi.first_use);
+                    rep_info.last_use = std::max(rep_info.last_use, mi.last_use);
+                    rep_info.bytes = std::max(rep_info.bytes, mi.bytes);
+                }
+                // Keep bytes on tensor_meta in sync with the union size —
+                // downstream readers use meta.bytes for arena sizing.
+                graph.tensor_meta[static_cast<std::size_t>(g.representative_tid)].bytes = rep_info.bytes;
+            }
+        }
+        return per_layer_groups;
+    };
+    auto fwd_alias_groups = collapse_frame_aliases(fwd_frame);
+    auto bwd_alias_groups = collapse_frame_aliases(bwd_frame);
+
     // Bump: sort by tid for deterministic ordering across ranks.
     auto bump_sort = [](std::vector<int>& tids) {
         std::sort(tids.begin(), tids.end());
@@ -2267,11 +2376,17 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
     }
 
     // Per-frame coloring. The region's peak is the max over frames (frames
-    // don't coexist — nested-stack semantics).
-    auto color_frames = [&](const std::vector<std::vector<int>>& frames) -> std::pair<std::size_t, std::size_t> {
+    // don't coexist — nested-stack semantics). `alias_groups` carries the
+    // tid→group membership produced by collapse_frame_aliases; after the
+    // coloring pass we propagate the representative's offset to every
+    // alias member so runtime slot-alias resolution is faithful.
+    auto color_frames =
+        [&](const std::vector<std::vector<int>>& frames,
+            const std::vector<std::vector<AliasGroup>>& alias_groups) -> std::pair<std::size_t, std::size_t> {
         std::size_t naive_max = 0;
         std::size_t coloring_max = 0;
-        for (const auto& tids : frames) {
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            const auto& tids = frames[L];
             std::size_t naive = 0;
             for (int tid : tids)
                 naive += info[static_cast<std::size_t>(tid)].bytes;
@@ -2283,12 +2398,26 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
             for (std::size_t i = 0; i < tids.size(); ++i) {
                 graph.tensor_meta[static_cast<std::size_t>(tids[i])].offset = offs[i];
             }
+            // Propagate representative offsets to alias members.
+            if (L < alias_groups.size()) {
+                for (const auto& g : alias_groups[L]) {
+                    if (g.member_tids.size() <= 1) continue;
+                    const std::size_t rep_off =
+                        graph.tensor_meta[static_cast<std::size_t>(g.representative_tid)].offset;
+                    for (int member : g.member_tids) {
+                        if (member == g.representative_tid) continue;
+                        graph.tensor_meta[static_cast<std::size_t>(member)].offset = rep_off;
+                        graph.tensor_meta[static_cast<std::size_t>(member)].bytes =
+                            graph.tensor_meta[static_cast<std::size_t>(g.representative_tid)].bytes;
+                    }
+                }
+            }
         }
         return {naive_max, coloring_max};
     };
 
-    auto [fwd_naive, fwd_colored] = color_frames(fwd_frame);
-    auto [bwd_naive, bwd_colored] = color_frames(bwd_frame);
+    auto [fwd_naive, fwd_colored] = color_frames(fwd_frame, fwd_alias_groups);
+    auto [bwd_naive, bwd_colored] = color_frames(bwd_frame, bwd_alias_groups);
 
     // Expose peaks for compute_arena_sizes (M5.d).
     graph.persistent_bytes = persistent_bytes;
@@ -2350,63 +2479,9 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
             }
         }
     };
-    // Slot-aliasing validator. At runtime, all refs sharing a block-scope
-    // TensorSlot (e.g., blocks[L].swiglu and blocks[L].swiglu_flat both
-    // resolve to simplified_acts[L][BlockSwiGLU].Data) collapse to one
-    // address. The per-tid coloring above happily assigns DIFFERENT offsets
-    // to aliased tids, which silently creates cross-slot aliasing at
-    // runtime: if slot A's aliased tids overlap slot B's aliased tids in
-    // runtime bytes, and their union live ranges overlap, corruption.
-    //
-    // Check the stricter invariant that enables safe arena consumption:
-    // tids sharing a block-scope slot in the same layer must have the
-    // same compile-time offset. Any split is a compile-time bug that the
-    // runtime op-io-aliasing validator (compiled_ops_save.cpp) will
-    // otherwise catch only at the first offending op dispatch.
-    auto is_block_scope_slot = [](TensorSlot s) {
-        switch (s) {
-            case TensorSlot::Mapped:
-            case TensorSlot::Parameter:
-            case TensorSlot::Saved:
-            case TensorSlot::TokenIDs:
-            case TensorSlot::PositionIDs:
-            case TensorSlot::Targets:
-            case TensorSlot::Losses:
-            case TensorSlot::DLoss:
-            case TensorSlot::Encoded:
-            case TensorSlot::LNFinal:
-            case TensorSlot::LNFinalRSTD:
-            case TensorSlot::FinalResidual:
-            case TensorSlot::FreqCis: return false;
-            default: return true;
-        }
-    };
-    // Build tid → (slot, layer_idx) map from op refs. A tid produced as an
-    // output carries its slot via the output TensorRef; inputs carry it too
-    // but we prefer the producing ref's slot when both exist.
-    struct TidSlotInfo {
-        TensorSlot slot = TensorSlot::Mapped;
-        int layer_idx = -1;
-        bool set = false;
-    };
-    std::vector<TidSlotInfo> tid_slot(num_tids);
-    auto record_ref = [&](const TensorRef& ref, bool is_output) {
-        if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
-        auto& rec = tid_slot[static_cast<std::size_t>(ref.tensor_id)];
-        // Prefer block-scope slot from the producing output ref; fall back to
-        // input refs' slot only if nothing better has been recorded.
-        if (!rec.set || (is_output && is_block_scope_slot(ref.slot))) {
-            rec.slot = ref.slot;
-            rec.layer_idx = ref.layer_idx;
-            rec.set = true;
-        }
-    };
-    for (const auto& op : graph.ops) {
-        for (const auto& ref : op.outputs)
-            record_ref(ref, true);
-        for (const auto& ref : op.inputs)
-            record_ref(ref, false);
-    }
+    // Slot-aliasing validator. The coloring collapse above should have made
+    // every (layer, block-scope slot) group share one offset — this check
+    // confirms and catches regressions.
     std::size_t alias_offset_splits = 0;
     auto check_slot_aliases = [&](const std::vector<std::vector<int>>& frames, const char* where) {
         for (std::size_t L = 0; L < frames.size(); ++L) {
