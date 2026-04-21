@@ -229,15 +229,13 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                     if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
                         resolved = *bp;
                     }
-                } else {
-                    // Unqualified global-level reference — try slot table first.
-                    const TensorSlot slot = builtin_slot_from_name(inp.name);
-                    if (Tensor* gp = global_activation_ptr(mRunState, slot)) {
-                        resolved = *gp;
-                    } else if (inp.name.find("freq_cis") != std::string::npos ||
-                               inp.name.find("rope_freqs") != std::string::npos) {
-                        resolved = mRunState.rope_freqs(inp.name);
-                    }
+                } else if (inp.name.find("freq_cis") != std::string::npos ||
+                           inp.name.find("rope_freqs") != std::string::npos) {
+                    // Rope frequencies come through unqualified global names;
+                    // inp.slot would be FreqCis and line 217 already handled
+                    // compile-classified refs. This fallback covers names the
+                    // compiler left as Mapped (e.g., qualified substring hits).
+                    resolved = mRunState.rope_freqs(inp.name);
                 }
 
                 // Cross-layer connector tensors: `layerN.<field>` (used by
