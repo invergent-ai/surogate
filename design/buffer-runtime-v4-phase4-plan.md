@@ -708,21 +708,88 @@ Big but less cross-cutting than M3 — weights/grads are fewer ops.
   Qwen3.5-0.8B (187 MiB), GPT-OSS-20B (29.8 GiB peak, identical to
   pre-flip). Losses bit-identical within noise.
 
+### M4a shipped (Persistent arena for base weights — post-compile rebind)
+
+`DslParamStore::rebind_to_persistent_arena` walks every locally-allocated
+entry (skipping QLoRA-external and `managed_by_weight_manager`), looks up
+its tid in the compiled forward graph, and for every tid whose
+`RegionKind::Persistent` offset resolves inside the arena:
+`cudaMemcpyAsync` the current bytes to `persistent_ptr + meta.offset`,
+`mAllocator->free` the original buffer, and rebind
+`entry.tensor.Data = arena_ptr`. `entry.tensor.Stats` and `Device` are
+preserved across the rebind.
+
+Call site: `GraphExecutor::compile_graphs`, immediately after
+`consume_fwdstack_arena()`. Runs on the `mRunState.MainStream` so the
+copy is ordered with the rest of the executor's work.
+
+Arena sizing gate is split in two:
+
+- `compute_arena_sizes` now reads `SUROGATE_USE_PHASE_PERSISTENT=1` and
+  `SUROGATE_USE_PHASE_ACCUMULATOR=1` independently — M4a only wants the
+  weight path, not gradients.
+- `GraphExecutor::compile_graphs` clamps
+  `mPhaseArenas.persistent_bytes` to
+  `DslParamStore::rebindable_persistent_bytes(*mCompiledForward)`, which
+  returns 0 as soon as **any** entry is external or weight-manager-
+  managed. Layout's bump allocator assigns offsets to every ForwardParam
+  tid, so the locally-allocated set's offsets are interspersed with
+  QLoRA-external ones; sizing to just the locals' high-water mark would
+  leave the external ranges unbacked. Whole-or-nothing keeps M4a sound;
+  M4c/d widen it.
+
+Validation (parallel GPU 1 / 2 / 3):
+
+| Model     | Flag off loss  | Flag on loss   | Flag on grad norm | Arena bytes | Rebound |
+|-----------|---------------:|---------------:|------------------:|------------:|--------:|
+| Qwen3 0.6B    | 2.0251 | 2.0251 | 3.4382 (base 3.4390 ∈ noise) | 1.46 GiB | 227 |
+| Qwen3.5 0.8B  | 1.9893 | 1.9893 | 4.1787                        | 1.88 GiB | 261 |
+| GPT-OSS 20B   | 1.7873 | 1.7873 | 2.7290 **exact**              | 0        | 0 (gate) |
+
+GPT-OSS's skip is by design: `is_qlora_param_name` marks every MoE
+expert weight `external`, the gate returns 0, and arena allocation is
+suppressed — no 40 GiB cudaMalloc attempted.
+
+Qwen3.5 reports 36 `skipped_size_mismatch`. These are ForwardParam tids
+whose `tensor_meta[tid].bytes == 0` (never referenced by any op in the
+active graph — a pre-existing quirk of the hybrid architecture's
+per-layer parameter inclusion). They stay in the allocator unchanged;
+`skipped_size_mismatch` being non-zero is not a correctness issue but
+is worth auditing in M5 cleanup.
+
+Commits: implementation in `dsl_param_store.{h,cpp}` +
+`graph_executor.cpp` call site + `graph_compiler.cpp` env-gate split.
+Gated behind `SUROGATE_USE_PHASE_PERSISTENT=1`, default off.
+
 ### M4 remaining (multi-session)
 
-- **Persistent arena for weights.** `DslWeightManager::allocate_weights`
-  calls `mAllocator->allocate` per weight. Routing those allocations to
-  `persistent_ptr + meta.offset` requires the Persistent layout to be
-  known before weight load — currently layout is computed inside
-  `compile_graphs`, which runs *after* the weight manager constructs.
-  Either reorder so layout runs first, or do a post-compile copy + rebind
-  (weights cudaMalloc'd, then memcpy'd into arena and original freed).
-  Complicated by streaming, offloading, LoRA adapter, and
-  FP8/FP4/BNB/MXFP4 quantization paths — each has its own allocation
-  strategy.
+- **M4b — LoRA adapter weights into Persistent arena.**
+  `modules::ModularLoRAWeightsManager` has its own allocation path in
+  `csrc/src/runtime/lora/`. LoRA-A / LoRA-B matrices are separate tids
+  from the frozen base weights but still land in `RegionKind::Persistent`
+  at layout time. The rebind pattern applies, but LoRA-specific
+  allocation policy (per-expert for MoE, adapter-merge flow) needs its
+  own walker.
+- **M4c — offload / streaming / weight-manager paths into Persistent
+  arena.** `DslWeightManager::allocate_weights` has five divergent
+  paths (streaming, offload_master, cpu_training, separate-work,
+  shared-alias). Master weights live on pinned CPU under offload;
+  work-weight prefetch slots are double-buffered. The arena-rebind
+  pattern would need to target the `entry.work` device buffer only,
+  and tolerate `entry.master.Data` being a pinned CPU pointer. Today
+  M4c is blocked by the compile-time layout assuming all Persistent
+  offsets are device-resident — the offload path's per-layer
+  gather-into-prefetch-slot needs its own arena treatment.
+- **M4d — quantized (FP8 / FP4 / BnB / MXFP4) weights into Persistent
+  arena.** `csrc/src/runtime/qlora/` pipelines hold quantized base
+  weights with per-block scales. Each quantizer's layout (packed
+  format, scale metadata) has to map into the arena; the current
+  per-name `cudaMalloc` path does not carry enough structural
+  information for a blind rebind.
 - **Accumulator arena for grads.** `DslGradStore` has a similar
   allocate-per-grad pattern; ZeRO-2 sharding + per-layer reduce add
-  complexity.
+  complexity. Gated separately now under
+  `SUROGATE_USE_PHASE_ACCUMULATOR=1` (shadow; no op consumes it yet).
 - **FwdStack / BwdStack shadows.** Blocked on M3 per-frame coloring
   work — a naive flip aliases each layer's same-slot tid into one arena
   offset and corrupts forward accumulation (see M3 first-strike memo).
@@ -838,11 +905,17 @@ If a feature passes validation, make it default and remove the env
 gate — features-behind-gates that validate clean are legacy-in-waiting.
 Conversely, features that fail validation: revert, document the gap,
 ship only the infra pieces that are independently correct.
-10. Persistent arena for weights — either reorder init so compile runs
-    before weight load, or post-compile rebind. **Not started.** Gated
-    on `SUROGATE_USE_PHASE_PERSISTENT=1`; no op consumes it yet.
+10. ✅ Persistent arena for base weights (M4a) — post-compile rebind via
+    `DslParamStore::rebind_to_persistent_arena` + executor-side clamp via
+    `rebindable_persistent_bytes` (auto-skip for QLoRA / weight-manager
+    configs). Gated on `SUROGATE_USE_PHASE_PERSISTENT=1`, default off.
+    Bit-identical on Qwen3 / Qwen3.5 (227 / 261 weights rebound,
+    1.46 / 1.88 GiB arena); GPT-OSS flag-on is a no-op by design (all
+    experts external). M4b/c/d for LoRA / offload / quantized paths
+    remain — see "M4 remaining" above.
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
-    complications. **Not started.**
+    complications. **Not started.** Env-gate now split:
+    `SUROGATE_USE_PHASE_ACCUMULATOR=1` (shadow; no op consumes it yet).
 12. ✅ Benchmark gate against `buffer-runtime-v4-benchmark.md` re-run
     (2026-04-21) with arena consumption default-on: step time neutral
     (−0.3% on qwen3, within noise on qwen3.5 / gpt-oss), peak memory

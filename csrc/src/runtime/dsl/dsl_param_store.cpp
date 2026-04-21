@@ -6,16 +6,19 @@
 #include "runtime/dsl/dsl_param_store.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
 
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/dsl_weight_manager.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "runtime/training/runtime_options.h"
 #include "runtime/training/model.h"
 #include "runtime/lora/lora_config.h"
 #include "utilities/dtype.h"
+#include "utilities/utils.h"
 
 namespace dsl {
 namespace {
@@ -282,6 +285,108 @@ const Tensor& DslParamStore::template_tensor(const std::string& name) const {
         throw std::runtime_error("DslParamStore: missing parameter " + name);
     }
     return it->second.tensor;
+}
+
+std::size_t DslParamStore::rebindable_persistent_bytes(const CompiledGraph& graph) const {
+    // Layout assigns offsets to every ForwardParam tid in the graph — the
+    // Persistent arena has to be sized to the maximum of (offset + bytes)
+    // across the tids whose backing storage the arena actually replaces.
+    // If ANY param is provider-resolved (QLoRA external) or managed by a
+    // weight manager, that set intersperses offsets with the locally-
+    // allocated set, so clamping to only the local-set high-water mark
+    // isn't sound — the compiler placed local tids at their global offsets,
+    // which include the unused external ranges. For M4a we therefore
+    // disable the arena whenever any param is not locally allocated;
+    // M4c/d widen this once the non-local paths grow their own arena-
+    // backed storage.
+    for (const auto& kv : mParams) {
+        const Entry& entry = kv.second;
+        if (entry.external || entry.managed_by_weight_manager) {
+            return 0;
+        }
+    }
+    std::size_t high_water = 0;
+    for (const auto& kv : mParams) {
+        const Entry& entry = kv.second;
+        if (entry.tensor.Data == nullptr) continue;
+        const int tid = graph.find_tensor_id(kv.first);
+        if (tid < 0) continue;
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != RegionKind::Persistent || meta.offset == SIZE_MAX) continue;
+        const std::size_t tensor_bytes = entry.tensor.bytes();
+        if (tensor_bytes == 0 || meta.bytes < tensor_bytes) continue;
+        high_water = std::max(high_water, meta.offset + tensor_bytes);
+    }
+    return high_water;
+}
+
+void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
+                                               const PhaseArenas& arenas,
+                                               cudaStream_t stream) {
+    const char* env = std::getenv("SUROGATE_USE_PHASE_PERSISTENT");
+    if (!env || std::string(env) != "1") return;
+    if (!arenas.allocated || arenas.persistent_ptr == nullptr || arenas.persistent_bytes == 0) return;
+
+    std::size_t rebound = 0;
+    std::size_t skipped_external = 0;
+    std::size_t skipped_managed = 0;
+    std::size_t skipped_no_tid = 0;
+    std::size_t skipped_non_persistent = 0;
+    std::size_t skipped_size_mismatch = 0;
+
+    for (const auto& name : mParamOrder) {
+        auto it = mParams.find(name);
+        if (it == mParams.end()) continue;
+        Entry& entry = it->second;
+        if (entry.external) {
+            ++skipped_external;
+            continue;
+        }
+        if (entry.managed_by_weight_manager) {
+            ++skipped_managed;
+            continue;
+        }
+        if (entry.tensor.Data == nullptr) continue;
+
+        const int tid = graph.find_tensor_id(name);
+        if (tid < 0) {
+            ++skipped_no_tid;
+            continue;
+        }
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != RegionKind::Persistent || meta.offset == SIZE_MAX) {
+            ++skipped_non_persistent;
+            continue;
+        }
+        const std::size_t tensor_bytes = entry.tensor.bytes();
+        if (tensor_bytes == 0 || meta.bytes < tensor_bytes || meta.offset + tensor_bytes > arenas.persistent_bytes) {
+            ++skipped_size_mismatch;
+            continue;
+        }
+
+        std::byte* arena_ptr = arenas.persistent_ptr + meta.offset;
+        CUDA_CHECK(cudaMemcpyAsync(arena_ptr, entry.tensor.Data, tensor_bytes, cudaMemcpyDeviceToDevice, stream));
+
+        float* preserved_stats = entry.tensor.Stats;
+        const int device = entry.tensor.Device;
+        mAllocator->free(entry.tensor);
+        entry.tensor.Data = arena_ptr;
+        entry.tensor.Device = device;
+        entry.tensor.Stats = preserved_stats;
+        ++rebound;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume persistent] rebound=" << rebound << " skipped_external=" << skipped_external
+                      << " skipped_managed=" << skipped_managed << " skipped_no_tid=" << skipped_no_tid
+                      << " skipped_non_persistent=" << skipped_non_persistent
+                      << " skipped_size_mismatch=" << skipped_size_mismatch
+                      << " arena_bytes=" << arenas.persistent_bytes << "\n";
+        }
+    }
 }
 
 void DslParamStore::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {

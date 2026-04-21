@@ -999,6 +999,16 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                          stack_bytes,
                                          bwd_cross_layer_bytes,
                                          moe_saved_bytes);
+                // Phase 4 M4a: clamp Persistent arena size to the bytes a
+                // locally-allocated param can actually consume. `compute_arena_sizes`
+                // estimates from every ForwardParam tid in the graph, but
+                // QLoRA-external and weight-manager-managed params are
+                // stored elsewhere — sizing for them would waste tens of
+                // GiB on quantized-weight configs. Zero if nothing local.
+                if (mPhaseArenas.persistent_bytes > 0) {
+                    const std::size_t needed = mWeights.rebindable_persistent_bytes(*mCompiledForward);
+                    mPhaseArenas.persistent_bytes = needed;
+                }
                 dsl::allocate_phase_arenas(mPhaseArenas);
                 // Shadow coverage report: of the tids the arena plan claims,
                 // how many actually fit (offset+bytes <= region capacity).
@@ -1052,6 +1062,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mPhaseArenas.fwd_stack_ptr != nullptr) {
                     consume_fwdstack_arena();
                 }
+                // Phase 4 M4a: route base parameter storage through the
+                // Persistent arena when requested. Gated on
+                // SUROGATE_USE_PHASE_PERSISTENT=1 inside the method. Only
+                // covers the simple DslParamStore path (single-GPU, no
+                // streaming, no offload, no QLoRA, no DslWeightManager).
+                mWeights.rebind_to_persistent_arena(*mCompiledForward, mPhaseArenas, mRunState.MainStream);
             }
         } else if (mCompiledExecutor) {
             mCompiledExecutor->set_phase_arenas(nullptr);
