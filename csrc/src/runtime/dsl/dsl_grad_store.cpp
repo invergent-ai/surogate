@@ -5,14 +5,19 @@
 
 #include "runtime/dsl/dsl_grad_store.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <cuda_bf16.h>
 
 #include "runtime/dsl/dsl_param_store.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "kernels/kernels.h"
 #include "utilities/comm.h"
 #include "utilities/utils.h"
@@ -918,6 +923,118 @@ const std::vector<std::string>& DslGradStore::layer_grad_names(int layer_idx) co
         return empty;
     }
     return mLayerGradNames[layer_idx];
+}
+
+namespace {
+
+bool is_device_resident_grad(const Tensor& t) {
+    return t.Data != nullptr && t.Device >= 0;
+}
+
+}  // namespace
+
+std::size_t DslGradStore::rebindable_accumulator_bytes(const CompiledGraph& graph) const {
+    // Whole-or-nothing gate: if any gradient path is non-local, the
+    // allocator keeps ownership of every grad. Offload / streaming /
+    // ZeRO-2 sharding all intersperse device and non-device storage, so
+    // clamping to just the local high-water mark isn't sound (the
+    // compiler's Accumulator offsets cover every grad tid).
+    if (mStreamGrads || mCpuTraining || mOffloadGrads) return 0;
+    if (!mShardedGrads.empty()) return 0;
+
+    std::size_t high_water = 0;
+    for (const auto& kv : mGrads) {
+        const Tensor& t = kv.second;
+        if (!is_device_resident_grad(t)) return 0;
+        const std::string grad_name = "d_" + kv.first;
+        const int tid = graph.find_tensor_id(grad_name);
+        if (tid < 0) continue;
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != RegionKind::Accumulator || meta.offset == SIZE_MAX) continue;
+        const std::size_t tensor_bytes = t.bytes();
+        if (tensor_bytes == 0 || meta.bytes < tensor_bytes) continue;
+        high_water = std::max(high_water, meta.offset + tensor_bytes);
+    }
+    return high_water;
+}
+
+void DslGradStore::rebind_to_accumulator_arena(const CompiledGraph& graph,
+                                               const PhaseArenas& arenas,
+                                               cudaStream_t stream) {
+    if (!arenas.allocated || arenas.accumulator_ptr == nullptr || arenas.accumulator_bytes == 0) return;
+    if (mStreamGrads || mCpuTraining || mOffloadGrads || !mShardedGrads.empty()) return;
+
+    std::size_t rebound = 0;
+    std::size_t skipped_no_tid = 0;
+    std::size_t skipped_non_accumulator = 0;
+    std::size_t skipped_size_mismatch = 0;
+
+    // Dedup aliased gradients (tied embedding → lm_head grad share
+    // a single Tensor in mGrads). Rebind the Data pointer once; later
+    // aliases repoint without re-freeing.
+    std::unordered_map<const std::byte*, std::byte*> rebind_map;
+
+    for (const auto& name : mParamOrder) {
+        auto it = mGrads.find(name);
+        if (it == mGrads.end()) continue;
+        Tensor& grad = it->second;
+        if (!is_device_resident_grad(grad)) continue;
+
+        auto cached = rebind_map.find(grad.Data);
+        if (cached != rebind_map.end()) {
+            // Aliased: repoint Data to the slot the original rebind chose.
+            grad.Data = cached->second;
+            continue;
+        }
+
+        const std::string grad_name = "d_" + name;
+        const int tid = graph.find_tensor_id(grad_name);
+        if (tid < 0) {
+            ++skipped_no_tid;
+            continue;
+        }
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != RegionKind::Accumulator || meta.offset == SIZE_MAX) {
+            ++skipped_non_accumulator;
+            continue;
+        }
+        const std::size_t tensor_bytes = grad.bytes();
+        if (tensor_bytes == 0 || meta.bytes < tensor_bytes || meta.offset + tensor_bytes > arenas.accumulator_bytes) {
+            ++skipped_size_mismatch;
+            continue;
+        }
+
+        std::byte* arena_ptr = arenas.accumulator_ptr + meta.offset;
+        CUDA_CHECK(cudaMemcpyAsync(arena_ptr, grad.Data, tensor_bytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = grad.Stats;
+        const int device = grad.Device;
+        std::byte* orig = grad.Data;
+        mAllocator->free(grad);
+        grad.Data = arena_ptr;
+        grad.Device = device;
+        grad.Stats = preserved_stats;
+        rebind_map.emplace(orig, arena_ptr);
+        ++rebound;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Grad pointers were rebound; the cached pointer/size packed arrays
+    // in mZeroPtrs / mZeroSizes (used by the bulk-zero kernel) still
+    // hold pre-rebind addresses, which are now freed. Rebuild from the
+    // current mGrads state.
+    if (rebound > 0) {
+        build_zero_segments();
+    }
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume accumulator] rebound=" << rebound << " skipped_no_tid=" << skipped_no_tid
+                      << " skipped_non_accumulator=" << skipped_non_accumulator
+                      << " skipped_size_mismatch=" << skipped_size_mismatch
+                      << " arena_bytes=" << arenas.accumulator_bytes << "\n";
+        }
+    }
 }
 
 }  // namespace dsl

@@ -1027,6 +1027,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
                         mPhaseArenas.persistent_bytes += lora_slab_bytes;
                     }
                 }
+                // Accumulator slab clamps to what DslGradStore can actually
+                // rebind; ZeRO-2 / offloaded / streaming / cpu-training
+                // configs return 0 and keep allocator-owned gradient storage.
+                if (mPhaseArenas.accumulator_bytes > 0) {
+                    mPhaseArenas.accumulator_bytes = mGrads.rebindable_accumulator_bytes(*mCompiledBackward);
+                }
                 dsl::allocate_phase_arenas(mPhaseArenas);
                 // Shadow coverage report: of the tids the arena plan claims,
                 // how many actually fit (offset+bytes <= region capacity).
@@ -1091,6 +1097,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mLoRAWeights && lora_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
                     std::byte* lora_base = mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes;
                     mLoRAWeights->rebind_to_persistent_arena(lora_base, lora_slab_bytes, mRunState.MainStream);
+                }
+                // Route device-resident gradients into the Accumulator arena.
+                // No-op when rebindable_accumulator_bytes clamped to 0
+                // (ZeRO-2 / offload / streaming / cpu-training configs).
+                if (mPhaseArenas.accumulator_bytes > 0 && mPhaseArenas.accumulator_ptr != nullptr) {
+                    mGrads.rebind_to_accumulator_arena(*mCompiledBackward, mPhaseArenas, mRunState.MainStream);
                 }
             }
         } else if (mCompiledExecutor) {

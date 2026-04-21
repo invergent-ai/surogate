@@ -21,6 +21,8 @@
 namespace dsl {
 
 class DslParamStore;
+struct CompiledGraph;
+struct PhaseArenas;
 
 }  // namespace dsl
 
@@ -159,6 +161,22 @@ public:
     Tensor& layer_norm_accum() {
         return mLayerNormAccum;
     }
+
+    /// Maximum (offset + bytes) across all locally-allocated device-resident
+    /// gradients whose tid lands in `graph`'s Accumulator region. Zero when
+    /// any gradient path is non-local (ZeRO-2 sharded, offloaded, streaming,
+    /// or CPU-training) — those keep allocator-owned storage. Used by
+    /// `GraphExecutor::compile_graphs` to clamp `mPhaseArenas.accumulator_bytes`.
+    [[nodiscard]] std::size_t rebindable_accumulator_bytes(const CompiledGraph& graph) const;
+
+    /// Route every locally-allocated device-resident gradient in `mGrads`
+    /// through the Accumulator arena: `cudaMemcpyAsync` bytes into
+    /// `arenas.accumulator_ptr + meta.offset`, `mAllocator->free` the
+    /// original, rebind `.Data` to the arena slot. Aliased entries
+    /// (tied embedding → lm_head grad) share a slot via pointer dedup.
+    /// Must run after `allocate_phase_arenas`; no-op when
+    /// `rebindable_accumulator_bytes()` returns 0.
+    void rebind_to_accumulator_arena(const CompiledGraph& graph, const PhaseArenas& arenas, cudaStream_t stream);
 
 private:
     void build_layer_grad_map();

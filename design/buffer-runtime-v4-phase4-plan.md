@@ -941,10 +941,24 @@ losses as before M4d.
 Flag stays default off.
 
 ### M4 remaining (multi-session)
-- **Accumulator arena for grads.** `DslGradStore` has a similar
-  allocate-per-grad pattern; ZeRO-2 sharding + per-layer reduce add
-  complexity. Gated separately now under
-  `SUROGATE_USE_PHASE_ACCUMULATOR=1` (shadow; no op consumes it yet).
+- ✅ **M4e — Accumulator arena for grads (shipped).**
+  `DslGradStore::rebind_to_accumulator_arena` rebinds every device-
+  resident entry in `mGrads` into `arenas.accumulator_ptr + meta.offset`
+  (tid found via `"d_" + name` in the compiled backward graph).
+  Auto-skipped (whole-or-nothing, `rebindable_accumulator_bytes → 0`)
+  whenever the config routes grads elsewhere: `mStreamGrads`,
+  `mCpuTraining`, `mOffloadGrads`, or any `mShardedGrads` entries
+  (ZeRO-2). Aliased tensors (tied embedding → lm_head grad) share
+  a single slab slot via pointer dedup. Post-rebind, `build_zero_segments()`
+  is re-run to refresh the cached `mZeroPtrs`/`mZeroSizes` pack used
+  by the bulk-zero kernel — missing this step was the one snag
+  (cudaErrorIllegalAddress in global_norm.cu:465 before the fix).
+  `SUROGATE_USE_PHASE_ACCUMULATOR` gate removed from
+  `compute_arena_sizes`; always-sized just like Persistent.
+  Validated: non-LoRA Qwen3 full-training rebinds 226 grads into
+  1.43 GiB arena (loss 2.1787 → 2.0470 across 2 steps). LoRA configs
+  (Q3 / Q3.5 / GPT-OSS) stay no-op because base is frozen and
+  `mGrads` is empty — losses bit-identical to pre-M4e.
 - **FwdStack / BwdStack shadows.** Blocked on M3 per-frame coloring
   work — a naive flip aliases each layer's same-slot tid into one arena
   offset and corrupts forward accumulation (see M3 first-strike memo).
