@@ -2350,11 +2350,100 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
             }
         }
     };
+    // Slot-aliasing validator. At runtime, all refs sharing a block-scope
+    // TensorSlot (e.g., blocks[L].swiglu and blocks[L].swiglu_flat both
+    // resolve to simplified_acts[L][BlockSwiGLU].Data) collapse to one
+    // address. The per-tid coloring above happily assigns DIFFERENT offsets
+    // to aliased tids, which silently creates cross-slot aliasing at
+    // runtime: if slot A's aliased tids overlap slot B's aliased tids in
+    // runtime bytes, and their union live ranges overlap, corruption.
+    //
+    // Check the stricter invariant that enables safe arena consumption:
+    // tids sharing a block-scope slot in the same layer must have the
+    // same compile-time offset. Any split is a compile-time bug that the
+    // runtime op-io-aliasing validator (compiled_ops_save.cpp) will
+    // otherwise catch only at the first offending op dispatch.
+    auto is_block_scope_slot = [](TensorSlot s) {
+        switch (s) {
+            case TensorSlot::Mapped:
+            case TensorSlot::Parameter:
+            case TensorSlot::Saved:
+            case TensorSlot::TokenIDs:
+            case TensorSlot::PositionIDs:
+            case TensorSlot::Targets:
+            case TensorSlot::Losses:
+            case TensorSlot::DLoss:
+            case TensorSlot::Encoded:
+            case TensorSlot::LNFinal:
+            case TensorSlot::LNFinalRSTD:
+            case TensorSlot::FinalResidual:
+            case TensorSlot::FreqCis: return false;
+            default: return true;
+        }
+    };
+    // Build tid → (slot, layer_idx) map from op refs. A tid produced as an
+    // output carries its slot via the output TensorRef; inputs carry it too
+    // but we prefer the producing ref's slot when both exist.
+    struct TidSlotInfo {
+        TensorSlot slot = TensorSlot::Mapped;
+        int layer_idx = -1;
+        bool set = false;
+    };
+    std::vector<TidSlotInfo> tid_slot(num_tids);
+    auto record_ref = [&](const TensorRef& ref, bool is_output) {
+        if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
+        auto& rec = tid_slot[static_cast<std::size_t>(ref.tensor_id)];
+        // Prefer block-scope slot from the producing output ref; fall back to
+        // input refs' slot only if nothing better has been recorded.
+        if (!rec.set || (is_output && is_block_scope_slot(ref.slot))) {
+            rec.slot = ref.slot;
+            rec.layer_idx = ref.layer_idx;
+            rec.set = true;
+        }
+    };
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.outputs)
+            record_ref(ref, true);
+        for (const auto& ref : op.inputs)
+            record_ref(ref, false);
+    }
+    std::size_t alias_offset_splits = 0;
+    auto check_slot_aliases = [&](const std::vector<std::vector<int>>& frames, const char* where) {
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            // Group this layer's FwdStack/BwdStack tids by their block-scope slot.
+            std::unordered_map<int, std::vector<int>> by_slot;  // key = int(TensorSlot)
+            for (int tid : frames[L]) {
+                const auto& rec = tid_slot[static_cast<std::size_t>(tid)];
+                if (!rec.set) continue;
+                if (!is_block_scope_slot(rec.slot)) continue;
+                if (rec.layer_idx != static_cast<int>(L)) continue;
+                by_slot[static_cast<int>(rec.slot)].push_back(tid);
+            }
+            for (auto& [slot_int, group] : by_slot) {
+                if (group.size() < 2) continue;
+                const auto& first_meta = graph.tensor_meta[static_cast<std::size_t>(group.front())];
+                for (std::size_t i = 1; i < group.size(); ++i) {
+                    const auto& mi = graph.tensor_meta[static_cast<std::size_t>(group[i])];
+                    if (mi.offset != first_meta.offset) {
+                        ++alias_offset_splits;
+                        std::cerr << "[coloring-alias-split] " << where << " L=" << L << " slot=" << slot_int
+                                  << " tid=" << group.front() << "(" << graph.name_for_tensor_id(group.front())
+                                  << ",off=" << first_meta.offset << ") vs tid=" << group[i] << "("
+                                  << graph.name_for_tensor_id(group[i]) << ",off=" << mi.offset
+                                  << ") — runtime slot-aliased but compile-time offsets differ\n";
+                    }
+                }
+            }
+        }
+    };
     if (const char* env = std::getenv("SUROGATE_CHECK_FRAME_COLORING")) {
         if (std::string(env) == "1") {
             check_frame(fwd_frame, is_backward ? "bwd.fwd_frame?" : "fwd_frame");
             check_frame(bwd_frame, is_backward ? "bwd_frame" : "fwd.bwd_frame?");
-            std::cerr << "[coloring-check] graph='" << graph.name << "' violations=" << coloring_violations << "\n";
+            check_slot_aliases(fwd_frame, is_backward ? "bwd.fwd_frame?" : "fwd_frame");
+            check_slot_aliases(bwd_frame, is_backward ? "bwd_frame" : "fwd.bwd_frame?");
+            std::cerr << "[coloring-check] graph='" << graph.name << "' pairwise_violations=" << coloring_violations
+                      << " alias_offset_splits=" << alias_offset_splits << "\n";
         }
     }
 
