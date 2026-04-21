@@ -61,9 +61,23 @@ namespace dsl {
 // These patterns repeat 4+ times in the dispatch loop (flat-ops path,
 // SegmentDispatch path, PhaseExit BwdBlock); hoist to file-scope so the
 // slot list stays in sync.
+//
+// Three states per slot:
+//   (a) Stack-owned transient — default; layer_end nulls so next layer's
+//       ensure_output_tensor temp_acquires fresh Stack storage.
+//   (b) replay-persist-arena transient — cudaMalloc'd per-op persist
+//       buffer from replay_layer_forward; next layer starts fresh via
+//       ensure_output_tensor. Same clear behavior as (a).
+//   (c) FwdStack-arena persistent — arena IS the permanent source of
+//       truth; layer_end preserves so arena-baked writes land correctly.
+//
+// `persist_across_layer_end[slot]` gates (c): when set, the null is
+// skipped. Wired by the arena-consumption path at compile time.
 static void clear_rstd_stack_slots(DslRunState& rs, int L, const char* phase) {
     static const bool debug = std::getenv("SUROGATE_DEBUG_RSTD_CLEAR") != nullptr;
+    auto& acts = rs.simplified_acts(L);
     auto clear = [&](TensorSlot s) {
+        if (acts.persist_across_layer_end[static_cast<std::size_t>(s)]) return;
         if (Tensor* t = block_activation_ptr(rs, L, s)) {
             if (debug && t->Data) {
                 fprintf(stderr,
@@ -88,14 +102,24 @@ static void clear_rstd_stack_slots(DslRunState& rs, int L, const char* phase) {
 }
 
 static void clear_ffn_temp_stack_slots(DslRunState& rs, int L) {
-    if (Tensor* t = block_activation_ptr(rs, L, TensorSlot::BlockMLPUp)) t->Data = nullptr;
-    if (Tensor* t = block_activation_ptr(rs, L, TensorSlot::BlockSwiGLU)) t->Data = nullptr;
+    auto& acts = rs.simplified_acts(L);
+    auto clear = [&](TensorSlot s) {
+        if (acts.persist_across_layer_end[static_cast<std::size_t>(s)]) return;
+        if (Tensor* t = block_activation_ptr(rs, L, s)) t->Data = nullptr;
+    };
+    clear(TensorSlot::BlockMLPUp);
+    clear(TensorSlot::BlockSwiGLU);
 }
 
 static void clear_large_bwd_grad_stack_slots(DslRunState& rs, int L) {
-    if (Tensor* t = block_gradient_ptr(rs, L, TensorSlot::BlockDQKV)) t->Data = nullptr;
-    if (Tensor* t = block_gradient_ptr(rs, L, TensorSlot::BlockDMLPUp)) t->Data = nullptr;
-    if (Tensor* t = block_gradient_ptr(rs, L, TensorSlot::BlockDSwiGLU)) t->Data = nullptr;
+    auto& grads = rs.simplified_grads(L);
+    auto clear = [&](TensorSlot s) {
+        if (grads.persist_across_layer_end[static_cast<std::size_t>(s)]) return;
+        if (Tensor* t = block_gradient_ptr(rs, L, s)) t->Data = nullptr;
+    };
+    clear(TensorSlot::BlockDQKV);
+    clear(TensorSlot::BlockDMLPUp);
+    clear(TensorSlot::BlockDSwiGLU);
 }
 
 void CompiledExecutor::replay_layer_forward(int layer_idx,
