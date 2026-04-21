@@ -2502,22 +2502,28 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
         return {naive_max, total_bytes};
     };
 
-    // FwdStack: per-layer section is load-bearing for correctness. Under
-    // recompute, replay regenerates layer K's activations into the arena,
-    // and the backward ops for layer K read them. Shared-arena with naive
-    // per-frame coloring leaves layer K's values clobbered by later-layer
-    // forward segment captures' replays (each layer's forward segment
-    // graph is captured with pointer = arena+offset, and different layers'
-    // segment captures all write to the same arena bytes). Per-layer
-    // sectioning gives each layer a distinct [L*peak, (L+1)*peak) slice,
-    // so layer K's captured forward segment writes land in layer K's
-    // slice and subsequent backward reads resolve to that slice.
+    // FwdStack: per-layer sectioning in the prototype. The plan's design
+    // (design/buffer-runtime-v4.md, Recomputed[i] row) calls for a single
+    // arena that the layer's BwdBlock re-enters each time — peak = max
+    // over layers, not sum — but an empirical test showed shared-arena
+    // under qwen3 recompute reads a different bf16 first-byte at the qkv
+    // matmul_backward (0x3ef6 vs baseline 0x3d32) despite RecomputeBlock
+    // firing before the read. Likely cause: qwen3's ln1-backward reads
+    // residual_out via `mRunState.get_residual(L)` (ResidualManager
+    // buffer), but the forward path writes residual_out to the
+    // BlockResidualAtt slot rather than ResidualManager; the two buffers
+    // are distinct cudaMallocs. Under per-frame+retain coloring, LN1's
+    // replay output in the arena is derived from ResidualManager's
+    // (possibly uninitialized?) buffer via the mInReplay=true
+    // zero-input path, and under shared arena the stale state is
+    // visible. Per-layer sectioning masks this because each layer's
+    // distinct arena slice preserves whatever replay writes for that
+    // specific layer without cross-layer contamination. Root-causing
+    // the ResidualManager wiring is the next step; until then we pay
+    // the num_layers × peak memory cost for correctness.
     //
-    // BwdStack: backward dispatch is fully eager (no captured segment
-    // graphs on the backward path — see compiled_ops_execute.cpp's note
-    // "backward always runs through the normal dispatch loop"), so
-    // pointers are resolved at op-execution time and never captured. Per-
-    // frame coloring (no sectioning) is both correct and memory-efficient.
+    // BwdStack: fully eager (no captured segment graphs), so per-frame
+    // coloring is both correct and memory-efficient.
     auto [fwd_naive, fwd_colored] = color_frames(fwd_frame, fwd_alias_groups, /*section_per_layer=*/true);
     auto [bwd_naive, bwd_colored] = color_frames(bwd_frame, bwd_alias_groups, /*section_per_layer=*/false);
 
