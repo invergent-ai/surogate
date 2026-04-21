@@ -5,8 +5,12 @@
 
 #include "runtime/qlora/generic_weight_manager.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include <fmt/format.h>
 #include <cuda_bf16.h>
@@ -194,6 +198,12 @@ GenericWeightManager::~GenericWeightManager() {
         cudaFree(mTransposeTemp.Data);
         mTransposeTemp = Tensor{};
     }
+
+    // Phase 4 M4d: release the self-managed Persistent arena (if any).
+    // Must run after the allocator-tracked buffers above, since owned
+    // tensors hold pointers into this arena and the allocator's own
+    // destruction would otherwise attempt to free them.
+    release_self_arena();
 }
 
 // =============================================================================
@@ -646,6 +656,172 @@ int GenericWeightManager::num_active_dequant_buffers() const {
         return num_quantized();  // All pre-allocated in unlimited mode
     }
     return mActivePoolBuffers;
+}
+
+// =============================================================================
+// Phase 4 M4d — Persistent arena rebind
+// =============================================================================
+
+namespace {
+
+bool is_device_resident(const Tensor& t) {
+    return t.Data != nullptr && t.Device >= 0;
+}
+
+}  // namespace
+
+std::size_t GenericWeightManager::total_persistent_bytes() const {
+    std::size_t total = 0;
+    std::unordered_set<const std::byte*> seen;
+    auto count = [&](const Tensor& t) {
+        if (!is_device_resident(t)) return;
+        if (!seen.insert(t.Data).second) return;
+        total += t.bytes();
+    };
+    for (const auto& kv : mWeights) {
+        const ManagedWeight& entry = kv.second;
+        // Offloaded weights have host-backed quantized storage; skip the
+        // whole entry so the CPU-resident primary data stays put.
+        if (quantized_has_host_storage(entry.quantized)) continue;
+        count(entry.quantized.data);
+        count(entry.quantized.scales);
+        count(entry.quantized.meta);
+        count(entry.quantized.meta2);
+        count(entry.dequant_buffer);
+        count(entry.full_precision);
+    }
+    return total;
+}
+
+std::size_t
+GenericWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream) {
+    if (arena_base == nullptr || max_bytes == 0) return 0;
+
+    std::size_t cursor = 0;
+    std::size_t rebound_quant = 0;
+    std::size_t rebound_dequant = 0;
+    std::size_t rebound_full = 0;
+    std::size_t skipped_host = 0;
+    std::unordered_map<const std::byte*, std::byte*> rebind_map;
+
+    auto rebind_one = [&](Tensor& t, std::size_t& counter) {
+        if (!is_device_resident(t)) return;
+        std::byte* orig = t.Data;
+        auto cached = rebind_map.find(orig);
+        if (cached != rebind_map.end()) {
+            t.Data = cached->second;
+            ++counter;
+            return;
+        }
+        const std::size_t bytes = t.bytes();
+        if (bytes == 0) return;
+        if (cursor + bytes > max_bytes) {
+            throw std::runtime_error("GenericWeightManager::rebind_to_persistent_arena: slab capacity " +
+                                     std::to_string(max_bytes) + " exhausted at cursor " + std::to_string(cursor) +
+                                     " needing " + std::to_string(bytes));
+        }
+        std::byte* slot = arena_base + cursor;
+        CUDA_CHECK(cudaMemcpyAsync(slot, orig, bytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = t.Stats;
+        const int device = t.Device;
+        mAllocator->free(t);
+        t.Data = slot;
+        t.Device = device;
+        t.Stats = preserved_stats;
+        cursor += bytes;
+        rebind_map.emplace(orig, slot);
+        ++counter;
+    };
+
+    // Deterministic order: alphabetic weight name so the slab layout is
+    // reproducible across runs for debugging.
+    std::vector<std::string> names;
+    names.reserve(mWeights.size());
+    for (const auto& kv : mWeights)
+        names.push_back(kv.first);
+    std::sort(names.begin(), names.end());
+
+    for (const auto& name : names) {
+        auto it = mWeights.find(name);
+        if (it == mWeights.end()) continue;
+        ManagedWeight& entry = it->second;
+        if (quantized_has_host_storage(entry.quantized)) {
+            ++skipped_host;
+            continue;
+        }
+        rebind_one(entry.quantized.data, rebound_quant);
+        rebind_one(entry.quantized.scales, rebound_quant);
+        rebind_one(entry.quantized.meta, rebound_quant);
+        rebind_one(entry.quantized.meta2, rebound_quant);
+        rebind_one(entry.dequant_buffer, rebound_dequant);
+        rebind_one(entry.full_precision, rebound_full);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume qlora_persistent] rebound_quant=" << rebound_quant
+                      << " rebound_dequant=" << rebound_dequant << " rebound_full=" << rebound_full
+                      << " skipped_host=" << skipped_host << " bytes_used=" << cursor << " slab_bytes=" << max_bytes
+                      << "\n";
+        }
+    }
+
+    return cursor;
+}
+
+void GenericWeightManager::consume_self_arena(cudaStream_t stream) {
+    const char* env = std::getenv("SUROGATE_USE_PHASE_PERSISTENT");
+    if (!env || std::string(env) != "1") return;
+    if (mSelfArena != nullptr) return;  // already consumed
+
+    const std::size_t bytes = total_persistent_bytes();
+    const bool dbg_arena = [] {
+        const char* d = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME");
+        return d && std::string(d) == "1";
+    }();
+    if (bytes == 0) {
+        if (dbg_arena) {
+            std::cerr
+                << "[arena-consume qlora_self_arena] nothing to consume (all storage host-backed or no weights)\n";
+        }
+        return;
+    }
+
+    std::size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    constexpr std::size_t kSafetyMargin = 1ULL << 30;  // 1 GiB headroom
+    if (bytes + kSafetyMargin > free_bytes) {
+        if (dbg_arena) {
+            std::cerr << "[arena-consume qlora_self_arena] skipped requested=" << bytes / (1024 * 1024)
+                      << "MiB free=" << free_bytes / (1024 * 1024) << "MiB total=" << total_bytes / (1024 * 1024)
+                      << "MiB (2× peak wouldn't fit)\n";
+        }
+        return;
+    }
+
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&mSelfArena), bytes);
+    if (err != cudaSuccess) {
+        if (dbg_arena) {
+            std::cerr << "[arena-consume qlora_self_arena] cudaMalloc(" << bytes
+                      << ") failed: " << cudaGetErrorString(err) << "\n";
+        }
+        mSelfArena = nullptr;
+        return;
+    }
+    mSelfArenaBytes = bytes;
+
+    const std::size_t consumed = rebind_to_persistent_arena(mSelfArena, bytes, stream);
+    (void)consumed;  // total_persistent_bytes already accounted for alignment
+}
+
+void GenericWeightManager::release_self_arena() {
+    if (mSelfArena) {
+        cudaFree(mSelfArena);
+        mSelfArena = nullptr;
+        mSelfArenaBytes = 0;
+    }
 }
 
 // =============================================================================

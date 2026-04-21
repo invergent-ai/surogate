@@ -892,13 +892,55 @@ norms within the baseline run-to-run envelope (baseline step 2 norm
 varies 1.83–2.06 across three back-to-back runs; flag-on clusters
 1.83–1.86). Flag stays default off.
 
+### M4d shipped (quantized weights into a self-managed arena)
+
+QLoRA base weights (FP8 / FP4 / BnB / MXFP4) live in
+`GenericWeightManager::mWeights[name].quantized` as device-resident
+`data` / `scales` / `meta` / `meta2` tensors, allocated via the shared
+`TensorAllocator` during `import_and_quantize`. M4a's `compile_graphs`
+hook couldn't reach them because `set_qlora_provider` runs **after**
+the first `allocate_run_state` (which is what triggers `compile_graphs`);
+by the time the executor sized the Persistent arena, the provider was
+still null.
+
+Rather than plumb a post-compile rebind hook back into the executor,
+M4d gives `GenericWeightManager` its own dedicated arena:
+
+- `total_persistent_bytes()` / `rebind_to_persistent_arena()` walk
+  every device-resident owned tensor (`quantized.{data,scales,meta,meta2}`,
+  `dequant_buffer`, `full_precision`), skipping host-backed entries
+  (`quantized_has_host_storage`) and deduping by pointer.
+- `consume_self_arena(stream)` — reads `SUROGATE_USE_PHASE_PERSISTENT=1`,
+  checks free GPU memory against `needed + 1 GiB safety margin`, and
+  (if it fits) `cudaMalloc`s a dedicated slab, then runs the rebind.
+  Skipped with a log when the 2× transient peak would OOM.
+- Stored in `mSelfArena` / `mSelfArenaBytes`; freed in the destructor
+  alongside the transpose-temp buffer.
+
+Wired from `DslModel::import_weights` immediately after
+`mQLoRAProvider->import_and_quantize` completes. Exposed on
+`QLoRAWeightProvider` as `virtual void consume_self_arena(stream)`;
+`GenericQLoRAProvider` forwards to the weight manager.
+
+Validation (flag-on):
+- Qwen3 QLoRA-BnB (0.6B, NF4): 448 quantized + 115 full-precision
+  tensors rebound → 810 MiB self-arena; 784 LoRA → 57.8 MiB Persistent
+  slab. 5-step losses 2.2451 → 1.5164 (baseline 2.2451 → 1.5169;
+  Δ ≤ 0.3%).
+- Qwen3 QLoRA-FP4 (0.6B, E2M1 2D-block): 336 quantized + 115 full-
+  precision → 830 MiB; 784 LoRA. Step-0 loss 2.1914 matches expected.
+- GPT-OSS MXFP4 (20B): `consume_self_arena` requests 13 GiB, free is
+  9 GiB (LoRA + other arenas already allocated) — auto-skipped.
+  Training proceeds on the allocator-backed storage; loss 1.7873,
+  norm 2.7290 bit-identical to baseline.
+
+Non-QLoRA regressions (Qwen3 / Qwen3.5 / fp32-master mixed-precision
+Qwen3 / offload_master Qwen3) unchanged — same rebind counts and
+losses as before M4d.
+
+Flag stays default off.
+
 ### M4 remaining (multi-session)
-- **M4d — quantized (FP8 / FP4 / BnB / MXFP4) weights into Persistent
-  arena.** `csrc/src/runtime/qlora/` pipelines hold quantized base
-  weights with per-block scales. Each quantizer's layout (packed
-  format, scale metadata) has to map into the arena; the current
-  per-name `cudaMalloc` path does not carry enough structural
-  information for a blind rebind.
 - **Accumulator arena for grads.** `DslGradStore` has a similar
   allocate-per-grad pattern; ZeRO-2 sharding + per-layer reduce add
   complexity. Gated separately now under
@@ -1038,7 +1080,14 @@ ship only the infra pieces that are independently correct.
     (0 base + 576 LoRA), fp32-master mixed-precision Qwen3 (0 base + 227
     WM-master + 227 WM-work + 784 LoRA, 5-step loss Δ ≤ 0.03%), and
     offload_master Qwen3 (3 WM-master + 3 WM-work + 448 prefetch + 784
-    LoRA, 5-step loss 2.0251 → 1.3369). M4d (quantized weights) remains.
+    LoRA, 5-step loss 2.0251 → 1.3369). **M4d** ships quantized base
+    weights via a self-managed arena on the QLoRA provider — walks
+    `GenericWeightManager::mWeights[...]` quantized storage + dequant
+    buffers + full-precision entries, dedicated `cudaMalloc` allocated
+    after `import_and_quantize` completes (same env gate, auto-skipped
+    when the 2× transient peak wouldn't fit). Validated on Qwen3 BnB /
+    FP4 QLoRA; GPT-OSS MXFP4 auto-skipped on a 32 GB GPU
+    (requested 13 GiB, free 9 GiB after LoRA slab).
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
     complications. **Not started.** Env-gate now split:
     `SUROGATE_USE_PHASE_ACCUMULATOR=1` (shadow; no op consumes it yet).
