@@ -1117,18 +1117,15 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
         // Delegate Block*/MoE*/BlockD*/global slot dispatch to the shared
         // helpers (same pattern as resolve_tensor at the call site below).
-        // Only Targets / Losses / DLoss / FreqCis need inline handling.
+        // Targets/Losses/DLoss are covered by the M5.α entry bindings and
+        // reach the mNamedTensors cache before this block; only FreqCis
+        // still needs a name-keyed lookup (names vary per-block: freq_cis,
+        // rope_freqs_0, rope_freqs_1, ...).
         Tensor* base = block_activation_ptr(rs, ref.layer_idx, ref.slot);
         if (!base) base = block_gradient_ptr(rs, ref.layer_idx, ref.slot);
         if (!base) base = global_activation_ptr(rs, ref.slot);
-        if (!base) {
-            switch (ref.slot) {
-                case TensorSlot::Targets: base = &rs.Targets; break;
-                case TensorSlot::Losses: base = &rs.Losses; break;
-                case TensorSlot::DLoss: base = &rs.scratch().cross_entropy_dloss; break;
-                case TensorSlot::FreqCis: base = &rs.rope_freqs(ref.name); break;
-                default: break;
-            }
+        if (!base && ref.slot == TensorSlot::FreqCis) {
+            base = &rs.rope_freqs(ref.name);
         }
         if (base && base->Data) {
             Tensor view = view_for_shape(*base, ref.shape, ref.name);
@@ -1158,9 +1155,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     if (Tensor* gp = global_activation_ptr(rs, ref.slot)) return *gp;
 
     switch (ref.slot) {
-        case TensorSlot::Targets: return rs.Targets;
-        case TensorSlot::Losses: return rs.Losses;
-        case TensorSlot::DLoss: return rs.scratch().cross_entropy_dloss;
+        // Targets / Losses / DLoss cases removed in M5.α — bound at
+        // execute_forward / execute_backward entry via bind_tensor and
+        // resolved by the mNamedTensors / mTensors[tid] fast paths above.
         case TensorSlot::FreqCis: return rs.rope_freqs(ref.name);
         case TensorSlot::Parameter: return mWeights.get(ref.name);
         case TensorSlot::Saved:

@@ -1071,7 +1071,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (L >= 0) handle_layer_end(L);
     };
 
-    // Bind known inputs (into both flat vector and write-through mirror)
+    // Bind known inputs (into both flat vector and write-through mirror).
+    // M5.α: bind every stable non-param global at entry so resolve_tensor
+    // finds them via mNamedTensors / mTensors[tid] without falling through
+    // to the slot switch. Each rs.X pointer is stable after allocation.
     bind_tensor("token_ids", mRunState.Inputs);
     bind_tensor("position_ids", mRunState.PositionIDs);
     if (mRunState.VisualPosMasks.Data) {
@@ -1088,7 +1091,26 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             bind_tensor("deepstack_visual_embeds_" + std::to_string(i), mRunState.DeepstackVisualEmbeds[i]);
         }
     }
+    // encoded/x0 alias the same backing tensor; bind under both names.
     bind_tensor("x0", mRunState.non_block_activations().encoded);
+    bind_tensor("encoded", mRunState.non_block_activations().encoded);
+    // LM-head-adjacent globals (present in the compiled graph when the
+    // head is on the forward graph — no-op for heads split onto backward).
+    if (mRunState.non_block_activations().ln_final.Data) {
+        bind_tensor("ln_final", mRunState.non_block_activations().ln_final);
+        bind_tensor("xF", mRunState.non_block_activations().ln_final);
+    }
+    if (mRunState.non_block_activations().ln_final_rstd.Data) {
+        bind_tensor("ln_final_rstd", mRunState.non_block_activations().ln_final_rstd);
+    }
+    // Loss I/O — losses/targets have their own fixed runtime slots.
+    if (mRunState.Targets.Data) {
+        bind_tensor("targets", mRunState.Targets);
+    }
+    if (mRunState.Losses.Data) {
+        bind_tensor("loss", mRunState.Losses);
+        bind_tensor("losses", mRunState.Losses);
+    }
 
     // Ensure non-block weights are gathered if streaming/offload is enabled
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
@@ -1770,6 +1792,32 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
     mMicroStep = micro_step;
+
+    // M5.α: bind every stable non-param global into mTensors + mNamedTensors
+    // at backward entry so resolve_tensor finds them via the tid/name cache
+    // without falling through to the slot switch. Runtime pointers are
+    // stable across steps — each cleared mTensors slot is re-bound here.
+    bind_tensor("token_ids", mRunState.Inputs);
+    bind_tensor("position_ids", mRunState.PositionIDs);
+    bind_tensor("x0", mRunState.non_block_activations().encoded);
+    bind_tensor("encoded", mRunState.non_block_activations().encoded);
+    if (mRunState.non_block_activations().ln_final.Data) {
+        bind_tensor("ln_final", mRunState.non_block_activations().ln_final);
+        bind_tensor("xF", mRunState.non_block_activations().ln_final);
+    }
+    if (mRunState.non_block_activations().ln_final_rstd.Data) {
+        bind_tensor("ln_final_rstd", mRunState.non_block_activations().ln_final_rstd);
+    }
+    if (mRunState.Targets.Data) {
+        bind_tensor("targets", mRunState.Targets);
+    }
+    if (mRunState.Losses.Data) {
+        bind_tensor("loss", mRunState.Losses);
+        bind_tensor("losses", mRunState.Losses);
+    }
+    if (mRunState.scratch().cross_entropy_dloss.Data) {
+        bind_tensor("d_loss", mRunState.scratch().cross_entropy_dloss);
+    }
 
     // Clear activation/non-block gradients for each micro-step.
     // When called from GraphExecutor::backward_with_hook(), the caller already zeroes these
