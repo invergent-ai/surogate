@@ -696,6 +696,37 @@ Weights in Persistent, gradients in Accumulator. Replaces `mWeights` / `mGrads` 
 
 Big but less cross-cutting than M3 — weights/grads are fewer ops.
 
+### M4 shipped so far
+
+- **UnifiedStack arena default-on** (`30cd8c3`, prereq `1430d22`):
+  Split the `SUROGATE_USE_PHASE_STACK_ARENAS` gate so UnifiedStack (the
+  Stack backing DslRunState actually consumes) is unconditional, while
+  FwdStack / BwdStack shadows stay behind the env flag. Adopted-arena
+  Stack is fully shrinkable after warmup (`shrink_stack_to_high_water_mark`
+  taught to use `Stack.capacity()` and branch resize on
+  `mOwnedExternalStack`). Memory-neutral on Qwen3-0.6B (328 MiB),
+  Qwen3.5-0.8B (187 MiB), GPT-OSS-20B (29.8 GiB peak, identical to
+  pre-flip). Losses bit-identical within noise.
+
+### M4 remaining (multi-session)
+
+- **Persistent arena for weights.** `DslWeightManager::allocate_weights`
+  calls `mAllocator->allocate` per weight. Routing those allocations to
+  `persistent_ptr + meta.offset` requires the Persistent layout to be
+  known before weight load — currently layout is computed inside
+  `compile_graphs`, which runs *after* the weight manager constructs.
+  Either reorder so layout runs first, or do a post-compile copy + rebind
+  (weights cudaMalloc'd, then memcpy'd into arena and original freed).
+  Complicated by streaming, offloading, LoRA adapter, and
+  FP8/FP4/BNB/MXFP4 quantization paths — each has its own allocation
+  strategy.
+- **Accumulator arena for grads.** `DslGradStore` has a similar
+  allocate-per-grad pattern; ZeRO-2 sharding + per-layer reduce add
+  complexity.
+- **FwdStack / BwdStack shadows.** Blocked on M3 per-frame coloring
+  work — a naive flip aliases each layer's same-slot tid into one arena
+  offset and corrupts forward accumulation (see M3 first-strike memo).
+
 ### M5 — Delete legacy machinery
 
 With all arenas backing everything ops read:
