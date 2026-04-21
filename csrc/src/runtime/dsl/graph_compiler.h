@@ -357,19 +357,18 @@ enum class TensorKind : uint8_t {
     Scratch,            ///< Everything else (zeros, constants, unknown intermediates)
 };
 
-/// Typed memory region (design/buffer-runtime-v4.md, M2). Each tensor is
-/// assigned to exactly one region by derive_regions(). Shadow-only in M2; the
-/// layout pass (M3) consumes region + block_layer_idx to bake buffer offsets.
+/// Typed memory region. Each tensor is assigned to exactly one region by
+/// derive_regions(); compute_layout() bakes an offset into TensorMeta per
+/// region. Regions that have a backing arena in PhaseArenas are resolved at
+/// runtime by resolve_tid_in_arena(); region=Unknown covers tids that live on
+/// DslRunState.Stack (block-scoped activations / gradients) or that cross the
+/// forward/backward boundary without a dedicated arena.
 enum class RegionKind : std::uint8_t {
-    Unknown = 0,     ///< Not yet classified (includes cross-graph forward activations in backward)
-    FwdStack,        ///< Block-scoped forward activation (bump arena; nested FwdBlock frames)
-    BwdStack,        ///< Block-scoped backward gradient / temporary (bump arena)
-    SaveForBwd,      ///< Forward activation persisted across block boundary for backward
-    Accumulator,     ///< Gradient accumulator (parameter grad + autodiff accum temps)
-    Persistent,      ///< Training-wide (parameters, token ids, losses, FP8 amax history)
-    Recomputed,      ///< Forward activation replayed during backward (reuses FwdStack arena)
-    GatheredWeight,  ///< ZeRO-3 all-gathered weight shards (unused in Llama prototype)
-    BwdCrossLayer,   ///< Backward-produced tensor consumed by a later backward block (MoE aux-loss; unused in Llama)
+    Unknown = 0,    ///< Stack-resident or unclassified (no arena resolution)
+    SaveForBwd,     ///< Forward activation persisted across block boundary for backward
+    Accumulator,    ///< Gradient accumulator (parameter grad + autodiff accum temps)
+    Persistent,     ///< Training-wide (parameters, token ids, losses, FP8 amax history)
+    BwdCrossLayer,  ///< Backward-produced tensor consumed by a later backward block (MoE aux-loss)
 };
 
 const char* region_kind_name(RegionKind k);
@@ -393,11 +392,11 @@ struct TensorMeta {
     // Region assignment (populated by derive_regions() after classify_tensors).
     RegionKind region = RegionKind::Unknown;
 
-    // Shadow-mode baked offset (populated by compute_layout()). Interpretation
+    // Baked arena offset (populated by compute_layout()). Interpretation
     // depends on region:
     //   - Persistent / Accumulator: byte offset in the respective arena
-    //   - FwdStack / BwdStack:      frame-local offset (runtime adds frame base)
     //   - SaveForBwd:               byte offset within SaveForBwd[block_layer_idx]
+    //   - Unknown:                  unused (tid lives on DslRunState.Stack or has no arena)
     // SIZE_MAX means "not assigned" (no bytes, or not in current graph).
     std::size_t offset = SIZE_MAX;
 
@@ -494,7 +493,7 @@ enum class InstKind : std::uint8_t {
     PhaseExit,        ///< Exit a phase (stack restore if FwdBlock/BwdBlock).
     SegmentDispatch,  ///< Execute ops [op_start, op_end); graph-captured or eager.
     PruneByLastUse,   ///< Release tensors whose last-use falls in [op_start, op_end).
-    RecomputeBlock,   ///< Replay forward block (block_index) into FwdStack before backward dispatch.
+    RecomputeBlock,   ///< Replay forward block (block_index) onto the Stack before backward dispatch.
 };
 
 const char* inst_kind_name(InstKind k);
@@ -587,7 +586,7 @@ struct CompiledGraph {
         return tid >= 0 ? meta_for_tensor_id(tid) : nullptr;
     }
 
-    /// Debuggability (P4.7): format "tid=5 name='blocks[3].ln1' region=FwdStack
+    /// Debuggability: format "tid=5 name='blocks[3].ln1' region=Unknown
     /// block=3 offset=0x1000 bytes=32768". Intended for error messages and
     /// exception rewrites. Returns "<tid=N unknown>" when tid is invalid.
     std::string describe_tensor_id(int tid) const;
@@ -753,12 +752,13 @@ private:
     void classify_tensors(CompiledGraph& graph);
 };
 
-/// Shadow-mode layout peaks + offset baking (design/buffer-runtime-v4.md, M3
-/// / M5.b). For each region, computes offsets and peak bytes:
-///   - Persistent, Accumulator, SaveForBwd: bump (sum of tensor bytes)
-///   - FwdStack, BwdStack: per-block-frame first-fit-by-offset coloring
-/// Writes TensorMeta::offset for every live tid. Dump gated on
-/// `SUROGATE_DEBUG_LAYOUT=1`.
+/// Layout peaks + offset baking. For each arena-backed region computes
+/// offsets via a bump allocator:
+///   - Persistent, Accumulator, SaveForBwd
+/// Writes TensorMeta::offset for every live tid in those regions. Tids at
+/// region=Unknown (Stack-resident block activations/gradients) carry no baked
+/// offset — DslRunState.Stack manages their placement at runtime. Dump gated
+/// on `SUROGATE_DEBUG_LAYOUT=1`.
 void compute_layout(CompiledGraph& graph, bool is_backward);
 
 /// Phase-tree arena allocator (design/buffer-runtime-v4.md, M5.d).
@@ -823,15 +823,11 @@ void allocate_phase_arenas(PhaseArenas& arenas);
 /// cudaFree all arenas and reset pointers.
 void release_phase_arenas(PhaseArenas& arenas);
 
-/// Resolve a tid to its arena-backed device pointer (what the pointer WOULD
-/// be if the arena was consumed for this region). Returns nullptr if:
+/// Resolve a tid to its arena-backed device pointer. Returns nullptr if:
 ///   - arenas is not allocated
 ///   - tid is out of range
-///   - TensorMeta::region is not an arena-backed region
+///   - TensorMeta::region is not an arena-backed region (Unknown → stack-resident)
 ///   - TensorMeta::offset is SIZE_MAX (unassigned)
-///   - region is FwdStack/BwdStack but the block_layer_idx is invalid
-/// Caller supplies the block contexts so block-scoped regions resolve to the
-/// correct frame base; pass -1 when outside a block.
 std::byte* resolve_tid_in_arena(const PhaseArenas& arenas, const CompiledGraph& graph, int tid);
 
 /// Shadow-mode validator reporting how well the arena plan covers the graph's
@@ -860,7 +856,7 @@ struct OpOperandCoverage {
     std::size_t covered_outputs = 0;  ///< op.outputs entries with an arena-served tid
     std::size_t total_inputs = 0;
     std::size_t total_outputs = 0;
-    std::array<std::size_t, 10> by_region{};  ///< per-RegionKind count of covered operands
+    std::array<std::size_t, 5> by_region{};  ///< per-RegionKind count of covered operands
 };
 OpOperandCoverage validate_op_operand_coverage(const PhaseArenas& arenas, const CompiledGraph& graph);
 
@@ -879,24 +875,22 @@ struct BakedOperand {
 };
 std::optional<BakedOperand> baked_view(const CompiledGraph& graph, const TensorRef& ref);
 
-/// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a).
-/// derive_regions() runs per-direction and cannot see across the pair, so
-/// block activations that are produced in forward and consumed in backward
-/// land in FwdStack / BwdStack. This pass walks both graphs, identifies
-/// shared tids, and promotes their region to SaveForBwd in both compiles,
-/// then re-runs compute_layout() on both so offsets reflect the final
-/// region assignment. Safe to call once per (forward, backward) compile
-/// pair; idempotent.
+/// Cross-graph SaveForBwd promotion. derive_regions() runs per-direction and
+/// cannot see across the pair, so block activations that are produced in
+/// forward and consumed in backward land at region=Unknown (Stack-resident).
+/// This pass walks both graphs, identifies shared tids, and promotes their
+/// region to SaveForBwd in both compiles, then re-runs compute_layout() on
+/// both so offsets reflect the final region assignment. Safe to call once
+/// per (forward, backward) compile pair; idempotent.
 ///
 /// When `save_names` is provided, promotion is restricted to tids whose
 /// name appears in the set — matching the runtime save list used by
-/// legacy save-snapshot path (GraphExecutor::mSaveList). Tids that cross
-/// the fwd→bwd boundary but are NOT in the save list (handled via Stack
-/// or recompute at runtime) stay in FwdStack / BwdStack. Passing an
-/// empty set promotes zero tids (valid in recompute/forward-replay modes
-/// where the runtime never consumes arena-backed saves). Passing
-/// `std::nullopt` disables filtering entirely, preserving prior behavior
-/// for callers that haven't plumbed the save list.
+/// GraphExecutor::mSaveList. Tids that cross the fwd→bwd boundary but are
+/// NOT in the save list (handled via Stack residency or recompute at
+/// runtime) stay at region=Unknown. Passing an empty set promotes zero
+/// tids (valid in recompute/forward-replay modes). Passing `std::nullopt`
+/// disables filtering entirely, preserving prior behavior for callers that
+/// haven't plumbed the save list.
 void finalize_save_for_bwd(CompiledGraph& fwd,
                            CompiledGraph& bwd,
                            std::optional<std::unordered_set<std::string>> save_names = std::nullopt);
