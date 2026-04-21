@@ -2314,6 +2314,50 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
     const std::size_t fwd_optimal = frame_optimal(fwd_frame);
     const std::size_t bwd_optimal = frame_optimal(bwd_frame);
 
+    // Liveness validator (Phase 3 step 4 prereq). Per-frame coloring packs
+    // multiple tids into the same arena bytes when their live ranges are
+    // disjoint — safe by construction, unsafe if liveness analysis missed a
+    // producer/consumer edge. Walks every frame; for each pair of tids
+    // whose [offset, offset+bytes) intervals overlap, asserts their
+    // [first_use, last_use] intervals are disjoint. Any violation is a
+    // compile-time bug that would corrupt memory at arena consumption time
+    // (the trap behind the M3 first-strike's NaN-from-step-0 failure).
+    std::size_t coloring_violations = 0;
+    auto check_frame = [&](const std::vector<std::vector<int>>& frames, const char* where) {
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            const auto& tids = frames[L];
+            for (std::size_t i = 0; i < tids.size(); ++i) {
+                const auto& mi = graph.tensor_meta[static_cast<std::size_t>(tids[i])];
+                const auto& ti = info[static_cast<std::size_t>(tids[i])];
+                for (std::size_t j = i + 1; j < tids.size(); ++j) {
+                    const auto& mj = graph.tensor_meta[static_cast<std::size_t>(tids[j])];
+                    const auto& tj = info[static_cast<std::size_t>(tids[j])];
+                    const std::size_t ai_end = mi.offset + mi.bytes;
+                    const std::size_t aj_end = mj.offset + mj.bytes;
+                    // Bytes ranges disjoint?
+                    if (ai_end <= mj.offset || aj_end <= mi.offset) continue;
+                    // Bytes overlap: live ranges must be disjoint.
+                    const bool lives_disjoint = ti.last_use < tj.first_use || tj.last_use < ti.first_use;
+                    if (lives_disjoint) continue;
+                    ++coloring_violations;
+                    std::cerr << "[coloring-violation] " << where << " L=" << L << " tid=" << tids[i]
+                              << " name=" << graph.name_for_tensor_id(tids[i]) << " [off=" << mi.offset
+                              << ",bytes=" << mi.bytes << ",live=" << ti.first_use << ".." << ti.last_use << "]"
+                              << " vs tid=" << tids[j] << " name=" << graph.name_for_tensor_id(tids[j])
+                              << " [off=" << mj.offset << ",bytes=" << mj.bytes << ",live=" << tj.first_use << ".."
+                              << tj.last_use << "] — bytes overlap AND live ranges overlap\n";
+                }
+            }
+        }
+    };
+    if (const char* env = std::getenv("SUROGATE_CHECK_FRAME_COLORING")) {
+        if (std::string(env) == "1") {
+            check_frame(fwd_frame, is_backward ? "bwd.fwd_frame?" : "fwd_frame");
+            check_frame(bwd_frame, is_backward ? "bwd_frame" : "fwd.bwd_frame?");
+            std::cerr << "[coloring-check] graph='" << graph.name << "' violations=" << coloring_violations << "\n";
+        }
+    }
+
     // Layout hash — determinism check point for distributed runs (Phase 2
     // step 5). Every rank running the same compile must produce the same
     // 64-bit value; callers can cross-rank-compare via NCCL/MPI allreduce.
