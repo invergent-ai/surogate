@@ -1104,9 +1104,15 @@ With all arenas backing everything ops read:
 
 - `TensorSlot::Block*/MoE*/SSM*` → remove enumerators + switch cases
 - `SimplifiedLayerActivations` → delete
-- `shared_tag()` → delete
-- `share_ln1/...` booleans → delete
-- `MatmulOp` alias → delete
+- ✅ `shared_tag()` — deleted in `d3ec195` (M5 progress table).
+- ✅ `share_ln1/...` booleans — deleted across `f771b03` / `1ef850f` /
+  `e887196` / `a59df06` (M5 progress table); buffer_plan.h retains
+  only historical comments.
+- ✅ `MatmulOp` alias → obsolete. No alias exists — the memo's earlier
+  "scratched from kill-list" note (line 495) confirms `modules::MatmulOp`
+  is the one definition, actively switched on across graph_compiler /
+  dsl_run_state / graph_executor_utils. Forward-decls in three
+  headers reference the same enum. Closing this entry.
 - `builtin_slot_from_name` + string-match dispatch → delete
 - `layer_start`/`layer_end` flags on ops → delete
 - ✅ Ad-hoc bwd cross-layer cudaMalloc fallback pruned.
@@ -1119,6 +1125,16 @@ With all arenas backing everything ops read:
   current size so the caller can bump. Validated bit-identical on
   Qwen3 / Qwen3.5 / GPT-OSS (the only one that exercises bwd cross-
   layer persist, via MoE aux-loss).
+
+  **Sibling `allocate_moe_saved` cleanup attempted, reverted.**
+  Looks structurally identical to `allocate_bwd_cross_layer` but
+  isn't: (1) arena is sized 0 for non-MoE configs, yet
+  `save_moe_layer_tensors` / `prepare_saved_buffers_for_capture` /
+  `persist_saved_source_now` are called from dense paths too; (2)
+  the cross-step monotonic bump (256 MiB) exhausts on GPT-OSS
+  within one step (253 MiB in use, 11 MiB more requested = throw).
+  The legacy cudaFree+cudaMalloc cycle on grow was load-bearing.
+  `mMoeSavedArenaBacked` + cudaMalloc fallback stay.
 
 ### M6 — Verify + commit the kill
 
