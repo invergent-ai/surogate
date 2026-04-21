@@ -1079,6 +1079,7 @@ void GraphExecutor::dump_simplified_activation_offsets() {
     };
 
     const int num_layers = static_cast<int>(mConfig.NumLayers);
+    std::cerr << "[act-offsets] fwd_stack_arena_bytes=" << mPhaseArenas.fwd_stack_bytes << "\n";
     for (int L = 0; L < num_layers; ++L) {
         const std::string prefix = "blocks[" + std::to_string(L) + "].";
         for (const char* slot : kSlotNames) {

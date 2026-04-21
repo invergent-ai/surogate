@@ -616,9 +616,11 @@ struct CompiledGraph {
     std::optional<PhaseNode> phase_tree;
 
     /// Per-region peak bytes populated by compute_layout() (M3 / M5.b).
-    /// Consumed by compute_arena_sizes() to size the phase arenas.
+    /// Consumed by compute_arena_sizes() to size the 5 phase arenas.
     std::size_t persistent_bytes = 0;
     std::size_t accumulator_bytes = 0;
+    std::size_t fwd_stack_peak = 0;  // max over frames
+    std::size_t bwd_stack_peak = 0;  // max over frames
     std::size_t save_for_bwd_bytes = 0;
     std::vector<std::size_t> save_for_bwd_block_bytes;  // per-block sizes
 
@@ -774,16 +776,24 @@ struct PhaseArenas {
     std::byte* accumulator_ptr = nullptr;
     std::size_t accumulator_bytes = 0;
 
+    // FwdStack / BwdStack: peak across all block frames (frames don't coexist).
+    std::byte* fwd_stack_ptr = nullptr;
+    std::size_t fwd_stack_bytes = 0;
+
+    std::byte* bwd_stack_ptr = nullptr;
+    std::size_t bwd_stack_bytes = 0;
+
     // SaveForBwd: concatenated per-block slots. Block i's save slot starts at
     // save_for_bwd_ptr + save_for_bwd_block_bases[i].
     std::byte* save_for_bwd_ptr = nullptr;
     std::size_t save_for_bwd_bytes = 0;
     std::vector<std::size_t> save_for_bwd_block_bases;
 
-    // Unified stack arena. Sized to match DeviceMemoryStack capacity so
-    // DslRunState.Stack gets rebased onto this buffer via
-    // rebase_stack_to_external + adopt_external_stack. Covers all Stack-resident
-    // block activations + non-block ops (LM-head d_logits, prologue temps).
+    // Unified stack arena (Phase 3 subsystem #3 flip). Sized to match today's
+    // DeviceMemoryStack capacity so DslRunState.Stack can be rebased onto this
+    // buffer via set_stack_buffer(). Separate from fwd_stack_bytes /
+    // bwd_stack_bytes because those are block-local coloring peaks and don't
+    // cover non-block ops (LM-head d_logits, embeddings, prologue temps).
     std::byte* unified_stack_ptr = nullptr;
     std::size_t unified_stack_bytes = 0;
 
