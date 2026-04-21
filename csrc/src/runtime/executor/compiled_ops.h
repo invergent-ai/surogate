@@ -487,16 +487,12 @@ private:
     std::size_t mMoeSavedBumpOffset = 0;
     std::unordered_map<std::string, bool> mMoeSavedArenaBacked;
 
-    /// Allocate `nbytes` for a backward cross-layer persistence. Uses
-    /// mPhaseArenas.bwd_cross_layer_ptr when bound and sufficient space remains,
-    /// else falls back to cudaMalloc. Returns the buffer pointer via `out` and
-    /// sets `arena_backed` true if the arena was used; caller must add
-    /// cudaMalloc-backed buffers to mPersistedBackwardTensors for later free.
-    struct BwdXLayerAlloc {
-        std::byte* ptr = nullptr;
-        bool arena_backed = false;
-    };
-    BwdXLayerAlloc allocate_bwd_cross_layer(std::size_t nbytes);
+    /// Allocate `nbytes` in `mPhaseArenas.bwd_cross_layer_ptr`. The arena
+    /// is sized at 64 MiB (see graph_executor.cpp) and reset per step;
+    /// throws when exhausted or when the arena isn't bound, so any
+    /// overflow surfaces immediately instead of silently degrading to
+    /// per-step cudaMalloc.
+    std::byte* allocate_bwd_cross_layer(std::size_t nbytes);
 
     /// Allocate `nbytes` for an MoE save buffer. Cross-step monotonic bump in
     /// mPhaseArenas.moe_saved_ptr; cudaMalloc fallback when arena exhausted or
@@ -639,10 +635,6 @@ private:
 
     // Gradient accumulation tracking (set of gradient tensor names that need accumulation)
     std::unordered_set<std::string> mAccumulateTensors;
-
-    // Cross-layer backward tensors persisted from stack to cudaMalloc.
-    // Freed at end of backward pass.
-    std::vector<std::byte*> mPersistedBackwardTensors;
 
     // Persistent storage for MoE expert_offsets (needs to survive from forward to backward)
     std::vector<int> mMoEExpertOffsetsData;

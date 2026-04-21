@@ -1109,7 +1109,16 @@ With all arenas backing everything ops read:
 - `MatmulOp` alias → delete
 - `builtin_slot_from_name` + string-match dispatch → delete
 - `layer_start`/`layer_end` flags on ops → delete
-- Ad-hoc bwd cross-layer cudaMalloc → already dead, just prune
+- ✅ Ad-hoc bwd cross-layer cudaMalloc fallback pruned.
+  `CompiledExecutor::allocate_bwd_cross_layer` now throws on
+  exhaustion/unbound instead of falling back to per-step cudaMalloc;
+  `BwdXLayerAlloc::arena_backed` field + `mPersistedBackwardTensors`
+  vector + three cleanup loops removed. The 64 MiB arena (sized in
+  graph_executor.cpp) comfortably fits our test configs — if a
+  larger MoE config exhausts it, the throw message names the
+  current size so the caller can bump. Validated bit-identical on
+  Qwen3 / Qwen3.5 / GPT-OSS (the only one that exercises bwd cross-
+  layer persist, via MoE aux-loss).
 
 ### M6 — Verify + commit the kill
 

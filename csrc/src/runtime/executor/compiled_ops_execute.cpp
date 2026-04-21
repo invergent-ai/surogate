@@ -1770,15 +1770,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
     mMicroStep = micro_step;
-    if (!mPersistedBackwardTensors.empty()) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        for (auto* ptr : mPersistedBackwardTensors) {
-            if (ptr) {
-                cudaFree(ptr);
-            }
-        }
-        mPersistedBackwardTensors.clear();
-    }
 
     // Clear activation/non-block gradients for each micro-step.
     // When called from GraphExecutor::backward_with_hook(), the caller already zeroes these
@@ -2245,20 +2236,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 ++it;
             }
         }
-        // Phase 3 #4: arena-backed pointers live in the bwd_cross_layer arena,
-        // not in mPersistedBackwardTensors. Only cudaFree pointers we actually
-        // cudaMalloc'd. Nulling the slot in mPersistedBackwardTensors is also
-        // the signal that it was cudaMalloc-backed.
-        bool was_cudamalloc_backed = false;
-        for (auto& active_ptr : mPersistedBackwardTensors) {
-            if (active_ptr == ptr) {
-                active_ptr = nullptr;
-                was_cudamalloc_backed = true;
-            }
-        }
-        if (was_cudamalloc_backed) {
-            CUDA_CHECK(cudaFreeAsync(ptr, mRunState.MainStream));
-        }
+        // Arena-backed pointers in the bwd_cross_layer arena are reclaimed
+        // by the per-step bump reset; nothing to free here.
         persisted_backward_refcount.erase(ptr);
     };
     auto release_persisted_backward_tid = [&](int tid) {
@@ -2515,12 +2494,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 persistent_by_ptr.reserve(max_bytes_by_ptr.size());
                 for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
                     if (nbytes == 0) continue;
-                    auto a = allocate_bwd_cross_layer(nbytes);
+                    std::byte* arena_ptr = allocate_bwd_cross_layer(nbytes);
                     auto* original = reinterpret_cast<const std::byte*>(ptr_key);
                     CUDA_CHECK(
-                        cudaMemcpyAsync(a.ptr, original, nbytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
-                    persistent_by_ptr.emplace(ptr_key, a.ptr);
-                    if (!a.arena_backed) mPersistedBackwardTensors.push_back(a.ptr);
+                        cudaMemcpyAsync(arena_ptr, original, nbytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                    persistent_by_ptr.emplace(ptr_key, arena_ptr);
                 }
                 for (const auto& p : pending) {
                     auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(p.ptr));
@@ -3024,18 +3002,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         clear_rstd_stack_slots(mRunState, L, "bwd_final");
         if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
         if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
-    }
-
-    // Free persisted cross-layer backward tensors
-    // Sync main stream first to ensure all consumers have completed
-    if (!mPersistedBackwardTensors.empty()) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        for (auto* ptr : mPersistedBackwardTensors) {
-            if (ptr) {
-                cudaFree(ptr);
-            }
-        }
-        mPersistedBackwardTensors.clear();
     }
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {

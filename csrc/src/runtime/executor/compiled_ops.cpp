@@ -509,23 +509,20 @@ std::byte* CompiledExecutor::allocate_replay_persist(std::size_t bytes) {
     return p;
 }
 
-CompiledExecutor::BwdXLayerAlloc CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
-    BwdXLayerAlloc result;
-    if (nbytes == 0) return result;
-    if (mPhaseArenas && mPhaseArenas->allocated && mPhaseArenas->bwd_cross_layer_ptr &&
-        mBwdCrossLayerBumpOffset + nbytes <= mPhaseArenas->bwd_cross_layer_bytes) {
-        result.ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
-        result.arena_backed = true;
-        mBwdCrossLayerBumpOffset += nbytes;
-        return result;
+std::byte* CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
+    if (nbytes == 0) return nullptr;
+    if (!mPhaseArenas || !mPhaseArenas->allocated || !mPhaseArenas->bwd_cross_layer_ptr) {
+        throw std::runtime_error("allocate_bwd_cross_layer: bwd_cross_layer arena not allocated");
     }
-    // Fallback: per-step cudaMalloc (today's behavior). Caller pushes to
-    // mPersistedBackwardTensors for free on cleanup.
-    void* raw = nullptr;
-    CUDA_CHECK(cudaMalloc(&raw, nbytes));
-    result.ptr = static_cast<std::byte*>(raw);
-    result.arena_backed = false;
-    return result;
+    if (mBwdCrossLayerBumpOffset + nbytes > mPhaseArenas->bwd_cross_layer_bytes) {
+        throw std::runtime_error("allocate_bwd_cross_layer: arena (" +
+                                 std::to_string(mPhaseArenas->bwd_cross_layer_bytes / (1024 * 1024)) +
+                                 " MiB) exhausted requesting " + std::to_string(nbytes / (1024 * 1024)) +
+                                 " MiB at offset " + std::to_string(mBwdCrossLayerBumpOffset));
+    }
+    std::byte* ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
+    mBwdCrossLayerBumpOffset += nbytes;
+    return ptr;
 }
 
 void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache) {
