@@ -783,6 +783,24 @@ Concrete remaining commits toward Phase 3 completion:
    preserve arena-backed slots instead of nulling, verify with (3)
    + (4) checks enabled. Multi-session — does the Qwen3.5 replay path
    interact cleanly, do stream-captured kernel args survive, etc.
+
+   **Attempted this session, reverted.** Changed `clear_rstd_stack_slots`
+   to only null when `rs.Stack.owns(slot.Data)`, expecting arena-backed
+   pointers to pass through. Broke the normal flow: `clear_*` does more
+   than Stack-invalidation — it's also the handshake that tells the
+   NEXT layer's `ensure_output_tensor` to `temp_acquire` fresh storage.
+   Skipping the null leaves last-layer's arena pointer (from the
+   replay-persist path) live; the next layer reuses it instead of
+   allocating fresh, and either reads stale data or races with the
+   replay-persist memcpy. Qwen3 bwd norm drifted (2.80 vs 3.44), Qwen3.5
+   + GPT-OSS surfaced runtime op-io aliasing.
+
+   Real fix requires distinguishing three states: (a) Stack-owned slot
+   that layer_end invalidates, (b) replay-persist-arena-owned slot that
+   layer_end should null (next layer starts fresh), (c) FwdStack-arena-owned
+   slot that layer_end should preserve (arena is the persistent source
+   of truth). A flag field on the simplified_acts slot — `persist_across_layer_end`
+   — is the cleanest fit; gates the null. Leaving for a dedicated session.
 10. Persistent arena for weights — either reorder init so compile runs
     before weight load, or post-compile rebind.
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
