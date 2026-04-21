@@ -371,6 +371,17 @@ private:
     // Tensor resolution (pre-resolved, O(1) lookup)
     Tensor& resolve_tensor(const TensorRef& ref);
     Tensor& ensure_output_tensor(const TensorRef& ref);
+
+    /// Runtime check: for the op about to dispatch (or just dispatched),
+    /// resolve every input and output to its current (Data, bytes) pair and
+    /// assert no input/output byte range overlaps. cuBLAS GEMM and similar
+    /// kernels have undefined behavior when input and output aliasing —
+    /// this check catches such bugs early (e.g., compile-time arena
+    /// coloring that didn't account for runtime slot-alias view resolution).
+    /// No-op unless SUROGATE_CHECK_OP_IO_ALIASING=1. Runs before op.fn;
+    /// logs the offending (input, output) pair and, if the env is set to
+    /// "abort", throws to halt execution.
+    void check_op_io_aliasing(const CompiledOp& op, std::size_t op_idx, const char* phase);
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 

@@ -341,6 +341,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // forward direction" — silently skip, preserving the old
             // replay_layer_forward `default: break` semantics.
             if (op.fn) {
+                check_op_io_aliasing(op, idx, "replay");
                 op.fn(*this, op, static_cast<const void*>(hook));
             }
         } catch (const std::exception& e) {
@@ -1360,6 +1361,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             if (!full && !graph.required_mask.empty() && !graph.required_mask[i]) continue;
                             const auto& op = graph.ops[i];
                             if (!op.fn) continue;
+                            check_op_io_aliasing(op, i, "fwd");
                             op.fn(*this, op, static_cast<const void*>(hook));
                         }
                     }
@@ -1562,6 +1564,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 throw std::runtime_error(std::string("CompiledExecutor: no dispatch fn for forward op type ") +
                                          op_type_to_string(op.type));
             }
+            check_op_io_aliasing(op, idx, "fwd");
             op.fn(*this, op, static_cast<const void*>(hook));
             check_nonfinite_refs(op, op.outputs);
             if (watch_tensor_enabled) {
@@ -2585,6 +2588,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             }
                         }
 
+                        check_op_io_aliasing(op, i, "bwd");
                         op.fn(*this, op, static_cast<const void*>(hook));
                         // LM-head post-dispatch cleanup: free the d_logits payload
                         // after the first matmul_backward (see line ~2372 comment).
@@ -2789,6 +2793,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
                 throw std::runtime_error(oss.str());
             }
+            check_op_io_aliasing(op, idx, "bwd");
             op.fn(*this, op, static_cast<const void*>(hook));
             if (bwd_filter_matched && bwd_filter_dump && mDebugDumpFn) {
                 std::vector<std::string> dump_names;

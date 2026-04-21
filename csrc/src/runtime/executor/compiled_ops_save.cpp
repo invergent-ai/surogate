@@ -1181,6 +1181,107 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     throw std::runtime_error(oss.str());
 }
 
+void CompiledExecutor::check_op_io_aliasing(const CompiledOp& op, std::size_t op_idx, const char* phase) {
+    static const int mode = []() {
+        const char* e = std::getenv("SUROGATE_CHECK_OP_IO_ALIASING");
+        if (!e) return 0;
+        const std::string v(e);
+        if (v == "1" || v == "on") return 1;
+        if (v == "abort") return 2;
+        return 0;
+    }();
+    if (mode == 0) return;
+
+    // Metadata-only reshape ops are *supposed* to share input/output buffers
+    // (the "output" is just a differently-shaped view of the input). No
+    // kernel writes actually happen.
+    switch (op.type) {
+        case CompiledOpType::View:
+        case CompiledOpType::ViewBackward:
+        case CompiledOpType::Narrow:
+        case CompiledOpType::NarrowBackward:
+        case CompiledOpType::Transpose:
+        case CompiledOpType::Split:
+        case CompiledOpType::Concat: return;
+        default: break;
+    }
+
+    struct RefPtr {
+        std::byte* data = nullptr;
+        std::size_t bytes = 0;
+        const TensorRef* ref = nullptr;
+    };
+    auto resolve_range = [&](const TensorRef& ref) -> RefPtr {
+        RefPtr out;
+        out.ref = &ref;
+        // Skip refs the compiler deliberately left abstract — checking them
+        // requires allocating, which would perturb normal execution.
+        if (ref.tensor_id < 0) return out;
+        try {
+            Tensor t = resolve_tensor(ref);
+            if (!t.Data) return out;
+            // Derive the view's real byte footprint. ref.shape (when set)
+            // captures per-use shape overrides; fall back to the resolved
+            // tensor's own shape otherwise.
+            std::size_t nelem = 0;
+            if (!ref.shape.empty()) {
+                nelem = 1;
+                for (long d : ref.shape)
+                    nelem *= static_cast<std::size_t>(d);
+            } else {
+                nelem = static_cast<std::size_t>(t.nelem());
+            }
+            if (nelem == 0) return out;
+            out.data = t.Data;
+            out.bytes = nelem * static_cast<std::size_t>(get_dtype_size(t.DType));
+        } catch (...) {
+            // resolve_tensor throws on unresolvable refs — not a bug for the
+            // check, just a ref that doesn't have runtime storage yet.
+        }
+        return out;
+    };
+
+    std::vector<RefPtr> inputs;
+    inputs.reserve(op.inputs.size());
+    for (const auto& inp : op.inputs) {
+        RefPtr rp = resolve_range(inp);
+        if (rp.data && rp.bytes > 0) inputs.push_back(rp);
+    }
+    std::vector<RefPtr> outputs;
+    outputs.reserve(op.outputs.size());
+    for (const auto& out : op.outputs) {
+        RefPtr rp = resolve_range(out);
+        if (rp.data && rp.bytes > 0) outputs.push_back(rp);
+    }
+
+    bool any_alias = false;
+    for (const auto& i : inputs) {
+        for (const auto& o : outputs) {
+            std::byte* i_end = i.data + i.bytes;
+            std::byte* o_end = o.data + o.bytes;
+            if (i_end <= o.data || o_end <= i.data) continue;
+            any_alias = true;
+            std::fprintf(stderr,
+                         "[op-io-alias] %s op_idx=%zu type=%s input='%s'#%d ptr=%p bytes=%zu "
+                         "vs output='%s'#%d ptr=%p bytes=%zu\n",
+                         phase,
+                         op_idx,
+                         op_type_to_string(op.type),
+                         i.ref->name.c_str(),
+                         i.ref->tensor_id,
+                         static_cast<void*>(i.data),
+                         i.bytes,
+                         o.ref->name.c_str(),
+                         o.ref->tensor_id,
+                         static_cast<void*>(o.data),
+                         o.bytes);
+        }
+    }
+    if (any_alias && mode == 2) {
+        throw std::runtime_error("SUROGATE_CHECK_OP_IO_ALIASING=abort: input/output aliased — see [op-io-alias] log");
+    }
+}
+
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     const int tid = ref.tensor_id;
     // `normalized_name` exists for historical compatibility with the old
