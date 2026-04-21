@@ -757,29 +757,40 @@ Current state vs design phases:
 
 Concrete remaining commits toward Phase 3 completion:
 
-1. Layout determinism hash (Phase 2 step 5) — single-rank invariant now,
-   `MPI_Allreduce` check in distributed runs.
-2. `MatmulRole` typed enum (Phase 1 step 4) — either rename+expand
+1. ✅ Layout determinism hash — `eea6650` (single-rank invariant;
+   MPI_Allreduce wiring deferred to distributed testing).
+2. ✅ Frame-coloring liveness validator — `cf944d5`
+   (`SUROGATE_CHECK_FRAME_COLORING=1` → pairwise overlap check).
+3. ✅ Runtime op-io-aliasing validator — `b0eed6c`
+   (`SUROGATE_CHECK_OP_IO_ALIASING=1` → per-op input/output overlap
+   check at dispatch; `=abort` for hard fail).
+4. ✅ Slot-alias offset-split validator — `b5d1a9e` (compile-time check
+   that aliased tids share offsets; 280 / 114 / 168 splits on Qwen3 /
+   Qwen3.5 / GPT-OSS under the pre-fix coloring).
+5. ✅ Coloring collapse for slot-aliased tids — `770492a` (groups
+   `{blocks[L].swiglu, blocks[L].swiglu_flat}` etc. into one coloring
+   unit; all three architectures now report 0 splits / 0 violations).
+6. `MatmulRole` typed enum (Phase 1 step 4) — either rename+expand
    `modules::MatmulOp` or introduce a parallel enum and migrate callers
    one hot path at a time.
-3. `PruneByLastUse` real dispatch — move per-op `prune_by_last_use` out
+7. `PruneByLastUse` real dispatch — move per-op `prune_by_last_use` out
    of the legacy backward loop into the instruction stream.
-4. `RecomputeBlock` real dispatch — consume the instruction in backward
+8. `RecomputeBlock` real dispatch — consume the instruction in backward
    instead of the current `mRecomputeFn` on op.layer_start.
-5. **Frame-discipline arena consumption** (Phase 3 step 4, the hard one):
-   per-block `Stack.save` / `Stack.restore` bracketing around activation
-   writes, then route ops to `resolve_tid_in_arena(...FwdStack, tid)`
-   for block-scoped reads. First-strike attempts aliased cross-layer
-   writes — this session's revert preserves the coloring infrastructure
-   needed to try again with discipline.
-6. Persistent arena for weights — either reorder init so compile runs
-   before weight load, or post-compile rebind.
-7. Accumulator arena for grads — same shape as (6), with ZeRO-2
-   complications.
-8. Benchmark gate against `buffer-runtime-v4-benchmark.md` after (5)
-   lands. Decision matrix in design doc.
-9. Phase 4 (cleanup) — only after (5) is in and the benchmark gate
-   passes can the M5 kill-list actually delete the legacy backings.
+9. **Actual FwdStack/BwdStack arena consumption** — now unblocked by
+   (5). Override `simplified_acts[L][SLOT].Data` to `arena_ptr + meta.offset`
+   at arena-alloc time, teach `clear_rstd_stack_slots` and siblings to
+   preserve arena-backed slots instead of nulling, verify with (3)
+   + (4) checks enabled. Multi-session — does the Qwen3.5 replay path
+   interact cleanly, do stream-captured kernel args survive, etc.
+10. Persistent arena for weights — either reorder init so compile runs
+    before weight load, or post-compile rebind.
+11. Accumulator arena for grads — same shape as (10), with ZeRO-2
+    complications.
+12. Benchmark gate against `buffer-runtime-v4-benchmark.md` after (9)
+    lands. Decision matrix in design doc.
+13. Phase 4 (cleanup) — only after (9) is in and the benchmark gate
+    passes can the M5 kill-list actually delete the legacy backings.
 
 ### M5 — Delete legacy machinery
 
