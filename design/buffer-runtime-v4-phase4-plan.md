@@ -772,11 +772,26 @@ Concrete remaining commits toward Phase 3 completion:
    unit; all three architectures now report 0 splits / 0 violations).
 6. `MatmulRole` typed enum (Phase 1 step 4) — either rename+expand
    `modules::MatmulOp` or introduce a parallel enum and migrate callers
-   one hot path at a time.
+   one hot path at a time. **Not started.** Cosmetic / cleanup-class;
+   defer to M5 sweep.
 7. `PruneByLastUse` real dispatch — move per-op `prune_by_last_use` out
-   of the legacy backward loop into the instruction stream.
+   of the legacy backward loop into the instruction stream. **Attempted
+   and reverted in compiled_ops_execute.cpp:2666 (no-op handler +
+   inline per-op prune):** batching to the instruction caused 3×+ Stack
+   bloat on Prologue-heavy graphs (MoE, hybrid Mamba) because hundreds
+   of Prologue ops accumulate before any gets freed. Inline prune stays;
+   the instruction is kept in the stream as a shape marker for
+   validation only.
 8. `RecomputeBlock` real dispatch — consume the instruction in backward
    instead of the current `mRecomputeFn` on op.layer_start.
+   **Partially shipped** (compiled_ops_execute.cpp:2597–2603): the
+   instruction's explicit handler calls `mRecomputeFn` when the block
+   index changes. Per-op fallback triggers at lines 2622–2632 /
+   2741–2748 / 2782–2796 / 2808–2827 are retained as safety nets for
+   graphs where ops with `layer_start < 0` land outside a BwdBlock
+   phase-tree bucket (GPT-OSS LM-head / MoE EP Prologue). Removal of
+   those fallbacks is gated on explicit backfill of the instruction
+   stream for those paths — left as a follow-up.
 9. ✅ **Actual FwdStack/BwdStack arena consumption — shipped default-on**
    (`cb3f2da`). Single arena per region, peak = max over layers, not
    sum. Route every stack-backed `simplified_acts[L][SLOT].Data` to
@@ -824,13 +839,19 @@ gate — features-behind-gates that validate clean are legacy-in-waiting.
 Conversely, features that fail validation: revert, document the gap,
 ship only the infra pieces that are independently correct.
 10. Persistent arena for weights — either reorder init so compile runs
-    before weight load, or post-compile rebind.
+    before weight load, or post-compile rebind. **Not started.** Gated
+    on `SUROGATE_USE_PHASE_PERSISTENT=1`; no op consumes it yet.
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
-    complications.
-12. Benchmark gate against `buffer-runtime-v4-benchmark.md` after (9)
-    lands. Decision matrix in design doc.
-13. Phase 4 (cleanup) — only after (9) is in and the benchmark gate
-    passes can the M5 kill-list actually delete the legacy backings.
+    complications. **Not started.**
+12. ✅ Benchmark gate against `buffer-runtime-v4-benchmark.md` re-run
+    (2026-04-21) with arena consumption default-on: step time neutral
+    (−0.3% on qwen3, within noise on qwen3.5 / gpt-oss), peak memory
+    unchanged versus pre-arena-consumption (verified via `git stash`
+    + rerun on qwen3: both configurations 11,796 MiB). Raw numbers
+    appended to the benchmark doc.
+13. Phase 4 (cleanup / M5 kill list) — unblocked by (9) + (12).
+    **Ready to start.** Each kill item is a multi-commit sweep; see
+    M5 below for targets.
 
 ### M5 — Delete legacy machinery
 
