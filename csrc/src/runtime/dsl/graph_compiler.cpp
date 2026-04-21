@@ -2300,18 +2300,11 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          std::size_t stack_bytes,
                          std::size_t bwd_cross_layer_bytes,
                          std::size_t moe_saved_bytes) {
-    // UnifiedStack adoption allocates a second Stack-sized buffer and
-    // then transfers ownership, freeing the original. The overlap during
-    // allocation doubles Stack footprint transiently — enough to OOM on
-    // GPT-OSS-class models that run within a few GiB of the 32 GiB
-    // budget. Since no op consumes block activations via the arena path
-    // yet (tensor-id baking is Phase 3 step 4), the adoption is pure
-    // memory shuffling. Gate behind the same flag that controls the
-    // other premature arenas; default off until ops actually read
-    // through unified_stack offsets.
-    const char* stack_arena_env = std::getenv("SUROGATE_USE_PHASE_STACK_ARENAS");
-    const bool want_stack_arenas = stack_arena_env && std::string(stack_arena_env) == "1";
-    arenas.unified_stack_bytes = want_stack_arenas ? stack_bytes : 0;
+    // UnifiedStack is the default backing for DslRunState::Stack. Adoption
+    // swaps the TensorAllocator-owned Stack buffer for this arena (same
+    // size, same allocation source — just relocated into the phase-arena
+    // bookkeeping). Pure ownership shuffle, net-neutral memory.
+    arenas.unified_stack_bytes = stack_bytes;
     arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
     arenas.moe_saved_bytes = moe_saved_bytes;
 
@@ -2324,9 +2317,12 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.persistent_bytes = want_persistent ? std::max(fwd.persistent_bytes, bwd.persistent_bytes) : 0;
     arenas.accumulator_bytes = want_persistent ? std::max(fwd.accumulator_bytes, bwd.accumulator_bytes) : 0;
 
-    // FwdStack, BwdStack: same gate as UnifiedStack — no op consumes
-    // these arenas yet; tensor-id baking (design §Phase 3 step 4) is
-    // the missing consumer.
+    // FwdStack, BwdStack: shadow only — no op consumes these arenas yet
+    // (tensor-id baking, design §Phase 3 step 4, is the missing consumer).
+    // Gated on SUROGATE_USE_PHASE_STACK_ARENAS=1 so the per-frame coloring
+    // peak doesn't waste memory on the default path.
+    const char* stack_arena_env = std::getenv("SUROGATE_USE_PHASE_STACK_ARENAS");
+    const bool want_stack_arenas = stack_arena_env && std::string(stack_arena_env) == "1";
     arenas.fwd_stack_bytes = want_stack_arenas ? fwd.fwd_stack_peak : 0;  // bwd's fwd_stack_peak is 0
     arenas.bwd_stack_bytes = want_stack_arenas ? bwd.bwd_stack_peak : 0;  // fwd's bwd_stack_peak is 0
 
