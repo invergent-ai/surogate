@@ -405,6 +405,18 @@ struct TensorMeta {
     /// for unassigned / dtype-unresolved tids.
     std::size_t bytes = 0;
 
+    /// Backward-read-without-save-list-promotion flag. Set by
+    /// finalize_save_for_bwd for tids produced in forward and consumed in
+    /// backward that the save list filter excluded (recompute-mode
+    /// candidates). Under arena consumption these tids CANNOT be aliased
+    /// with later-forward-op outputs — replay produces them and backward
+    /// reads them after the rest of the forward frame has executed, so
+    /// their bytes must remain exclusive through the full forward op range.
+    /// The legacy Stack bump allocator preserves them automatically (no
+    /// reuse); arena coloring needs this flag to lengthen LayoutInfo's
+    /// last_use to the frame end.
+    bool retain_through_forward = false;
+
     bool is_cross_layer() const {
         return flags & kCrossLayer;
     }

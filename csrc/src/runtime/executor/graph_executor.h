@@ -451,6 +451,27 @@ private:
     /// the slots we'd need to migrate, before designing the runtime
     /// frame discipline.
     void dump_simplified_activation_offsets();
+
+    /// Override every FwdStack `simplified_acts[L][SLOT].Data` to
+    /// `fwd_stack_ptr + meta.offset` and mark the slot
+    /// persist_across_layer_end so the arena-baked pointer survives
+    /// layer_end clears. Runs once per (B,T) recompile after
+    /// allocate_phase_arenas succeeds. Correctness prerequisites:
+    ///   (i) per-frame coloring collapses slot-aliased tids so every ref
+    ///       that resolves to a given runtime slot shares a single
+    ///       compile-time offset;
+    ///  (ii) retain_through_forward extends block-scope FwdStack tids'
+    ///       last_use to the forward frame end so within-a-layer coloring
+    ///       never aliases a backward-read activation with a later op's
+    ///       output;
+    /// (iii) per-layer arena sectioning gives each layer `L` its own
+    ///       `[L*peak_per_frame, (L+1)*peak_per_frame)` slice — captured
+    ///       forward segment graphs bake pointers at capture time and
+    ///       replay verbatim, so a shared slice across layers would let
+    ///       a later layer's captured replay overwrite an earlier layer's
+    ///       activations before backward reads them.
+    void consume_fwdstack_arena();
+
     void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);
     void execute_backward(long B,
                           long T,

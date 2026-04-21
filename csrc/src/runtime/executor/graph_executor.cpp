@@ -1041,6 +1041,17 @@ void GraphExecutor::compile_graphs(long B, long T) {
                         dump_simplified_activation_offsets();
                     }
                 }
+                // Phase 3 step 4 arena consumption: route every FwdStack
+                // simplified_acts slot to its arena-baked offset. Arena
+                // is allocated under SUROGATE_USE_PHASE_STACK_ARENAS=1
+                // (same env gate still guards the allocation). Once the
+                // allocation happens, consumption is the default path
+                // — there is no correctness benefit to keeping the
+                // per-layer Stack allocations alongside an allocated
+                // FwdStack arena.
+                if (mPhaseArenas.fwd_stack_ptr != nullptr) {
+                    consume_fwdstack_arena();
+                }
             }
         } else if (mCompiledExecutor) {
             mCompiledExecutor->set_phase_arenas(nullptr);
@@ -1052,6 +1063,85 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // Resize split-attention segment graph storage when dimensions change
         if (mCompiledForward && mCompiledBackward) {
             mCompiledExecutor->resize_segment_graphs(*mCompiledForward, *mCompiledBackward);
+        }
+    }
+}
+
+namespace {
+
+struct FwdStackConsumeSlot {
+    dsl::TensorSlot slot;
+    const char* name;
+};
+
+// Block-scope FwdStack slots that simplified_acts tracks.
+constexpr FwdStackConsumeSlot kFwdStackConsumeSlots[] = {
+    {dsl::TensorSlot::BlockLN1RSTD, "ln1_rstd"},
+    {dsl::TensorSlot::BlockLN1, "ln1"},
+    {dsl::TensorSlot::BlockLN2RSTD, "ln2_rstd"},
+    {dsl::TensorSlot::BlockLN2, "ln2"},
+    {dsl::TensorSlot::BlockQRSTD, "q_rstd"},
+    {dsl::TensorSlot::BlockKRSTD, "k_rstd"},
+    {dsl::TensorSlot::BlockQKV, "qkv"},
+    {dsl::TensorSlot::BlockQKVRoPE, "qkv_rope"},
+    {dsl::TensorSlot::BlockLSE, "lse"},
+    {dsl::TensorSlot::BlockAtt, "att"},
+    {dsl::TensorSlot::BlockAttOut, "att_out"},
+    {dsl::TensorSlot::BlockMLPUp, "mlp_up"},
+    {dsl::TensorSlot::BlockSwiGLU, "swiglu"},
+    {dsl::TensorSlot::BlockMLPDown, "mlp_down"},
+    {dsl::TensorSlot::BlockHOut, "h_out"},
+};
+
+}  // namespace
+
+void GraphExecutor::consume_fwdstack_arena() {
+    if (!mCompiledForward) return;
+    if (!mPhaseArenas.fwd_stack_ptr || mPhaseArenas.fwd_stack_bytes == 0) return;
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+    std::size_t overridden = 0;
+    std::size_t skipped_allocator_owned = 0;
+    std::size_t skipped_undersized = 0;
+    for (int L = 0; L < num_layers; ++L) {
+        auto& acts = mRunState.simplified_acts(L);
+        const std::string prefix = "blocks[" + std::to_string(L) + "].";
+        for (const auto& entry : kFwdStackConsumeSlots) {
+            const auto slot_idx = static_cast<std::size_t>(entry.slot);
+            Tensor& slot = acts[entry.slot];
+            if (slot.Rank == 0) continue;
+            if (slot.Data != nullptr) {
+                ++skipped_allocator_owned;
+                continue;
+            }
+            const int tid = mCompiledForward->find_tensor_id(prefix + entry.name);
+            if (tid < 0) continue;
+            const auto& meta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
+            if (meta.region != dsl::RegionKind::FwdStack || meta.offset == SIZE_MAX) continue;
+            const std::size_t runtime_bytes =
+                static_cast<std::size_t>(slot.nelem()) * static_cast<std::size_t>(get_dtype_size(slot.DType));
+            if (meta.bytes < runtime_bytes) {
+                ++skipped_undersized;
+                continue;
+            }
+            if (meta.offset + runtime_bytes > mPhaseArenas.fwd_stack_bytes) {
+                // Defensive: never produce an OOB pointer. Reaching this
+                // branch means coloring under-sized the arena relative to
+                // its per-tid offsets — a compiler invariant violation.
+                throw std::runtime_error("consume_fwdstack_arena: slot offset " + std::to_string(meta.offset) +
+                                         " + runtime_bytes " + std::to_string(runtime_bytes) + " exceeds arena " +
+                                         std::to_string(mPhaseArenas.fwd_stack_bytes) + " for " + prefix + entry.name);
+            }
+            slot.Data = mPhaseArenas.fwd_stack_ptr + meta.offset;
+            acts.persist_across_layer_end[slot_idx] = true;
+            ++overridden;
+        }
+    }
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume fwd_stack] overridden=" << overridden
+                      << " skipped_allocator_owned=" << skipped_allocator_owned
+                      << " skipped_undersized=" << skipped_undersized << " arena_bytes=" << mPhaseArenas.fwd_stack_bytes
+                      << "\n";
         }
     }
 }
