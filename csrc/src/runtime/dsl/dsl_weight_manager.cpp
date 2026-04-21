@@ -899,7 +899,7 @@ bool is_device_resident(const Tensor& t) {
 
 std::size_t DslWeightManager::total_persistent_bytes() const {
     std::size_t total = 0;
-    std::unordered_set<const std::byte*> seen;  // dedupe master/work aliases
+    std::unordered_set<const std::byte*> seen;  // dedupe master/work/prefetch aliases
     auto count_if_eligible = [&](const Tensor& t) {
         if (!is_device_resident(t)) return;
         if (!seen.insert(t.Data).second) return;
@@ -909,6 +909,16 @@ std::size_t DslWeightManager::total_persistent_bytes() const {
         const auto& entry = kv.second;
         count_if_eligible(entry.master);
         count_if_eligible(entry.work);
+    }
+    // M4c2: include streaming prefetch buffers. Entries within a slot
+    // alias a shared per-base-name device buffer — the seen-set dedup
+    // ensures each distinct buffer is counted once across both slots
+    // even when base-buffer pointers happen to repeat (they don't, but
+    // the invariant is cheap).
+    for (const auto& slot_map : mPrefetchBuffers) {
+        for (const auto& kv : slot_map) {
+            count_if_eligible(kv.second);
+        }
     }
     return total;
 }
@@ -973,7 +983,10 @@ DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t 
             ++skipped_offloaded;
         }
         // Work: streaming block weights have `.Data == nullptr` until
-        // `gather_block` fills a prefetch slot — skip them here.
+        // `gather_block` fills a prefetch slot. The underlying buffers
+        // are rebound below as part of mPrefetchBuffers; the per-entry
+        // `entry.work` field gets rewritten on every gather so we don't
+        // touch it here.
         if (is_device_resident(entry.work)) {
             if (rebind_one(entry.work)) {
                 ++rebound_work;
@@ -983,14 +996,28 @@ DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t 
         }
     }
 
+    // M4c2: prefetch slots. Each slot holds one Tensor per base-param
+    // name (aliased across layers within the slot). Rebind once per
+    // unique buffer; the dedup map handles the aliasing so every
+    // entry.second.Data ends up pointing at the same arena slot it
+    // resolved to on the first encounter.
+    std::size_t rebound_prefetch = 0;
+    for (auto& slot_map : mPrefetchBuffers) {
+        for (auto& kv : slot_map) {
+            if (rebind_one(kv.second)) {
+                ++rebound_prefetch;
+            }
+        }
+    }
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
             std::cerr << "[arena-consume dsl_wm_persistent] rebound_master=" << rebound_master
-                      << " rebound_work=" << rebound_work << " skipped_offloaded=" << skipped_offloaded
-                      << " skipped_streaming=" << skipped_streaming << " bytes_used=" << cursor
-                      << " slab_bytes=" << max_bytes << "\n";
+                      << " rebound_work=" << rebound_work << " rebound_prefetch=" << rebound_prefetch
+                      << " skipped_offloaded=" << skipped_offloaded << " skipped_streaming=" << skipped_streaming
+                      << " bytes_used=" << cursor << " slab_bytes=" << max_bytes << "\n";
         }
     }
 

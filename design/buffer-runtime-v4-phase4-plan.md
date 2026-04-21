@@ -866,16 +866,33 @@ Regressions checked: Qwen3 / Qwen3.5 / GPT-OSS flag-on (no weight
 manager configs) continue to produce identical rebind counts and
 losses as before M4c.
 
-### M4 remaining (multi-session)
+### M4c2 shipped (streaming prefetch buffers)
 
-- **M4c2 — streaming / offload paths (prefetch buffers, pinned CPU
-  masters).** The in-shipped M4c handles device-resident pairs.
-  Streaming configs (ZeRO sharding + prefetch buffers) and offload
-  (pinned-CPU masters, zero-copy embeddings) still live outside the
-  arena. `mPrefetchBuffers` is its own structure — a separate slab
-  or arena extension could cover it. `offload_master` pinned CPU
-  storage can't be arena-backed without moving to UVA or dropping
-  the offload savings — likely stays out.
+`total_persistent_bytes()` and `rebind_to_persistent_arena()` now also
+walk `mPrefetchBuffers[kNumPrefetchBuffers]`. Each slot's per-base-name
+Tensor entries are passed through the existing `rebind_one` helper, so
+the pointer-dedup map correctly collapses the many-to-one alias pattern
+(all layers sharing a given base-name point at a single slot buffer
+per prefetch slot). The first occurrence of each unique buffer does
+the memcpy+free+rebind; later aliased entries simply repoint `.Data`.
+
+Pinned-CPU masters (`offload_master=true` block weights) remain out of
+the arena by design — arena storage is device-only, and moving pinned
+storage to UVA would defeat the offload savings the flag was set to
+obtain. They continue to hit the `skipped_offloaded` counter.
+
+Validation: single-GPU qwen3 + `offload_master: true` + LoRA, 5 steps
+flag-on. 3 WM-master (non-block embeddings / final_norm / lm_head) +
+3 WM-work + 448 prefetch-entry rebinds (224 per slot × 2 slots,
+collapsing to a handful of unique per-base-name buffers) + 784 LoRA
+into a 1.31 GiB slab. 224 block masters skipped as offloaded; 224
+streaming work entries skipped (filled at gather time into the
+now-arena-backed prefetch slots). Loss trajectory 2.0251 → 1.3369,
+norms within the baseline run-to-run envelope (baseline step 2 norm
+varies 1.83–2.06 across three back-to-back runs; flag-on clusters
+1.83–1.86). Flag stays default off.
+
+### M4 remaining (multi-session)
 - **M4d — quantized (FP8 / FP4 / BnB / MXFP4) weights into Persistent
   arena.** `csrc/src/runtime/qlora/` pipelines hold quantized base
   weights with per-block scales. Each quantizer's layout (packed
@@ -1002,22 +1019,26 @@ gate — features-behind-gates that validate clean are legacy-in-waiting.
 Conversely, features that fail validation: revert, document the gap,
 ship only the infra pieces that are independently correct.
 10. ✅ Persistent arena for base weights (M4a) + LoRA adapters (M4b) +
-    DslWeightManager master/work pairs (M4c). M4a: `DslParamStore::
-    rebind_to_persistent_arena` rebinds locally-allocated base weights
-    post-compile; clamp via `rebindable_persistent_bytes` auto-skips
-    QLoRA / weight-manager configs. M4b: `ModularLoRAWeightsManager::
-    rebind_to_persistent_arena` reserves a bump-allocated slab for every
-    LoRA leaf tensor (master + work, attention / MLP / MoE-experts /
-    MoE-grouped / router). M4c: `DslWeightManager::
-    rebind_to_persistent_arena` routes device-resident master/work pairs
-    (mixed-precision, streaming-sharded masters) into a middle slab
-    between base and LoRA; offloaded pinned-CPU masters and streaming
-    prefetch work buffers stay outside. Gated on
+    DslWeightManager master/work pairs (M4c) + streaming prefetch
+    buffers (M4c2). M4a: `DslParamStore::rebind_to_persistent_arena`
+    rebinds locally-allocated base weights post-compile; clamp via
+    `rebindable_persistent_bytes` auto-skips QLoRA / weight-manager
+    configs. M4b: `ModularLoRAWeightsManager::rebind_to_persistent_arena`
+    reserves a bump-allocated slab for every LoRA leaf tensor (master
+    + work, attention / MLP / MoE-experts / MoE-grouped / router). M4c:
+    `DslWeightManager::rebind_to_persistent_arena` routes device-
+    resident master/work pairs (mixed-precision, streaming-sharded
+    masters) into a middle slab between base and LoRA. M4c2: same
+    walker extends to `mPrefetchBuffers[slot]` so each prefetch slot's
+    per-base-name device buffer lands in the arena; aliased entries
+    across layers share a slot via pointer-dedup. Offloaded pinned-CPU
+    masters stay outside by design (arena is device-only). Gated on
     `SUROGATE_USE_PHASE_PERSISTENT=1`, default off. Bit-identical on
     Qwen3 (227 base + 784 LoRA), Qwen3.5 (261 base + 384 LoRA), GPT-OSS
     (0 base + 576 LoRA), fp32-master mixed-precision Qwen3 (0 base + 227
-    WM-master + 227 WM-work + 784 LoRA, 5-step loss Δ ≤ 0.03%). M4c2
-    (offload/streaming prefetch) and M4d (quantized weights) remain.
+    WM-master + 227 WM-work + 784 LoRA, 5-step loss Δ ≤ 0.03%), and
+    offload_master Qwen3 (3 WM-master + 3 WM-work + 448 prefetch + 784
+    LoRA, 5-step loss 2.0251 → 1.3369). M4d (quantized weights) remains.
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
     complications. **Not started.** Env-gate now split:
     `SUROGATE_USE_PHASE_ACCUMULATOR=1` (shadow; no op consumes it yet).
