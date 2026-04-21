@@ -339,6 +339,16 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     // constraint — resize up if so. Shrinking is deliberately skipped to
     // avoid churn on the allocator.
     // ------------------------------------------------------------------
+    // Phase 4 M4b: wire LoRA weights to executor BEFORE compile so the
+    // Persistent arena sizing can include LoRA bytes. set_lora_state is
+    // idempotent — we pass the weights manager here (grads/run_state
+    // aren't allocated yet) and re-call below with the full state.
+    if (lora_enabled()) {
+        mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
+                                  mLoRAWeights.get(),
+                                  /*grads=*/nullptr,
+                                  /*run_state=*/nullptr);
+    }
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
         exec->ensure_graphs_compiled(B, T);
         const long needed =

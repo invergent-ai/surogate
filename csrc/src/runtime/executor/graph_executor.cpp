@@ -1005,9 +1005,19 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // QLoRA-external and weight-manager-managed params are
                 // stored elsewhere — sizing for them would waste tens of
                 // GiB on quantized-weight configs. Zero if nothing local.
+                std::size_t lora_slab_bytes = 0;
+                std::size_t base_persistent_bytes = 0;
                 if (mPhaseArenas.persistent_bytes > 0) {
-                    const std::size_t needed = mWeights.rebindable_persistent_bytes(*mCompiledForward);
-                    mPhaseArenas.persistent_bytes = needed;
+                    base_persistent_bytes = mWeights.rebindable_persistent_bytes(*mCompiledForward);
+                    mPhaseArenas.persistent_bytes = base_persistent_bytes;
+                    // Phase 4 M4b: when LoRA is enabled, reserve a slab at
+                    // the tail of the Persistent arena for LoRA adapter
+                    // storage. The slab follows the base-weight region,
+                    // sized from `mLoRAWeights->total_persistent_bytes()`.
+                    if (mLoRAWeights) {
+                        lora_slab_bytes = mLoRAWeights->total_persistent_bytes();
+                        mPhaseArenas.persistent_bytes += lora_slab_bytes;
+                    }
                 }
                 dsl::allocate_phase_arenas(mPhaseArenas);
                 // Shadow coverage report: of the tids the arena plan claims,
@@ -1068,6 +1078,14 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // covers the simple DslParamStore path (single-GPU, no
                 // streaming, no offload, no QLoRA, no DslWeightManager).
                 mWeights.rebind_to_persistent_arena(*mCompiledForward, mPhaseArenas, mRunState.MainStream);
+                // Phase 4 M4b: LoRA adapter slab sits at the tail of the
+                // Persistent arena, sized at allocation time. Same env gate
+                // as M4a — no-op unless the Persistent arena was sized with
+                // the LoRA reservation above.
+                if (mLoRAWeights && lora_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
+                    std::byte* lora_base = mPhaseArenas.persistent_ptr + base_persistent_bytes;
+                    mLoRAWeights->rebind_to_persistent_arena(lora_base, lora_slab_bytes, mRunState.MainStream);
+                }
             }
         } else if (mCompiledExecutor) {
             mCompiledExecutor->set_phase_arenas(nullptr);
