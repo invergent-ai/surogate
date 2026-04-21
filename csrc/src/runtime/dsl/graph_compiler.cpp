@@ -1708,48 +1708,54 @@ void GraphCompiler::build_phase_tree(CompiledGraph& graph, bool is_backward) {
 const char* region_kind_name(RegionKind k) {
     switch (k) {
         case RegionKind::Unknown: return "Unknown";
+        case RegionKind::FwdStack: return "FwdStack";
+        case RegionKind::BwdStack: return "BwdStack";
         case RegionKind::SaveForBwd: return "SaveForBwd";
         case RegionKind::Accumulator: return "Accumulator";
         case RegionKind::Persistent: return "Persistent";
+        case RegionKind::Recomputed: return "Recomputed";
+        case RegionKind::GatheredWeight: return "GatheredWeight";
         case RegionKind::BwdCrossLayer: return "BwdCrossLayer";
     }
     return "?";
 }
 
 void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
-    // Map TensorKind (populated by classify_tensors) to a region. Regions
-    // correspond to arenas in PhaseArenas; block-scoped activations and
-    // gradients have no dedicated arena (they live on DslRunState.Stack), so
-    // they stay at Unknown and don't reach resolve_tid_in_arena.
+    // Map TensorKind (populated by classify_tensors) to a region, consulting
+    // block_layer_idx to distinguish block-scoped from global tensors. M2
+    // intentionally stops at this coarse classification; SaveForBwd detection
+    // (save-list integration) and Recomputed (recompute-plan integration)
+    // arrive in later milestones.
     for (auto& meta : graph.tensor_meta) {
         switch (meta.kind) {
             case TensorKind::ForwardParam: meta.region = RegionKind::Persistent; break;
             case TensorKind::ForwardActivation:
-                // Block-scoped activations live on the Stack; only non-block
-                // forward activations reach the Persistent arena.
-                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::Unknown : RegionKind::Persistent;
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::FwdStack : RegionKind::Persistent;
                 break;
             case TensorKind::ActivationGrad:
-                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::Unknown : RegionKind::Persistent;
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::BwdStack : RegionKind::Persistent;
                 break;
             case TensorKind::ParamGrad:
             case TensorKind::AccumTemp: meta.region = RegionKind::Accumulator; break;
             case TensorKind::LossInput: meta.region = RegionKind::Persistent; break;
             case TensorKind::Scratch:
-                // Un-typed intermediates (views, zeros, constants). Stack-resident.
-                meta.region = RegionKind::Unknown;
+                // Pessimistic default for un-typed intermediates (views,
+                // zeros, constants). Correct when the scratch dies within a
+                // block; M3 will re-verify against last-use spans.
+                meta.region = is_backward ? RegionKind::BwdStack : RegionKind::FwdStack;
                 break;
             case TensorKind::Unknown:
                 // Includes cross-graph references (e.g., forward activations
-                // read by backward). save-list integration promotes these to
-                // SaveForBwd downstream.
+                // read by backward). Left as Unknown for now; save-list
+                // integration in a later milestone will promote these to
+                // SaveForBwd.
                 break;
         }
     }
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
         if (std::string(env) == "1") {
-            std::array<int, 5> counts{};  // Indexed by RegionKind.
+            std::array<int, 9> counts{};  // Indexed by RegionKind.
             for (const auto& meta : graph.tensor_meta) {
                 counts[static_cast<std::size_t>(meta.region)]++;
             }
@@ -1799,9 +1805,7 @@ void finalize_save_for_bwd(CompiledGraph& fwd,
         // Only block activations are SaveForBwd candidates. Guard rules out
         // globals like TokenIDs that are consumed in bwd but stay Persistent.
         if (!meta.is_blocks()) return;
-        // Block tids land at region=Unknown (Stack-resident). Promote to
-        // SaveForBwd for the dedicated cross-boundary arena.
-        if (meta.region == RegionKind::Unknown) {
+        if (meta.region == RegionKind::FwdStack || meta.region == RegionKind::BwdStack) {
             meta.region = RegionKind::SaveForBwd;
         }
     };
@@ -1809,7 +1813,7 @@ void finalize_save_for_bwd(CompiledGraph& fwd,
     // When save_names is provided, a tid that crosses the fwd→bwd
     // boundary but is NOT in the runtime save list is satisfied via
     // Stack residency, recompute, or forward replay — none need a
-    // SaveForBwd slot. Leave those tids at region=Unknown. An empty
+    // SaveForBwd slot. Leave those tids in FwdStack/BwdStack. An empty
     // set promotes nothing (valid in recompute modes). Nullopt disables
     // filtering entirely (all fwd∧bwd-crossing block activations
     // promoted, prior behavior). Name lookup uses fwd first (SaveForBwd
@@ -1850,7 +1854,7 @@ void finalize_save_for_bwd(CompiledGraph& fwd,
 
     // Re-run layout now that regions are finalized. The first pass in
     // compile() baked offsets under stale regions (SaveForBwd candidates sat
-    // at Unknown); re-running fixes them.
+    // in FwdStack / BwdStack frames); re-running fixes them.
     if (promoted > 0) {
         for (auto& m : fwd.tensor_meta)
             m.offset = SIZE_MAX;
@@ -2047,6 +2051,58 @@ std::size_t bytes_for_ref(const TensorRef& ref) {
     return elems * static_cast<std::size_t>(get_dtype_size(ref.dtype));
 }
 
+/// First-fit-by-offset greedy for 1D-interval coloring. Returns per-tid
+/// frame-local byte offsets; sets peak_out to the bytes consumed. Non-optimal
+/// but correct (no two live tensors share bytes) and close to the max-clique
+/// peak for typical transformer-block activation patterns.
+std::vector<std::size_t>
+color_frame(const std::vector<int>& tids, const std::vector<LayoutInfo>& info, std::size_t& peak_out) {
+    std::vector<std::size_t> offsets(tids.size(), SIZE_MAX);
+    if (tids.empty()) {
+        peak_out = 0;
+        return offsets;
+    }
+
+    std::vector<std::size_t> order(tids.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        const auto& ia = info[static_cast<std::size_t>(tids[a])];
+        const auto& ib = info[static_cast<std::size_t>(tids[b])];
+        if (ia.first_use != ib.first_use) return ia.first_use < ib.first_use;
+        return ia.bytes > ib.bytes;  // prefer larger tensors first at same first_use
+    });
+
+    struct Slot {
+        std::size_t off, size, last;
+    };
+    std::vector<Slot> live;
+    std::size_t peak = 0;
+
+    for (std::size_t idx : order) {
+        const auto& ti = info[static_cast<std::size_t>(tids[idx])];
+
+        // Expire slots freed strictly before ti.first_use.
+        live.erase(std::remove_if(live.begin(), live.end(), [&](const Slot& s) { return s.last < ti.first_use; }),
+                   live.end());
+
+        std::sort(live.begin(), live.end(), [](const Slot& a, const Slot& b) { return a.off < b.off; });
+
+        // Find smallest gap of size >= ti.bytes.
+        std::size_t off = 0;
+        for (const auto& s : live) {
+            if (off + ti.bytes <= s.off) break;
+            off = std::max(off, s.off + s.size);
+        }
+
+        offsets[idx] = off;
+        live.push_back({off, ti.bytes, ti.last_use});
+        peak = std::max(peak, off + ti.bytes);
+    }
+
+    peak_out = peak;
+    return offsets;
+}
+
 std::string fmt_bytes(std::size_t b) {
     std::ostringstream os;
     if (b >= (1ULL << 30)) {
@@ -2093,27 +2149,30 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
 
     const std::size_t num_layers = graph.layer_start_indices.size();
 
-    // Bucket live tids by (region, block). Persistent + Accumulator bump into
-    // one arena offset space each; SaveForBwd is per-block (each block has its
-    // own persistent slot). Stack-resident tids (region=Unknown) carry no
-    // arena offset — DslRunState.Stack manages them at runtime via
-    // bump/restore at block boundaries.
+    // Bucket live tids by (region, block). SaveForBwd is treated per-block
+    // (each block has its own persistent slot); FwdStack / BwdStack coloring
+    // is per-frame (frames don't coexist, so offsets are frame-local).
     std::vector<int> persistent_tids;
     std::vector<int> accumulator_tids;
+    std::vector<std::vector<int>> fwd_frame(num_layers);
+    std::vector<std::vector<int>> bwd_frame(num_layers);
     std::vector<std::vector<int>> save_for_bwd(num_layers);
 
     for (std::size_t tid = 0; tid < num_tids; ++tid) {
         const auto& meta = graph.tensor_meta[tid];
         const auto& ti = info[tid];
         if (!ti.live || ti.bytes == 0) continue;
+        auto block_bucket = [&](std::vector<std::vector<int>>& buckets) {
+            if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
+                buckets[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
+            }
+        };
         switch (meta.region) {
             case RegionKind::Persistent: persistent_tids.push_back(static_cast<int>(tid)); break;
             case RegionKind::Accumulator: accumulator_tids.push_back(static_cast<int>(tid)); break;
-            case RegionKind::SaveForBwd:
-                if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
-                    save_for_bwd[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
-                }
-                break;
+            case RegionKind::FwdStack: block_bucket(fwd_frame); break;
+            case RegionKind::BwdStack: block_bucket(bwd_frame); break;
+            case RegionKind::SaveForBwd: block_bucket(save_for_bwd); break;
             default: break;
         }
     }
@@ -2146,6 +2205,36 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
         save_for_bwd_bytes += block_sz;
     }
 
+    // Per-frame coloring. The region's peak is the max over frames (frames
+    // don't coexist — nested-stack semantics).
+    auto color_frames = [&](const std::vector<std::vector<int>>& frames) -> std::pair<std::size_t, std::size_t> {
+        std::size_t naive_max = 0;
+        std::size_t coloring_max = 0;
+        for (const auto& tids : frames) {
+            std::size_t naive = 0;
+            for (int tid : tids)
+                naive += info[static_cast<std::size_t>(tid)].bytes;
+            naive_max = std::max(naive_max, naive);
+
+            std::size_t peak = 0;
+            auto offs = color_frame(tids, info, peak);
+            coloring_max = std::max(coloring_max, peak);
+            for (std::size_t i = 0; i < tids.size(); ++i) {
+                graph.tensor_meta[static_cast<std::size_t>(tids[i])].offset = offs[i];
+            }
+        }
+        return {naive_max, coloring_max};
+    };
+
+    // FwdStack / BwdStack tids keep their coloring here (offsets written into
+    // tensor_meta for telemetry + future reconsideration), but the per-region
+    // arena that was going to consume them has been dropped — DslRunState's
+    // unified Stack does the per-block bump/restore bookkeeping with better
+    // coverage of non-block tids at comparable or lower peak.
+    (void)color_frames(fwd_frame);
+    (void)color_frames(bwd_frame);
+
+    // Expose peaks for compute_arena_sizes.
     graph.persistent_bytes = persistent_bytes;
     graph.accumulator_bytes = accumulator_bytes;
     graph.save_for_bwd_bytes = save_for_bwd_bytes;
@@ -2288,6 +2377,10 @@ ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledG
     for (int tid = 0; tid < graph.num_tensors; ++tid) {
         const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
         if (meta.region == RegionKind::Unknown) continue;
+        // FwdStack / BwdStack tids are block-scoped and live on
+        // DslRunState.Stack (unified arena); skip them here — they have no
+        // dedicated region arena to validate against.
+        if (meta.region == RegionKind::FwdStack || meta.region == RegionKind::BwdStack) continue;
         ++cov.total;
         if (meta.offset == SIZE_MAX || meta.bytes == 0) continue;
         switch (meta.region) {

@@ -1168,8 +1168,8 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             throw std::runtime_error("CompiledExecutor: tensor not found: " + ref.name);
         }
     }
-    // Error rewriter: include tid context when available, so users see
-    // "invalid tensor slot for tid=12 name='blocks[3].att' region=Unknown"
+    // P4.7 error rewriter: include tid context when available, so users see
+    // "invalid tensor slot for tid=12 name='blocks[3].att' region=FwdStack"
     // instead of the bare "invalid tensor slot".
     std::ostringstream oss;
     oss << "CompiledExecutor: invalid tensor slot";
