@@ -460,23 +460,18 @@ void DslRunState::resize_stack_to(long new_size_bytes) {
         throw std::runtime_error("DslRunState::resize_stack_to: non-positive size");
     }
     // Scrub any simplified_acts / simplified_grads slot whose .Data still
-    // points into the old Stack range. The typical shrink-after-warmup path
-    // reallocates the Stack buffer at a new cudaMalloc address; cached Stack
-    // pointers from step 0 (e.g., the stack-resident rstd / ln / h_out slots)
-    // would dangle otherwise, and faulting code paths (illegal access at step
-    // 1 replay) arise whenever the new allocation overlaps the freed region.
-    std::byte* const old_base = static_cast<std::byte*>(mStackBuffer.Data);
-    const std::size_t old_capacity = mStackBuffer.bytes();
-    auto in_old_stack = [&](std::byte* p) -> bool {
-        return old_base && p >= old_base && p < old_base + old_capacity;
-    };
+    // points into the old Stack range. Both allocator-owned and adopted-arena
+    // buffers are freed+reallocated below, so cached pointers (e.g., the
+    // stack-resident rstd / ln / h_out slots) would dangle otherwise — step 1
+    // replay faults with illegal access whenever the new allocation overlaps
+    // the freed region.
     const bool debug = std::getenv("SUROGATE_DEBUG_STACK_RESIZE") != nullptr;
     std::size_t scrubbed = 0;
     auto scrub_slot_array = [&](auto& per_layer_array, const char* where) {
         for (std::size_t L = 0; L < per_layer_array.size(); ++L) {
             auto& slots = per_layer_array[L].slots;
             for (std::size_t s = 0; s < slots.size(); ++s) {
-                if (slots[s].Data && in_old_stack(slots[s].Data)) {
+                if (slots[s].Data && Stack.owns(slots[s].Data)) {
                     if (debug) {
                         fprintf(stderr,
                                 "[stack-resize] scrub %s layer=%zu slot=%zu ptr=%p\n",
@@ -494,22 +489,32 @@ void DslRunState::resize_stack_to(long new_size_bytes) {
     scrub_slot_array(mSimplifiedActivations, "simplified_acts");
     scrub_slot_array(mSimplifiedGradients, "simplified_grads");
     if (debug) {
-        fprintf(stderr,
-                "[stack-resize] old=[%p, %p) new_size=%ld scrubbed=%zu\n",
-                static_cast<void*>(old_base),
-                static_cast<void*>(old_base + old_capacity),
-                new_size_bytes,
-                scrubbed);
+        fprintf(stderr, "[stack-resize] new_size=%ld scrubbed=%zu\n", new_size_bytes, scrubbed);
     }
     // Free the old buffer *before* requesting the new one. The TensorAllocator
     // retains tracked allocations until its destructor runs, so a naive
     // allocate+swap would leak the pre-resize buffer to the end of the run
-    // and briefly hold 2x VRAM on tight-memory setups.
-    mAllocator->free(mStackBuffer);
+    // and briefly hold 2x VRAM on tight-memory setups. Branch on which owner
+    // currently backs the Stack: allocator buffer vs adopted arena.
+    const bool adopted = (mOwnedExternalStack != nullptr);
     Stack = DeviceMemoryStack();
-    Tensor new_stack =
-        mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {new_size_bytes});
-    set_stack_buffer(std::move(new_stack));
+    if (adopted) {
+        // Adopted arena (cudaMalloc'd by allocate_phase_arenas, ownership handed
+        // to this run state). Free + re-cudaMalloc at the new size, re-adopt.
+        cudaFree(mOwnedExternalStack);
+        mOwnedExternalStack = nullptr;
+        mOwnedExternalStackBytes = 0;
+        void* new_ptr = nullptr;
+        CUDA_CHECK(cudaMalloc(&new_ptr, static_cast<std::size_t>(new_size_bytes)));
+        mOwnedExternalStack = static_cast<std::byte*>(new_ptr);
+        mOwnedExternalStackBytes = static_cast<std::size_t>(new_size_bytes);
+        Stack = DeviceMemoryStack(mOwnedExternalStack, mOwnedExternalStackBytes, DeviceId);
+    } else {
+        mAllocator->free(mStackBuffer);
+        Tensor new_stack =
+            mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {new_size_bytes});
+        set_stack_buffer(std::move(new_stack));
+    }
 }
 
 long DslRunState::shrink_stack_to_high_water_mark(long safety_bytes, long min_savings_bytes) {
@@ -518,7 +523,10 @@ long DslRunState::shrink_stack_to_high_water_mark(long safety_bytes, long min_sa
         // Stack has never seen an allocation — nothing to measure.
         return 0;
     }
-    const long current = static_cast<long>(mStackBuffer.bytes());
+    // Read capacity from the Stack itself so this works for both
+    // allocator-owned (mStackBuffer) and adopted-arena (mOwnedExternalStack)
+    // backings. Resize handles each ownership path internally.
+    const long current = static_cast<long>(Stack.capacity());
     const long target = peak + safety_bytes;
     if (current - target < min_savings_bytes) {
         return 0;
