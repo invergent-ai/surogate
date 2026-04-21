@@ -339,15 +339,21 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     // constraint — resize up if so. Shrinking is deliberately skipped to
     // avoid churn on the allocator.
     // ------------------------------------------------------------------
-    // Phase 4 M4b: wire LoRA weights to executor BEFORE compile so the
-    // Persistent arena sizing can include LoRA bytes. set_lora_state is
-    // idempotent — we pass the weights manager here (grads/run_state
-    // aren't allocated yet) and re-call below with the full state.
+    // Phase 4 M4b/M4c: wire LoRA weights and weight manager to executor
+    // BEFORE compile so the Persistent arena sizing can include LoRA and
+    // DslWeightManager slab bytes. set_lora_state / set_weight_manager
+    // are idempotent setters — pass the managers here (grads/run_state
+    // not yet allocated) and re-call below with full LoRA state.
     if (lora_enabled()) {
         mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
                                   mLoRAWeights.get(),
                                   /*grads=*/nullptr,
                                   /*run_state=*/nullptr);
+    }
+    if (mWeightManager) {
+        if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
+            exec->set_weight_manager(mWeightManager.get());
+        }
     }
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
         exec->ensure_graphs_compiled(B, T);
@@ -373,13 +379,6 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     if (mModelConfig.NumExperts > 0) {
         float aux_coef = mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->router_aux_loss_coef : 0.01f;
         mRunState->set_moe_config(mModelConfig.NumExperts, aux_coef);
-    }
-
-    // Wire weight manager for streaming/sharding
-    if (mWeightManager) {
-        if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
-            exec->set_weight_manager(mWeightManager.get());
-        }
     }
 
     if (lora_enabled()) {

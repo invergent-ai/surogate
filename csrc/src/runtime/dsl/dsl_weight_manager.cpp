@@ -6,9 +6,12 @@
 #include "runtime/dsl/dsl_weight_manager.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <regex>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_set>
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
@@ -17,6 +20,7 @@
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/tensor.h"
+#include "utilities/utils.h"
 
 #include <cuda_runtime.h>
 
@@ -879,6 +883,118 @@ void DslWeightManager::iterate_tensors(const std::function<void(std::string, con
             callback(name, TensorShard(it->second.master));
         }
     }
+}
+
+namespace {
+
+// True when `t` is a device-resident Tensor backed by a `cudaMalloc`
+// allocation (as opposed to pinned CPU / zero-copy / uninitialized).
+// `Device >= 0` is the signal the allocator sets for on-device buffers;
+// pinned and host allocations leave it at -1.
+bool is_device_resident(const Tensor& t) {
+    return t.Data != nullptr && t.Device >= 0;
+}
+
+}  // namespace
+
+std::size_t DslWeightManager::total_persistent_bytes() const {
+    std::size_t total = 0;
+    std::unordered_set<const std::byte*> seen;  // dedupe master/work aliases
+    auto count_if_eligible = [&](const Tensor& t) {
+        if (!is_device_resident(t)) return;
+        if (!seen.insert(t.Data).second) return;
+        total += t.bytes();
+    };
+    for (const auto& kv : mWeights) {
+        const auto& entry = kv.second;
+        count_if_eligible(entry.master);
+        count_if_eligible(entry.work);
+    }
+    return total;
+}
+
+std::size_t
+DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream) {
+    if (arena_base == nullptr || max_bytes == 0) return 0;
+
+    std::size_t cursor = 0;
+    std::size_t rebound_master = 0;
+    std::size_t rebound_work = 0;
+    std::size_t skipped_offloaded = 0;
+    std::size_t skipped_streaming = 0;
+
+    // Track rebound buffers by original Data pointer so aliased entries
+    // (master == work when !separate_work) rebind to a single slab slot
+    // and only free once.
+    std::unordered_map<const std::byte*, std::byte*> rebind_map;
+
+    auto rebind_one = [&](Tensor& t) -> bool {
+        if (!is_device_resident(t)) return false;
+        std::byte* orig = t.Data;
+        auto cached = rebind_map.find(orig);
+        if (cached != rebind_map.end()) {
+            // Alias: another entry already rebound this buffer — just
+            // repoint Data to the arena slot. Do NOT re-free.
+            t.Data = cached->second;
+            return true;
+        }
+        const std::size_t bytes = t.bytes();
+        if (bytes == 0) return false;
+        if (cursor + bytes > max_bytes) {
+            throw std::runtime_error("DslWeightManager::rebind_to_persistent_arena: slab capacity " +
+                                     std::to_string(max_bytes) + " exhausted at cursor " + std::to_string(cursor) +
+                                     " needing " + std::to_string(bytes));
+        }
+        std::byte* slot = arena_base + cursor;
+        CUDA_CHECK(cudaMemcpyAsync(slot, orig, bytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = t.Stats;
+        const int device = t.Device;
+        mAllocator->free(t);  // clears t.Data
+        t.Data = slot;
+        t.Device = device;
+        t.Stats = preserved_stats;
+        cursor += bytes;
+        rebind_map.emplace(orig, slot);
+        return true;
+    };
+
+    for (const auto& name : mParamOrder) {
+        auto it = mWeights.find(name);
+        if (it == mWeights.end()) continue;
+        auto& entry = it->second;
+        // Master: skip when pinned CPU (offloaded) — can't arena-back host
+        // storage. Streaming-sharded masters are still device-resident
+        // (the local shard lives on-device), so they do rebind.
+        if (is_device_resident(entry.master)) {
+            if (rebind_one(entry.master)) {
+                ++rebound_master;
+            }
+        } else if (entry.master.Data != nullptr) {
+            ++skipped_offloaded;
+        }
+        // Work: streaming block weights have `.Data == nullptr` until
+        // `gather_block` fills a prefetch slot — skip them here.
+        if (is_device_resident(entry.work)) {
+            if (rebind_one(entry.work)) {
+                ++rebound_work;
+            }
+        } else if (entry.work.Data == nullptr && entry.is_block && (mStreamWeights || mConfig.offload_master)) {
+            ++skipped_streaming;
+        }
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume dsl_wm_persistent] rebound_master=" << rebound_master
+                      << " rebound_work=" << rebound_work << " skipped_offloaded=" << skipped_offloaded
+                      << " skipped_streaming=" << skipped_streaming << " bytes_used=" << cursor
+                      << " slab_bytes=" << max_bytes << "\n";
+        }
+    }
+
+    return cursor;
 }
 
 void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaStream_t stream) {

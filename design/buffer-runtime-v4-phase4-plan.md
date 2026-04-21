@@ -810,17 +810,72 @@ Validation (parallel GPU 1 / 2 / 3, flag-on):
 Qwen3 flag-off baseline step-0 norm 3.4395; flag-on 3.4383 (Δ = 0.03%,
 parallel-run noise envelope).
 
+### M4c shipped (DslWeightManager master/work into Persistent arena)
+
+`DslWeightManager::allocate_weights` creates per-weight master + work
+tensors via `mAllocator->allocate`. Out of its five paths — streaming,
+offload_master, cpu_training, separate-work (dtype mismatch),
+shared-alias — M4c rebinds **every device-resident pair**, skipping
+offloaded (pinned CPU) masters and streaming work (`.Data == nullptr`
+prefetch slots). The fall-through handles dtype-mismatch (fp32-master /
+bf16-work mixed-precision training) directly; streaming-sharded masters
+still rebind (they're device-local even when work buffers aren't).
+
+New methods on `DslWeightManager`:
+- `total_persistent_bytes()` — sums bytes of every device-resident
+  tensor across `mWeights` (master + work), deduping any aliased
+  pointers so we don't double-count the non-`separate_work` case
+  (shouldn't happen — that path uses DslParamStore — but defensive).
+- `rebind_to_persistent_arena(arena_base, max_bytes, stream)` — walks
+  `mWeights` in deterministic `mParamOrder`, bump-allocates each
+  eligible tensor, `cudaMemcpyAsync`'s current bytes to the slab,
+  `mAllocator->free`'s the original, rebinds `.Data`. Aliased
+  buffers are detected by pointer equality and reuse the same slab
+  slot (single free). Preserves `Stats` + `Device`.
+
+Arena layout extended to three slabs:
+
+1. `[0, base_persistent_bytes)` — M4a base weights (layout offsets).
+2. `[base_persistent_bytes, + wm_slab_bytes)` — M4c DslWeightManager
+   pairs (bump offsets inside the slab).
+3. `[..+lora_slab_bytes)` — M4b LoRA adapters.
+
+Wiring: `dsl_model_execution.cpp` sets the weight manager on the
+executor **before** `ensure_graphs_compiled`, so `compile_graphs` can
+compute the slab size upfront. Removed the redundant late
+`set_weight_manager` call (idempotent; propagation to
+`mCompiledExecutor` happens inside `init_compiled_execution`).
+
+Validation (fp32-master / bf16-work qwen3 LoRA, 5 steps, parallel GPU):
+
+| Step | Base loss | Flag loss | Base norm | Flag norm |
+|-----:|----------:|----------:|----------:|----------:|
+|  0   | 2.0251    | 2.0251    | 3.4393    | 3.4387    |
+|  1   | 1.6158    | 1.6162    | 2.3241    | 2.3263    |
+|  2   | 1.5360    | 1.5355    | 1.9830    | 1.9392    |
+|  3   | 1.3975    | 1.3974    | 1.6312    | 1.6128    |
+|  4   | 1.3373    | 1.3371    | 1.4493    | 1.4362    |
+
+Loss deltas ≤ 0.03% through step 4. 227 WM-master (fp32) + 227
+WM-work (bf16) rebound into a 4.31 GiB slab; 784 LoRA tensors into
+57.8 MiB. `DslParamStore` correctly reports `skipped_managed=227`
+(no locally-allocated base params; all are deferred to the weight
+manager). Flag stays default off.
+
+Regressions checked: Qwen3 / Qwen3.5 / GPT-OSS flag-on (no weight
+manager configs) continue to produce identical rebind counts and
+losses as before M4c.
+
 ### M4 remaining (multi-session)
-- **M4c — offload / streaming / weight-manager paths into Persistent
-  arena.** `DslWeightManager::allocate_weights` has five divergent
-  paths (streaming, offload_master, cpu_training, separate-work,
-  shared-alias). Master weights live on pinned CPU under offload;
-  work-weight prefetch slots are double-buffered. The arena-rebind
-  pattern would need to target the `entry.work` device buffer only,
-  and tolerate `entry.master.Data` being a pinned CPU pointer. Today
-  M4c is blocked by the compile-time layout assuming all Persistent
-  offsets are device-resident — the offload path's per-layer
-  gather-into-prefetch-slot needs its own arena treatment.
+
+- **M4c2 — streaming / offload paths (prefetch buffers, pinned CPU
+  masters).** The in-shipped M4c handles device-resident pairs.
+  Streaming configs (ZeRO sharding + prefetch buffers) and offload
+  (pinned-CPU masters, zero-copy embeddings) still live outside the
+  arena. `mPrefetchBuffers` is its own structure — a separate slab
+  or arena extension could cover it. `offload_master` pinned CPU
+  storage can't be arena-backed without moving to UVA or dropping
+  the offload savings — likely stays out.
 - **M4d — quantized (FP8 / FP4 / BnB / MXFP4) weights into Persistent
   arena.** `csrc/src/runtime/qlora/` pipelines hold quantized base
   weights with per-block scales. Each quantizer's layout (packed
@@ -946,19 +1001,23 @@ If a feature passes validation, make it default and remove the env
 gate — features-behind-gates that validate clean are legacy-in-waiting.
 Conversely, features that fail validation: revert, document the gap,
 ship only the infra pieces that are independently correct.
-10. ✅ Persistent arena for base weights (M4a) + LoRA adapters (M4b).
-    M4a: `DslParamStore::rebind_to_persistent_arena` rebinds locally-
-    allocated base weights post-compile; clamp via
-    `rebindable_persistent_bytes` auto-skips QLoRA / weight-manager
-    configs. M4b: `ModularLoRAWeightsManager::rebind_to_persistent_arena`
-    reserves a bump-allocated slab at the tail of the Persistent arena
-    for every LoRA leaf tensor (master + work, attention / MLP / MoE-
-    experts / MoE-grouped / router). Gated on
+10. ✅ Persistent arena for base weights (M4a) + LoRA adapters (M4b) +
+    DslWeightManager master/work pairs (M4c). M4a: `DslParamStore::
+    rebind_to_persistent_arena` rebinds locally-allocated base weights
+    post-compile; clamp via `rebindable_persistent_bytes` auto-skips
+    QLoRA / weight-manager configs. M4b: `ModularLoRAWeightsManager::
+    rebind_to_persistent_arena` reserves a bump-allocated slab for every
+    LoRA leaf tensor (master + work, attention / MLP / MoE-experts /
+    MoE-grouped / router). M4c: `DslWeightManager::
+    rebind_to_persistent_arena` routes device-resident master/work pairs
+    (mixed-precision, streaming-sharded masters) into a middle slab
+    between base and LoRA; offloaded pinned-CPU masters and streaming
+    prefetch work buffers stay outside. Gated on
     `SUROGATE_USE_PHASE_PERSISTENT=1`, default off. Bit-identical on
     Qwen3 (227 base + 784 LoRA), Qwen3.5 (261 base + 384 LoRA), GPT-OSS
-    (0 base + 576 LoRA — the QLoRA external-expert path). M4c/d for
-    offload/streaming and quantized weight paths remain — see "M4
-    remaining" above.
+    (0 base + 576 LoRA), fp32-master mixed-precision Qwen3 (0 base + 227
+    WM-master + 227 WM-work + 784 LoRA, 5-step loss Δ ≤ 0.03%). M4c2
+    (offload/streaming prefetch) and M4d (quantized weights) remain.
 11. Accumulator arena for grads — same shape as (10), with ZeRO-2
     complications. **Not started.** Env-gate now split:
     `SUROGATE_USE_PHASE_ACCUMULATOR=1` (shadow; no op consumes it yet).
