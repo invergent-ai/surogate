@@ -1040,6 +1040,7 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     std::size_t skipped_no_producer = 0;
     std::size_t skipped_no_shape = 0;
     std::size_t skipped_no_offset = 0;
+    std::size_t skipped_non_arena_slot = 0;
     for (int tid = 0; tid < graph.num_tensors; ++tid) {
         const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
         if (meta.region != dsl::RegionKind::FwdStack) continue;
@@ -1055,6 +1056,33 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
         if (out_ref->shape.empty()) {
             ++skipped_no_shape;
             continue;
+        }
+        // Skip slots whose actual runtime storage lives OUTSIDE the
+        // FwdStack arena even though the compiler classified them as
+        // FwdStack region. These are either (a) owned by mAllocator
+        // (persistent cudaMalloc in dsl_run_state init, never consumed
+        // by consume_fwdstack_arena), or (b) routed through a special
+        // path (residual stream, QKVRoPE fallback to QKV, MoE buffers).
+        // Pre-binding to arena offsets would mismatch the legacy
+        // block_activation_ptr path which is still authoritative for
+        // these slots.
+        switch (out_ref->slot) {
+            case TensorSlot::BlockResidualAtt:  // mAllocator
+            case TensorSlot::BlockResidualFFN:  // managed residual stream
+            case TensorSlot::BlockQKVRoPE:      // falls back to BlockQKV when in-place
+            case TensorSlot::BlockRouterLogits:
+            case TensorSlot::BlockRouterProbs:
+            case TensorSlot::BlockRoutingWeights:
+            case TensorSlot::BlockRoutingIndices:
+            case TensorSlot::BlockPermutedInput:
+            case TensorSlot::BlockScatterIndices:
+            case TensorSlot::BlockExpertGateUp:
+            case TensorSlot::BlockExpertAct:
+            case TensorSlot::BlockExpertDown:
+            case TensorSlot::BlockMoeOut:  // view over BlockMLPDown
+                ++skipped_non_arena_slot;
+                continue;
+            default: break;
         }
 
         Tensor& t = mTensors[static_cast<std::size_t>(tid)];
@@ -1073,7 +1101,8 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
         if (std::string(dbg) == "1") {
             std::cerr << "[arena-consume fwd_stack tid] graph=" << graph.name << " bound=" << bound
                       << " skipped_no_producer=" << skipped_no_producer << " skipped_no_shape=" << skipped_no_shape
-                      << " skipped_no_offset=" << skipped_no_offset << "\n";
+                      << " skipped_no_offset=" << skipped_no_offset
+                      << " skipped_non_arena_slot=" << skipped_non_arena_slot << "\n";
         }
     }
 }
@@ -1117,10 +1146,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // Phase 4 M2: baked-view shortcut for SaveForBwd tids.
     // persist_saved_layer_tensors() writes the arena-backed Tensor into
     // mTensors[tid] via bind_tensor; reading directly from there skips a
-    // string-keyed hashmap lookup on the backward hot path. The M5.0
-    // `bind_from_region()` infrastructure (below) consolidates the
-    // arena-offset math for later milestones; this call site keeps the
-    // cached-only behavior for M5.0 (no change from pre-M5.0).
+    // string-keyed hashmap lookup on the backward hot path.
     if (tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
         const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
         if (meta.region == dsl::RegionKind::SaveForBwd) {
@@ -1137,6 +1163,25 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         if (name_it != mNamedTensors.end() && name_it->second.Data) {
             log_tensor(name_it->second, "named");
             return name_it->second;
+        }
+    }
+
+    // M5.γ: tid-baked fast path for FwdStack tids. Return the arena-backed
+    // cached Tensor pre-bound by populate_fwd_stack_bindings (runs on
+    // forward + replay entry). Skips when cached.Data is null (backward
+    // pass, or a slot excluded by the non-arena-slot filter in
+    // populate_fwd_stack_bindings) so the legacy block_activation_ptr
+    // chain below still resolves those cases. Skips when ref.shape is
+    // empty — caller hasn't declared a view, so let the canonical-shape
+    // cached/slot path run unchanged.
+    if (tid >= 0 && mCurrentGraph && !ref.shape.empty() && static_cast<std::size_t>(tid) < mTensors.size()) {
+        const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region == dsl::RegionKind::FwdStack) {
+            Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
+            if (cached.Data) {
+                log_tensor(cached, "region_fwd_stack_cached");
+                return cached;
+            }
         }
     }
 

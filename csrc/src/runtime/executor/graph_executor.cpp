@@ -1152,8 +1152,8 @@ void GraphExecutor::consume_fwdstack_arena() {
     if (!mPhaseArenas.fwd_stack_ptr || mPhaseArenas.fwd_stack_bytes == 0) return;
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     std::size_t overridden = 0;
-    std::size_t skipped_allocator_owned = 0;
     std::size_t skipped_undersized = 0;
+    std::size_t skipped_non_fwdstack = 0;
     for (int L = 0; L < num_layers; ++L) {
         auto& acts = mRunState.simplified_acts(L);
         const std::string prefix = "blocks[" + std::to_string(L) + "].";
@@ -1161,14 +1161,17 @@ void GraphExecutor::consume_fwdstack_arena() {
             const auto slot_idx = static_cast<std::size_t>(entry.slot);
             Tensor& slot = acts[entry.slot];
             if (slot.Rank == 0) continue;
-            if (slot.Data != nullptr) {
-                ++skipped_allocator_owned;
-                continue;
-            }
             const int tid = mCompiledForward->find_tensor_id(prefix + entry.name);
             if (tid < 0) continue;
             const auto& meta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
-            if (meta.region != dsl::RegionKind::FwdStack || meta.offset == SIZE_MAX) continue;
+            // Only route slots whose compile-time region is FwdStack. Slots
+            // promoted to SaveForBwd (e.g., BlockQKV saved for attention
+            // backward) keep their allocator-owned persistent buffers — the
+            // save path owns them.
+            if (meta.region != dsl::RegionKind::FwdStack || meta.offset == SIZE_MAX) {
+                ++skipped_non_fwdstack;
+                continue;
+            }
             const std::size_t runtime_bytes =
                 static_cast<std::size_t>(slot.nelem()) * static_cast<std::size_t>(get_dtype_size(slot.DType));
             if (meta.bytes < runtime_bytes) {
@@ -1183,15 +1186,29 @@ void GraphExecutor::consume_fwdstack_arena() {
                                          " + runtime_bytes " + std::to_string(runtime_bytes) + " exceeds arena " +
                                          std::to_string(mPhaseArenas.fwd_stack_bytes) + " for " + prefix + entry.name);
             }
+            // Unconditional override: for FwdStack-region slots the arena IS
+            // the truth. Pre-existing slot.Data (from mAllocator or a Stack
+            // lazy-alloc handoff) is replaced here so block_activation_ptr
+            // and the tid-baked populate_fwd_stack_bindings path converge
+            // on the same bytes.
             slot.Data = mPhaseArenas.fwd_stack_ptr + meta.offset;
             acts.persist_across_layer_end[slot_idx] = true;
             ++overridden;
+        }
+        // Re-propagate BlockMoeOut's view over BlockMLPDown — it was set
+        // once at run-state init and must refresh whenever MLPDown.Data
+        // moves (override above).
+        if (Tensor& mlp_down = acts[dsl::TensorSlot::BlockMLPDown]; mlp_down.Data != nullptr) {
+            if (Tensor& moe_out = acts[dsl::TensorSlot::BlockMoeOut]; moe_out.Rank > 0) {
+                std::vector<long> shape(moe_out.Sizes.begin(), moe_out.Sizes.begin() + moe_out.Rank);
+                moe_out = view_tensor(mlp_down, shape);
+            }
         }
     }
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
             std::cerr << "[arena-consume fwd_stack] overridden=" << overridden
-                      << " skipped_allocator_owned=" << skipped_allocator_owned
+                      << " skipped_non_fwdstack=" << skipped_non_fwdstack
                       << " skipped_undersized=" << skipped_undersized << " arena_bytes=" << mPhaseArenas.fwd_stack_bytes
                       << "\n";
         }

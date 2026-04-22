@@ -287,9 +287,22 @@ branch at `graph_executor.cpp:1164`). Requires that the initial Stack
 allocator handoff for simplified_acts not pre-populate arena-backed
 slots. Alternative: delete the stack-init path for simplified_acts
 entirely and source those slots only from the arena.
+**Shipped 2026-04-22.** `consume_fwdstack_arena` now overrides every
+allowlisted FwdStack slot unconditionally. `BlockMoeOut` view over
+`BlockMLPDown` is re-propagated after override. A symmetric filter
+was added to `populate_fwd_stack_bindings`: slots whose runtime
+storage lives outside the FwdStack arena (allocator-owned
+`BlockResidualAtt`, managed-residual `BlockResidualFFN`, the
+`BlockQKVRoPE` in-place fallback to `BlockQKV`, and all MoE
+allocator slots) are NOT pre-bound, so the legacy
+`block_activation_ptr` dispatch still owns those reads/writes.
 
-Only after that ships can `bind_from_region` be wired into
-`resolve_tensor` for FwdStack as the authoritative source.
+**M5.γ wiring (shipped, session 1 retry 2).** A cached-only fast
+path in `resolve_tensor` (after the `mNamedTensors` lookup): for
+FwdStack tids with non-empty `ref.shape` and `mTensors[tid].Data`
+set, return the pre-bound Tensor directly — skips the slot switch,
+`view_for_shape` call, and `block_activation_ptr` dispatch. Validated
+bit-identical on Qwen3 / GPT-OSS MXFP4 / Qwen3.5.
 
 **Deletes:** `SimplifiedLayerActivations` struct, `block_activation_ptr`,
 `block_gradient_ptr`, `TensorSlot::Block*/MoE*/DBlock*` enumerators,
