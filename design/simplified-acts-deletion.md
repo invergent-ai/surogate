@@ -356,3 +356,36 @@ Total: −480 lines net.
 - `block_activation_ptr` is 10 lines: tid-first lookup + `BlockResidualFFN → get_residual` + `BlockQKVRoPE → BlockQKV` fallback.
 - `SimplifiedLayerActivations`, the `simplified_acts(L)` accessor, `mSimplifiedActivations` storage, `allocate_simplified_activations`, `consume_fwdstack_arena`, `kFwdStackConsumeSlots`, and `block_slot_tensor` no longer exist.
 - Validation: Q3 / Q3.5 / GPT-OSS all within BF16 noise of baseline; Q3 no-recompute at 37.2k tps (base 36.9k).
+
+## M5.δ — gradient-side deletion (partial, 2026-04-22)
+
+Same scope for `SimplifiedLayerGradients` / `simplified_grads` / `block_gradient_ptr` / `consume_bwdstack_arena` / `allocate_simplified_gradients` / `refresh_simplified_gradients_base`. Started this session; partial progress.
+
+### Landed (commit `218d170`)
+
+**Dead `persist_across_layer_end` bitmap removed.** Grep-confirmed zero writes in the tree; the single read (`clear_large_bwd_grad_stack_slots`'s `if (bitmap[s]) return;` guard) always evaluated false and never short-circuited. Removing the field and the dead guard is a behavior-preserving cleanup.
+
+### Blocked
+
+Two attempted follow-up changes both regressed:
+
+1. **Tid-first routing in `block_gradient_ptr`** (analog of `block_activation_ptr`'s Option C path). Step 0 norm collapsed to `nan`. Root cause: during backward, some ops mutate `simplified_grads[slot].Data` via the returned pointer (e.g., `matmul_swiglu.cpp:460` — `d_ln2->Data = d_inp_ptr->Data`) while `mTensors[tid]` is still empty. Tid-first returns `mTensors[tid]` for later readers, diverging from the mutated `simplified_grads[slot]`. Reverted.
+2. **`populate_bwd_stack_bindings`** (analog of `populate_fwd_stack_bindings`) seeding `mTensors[tid].Data = bwd_stack_ptr + meta.offset` at backward entry. Step 0 norm regressed `3.4389 → 0.7786` — the exact value documented in the original design doc's post-failure notes. Root cause: pre-binding BwdStack tids with arena pointers bypasses the `Stack.owns(t.Data)` check at the cross-layer persist (`bwd_layer_end_cleanup`), so tids whose Data got rebound to Stack buffers via the mutation pattern never get persisted into `BwdCrossLayer` arena. Reverted.
+
+### Why gradients are structurally harder than activations
+
+The gradient-side machinery has three entangled subsystems the activation side didn't:
+
+- **Mutation-to-alias pattern.** `d_ln2->Data = d_inp_ptr->Data` and similar rebind an already-arena-backed slot to point at a Stack-backed op output. The `simplified_grads[slot]` storage holds the rebind; `mTensors[tid]` doesn't see it unless we mirror the write there.
+- **Temp-acquire on null-Data.** `block_gradient_ptr(...)->Data == nullptr` triggers `temp_acquire` (Stack allocation). Pre-populating `mTensors[tid]` with an arena pointer short-circuits this, changing whether the op writes to Stack or arena.
+- **Cross-layer persist via `Stack.owns`.** `bwd_layer_end_cleanup` scans `mTensors` for Stack-resident Data whose `last_use > idx` and copies them into `BwdCrossLayer` arena. Any pre-population that bypasses this detection (arena pointers aren't Stack-owned) skips the persist — correct for the 8 allowlist slots, incorrect for other BwdStack tids that do cross-layer.
+
+### What a clean M5.δ needs
+
+The gradient deletion cannot just copy the activation playbook. It needs either:
+
+1. **Mutation-aware populate.** Pre-populate `mTensors[tid]` identically to `simplified_grads[slot]` AND mirror every mutation through both until simplified_grads is deleted. Essentially a dual-cache sync layer — the Option A pattern from Session B that was abandoned on the activation side.
+2. **Delete the mutation sites first.** Find the N mutation sites (matmul_swiglu, fused_residual_rmsnorm, compiled_ops_execute) and convert them to use `mTensors[tid]` directly (via `executor_tid_slot`), bypassing `block_gradient_ptr`. Once no mutations touch `simplified_grads`, tid-first routing becomes safe.
+3. **Defer tid migration until after temp_acquire + cross-layer persist are restructured.** The current Stack+persist machinery predates the arena system; it could arguably be recast to work directly against `mTensors[tid]` and the tracking tables at `bwd_layer_end_cleanup`, at which point `simplified_grads` becomes redundant naturally.
+
+Option 2 is the minimum-viable path — same shape as the activation deletion sequence (`03c56b8` and after). It's probably a 1–2 session effort with focused investigation.
