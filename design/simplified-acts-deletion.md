@@ -245,3 +245,48 @@ Mapped-slot tids triggering the regression suggests path (3) — they're interme
 - **Consider whether replay_layer_forward's `mTensors` swap/restore interacts badly.** At backward entry my populate fills `mTensors`; replay swaps mTensors out for a fresh one, runs forward, swaps back. The swapped-back `mTensors` has the populate values — but any op during replay that wrote to `mTensors[tid]` (via tid cache) wouldn't reach the outer mTensors. Verify with a pointer snapshot at each boundary.
 
 **Status:** Still blocked. Three attempts so far; each narrowed the problem but none closed it. The current dual-dispatch stays. Session D proper remains cosmetic cleanup, not a correctness issue.
+
+## Session D proper — fourth attempt 2026-04-22 evening, abandoned
+
+Final (for now) deep dive. Narrowed the Q3.5 regression to a **shape mismatch in Q3.5-specific attention views**, specifically `view_backward` resolving via `shape_like` against a populate-bound forward-activation tid.
+
+### What was tried
+
+- Added `skipped_already_bound` check in `populate_fwd_stack_bindings` (preserves mSaved pre-bind). Did NOT fix Q3.5 norm.
+- Added `xbind-diff` instrumentation that snapshots `mTensors[tid].Data` before/after populate and logs per-tid changes. Produced a large list of Mapped-slot Q3.5 intermediates (lin_x_flat, split_N, transpose_N, lin_query/key/value, ones_1, ln1_weight_eff, ...).
+- Tried skipping populate for tids whose forward producer is `Ones`/`Zeros` (stack-backed via temp_alloc + store_tensor). No change in Q3.5 norm.
+- Tried skipping populate for a broader set of metadata ops (View/Transpose/Split/Narrow/Concat/Mul/Scale/MaskScatter/DeepstackInject/MRoPE/RoPE). Crashed Q3 with `view_backward: shape nelem mismatch` — those tids' bindings ARE needed for Q3.
+
+### What the crashes revealed
+
+Skipping Mapped-slot tids in populate (any variant) crashes Q3.5 backward with:
+
+```
+view_backward: shape nelem mismatch op=view_backward_20
+  input=d_blocks[23].att_4d  in_shape=[2,4096,1024]   in_nelem=8388608   (Hkv * D = 8 * 128 = 1024)
+  output=d_blocks[23].att    target_shape=[2,4096,8,256]  target_nelem=16777216  (Hq * D = 16 * 128 = 2048 when flat)
+```
+
+Q3.5 has `Hq=16, Hkv=8` — so `d_att_4d` vs `d_att` live at different head counts. `view_backward` resolves the target shape via `shape_like` → reads `mTensors[att_4d_tid]`. With populate bound → 4D shape (16M elem) returned. Without → falls through to the `wants_flat` infer path, which returns a 3D shape different from populate's.
+
+The two paths produce DIFFERENT `target_shape` values, and the legacy (infer) path happens to match what the backward operand expects. The populate path returns the forward-canonical shape, which doesn't.
+
+### Actual root cause
+
+**The `view_backward` shape resolution mechanism depends on the runtime state of `mTensors[shape_like_tid]`.** Under the current design it's intentional that the tid is null / has a stale shape when the fallback infer path needs to fire. Populate filling in the tid breaks that fallback assumption.
+
+This is a genuine design tension, not a bug in populate. Fixing it requires either:
+1. Making `view_backward` ignore populate-bound shape_like entries (e.g., by checking an "is_recomputed" flag on the tid) and always fall through to infer.
+2. Tracking a separate "fwd_shape" on the TensorMeta that populate can reflect without trampling `mTensors[tid].Rank/Sizes` — so `view_backward`'s shape_like reads the infer-compatible shape while the hot-path dispatch uses the populate's Data.
+3. Restructuring `view_backward` so it doesn't depend on `shape_like` resolving differently in fwd vs bwd.
+
+None of these are small changes.
+
+### Current status
+
+- Q3/Q3.5/GPT-OSS backward correctness intact on current HEAD (no populate at bwd entry).
+- Session D proper is structurally blocked by the `view_backward` shape_like resolution mechanism.
+- `SimplifiedLayerActivations` deletion still hinges on landing per-tid dispatch without disrupting `view_backward` — the root is now understood (`shape_like` reads populate-bound shape instead of inferring).
+- The dual-dispatch shipped via Option C remains correct on all tested configs and is the end-of-line for this branch.
+
+**Recommendation for a future attempt:** tackle `view_backward` FIRST — make its shape resolution self-contained (don't consult `mTensors[shape_like_tid]` for shape), then retry populate. Without that fix, populate at bwd entry is fundamentally incompatible with Q3.5's attention view chain.
