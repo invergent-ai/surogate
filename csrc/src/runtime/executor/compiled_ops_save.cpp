@@ -1122,9 +1122,12 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
 
 void CompiledExecutor::populate_bwd_stack_bindings(const CompiledGraph& graph) {
     // Seed mTensors[tid] from simplified_grads[L][slot] for every block-
-    // scope gradient slot. Arena-backed slots get the arena pointer;
-    // Stack-backed ones get null Data + shape/dtype. Post-populate,
-    // block_gradient_ptr can route tid-first without losing shape/dtype.
+    // scope gradient slot. simplified_grads encodes per-layer shape/dtype
+    // (including hybrid per-layer dims and the non-hybrid DAttOut→DResAtt
+    // aliasing) plus consume_bwdstack_arena's arena pointer assignments;
+    // deriving this from TensorMeta alone misses those distinctions and
+    // regresses Q3.5 / GPT-OSS. Post-populate, block_gradient_ptr's tid-
+    // first path routes every caller through mTensors[tid].
     if (static_cast<std::size_t>(graph.num_tensors) > mTensors.size()) return;
 
     static constexpr dsl::TensorSlot kSlots[] = {

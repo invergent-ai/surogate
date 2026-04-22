@@ -84,18 +84,15 @@ Tensor* block_activation_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
 Tensor* block_gradient_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
     if (layer_idx < 0) return nullptr;
     if (!is_block_gradient_slot(slot)) return nullptr;
-    // M5.δ: tid-first routing. populate_bwd_stack_bindings seeds
-    // mTensors[tid] from simplified_grads at bwd entry and every mutation
-    // site mirrors to both caches; either is authoritative. Prefer
-    // mTensors[tid] so deletion of simplified_grads doesn't need caller
-    // migration. Fall through when no executor is active (compile-time
-    // probes).
+    // M5.δ: mTensors[tid] is the sole source of truth for gradient
+    // activations. populate_bwd_stack_bindings seeds arena-backed tids
+    // at bwd entry; Stack-backed gradient tids get Data via temp_acquire
+    // on first use. When no executor is active (compile-time probes),
+    // there is no binding and nullptr is returned.
     if (auto* exec = rs.active_executor()) {
-        if (Tensor* t = exec->executor_tid_slot_binding(layer_idx, slot)) {
-            return t;
-        }
+        return exec->executor_tid_slot_binding(layer_idx, slot);
     }
-    return &rs.simplified_grads(layer_idx)[slot];
+    return nullptr;
 }
 
 Tensor* global_activation_ptr(DslRunState& rs, TensorSlot slot) {
