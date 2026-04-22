@@ -1061,68 +1061,22 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
             ++skipped_no_shape;
             continue;
         }
-        // Route each tid to its authoritative backing storage. Arena-backed
-        // slots live at `fwd_stack_ptr + meta.offset`; excluded slots
-        // (residual, MoE, managed stream, QKVRoPE in-place fallback) live
-        // in allocator-owned buffers on `simplified_acts` or the managed
-        // residual stream. Session D prep: binding all FwdStack tids into
-        // mTensors[tid] means `executor_tid_slot` returns non-null for
-        // every (layer, slot) pair, and `block_activation_ptr`'s
-        // legacy-fallback path becomes reachable only for tids the
-        // compiler didn't assign to FwdStack.
         Tensor& t = mTensors[static_cast<std::size_t>(tid)];
         const int layer = meta.block_layer_idx;
-        auto bind_from_acts_slot = [&](dsl::TensorSlot s) -> bool {
-            if (layer < 0) return false;
-            auto& acts = mRunState.simplified_acts(layer);
-            const Tensor& src = acts[s];
-            if (!src.Data) return false;
-            t = src;
-            return true;
-        };
-        bool bound_via_slot = false;
-        switch (out_ref->slot) {
-            case dsl::TensorSlot::BlockResidualAtt:
-            case dsl::TensorSlot::BlockRouterLogits:
-            case dsl::TensorSlot::BlockRouterProbs:
-            case dsl::TensorSlot::BlockRoutingWeights:
-            case dsl::TensorSlot::BlockRoutingIndices:
-            case dsl::TensorSlot::BlockPermutedInput:
-            case dsl::TensorSlot::BlockScatterIndices:
-            case dsl::TensorSlot::BlockExpertGateUp:
-            case dsl::TensorSlot::BlockExpertAct:
-            case dsl::TensorSlot::BlockExpertDown:
-            case dsl::TensorSlot::BlockMoeOut:
-                // Allocator-owned simplified_acts slots (or view thereof —
-                // BlockMoeOut is a view over BlockMLPDown, re-propagated by
-                // consume_fwdstack_arena).
-                bound_via_slot = bind_from_acts_slot(out_ref->slot);
-                break;
-            case dsl::TensorSlot::BlockQKVRoPE:
-                // In-place QKVRoPE: the slot may be unallocated (Data=nullptr
-                // in acts[]) when the model does in-place RoPE on the QKV
-                // buffer. Fall back to acts[BlockQKV] in that case.
-                bound_via_slot = bind_from_acts_slot(dsl::TensorSlot::BlockQKVRoPE);
-                if (!bound_via_slot) {
-                    bound_via_slot = bind_from_acts_slot(dsl::TensorSlot::BlockQKV);
-                }
-                break;
-            case dsl::TensorSlot::BlockResidualFFN:
-                // Managed residual stream. get_residual(layer) returns a
-                // Tensor handle into the residual-stream manager.
-                if (layer >= 0) {
-                    const Tensor& r = mRunState.get_residual(layer, mRunState.MainStream);
-                    if (r.Data) {
-                        t = r;
-                        bound_via_slot = true;
-                    }
-                }
-                break;
-            default: break;
-        }
-        if (bound_via_slot) {
-            ++bound;
-            continue;
+        // BlockResidualFFN lives on the managed residual stream, not the
+        // FwdStack arena; `rs.get_residual(layer)` returns its canonical
+        // handle. Every other FwdStack tid (including the MoE slots and
+        // BlockMoeOut's view over BlockMLPDown) takes its Data from
+        // `fwd_stack_ptr + meta.offset` — the coloring gives each slot its
+        // own offset, so generic binding produces the right pointer with
+        // the producing op's shape/dtype.
+        if (out_ref->slot == dsl::TensorSlot::BlockResidualFFN && layer >= 0) {
+            const Tensor& r = mRunState.get_residual(layer, mRunState.MainStream);
+            if (r.Data) {
+                t = r;
+                ++bound;
+                continue;
+            }
         }
 
         t.Data = mPhaseArenas->fwd_stack_ptr + meta.offset;
