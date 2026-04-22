@@ -241,8 +241,6 @@ Bit-identical loss/norm on all three models.
 
 ### Attempted but reverted
 
-- **`simplified_grads` → BwdStack arena** (~1.5 GiB Q3 win attempt). BwdStack is sized and coloring shares bytes across layers, but the cross-layer persist mechanism at `compiled_ops_execute.cpp:2500` only catches Stack-owned tensors. With grads arena-backed and arena bytes shared across layers, the residual-chain gradients (d_res_ffn, d_res_att, d_mlp_down) get overwritten by the next layer's backward before the earlier layer finishes reading them. The `Stack.owns` check also surprisingly returns true for the arena pointers being persisted, blowing the 64 MiB BwdCrossLayer budget after ~9 layers. Needs a dedicated migration that either grows BwdCrossLayer or extends the persist check to route arena-backed tensors too. Full revert.
-
 - **`cudnn_workspace` + `encoder_bwd_scratch`**: rebinding these caused "Invalid dtype" during weight import on Qwen3.5 and GPT-OSS. cudnn_workspace is declared in run_state_types.h as stack-overlaid via temp_acquire/temp_free, and the attention backend reads `.DType` in a code path that breaks across (B,T) recompiles when the pointer is owned by the arena rather than mAllocator. Reverted.
 
 ### Skipped by design
@@ -252,3 +250,31 @@ Bit-identical loss/norm on all three models.
 - **`dsl_stack` buffer**: ownership is already transferred via `rebase_stack_to_external` / `adopt_external_stack`; the `unified_stack_bytes = 0` decision in `compute_arena_sizes` documents why it stays mAllocator-backed for now (adoption briefly doubles stack-sized memory, which tripped the benchmark gate earlier).
 
 Total remaining `mAllocator->allocate` in the steady-state training path: `dsl_stack`, `cudnn_workspace`, `encoder_bwd_*` (4 tensors), quant-grad buffers + `mGradQuantStats`, and the two `act_grad_zero_ptrs`/`sizes` metadata tensors (sub-MiB each). Everything else routes through a Persistent / FwdStack / SaveForBwd / Accumulator / LoRA arena.
+
+## 2026-04-22: simplified_grads routed through BwdStack arena
+
+Second attempt at the BwdStack migration, this time successful. The first attempt (earlier today, reverted) failed because `mSimplifiedGradientsBase` is snapshotted in `allocate_simplified_gradients` *before* any arena consumer runs, so the `reset_simplified_gradients` call at `execute_backward` entry restored `.Data` to the pre-arena nullptrs. First op write then allocated on Stack via `ensure_output_tensor`, and the cross-layer persist mechanism caught the Stack-owned pointer and blew BwdCrossLayer's 64 MiB budget after ~9 layers.
+
+Fix: add `DslRunState::refresh_simplified_gradients_base()` and call it from `GraphExecutor::consume_bwdstack_arena` after the per-layer override, so the snapshot reflects arena pointers.
+
+`consume_bwdstack_arena` mirrors `consume_fwdstack_arena`: allowlist of 8 slots (`BlockDResFFN`, `BlockDResAtt`, `BlockDAttOut`, `BlockDLN2`, `BlockDMLPDown`, `BlockDHOut`, `BlockDAtt`, `BlockDLN1`), walks layers × slots, resolves tid via `mCompiledBackward->slot_to_tid`, overrides `Data = bwd_stack_ptr + meta.offset`. BwdStack coloring is `section_per_layer=false`, so all layers share one arena frame — backward processes layers sequentially and each overwrites the previous. The residual-chain cross-layer dependency still holds because layer L+1's write is still in memory when layer L reads.
+
+| Model        | Peak before | Peak after   | Δ mem                  | Δ step |
+|--------------|------------:|-------------:|-----------------------:|-------:|
+| Qwen3 0.6B   |       9,148 |   **7,356**  | **−1,792 MiB / −19.6%** | ≈noise |
+| Qwen3.5 0.8B |      14,934 |  **11,494**  | **−3,440 MiB / −23.0%** | ≈noise |
+| GPT-OSS 20B  |      27,928 |  **27,254**  | **−674 MiB / −2.4%**    | ≈noise |
+
+Q3/Q3.5 dense models see the big wins: `NumLayers × 7 × B*T*C × 2 bytes` collapses to one shared `B*T*C × 2` arena slot. GPT-OSS is smaller because `B=1, T=512` and the MoE-specific grad paths weren't in the allowlist.
+
+**Not bit-identical** to the pre-migration baseline — step 0 matches, but later steps drift within BF16 noise (step 19 on Q3: loss 0.9826 vs 0.9818, norm 0.7869 vs 0.7763). cuBLAS selects different matmul tiles based on pointer alignment; arena bytes have different offsets than allocator-owned cudaMallocs, so the backward matmuls pick marginally different kernels. Loss trajectory tracks baseline closely (monotonic decrease, no divergence).
+
+### Cumulative from post-M6 baseline (2026-04-21: `ee0a7ad`)
+
+| Model        | Post-M6 |  Today   | Δ mem             | Δ%     |
+|--------------|--------:|---------:|------------------:|-------:|
+| Qwen3 0.6B   |  11,874 | **7,356**| **−4,518 MiB**    | **−38%** |
+| Qwen3.5 0.8B |  18,822 | **11,494**| **−7,328 MiB**   | **−39%** |
+| GPT-OSS 20B  |  29,830 | **27,254**| **−2,576 MiB**   | **−9%**  |
+
+Final remaining `mAllocator->allocate` list: `dsl_stack`, `cudnn_workspace`, `encoder_bwd_*` (4 tensors), quant-grad tensors + `mGradQuantStats`, `act_grad_zero_ptrs`/`sizes`. All either have ownership reasons (`dsl_stack` adopt pattern), conflict with runtime-introspection behavior (`cudnn_workspace`), or hold sub-MiB metadata. Every sizeable steady-state device allocation is now arena-backed.
