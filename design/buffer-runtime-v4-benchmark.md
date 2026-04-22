@@ -220,3 +220,35 @@ Memory savings are negligible — and expected. Moving `output` from `mAllocator
 The architectural win is that the last sizeable `mAllocator->allocate` in `allocate_non_block_state` now goes through the arena; the only non-arena allocations remaining are `ln_final_rstd` / `freq_cis` / `d_embeddings` (small, skipped for later) and various scratch buffers in `allocate_scratch_buffers`.
 
 Bit-identical loss/norm on Q3 1-step (norm 3.4393 vs baseline 3.4389).
+
+## 2026-04-22: Persistent-extras slab expanded — all safe non-arena allocations
+
+After the `output` routing, the remaining `mAllocator->allocate` calls were audited and folded into the same extras slab where applicable. The final shape of `DslRunState::non_graph_persistent_extras_bytes()` covers three groups:
+
+1. **Remaining non-block buffers** (commit `417a124`): `ln_final_rstd`, `freq_cis`, `d_embeddings`, per-layer RoPE tables. Each is either small (rstd, rope) or had a DSL tid classified in a non-Persistent region (`d_encoded`/`d_x0` → ActivationGrad but landed BwdStack). Migrating them to the extras slab sidesteps the graph-classification question.
+
+2. **Device scratch buffers** (commit `520673a`): `rmsnorm_scratch`, `matmul_bias_scratch`, `norm_buffer`, `matmul_scales`, `cross_entropy_dloss`, `cross_entropy_logsumexp`, `cross_entropy_chunk_logsumexp`. Small/medium buffers with straightforward allocate→copy→free semantics.
+
+Final 3-model state (peak MiB, step ms):
+
+| Model        | Peak before cleanup | Peak after all cleanups | Δ from post-M6 baseline (11,874 / 18,822 / 29,830) |
+|--------------|--------------------:|------------------------:|---------------------------------------------------:|
+| Qwen3 0.6B   |               9,166 |               **9,148** | **−2,726 MiB / −23%**                              |
+| Qwen3.5 0.8B |              14,982 |              **14,934** | **−3,888 MiB / −21%**                              |
+| GPT-OSS 20B  |              27,932 |              **27,928** | **−1,902 MiB / −6%**                               |
+
+Bit-identical loss/norm on all three models.
+
+### Attempted but reverted
+
+- **`simplified_grads` → BwdStack arena** (~1.5 GiB Q3 win attempt). BwdStack is sized and coloring shares bytes across layers, but the cross-layer persist mechanism at `compiled_ops_execute.cpp:2500` only catches Stack-owned tensors. With grads arena-backed and arena bytes shared across layers, the residual-chain gradients (d_res_ffn, d_res_att, d_mlp_down) get overwritten by the next layer's backward before the earlier layer finishes reading them. The `Stack.owns` check also surprisingly returns true for the arena pointers being persisted, blowing the 64 MiB BwdCrossLayer budget after ~9 layers. Needs a dedicated migration that either grows BwdCrossLayer or extends the persist check to route arena-backed tensors too. Full revert.
+
+- **`cudnn_workspace` + `encoder_bwd_scratch`**: rebinding these caused "Invalid dtype" during weight import on Qwen3.5 and GPT-OSS. cudnn_workspace is declared in run_state_types.h as stack-overlaid via temp_acquire/temp_free, and the attention backend reads `.DType` in a code path that breaks across (B,T) recompiles when the pointer is owned by the arena rather than mAllocator. Reverted.
+
+### Skipped by design
+
+- **PINNED host buffers** (`encoder_bwd_indices`, `encoder_bwd_info`): host memory, not device arena candidates.
+- **Quant-grad tensors** (`mSimplifiedQuantGrads.*`): their `.Stats` is pointer arithmetic into `mGradQuantStats`; rebinding would orphan the link.
+- **`dsl_stack` buffer**: ownership is already transferred via `rebase_stack_to_external` / `adopt_external_stack`; the `unified_stack_bytes = 0` decision in `compute_arena_sizes` documents why it stays mAllocator-backed for now (adoption briefly doubles stack-sized memory, which tripped the benchmark gate earlier).
+
+Total remaining `mAllocator->allocate` in the steady-state training path: `dsl_stack`, `cudnn_workspace`, `encoder_bwd_*` (4 tensors), quant-grad buffers + `mGradQuantStats`, and the two `act_grad_zero_ptrs`/`sizes` metadata tensors (sub-MiB each). Everything else routes through a Persistent / FwdStack / SaveForBwd / Accumulator / LoRA arena.
