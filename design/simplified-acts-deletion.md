@@ -326,5 +326,33 @@ All three failure modes from prior attempts (Q3.5 norm collapse, GPT-OSS norm ex
 
 ### Open items
 
-- `SimplifiedLayerActivations` deletion is now mechanically unblocked. Next session can migrate remaining `block_activation_ptr` callers to the tid path without dual-cache sync concerns.
 - The `mForwardNamedTensorsSnapshot` map is populated but the current restore loop only restores tid entries; extend to named-tensor restoration if downstream migrations need it.
+
+## Deletion landed 2026-04-22
+
+Staged across five commits on top of the Session D proper unblock:
+
+| Commit    | Change                                                                                  | LOC   |
+|-----------|-----------------------------------------------------------------------------------------|-------|
+| `19662ef` | `executor_tid_slot` falls back to `mForwardGraph->slot_to_tid` when bwd has no mapping  | +10   |
+| `03c56b8` | `block_activation_ptr` drops the `simplified_acts` fallback branch                       | −57/+11 |
+| `a29dbd1` | `populate_fwd_stack_bindings` stops reading `simplified_acts`                            | −60/+14 |
+| `3190125` | Delete `consume_fwdstack_arena`, `simplified_acts()` accessor, `mSimplifiedActivations` | −296/+2 |
+| `f677dc8` | Delete `SimplifiedLayerActivations` struct + `block_slot_tensor` shim                   | −57/+3  |
+| `b2b3bef` | Extend populate + snapshot/restore to `SaveForBwd` region (no-recompute)                 | +44/−17 |
+
+Total: −480 lines net.
+
+### Key insights
+
+1. **Cross-graph tid lookup gap.** The backward graph's `slot→tid` map only has slots declared as output by bwd ops (the `d_*` gradients). Forward-only slots like `res_att`, `ln2`, `ln1_rstd` — which backward READS — were never in the bwd map, so `slot_to_tid` returned −1 and every such read fell back to `simplified_acts`. Since fwd/bwd share the tid namespace, consulting `mForwardGraph->slot_to_tid` when bwd's lookup misses recovers the correct tid and the mTensors fast path takes over.
+2. **simplified_acts was already redundant.** `consume_fwdstack_arena` wrote `fwd_stack_ptr + meta.offset` to `simplified_acts[L][slot].Data` for every arena-backed slot — the exact same pointer `populate_fwd_stack_bindings` writes into `mTensors[tid]`. The struct duplicated arena-backed bindings that mTensors already held.
+3. **Hot-path fallback fires were all compile-time or return-nullptr anyway.** The audit counted 15–21 fallback fires per session; every one of them fired at setup time, and after the cross-graph fix all but 6 disappeared. The remaining 6 (Parameter, Mapped, D* gradient slots, Saved, BlockHOut L=last) either return `nullptr` from the fallback (not block activations) or are null-guarded by the single caller.
+4. **SaveForBwd parity.** Under no-recompute, `finalize_save_for_bwd` promotes fwd→bwd-crossing block activations to `SaveForBwd`. The old `consume_fwdstack_arena` routed both regions; the new `populate_fwd_stack_bindings` and snapshot/restore had to cover both arenas too.
+
+### Final state
+
+- `mTensors[tid]` is the sole source of truth for block activations in both forward and backward.
+- `block_activation_ptr` is 10 lines: tid-first lookup + `BlockResidualFFN → get_residual` + `BlockQKVRoPE → BlockQKV` fallback.
+- `SimplifiedLayerActivations`, the `simplified_acts(L)` accessor, `mSimplifiedActivations` storage, `allocate_simplified_activations`, `consume_fwdstack_arena`, `kFwdStackConsumeSlots`, and `block_slot_tensor` no longer exist.
+- Validation: Q3 / Q3.5 / GPT-OSS all within BF16 noise of baseline; Q3 no-recompute at 37.2k tps (base 36.9k).
