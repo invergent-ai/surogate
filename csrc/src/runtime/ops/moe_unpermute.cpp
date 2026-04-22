@@ -29,7 +29,7 @@ void CompiledExecutor::dispatch_moe_unpermute(const CompiledOp& op) {
     // The mlp_down buffer has shape (B, T, C) which equals [num_tokens, hidden_size]
     // when viewed as 2D. This buffer survives layer boundary cleanup.
     int layer_idx = mCurrentLayer >= 0 ? mCurrentLayer : 0;
-    Tensor* mlp_down_ptr = block_activation_ptr(mRunState, layer_idx, TensorSlot::BlockMLPDown);
+    Tensor* mlp_down_ptr = block_slot_tensor(layer_idx, TensorSlot::BlockMLPDown);
     if (!mlp_down_ptr) {
         throw std::runtime_error("moe_unpermute: mlp_down slot unavailable for layer " + std::to_string(layer_idx));
     }

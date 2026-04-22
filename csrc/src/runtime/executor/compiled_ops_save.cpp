@@ -1107,6 +1107,17 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     }
 }
 
+Tensor* CompiledExecutor::block_slot_tensor(int layer_idx, TensorSlot slot) {
+    if (mCurrentGraph) {
+        const int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
+        if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+            Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
+            if (cached.Data) return &cached;
+        }
+    }
+    return block_activation_ptr(mRunState, layer_idx, slot);
+}
+
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
     const int tid = ref.tensor_id;

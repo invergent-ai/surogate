@@ -418,6 +418,15 @@ private:
     /// every FwdStack tid the compiler assigned an offset for.
     void populate_fwd_stack_bindings(const CompiledGraph& graph);
 
+    /// M5.γ migration helper: resolve (layer_idx, slot) → Tensor* preferring
+    /// the arena-backed `mTensors[tid]` path when populate_fwd_stack_bindings
+    /// pre-bound it, falling back to the legacy `block_activation_ptr` slot
+    /// dispatch for slots whose runtime storage lives outside the FwdStack
+    /// arena (residual, MoE, managed streams). Returns nullptr when neither
+    /// path yields a populated Tensor. Intended as the drop-in replacement
+    /// for direct `block_activation_ptr` calls in op dispatchers.
+    Tensor* block_slot_tensor(int layer_idx, TensorSlot slot);
+
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 

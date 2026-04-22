@@ -1156,12 +1156,13 @@ void GraphExecutor::consume_fwdstack_arena() {
     std::size_t skipped_non_fwdstack = 0;
     for (int L = 0; L < num_layers; ++L) {
         auto& acts = mRunState.simplified_acts(L);
-        const std::string prefix = "blocks[" + std::to_string(L) + "].";
         for (const auto& entry : kFwdStackConsumeSlots) {
             const auto slot_idx = static_cast<std::size_t>(entry.slot);
             Tensor& slot = acts[entry.slot];
             if (slot.Rank == 0) continue;
-            const int tid = mCompiledForward->find_tensor_id(prefix + entry.name);
+            // M5.γ migration: replaced `find_tensor_id("blocks[L].<name>")`
+            // + 15 string concatenations per layer with an O(1) LUT.
+            const int tid = mCompiledForward->slot_to_tid(L, entry.slot);
             if (tid < 0) continue;
             const auto& meta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
             // Only route slots whose compile-time region is FwdStack. Slots
@@ -1184,7 +1185,8 @@ void GraphExecutor::consume_fwdstack_arena() {
                 // its per-tid offsets — a compiler invariant violation.
                 throw std::runtime_error("consume_fwdstack_arena: slot offset " + std::to_string(meta.offset) +
                                          " + runtime_bytes " + std::to_string(runtime_bytes) + " exceeds arena " +
-                                         std::to_string(mPhaseArenas.fwd_stack_bytes) + " for " + prefix + entry.name);
+                                         std::to_string(mPhaseArenas.fwd_stack_bytes) + " for blocks[" +
+                                         std::to_string(L) + "]." + entry.name);
             }
             // Unconditional override: for FwdStack-region slots the arena IS
             // the truth. Pre-existing slot.Data (from mAllocator or a Stack

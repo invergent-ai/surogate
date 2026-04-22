@@ -2622,6 +2622,32 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
         }
     }
 
+    // M5.γ migration: populate CompiledGraph::slot_tid_by_layer so
+    // downstream dispatchers can resolve (layer_idx, slot) → tid in O(1)
+    // instead of constructing "blocks[L].<slot_name>" and hitting
+    // tensor_name_to_id. tid_slot above already carries the canonical
+    // (slot, layer) for every tid; fold it into the per-layer array.
+    {
+        constexpr std::size_t kSlotCount = static_cast<std::size_t>(TensorSlot::Mapped) + 1;
+        graph.slot_tid_by_layer.assign(num_layers, {});
+        for (auto& row : graph.slot_tid_by_layer) {
+            row.fill(-1);
+        }
+        for (std::size_t tid = 0; tid < num_tids; ++tid) {
+            const auto& rec = tid_slot[tid];
+            if (!rec.set) continue;
+            if (rec.layer_idx < 0 || static_cast<std::size_t>(rec.layer_idx) >= num_layers) continue;
+            const auto slot_idx = static_cast<std::size_t>(rec.slot);
+            if (slot_idx >= kSlotCount) continue;
+            // First writer wins; downstream ops that reference the same
+            // (layer, slot) with aliased tids resolve to the producer's
+            // canonical tid because record_ref favors outputs over inputs.
+            if (graph.slot_tid_by_layer[static_cast<std::size_t>(rec.layer_idx)][slot_idx] < 0) {
+                graph.slot_tid_by_layer[static_cast<std::size_t>(rec.layer_idx)][slot_idx] = static_cast<int>(tid);
+            }
+        }
+    }
+
     // Layout hash — determinism check point for distributed runs (Phase 2
     // step 5). Every rank running the same compile must produce the same
     // 64-bit value; callers can cross-rank-compare via NCCL/MPI allreduce.

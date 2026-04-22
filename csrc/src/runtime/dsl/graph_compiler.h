@@ -593,6 +593,25 @@ struct CompiledGraph {
         return &tensor_meta[static_cast<std::size_t>(tid)];
     }
 
+    /// M5.γ migration: reverse lookup table `(layer_idx, slot) -> tid`
+    /// populated by compute_layout. Replaces the
+    /// `find_tensor_id("blocks[L].<slot_name>")` string-construction +
+    /// hashmap lookup that every slot-keyed dispatcher used. Row layout:
+    /// `slot_tid_by_layer[layer_idx][static_cast<std::size_t>(slot)]`.
+    /// Returns -1 when the (layer, slot) pair has no tid in this graph.
+    std::vector<std::array<int, static_cast<std::size_t>(TensorSlot::Mapped) + 1>> slot_tid_by_layer;
+
+    int slot_to_tid(int layer_idx, TensorSlot slot) const {
+        if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= slot_tid_by_layer.size()) {
+            return -1;
+        }
+        const auto slot_idx = static_cast<std::size_t>(slot);
+        if (slot_idx >= slot_tid_by_layer[static_cast<std::size_t>(layer_idx)].size()) {
+            return -1;
+        }
+        return slot_tid_by_layer[static_cast<std::size_t>(layer_idx)][slot_idx];
+    }
+
     /// Debuggability (P4.7): name -> TensorMeta via name_to_id + meta_for_tensor_id.
     const TensorMeta* meta_for_name(const std::string& name) const {
         int tid = find_tensor_id(name);
