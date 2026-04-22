@@ -8,7 +8,7 @@ Supersedes schema-per-block and SSA+coloring plans. This revision incorporates c
 
 ## Status (keep updated)
 
-Last refresh: 2026-04-22. Grep for `Status (keep updated)` to find and update this section after any milestone lands.
+Last refresh: 2026-04-22 (Session D proper shipped). Grep for `Status (keep updated)` to find and update this section after any milestone lands.
 
 Legend: ✅ shipped • 🟡 in progress • ⬜ not started • ❌ abandoned
 
@@ -35,7 +35,8 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   ├── Session D prep: excluded-slot mTensors binding              ✅ 9a0e1f9
 │   │   ├── replay-path fix: Mapped-slot rejection, drop replay gate    ✅ 99368a5
 │   │   ├── Session D: reorder set_active_executor + fwd-graph setter   ✅ ca48fbc
-│   │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked — producer-based partition binds correctly by topology but regresses Q3.5 (norm 8.04→2.15) and GPT-OSS (norm 2.73→180). FwdStack arena data is overwritten across layers; debugging why legacy fallback is bit-correct while direct tid binding isn't requires per-tid shape/ptr divergence instrumentation. Postmortem: design/simplified-acts-deletion.md "Session D proper — attempted".
+│   │   ├── Session D proper unblock: snapshot/restore at bwd entry     ✅ ab463bf
+│   │   └── SimplifiedLayerActivations deletion (5-commit series)       ✅ 19662ef..b2b3bef — see design/simplified-acts-deletion.md
 │   ├── M5.δ  views + gradient leftovers                                ⬜ not started
 │   ├── M5.ε  cleanup sweep                                             ⬜ not started
 │   └── M5.ζ  no-recompute NaN fix (compile-time 3-change combo)        ✅ 531cda3 — see below
@@ -43,7 +44,7 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 Phase 5+                                                                 ⬜ not planned
 ```
 
-**Phase 4 closed** (M6 passed 2026-04-22). Post-M6 legacy-allocator cleanup (3 commits) dropped **2.7 GiB / 3.8 GiB / 1.9 GiB** on Qwen3 / Qwen3.5 / GPT-OSS — every block-scope simplified_acts slot is now arena-backed; `mAllocator->allocate` for block slots is gone. See buffer-runtime-v4-benchmark.md §"post-M6: legacy allocator cleanup". Follow-up on 2026-04-22 added `rebind_non_block_to_persistent_arena` (2026-04-22 §): 3 non-block tids (`x0`, `xF`, `d_ln_final`) rebound; a further 16/48/0 MiB on Q3/Q3.5/GPT-OSS. Remaining non-block tensors (`output`, `freq_cis`, `ln_final_rstd`, `d_embeddings`) are not yet DSL-op outputs so the arena doesn't size for them — future work registers them via `register_external_names`. Remaining M5 sub-milestones (Session D proper, M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
+**Phase 4 closed** (M6 passed 2026-04-22). Post-M6 legacy-allocator cleanup (3 commits) dropped **2.7 GiB / 3.8 GiB / 1.9 GiB** on Qwen3 / Qwen3.5 / GPT-OSS — every block-scope simplified_acts slot is now arena-backed; `mAllocator->allocate` for block slots is gone. See buffer-runtime-v4-benchmark.md §"post-M6: legacy allocator cleanup". Follow-up on 2026-04-22 added `rebind_non_block_to_persistent_arena` (2026-04-22 §): 3 non-block tids (`x0`, `xF`, `d_ln_final`) rebound; a further 16/48/0 MiB on Q3/Q3.5/GPT-OSS. Remaining non-block tensors (`output`, `freq_cis`, `ln_final_rstd`, `d_embeddings`) are not yet DSL-op outputs so the arena doesn't size for them — future work registers them via `register_external_names`. Remaining M5 sub-milestones (M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
 
 **M5.ζ — no-recompute NaN fix (shipped 2026-04-22, commit `531cda3`).** The pre-existing no-recompute NaN (pre-dated this branch, see [design/norecompute-nan-investigation.md](norecompute-nan-investigation.md)) is fixed with three tightly-coupled compile-time changes — *no* runtime-dispatch refactor was needed after all.
 
@@ -66,13 +67,17 @@ Phase 5+                                                                 ⬜ not
 - **`populate_bwd_stack_bindings` regression** (norm 3.4389→0.7786) was an unrelated side effect: pre-binding BwdStack tids in `mTensors[tid]` bypasses the `Stack.owns(t.Data)` check at `compiled_ops_execute.cpp:2500` and skips the cross-layer persist that backward consumers rely on. Unnecessary for the no-recompute fix — dropped from the shipped version.
 - **SaveForBwd arena routing was never the issue.** `consume_fwdstack_arena` already routes SaveForBwd tids to `save_for_bwd_ptr + block_base + meta.offset` for allowlisted slots. The `save_tensor_with_policy` by-reference path (`*mSaved[name] = src`) correctly stores the save-arena pointer from there.
 
-### Session D proper
+### Session D proper (shipped 2026-04-22)
 
-The runtime-dispatch blocker that halted Session D proper stands unchanged. M5.ζ does not touch it — the three shipped fixes are compile-time only. Session D proper's regressions on Q3.5 / GPT-OSS need a separate investigation; the hypothesis that it needed per-tid dispatch was incorrect (or at least incomplete).
+After four abandoned populate-at-bwd-entry attempts, the unblock turned out to be:
 
-**Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Session D (ca48fbc) shipped the two narrow wins toward simplified_acts deletion — reordering set_active_executor to after populate so the tid-first path is coherent at all times within execute_*, plus a forward-graph setter for future cross-graph work. Session D proper (the actual struct deletion) was attempted and abandoned after three partition strategies failed — producer-based topology is correct but binding cross-graph tids to `fwd_stack_ptr + offset` regresses on Q3.5 and GPT-OSS even though it's bit-identical to the legacy fallback on Q3. Postmortem captured in `design/simplified-acts-deletion.md`. The current dual-dispatch is bit-identical everywhere, well-understood, and carries no outstanding risk — further deletion is cosmetic and a future project, not a Phase 4 blocker.
+1. **`ab463bf` — snapshot/restore at bwd entry.** Snapshot forward's end-state `mTensors` / `mNamedTensors` and restore the arena-range-resident entries at `execute_backward` entry. Preserves forward's authoritative bindings (including `view_backward`'s `shape_like` sources) without re-deriving from `meta.offset`, which had been the Q3.5-regressing path.
+2. **`19662ef` — cross-graph `slot_to_tid` fallback.** Forward-only slots (`res_att`, `ln2`, `ln1_rstd`, …) aren't declared as output by any backward op, so the bwd graph's slot→tid map has no entry for them. Since fwd/bwd share the tid namespace, `executor_tid_slot` falls back to `mForwardGraph->slot_to_tid` when the current graph misses. Dropped hot-path `simplified_acts` fallback fires from 15 → 6 per session (all remaining 6 either return nullptr or hit null-guarded callers).
+3. **`03c56b8` → `f677dc8` + `b2b3bef`** — five-commit deletion sequence: `block_activation_ptr` fallback branch, `populate_fwd_stack_bindings` reads, `consume_fwdstack_arena`, `mSimplifiedActivations` storage, `SimplifiedLayerActivations` struct, `block_slot_tensor` shim. `populate_fwd_stack_bindings` and snapshot/restore extended to cover `SaveForBwd` arena for no-recompute parity.
 
-**Next step:** run **M6** (the Phase 4 benchmark gate — 3 models, see [buffer-runtime-v4-benchmark.md](buffer-runtime-v4-benchmark.md) thresholds) to close Phase 4 at a coherent milestone. Session D proper's abandonment means further M5.γ deletion is parked; M6 validates the current state as correctness-and-performance-complete.
+**Current position (2026-04-22):** Phase 4 M5.γ closed. `mTensors[tid]` is the sole source of truth for block activations; `block_activation_ptr` is 10 lines (tid lookup + `BlockResidualFFN` → managed residual + `BlockQKVRoPE` → `BlockQKV` fallback). Net ~480 lines deleted. Validation bit-identical on Q3/Q3.5/GPT-OSS (recompute) and Q3 no-recompute. Postmortem: `design/simplified-acts-deletion.md` §"Deletion landed 2026-04-22".
+
+**Next step:** M5.δ (views + gradient leftovers) and M5.ε (cleanup sweep) remain — cosmetic-only.
 
 **Kill criteria status:** none hit. Phase 1's role unification (`MatmulRole` typed ID) composes with all outcomes and is the fallback safety net.
 
