@@ -58,59 +58,13 @@ namespace dsl {
 // ---------------------------------------------------------------------------
 
 // Clear-.Data helpers for Stack-backed slots that Stack.restore invalidates.
-// These patterns repeat 4+ times in the dispatch loop (flat-ops path,
-// SegmentDispatch path, PhaseExit BwdBlock); hoist to file-scope so the
-// slot list stays in sync.
-//
-// Three states per slot:
-//   (a) Stack-owned transient — default; layer_end nulls so next layer's
-//       ensure_output_tensor temp_acquires fresh Stack storage.
-//   (b) replay-persist-arena transient — cudaMalloc'd per-op persist
-//       buffer from replay_layer_forward; next layer starts fresh via
-//       ensure_output_tensor. Same clear behavior as (a).
-//   (c) FwdStack-arena persistent — arena IS the permanent source of
-//       truth; layer_end preserves so arena-baked writes land correctly.
-//
-// `persist_across_layer_end[slot]` gates (c): when set, the null is
-// skipped. Wired by the arena-consumption path at compile time.
-static void clear_rstd_stack_slots(DslRunState& rs, int L, const char* phase) {
-    static const bool debug = std::getenv("SUROGATE_DEBUG_RSTD_CLEAR") != nullptr;
-    auto& acts = rs.simplified_acts(L);
-    auto clear = [&](TensorSlot s) {
-        if (acts.persist_across_layer_end[static_cast<std::size_t>(s)]) return;
-        if (Tensor* t = block_activation_ptr(rs, L, s)) {
-            if (debug && t->Data) {
-                fprintf(stderr,
-                        "[rstd-clear] %s layer=%d slot=%d ptr=%p\n",
-                        phase,
-                        L,
-                        static_cast<int>(s),
-                        static_cast<void*>(t->Data));
-            }
-            t->Data = nullptr;
-        }
-    };
-    clear(TensorSlot::BlockLN1RSTD);
-    clear(TensorSlot::BlockLN2RSTD);
-    clear(TensorSlot::BlockQRSTD);
-    clear(TensorSlot::BlockKRSTD);
-    clear(TensorSlot::BlockLSE);
-    clear(TensorSlot::BlockAttOut);
-    clear(TensorSlot::BlockLN1);
-    clear(TensorSlot::BlockLN2);
-    clear(TensorSlot::BlockHOut);
-}
-
-static void clear_ffn_temp_stack_slots(DslRunState& rs, int L) {
-    auto& acts = rs.simplified_acts(L);
-    auto clear = [&](TensorSlot s) {
-        if (acts.persist_across_layer_end[static_cast<std::size_t>(s)]) return;
-        if (Tensor* t = block_activation_ptr(rs, L, s)) t->Data = nullptr;
-    };
-    clear(TensorSlot::BlockMLPUp);
-    clear(TensorSlot::BlockSwiGLU);
-}
-
+// Removed `clear_rstd_stack_slots` and `clear_ffn_temp_stack_slots` —
+// consume_fwdstack_arena's unconditional override (M5.γ session 1,
+// ee0a7ad) arena-backs every slot in its allowlist and sets
+// persist_across_layer_end=true, so the clear path was a no-op on all
+// validated configs (Qwen3 / GPT-OSS MXFP4 / Qwen3.5). Clears for
+// simplified_grads (large_bwd_temps) still fire — see
+// clear_large_bwd_grad_stack_slots below.
 static void clear_large_bwd_grad_stack_slots(DslRunState& rs, int L) {
     auto& grads = rs.simplified_grads(L);
     auto clear = [&](TensorSlot s) {
@@ -1071,8 +1025,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
             }
             prune_stack_tensors();
-            if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
-            clear_rstd_stack_slots(mRunState, L, "fwd_end");
             layer_active[static_cast<std::size_t>(L)] = 0;
         }
         if (L >= 0) handle_layer_end(L);
@@ -2607,8 +2559,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mRunState.Stack.restore(initial_checkpoint);
         mTemps.clear();
         prune_stack_tensors(L);
-        clear_rstd_stack_slots(mRunState, L, "bwd_end");
-        if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
         if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
         last_layer_restored = L;
     };
@@ -3071,8 +3021,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // replay pollutes blocks[L+1]. Sweep every layer here so no Stack-range
     // pointer survives into the optimizer / next step.
     for (int L = 0; L < static_cast<int>(mConfig.NumLayers); ++L) {
-        clear_rstd_stack_slots(mRunState, L, "bwd_final");
-        if (mRunState.ffn_temps_on_stack()) clear_ffn_temp_stack_slots(mRunState, L);
         if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
     }
 
