@@ -28,7 +28,7 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   ├── session 1: FwdStack fast path in resolve_tensor             ✅ ee0a7ad
 │   │   ├── session 2: consolidate fast paths, drop stray debug         ✅ 559e5e6
 │   │   ├── session 3 / Session A: slot_to_tid LUT + helpers            ✅ 50daf70
-│   │   ├── Session B: mass migration attempt                           ❌ reverted (cache divergence)
+│   │   ├── Session B: mass migration attempt                           ❌ reverted; goal achieved by Option C below (no caller migration needed)
 │   │   ├── Session C design memo                                       ✅ 331f1fa (design/simplified-acts-deletion.md)
 │   │   ├── Session C step 1: delete dead layer-end clears              ✅ 72e8f4a
 │   │   ├── Session C step 2: delete dead persist bitmap                ✅ 0a28133
