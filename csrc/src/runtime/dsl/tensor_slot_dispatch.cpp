@@ -39,43 +39,6 @@ resolve_block_slot(const std::string& name, int* out_layer_idx, bool* out_is_fla
 
 namespace {
 
-// Post-storage-migration, SimplifiedLayerActivations / SimplifiedLayerGradients
-// hold their Tensors in a std::array indexed by TensorSlot enum value. The
-// previous member-pointer tables collapse into direct `acts[slot]` access.
-// `kValid*Slots` encode which indices are actually populated by
-// allocate_simplified_{activations,gradients} so lookups for unrelated slots
-// (globals, IO, params) cleanly return nullptr.
-constexpr bool is_block_activation_slot(TensorSlot s) {
-    switch (s) {
-        case TensorSlot::BlockLN1:
-        case TensorSlot::BlockLN1RSTD:
-        case TensorSlot::BlockLN2:
-        case TensorSlot::BlockLN2RSTD:
-        case TensorSlot::BlockQRSTD:
-        case TensorSlot::BlockKRSTD:
-        case TensorSlot::BlockQKV:
-        case TensorSlot::BlockLSE:
-        case TensorSlot::BlockAtt:
-        case TensorSlot::BlockAttOut:
-        case TensorSlot::BlockResidualAtt:
-        case TensorSlot::BlockMLPUp:
-        case TensorSlot::BlockSwiGLU:
-        case TensorSlot::BlockMLPDown:
-        case TensorSlot::BlockHOut:
-        case TensorSlot::BlockRouterLogits:
-        case TensorSlot::BlockRouterProbs:
-        case TensorSlot::BlockRoutingWeights:
-        case TensorSlot::BlockRoutingIndices:
-        case TensorSlot::BlockPermutedInput:
-        case TensorSlot::BlockScatterIndices:
-        case TensorSlot::BlockExpertGateUp:
-        case TensorSlot::BlockExpertAct:
-        case TensorSlot::BlockExpertDown:
-        case TensorSlot::BlockMoeOut: return true;
-        default: return false;
-    }
-}
-
 constexpr bool is_block_gradient_slot(TensorSlot s) {
     switch (s) {
         case TensorSlot::BlockDLN1:
@@ -98,32 +61,23 @@ constexpr bool is_block_gradient_slot(TensorSlot s) {
 Tensor* block_activation_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
     if (layer_idx < 0) return nullptr;
 
-    // M5.γ Option C: tid-first routing. When an executor is active, its
-    // mTensors[slot_to_tid(L, slot)] is the single source of truth for
-    // arena-backed FwdStack slots (populate_fwd_stack_bindings set it;
-    // consume_fwdstack_arena mirrored the same pointer into acts[slot] for
-    // backward compatibility). Mutations through the returned pointer
-    // reach the same Tensor regardless of which caller writes — closing
-    // the cache-divergence gap that derailed Session B. Excluded slots
-    // (residual, MoE, managed stream) have no tid binding, so
-    // active_executor_slot returns nullptr and we fall through to the
-    // existing simplified_acts / managed-residual dispatch.
+    // M5.η (post-Session-D+): mTensors[tid] is the sole source of truth for
+    // block activations. Non-arena special cases (managed residual stream,
+    // in-place QKVRoPE fallback) route directly to their owners. Callers
+    // that query an unbound slot at a phase where no executor is active
+    // (compile-time probes, debug dumps) get nullptr and are expected to
+    // handle it — every hot-path caller reaches here with an active
+    // executor whose mTensors already holds the authoritative binding.
     if (Tensor* t = rs.active_executor_slot(layer_idx, slot)) {
         return t;
-    }
-
-    auto& acts = rs.simplified_acts(layer_idx);
-    // Special cases: BlockQKVRoPE falls back to acts[BlockQKV] when
-    // qkv_rope isn't allocated (non-QK-norm path does in-place RoPE).
-    // BlockResidualFFN is owned by the managed residual stream.
-    if (slot == TensorSlot::BlockQKVRoPE) {
-        return acts[TensorSlot::BlockQKVRoPE].Data ? &acts[TensorSlot::BlockQKVRoPE] : &acts[TensorSlot::BlockQKV];
     }
     if (slot == TensorSlot::BlockResidualFFN) {
         return &rs.get_residual(layer_idx, rs.MainStream);
     }
-    if (!is_block_activation_slot(slot)) return nullptr;
-    return &acts[slot];
+    if (slot == TensorSlot::BlockQKVRoPE) {
+        return rs.active_executor_slot(layer_idx, TensorSlot::BlockQKV);
+    }
+    return nullptr;
 }
 
 Tensor* block_gradient_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
