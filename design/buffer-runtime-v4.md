@@ -34,14 +34,15 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   ├── Session C step 3 (Option C): block_activation_ptr → tid     ✅ 9ccc784
 │   │   ├── Session D prep: excluded-slot mTensors binding              ✅ 9a0e1f9
 │   │   ├── replay-path fix: Mapped-slot rejection, drop replay gate    ✅ 99368a5
-│   │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked by fallback-path callers (~6.8k hits/step on Q3)
+│   │   ├── Session D: reorder set_active_executor + fwd-graph setter   ✅ ca48fbc
+│   │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked — bwd's classify_tensors gives non-Unknown region to every fwd tid in the shared namespace, so a cross-graph populate can't safely target "bwd doesn't own this tid" via region alone. Needs a different partition (producer_op, or a dedicated cross-graph tid set).
 │   ├── M5.δ  views + gradient leftovers                                ⬜ not started
 │   └── M5.ε  cleanup sweep                                             ⬜ not started
 └── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ⬜ not started — blocked on M5 completion
 Phase 5+                                                                 ⬜ not planned
 ```
 
-**Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Remaining work is cleanup — the `SimplifiedLayerActivations` struct itself still has ~6.8k fallback hits per 1-step Qwen3 run (legitimate: pre-populate window, gradient slots, Parameter/Saved/Mapped lookups). Deleting the struct requires moving those callers off the fallback, which is a bigger structural refactor tracked in `design/simplified-acts-deletion.md`.
+**Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Session D (ca48fbc) shipped the two narrow wins toward simplified_acts deletion — reordering set_active_executor to after populate so the tid-first path is coherent at all times within execute_*, plus a forward-graph setter for future cross-graph work. Remaining work is the actual struct deletion, tracked in `design/simplified-acts-deletion.md`. The deeper blocker: bwd's `classify_tensors`/`derive_regions` assigns non-Unknown regions (via cross-graph SaveForBwd promotion, or ForwardActivation→FwdStack if bwd's tid_map has the name) to every tid in the shared namespace, so a "bind cross-graph fwd tids where bwd region=Unknown" filter matches 0 tids. Closing it needs either a producer-based partition or a dedicated cross-graph tid set built at `finalize_save_for_bwd` time.
 
 **Decision pending:** run **M6** (the Phase 4 benchmark gate — 3 models, see [buffer-runtime-v4-benchmark.md](buffer-runtime-v4-benchmark.md) thresholds) to close Phase 4 at a coherent milestone, or continue M5.γ → M5.ε cleanup first. M6 is the honest next step; the remaining M5 deletions are cosmetic given Option C closes the real design risk, and M6 can run against the current state to confirm no regressions before touching more code.
 
