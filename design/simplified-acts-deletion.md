@@ -290,3 +290,41 @@ None of these are small changes.
 - The dual-dispatch shipped via Option C remains correct on all tested configs and is the end-of-line for this branch.
 
 **Recommendation for a future attempt:** tackle `view_backward` FIRST — make its shape resolution self-contained (don't consult `mTensors[shape_like_tid]` for shape), then retry populate. Without that fix, populate at bwd entry is fundamentally incompatible with Q3.5's attention view chain.
+
+## Session D proper — UNBLOCKED 2026-04-22 (commit `ab463bf`)
+
+After four abandoned populate-based attempts, the working approach is snapshot/restore rather than re-deriving bindings at bwd entry.
+
+### Mechanism
+
+1. `CompiledExecutor` gets two new member vectors (`compiled_ops.h`):
+   - `std::vector<Tensor> mForwardTensorsSnapshot;`
+   - `std::unordered_map<std::string, Tensor> mForwardNamedTensorsSnapshot;`
+2. At the end of `execute_forward` (after `set_active_executor(nullptr)`), snapshot the full `mTensors` / `mNamedTensors` state.
+3. At the top of `execute_backward` — after `set_active_executor(this)`, **before** the `mSaved` pre-bind loop — restore snapshot entries filtered to tids where:
+   - `tensor_meta[i].region == RegionKind::FwdStack`, AND
+   - `snapshot[i].Data` lies in `[fwd_stack_ptr, fwd_stack_ptr + fwd_stack_bytes)`.
+
+The arena-range guard is the key. It avoids `Stack.owns()` false positives that sank the BwdStack migration earlier, and it preserves whatever mutations forward made to the Tensor struct (shape, dtype, in-place rebinds via `mlp_up->Data = up_out.Data`, etc.) — so `view_backward`'s `shape_like` resolution reads forward's *actual* post-execution shape rather than a fresh populate that would desynchronize from the shape_like fallback path.
+
+### Validation
+
+| Config          | Before / baseline | After  | Status |
+|-----------------|-------------------|--------|--------|
+| Qwen3           | norm 3.4389       | 3.4390 | ✓      |
+| Qwen3.5         | norm 8.0438       | 8.0439 | ✓      |
+| GPT-OSS         | norm 2.7561       | 2.7282 | ✓      |
+| Q3 no-recompute | — (peak 30004 MiB) | 444 ms / 36911 tps | ✓ |
+
+All three failure modes from prior attempts (Q3.5 norm collapse, GPT-OSS norm explosion, `view_backward` shape mismatch crash) are resolved by the arena-range filter.
+
+### Why this works where populate didn't
+
+- Populate re-derives the Tensor from `meta.offset` and canonical `ref.shape`. That's a *synthetic* binding; consumers that read the Tensor struct by value pick up forward-canonical shape, which is wrong for bwd flows that expect an infer-compatible shape (Q3.5 `att_4d` vs `att` at Hq≠Hkv).
+- Snapshot/restore replays exactly the bindings forward ended with — including every `bind_tensor`, in-place mutation, and view re-propagation. No shape re-derivation, no `shape_like` desync.
+- The arena-range guard prevents restoring entries whose `Data` was a transient BwdStack or Persistent slot that doesn't survive into backward; only true FwdStack live-outs come back.
+
+### Open items
+
+- `SimplifiedLayerActivations` deletion is now mechanically unblocked. Next session can migrate remaining `block_activation_ptr` callers to the tid path without dual-cache sync concerns.
+- The `mForwardNamedTensorsSnapshot` map is populated but the current restore loop only restores tid entries; extend to named-tensor restoration if downstream migrations need it.
