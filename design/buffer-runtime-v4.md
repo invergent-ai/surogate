@@ -17,33 +17,34 @@ Phase 0 — Audits                                                        ✅ do
 Phase 1 — Phase tree IR + region derivation + role unification          ✅ done
 Phase 2 — Compile-time layout + within-frame coloring                   ✅ done
 Phase 3 — Runtime-architecture migration + benchmark gate               ✅ done (arena consumption shipped; benchmark gate run at 3976cdb)
-Phase 4 — Delete the legacy machinery                                   🟡 in progress
+Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-plan.md) 🟡
 ├── M4a-e: arena routing default-on (Persistent + Accumulator + LoRA)   ✅ done (56904e8 closes out)
-└── M5: tid-baked dispatch (design/tid-baked-dispatch.md)
-    ├── M5.0  bind_from_region framework                                ✅ b4c34e2
-    ├── M5.α  globals bind-on-entry                                     ✅ 3309879
-    ├── M5.β  mSaved pre-bind at backward entry                         ✅ 80f0bf5
-    ├── M5.γ  FwdStack tid-baked dispatch                               🟡 HERE
-    │   ├── prereq: full FwdStack arena coverage                        ✅ 620f958
-    │   ├── session 1: FwdStack fast path in resolve_tensor             ✅ ee0a7ad
-    │   ├── session 2: consolidate fast paths, drop stray debug         ✅ 559e5e6
-    │   ├── session 3 / Session A: slot_to_tid LUT + helpers            ✅ 50daf70
-    │   ├── Session B: mass migration attempt                           ❌ reverted (cache divergence)
-    │   ├── Session C design memo                                       ✅ 331f1fa (design/simplified-acts-deletion.md)
-    │   ├── Session C step 1: delete dead layer-end clears              ✅ 72e8f4a
-    │   ├── Session C step 2: delete dead persist bitmap                ✅ 0a28133
-    │   ├── Session C step 3 (Option C): block_activation_ptr → tid     ✅ 9ccc784
-    │   ├── Session D prep: excluded-slot mTensors binding              ✅ 9a0e1f9
-    │   ├── replay-path fix: Mapped-slot rejection, drop replay gate    ✅ 99368a5
-    │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked by fallback-path callers (~6.8k hits/step on Q3)
-    ├── M5.δ  views + gradient leftovers                                ⬜ not started
-    └── M5.ε  cleanup sweep                                             ⬜ not started
+├── M5: tid-baked dispatch (design/tid-baked-dispatch.md)               🟡 HERE
+│   ├── M5.0  bind_from_region framework                                ✅ b4c34e2
+│   ├── M5.α  globals bind-on-entry                                     ✅ 3309879
+│   ├── M5.β  mSaved pre-bind at backward entry                         ✅ 80f0bf5
+│   ├── M5.γ  FwdStack tid-baked dispatch                               🟡
+│   │   ├── prereq: full FwdStack arena coverage                        ✅ 620f958
+│   │   ├── session 1: FwdStack fast path in resolve_tensor             ✅ ee0a7ad
+│   │   ├── session 2: consolidate fast paths, drop stray debug         ✅ 559e5e6
+│   │   ├── session 3 / Session A: slot_to_tid LUT + helpers            ✅ 50daf70
+│   │   ├── Session B: mass migration attempt                           ❌ reverted (cache divergence)
+│   │   ├── Session C design memo                                       ✅ 331f1fa (design/simplified-acts-deletion.md)
+│   │   ├── Session C step 1: delete dead layer-end clears              ✅ 72e8f4a
+│   │   ├── Session C step 2: delete dead persist bitmap                ✅ 0a28133
+│   │   ├── Session C step 3 (Option C): block_activation_ptr → tid     ✅ 9ccc784
+│   │   ├── Session D prep: excluded-slot mTensors binding              ✅ 9a0e1f9
+│   │   ├── replay-path fix: Mapped-slot rejection, drop replay gate    ✅ 99368a5
+│   │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked by fallback-path callers (~6.8k hits/step on Q3)
+│   ├── M5.δ  views + gradient leftovers                                ⬜ not started
+│   └── M5.ε  cleanup sweep                                             ⬜ not started
+└── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ⬜ not started — blocked on M5 completion
 Phase 5+                                                                 ⬜ not planned
 ```
 
 **Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Remaining work is cleanup — the `SimplifiedLayerActivations` struct itself still has ~6.8k fallback hits per 1-step Qwen3 run (legitimate: pre-populate window, gradient slots, Parameter/Saved/Mapped lookups). Deleting the struct requires moving those callers off the fallback, which is a bigger structural refactor tracked in `design/simplified-acts-deletion.md`.
 
-**Decision pending:** run the Phase 3 benchmark gate (peak memory + throughput on Qwen3-MoE / GPT-OSS 4-8 GPU) to close Phase 4 at a coherent milestone, or continue M5.γ → M5.ε cleanup. Benchmark gate is the honest next step; the remaining deletions are cosmetic given Option C closes the real design risk.
+**Decision pending:** run **M6** (the Phase 4 benchmark gate — 3 models, see [buffer-runtime-v4-benchmark.md](buffer-runtime-v4-benchmark.md) thresholds) to close Phase 4 at a coherent milestone, or continue M5.γ → M5.ε cleanup first. M6 is the honest next step; the remaining M5 deletions are cosmetic given Option C closes the real design risk, and M6 can run against the current state to confirm no regressions before touching more code.
 
 **Kill criteria status:** none hit. Phase 1's role unification (`MatmulRole` typed ID) composes with all outcomes and is the fallback safety net.
 
