@@ -1144,13 +1144,13 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
 
 Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
     if (!mCurrentGraph) return nullptr;
-    // Replay guard: during replay_layer_forward, mCurrentGraph is
-    // fwd_graph but the tid cache was populated from fwd-graph ref
-    // shapes. Cross-layer / slot-aliased resolution paths (view ops,
-    // _flat variants, Mamba-style 1D weight slots) can diverge from
-    // the simplified_acts-init shape that in-op callers expect. Keep
-    // block_activation_ptr on the legacy path during replay.
-    if (mInReplay) return nullptr;
+    // Mapped is the wildcard slot — block_activation_ptr(..., Mapped)
+    // returns nullptr (is_block_activation_slot(Mapped) == false), so the
+    // tid-first path must do the same. Without this guard, slot_to_tid
+    // returns the first Mapped tid per layer (arbitrary, often a 1D
+    // Mamba-style decay vector or similar) and the caller gets a
+    // shape-wrong tensor.
+    if (slot == TensorSlot::Mapped) return nullptr;
     const int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
     if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
     Tensor& t = mTensors[static_cast<std::size_t>(tid)];
