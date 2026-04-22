@@ -789,20 +789,32 @@ std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
         total += rf.bytes();
     }
     // Device scratch buffers — small individually but several per model.
-    // encoder_bwd_scratch (INT32, encoder-side) and cudnn_workspace
-    // (attention) are currently SKIPPED: cudnn_workspace is declared as
-    // stack-overlaid in run_state_types.h and the attention backend
-    // inspects `.DType` in ways that break when rebound across (B,T)
-    // recompiles for Qwen3.5/GPT-OSS. Quant-grad tensors are skipped
-    // because their `.Stats` field is pointer arithmetic into
-    // mGradQuantStats — rebinding would orphan the Stats link.
-    total += mScratch.rmsnorm_scratch.bytes();
-    total += mScratch.matmul_bias_scratch.bytes();
-    total += mScratch.norm_buffer.bytes();
-    total += mScratch.matmul_scales.bytes();
-    total += mScratch.cross_entropy_dloss.bytes();
-    total += mScratch.cross_entropy_logsumexp.bytes();
-    total += mScratch.cross_entropy_chunk_logsumexp.bytes();
+    // `bytes()` relies on the DType field being a valid enum; tensors that
+    // may be left default-constructed (DType uninitialized — e.g.
+    // encoder_bwd_scratch in LoRA-only mode) are gated on Data != nullptr
+    // via `.has_value()` to avoid throwing "Invalid dtype" from
+    // get_dtype_size. Quant-grad tensors are skipped because their `.Stats`
+    // field is pointer arithmetic into mGradQuantStats — rebinding would
+    // orphan the Stats link.
+    auto safe_bytes = [](const Tensor& t) -> std::size_t {
+        return t.has_value() ? t.bytes() : 0;
+    };
+    total += safe_bytes(mScratch.rmsnorm_scratch);
+    total += safe_bytes(mScratch.matmul_bias_scratch);
+    total += safe_bytes(mScratch.norm_buffer);
+    total += safe_bytes(mScratch.matmul_scales);
+    total += safe_bytes(mScratch.cross_entropy_dloss);
+    total += safe_bytes(mScratch.cross_entropy_logsumexp);
+    total += safe_bytes(mScratch.cross_entropy_chunk_logsumexp);
+    total += safe_bytes(mScratch.encoder_bwd_scratch);
+    // `cudnn_workspace` is NOT migrated: the rebind pattern transiently
+    // holds both the mAllocator buffer and the arena slot until
+    // `rebind_non_graph_persistent_to_arena` runs. On GPT-OSS that
+    // workspace is ~574 MiB, and the benchmark gate's peak-memory poll
+    // catches the spike — a +574 MiB regression vs mAllocator-only. Q3's
+    // cudnn_workspace is smaller (~192 MiB) and hides under other peaks.
+    // Moving cudnn to the arena requires allocating arena before run-
+    // state scratch buffers, which is a larger ordering refactor.
     return total;
 }
 
@@ -840,6 +852,7 @@ void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::siz
     rebind_into(mScratch.cross_entropy_dloss);
     rebind_into(mScratch.cross_entropy_logsumexp);
     rebind_into(mScratch.cross_entropy_chunk_logsumexp);
+    rebind_into(mScratch.encoder_bwd_scratch);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
