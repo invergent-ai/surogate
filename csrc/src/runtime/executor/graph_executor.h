@@ -453,9 +453,8 @@ private:
     void dump_simplified_activation_offsets();
 
     /// Override every FwdStack `simplified_acts[L][SLOT].Data` to
-    /// `fwd_stack_ptr + meta.offset` and mark the slot
-    /// persist_across_layer_end so the arena-baked pointer survives
-    /// layer_end clears. Runs once per (B,T) recompile after
+    /// `fwd_stack_ptr + meta.offset` so the arena-baked pointer is the
+    /// single source of truth. Runs once per (B,T) recompile after
     /// allocate_phase_arenas succeeds. Correctness prerequisites:
     ///   (i) per-frame coloring collapses slot-aliased tids so every ref
     ///       that resolves to a given runtime slot shares a single

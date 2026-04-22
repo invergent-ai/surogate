@@ -49,15 +49,6 @@ struct SimplifiedLayerActivations {
     // ("blocks[N].mamba_*") — no per-field struct storage needed.
     static constexpr std::size_t kSize = static_cast<std::size_t>(dsl::TensorSlot::Mapped) + 1;
     std::array<Tensor, kSize> slots{};
-    /// Per-slot "survive layer_end clears" bitmap. Default false (legacy
-    /// behavior: layer_end nulls the slot so the next layer's
-    /// ensure_output_tensor temp_acquires fresh Stack storage). Set true
-    /// for slots backed by a persistent arena (FwdStack, Persistent) where
-    /// the arena IS the permanent source of truth and layer_end must not
-    /// null the pointer — otherwise ensure_output_tensor would allocate
-    /// Stack storage on the next layer and the arena-baked write would
-    /// land in the wrong buffer.
-    std::array<bool, kSize> persist_across_layer_end{};
 
     Tensor& operator[](dsl::TensorSlot s) {
         return slots[static_cast<std::size_t>(s)];

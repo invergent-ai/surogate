@@ -1157,7 +1157,6 @@ void GraphExecutor::consume_fwdstack_arena() {
     for (int L = 0; L < num_layers; ++L) {
         auto& acts = mRunState.simplified_acts(L);
         for (const auto& entry : kFwdStackConsumeSlots) {
-            const auto slot_idx = static_cast<std::size_t>(entry.slot);
             Tensor& slot = acts[entry.slot];
             if (slot.Rank == 0) continue;
             // M5.γ migration: replaced `find_tensor_id("blocks[L].<name>")`
@@ -1194,7 +1193,6 @@ void GraphExecutor::consume_fwdstack_arena() {
             // and the tid-baked populate_fwd_stack_bindings path converge
             // on the same bytes.
             slot.Data = mPhaseArenas.fwd_stack_ptr + meta.offset;
-            acts.persist_across_layer_end[slot_idx] = true;
             ++overridden;
         }
         // Re-propagate BlockMoeOut's view over BlockMLPDown — it was set
