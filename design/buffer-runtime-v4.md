@@ -42,7 +42,7 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 Phase 5+                                                                 ⬜ not planned
 ```
 
-**Phase 4 closed** (M6 passed 2026-04-22). Remaining M5 sub-milestones (Session D proper, M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
+**Phase 4 closed** (M6 passed 2026-04-22). Post-M6 legacy-allocator cleanup dropped 2.5 GiB / 3.5 GiB on Qwen3 / Qwen3.5 by removing `mAllocator` leaks on 4 slots the arena already overrides — see buffer-runtime-v4-benchmark.md §"post-M6: legacy allocator cleanup". Remaining M5 sub-milestones (Session D proper, M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
 
 **Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Session D (ca48fbc) shipped the two narrow wins toward simplified_acts deletion — reordering set_active_executor to after populate so the tid-first path is coherent at all times within execute_*, plus a forward-graph setter for future cross-graph work. Session D proper (the actual struct deletion) was attempted and abandoned after three partition strategies failed — producer-based topology is correct but binding cross-graph tids to `fwd_stack_ptr + offset` regresses on Q3.5 and GPT-OSS even though it's bit-identical to the legacy fallback on Q3. Postmortem captured in `design/simplified-acts-deletion.md`. The current dual-dispatch is bit-identical everywhere, well-understood, and carries no outstanding risk — further deletion is cosmetic and a future project, not a Phase 4 blocker.
 

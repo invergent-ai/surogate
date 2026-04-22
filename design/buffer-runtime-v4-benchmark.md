@@ -157,3 +157,26 @@ the deletion.
 **Not measured in this gate (same as prior):** capture-replay split,
 multi-rank, fresh recompute correctness diff. These are untouched by
 M5.γ changes; prior validation stands.
+
+## 2026-04-22 post-M6: legacy allocator cleanup
+
+Found 4 `mAllocator->allocate` calls in
+`allocate_simplified_activations` for slots that
+`consume_fwdstack_arena` always overrides (BlockQKV / BlockQKVRoPE /
+BlockAtt / BlockMLPDown). Allocator-owned memory was never used —
+the arena pointer replaced it at (B,T) compile. Pure leak.
+
+Flipped all four to `stack_or_alloc(on_stack=true)` (Data=nullptr at
+init, arena override writes the real pointer).
+
+| Model        | Peak before | Peak after | Δ mem          | Δ step  |
+|--------------|------------:|-----------:|---------------:|--------:|
+| Qwen3 0.6B   |      11,874 |  **9,390** | **−2,484 MiB / −21%** | +0.30% |
+| Qwen3.5 0.8B |      18,822 | **15,350** | **−3,472 MiB / −18%** | +0.26% |
+| GPT-OSS 20B  |      29,830 | **29,494** | −336 MiB       | +0.62% |
+
+GPT-OSS's smaller peak delta: its peak is dominated by MoE expert
+buffers (still allocator-owned — not in `kFwdStackConsumeSlots`).
+The non-MoE cleanup hits the dense models hardest.
+
+Step throughput within ±1% on all configs. Correctness bit-identical.
