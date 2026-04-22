@@ -232,6 +232,21 @@ public:
     void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list,
                                            const CompiledGraph* capture_graph = nullptr);
 
+    /// M5.γ Option C tid-only slot resolver: returns `&mTensors[tid]` when
+    /// slot_to_tid resolves AND the tid has populated Data. Returns
+    /// nullptr otherwise — does NOT fall back to simplified_acts.
+    /// `DslRunState::active_executor_slot` calls this through the
+    /// active-executor back-reference so `block_activation_ptr` can
+    /// dispatch tid-first without recursion. See
+    /// design/simplified-acts-deletion.md.
+    Tensor* executor_tid_slot(int layer_idx, TensorSlot slot);
+
+    /// M5.γ migration shim (pre-dating Option C): tries the tid path,
+    /// falls back to `block_activation_ptr`. Retained for in-executor
+    /// callers that want a local one-liner; `block_activation_ptr` now
+    /// does the same internally via `executor_tid_slot`.
+    Tensor* block_slot_tensor(int layer_idx, TensorSlot slot);
+
 private:
     // Execute an MLP tile group in chunks along the sequence dimension.
     // Used when long_context mode is enabled to reduce peak MLP activation memory.
@@ -417,15 +432,6 @@ private:
     /// to `consume_fwdstack_arena` for the allowlisted slots but covers
     /// every FwdStack tid the compiler assigned an offset for.
     void populate_fwd_stack_bindings(const CompiledGraph& graph);
-
-    /// M5.γ migration helper: resolve (layer_idx, slot) → Tensor* preferring
-    /// the arena-backed `mTensors[tid]` path when populate_fwd_stack_bindings
-    /// pre-bound it, falling back to the legacy `block_activation_ptr` slot
-    /// dispatch for slots whose runtime storage lives outside the FwdStack
-    /// arena (residual, MoE, managed streams). Returns nullptr when neither
-    /// path yields a populated Tensor. Intended as the drop-in replacement
-    /// for direct `block_activation_ptr` calls in op dispatchers.
-    Tensor* block_slot_tensor(int layer_idx, TensorSlot slot);
 
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);

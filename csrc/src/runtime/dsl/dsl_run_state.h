@@ -30,6 +30,8 @@ class FP8ScalingState;
 
 namespace dsl {
 
+class CompiledExecutor;  // forward decl — see runtime/executor/compiled_ops.h
+
 // DSL run state for graph execution (activation buffers, scratch, etc).
 class DslRunState final : public IRunState {
 public:
@@ -99,6 +101,24 @@ public:
     modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) {
         return mSimplifiedActivations[layer_idx];
     }
+
+    /// M5.γ Option C: `block_activation_ptr` consults this back-ref to
+    /// route slot lookups through the executor's tid-keyed mTensors cache
+    /// before falling back to the simplified_acts struct. Set by the
+    /// executor at `execute_forward`/`execute_backward`/`replay_layer_forward`
+    /// entry, cleared at exit. Returns nullptr when no executor is active
+    /// (e.g., pre-execute paths, model init). See
+    /// design/simplified-acts-deletion.md.
+    void set_active_executor(CompiledExecutor* exec) {
+        mActiveExecutor = exec;
+    }
+    CompiledExecutor* active_executor() const {
+        return mActiveExecutor;
+    }
+    /// Delegate helper: returns `exec->executor_tid_slot(layer_idx, slot)`
+    /// when an executor is active, nullptr otherwise. Implemented in
+    /// dsl_run_state.cpp to keep this header free of compiled_ops.h.
+    Tensor* active_executor_slot(int layer_idx, TensorSlot slot);
     modules::SimplifiedLayerGradients& simplified_grads(int layer_idx) {
         return mSimplifiedGradients[layer_idx];
     }
@@ -317,6 +337,8 @@ public:
     }
 
 private:
+    CompiledExecutor* mActiveExecutor = nullptr;  // M5.γ Option C back-ref; unowned
+
     void allocate_non_block_state(const PretrainedConfig& cfg);
     void allocate_simplified_activations(const PretrainedConfig& cfg);
     void allocate_simplified_gradients(const PretrainedConfig& cfg);

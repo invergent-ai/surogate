@@ -1107,14 +1107,25 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     }
 }
 
+Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
+    if (!mCurrentGraph) return nullptr;
+    // During replay_layer_forward, mCurrentGraph switches to fwd_graph
+    // but the surrounding execution context is still backward. Cross-
+    // layer block_activation_ptr calls from the replay's pre-bind loop
+    // (external-inputs resolution) and in-op legacy callers expect the
+    // simplified_acts / managed-residual storage, not an fwd_graph
+    // tid-bound view that may have shape-diverged (aliased `_flat`
+    // variants, view ops producing different tids for the same slot).
+    // Fall through to legacy dispatch for replay.
+    if (mInReplay) return nullptr;
+    const int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
+    if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+    Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+    return t.Data ? &t : nullptr;
+}
+
 Tensor* CompiledExecutor::block_slot_tensor(int layer_idx, TensorSlot slot) {
-    if (mCurrentGraph) {
-        const int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
-        if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
-            Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
-            if (cached.Data) return &cached;
-        }
-    }
+    if (Tensor* t = executor_tid_slot(layer_idx, slot)) return t;
     return block_activation_ptr(mRunState, layer_idx, slot);
 }
 

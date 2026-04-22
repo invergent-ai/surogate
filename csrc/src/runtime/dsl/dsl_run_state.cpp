@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "runtime/attention/attention_backend.h"
+#include "runtime/executor/compiled_ops.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "runtime/training/runtime_options.h"
@@ -533,6 +534,10 @@ long DslRunState::shrink_stack_to_high_water_mark(long safety_bytes, long min_sa
     }
     resize_stack_to(target);
     return target;
+}
+
+Tensor* DslRunState::active_executor_slot(int layer_idx, TensorSlot slot) {
+    return mActiveExecutor ? mActiveExecutor->executor_tid_slot(layer_idx, slot) : nullptr;
 }
 
 Tensor& DslRunState::get_residual(int layer_idx, cudaStream_t stream) {

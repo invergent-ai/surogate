@@ -595,6 +595,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        const modules::ForwardHook* hook) {
     mComm = &comm;
     mCurrentGraph = &graph;
+    // M5.γ Option C: register as the active executor so block_activation_ptr
+    // routes slot lookups through mTensors[tid] first, matching the
+    // simplified_acts[slot] source of truth for arena-backed slots.
+    mRunState.set_active_executor(this);
     mTemps.clear();
     mMoEHostOffsetsCache.clear();
     // cudaFree and cudaMemPoolTrimTo are prohibited during CUDA stream capture —
@@ -1724,6 +1728,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         mWeightManager->release_embeddings(mRunState.MainStream);
         mWeightManager->release_final_norm(mRunState.MainStream);
     }
+
+    // M5.γ Option C: deregister. block_activation_ptr falls back to
+    // simplified_acts for any callers that run between execute_*
+    // invocations (e.g., GraphExecutor prologue / epilogue code).
+    mRunState.set_active_executor(nullptr);
 }
 
 void CompiledExecutor::execute_backward(const CompiledGraph& graph,
@@ -1734,6 +1743,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         bool skip_zeroing) {
     mComm = &comm;
     mCurrentGraph = &graph;
+    // M5.γ Option C: register as active executor for block_activation_ptr.
+    mRunState.set_active_executor(this);
     mRunState.reset_simplified_gradients();
     mTemps.clear();
     // Phase 3 subsystem #4: reset per-step bump cursor for bwd_cross_layer arena.
@@ -3035,6 +3046,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     if (mGrads.is_streaming_grads()) {
         mGrads.offload_non_block_grads(mRunState.MainStream);
     }
+
+    // M5.γ Option C: deregister on backward exit.
+    mRunState.set_active_executor(nullptr);
 }
 
 }  // namespace dsl
