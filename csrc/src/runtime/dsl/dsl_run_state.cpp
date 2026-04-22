@@ -808,26 +808,22 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         if (NumExperts > 0) {
             const long num_tokens = B * T;
             const long total_tokens = num_tokens * TopK;
-            acts[TensorSlot::BlockRouterLogits] =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterLogits), kind, {num_tokens, NumExperts});
-            acts[TensorSlot::BlockRouterProbs] =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterProbs), kind, {num_tokens, NumExperts});
-            acts[TensorSlot::BlockRoutingWeights] =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockRoutingWeights), kind, {num_tokens, TopK});
-            acts[TensorSlot::BlockRoutingIndices] = mAllocator->allocate(ETensorDType::INT32,
-                                                                         tag(TensorSlot::BlockRoutingIndices),
-                                                                         kind,
-                                                                         {num_tokens, TopK});
-            acts[TensorSlot::BlockPermutedInput] =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockPermutedInput), kind, {total_tokens, C});
-            acts[TensorSlot::BlockScatterIndices] =
-                mAllocator->allocate(ETensorDType::INT32, tag(TensorSlot::BlockScatterIndices), kind, {total_tokens});
-            acts[TensorSlot::BlockExpertGateUp] =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertGateUp), kind, {total_tokens, MoeMUp});
-            acts[TensorSlot::BlockExpertAct] =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertAct), kind, {total_tokens, MoeM});
-            acts[TensorSlot::BlockExpertDown] =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertDown), kind, {total_tokens, C});
+            // M5 cleanup: MoE slots now stack-init; consume_fwdstack_arena
+            // routes every MoE-layer FwdStack tid through the arena at
+            // (B,T) compile time. Drops 9 persistent mAllocator allocations
+            // per MoE layer in favor of the already-sized FwdStack arena.
+            stack_or_alloc(TensorSlot::BlockRouterLogits, true, dtype, {num_tokens, NumExperts});
+            stack_or_alloc(TensorSlot::BlockRouterProbs, true, dtype, {num_tokens, NumExperts});
+            stack_or_alloc(TensorSlot::BlockRoutingWeights, true, dtype, {num_tokens, TopK});
+            stack_or_alloc(TensorSlot::BlockRoutingIndices, true, ETensorDType::INT32, {num_tokens, TopK});
+            stack_or_alloc(TensorSlot::BlockPermutedInput, true, dtype, {total_tokens, C});
+            stack_or_alloc(TensorSlot::BlockScatterIndices, true, ETensorDType::INT32, {total_tokens});
+            stack_or_alloc(TensorSlot::BlockExpertGateUp, true, dtype, {total_tokens, MoeMUp});
+            stack_or_alloc(TensorSlot::BlockExpertAct, true, dtype, {total_tokens, MoeM});
+            stack_or_alloc(TensorSlot::BlockExpertDown, true, dtype, {total_tokens, C});
+            // BlockMoeOut is a VIEW of BlockMLPDown; consume_fwdstack_arena
+            // re-propagates the view after the MLPDown override (both MLPDown
+            // and MoeOut now resolve to the same arena bytes).
             acts[TensorSlot::BlockMoeOut] = view_tensor(acts[TensorSlot::BlockMLPDown], {num_tokens, C});
         }
         // else: slots default-constructed by std::array{} init above.

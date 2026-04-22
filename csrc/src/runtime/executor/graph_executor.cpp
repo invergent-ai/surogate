@@ -1145,6 +1145,17 @@ constexpr FwdStackConsumeSlot kFwdStackConsumeSlots[] = {
     {dsl::TensorSlot::BlockMLPDown, "mlp_down"},
     {dsl::TensorSlot::BlockHOut, "h_out"},
     {dsl::TensorSlot::BlockResidualAtt, "res_att"},
+    // MoE slots (only allocated when NumExperts > 0; Rank=0 skip in
+    // consume_fwdstack_arena handles dense-model case).
+    {dsl::TensorSlot::BlockRouterLogits, "router_logits"},
+    {dsl::TensorSlot::BlockRouterProbs, "router_probs"},
+    {dsl::TensorSlot::BlockRoutingWeights, "routing_weights"},
+    {dsl::TensorSlot::BlockRoutingIndices, "routing_indices"},
+    {dsl::TensorSlot::BlockPermutedInput, "permuted_input"},
+    {dsl::TensorSlot::BlockScatterIndices, "scatter_indices"},
+    {dsl::TensorSlot::BlockExpertGateUp, "expert_gate_up"},
+    {dsl::TensorSlot::BlockExpertAct, "expert_act"},
+    {dsl::TensorSlot::BlockExpertDown, "expert_down"},
 };
 
 }  // namespace
