@@ -158,6 +158,14 @@ public:
 
     void reset_simplified_gradients();
 
+    /// Re-snapshot `mSimplifiedGradientsBase` from the current
+    /// `mSimplifiedGradients` state. Call this after an arena consumer has
+    /// re-pointed block-scope grad slots (e.g.
+    /// `GraphExecutor::consume_bwdstack_arena`) so subsequent
+    /// `reset_simplified_gradients()` restores to arena pointers, not the
+    /// stale pre-arena snapshot.
+    void refresh_simplified_gradients_base();
+
     /// @brief Zero all activation gradient buffers (d_res_ffn, d_res_att) for all layers.
     /// Call this at the start of each backward pass to prevent stale gradients from accumulating.
     void zero_activation_gradients(cudaStream_t stream);

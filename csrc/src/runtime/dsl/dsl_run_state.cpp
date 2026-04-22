@@ -1010,13 +1010,27 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
                                : mAllocator->allocate(dtype, name, kind, shape);
         };
 
-        g[TensorSlot::BlockDResFFN] = mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
-        g[TensorSlot::BlockDResAtt] = mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        // Hybrid (Nemotron-H) keeps d_att_out independent; standard transformers
-        // alias it to d_res_att (residual + attn share the same backward path).
-        g[TensorSlot::BlockDAttOut] =
-            plan.is_hybrid ? mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}) : g[TensorSlot::BlockDResAtt];
-        g[TensorSlot::BlockDLN2] = mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
+        // Block-scope activation grads. Stack-init (Data=nullptr); the
+        // BwdStack arena is routed to these slots in
+        // `GraphExecutor::consume_bwdstack_arena`, which then calls
+        // `refresh_simplified_gradients_base()` so subsequent
+        // `reset_simplified_gradients` calls restore to arena pointers.
+        // BwdStack coloring shares bytes across layers
+        // (section_per_layer=false) because backward frames don't
+        // coexist — each layer overwrites the previous layer's slot.
+        // Hybrid (Nemotron-H) keeps d_att_out independent; standard
+        // transformers alias it to d_res_att.
+        auto stack_init_grad = [&](TensorSlot slot, std::vector<long> shape) {
+            g[slot] = Tensor::from_pointer(nullptr, DeviceId, dtype, shape);
+        };
+        stack_init_grad(TensorSlot::BlockDResFFN, {B, T, C});
+        stack_init_grad(TensorSlot::BlockDResAtt, {B, T, C});
+        if (plan.is_hybrid) {
+            stack_init_grad(TensorSlot::BlockDAttOut, {B, T, C});
+        } else {
+            g[TensorSlot::BlockDAttOut] = g[TensorSlot::BlockDResAtt];
+        }
+        stack_init_grad(TensorSlot::BlockDLN2, {B, T, C});
 
         stack_or_alloc_grad(TensorSlot::BlockDMLPUp,
                             plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot,
@@ -1028,17 +1042,18 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
                             {B, T, lM});
         stack_or_alloc_grad(TensorSlot::BlockDQKV, plan.large_bwd_temps_on_stack, "d_qkv", {B, T, lQKV});
 
-        g[TensorSlot::BlockDMLPDown] = mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
-        // Per-layer h_out gradient (Gemma4: block's final-output grad,
-        // separate from MLP's d_mlp_down so the backward chain doesn't
-        // collide across the MLP / _finalize split).
-        g[TensorSlot::BlockDHOut] = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
-        g[TensorSlot::BlockDAtt] = mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
-        g[TensorSlot::BlockDLN1] = mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
+        stack_init_grad(TensorSlot::BlockDMLPDown, {B, T, C});
+        stack_init_grad(TensorSlot::BlockDHOut, {B, T, C});
+        stack_init_grad(TensorSlot::BlockDAtt, {B, T, lAttnDim});
+        stack_init_grad(TensorSlot::BlockDLN1, {B, T, C});
     }
 
     // Preserve the original buffer pointers so we can restore them if the
     // compiled executor temporarily aliases gradients to stack-backed temps.
+    mSimplifiedGradientsBase = mSimplifiedGradients;
+}
+
+void DslRunState::refresh_simplified_gradients_base() {
     mSimplifiedGradientsBase = mSimplifiedGradients;
 }
 
