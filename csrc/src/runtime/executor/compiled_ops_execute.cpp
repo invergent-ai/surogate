@@ -1797,23 +1797,30 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // resolve_tensor tid-cache fast path for backward-consumed forward
     // activations (eliminates the slot-dispatch fallback that
     // Session D proper wants to remove).
-    if (!mForwardTensorsSnapshot.empty() && mForwardGraph && mPhaseArenas && mPhaseArenas->fwd_stack_ptr &&
-        mPhaseArenas->fwd_stack_bytes > 0) {
+    if (!mForwardTensorsSnapshot.empty() && mForwardGraph && mPhaseArenas) {
         const std::size_t n =
             std::min({mForwardTensorsSnapshot.size(), mTensors.size(), mForwardGraph->tensor_meta.size()});
         std::byte* fwd_lo = mPhaseArenas->fwd_stack_ptr;
         std::byte* fwd_hi = fwd_lo + mPhaseArenas->fwd_stack_bytes;
+        std::byte* save_lo = mPhaseArenas->save_for_bwd_ptr;
+        std::byte* save_hi = save_lo + mPhaseArenas->save_for_bwd_bytes;
+        const bool has_fwd = fwd_lo && mPhaseArenas->fwd_stack_bytes > 0;
+        const bool has_save = save_lo && mPhaseArenas->save_for_bwd_bytes > 0;
         for (std::size_t i = 0; i < n; ++i) {
             const auto& meta = mForwardGraph->tensor_meta[i];
-            if (meta.region != dsl::RegionKind::FwdStack) continue;
             std::byte* data = mForwardTensorsSnapshot[i].Data;
             if (!data) continue;
-            // Only restore if the Data pointer is within the FwdStack arena.
-            // Stack-owned pointers would trigger bwd_layer_end_cleanup's
-            // cross-layer persist (Stack.owns → true), which allocates per-tid
-            // copies into the 64 MiB BwdCrossLayer arena and overflows on
-            // Q3.5's hybrid blocks.
-            if (data < fwd_lo || data >= fwd_hi) continue;
+            // Only restore arena-resident bindings: Stack-owned pointers would
+            // trigger bwd_layer_end_cleanup's cross-layer persist (Stack.owns
+            // → true), which allocates per-tid copies into the 64 MiB
+            // BwdCrossLayer arena and overflows on Q3.5's hybrid blocks.
+            // FwdStack-region tids live in fwd_stack arena; under no-recompute,
+            // finalize_save_for_bwd promotes some to SaveForBwd, whose bindings
+            // live in save_for_bwd arena.
+            const bool in_fwd = has_fwd && meta.region == dsl::RegionKind::FwdStack && data >= fwd_lo && data < fwd_hi;
+            const bool in_save =
+                has_save && meta.region == dsl::RegionKind::SaveForBwd && data >= save_lo && data < save_hi;
+            if (!in_fwd && !in_save) continue;
             mTensors[i] = mForwardTensorsSnapshot[i];
         }
     }

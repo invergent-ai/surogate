@@ -1018,7 +1018,9 @@ Tensor* CompiledExecutor::bind_from_region(int tid, const TensorRef& ref) {
 
 void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     if (!mPhaseArenas || !mPhaseArenas->allocated) return;
-    if (!mPhaseArenas->fwd_stack_ptr || mPhaseArenas->fwd_stack_bytes == 0) return;
+    const bool has_fwd_arena = mPhaseArenas->fwd_stack_ptr && mPhaseArenas->fwd_stack_bytes > 0;
+    const bool has_save_arena = mPhaseArenas->save_for_bwd_ptr && mPhaseArenas->save_for_bwd_bytes > 0;
+    if (!has_fwd_arena && !has_save_arena) return;
     // Session D: during execute_backward we invoke this on the forward
     // graph to pre-bind fwd-activation tids into bwd's mTensors via the
     // shared tid namespace. bwd.num_tensors >= fwd.num_tensors, so allow
@@ -1047,7 +1049,25 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     std::size_t skipped_non_arena_slot = 0;
     for (int tid = 0; tid < graph.num_tensors; ++tid) {
         const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
-        if (meta.region != dsl::RegionKind::FwdStack) continue;
+        // Route FwdStack → fwd_stack arena; SaveForBwd → save_for_bwd arena
+        // (per-layer base + meta.offset). Under no-recompute,
+        // finalize_save_for_bwd promotes block activations that backward
+        // reads into SaveForBwd; their mTensors binding has to come from
+        // this populate since nothing else writes them before use.
+        std::byte* base_ptr = nullptr;
+        if (meta.region == dsl::RegionKind::FwdStack && has_fwd_arena) {
+            base_ptr = mPhaseArenas->fwd_stack_ptr;
+        } else if (meta.region == dsl::RegionKind::SaveForBwd && has_save_arena) {
+            if (meta.block_layer_idx >= 0 &&
+                static_cast<std::size_t>(meta.block_layer_idx) < mPhaseArenas->save_for_bwd_block_bases.size()) {
+                base_ptr = mPhaseArenas->save_for_bwd_ptr +
+                           mPhaseArenas->save_for_bwd_block_bases[static_cast<std::size_t>(meta.block_layer_idx)];
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        }
         if (meta.offset == SIZE_MAX) {
             ++skipped_no_offset;
             continue;
@@ -1065,11 +1085,11 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
         const int layer = meta.block_layer_idx;
         // BlockResidualFFN lives on the managed residual stream, not the
         // FwdStack arena; `rs.get_residual(layer)` returns its canonical
-        // handle. Every other FwdStack tid (including the MoE slots and
-        // BlockMoeOut's view over BlockMLPDown) takes its Data from
-        // `fwd_stack_ptr + meta.offset` — the coloring gives each slot its
-        // own offset, so generic binding produces the right pointer with
-        // the producing op's shape/dtype.
+        // handle. Every other arena-backed tid (FwdStack or SaveForBwd;
+        // including MoE slots and BlockMoeOut's view over BlockMLPDown)
+        // takes its Data from `base_ptr + meta.offset` — the coloring
+        // gives each slot its own offset, so generic binding produces the
+        // right pointer with the producing op's shape/dtype.
         if (out_ref->slot == dsl::TensorSlot::BlockResidualFFN && layer >= 0) {
             const Tensor& r = mRunState.get_residual(layer, mRunState.MainStream);
             if (r.Data) {
@@ -1079,7 +1099,7 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
             }
         }
 
-        t.Data = mPhaseArenas->fwd_stack_ptr + meta.offset;
+        t.Data = base_ptr + meta.offset;
         t.DType = out_ref->dtype;
         t.Rank = static_cast<int>(out_ref->shape.size());
         for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
