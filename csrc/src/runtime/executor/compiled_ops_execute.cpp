@@ -1735,6 +1735,20 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // simplified_acts for any callers that run between execute_*
     // invocations (e.g., GraphExecutor prologue / epilogue code).
     mRunState.set_active_executor(nullptr);
+
+    // M5.ζ+ / Session D proper: snapshot mTensors + mNamedTensors at the
+    // end of forward execution. Captures the authoritative per-tid
+    // runtime state produced by the forward dispatchers — including
+    // matmul_swiglu's live-buffer rebinds, store_tensor updates from
+    // metadata ops, Stack-backed temps, and view aliases. Restored at
+    // execute_backward entry so backward resolves route through the
+    // tid-cache fast path instead of relying on the slot-dispatch
+    // fallback. Prior Session D proper attempts re-populated from
+    // arena offsets at bwd entry, overwriting forward's mutations
+    // and regressing Q3.5 (norm 8.04→2.15) and GPT-OSS (norm
+    // 2.73→180); snapshotting forward's actual state sidesteps that.
+    mForwardTensorsSnapshot = mTensors;
+    mForwardNamedTensorsSnapshot = mNamedTensors;
 }
 
 void CompiledExecutor::execute_backward(const CompiledGraph& graph,
@@ -1772,6 +1786,37 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // for SaveForBwd tids, (b) replay_layer_forward for recompute tids, or
     // (c) block_activation_ptr's simplified_acts fallback.
     mRunState.set_active_executor(this);
+
+    // M5.ζ+ / Session D proper: restore forward's end-state mTensors for
+    // FwdStack-region tids only. Restricts to arena-backed activations
+    // (exclude Stack-backed temps like ones/zeros/views whose Stack
+    // pointer would trigger `Stack.owns(t.Data)` at
+    // bwd_layer_end_cleanup's cross-layer persist, blowing the 64 MiB
+    // BwdCrossLayer arena budget). Arena-backed tids have stable
+    // cross-phase pointers so restoring them is safe, and enables the
+    // resolve_tensor tid-cache fast path for backward-consumed forward
+    // activations (eliminates the slot-dispatch fallback that
+    // Session D proper wants to remove).
+    if (!mForwardTensorsSnapshot.empty() && mForwardGraph && mPhaseArenas && mPhaseArenas->fwd_stack_ptr &&
+        mPhaseArenas->fwd_stack_bytes > 0) {
+        const std::size_t n =
+            std::min({mForwardTensorsSnapshot.size(), mTensors.size(), mForwardGraph->tensor_meta.size()});
+        std::byte* fwd_lo = mPhaseArenas->fwd_stack_ptr;
+        std::byte* fwd_hi = fwd_lo + mPhaseArenas->fwd_stack_bytes;
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& meta = mForwardGraph->tensor_meta[i];
+            if (meta.region != dsl::RegionKind::FwdStack) continue;
+            std::byte* data = mForwardTensorsSnapshot[i].Data;
+            if (!data) continue;
+            // Only restore if the Data pointer is within the FwdStack arena.
+            // Stack-owned pointers would trigger bwd_layer_end_cleanup's
+            // cross-layer persist (Stack.owns → true), which allocates per-tid
+            // copies into the 64 MiB BwdCrossLayer arena and overflows on
+            // Q3.5's hybrid blocks.
+            if (data < fwd_lo || data >= fwd_hi) continue;
+            mTensors[i] = mForwardTensorsSnapshot[i];
+        }
+    }
 
     // M5.α: bind every stable non-param global into mTensors + mNamedTensors
     // at backward entry so resolve_tensor finds them via the tid/name cache

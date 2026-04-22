@@ -641,6 +641,16 @@ private:
     std::vector<Tensor> mTensors;
     // Name-indexed tensor overrides for cases where multiple tensor names share one tensor_id/slot.
     std::unordered_map<std::string, Tensor> mNamedTensors;
+    // M5.ζ+ / Session D proper: snapshot of forward's end-state mTensors /
+    // mNamedTensors, taken at execute_forward exit (before save_tensors).
+    // Restored into mTensors / mNamedTensors at execute_backward entry so
+    // backward ops see forward's authoritative runtime pointers — including
+    // matmul_swiglu's live-buffer rebinds, Stack-backed temps, and Mapped-slot
+    // intermediates. Prior Session D proper attempts tried populating from
+    // the arena offsets at bwd entry, which overwrote forward's mutations
+    // with stale arena pointers and regressed Q3.5 norm 8.04 → 2.15.
+    std::vector<Tensor> mForwardTensorsSnapshot;
+    std::unordered_map<std::string, Tensor> mForwardNamedTensorsSnapshot;
     std::vector<bool> mSaveMask;  // Per-tensor-id: true if in save list (for prune)
     const CompiledGraph* mCurrentGraph = nullptr;
 
