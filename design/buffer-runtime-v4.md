@@ -38,43 +38,37 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked — producer-based partition binds correctly by topology but regresses Q3.5 (norm 8.04→2.15) and GPT-OSS (norm 2.73→180). FwdStack arena data is overwritten across layers; debugging why legacy fallback is bit-correct while direct tid binding isn't requires per-tid shape/ptr divergence instrumentation. Postmortem: design/simplified-acts-deletion.md "Session D proper — attempted".
 │   ├── M5.δ  views + gradient leftovers                                ⬜ not started
 │   ├── M5.ε  cleanup sweep                                             ⬜ not started
-│   └── M5.ζ  per-tid region-aware block resolve                        ⬜ not started — unblocks Session D proper + fixes no-recompute NaN (see design/norecompute-nan-investigation.md)
+│   └── M5.ζ  no-recompute NaN fix (compile-time 3-change combo)        ✅ 531cda3 — see below
 └── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ✅ passed 2026-04-22 — see buffer-runtime-v4-benchmark.md §"M6 gate"
 Phase 5+                                                                 ⬜ not planned
 ```
 
 **Phase 4 closed** (M6 passed 2026-04-22). Post-M6 legacy-allocator cleanup (3 commits) dropped **2.7 GiB / 3.8 GiB / 1.9 GiB** on Qwen3 / Qwen3.5 / GPT-OSS — every block-scope simplified_acts slot is now arena-backed; `mAllocator->allocate` for block slots is gone. See buffer-runtime-v4-benchmark.md §"post-M6: legacy allocator cleanup". Follow-up on 2026-04-22 added `rebind_non_block_to_persistent_arena` (2026-04-22 §): 3 non-block tids (`x0`, `xF`, `d_ln_final`) rebound; a further 16/48/0 MiB on Q3/Q3.5/GPT-OSS. Remaining non-block tensors (`output`, `freq_cis`, `ln_final_rstd`, `d_embeddings`) are not yet DSL-op outputs so the arena doesn't size for them — future work registers them via `register_external_names`. Remaining M5 sub-milestones (Session D proper, M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
 
-**M5.ζ — per-tid region-aware block resolve (proposed, implementation attempted 2026-04-22, reverted).** The no-recompute NaN investigation (see [design/norecompute-nan-investigation.md](norecompute-nan-investigation.md)) uncovered a runtime-resolve blocker that also stalled Session D proper: `resolve_tensor` for block-scope tensors dispatches **per-slot** via `block_activation_ptr(rs, L, slot) → simplified_acts[L][slot].Data`, returning one canonical pointer per `(layer, slot)` pair. SSA aliases with distinct tids but the same slot all resolve to that one pointer. Consequently: (a) promoting a tid to `SaveForBwd` at compile time doesn't route its runtime resolves to the save arena; (b) two tids sharing a slot but with different regions can't both be honored. Two implementation options were considered:
+**M5.ζ — no-recompute NaN fix (shipped 2026-04-22, commit `531cda3`).** The pre-existing no-recompute NaN (pre-dated this branch, see [design/norecompute-nan-investigation.md](norecompute-nan-investigation.md)) is fixed with three tightly-coupled compile-time changes — *no* runtime-dispatch refactor was needed after all.
 
-1. **Per-tid arena-base lookup in the slot helpers.** `block_activation_ptr` / `block_gradient_ptr` consult `graph.tensor_meta[tid].{region, offset}` and return `arena_base[region] + offset` rather than the cached `simplified_acts[L][slot].Data`. `simplified_acts` stays as the ownership/metadata record (shape, dtype) but the hot-path dispatch reads the arena directly.
-2. **Expand the pre-binding consumers.** `populate_fwd_stack_bindings` / `consume_*_arena` iterate every live block-scope tid (not just the allowlisted canonical slots), so every promoted / reassigned tid gets its own backing pointer in its `mTensors[tid]` slot, and `resolve_tensor`'s existing tid-cache fast path picks it up before the slot fallback runs.
+### What shipped
 
-### Implementation attempt (reverted)
+1. **FwdStack `section_per_layer=true` under no-recompute.** Shared-across-layers coloring only kept the last layer's data in the arena; per-layer sections give every layer its own `[L*peak, (L+1)*peak)` slice so forward activations survive until save_tensors runs at forward exit. `compute_layout` now takes a `fwd_per_layer_sections` bool, threaded through `finalize_save_for_bwd` and the compile call site.
+2. **`finalize_save_for_bwd(..., std::nullopt, ...)` under no-recompute.** Name-match filtering against `mSaveList` missed SSA-alias tids (`blocks[L].x_flat` / `blocks[L].ln1_flat` — distinct tids that alias `blocks[L].ln1`), leaving them unpromoted in FwdStack where within-layer coloring clobbered their bytes. Passing `nullopt` (no filter) promotes every fwd∧bwd-crossing block tid to SaveForBwd.
+3. **Extended `retain_through_forward`** to fire under `fwd_per_layer_sections`, not just `recompute_mode`. Per-layer sectioning stops *cross*-layer clobber, but within-layer coloring still reuses bytes for disjoint-lifetime tids. `retain_through_forward` extends every block-scope FwdStack tid's live range to frame end so coloring cannot reuse — save_tensors finds the right bytes at each slot pointer.
 
-Option 2 was attempted incrementally:
+### Results
 
-- **Extended `populate_fwd_stack_bindings`** to also bind `SaveForBwd`-region tids to `save_for_bwd_ptr + block_base + meta.offset`. Safe in isolation (recompute stays bit-identical).
-- **Added `populate_fwd_stack_bindings(*mForwardGraph)` at `execute_backward` entry**. Safe in isolation.
-- **Added symmetric `populate_bwd_stack_bindings`** for BwdStack region (grads). **Regressed Q3 recompute norm 3.4389 → 0.7786** — the pre-bind suppresses the `Stack.owns(t.Data)` check in `bwd_layer_end_cleanup`, skipping cross-layer BwdCrossLayer persist that `simplified_grads` consumers rely on. Reverted.
-- **Folded in compile-time fixes** (`section_per_layer=!recompute` + `save_name_arg=nullopt` under no-recompute). On no-recompute: NaN → `loss ≈ 16 / norm ≈ 0` (no longer crashing but still not training). Revealed a deeper interaction: `save_tensor_with_policy`'s `force_persist` path copies to `mMoeSavedBuffers` (the MoE-saved arena), not the SaveForBwd arena, so pre-binding `SaveForBwd` tids to `save_for_bwd_ptr` in `populate_fwd_stack_bindings` points at the sized-but-unwritten save slab. Reverted. Regressed recompute too.
+- **Recompute bit-identical on all 3 models.** Q3 norm 3.4386, Q3.5 norm 8.0438, GPT-OSS norm 2.7561 — all match pre-fix baselines.
+- **No-recompute converges normally.** Q3 loss 2.0251→0.94 over 20 steps; norm trajectory matches recompute within BF16 noise (step 0: 3.4389 recompute vs 3.3997 no-recompute).
+- **No-recompute is 32% faster.** 37k tps no-recompute vs 28k tps recompute on Q3.
+- **Memory cost is real.** Q3 no-recompute peak 30 GiB vs recompute 7 GiB — SaveForBwd arena sizes for every fwd→bwd crossing (~5 GiB), FwdStack grows `num_layers×` (~2.6 GiB). No way around this; no-recompute trades memory for speed by definition.
 
-Full revert; branch restored to `fa0c57e`.
+### What the earlier failed attempts got wrong
 
-### Lessons for the next attempt
+- **Per-tid runtime dispatch wasn't actually needed.** Once `retain_through_forward` is applied in no-recompute mode, the per-slot simplified_acts dispatch works fine — the retained tid's bytes aren't reused, so the slot's cached pointer resolves to the right data.
+- **`populate_bwd_stack_bindings` regression** (norm 3.4389→0.7786) was an unrelated side effect: pre-binding BwdStack tids in `mTensors[tid]` bypasses the `Stack.owns(t.Data)` check at `compiled_ops_execute.cpp:2500` and skips the cross-layer persist that backward consumers rely on. Unnecessary for the no-recompute fix — dropped from the shipped version.
+- **SaveForBwd arena routing was never the issue.** `consume_fwdstack_arena` already routes SaveForBwd tids to `save_for_bwd_ptr + block_base + meta.offset` for allowlisted slots. The `save_tensor_with_policy` by-reference path (`*mSaved[name] = src`) correctly stores the save-arena pointer from there.
 
-1. **BwdStack pre-binding needs coordination with the cross-layer persist mechanism.** `bwd_layer_end_cleanup`'s persist check at `compiled_ops_execute.cpp:2500` assumes tensors that need cross-layer survival are `Stack.owns`-backed. Arena-backed tensors are assumed naturally-persistent, but that's false when the arena is shared-across-layers (BwdStack `section_per_layer=false`). Fix candidates: extend the persist check to also route BwdStack arena tensors with `last_use` past the current layer, or switch BwdStack to `section_per_layer=true` under certain conditions.
-2. **SaveForBwd arena is compile-time-sized but not where runtime actually writes saves.** Under no-recompute, the by-reference save (`*mSaved[name] = src`) points at *FwdStack* arena bytes (because forward ops write there, not SaveForBwd). The SaveForBwd arena is reserved but unused. To make per-tid SaveForBwd binding correct, either (a) teach `save_tensor_with_policy` to copy into the SaveForBwd arena under no-recompute, or (b) abandon SaveForBwd region for no-recompute and keep FwdStack with per-layer sectioning.
-3. **Incremental flip-by-flip is essential.** Each pre-bind change (fwd tids / SaveForBwd / bwd tids / compile filter) interacts with different parts of the save / persist / recompute machinery. Land one at a time behind a feature flag; validate recompute bit-identical and no-recompute incrementally.
+### Session D proper
 
-### Acceptance criteria (unchanged)
-
-- Qwen3 / Qwen3.5 / GPT-OSS bit-identical on recompute-on bench configs.
-- Qwen3 no-recompute bench (`qwen3-lora-bf16-bench-norecompute.yaml`) loss/norm trajectory matches recompute-on within BF16 noise (current state: NaN from step 0).
-- Session D proper's three failed partition strategies can be retried without regressing Qwen3.5 / GPT-OSS — the per-tid pointer routing should remove the dependency on the fallback path that was the root cause of the earlier regressions.
-- Peak memory gate: ±2% on all three models, same thresholds as M6.
-
-**Not in scope for M5.ζ:** the `section_per_layer` / `save_name_set` compile-time fixes are necessary but not sufficient; lesson 2 above makes them dependent on a runtime save-path change that belongs in the same milestone.
+The runtime-dispatch blocker that halted Session D proper stands unchanged. M5.ζ does not touch it — the three shipped fixes are compile-time only. Session D proper's regressions on Q3.5 / GPT-OSS need a separate investigation; the hypothesis that it needed per-tid dispatch was incorrect (or at least incomplete).
 
 **Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Session D (ca48fbc) shipped the two narrow wins toward simplified_acts deletion — reordering set_active_executor to after populate so the tid-first path is coherent at all times within execute_*, plus a forward-graph setter for future cross-graph work. Session D proper (the actual struct deletion) was attempted and abandoned after three partition strategies failed — producer-based topology is correct but binding cross-graph tids to `fwd_stack_ptr + offset` regresses on Q3.5 and GPT-OSS even though it's bit-identical to the legacy fallback on Q3. Postmortem captured in `design/simplified-acts-deletion.md`. The current dual-dispatch is bit-identical everywhere, well-understood, and carries no outstanding risk — further deletion is cosmetic and a future project, not a Phase 4 blocker.
 

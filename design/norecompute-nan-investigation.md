@@ -1,5 +1,7 @@
 # No-recompute NaN Investigation
 
+**Status:** FIXED as of commit `531cda3` (2026-04-22). See `design/buffer-runtime-v4.md` M5.ζ for shipped details.
+
 **Date:** 2026-04-22
 **Branch:** `buffer-runtime-v4-prototype`
 **Config:** `examples/sft/qwen3/qwen3-lora-bf16-bench-norecompute.yaml`
