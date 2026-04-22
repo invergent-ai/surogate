@@ -118,3 +118,42 @@ baseline in the table above (7,700 / 12,204 → 11,796 / 19,020 MiB)
 because of independent codebase changes between the two gate runs;
 the measurement-local delta attributable to arena consumption is
 the ±0.3% reported in the "Δ step_ms" column.
+
+## 2026-04-22 M6 gate: Phase 4 close-out
+
+Post–M5.γ (Option C + replay fix + Session D narrow wins, landing
+at commit `61831e4`). This closes Phase 4 — every subsequent delta
+shipped since the 2026-04-21 re-bench goes through this gate.
+
+| Model        | Avg step (ms) | Tokens/s | Peak (MiB) | Δ step_ms vs 2026-04-21 | Δ peak_MiB vs 2026-04-21 |
+|--------------|--------------:|---------:|-----------:|------------------------:|-------------------------:|
+| Qwen3 0.6B   |        577.3  |  28,381  |    11,874  | **−0.2%** (within noise) | **+0.7%** ✓              |
+| Qwen3.5 0.8B |      2,155.6  |  15,201  |    18,822  | **−3.7%** ✓              | **−1.0%** ✓              |
+| GPT-OSS 20B  |      2,636.1  |     777  |    29,830  | **−3.8%** ✓              | **−1.8%** ✓              |
+
+Applied to the decision matrix: all three rows read "Proceed."
+
+Step throughput is **better** on the two larger models (Q3.5 and
+GPT-OSS) — the M5.α/β/γ cache pre-bind work shortens `resolve_tensor`
+on the hot path. Peak memory drops on the larger models too, likely
+because M5.γ's unconditional arena override (`ee0a7ad`) lets
+`consume_fwdstack_arena` route every allowlisted slot through the
+arena instead of leaking a second copy through mAllocator's
+allocator-owned path.
+
+Q3 is within measurement noise on both axes. No model regresses.
+
+**Status of Phase 4.**
+- Correctness: ✅ bit-identical across all M5.γ sessions (3 configs in parallel, GPUs 1/2/3, after every session commit)
+- Step throughput: ✅ −3.8% to +0.2% — all within or better than the ±2% envelope
+- Peak memory: ✅ −1.8% to +0.7% — all within the ±2% envelope
+- Structural: Option C closed the cache-divergence design risk. `SimplifiedLayerActivations` deletion attempted (Session D proper) and abandoned after three failed partition strategies — postmortem in `design/simplified-acts-deletion.md`. The dual-dispatch shipped is stable and well-understood; deletion is cosmetic.
+
+**Phase 4 closed.** Next: Phase 5 or new feature work; the tid-baked
+infrastructure (slot_to_tid LUT, executor_tid_slot, block_slot_tensor)
+is a stable foundation for any future refactor that wants to revisit
+the deletion.
+
+**Not measured in this gate (same as prior):** capture-replay split,
+multi-rank, fresh recompute correctness diff. These are untouched by
+M5.γ changes; prior validation stands.

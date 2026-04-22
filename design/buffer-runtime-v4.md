@@ -38,9 +38,11 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked — producer-based partition binds correctly by topology but regresses Q3.5 (norm 8.04→2.15) and GPT-OSS (norm 2.73→180). FwdStack arena data is overwritten across layers; debugging why legacy fallback is bit-correct while direct tid binding isn't requires per-tid shape/ptr divergence instrumentation. Postmortem: design/simplified-acts-deletion.md "Session D proper — attempted".
 │   ├── M5.δ  views + gradient leftovers                                ⬜ not started
 │   └── M5.ε  cleanup sweep                                             ⬜ not started
-└── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ⬜ not started — blocked on M5 completion
+└── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ✅ passed 2026-04-22 — see buffer-runtime-v4-benchmark.md §"M6 gate"
 Phase 5+                                                                 ⬜ not planned
 ```
+
+**Phase 4 closed** (M6 passed 2026-04-22). Remaining M5 sub-milestones (Session D proper, M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
 
 **Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Session D (ca48fbc) shipped the two narrow wins toward simplified_acts deletion — reordering set_active_executor to after populate so the tid-first path is coherent at all times within execute_*, plus a forward-graph setter for future cross-graph work. Session D proper (the actual struct deletion) was attempted and abandoned after three partition strategies failed — producer-based topology is correct but binding cross-graph tids to `fwd_stack_ptr + offset` regresses on Q3.5 and GPT-OSS even though it's bit-identical to the legacy fallback on Q3. Postmortem captured in `design/simplified-acts-deletion.md`. The current dual-dispatch is bit-identical everywhere, well-understood, and carries no outstanding risk — further deletion is cosmetic and a future project, not a Phase 4 blocker.
 
