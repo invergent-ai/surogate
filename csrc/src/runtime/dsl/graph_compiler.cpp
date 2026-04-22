@@ -989,13 +989,35 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         attrs.rotary_dim = mConfig.head_size();
     }
 
-    // Shape attribute (direct shape or shape_like reference)
+    // Shape attribute (direct shape or shape_like reference). When the
+    // shape_like target's shape is known statically (via mExtraShapes or
+    // known-tensor inference), bake it into attrs.shape so view_backward's
+    // runtime dispatch uses the compile-time value and doesn't consult
+    // mTensors[shape_like_tid] at runtime. That runtime consultation was
+    // the blocker for Session D proper: when populate_fwd_stack_bindings
+    // pre-bound the shape_like tid, view_backward picked up the
+    // forward-canonical shape even though the consumer expected a
+    // different (infer-path) shape on Q3.5's Hq/Hkv attention views.
     if (auto* shape_attr = find_attr(op.attrs, "shape")) {
         attrs.shape = resolve_attr_shape(*shape_attr, env);
     } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
-        // Store the reference name for runtime lookup
         if (auto ref_name = attr_string(*shape_like_attr)) {
             attrs.shape_like = *ref_name;
+            std::string effective = attrs.shape_like;
+            const std::string saved_prefix = "saved.";
+            if (starts_with(effective, saved_prefix)) {
+                effective = effective.substr(saved_prefix.size());
+            }
+            std::vector<long> ref_shape;
+            auto it = mExtraShapes.find(effective);
+            if (it != mExtraShapes.end()) {
+                ref_shape = it->second;
+            } else if (!resolve_tensor_shape(effective, ref_shape)) {
+                infer_known_tensor_shape(effective, mConfig, mB, mT, ref_shape);
+            }
+            if (!ref_shape.empty()) {
+                attrs.shape = std::move(ref_shape);
+            }
         }
     }
 
