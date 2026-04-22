@@ -58,10 +58,13 @@ namespace dsl {
 // ---------------------------------------------------------------------------
 
 // Clear-.Data helpers for Stack-backed gradient slots that Stack.restore
-// invalidates across layer boundaries.
-static void clear_large_bwd_grad_stack_slots(DslRunState& rs, int L) {
+// invalidates across layer boundaries. Mirrors the null into both
+// simplified_grads and mTensors[tid] so either cache sees the post-Stack-
+// restore state.
+static void clear_large_bwd_grad_stack_slots(dsl::CompiledExecutor& exec, dsl::DslRunState& rs, int L) {
     auto clear = [&](TensorSlot s) {
         if (Tensor* t = block_gradient_ptr(rs, L, s)) t->Data = nullptr;
+        if (Tensor* t = exec.executor_tid_slot_binding(L, s)) t->Data = nullptr;
     };
     clear(TensorSlot::BlockDQKV);
     clear(TensorSlot::BlockDMLPUp);
@@ -1817,6 +1820,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
+    // M5.δ: seed mTensors[tid] from simplified_grads for every block-scope
+    // gradient slot. Phase 1 of the gradient-side SimplifiedLayerGradients
+    // deletion — mutation sites below mirror their writes to both caches
+    // so either can be read authoritatively during the transition.
+    populate_bwd_stack_bindings(graph);
+
     // M5.α: bind every stable non-param global into mTensors + mNamedTensors
     // at backward entry so resolve_tensor finds them via the tid/name cache
     // without falling through to the slot switch. Runtime pointers are
@@ -2624,7 +2633,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mRunState.Stack.restore(initial_checkpoint);
         mTemps.clear();
         prune_stack_tensors(L);
-        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
+        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(*this, mRunState, L);
         last_layer_restored = L;
     };
     if (bwd_stream_driven) {
@@ -3086,7 +3095,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // replay pollutes blocks[L+1]. Sweep every layer here so no Stack-range
     // pointer survives into the optimizer / next step.
     for (int L = 0; L < static_cast<int>(mConfig.NumLayers); ++L) {
-        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
+        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(*this, mRunState, L);
     }
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {

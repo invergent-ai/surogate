@@ -250,6 +250,14 @@ public:
     /// design/simplified-acts-deletion.md.
     Tensor* executor_tid_slot(int layer_idx, TensorSlot slot);
 
+    /// Non-guarded variant: returns &mTensors[tid] for any valid tid
+    /// regardless of Data state. Writers (mutation sites that set `.Data`
+    /// or call temp_acquire on the returned pointer) need this; the
+    /// guarded variant rejects null-Data entries which makes it unusable
+    /// for "allocate then bind" patterns. Safe because populate_bwd_
+    /// stack_bindings seeds shape/dtype at bwd entry.
+    Tensor* executor_tid_slot_binding(int layer_idx, TensorSlot slot);
+
 private:
     // Execute an MLP tile group in chunks along the sequence dimension.
     // Used when long_context mode is enabled to reduce peak MLP activation memory.
@@ -435,6 +443,7 @@ private:
     /// to `consume_fwdstack_arena` for the allowlisted slots but covers
     /// every FwdStack tid the compiler assigned an offset for.
     void populate_fwd_stack_bindings(const CompiledGraph& graph);
+    void populate_bwd_stack_bindings(const CompiledGraph& graph);
 
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);

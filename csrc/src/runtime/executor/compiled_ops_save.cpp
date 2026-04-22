@@ -1120,6 +1120,49 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     }
 }
 
+void CompiledExecutor::populate_bwd_stack_bindings(const CompiledGraph& graph) {
+    // Seed mTensors[tid] from simplified_grads[L][slot] for every block-
+    // scope gradient slot. Arena-backed slots get the arena pointer;
+    // Stack-backed ones get null Data + shape/dtype. Post-populate,
+    // block_gradient_ptr can route tid-first without losing shape/dtype.
+    if (static_cast<std::size_t>(graph.num_tensors) > mTensors.size()) return;
+
+    static constexpr dsl::TensorSlot kSlots[] = {
+        dsl::TensorSlot::BlockDLN1,
+        dsl::TensorSlot::BlockDLN2,
+        dsl::TensorSlot::BlockDQKV,
+        dsl::TensorSlot::BlockDAtt,
+        dsl::TensorSlot::BlockDAttOut,
+        dsl::TensorSlot::BlockDMLPUp,
+        dsl::TensorSlot::BlockDSwiGLU,
+        dsl::TensorSlot::BlockDMLPDown,
+        dsl::TensorSlot::BlockDHOut,
+        dsl::TensorSlot::BlockDResAtt,
+        dsl::TensorSlot::BlockDResFFN,
+    };
+
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+    for (int L = 0; L < num_layers; ++L) {
+        for (dsl::TensorSlot slot : kSlots) {
+            const int tid = graph.slot_to_tid(L, slot);
+            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+            const Tensor& src = mRunState.simplified_grads(L)[slot];
+            if (src.Rank == 0) continue;
+            mTensors[static_cast<std::size_t>(tid)] = src;
+        }
+    }
+}
+
+Tensor* CompiledExecutor::executor_tid_slot_binding(int layer_idx, TensorSlot slot) {
+    if (!mCurrentGraph || slot == TensorSlot::Mapped) return nullptr;
+    int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
+    if (tid < 0 && mForwardGraph && mForwardGraph != mCurrentGraph) {
+        tid = mForwardGraph->slot_to_tid(layer_idx, slot);
+    }
+    if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+    return &mTensors[static_cast<std::size_t>(tid)];
+}
+
 Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
     if (!mCurrentGraph) return nullptr;
     // Mapped is the wildcard slot — block_activation_ptr(..., Mapped)
