@@ -1057,35 +1057,70 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
             ++skipped_no_shape;
             continue;
         }
-        // Skip slots whose actual runtime storage lives OUTSIDE the
-        // FwdStack arena even though the compiler classified them as
-        // FwdStack region. These are either (a) owned by mAllocator
-        // (persistent cudaMalloc in dsl_run_state init, never consumed
-        // by consume_fwdstack_arena), or (b) routed through a special
-        // path (residual stream, QKVRoPE fallback to QKV, MoE buffers).
-        // Pre-binding to arena offsets would mismatch the legacy
-        // block_activation_ptr path which is still authoritative for
-        // these slots.
+        // Route each tid to its authoritative backing storage. Arena-backed
+        // slots live at `fwd_stack_ptr + meta.offset`; excluded slots
+        // (residual, MoE, managed stream, QKVRoPE in-place fallback) live
+        // in allocator-owned buffers on `simplified_acts` or the managed
+        // residual stream. Session D prep: binding all FwdStack tids into
+        // mTensors[tid] means `executor_tid_slot` returns non-null for
+        // every (layer, slot) pair, and `block_activation_ptr`'s
+        // legacy-fallback path becomes reachable only for tids the
+        // compiler didn't assign to FwdStack.
+        Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+        const int layer = meta.block_layer_idx;
+        auto bind_from_acts_slot = [&](dsl::TensorSlot s) -> bool {
+            if (layer < 0) return false;
+            auto& acts = mRunState.simplified_acts(layer);
+            const Tensor& src = acts[s];
+            if (!src.Data) return false;
+            t = src;
+            return true;
+        };
+        bool bound_via_slot = false;
         switch (out_ref->slot) {
-            case TensorSlot::BlockResidualAtt:  // mAllocator
-            case TensorSlot::BlockResidualFFN:  // managed residual stream
-            case TensorSlot::BlockQKVRoPE:      // falls back to BlockQKV when in-place
-            case TensorSlot::BlockRouterLogits:
-            case TensorSlot::BlockRouterProbs:
-            case TensorSlot::BlockRoutingWeights:
-            case TensorSlot::BlockRoutingIndices:
-            case TensorSlot::BlockPermutedInput:
-            case TensorSlot::BlockScatterIndices:
-            case TensorSlot::BlockExpertGateUp:
-            case TensorSlot::BlockExpertAct:
-            case TensorSlot::BlockExpertDown:
-            case TensorSlot::BlockMoeOut:  // view over BlockMLPDown
-                ++skipped_non_arena_slot;
-                continue;
+            case dsl::TensorSlot::BlockResidualAtt:
+            case dsl::TensorSlot::BlockRouterLogits:
+            case dsl::TensorSlot::BlockRouterProbs:
+            case dsl::TensorSlot::BlockRoutingWeights:
+            case dsl::TensorSlot::BlockRoutingIndices:
+            case dsl::TensorSlot::BlockPermutedInput:
+            case dsl::TensorSlot::BlockScatterIndices:
+            case dsl::TensorSlot::BlockExpertGateUp:
+            case dsl::TensorSlot::BlockExpertAct:
+            case dsl::TensorSlot::BlockExpertDown:
+            case dsl::TensorSlot::BlockMoeOut:
+                // Allocator-owned simplified_acts slots (or view thereof —
+                // BlockMoeOut is a view over BlockMLPDown, re-propagated by
+                // consume_fwdstack_arena).
+                bound_via_slot = bind_from_acts_slot(out_ref->slot);
+                break;
+            case dsl::TensorSlot::BlockQKVRoPE:
+                // In-place QKVRoPE: the slot may be unallocated (Data=nullptr
+                // in acts[]) when the model does in-place RoPE on the QKV
+                // buffer. Fall back to acts[BlockQKV] in that case.
+                bound_via_slot = bind_from_acts_slot(dsl::TensorSlot::BlockQKVRoPE);
+                if (!bound_via_slot) {
+                    bound_via_slot = bind_from_acts_slot(dsl::TensorSlot::BlockQKV);
+                }
+                break;
+            case dsl::TensorSlot::BlockResidualFFN:
+                // Managed residual stream. get_residual(layer) returns a
+                // Tensor handle into the residual-stream manager.
+                if (layer >= 0) {
+                    const Tensor& r = mRunState.get_residual(layer, mRunState.MainStream);
+                    if (r.Data) {
+                        t = r;
+                        bound_via_slot = true;
+                    }
+                }
+                break;
             default: break;
         }
+        if (bound_via_slot) {
+            ++bound;
+            continue;
+        }
 
-        Tensor& t = mTensors[static_cast<std::size_t>(tid)];
         t.Data = mPhaseArenas->fwd_stack_ptr + meta.offset;
         t.DType = out_ref->dtype;
         t.Rank = static_cast<int>(out_ref->shape.size());
@@ -1109,14 +1144,12 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
 
 Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
     if (!mCurrentGraph) return nullptr;
-    // During replay_layer_forward, mCurrentGraph switches to fwd_graph
-    // but the surrounding execution context is still backward. Cross-
-    // layer block_activation_ptr calls from the replay's pre-bind loop
-    // (external-inputs resolution) and in-op legacy callers expect the
-    // simplified_acts / managed-residual storage, not an fwd_graph
-    // tid-bound view that may have shape-diverged (aliased `_flat`
-    // variants, view ops producing different tids for the same slot).
-    // Fall through to legacy dispatch for replay.
+    // Replay guard: during replay_layer_forward, mCurrentGraph is
+    // fwd_graph but the tid cache was populated from fwd-graph ref
+    // shapes. Cross-layer / slot-aliased resolution paths (view ops,
+    // _flat variants, Mamba-style 1D weight slots) can diverge from
+    // the simplified_acts-init shape that in-op callers expect. Keep
+    // block_activation_ptr on the legacy path during replay.
     if (mInReplay) return nullptr;
     const int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
     if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
