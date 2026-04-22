@@ -770,13 +770,21 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
             acts[TensorSlot::BlockKRSTD] = {};
         }
 
-        acts[TensorSlot::BlockQKV] = mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
-        acts[TensorSlot::BlockQKVRoPE] =
-            plan.need_separate_qkv_rope ? mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV})
-                                        : Tensor{};
+        // M5 cleanup: BlockQKV / BlockQKVRoPE / BlockAtt / BlockMLPDown
+        // used to mAllocator->allocate here — wasted once
+        // consume_fwdstack_arena unconditionally overrides acts[slot].Data
+        // to arena+offset (ee0a7ad). Stack-init with Data=nullptr; the
+        // arena override writes the real pointer at (B,T) compile time.
+        // ~700 MiB saved on Qwen3-0.6B / similar scaling on larger models.
+        stack_or_alloc(TensorSlot::BlockQKV, true, dtype, {B, T, lQKV});
+        if (plan.need_separate_qkv_rope) {
+            stack_or_alloc(TensorSlot::BlockQKVRoPE, true, dtype, {B, T, lQKV});
+        } else {
+            acts[TensorSlot::BlockQKVRoPE] = Tensor{};
+        }
 
         stack_or_alloc(TensorSlot::BlockLSE, true, ETensorDType::FP32, {B, Hq, T});
-        acts[TensorSlot::BlockAtt] = mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
+        stack_or_alloc(TensorSlot::BlockAtt, true, dtype, {B, T, lAttnDim});
         stack_or_alloc(TensorSlot::BlockAttOut, true, dtype, {B, T, C});
         acts[TensorSlot::BlockResidualAtt] =
             mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
@@ -786,7 +794,7 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         stack_or_alloc(TensorSlot::BlockMLPUp, plan.ffn_temps_on_stack || !plan.has_mlp_up_slot, dtype, {B, T, lMUp});
         stack_or_alloc(TensorSlot::BlockSwiGLU, plan.ffn_temps_on_stack || !plan.has_swiglu_slot, dtype, {B, T, lM});
 
-        acts[TensorSlot::BlockMLPDown] = mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
+        stack_or_alloc(TensorSlot::BlockMLPDown, true, dtype, {B, T, C});
         // Dedicated per-layer block output slot used by Gemma4 (keeps the
         // block's final h_out separate from the MLP's mlp_down so the
         // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
