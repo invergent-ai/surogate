@@ -1016,6 +1016,68 @@ Tensor* CompiledExecutor::bind_from_region(int tid, const TensorRef& ref) {
     return &cached;
 }
 
+void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return;
+    if (!mPhaseArenas->fwd_stack_ptr || mPhaseArenas->fwd_stack_bytes == 0) return;
+    if (mTensors.size() != static_cast<std::size_t>(graph.num_tensors)) return;
+
+    // Per-tid producing output ref — the canonical shape/dtype source.
+    // Last writer wins; the compiler's SSA invariant means there is at
+    // most one.
+    std::vector<const TensorRef*> producer(static_cast<std::size_t>(graph.num_tensors), nullptr);
+    for (const auto& op : graph.ops) {
+        for (const auto& out : op.outputs) {
+            if (out.tensor_id >= 0 && out.tensor_id < graph.num_tensors) {
+                producer[static_cast<std::size_t>(out.tensor_id)] = &out;
+            }
+        }
+    }
+
+    int device = 0;
+    (void)cudaGetDevice(&device);
+
+    std::size_t bound = 0;
+    std::size_t skipped_no_producer = 0;
+    std::size_t skipped_no_shape = 0;
+    std::size_t skipped_no_offset = 0;
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != dsl::RegionKind::FwdStack) continue;
+        if (meta.offset == SIZE_MAX) {
+            ++skipped_no_offset;
+            continue;
+        }
+        const TensorRef* out_ref = producer[static_cast<std::size_t>(tid)];
+        if (!out_ref) {
+            ++skipped_no_producer;
+            continue;
+        }
+        if (out_ref->shape.empty()) {
+            ++skipped_no_shape;
+            continue;
+        }
+
+        Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+        t.Data = mPhaseArenas->fwd_stack_ptr + meta.offset;
+        t.DType = out_ref->dtype;
+        t.Rank = static_cast<int>(out_ref->shape.size());
+        for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+            t.Sizes[i] = (i < t.Rank) ? out_ref->shape[i] : 1;
+        }
+        t.Device = device;
+        t.Stats = nullptr;
+        ++bound;
+    }
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume fwd_stack tid] graph=" << graph.name << " bound=" << bound
+                      << " skipped_no_producer=" << skipped_no_producer << " skipped_no_shape=" << skipped_no_shape
+                      << " skipped_no_offset=" << skipped_no_offset << "\n";
+        }
+    }
+}
+
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
     const int tid = ref.tensor_id;

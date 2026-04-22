@@ -241,6 +241,33 @@ Binder for `RegionKind::FwdStack` and `BwdStack` reads from
 `acts[slot].Data` is no longer the authoritative source; ops bypass
 `simplified_acts` entirely for block-scope activations.
 
+**Blocker discovered 2026-04-22 (session 1 attempt).** Today's
+`consume_fwdstack_arena` only covers 15 well-known block-scope slots
+(`kFwdStackConsumeSlots` in [`graph_executor.cpp:1124`](../csrc/src/runtime/executor/graph_executor.cpp#L1124)).
+Every other FwdStack tid (scratch, views, intermediate activations,
+MoE internals) still lives in the `mRunState.Stack` allocator. Wiring
+`bind_from_region(FwdStack)` in `resolve_tensor` returns
+`fwd_stack_ptr + meta.offset` for those tids — a deterministic arena
+address but NOT where the data actually lives. Validation: Q3 3-step
+loss diverged (1.6166 → 1.8263, norm 0.0000 vs 2.3503). Similarly
+`BwdStack` has *zero* arena consumption today — `simplified_grads`
+owns all gradients on the plain stack.
+
+**Pre-M5.γ work required.**
+- Extend `consume_fwdstack_arena` (or author a full op-emit-time
+  route) so every FwdStack tid writes/reads via the arena. Target:
+  the `kFwdStackConsumeSlots` allowlist goes away; every tid whose
+  `meta.region == FwdStack && meta.offset != SIZE_MAX` binds to
+  `fwd_stack_ptr + meta.offset` at op dispatch.
+- Parallel milestone for BwdStack: arena consumption for
+  `simplified_grads` slots (~15 BlockD* + MoE gradient slots).
+- Each of these is effectively a mini-M3 finish: shape the arena
+  sizer to accept a dynamic set of tids, then route every producer
+  through the arena.
+
+Only after this is complete can `bind_from_region` be wired into
+`resolve_tensor` for FwdStack/BwdStack as the authoritative source.
+
 **Deletes:** `SimplifiedLayerActivations` struct, `block_activation_ptr`,
 `block_gradient_ptr`, `TensorSlot::Block*/MoE*/DBlock*` enumerators,
 `builtin_slot_from_name` for block/MoE slots (globals remain),

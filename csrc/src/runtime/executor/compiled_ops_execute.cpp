@@ -178,6 +178,9 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
     mCurrentGraph = &fwd_graph;
     mTensors.assign(static_cast<std::size_t>(fwd_graph.num_tensors), Tensor{});
     mNamedTensors.clear();
+    // M5.γ prereq: mirror the pre-bind that execute_forward does so
+    // replayed ops hit the mTensors[tid] cache and write to the arena.
+    populate_fwd_stack_bindings(fwd_graph);
 
     // Bind known inputs
     bind_tensor("token_ids", mRunState.Inputs);
@@ -673,6 +676,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mNamedTensors.clear();
+    // M5.γ prereq: pre-bind every FwdStack tid to its arena slot so
+    // block-scope Mapped-slot ops route through the arena at
+    // ensure_output_tensor instead of Stack temp_alloc.
+    populate_fwd_stack_bindings(graph);
     // Scrub mSaved entries pointing into the Stack arena or the
     // replay-persist arena. Between steps both are reset — Stack top rolls
     // back, replay-persist offset rewinds — so any saved Tensor whose Data

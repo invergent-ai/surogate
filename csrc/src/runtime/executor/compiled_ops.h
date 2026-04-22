@@ -408,6 +408,16 @@ private:
     /// follow-on milestones that make this the authoritative path.
     Tensor* bind_from_region(int tid, const TensorRef& ref);
 
+    /// M5.γ prereq: pre-populate `mTensors[tid]` for every FwdStack tid in
+    /// `graph` with an arena-backed Tensor (`Data = fwd_stack_ptr +
+    /// meta.offset`, shape/dtype from the producing op output ref). Runs
+    /// after every `mTensors.assign` so block-scope forward ops dispatched
+    /// via the Mapped-slot path hit the `mTensors[tid].Data` cache in
+    /// `ensure_output_tensor` and skip `mRunState.temp_alloc()`. Equivalent
+    /// to `consume_fwdstack_arena` for the allowlisted slots but covers
+    /// every FwdStack tid the compiler assigned an offset for.
+    void populate_fwd_stack_bindings(const CompiledGraph& graph);
+
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 
