@@ -254,19 +254,42 @@ loss diverged (1.6166 → 1.8263, norm 0.0000 vs 2.3503). Similarly
 owns all gradients on the plain stack.
 
 **Pre-M5.γ work required.**
-- Extend `consume_fwdstack_arena` (or author a full op-emit-time
-  route) so every FwdStack tid writes/reads via the arena. Target:
-  the `kFwdStackConsumeSlots` allowlist goes away; every tid whose
-  `meta.region == FwdStack && meta.offset != SIZE_MAX` binds to
-  `fwd_stack_ptr + meta.offset` at op dispatch.
+- ~~Extend `consume_fwdstack_arena` (or author a full op-emit-time
+  route) so every FwdStack tid writes/reads via the arena.~~ **Shipped
+  as `populate_fwd_stack_bindings` (commit `620f958`, 2026-04-22).**
+  Pre-binds every FwdStack tid with a valid compile-time offset into
+  `mTensors[tid]` after each `mTensors.assign`. Ops dispatched via
+  the Mapped-slot path hit the `mTensors[tid].Data` cache in
+  `ensure_output_tensor` and skip `mRunState.temp_alloc()` — writes
+  land in the arena. Non-Mapped (Block* slot) ops still route through
+  `simplified_acts[slot]` / `block_activation_ptr`.
 - Parallel milestone for BwdStack: arena consumption for
-  `simplified_grads` slots (~15 BlockD* + MoE gradient slots).
-- Each of these is effectively a mini-M3 finish: shape the arena
-  sizer to accept a dynamic set of tids, then route every producer
-  through the arena.
+  `simplified_grads` slots (~15 BlockD* + MoE gradient slots) — not
+  yet started.
 
-Only after this is complete can `bind_from_region` be wired into
-`resolve_tensor` for FwdStack/BwdStack as the authoritative source.
+**Second blocker discovered 2026-04-22 (session 1 retry).** Even with
+`populate_fwd_stack_bindings` covering every FwdStack tid, wiring
+`bind_from_region(FwdStack)` into `resolve_tensor` still diverges
+gradients (Q3 norm 0.0000 at step 1). Root cause: the existing
+`consume_fwdstack_arena` allowlist path (graph_executor.cpp) SKIPS
+slots whose `simplified_acts[slot].Data` was non-null from the Stack
+allocator — `kFwdStackConsumeSlots` coverage is conditional on the
+slot being empty at (B,T) compile time. Skipped slots keep stack
+pointers; `clear_rstd_stack_slots` at layer-end nullifies them and
+the next layer re-stack-allocates. Meanwhile `populate_fwd_stack_bindings`
+wrote arena pointers into `mTensors[tid]`. Writes land in arena,
+but `block_activation_ptr` readers (still referenced by Block*
+slot ops) return stack pointers. The two paths diverge.
+
+**Third pre-M5.γ task.** Make `consume_fwdstack_arena` unconditionally
+route every FwdStack tid through the arena (drop the `skipped_allocator_owned`
+branch at `graph_executor.cpp:1164`). Requires that the initial Stack
+allocator handoff for simplified_acts not pre-populate arena-backed
+slots. Alternative: delete the stack-init path for simplified_acts
+entirely and source those slots only from the arena.
+
+Only after that ships can `bind_from_region` be wired into
+`resolve_tensor` for FwdStack as the authoritative source.
 
 **Deletes:** `SimplifiedLayerActivations` struct, `block_activation_ptr`,
 `block_gradient_ptr`, `TensorSlot::Block*/MoE*/DBlock*` enumerators,
