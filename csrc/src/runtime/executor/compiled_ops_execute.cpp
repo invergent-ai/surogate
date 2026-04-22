@@ -1763,17 +1763,14 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mLastRecomputeLayer = -1;
     mMicroStep = micro_step;
 
-    // M5.γ Option C: register as active executor. No populate for the bwd
-    // graph's own FwdStack tids — the bwd graph doesn't have ForwardActivation
-    // kind tids (it has gradients, saves, and cross-graph Unknowns). Forward
-    // activations are resolved via:
-    //   - SaveForBwd: mSaved pre-bind from M5.β (bind_tensor(name, t) in
-    //     persist_saved_layer_tensors at forward layer_end, read at backward
-    //     entry via the loop below).
-    //   - Recomputed: replay_layer_forward's own populate pass.
-    //   - Otherwise: block_activation_ptr fallback to simplified_acts[slot],
-    //     which has arena-backed Data from consume_fwdstack_arena (stable
-    //     addresses across fwd→bwd within a step).
+    // M5.γ Option C: register as active executor. No cross-graph populate
+    // here — see design/simplified-acts-deletion.md for why the apparently-
+    // straightforward "fwd produces, bwd doesn't" partition still
+    // regresses on GPT-OSS (norm 2.73 → 180) and Qwen3.5 (norm 8.04 → 15)
+    // even when restricted to the kFwdStackConsumeSlots allowlist. Forward
+    // activations reach backward via (a) mSaved pre-bind at backward entry
+    // for SaveForBwd tids, (b) replay_layer_forward for recompute tids, or
+    // (c) block_activation_ptr's simplified_acts fallback.
     mRunState.set_active_executor(this);
 
     // M5.α: bind every stable non-param global into mTensors + mNamedTensors

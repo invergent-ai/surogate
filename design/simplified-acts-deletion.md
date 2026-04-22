@@ -183,3 +183,33 @@ Session 3 (Option D — delete):
 1. **Option A vs C.** Am I underweighting Option A's simplicity? The dual-cache-sync helper would be maybe 30 lines and every mutation site becomes a 1-line change. The "future maintainer might forget" argument is real but not unique to this code.
 2. **Excluded-slot landing site.** Should MoE slots move into the FwdStack arena (growing its size) or stay on mAllocator with a new population path? Arena growth has implications for cross-layer reuse and peak memory.
 3. **Regression gate.** Are the 3 smoke configs enough, or do we need the full benchmark suite to land Session 3?
+
+## Session D proper — attempted 2026-04-22, abandoned
+
+Tried three partition strategies to bind cross-graph forward activations into `mTensors[tid]` at backward entry. All regressed. Captured here as evidence for future attempts.
+
+**Why Option D's obvious plan is harder than it looks.**
+
+1. **Region-only filter (`bwd_meta.region == Unknown`)** matches **0 tids**. bwd's `classify_tensors` + `derive_regions` + `finalize_save_for_bwd` promotion assigns non-Unknown regions (BwdStack, Persistent via global bindings, SaveForBwd via promotion) across the full tid range. The cross-graph set isn't identifiable by region alone.
+
+2. **Producer-based filter (`fwd.produces(tid) && !bwd.produces(tid)`)** is semantically correct and matches the expected tid set — 672 tids on Qwen3, 1110 on Qwen3.5. But binding `mTensors[tid] = fwd_stack_ptr + meta.offset` regresses backward:
+   - Qwen3 stays bit-identical (loss unchanged).
+   - **Qwen3.5 norm 8.04 → 2.15** (gradient norm collapses).
+   - **GPT-OSS norm 2.73 → 180** (gradient norm explodes).
+
+3. **Narrowed to `kFwdStackConsumeSlots` allowlist**: same two regressions, slightly different magnitudes.
+
+**Root cause (hypothesis).** FwdStack offsets are reused across layers via coloring. At any instant, `fwd_stack_ptr + offset` contains data from whichever layer wrote there most recently. During forward, layer N overwrites layer N-1's offset. Post-forward, the arena holds layer N-1's data (or whatever ran last). Backward runs in reverse: bwd(N-1) reads correctly, but bwd(N-2) needs arena data that was overwritten — which `replay_layer_forward(N-2)` is supposed to regenerate before bwd(N-2)'s ops run.
+
+The legacy `block_activation_ptr` fallback works because it reads `simplified_acts[slot].Data`, which is the arena pointer — same location. The DATA at that location is what changes. If backward's replay happened for layer N-2, arena has layer N-2's data; both legacy and my tid path read it correctly.
+
+My cross-graph populate binds `mTensors[tid].Data = arena+offset` once at backward entry. The pointer is stable; the data is whatever replay writes before bwd(L) runs. This should be equivalent to the legacy path... but the regressions prove it isn't.
+
+**What I didn't resolve:**
+- Why Q3 is bit-identical but Q3.5 and GPT-OSS regress with the same binding logic.
+- Whether the issue is a shape mismatch (consumer expects view shape, producer ref has canonical shape) that the legacy fallback handles via an intermediate path but my direct binding doesn't.
+- Whether the binding interacts badly with `replay_layer_forward`'s own `mTensors` swap/restore (my bound pointer persists across the swap).
+
+**Recommendation for the next attempt:** don't just bind in backward — also bind at `replay_layer_forward` entry for the fwd_graph's own tids (need to check if already done), and add a debug assertion that every cross-graph read through the tid path matches the legacy fallback's returned pointer and shape bit-for-bit. If they diverge, we've identified the specific slot/op that needs different handling.
+
+**Status:** `SimplifiedLayerActivations` deletion remains blocked. The existing dual-dispatch (Option C) is bit-identical on all tested configs and closed the original design risk (cache divergence from mutations). Further deletion is cosmetic and costs more sessions to get right than it saves.
