@@ -788,6 +788,21 @@ std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
     for (const auto& rf : mPerLayerRopeFreqs) {
         total += rf.bytes();
     }
+    // Device scratch buffers — small individually but several per model.
+    // encoder_bwd_scratch (INT32, encoder-side) and cudnn_workspace
+    // (attention) are currently SKIPPED: cudnn_workspace is declared as
+    // stack-overlaid in run_state_types.h and the attention backend
+    // inspects `.DType` in ways that break when rebound across (B,T)
+    // recompiles for Qwen3.5/GPT-OSS. Quant-grad tensors are skipped
+    // because their `.Stats` field is pointer arithmetic into
+    // mGradQuantStats — rebinding would orphan the Stats link.
+    total += mScratch.rmsnorm_scratch.bytes();
+    total += mScratch.matmul_bias_scratch.bytes();
+    total += mScratch.norm_buffer.bytes();
+    total += mScratch.matmul_scales.bytes();
+    total += mScratch.cross_entropy_dloss.bytes();
+    total += mScratch.cross_entropy_logsumexp.bytes();
+    total += mScratch.cross_entropy_chunk_logsumexp.bytes();
     return total;
 }
 
@@ -818,6 +833,13 @@ void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::siz
     for (auto& rf : mPerLayerRopeFreqs) {
         rebind_into(rf);
     }
+    rebind_into(mScratch.rmsnorm_scratch);
+    rebind_into(mScratch.matmul_bias_scratch);
+    rebind_into(mScratch.norm_buffer);
+    rebind_into(mScratch.matmul_scales);
+    rebind_into(mScratch.cross_entropy_dloss);
+    rebind_into(mScratch.cross_entropy_logsumexp);
+    rebind_into(mScratch.cross_entropy_chunk_logsumexp);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
