@@ -389,3 +389,32 @@ The gradient deletion cannot just copy the activation playbook. It needs either:
 3. **Defer tid migration until after temp_acquire + cross-layer persist are restructured.** The current Stack+persist machinery predates the arena system; it could arguably be recast to work directly against `mTensors[tid]` and the tracking tables at `bwd_layer_end_cleanup`, at which point `simplified_grads` becomes redundant naturally.
 
 Option 2 is the minimum-viable path — same shape as the activation deletion sequence (`03c56b8` and after). It's probably a 1–2 session effort with focused investigation.
+
+### Shipped 2026-04-22 (commits `a17ddcc` → `1e4d801`)
+
+Took the dual-cache mirror route (a mix of options 1 and 2). Five commits:
+
+| Commit | Change | LOC |
+|--------|--------|-----|
+| `a17ddcc` | `executor_tid_slot_binding` + `populate_bwd_stack_bindings` + tid-first in `block_gradient_ptr` + mirrors at 5 mutation sites | +101/−5 |
+| `3106baf` | Remove mirrors (redundant once tid-first lands) | +7/−32 |
+| `9c67f98` | Remove `simplified_grads` fallback in `block_gradient_ptr` | +13/−13 |
+| `1e4d801` | Delete `reset_simplified_gradients`, `refresh_simplified_gradients_base`, `mSimplifiedGradientsBase` | +6/−55 |
+
+Net: ~80 lines deleted.
+
+**Key insight that unblocked it:** the `is_block_gradient_slot` guard must fire BEFORE `executor_tid_slot_binding`, not after. `resolve_tensor` calls `block_gradient_ptr` with the current ref's slot (which may be an activation or a gradient depending on the op); without the guard, the binding call for an activation slot returns an empty Tensor{} which then propagates wrong DType downstream.
+
+**Populate mechanism:** seed `mTensors[tid]` from `simplified_grads[L][slot]` verbatim for the 11 block-gradient slots. Arena-based seeding (mirror of `populate_fwd_stack_bindings`) regressed Q3.5/GPT-OSS because `simplified_grads` encodes per-layer hybrid shapes and non-hybrid DAttOut→DResAtt aliasing that TensorMeta alone doesn't carry. Keeping `simplified_grads` as init-time metadata carrier is the right tradeoff.
+
+**Current state:**
+- `mTensors[tid]` is the sole source of truth for gradient activations during backward.
+- `simplified_grads` storage remains — `allocate_simplified_gradients` populates it once, `consume_bwdstack_arena` writes arena pointers, `populate_bwd_stack_bindings` reads it once per bwd to seed `mTensors[tid]`. Write-free on hot path.
+- `block_gradient_ptr` is a thin wrapper: slot-filter + `executor_tid_slot_binding` + nullptr fallback.
+
+Validation:
+- Q3: norm 3.4391 (base 3.4389)
+- Q3.5: norm 8.0429 (base 8.0438)
+- GPT-OSS: norm 2.7559 (base 2.7561)
+
+**Remaining:** the `SimplifiedLayerGradients` struct and `allocate_simplified_gradients` + `consume_bwdstack_arena` still exist. Full deletion requires moving the per-layer hybrid shape/alias logic out of allocate_simplified_gradients into a structure populate can consume directly (or threading TensorMeta to include alias info). Scope is small-to-medium; not on the critical path since runtime is already all-mTensors.
