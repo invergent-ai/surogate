@@ -198,6 +198,15 @@ public:
         mForwardPlan = plan;
     }
 
+    /// M5.γ Session D: share the forward compiled graph so execute_backward
+    /// can pre-bind cross-graph forward-activation tids (region=Unknown in
+    /// the bwd graph, but FwdStack in the fwd graph) into mTensors at
+    /// backward entry. Without this, bwd ops that read forward activations
+    /// fall through to block_activation_ptr's simplified_acts legacy path.
+    void set_forward_graph(const CompiledGraph* graph) {
+        mForwardGraph = graph;
+    }
+
     // For embedding backward (requires CPU-side inputs for deterministic bucketing)
     void set_last_inputs_cpu(const Tensor* inputs_cpu);
 
@@ -514,6 +523,7 @@ private:
     bool mRecomputeUseGraphs = true;
     int mLastRecomputeLayer = -1;
     NCCLCommunicator* mComm = nullptr;
+    const CompiledGraph* mForwardGraph = nullptr;  // M5.γ Session D: set via set_forward_graph
 
     // Caches
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8Cache = nullptr;

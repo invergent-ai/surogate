@@ -1019,7 +1019,11 @@ Tensor* CompiledExecutor::bind_from_region(int tid, const TensorRef& ref) {
 void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     if (!mPhaseArenas || !mPhaseArenas->allocated) return;
     if (!mPhaseArenas->fwd_stack_ptr || mPhaseArenas->fwd_stack_bytes == 0) return;
-    if (mTensors.size() != static_cast<std::size_t>(graph.num_tensors)) return;
+    // Session D: during execute_backward we invoke this on the forward
+    // graph to pre-bind fwd-activation tids into bwd's mTensors via the
+    // shared tid namespace. bwd.num_tensors >= fwd.num_tensors, so allow
+    // graph.num_tensors <= mTensors.size().
+    if (static_cast<std::size_t>(graph.num_tensors) > mTensors.size()) return;
 
     // Per-tid producing output ref — the canonical shape/dtype source.
     // Last writer wins; the compiler's SSA invariant means there is at

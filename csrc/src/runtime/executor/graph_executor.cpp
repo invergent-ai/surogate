@@ -916,6 +916,7 @@ void GraphExecutor::compile_graphs(long B, long T) {
             mCompiledForward =
                 std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T, /*is_backward=*/false));
             mCompiledForward->compute_layer_segments();
+            mCompiledExecutor->set_forward_graph(mCompiledForward.get());
         }
         if (mBackward) {
             mCompiledBackward =

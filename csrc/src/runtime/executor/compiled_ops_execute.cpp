@@ -595,10 +595,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        const modules::ForwardHook* hook) {
     mComm = &comm;
     mCurrentGraph = &graph;
-    // M5.γ Option C: register as the active executor so block_activation_ptr
-    // routes slot lookups through mTensors[tid] first, matching the
-    // simplified_acts[slot] source of truth for arena-backed slots.
-    mRunState.set_active_executor(this);
     mTemps.clear();
     mMoEHostOffsetsCache.clear();
     // cudaFree and cudaMemPoolTrimTo are prohibited during CUDA stream capture —
@@ -638,6 +634,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // block-scope Mapped-slot ops route through the arena at
     // ensure_output_tensor instead of Stack temp_alloc.
     populate_fwd_stack_bindings(graph);
+    // M5.γ Option C: register as active executor ONLY after populate, so
+    // block_activation_ptr's tid-first path sees a coherent mTensors on
+    // every call (pre-populate callers during the cleanup block above
+    // safely fall through to simplified_acts — which still carries the
+    // previous step's arena pointers, all stable addresses).
+    mRunState.set_active_executor(this);
     // Scrub mSaved entries pointing into the Stack arena or the
     // replay-persist arena. Between steps both are reset — Stack top rolls
     // back, replay-persist offset rewinds — so any saved Tensor whose Data
@@ -1743,8 +1745,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         bool skip_zeroing) {
     mComm = &comm;
     mCurrentGraph = &graph;
-    // M5.γ Option C: register as active executor for block_activation_ptr.
-    mRunState.set_active_executor(this);
     mRunState.reset_simplified_gradients();
     mTemps.clear();
     // Phase 3 subsystem #4: reset per-step bump cursor for bwd_cross_layer arena.
@@ -1762,6 +1762,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
     mMicroStep = micro_step;
+
+    // M5.γ Option C: register as active executor. No populate for the bwd
+    // graph's own FwdStack tids — the bwd graph doesn't have ForwardActivation
+    // kind tids (it has gradients, saves, and cross-graph Unknowns). Forward
+    // activations are resolved via:
+    //   - SaveForBwd: mSaved pre-bind from M5.β (bind_tensor(name, t) in
+    //     persist_saved_layer_tensors at forward layer_end, read at backward
+    //     entry via the loop below).
+    //   - Recomputed: replay_layer_forward's own populate pass.
+    //   - Otherwise: block_activation_ptr fallback to simplified_acts[slot],
+    //     which has arena-backed Data from consume_fwdstack_arena (stable
+    //     addresses across fwd→bwd within a step).
+    mRunState.set_active_executor(this);
 
     // M5.α: bind every stable non-param global into mTensors + mNamedTensors
     // at backward entry so resolve_tensor finds them via the tid/name cache
