@@ -1084,17 +1084,8 @@ void GraphExecutor::compile_graphs(long B, long T) {
                         dump_simplified_activation_offsets();
                     }
                 }
-                // Phase 3 step 4 arena consumption: route every FwdStack
-                // simplified_acts slot to its arena-baked offset. Arena
-                // is allocated under SUROGATE_USE_PHASE_STACK_ARENAS=1
-                // (same env gate still guards the allocation). Once the
-                // allocation happens, consumption is the default path
-                // — there is no correctness benefit to keeping the
-                // per-layer Stack allocations alongside an allocated
-                // FwdStack arena.
-                if (mPhaseArenas.fwd_stack_ptr != nullptr) {
-                    consume_fwdstack_arena();
-                }
+                // BwdStack arena consumption still routes simplified_grads
+                // to per-layer offsets — that struct hasn't been deleted yet.
                 if (mPhaseArenas.bwd_stack_ptr != nullptr) {
                     consume_bwdstack_arena();
                 }
@@ -1139,129 +1130,6 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // Resize split-attention segment graph storage when dimensions change
         if (mCompiledForward && mCompiledBackward) {
             mCompiledExecutor->resize_segment_graphs(*mCompiledForward, *mCompiledBackward);
-        }
-    }
-}
-
-namespace {
-
-struct FwdStackConsumeSlot {
-    dsl::TensorSlot slot;
-    const char* name;
-};
-
-// Block-scope FwdStack slots that simplified_acts tracks.
-constexpr FwdStackConsumeSlot kFwdStackConsumeSlots[] = {
-    {dsl::TensorSlot::BlockLN1RSTD, "ln1_rstd"},
-    {dsl::TensorSlot::BlockLN1, "ln1"},
-    {dsl::TensorSlot::BlockLN2RSTD, "ln2_rstd"},
-    {dsl::TensorSlot::BlockLN2, "ln2"},
-    {dsl::TensorSlot::BlockQRSTD, "q_rstd"},
-    {dsl::TensorSlot::BlockKRSTD, "k_rstd"},
-    {dsl::TensorSlot::BlockQKV, "qkv"},
-    {dsl::TensorSlot::BlockQKVRoPE, "qkv_rope"},
-    {dsl::TensorSlot::BlockLSE, "lse"},
-    {dsl::TensorSlot::BlockAtt, "att"},
-    {dsl::TensorSlot::BlockAttOut, "att_out"},
-    {dsl::TensorSlot::BlockMLPUp, "mlp_up"},
-    {dsl::TensorSlot::BlockSwiGLU, "swiglu"},
-    {dsl::TensorSlot::BlockMLPDown, "mlp_down"},
-    {dsl::TensorSlot::BlockHOut, "h_out"},
-    {dsl::TensorSlot::BlockResidualAtt, "res_att"},
-    // MoE slots (only allocated when NumExperts > 0; Rank=0 skip in
-    // consume_fwdstack_arena handles dense-model case).
-    {dsl::TensorSlot::BlockRouterLogits, "router_logits"},
-    {dsl::TensorSlot::BlockRouterProbs, "router_probs"},
-    {dsl::TensorSlot::BlockRoutingWeights, "routing_weights"},
-    {dsl::TensorSlot::BlockRoutingIndices, "routing_indices"},
-    {dsl::TensorSlot::BlockPermutedInput, "permuted_input"},
-    {dsl::TensorSlot::BlockScatterIndices, "scatter_indices"},
-    {dsl::TensorSlot::BlockExpertGateUp, "expert_gate_up"},
-    {dsl::TensorSlot::BlockExpertAct, "expert_act"},
-    {dsl::TensorSlot::BlockExpertDown, "expert_down"},
-};
-
-}  // namespace
-
-void GraphExecutor::consume_fwdstack_arena() {
-    if (!mCompiledForward) return;
-    const bool has_fwd_arena = mPhaseArenas.fwd_stack_ptr && mPhaseArenas.fwd_stack_bytes > 0;
-    const bool has_save_arena = mPhaseArenas.save_for_bwd_ptr && mPhaseArenas.save_for_bwd_bytes > 0;
-    if (!has_fwd_arena && !has_save_arena) return;
-    const int num_layers = static_cast<int>(mConfig.NumLayers);
-    std::size_t overridden_fwd = 0;
-    std::size_t overridden_save = 0;
-    std::size_t skipped_undersized = 0;
-    std::size_t skipped_other_region = 0;
-    for (int L = 0; L < num_layers; ++L) {
-        auto& acts = mRunState.simplified_acts(L);
-        for (const auto& entry : kFwdStackConsumeSlots) {
-            Tensor& slot = acts[entry.slot];
-            if (slot.Rank == 0) continue;
-            const int tid = mCompiledForward->slot_to_tid(L, entry.slot);
-            if (tid < 0) continue;
-            const auto& meta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
-            if (meta.offset == SIZE_MAX) {
-                ++skipped_other_region;
-                continue;
-            }
-            const std::size_t runtime_bytes =
-                static_cast<std::size_t>(slot.nelem()) * static_cast<std::size_t>(get_dtype_size(slot.DType));
-            if (meta.bytes < runtime_bytes) {
-                ++skipped_undersized;
-                continue;
-            }
-            // Route by compile-time region. FwdStack is the common recompute-
-            // mode path; SaveForBwd covers the promoted tids in no-recompute
-            // configs (finalize_save_for_bwd moves fwd→bwd-crossing block
-            // activations here when they're in the save list). Both arenas
-            // have baked per-tid offsets; we just need the right base.
-            if (meta.region == dsl::RegionKind::FwdStack && has_fwd_arena) {
-                if (meta.offset + runtime_bytes > mPhaseArenas.fwd_stack_bytes) {
-                    throw std::runtime_error("consume_fwdstack_arena: FwdStack offset " + std::to_string(meta.offset) +
-                                             " + bytes " + std::to_string(runtime_bytes) + " exceeds arena " +
-                                             std::to_string(mPhaseArenas.fwd_stack_bytes) + " for blocks[" +
-                                             std::to_string(L) + "]." + entry.name);
-                }
-                slot.Data = mPhaseArenas.fwd_stack_ptr + meta.offset;
-                ++overridden_fwd;
-            } else if (meta.region == dsl::RegionKind::SaveForBwd && has_save_arena) {
-                if (meta.block_layer_idx < 0 ||
-                    static_cast<std::size_t>(meta.block_layer_idx) >= mPhaseArenas.save_for_bwd_block_bases.size()) {
-                    ++skipped_other_region;
-                    continue;
-                }
-                const std::size_t base_off =
-                    mPhaseArenas.save_for_bwd_block_bases[static_cast<std::size_t>(meta.block_layer_idx)];
-                if (base_off + meta.offset + runtime_bytes > mPhaseArenas.save_for_bwd_bytes) {
-                    throw std::runtime_error("consume_fwdstack_arena: SaveForBwd offset " +
-                                             std::to_string(base_off + meta.offset) + " + bytes " +
-                                             std::to_string(runtime_bytes) + " exceeds arena " +
-                                             std::to_string(mPhaseArenas.save_for_bwd_bytes) + " for blocks[" +
-                                             std::to_string(L) + "]." + entry.name);
-                }
-                slot.Data = mPhaseArenas.save_for_bwd_ptr + base_off + meta.offset;
-                ++overridden_save;
-            } else {
-                ++skipped_other_region;
-            }
-        }
-        // Re-propagate BlockMoeOut's view over BlockMLPDown — it was set
-        // once at run-state init and must refresh whenever MLPDown.Data
-        // moves (override above).
-        if (Tensor& mlp_down = acts[dsl::TensorSlot::BlockMLPDown]; mlp_down.Data != nullptr) {
-            if (Tensor& moe_out = acts[dsl::TensorSlot::BlockMoeOut]; moe_out.Rank > 0) {
-                std::vector<long> shape(moe_out.Sizes.begin(), moe_out.Sizes.begin() + moe_out.Rank);
-                moe_out = view_tensor(mlp_down, shape);
-            }
-        }
-    }
-    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
-        if (std::string(dbg) == "1") {
-            std::cerr << "[arena-consume slots] overridden_fwd=" << overridden_fwd
-                      << " overridden_save=" << overridden_save << " skipped_other_region=" << skipped_other_region
-                      << " skipped_undersized=" << skipped_undersized << " fwd_bytes=" << mPhaseArenas.fwd_stack_bytes
-                      << " save_bytes=" << mPhaseArenas.save_for_bwd_bytes << "\n";
         }
     }
 }

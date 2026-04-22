@@ -100,10 +100,6 @@ public:
     long shrink_stack_to_high_water_mark(long safety_bytes = 64L * 1024 * 1024,
                                          long min_savings_bytes = 128L * 1024 * 1024);
 
-    modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) {
-        return mSimplifiedActivations[layer_idx];
-    }
-
     /// M5.γ Option C: `block_activation_ptr` consults this back-ref to
     /// route slot lookups through the executor's tid-keyed mTensors cache
     /// before falling back to the simplified_acts struct. Set by the
@@ -371,7 +367,6 @@ private:
     CompiledExecutor* mActiveExecutor = nullptr;  // M5.γ Option C back-ref; unowned
 
     void allocate_non_block_state(const PretrainedConfig& cfg);
-    void allocate_simplified_activations(const PretrainedConfig& cfg);
     void allocate_simplified_gradients(const PretrainedConfig& cfg);
     void build_activation_grad_zero_segments();
     void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);
@@ -411,7 +406,6 @@ private:
     BufferPlan mBufferPlan;
     std::vector<Tensor> mPerLayerRopeFreqs;
 
-    std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradientsBase;
 

@@ -376,7 +376,6 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                                     mGradDtype);
 
     allocate_non_block_state(config);
-    allocate_simplified_activations(config);
     allocate_simplified_gradients(config);
     build_activation_grad_zero_segments();
     allocate_simplified_quant_buffers(config, options);
@@ -488,7 +487,6 @@ void DslRunState::resize_stack_to(long new_size_bytes) {
             }
         }
     };
-    scrub_slot_array(mSimplifiedActivations, "simplified_acts");
     scrub_slot_array(mSimplifiedGradients, "simplified_grads");
     if (debug) {
         fprintf(stderr, "[stack-resize] new_size=%ld scrubbed=%zu\n", new_size_bytes, scrubbed);
@@ -860,141 +858,6 @@ void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::siz
         if (std::string(dbg) == "1") {
             std::cerr << "[arena-consume non-graph-extras] consumed=" << consumed << " slab_bytes=" << bytes << "\n";
         }
-    }
-}
-
-void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
-    // All sharing / sizing / stack-temp decisions come from the plan built
-    // in the constructor — see buffer_plan.{h,cpp}. This function is a
-    // mechanical walk over the plan: any NEW sharing or sizing decision
-    // belongs in `BufferPlan::build`, not here. Re-reading `mRecomputeLevel`,
-    // `mLoraOnlyMode`, `mRuntimeConfig`, or `mSlotRegistry` directly inside
-    // the allocator would re-introduce the policy/mechanism split the plan
-    // was introduced to eliminate.
-    const auto& plan = mBufferPlan;
-    const long B = plan.B;
-    const long T = plan.T;
-    const long C = plan.C;
-    const long Hq = plan.Hq;
-    const long Hkv = plan.Hkv;
-    const long AttnDim = plan.AttnDim;  // max across hybrid layers
-    const long QKV = plan.QKV;          // max across hybrid layers
-    const long M = plan.M;              // max across hybrid layers
-    const long MUp = plan.MUp;          // max across hybrid layers
-    const long NumExperts = plan.NumExperts;
-    const long TopK = plan.TopK;
-    const long MoeM = plan.MoeM;
-    const long MoeMUp = plan.MoeMUp;
-    const bool use_qk_norm = plan.use_qk_norm;
-    const bool recompute_enabled = plan.recompute_enabled;
-
-    const auto dtype = plan.act_dtype;
-    const auto kind = EAllocationType::ON_DEVICE;
-
-    // Phase 4 M5 preamble: remove upfront `shared_*` buffer allocations.
-    // The legacy share pattern coalesced all layers' <slot> onto one
-    // buffer under recompute, relying on forward replay to regenerate
-    // per-layer values before each backward reads. That broke the LoRA
-    // dispatch's captured input pointers when Phase A's per-layer
-    // Stack migration changed the storage. Always allocate per-layer
-    // now; LoRA naturally sees per-layer pointers and Phase A
-    // migration can proceed slot-by-slot without special-casing share.
-    // Memory cost: (NumLayers - 1) * <slot size> per shared slot.
-
-    mSimplifiedActivations.resize(cfg.NumLayers);
-    for (int i = 0; i < cfg.NumLayers; ++i) {
-        auto& acts = mSimplifiedActivations[i];
-
-        // Per-layer dimensions for hybrid models — accessors fall back to the
-        // shared (max) value for homogeneous models.
-        const long lQKV = plan.layer_qkv(i);
-        const long lAttnDim = plan.layer_attn_dim(i);
-        const long lMUp = plan.layer_mlp_up(i);
-        const long lM = plan.layer_intermediate(i);
-
-        // Per-layer allocation tag = canonical slot name; shared buffers are
-        // already created above with the `<slot>_shared` tag.
-        auto tag = [](TensorSlot s) {
-            return builtin_slot_name(s);
-        };
-
-        // Helper: allocate on Stack (via metadata-only Tensor that the
-        // executor fills in) or through mAllocator, depending on flag.
-        auto stack_or_alloc = [&](TensorSlot slot, bool on_stack, ETensorDType t, std::vector<long> shape) {
-            acts[slot] = on_stack ? Tensor::from_pointer(nullptr, DeviceId, t, shape)
-                                  : mAllocator->allocate(t, tag(slot), kind, shape);
-        };
-
-        stack_or_alloc(TensorSlot::BlockLN1RSTD, true, ETensorDType::FP32, {B, T});
-        stack_or_alloc(TensorSlot::BlockLN1, true, dtype, {B, T, C});
-        stack_or_alloc(TensorSlot::BlockLN2RSTD, true, ETensorDType::FP32, {B, T});
-        stack_or_alloc(TensorSlot::BlockLN2, true, dtype, {B, T, C});
-
-        if (use_qk_norm) {
-            stack_or_alloc(TensorSlot::BlockQRSTD, true, ETensorDType::FP32, {B, T, Hq});
-            stack_or_alloc(TensorSlot::BlockKRSTD, true, ETensorDType::FP32, {B, T, Hkv});
-        } else {
-            acts[TensorSlot::BlockQRSTD] = {};
-            acts[TensorSlot::BlockKRSTD] = {};
-        }
-
-        // M5 cleanup: BlockQKV / BlockQKVRoPE / BlockAtt / BlockMLPDown
-        // used to mAllocator->allocate here — wasted once
-        // consume_fwdstack_arena unconditionally overrides acts[slot].Data
-        // to arena+offset (ee0a7ad). Stack-init with Data=nullptr; the
-        // arena override writes the real pointer at (B,T) compile time.
-        // ~700 MiB saved on Qwen3-0.6B / similar scaling on larger models.
-        stack_or_alloc(TensorSlot::BlockQKV, true, dtype, {B, T, lQKV});
-        if (plan.need_separate_qkv_rope) {
-            stack_or_alloc(TensorSlot::BlockQKVRoPE, true, dtype, {B, T, lQKV});
-        } else {
-            acts[TensorSlot::BlockQKVRoPE] = Tensor{};
-        }
-
-        stack_or_alloc(TensorSlot::BlockLSE, true, ETensorDType::FP32, {B, Hq, T});
-        stack_or_alloc(TensorSlot::BlockAtt, true, dtype, {B, T, lAttnDim});
-        stack_or_alloc(TensorSlot::BlockAttOut, true, dtype, {B, T, C});
-        // BlockResidualAtt is in kFwdStackConsumeSlots (see graph_executor.cpp)
-        // — the arena override replaces this pointer at (B,T) compile time.
-        // Promoted to SaveForBwd when saved, falling back to allocator for
-        // those configs is fine because consume_fwdstack_arena's region
-        // filter skips non-FwdStack meta anyway.
-        stack_or_alloc(TensorSlot::BlockResidualAtt, true, dtype, {B, T, C});
-
-        // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
-        // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
-        stack_or_alloc(TensorSlot::BlockMLPUp, plan.ffn_temps_on_stack || !plan.has_mlp_up_slot, dtype, {B, T, lMUp});
-        stack_or_alloc(TensorSlot::BlockSwiGLU, plan.ffn_temps_on_stack || !plan.has_swiglu_slot, dtype, {B, T, lM});
-
-        stack_or_alloc(TensorSlot::BlockMLPDown, true, dtype, {B, T, C});
-        // Dedicated per-layer block output slot used by Gemma4 (keeps the
-        // block's final h_out separate from the MLP's mlp_down so the
-        // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
-        // dependency that drives MLP LoRA gradients).
-        stack_or_alloc(TensorSlot::BlockHOut, true, dtype, {B, T, C});
-
-        if (NumExperts > 0) {
-            const long num_tokens = B * T;
-            const long total_tokens = num_tokens * TopK;
-            // M5 cleanup: MoE slots now stack-init; consume_fwdstack_arena
-            // routes every MoE-layer FwdStack tid through the arena at
-            // (B,T) compile time. Drops 9 persistent mAllocator allocations
-            // per MoE layer in favor of the already-sized FwdStack arena.
-            stack_or_alloc(TensorSlot::BlockRouterLogits, true, dtype, {num_tokens, NumExperts});
-            stack_or_alloc(TensorSlot::BlockRouterProbs, true, dtype, {num_tokens, NumExperts});
-            stack_or_alloc(TensorSlot::BlockRoutingWeights, true, dtype, {num_tokens, TopK});
-            stack_or_alloc(TensorSlot::BlockRoutingIndices, true, ETensorDType::INT32, {num_tokens, TopK});
-            stack_or_alloc(TensorSlot::BlockPermutedInput, true, dtype, {total_tokens, C});
-            stack_or_alloc(TensorSlot::BlockScatterIndices, true, ETensorDType::INT32, {total_tokens});
-            stack_or_alloc(TensorSlot::BlockExpertGateUp, true, dtype, {total_tokens, MoeMUp});
-            stack_or_alloc(TensorSlot::BlockExpertAct, true, dtype, {total_tokens, MoeM});
-            stack_or_alloc(TensorSlot::BlockExpertDown, true, dtype, {total_tokens, C});
-            // BlockMoeOut is a VIEW of BlockMLPDown; consume_fwdstack_arena
-            // re-propagates the view after the MLPDown override (both MLPDown
-            // and MoeOut now resolve to the same arena bytes).
-            acts[TensorSlot::BlockMoeOut] = view_tensor(acts[TensorSlot::BlockMLPDown], {num_tokens, C});
-        }
-        // else: slots default-constructed by std::array{} init above.
     }
 }
 
