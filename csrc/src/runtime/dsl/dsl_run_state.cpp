@@ -29,6 +29,7 @@
 #include "runtime/core/fp8_scaling_state.h"
 #include "runtime/core/matmul_context.h"
 #include "runtime/core/model_config.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
@@ -693,6 +694,82 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     // and causing stack OOM on MoE models with many layers.
     mNonBlockGradients.d_embeddings =
         mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+}
+
+void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& graph,
+                                                       const PhaseArenas& arenas,
+                                                       cudaStream_t stream) {
+    if (!arenas.allocated || arenas.persistent_ptr == nullptr || arenas.persistent_bytes == 0) return;
+
+    std::size_t rebound = 0;
+    std::size_t skipped_no_tid = 0;
+    std::size_t skipped_non_persistent = 0;
+    std::size_t skipped_size_mismatch = 0;
+
+    auto try_rebind = [&](const char* name, Tensor& t) {
+        if (t.Data == nullptr) return;
+        const int tid = graph.find_tensor_id(name);
+        if (tid < 0) {
+            ++skipped_no_tid;
+            return;
+        }
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != RegionKind::Persistent || meta.offset == SIZE_MAX) {
+            ++skipped_non_persistent;
+            return;
+        }
+        const std::size_t tensor_bytes = t.bytes();
+        if (tensor_bytes == 0 || meta.bytes < tensor_bytes || meta.offset + tensor_bytes > arenas.persistent_bytes) {
+            ++skipped_size_mismatch;
+            return;
+        }
+        std::byte* arena_ptr = arenas.persistent_ptr + meta.offset;
+        CUDA_CHECK(cudaMemcpyAsync(arena_ptr, t.Data, tensor_bytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = t.Stats;
+        const int device = t.Device;
+        mAllocator->free(t);
+        t.Data = arena_ptr;
+        t.Device = device;
+        t.Stats = preserved_stats;
+        ++rebound;
+    };
+
+    // Multiple names may route to the same backing buffer (SSA aliases). We
+    // only rebind once per buffer; subsequent attempts see Data==nullptr (after
+    // free) and no-op.
+    auto try_rebind_aliases = [&](std::initializer_list<const char*> names, Tensor& t) {
+        for (const char* n : names) {
+            if (t.Data == nullptr) return;  // already rebound via earlier alias
+            try_rebind(n, t);
+        }
+    };
+
+    // "x0" is the SSA output of the main embedding op; "encoded" is the
+    // slot-registry alias. "xF" is the final-norm SSA output; "ln_final" is
+    // the slot alias. Register both so we match whichever tid the graph kept.
+    try_rebind_aliases({"encoded", "x0"}, mNonBlockActivations.encoded);
+    try_rebind_aliases({"ln_final", "xF"}, mNonBlockActivations.ln_final);
+    try_rebind_aliases({"ln_final_rstd"}, mNonBlockActivations.ln_final_rstd);
+    try_rebind_aliases({"output"}, mNonBlockActivations.output);
+    try_rebind_aliases({"freq_cis"}, mNonBlockActivations.freq_cis);
+    try_rebind_aliases({"d_ln_final"}, mNonBlockGradients.d_ln_final);
+    try_rebind_aliases({"d_embeddings"}, mNonBlockGradients.d_embeddings);
+
+    for (std::size_t i = 0; i < mPerLayerRopeFreqs.size(); ++i) {
+        const std::string name = "rope_freqs_layer" + std::to_string(i);
+        try_rebind(name.c_str(), mPerLayerRopeFreqs[i]);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume non-block] rebound=" << rebound << " skipped_no_tid=" << skipped_no_tid
+                      << " skipped_non_persistent=" << skipped_non_persistent
+                      << " skipped_size_mismatch=" << skipped_size_mismatch
+                      << " arena_bytes=" << arenas.persistent_bytes << "\n";
+        }
+    }
 }
 
 void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {

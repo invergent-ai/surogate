@@ -181,3 +181,26 @@ Q3/Q3.5 see the bulk of savings from the first two commits (dense activation + r
 Correctness bit-identical on all 3 recompute configs. The `qwen3-lora-bf16-bench-norecompute.yaml` config has a pre-existing NaN at step 0 independent of this work — tracked for separate investigation.
 
 **No `mAllocator->allocate` calls remain in `allocate_simplified_activations` for FwdStack / SaveForBwd block-scope slots.** Everything's arena-backed now.
+
+## 2026-04-22: non-block activation rebind to Persistent arena
+
+Follow-up cleanup for the non-block tensors (`encoded`/`x0`, `ln_final`/`xF`, `d_ln_final`, `freq_cis`, `output`, `ln_final_rstd`, `d_embeddings`, per-layer RoPE). These were all allocated via `mAllocator->allocate` in `allocate_non_block_state`, duplicating the Persistent arena slot already reserved for any tid matching by name.
+
+Added `DslRunState::rebind_non_block_to_persistent_arena()` — mirrors the pattern in `DslParamStore::rebind_to_persistent_arena`: copy bytes to `persistent_ptr + meta.offset`, free the allocator buffer, repoint `Tensor.Data` at the arena slot. Aliases (`encoded`/`x0`, `ln_final`/`xF`) are tried in order so whichever canonical name the graph kept gets matched. Called from `GraphExecutor::set_config` once per run, gated by `mNonBlockRebasedToArena`.
+
+Reality check: only **3 of 7** non-block tensors have Persistent tids in the current graph (the ones produced as DSL op outputs: `x0`, `xF`, `d_ln_final`). The other 4 (`output`, `freq_cis`, `ln_final_rstd`, `d_embeddings`) are not referenced by any DSL op — they're accessed by C++ dispatchers directly — so the arena never reserved space for them. Migrating those requires registering them as external tids and wiring proper `TensorKind` (future work).
+
+| Model        | Peak before | Peak after | Δ mem                 | Δ step |
+|--------------|------------:|-----------:|----------------------:|-------:|
+| Qwen3 0.6B   |       9,166 |  **9,150** | **−16 MiB / −0.17%**  | ≈noise |
+| Qwen3.5 0.8B |      14,982 | **14,934** | **−48 MiB / −0.32%**  | ≈noise |
+| GPT-OSS 20B  |      27,932 | **27,932** | 0                     | ≈noise |
+
+Savings scale with `B*T*C` (the three rebound tensors are all `{B,T,C}`-shaped). GPT-OSS's tiny nominal saving is below the 1-MiB measurement granularity.
+
+Bit-identical loss/norm on all 3 configs:
+- Q3: loss 2.0251 / norm 3.4389 (step 0) — matches baseline
+- Q3.5: loss 1.7096 / norm 8.0438 — matches baseline
+- GPT-OSS: loss 1.7892 / norm 2.7561 — matches baseline
+
+Biggest remaining allocator win: the `output` buffer (~1.2 GiB on Q3's full-V lmhead path). Moving it into Persistent requires adding it as an external tid in `register_external_names`, same recipe the 3 rebound tids already follow.

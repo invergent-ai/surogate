@@ -1099,6 +1099,11 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     std::byte* lora_base = mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes;
                     mLoRAWeights->rebind_to_persistent_arena(lora_base, lora_slab_bytes, mRunState.MainStream);
                 }
+                if (mPhaseArenas.persistent_ptr != nullptr) {
+                    mRunState.rebind_non_block_to_persistent_arena(*mCompiledForward,
+                                                                   mPhaseArenas,
+                                                                   mRunState.MainStream);
+                }
                 // Route device-resident gradients into the Accumulator arena.
                 // No-op when rebindable_accumulator_bytes clamped to 0
                 // (ZeRO-2 / offload / streaming / cpu-training configs).

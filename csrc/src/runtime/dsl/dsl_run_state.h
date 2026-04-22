@@ -31,6 +31,8 @@ class FP8ScalingState;
 namespace dsl {
 
 class CompiledExecutor;  // forward decl — see runtime/executor/compiled_ops.h
+struct CompiledGraph;    // forward decl — see runtime/dsl/graph_compiler.h
+struct PhaseArenas;      // forward decl — see runtime/dsl/graph_compiler.h
 
 // DSL run state for graph execution (activation buffers, scratch, etc).
 class DslRunState final : public IRunState {
@@ -176,6 +178,16 @@ public:
     }
     Tensor& rope_freqs(std::string_view name);
     const Tensor& rope_freqs(std::string_view name) const;
+
+    /// Move every non-block activation / gradient / rope buffer whose tid is
+    /// Persistent-region into the pre-sized Persistent arena. Mirrors the
+    /// weight-rebind pattern in DslParamStore: copy device-resident bytes to
+    /// `arenas.persistent_ptr + meta.offset`, free the allocator-owned
+    /// buffer, and repoint the Tensor at the arena slot. Called on every
+    /// `compile_graphs` recompile (not gated) so rebind re-fires if the
+    /// Persistent arena is re-allocated under a new (B,T).
+    void
+    rebind_non_block_to_persistent_arena(const CompiledGraph& graph, const PhaseArenas& arenas, cudaStream_t stream);
 
     Tensor& get_residual(int layer_idx, cudaStream_t stream);
     Tensor& get_final_residual();
