@@ -1155,7 +1155,16 @@ Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
     // Mamba-style decay vector or similar) and the caller gets a
     // shape-wrong tensor.
     if (slot == TensorSlot::Mapped) return nullptr;
-    const int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
+    int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
+    // Session D+: forward-only slots (res_att, ln2, ln2_rstd, etc.) don't
+    // appear in the backward graph's slot→tid map because no backward op
+    // declares them as an output with that slot tag — they're forward
+    // activations consumed during bwd via snapshot/restore. Fall through
+    // to the forward graph's map (shared tid namespace) so the tid-cache
+    // lookup still succeeds during backward.
+    if (tid < 0 && mForwardGraph && mForwardGraph != mCurrentGraph) {
+        tid = mForwardGraph->slot_to_tid(layer_idx, slot);
+    }
     if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
     Tensor& t = mTensors[static_cast<std::size_t>(tid)];
     return t.Data ? &t : nullptr;
