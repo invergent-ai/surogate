@@ -37,12 +37,27 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   ├── Session D: reorder set_active_executor + fwd-graph setter   ✅ ca48fbc
 │   │   └── Session D proper: delete SimplifiedLayerActivations         ⬜ blocked — producer-based partition binds correctly by topology but regresses Q3.5 (norm 8.04→2.15) and GPT-OSS (norm 2.73→180). FwdStack arena data is overwritten across layers; debugging why legacy fallback is bit-correct while direct tid binding isn't requires per-tid shape/ptr divergence instrumentation. Postmortem: design/simplified-acts-deletion.md "Session D proper — attempted".
 │   ├── M5.δ  views + gradient leftovers                                ⬜ not started
-│   └── M5.ε  cleanup sweep                                             ⬜ not started
+│   ├── M5.ε  cleanup sweep                                             ⬜ not started
+│   └── M5.ζ  per-tid region-aware block resolve                        ⬜ not started — unblocks Session D proper + fixes no-recompute NaN (see design/norecompute-nan-investigation.md)
 └── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ✅ passed 2026-04-22 — see buffer-runtime-v4-benchmark.md §"M6 gate"
 Phase 5+                                                                 ⬜ not planned
 ```
 
 **Phase 4 closed** (M6 passed 2026-04-22). Post-M6 legacy-allocator cleanup (3 commits) dropped **2.7 GiB / 3.8 GiB / 1.9 GiB** on Qwen3 / Qwen3.5 / GPT-OSS — every block-scope simplified_acts slot is now arena-backed; `mAllocator->allocate` for block slots is gone. See buffer-runtime-v4-benchmark.md §"post-M6: legacy allocator cleanup". Follow-up on 2026-04-22 added `rebind_non_block_to_persistent_arena` (2026-04-22 §): 3 non-block tids (`x0`, `xF`, `d_ln_final`) rebound; a further 16/48/0 MiB on Q3/Q3.5/GPT-OSS. Remaining non-block tensors (`output`, `freq_cis`, `ln_final_rstd`, `d_embeddings`) are not yet DSL-op outputs so the arena doesn't size for them — future work registers them via `register_external_names`. Remaining M5 sub-milestones (Session D proper, M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
+
+**M5.ζ — per-tid region-aware block resolve (proposed, unscoped).** The no-recompute NaN investigation (see [design/norecompute-nan-investigation.md](norecompute-nan-investigation.md)) uncovered a runtime-resolve blocker that also stalled Session D proper: `resolve_tensor` for block-scope tensors dispatches **per-slot** via `block_activation_ptr(rs, L, slot) → simplified_acts[L][slot].Data`, returning one canonical pointer per `(layer, slot)` pair. SSA aliases with distinct tids but the same slot all resolve to that one pointer. Consequently: (a) promoting a tid to `SaveForBwd` at compile time doesn't route its runtime resolves to the save arena; (b) two tids sharing a slot but with different regions can't both be honored. Two implementation options on the table:
+
+1. **Per-tid arena-base lookup in the slot helpers.** `block_activation_ptr` / `block_gradient_ptr` consult `graph.tensor_meta[tid].{region, offset}` and return `arena_base[region] + offset` rather than the cached `simplified_acts[L][slot].Data`. `simplified_acts` stays as the ownership/metadata record (shape, dtype) but the hot-path dispatch reads the arena directly.
+2. **Expand the arena consumers.** `consume_fwdstack_arena` / `consume_bwdstack_arena` iterate every live block-scope tid (not just the allowlisted canonical slots), so every promoted / reassigned tid gets its own backing pointer in its `mTensors[tid]` slot, and `resolve_tensor`'s existing tid-cache fast path picks it up before the slot fallback runs.
+
+(1) is smaller and matches the M5.γ Option C precedent; (2) is more uniform but requires the tid-baking infrastructure to cover every operand in the backward graph. Both bind to the same acceptance criteria:
+
+- Qwen3 / Qwen3.5 / GPT-OSS bit-identical on recompute-on bench configs.
+- Qwen3 no-recompute bench (`qwen3-lora-bf16-bench-norecompute.yaml`) loss/norm trajectory matches recompute-on within BF16 noise (current state: NaN from step 0).
+- Session D proper's three failed partition strategies can be retried without regressing Qwen3.5 / GPT-OSS — the per-tid pointer routing should remove the dependency on the fallback path that was the root cause of the earlier regressions.
+- Peak memory gate: ±2% on all three models, same thresholds as M6.
+
+**Not in scope for M5.ζ:** the `section_per_layer` / `save_name_set` compile-time fixes already identified in the no-recompute memo. Those are additive and only useful once the runtime resolve path routes per-tid; land them in the same milestone to avoid a two-step correctness story.
 
 **Current position (2026-04-22):** Phase 4 M5.γ. The cache-divergence bug class that motivated the memo is structurally closed by Option C (9ccc784) and the replay-path fix (99368a5). Session D (ca48fbc) shipped the two narrow wins toward simplified_acts deletion — reordering set_active_executor to after populate so the tid-first path is coherent at all times within execute_*, plus a forward-graph setter for future cross-graph work. Session D proper (the actual struct deletion) was attempted and abandoned after three partition strategies failed — producer-based topology is correct but binding cross-graph tids to `fwd_stack_ptr + offset` regresses on Q3.5 and GPT-OSS even though it's bit-identical to the legacy fallback on Q3. Postmortem captured in `design/simplified-acts-deletion.md`. The current dual-dispatch is bit-identical everywhere, well-understood, and carries no outstanding risk — further deletion is cosmetic and a future project, not a Phase 4 blocker.
 
