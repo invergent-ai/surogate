@@ -242,11 +242,6 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         d_mlp_up_ptr = block_gradient_ptr(mRunState, layer_idx, TensorSlot::BlockDMLPUp);
         if (d_mlp_up_ptr && !d_mlp_up_ptr->Data) {
             mRunState.temp_acquire(*d_mlp_up_ptr);
-            // M5.δ dual-cache mirror: propagate the Stack allocation into
-            // mTensors[tid] so tid-cache readers see the same buffer.
-            if (Tensor* t = executor_tid_slot_binding(layer_idx, TensorSlot::BlockDMLPUp)) {
-                *t = *d_mlp_up_ptr;
-            }
             mTemps.push_back(*d_mlp_up_ptr);
         }
     }
@@ -463,12 +458,6 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
     if (layer_idx >= 0 && d_inp_ptr) {
         if (Tensor* d_ln2 = block_gradient_ptr(mRunState, layer_idx, TensorSlot::BlockDLN2)) {
             d_ln2->Data = d_inp_ptr->Data;
-        }
-        // M5.δ dual-cache mirror: rebind mTensors[tid_dln2].Data too so
-        // tid-cache readers see the same aliased buffer that simplified_
-        // grads[BlockDLN2].Data was just rebound to.
-        if (Tensor* t = executor_tid_slot_binding(layer_idx, TensorSlot::BlockDLN2)) {
-            t->Data = d_inp_ptr->Data;
         }
     }
 

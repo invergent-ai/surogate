@@ -526,18 +526,12 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                                    mRunState.MainStream));
     }
 
-    // Alias related gradient buffers so code reading simplified_grads directly
-    // (not via resolve_tensor/mTensors) sees the correct data. M5.δ: mirror
-    // the same Data rebind into mTensors[tid] so block_gradient_ptr's tid-
-    // first readers see the aliased pointer once the deletion lands.
+    // Alias related gradient buffers so downstream add_backward reads
+    // pick up the aliased pointer via block_gradient_ptr's tid-first path.
     if (ln_layer_idx >= 0 && ln_field == "ln2_weight") {
         if (Tensor* d_res_ffn = block_gradient_ptr(mRunState, ln_layer_idx, TensorSlot::BlockDResFFN);
             d_res_ffn && d_res_ffn->Data && d_res_ffn->Data != d_input.Data) {
             d_res_ffn->Data = d_input.Data;
-        }
-        if (Tensor* t = executor_tid_slot_binding(ln_layer_idx, TensorSlot::BlockDResFFN);
-            t && t->Data != d_input.Data) {
-            t->Data = d_input.Data;
         }
     }
     if (ln_layer_idx >= 0 && (ln_field == "ln1_weight" || ln_field == "norm_weight") && op.outputs.size() > 1 &&
@@ -549,12 +543,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             const bool d_h_out_empty = !d_h_out || !d_h_out->Data;
             if (d_h_out_empty && d_res_ffn && d_res_ffn->Data && d_res_ffn->Data != d_input.Data) {
                 d_res_ffn->Data = d_input.Data;
-            }
-            if (d_h_out_empty) {
-                if (Tensor* t = executor_tid_slot_binding(prev_layer, TensorSlot::BlockDResFFN);
-                    t && t->Data && t->Data != d_input.Data) {
-                    t->Data = d_input.Data;
-                }
             }
         }
     }
