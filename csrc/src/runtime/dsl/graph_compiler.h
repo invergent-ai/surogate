@@ -800,7 +800,7 @@ private:
 /// Writes TensorMeta::offset for every live tid and populates
 /// graph.layout_hash for distributed determinism checks. Dump gated on
 /// `SUROGATE_DEBUG_LAYOUT=1`.
-void compute_layout(CompiledGraph& graph, bool is_backward);
+void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_sections = false);
 
 /// Recompute the FNV-1a 64-bit layout hash from tensor_meta + peaks. Called
 /// internally by compute_layout(); exposed so distributed init can
@@ -955,7 +955,8 @@ std::optional<BakedOperand> baked_view(const CompiledGraph& graph, const TensorR
 /// for callers that haven't plumbed the save list.
 void finalize_save_for_bwd(CompiledGraph& fwd,
                            CompiledGraph& bwd,
-                           std::optional<std::unordered_set<std::string>> save_names = std::nullopt);
+                           std::optional<std::unordered_set<std::string>> save_names = std::nullopt,
+                           bool fwd_per_layer_sections = false);
 
 }  // namespace dsl
 

@@ -1776,7 +1776,8 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
 
 void finalize_save_for_bwd(CompiledGraph& fwd,
                            CompiledGraph& bwd,
-                           std::optional<std::unordered_set<std::string>> save_names) {
+                           std::optional<std::unordered_set<std::string>> save_names,
+                           bool fwd_per_layer_sections) {
     // Tids are shared across the fwd+bwd pair (reset_tid_namespace contract).
     const int num_tids = std::max(fwd.num_tensors, bwd.num_tensors);
     if (num_tids <= 0) return;
@@ -1866,7 +1867,16 @@ void finalize_save_for_bwd(CompiledGraph& fwd,
     // the clean signal; save_names.empty() after the promotion pass.
     int retained_through_fwd = 0;
     const bool recompute_mode = filter_by_save_names && save_names && save_names->empty();
-    if (recompute_mode) {
+    // Apply retain_through_forward to every block-scope FwdStack tid in two
+    // cases: (1) recompute_mode (empty save list + replay regenerates) — the
+    // original rule; (2) fwd_per_layer_sections (no-recompute) — per-layer
+    // sectioning stops cross-layer clobber, but within-layer coloring still
+    // reuses bytes for disjoint-lifetime tids. Under no-recompute,
+    // save_tensors runs after forward and captures simplified_acts[L][slot]
+    // pointers; if coloring reused those bytes mid-forward, the saved
+    // snapshot is the LATER tid's data, not the slot's. retain_through_forward
+    // extends live ranges to frame end so coloring cannot reuse.
+    if (recompute_mode || fwd_per_layer_sections) {
         for (auto& meta : fwd.tensor_meta) {
             if (!meta.is_blocks()) continue;
             if (meta.region != RegionKind::FwdStack) continue;
@@ -1898,8 +1908,8 @@ void finalize_save_for_bwd(CompiledGraph& fwd,
             m.offset = SIZE_MAX;
         for (auto& m : bwd.tensor_meta)
             m.offset = SIZE_MAX;
-        compute_layout(fwd, /*is_backward=*/false);
-        compute_layout(bwd, /*is_backward=*/true);
+        compute_layout(fwd, /*is_backward=*/false, fwd_per_layer_sections);
+        compute_layout(bwd, /*is_backward=*/true, fwd_per_layer_sections);
     }
 }
 
@@ -2218,7 +2228,7 @@ std::uint64_t compute_layout_hash(const CompiledGraph& graph) {
     return h;
 }
 
-void compute_layout(CompiledGraph& graph, bool is_backward) {
+void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_sections) {
     const std::size_t num_tids = static_cast<std::size_t>(graph.num_tensors);
     std::vector<LayoutInfo> info(num_tids);
 
@@ -2516,7 +2526,8 @@ void compute_layout(CompiledGraph& graph, bool is_backward) {
     // extra op overwrote layer L's just-replayed LN1 before layer L's
     // backward ops read it. See the `idx < end` bound in
     // compiled_ops_execute.cpp.
-    auto [fwd_naive, fwd_colored] = color_frames(fwd_frame, fwd_alias_groups, /*section_per_layer=*/false);
+    auto [fwd_naive, fwd_colored] =
+        color_frames(fwd_frame, fwd_alias_groups, /*section_per_layer=*/(fwd_per_layer_sections && !is_backward));
     auto [bwd_naive, bwd_colored] = color_frames(bwd_frame, bwd_alias_groups, /*section_per_layer=*/false);
 
     // Expose peaks for compute_arena_sizes (M5.d).
@@ -5550,7 +5561,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // regions from M2 plus per-tid lifetimes to compute per-region peak
     // bytes and bake TensorMeta::offset. Re-run by finalize_save_for_bwd()
     // once cross-graph region promotion is applied.
-    compute_layout(result, is_backward);
+    compute_layout(result, is_backward, /*fwd_per_layer_sections=*/!mOptions.recompute_enabled());
 
     // Flatten the phase tree to a linear instruction stream (M4). The M5
     // interpreter will consume this stream; for now it is shadow-only.

@@ -945,24 +945,24 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // actually materializes, not to every fwd∧bwd-crossing tid.
         if (mCompiledForward && mCompiledBackward) {
             const bool recompute_active = mOptions.recompute_enabled();
-            std::unordered_set<std::string> save_name_set;
-            if (!recompute_active) {
-                const bool lora_only = mRunState.is_lora_only_mode();
-                const auto& registry = mCompiler->slot_registry();
-                save_name_set.reserve(mSaveList.size());
-                for (const auto& name : mSaveList) {
-                    int lyr = -1;
-                    std::string fld;
-                    const bool recompute = parse_block_param(name, lyr, fld)
-                                               ? registry.will_recompute(dsl::strip_ssa_suffix(fld), lora_only)
-                                               : registry.will_recompute(dsl::strip_ssa_suffix(name), lora_only);
-                    if (recompute) continue;
-                    save_name_set.insert(name);
-                }
+            // Under recompute: pass an empty set so finalize_save_for_bwd
+            // promotes zero tids and sizes SaveForBwd to 0 (replay
+            // regenerates activations just-in-time, so no save needed).
+            // Under no-recompute: pass nullopt so every fwd∧bwd-crossing
+            // block tid is promoted to SaveForBwd and gets
+            // retain_through_forward applied — name-match filtering
+            // against mSaveList misses SSA-alias tids (`x_flat` aliases
+            // `ln1`) whose canonical name differs from any save-list
+            // entry, leaving them in FwdStack where within-layer coloring
+            // clobbers their bytes before save_tensors captures them.
+            std::optional<std::unordered_set<std::string>> save_name_arg;
+            if (recompute_active) {
+                save_name_arg = std::unordered_set<std::string>{};
             }
-            // Always pass a set (possibly empty under recompute). nullopt
-            // is reserved for callers that haven't plumbed mSaveList at all.
-            dsl::finalize_save_for_bwd(*mCompiledForward, *mCompiledBackward, std::move(save_name_set));
+            dsl::finalize_save_for_bwd(*mCompiledForward,
+                                       *mCompiledBackward,
+                                       std::move(save_name_arg),
+                                       /*fwd_per_layer_sections=*/!recompute_active);
         }
 
         // Phase-tree arena allocation (M5.d). Sized from baked offsets;
