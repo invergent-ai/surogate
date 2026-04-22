@@ -1144,33 +1144,31 @@ constexpr FwdStackConsumeSlot kFwdStackConsumeSlots[] = {
     {dsl::TensorSlot::BlockSwiGLU, "swiglu"},
     {dsl::TensorSlot::BlockMLPDown, "mlp_down"},
     {dsl::TensorSlot::BlockHOut, "h_out"},
+    {dsl::TensorSlot::BlockResidualAtt, "res_att"},
 };
 
 }  // namespace
 
 void GraphExecutor::consume_fwdstack_arena() {
     if (!mCompiledForward) return;
-    if (!mPhaseArenas.fwd_stack_ptr || mPhaseArenas.fwd_stack_bytes == 0) return;
+    const bool has_fwd_arena = mPhaseArenas.fwd_stack_ptr && mPhaseArenas.fwd_stack_bytes > 0;
+    const bool has_save_arena = mPhaseArenas.save_for_bwd_ptr && mPhaseArenas.save_for_bwd_bytes > 0;
+    if (!has_fwd_arena && !has_save_arena) return;
     const int num_layers = static_cast<int>(mConfig.NumLayers);
-    std::size_t overridden = 0;
+    std::size_t overridden_fwd = 0;
+    std::size_t overridden_save = 0;
     std::size_t skipped_undersized = 0;
-    std::size_t skipped_non_fwdstack = 0;
+    std::size_t skipped_other_region = 0;
     for (int L = 0; L < num_layers; ++L) {
         auto& acts = mRunState.simplified_acts(L);
         for (const auto& entry : kFwdStackConsumeSlots) {
             Tensor& slot = acts[entry.slot];
             if (slot.Rank == 0) continue;
-            // M5.γ migration: replaced `find_tensor_id("blocks[L].<name>")`
-            // + 15 string concatenations per layer with an O(1) LUT.
             const int tid = mCompiledForward->slot_to_tid(L, entry.slot);
             if (tid < 0) continue;
             const auto& meta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
-            // Only route slots whose compile-time region is FwdStack. Slots
-            // promoted to SaveForBwd (e.g., BlockQKV saved for attention
-            // backward) keep their allocator-owned persistent buffers — the
-            // save path owns them.
-            if (meta.region != dsl::RegionKind::FwdStack || meta.offset == SIZE_MAX) {
-                ++skipped_non_fwdstack;
+            if (meta.offset == SIZE_MAX) {
+                ++skipped_other_region;
                 continue;
             }
             const std::size_t runtime_bytes =
@@ -1179,22 +1177,40 @@ void GraphExecutor::consume_fwdstack_arena() {
                 ++skipped_undersized;
                 continue;
             }
-            if (meta.offset + runtime_bytes > mPhaseArenas.fwd_stack_bytes) {
-                // Defensive: never produce an OOB pointer. Reaching this
-                // branch means coloring under-sized the arena relative to
-                // its per-tid offsets — a compiler invariant violation.
-                throw std::runtime_error("consume_fwdstack_arena: slot offset " + std::to_string(meta.offset) +
-                                         " + runtime_bytes " + std::to_string(runtime_bytes) + " exceeds arena " +
-                                         std::to_string(mPhaseArenas.fwd_stack_bytes) + " for blocks[" +
-                                         std::to_string(L) + "]." + entry.name);
+            // Route by compile-time region. FwdStack is the common recompute-
+            // mode path; SaveForBwd covers the promoted tids in no-recompute
+            // configs (finalize_save_for_bwd moves fwd→bwd-crossing block
+            // activations here when they're in the save list). Both arenas
+            // have baked per-tid offsets; we just need the right base.
+            if (meta.region == dsl::RegionKind::FwdStack && has_fwd_arena) {
+                if (meta.offset + runtime_bytes > mPhaseArenas.fwd_stack_bytes) {
+                    throw std::runtime_error("consume_fwdstack_arena: FwdStack offset " + std::to_string(meta.offset) +
+                                             " + bytes " + std::to_string(runtime_bytes) + " exceeds arena " +
+                                             std::to_string(mPhaseArenas.fwd_stack_bytes) + " for blocks[" +
+                                             std::to_string(L) + "]." + entry.name);
+                }
+                slot.Data = mPhaseArenas.fwd_stack_ptr + meta.offset;
+                ++overridden_fwd;
+            } else if (meta.region == dsl::RegionKind::SaveForBwd && has_save_arena) {
+                if (meta.block_layer_idx < 0 ||
+                    static_cast<std::size_t>(meta.block_layer_idx) >= mPhaseArenas.save_for_bwd_block_bases.size()) {
+                    ++skipped_other_region;
+                    continue;
+                }
+                const std::size_t base_off =
+                    mPhaseArenas.save_for_bwd_block_bases[static_cast<std::size_t>(meta.block_layer_idx)];
+                if (base_off + meta.offset + runtime_bytes > mPhaseArenas.save_for_bwd_bytes) {
+                    throw std::runtime_error("consume_fwdstack_arena: SaveForBwd offset " +
+                                             std::to_string(base_off + meta.offset) + " + bytes " +
+                                             std::to_string(runtime_bytes) + " exceeds arena " +
+                                             std::to_string(mPhaseArenas.save_for_bwd_bytes) + " for blocks[" +
+                                             std::to_string(L) + "]." + entry.name);
+                }
+                slot.Data = mPhaseArenas.save_for_bwd_ptr + base_off + meta.offset;
+                ++overridden_save;
+            } else {
+                ++skipped_other_region;
             }
-            // Unconditional override: for FwdStack-region slots the arena IS
-            // the truth. Pre-existing slot.Data (from mAllocator or a Stack
-            // lazy-alloc handoff) is replaced here so block_activation_ptr
-            // and the tid-baked populate_fwd_stack_bindings path converge
-            // on the same bytes.
-            slot.Data = mPhaseArenas.fwd_stack_ptr + meta.offset;
-            ++overridden;
         }
         // Re-propagate BlockMoeOut's view over BlockMLPDown — it was set
         // once at run-state init and must refresh whenever MLPDown.Data
@@ -1208,10 +1224,10 @@ void GraphExecutor::consume_fwdstack_arena() {
     }
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
-            std::cerr << "[arena-consume fwd_stack] overridden=" << overridden
-                      << " skipped_non_fwdstack=" << skipped_non_fwdstack
-                      << " skipped_undersized=" << skipped_undersized << " arena_bytes=" << mPhaseArenas.fwd_stack_bytes
-                      << "\n";
+            std::cerr << "[arena-consume slots] overridden_fwd=" << overridden_fwd
+                      << " overridden_save=" << overridden_save << " skipped_other_region=" << skipped_other_region
+                      << " skipped_undersized=" << skipped_undersized << " fwd_bytes=" << mPhaseArenas.fwd_stack_bytes
+                      << " save_bytes=" << mPhaseArenas.save_for_bwd_bytes << "\n";
         }
     }
 }

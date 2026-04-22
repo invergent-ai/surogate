@@ -786,8 +786,12 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         stack_or_alloc(TensorSlot::BlockLSE, true, ETensorDType::FP32, {B, Hq, T});
         stack_or_alloc(TensorSlot::BlockAtt, true, dtype, {B, T, lAttnDim});
         stack_or_alloc(TensorSlot::BlockAttOut, true, dtype, {B, T, C});
-        acts[TensorSlot::BlockResidualAtt] =
-            mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
+        // BlockResidualAtt is in kFwdStackConsumeSlots (see graph_executor.cpp)
+        // — the arena override replaces this pointer at (B,T) compile time.
+        // Promoted to SaveForBwd when saved, falling back to allocator for
+        // those configs is fine because consume_fwdstack_arena's region
+        // filter skips non-FwdStack meta anyway.
+        stack_or_alloc(TensorSlot::BlockResidualAtt, true, dtype, {B, T, C});
 
         // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
         // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
