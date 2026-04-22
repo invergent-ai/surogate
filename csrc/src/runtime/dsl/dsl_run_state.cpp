@@ -753,7 +753,10 @@ void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& grap
     try_rebind_aliases({"output"}, mNonBlockActivations.output);
     try_rebind_aliases({"freq_cis"}, mNonBlockActivations.freq_cis);
     try_rebind_aliases({"d_ln_final"}, mNonBlockGradients.d_ln_final);
-    try_rebind_aliases({"d_embeddings"}, mNonBlockGradients.d_embeddings);
+    // `d_embeddings` / `d_encoded` / `d_x0` tids exist but aren't classified
+    // Persistent in the graph (ActivationGrad→Persistent rule doesn't fire
+    // for them in practice), so this buffer is rebound via the extras slab
+    // instead. See `rebind_non_graph_persistent_to_arena`.
 
     for (std::size_t i = 0; i < mPerLayerRopeFreqs.size(); ++i) {
         const std::string name = "rope_freqs_layer" + std::to_string(i);
@@ -773,10 +776,19 @@ void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& grap
 }
 
 std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
-    // `output` is the only non-graph-tid persistent buffer today. It is sized
-    // at construction in `allocate_non_block_state`, so reading `.bytes()`
-    // here is authoritative for the current (B,T,V,lmhead_chunks,dtype).
-    return mNonBlockActivations.output.bytes();
+    // Persistent buffers that don't have a graph tid today. The list here
+    // must stay in lockstep with the rebind order in
+    // `rebind_non_graph_persistent_to_arena` — same tensors, same order,
+    // so bump-allocated offsets are deterministic.
+    std::size_t total = 0;
+    total += mNonBlockActivations.output.bytes();
+    total += mNonBlockActivations.ln_final_rstd.bytes();
+    total += mNonBlockActivations.freq_cis.bytes();
+    total += mNonBlockGradients.d_embeddings.bytes();
+    for (const auto& rf : mPerLayerRopeFreqs) {
+        total += rf.bytes();
+    }
+    return total;
 }
 
 void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::size_t bytes, cudaStream_t stream) {
@@ -798,7 +810,14 @@ void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::siz
         consumed += tbytes;
     };
 
+    // Order must match `non_graph_persistent_extras_bytes`.
     rebind_into(mNonBlockActivations.output);
+    rebind_into(mNonBlockActivations.ln_final_rstd);
+    rebind_into(mNonBlockActivations.freq_cis);
+    rebind_into(mNonBlockGradients.d_embeddings);
+    for (auto& rf : mPerLayerRopeFreqs) {
+        rebind_into(rf);
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
