@@ -158,25 +158,26 @@ the deletion.
 multi-rank, fresh recompute correctness diff. These are untouched by
 M5.γ changes; prior validation stands.
 
-## 2026-04-22 post-M6: legacy allocator cleanup
+## 2026-04-22 post-M6: legacy allocator cleanup (3 commits)
 
-Found 4 `mAllocator->allocate` calls in
-`allocate_simplified_activations` for slots that
-`consume_fwdstack_arena` always overrides (BlockQKV / BlockQKVRoPE /
-BlockAtt / BlockMLPDown). Allocator-owned memory was never used —
-the arena pointer replaced it at (B,T) compile. Pure leak.
+After M6 closed Phase 4, the user asked "do we have legacy allocations left that don't use the arenas?" Yes — lots. This section tracks the cleanup that routes every block-scope simplified_acts slot through the arenas.
 
-Flipped all four to `stack_or_alloc(on_stack=true)` (Data=nullptr at
-init, arena override writes the real pointer).
+**Commit 1 (a163374) — 4 wasted slots.** BlockQKV / BlockQKVRoPE / BlockAtt / BlockMLPDown were being `mAllocator->allocate`'d at init *and* then overridden to arena by `consume_fwdstack_arena`. The allocator memory was never read. Flipped all four to `stack_or_alloc(on_stack=true)`.
 
-| Model        | Peak before | Peak after | Δ mem          | Δ step  |
-|--------------|------------:|-----------:|---------------:|--------:|
-| Qwen3 0.6B   |      11,874 |  **9,390** | **−2,484 MiB / −21%** | +0.30% |
-| Qwen3.5 0.8B |      18,822 | **15,350** | **−3,472 MiB / −18%** | +0.26% |
-| GPT-OSS 20B  |      29,830 | **29,494** | −336 MiB       | +0.62% |
+**Commit 2 (ef0a3f9) — BlockResidualAtt dual-mode routing.** BlockResidualAtt was allocator-backed because in no-recompute configs `finalize_save_for_bwd` promotes it to SaveForBwd region, where `consume_fwdstack_arena` didn't touch it. Extended `consume_fwdstack_arena` to route by `meta.region`: FwdStack → fwd arena, SaveForBwd → `save_for_bwd_ptr + block_base + offset`. BlockResidualAtt added to the allowlist; the allocator call gone.
 
-GPT-OSS's smaller peak delta: its peak is dominated by MoE expert
-buffers (still allocator-owned — not in `kFwdStackConsumeSlots`).
-The non-MoE cleanup hits the dense models hardest.
+**Commit 3 — 10 MoE slots.** Every MoE-layer slot (RouterLogits/Probs/Weights/Indices, PermutedInput, ScatterIndices, ExpertGateUp/Act/Down, MoeOut view) migrated from `mAllocator->allocate` to stack-init + arena override. Added 9 slot names to `kFwdStackConsumeSlots`; the MoeOut view propagation (shipped in Session 1) handles the BlockMLPDown→MoeOut aliasing.
 
-Step throughput within ±1% on all configs. Correctness bit-identical.
+**Cumulative results:**
+
+| Model        | Peak before | Peak final | Δ mem                  | Δ step |
+|--------------|------------:|-----------:|-----------------------:|-------:|
+| Qwen3 0.6B   |      11,874 |  **9,166** | **−2,708 MiB / −23%**  | +0.52% |
+| Qwen3.5 0.8B |      18,822 | **14,982** | **−3,840 MiB / −20%**  | +0.42% |
+| GPT-OSS 20B  |      29,830 | **27,932** | **−1,898 MiB / −6%**   | +0.56% |
+
+Q3/Q3.5 see the bulk of savings from the first two commits (dense activation + residual). GPT-OSS's biggest gain is from the MoE migration (29,494 → 27,932 = 1.5 GiB). Step throughput within ±1% everywhere — well under the ±2% gate threshold.
+
+Correctness bit-identical on all 3 recompute configs. The `qwen3-lora-bf16-bench-norecompute.yaml` config has a pre-existing NaN at step 0 independent of this work — tracked for separate investigation.
+
+**No `mAllocator->allocate` calls remain in `allocate_simplified_activations` for FwdStack / SaveForBwd block-scope slots.** Everything's arena-backed now.
