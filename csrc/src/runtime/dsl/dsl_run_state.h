@@ -152,16 +152,6 @@ public:
         mFP8BufferReadyFlags = FP8Ready_None;
     }
 
-    void reset_simplified_gradients();
-
-    /// Re-snapshot `mSimplifiedGradientsBase` from the current
-    /// `mSimplifiedGradients` state. Call this after an arena consumer has
-    /// re-pointed block-scope grad slots (e.g.
-    /// `GraphExecutor::consume_bwdstack_arena`) so subsequent
-    /// `reset_simplified_gradients()` restores to arena pointers, not the
-    /// stale pre-arena snapshot.
-    void refresh_simplified_gradients_base();
-
     /// @brief Zero all activation gradient buffers (d_res_ffn, d_res_att) for all layers.
     /// Call this at the start of each backward pass to prevent stale gradients from accumulating.
     void zero_activation_gradients(cudaStream_t stream);
@@ -407,7 +397,6 @@ private:
     std::vector<Tensor> mPerLayerRopeFreqs;
 
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
-    std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradientsBase;
 
     // Precomputed list of activation-gradient buffers to zero at the start of backward.
     // Stored as device arrays of (ptr, bytes) to zero in a single kernel launch.

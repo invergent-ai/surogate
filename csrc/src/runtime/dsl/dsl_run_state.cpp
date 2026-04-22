@@ -923,39 +923,6 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         stack_init_grad(TensorSlot::BlockDAtt, {B, T, lAttnDim});
         stack_init_grad(TensorSlot::BlockDLN1, {B, T, C});
     }
-
-    // Preserve the original buffer pointers so we can restore them if the
-    // compiled executor temporarily aliases gradients to stack-backed temps.
-    mSimplifiedGradientsBase = mSimplifiedGradients;
-}
-
-void DslRunState::refresh_simplified_gradients_base() {
-    mSimplifiedGradientsBase = mSimplifiedGradients;
-}
-
-void DslRunState::reset_simplified_gradients() {
-    if (mSimplifiedGradientsBase.size() != mSimplifiedGradients.size()) {
-        return;
-    }
-    for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
-        auto& dst = mSimplifiedGradients[i];
-        const auto& src = mSimplifiedGradientsBase[i];
-        // Restore .Data of every BlockD* slot from the base snapshot. The
-        // executor may have aliased these to stack-backed buffers during
-        // backward; this resets them for the next step.
-        for (TensorSlot s : {TensorSlot::BlockDResFFN,
-                             TensorSlot::BlockDResAtt,
-                             TensorSlot::BlockDAttOut,
-                             TensorSlot::BlockDLN2,
-                             TensorSlot::BlockDMLPUp,
-                             TensorSlot::BlockDSwiGLU,
-                             TensorSlot::BlockDMLPDown,
-                             TensorSlot::BlockDAtt,
-                             TensorSlot::BlockDQKV,
-                             TensorSlot::BlockDLN1}) {
-            dst[s].Data = src[s].Data;
-        }
-    }
 }
 
 void DslRunState::zero_activation_gradients(cudaStream_t stream) {
@@ -989,17 +956,17 @@ void DslRunState::build_activation_grad_zero_segments() {
     if (!mAllocator) {
         return;
     }
-    if (mSimplifiedGradientsBase.empty()) {
+    if (mSimplifiedGradients.empty()) {
         return;
     }
 
     std::vector<std::uint64_t> ptrs;
     std::vector<std::uint64_t> sizes;
-    ptrs.reserve(mSimplifiedGradientsBase.size() * 8);
-    sizes.reserve(mSimplifiedGradientsBase.size() * 8);
+    ptrs.reserve(mSimplifiedGradients.size() * 8);
+    sizes.reserve(mSimplifiedGradients.size() * 8);
 
     std::unordered_set<std::byte*> seen;
-    seen.reserve(mSimplifiedGradientsBase.size() * 8);
+    seen.reserve(mSimplifiedGradients.size() * 8);
 
     auto add = [&](const Tensor& t) {
         if (!t.Data) return;
@@ -1010,9 +977,9 @@ void DslRunState::build_activation_grad_zero_segments() {
         sizes.push_back(static_cast<std::uint64_t>(bytes));
     };
 
-    const std::size_t n_layers = mSimplifiedGradientsBase.size();
+    const std::size_t n_layers = mSimplifiedGradients.size();
     for (std::size_t i = 0; i < n_layers; ++i) {
-        const auto& g = mSimplifiedGradientsBase[i];
+        const auto& g = mSimplifiedGradients[i];
         // d_res_ffn for the last layer is zeroed separately (it receives the loss gradient).
         if (i + 1 < n_layers) {
             add(g[TensorSlot::BlockDResFFN]);

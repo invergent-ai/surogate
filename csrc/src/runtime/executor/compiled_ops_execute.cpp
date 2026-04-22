@@ -1752,7 +1752,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         bool skip_zeroing) {
     mComm = &comm;
     mCurrentGraph = &graph;
-    mRunState.reset_simplified_gradients();
     mTemps.clear();
     // Phase 3 subsystem #4: reset per-step bump cursor for bwd_cross_layer arena.
     mBwdCrossLayerBumpOffset = 0;

@@ -1193,10 +1193,6 @@ void GraphExecutor::consume_bwdstack_arena() {
             ++overridden;
         }
     }
-    // Re-snapshot the base pointers so reset_simplified_gradients at
-    // execute_backward entry restores to arena pointers, not the
-    // pre-arena nullptrs captured at construction.
-    mRunState.refresh_simplified_gradients_base();
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
             std::cerr << "[arena-consume bwd_stack] overridden=" << overridden
