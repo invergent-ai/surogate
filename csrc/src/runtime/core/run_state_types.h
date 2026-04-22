@@ -46,8 +46,6 @@ struct SimplifiedLayerGradients {
     // ("d_blocks[N].mamba_*") — no per-field struct storage needed.
     static constexpr std::size_t kSize = static_cast<std::size_t>(dsl::TensorSlot::Mapped) + 1;
     std::array<Tensor, kSize> slots{};
-    /// Gradient slots backed by a persistent arena (Accumulator, BwdStack).
-    std::array<bool, kSize> persist_across_layer_end{};
 
     Tensor& operator[](dsl::TensorSlot s) {
         return slots[static_cast<std::size_t>(s)];

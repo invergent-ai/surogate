@@ -57,18 +57,10 @@ namespace dsl {
 // must restore the stack checkpoint after consuming the data.
 // ---------------------------------------------------------------------------
 
-// Clear-.Data helpers for Stack-backed slots that Stack.restore invalidates.
-// Removed `clear_rstd_stack_slots` and `clear_ffn_temp_stack_slots` —
-// consume_fwdstack_arena's unconditional override (M5.γ session 1,
-// ee0a7ad) arena-backs every slot in its allowlist and sets
-// persist_across_layer_end=true, so the clear path was a no-op on all
-// validated configs (Qwen3 / GPT-OSS MXFP4 / Qwen3.5). Clears for
-// simplified_grads (large_bwd_temps) still fire — see
-// clear_large_bwd_grad_stack_slots below.
+// Clear-.Data helpers for Stack-backed gradient slots that Stack.restore
+// invalidates across layer boundaries.
 static void clear_large_bwd_grad_stack_slots(DslRunState& rs, int L) {
-    auto& grads = rs.simplified_grads(L);
     auto clear = [&](TensorSlot s) {
-        if (grads.persist_across_layer_end[static_cast<std::size_t>(s)]) return;
         if (Tensor* t = block_gradient_ptr(rs, L, s)) t->Data = nullptr;
     };
     clear(TensorSlot::BlockDQKV);
