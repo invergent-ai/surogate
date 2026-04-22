@@ -1143,16 +1143,23 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }();
 
-    // Phase 4 M2: baked-view shortcut for SaveForBwd tids.
-    // persist_saved_layer_tensors() writes the arena-backed Tensor into
-    // mTensors[tid] via bind_tensor; reading directly from there skips a
-    // string-keyed hashmap lookup on the backward hot path.
+    // Tid-baked fast paths for arena-backed regions (Phase 4 M2 +
+    // M5.γ). persist_saved_layer_tensors / populate_fwd_stack_bindings
+    // write the arena Tensor into mTensors[tid]; returning cached here
+    // skips the mNamedTensors hashmap lookup and the slot switch below.
+    //   - SaveForBwd fires regardless of ref.shape (canonical shape).
+    //   - FwdStack fires only when ref.shape is non-empty (caller
+    //     declared a view that the pre-bind already materialized); an
+    //     empty-shape ref falls through to the canonical-shape cached
+    //     path at the tail.
     if (tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
         const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
-        if (meta.region == dsl::RegionKind::SaveForBwd) {
+        const bool is_save_for_bwd = meta.region == dsl::RegionKind::SaveForBwd;
+        const bool is_fwd_stack = meta.region == dsl::RegionKind::FwdStack && !ref.shape.empty();
+        if (is_save_for_bwd || is_fwd_stack) {
             Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
             if (cached.Data) {
-                log_tensor(cached, "baked_save");
+                log_tensor(cached, is_save_for_bwd ? "baked_save" : "region_fwd_stack_cached");
                 return cached;
             }
         }
@@ -1163,25 +1170,6 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         if (name_it != mNamedTensors.end() && name_it->second.Data) {
             log_tensor(name_it->second, "named");
             return name_it->second;
-        }
-    }
-
-    // M5.γ: tid-baked fast path for FwdStack tids. Return the arena-backed
-    // cached Tensor pre-bound by populate_fwd_stack_bindings (runs on
-    // forward + replay entry). Skips when cached.Data is null (backward
-    // pass, or a slot excluded by the non-arena-slot filter in
-    // populate_fwd_stack_bindings) so the legacy block_activation_ptr
-    // chain below still resolves those cases. Skips when ref.shape is
-    // empty — caller hasn't declared a view, so let the canonical-shape
-    // cached/slot path run unchanged.
-    if (tid >= 0 && mCurrentGraph && !ref.shape.empty() && static_cast<std::size_t>(tid) < mTensors.size()) {
-        const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
-        if (meta.region == dsl::RegionKind::FwdStack) {
-            Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
-            if (cached.Data) {
-                log_tensor(cached, "region_fwd_stack_cached");
-                return cached;
-            }
         }
     }
 
@@ -1211,17 +1199,6 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
         ref.slot != TensorSlot::Parameter) {
-        // Need to create a view from the base tensor
-        if (ref.name.find("att_flat") != std::string::npos && ref.layer_idx == 4) {
-            fprintf(stderr,
-                    "[RESOLVE] %s slot=%d layer=%d shape=[%ld,%ld] tid=%d\n",
-                    ref.name.c_str(),
-                    (int)ref.slot,
-                    ref.layer_idx,
-                    ref.shape.size() > 0 ? ref.shape[0] : -1,
-                    ref.shape.size() > 1 ? ref.shape[1] : -1,
-                    tid);
-        }
         // Delegate Block*/MoE*/BlockD*/global slot dispatch to the shared
         // helpers (same pattern as resolve_tensor at the call site below).
         // Targets/Losses/DLoss are covered by the M5.α entry bindings and
