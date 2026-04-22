@@ -213,3 +213,35 @@ My cross-graph populate binds `mTensors[tid].Data = arena+offset` once at backwa
 **Recommendation for the next attempt:** don't just bind in backward — also bind at `replay_layer_forward` entry for the fwd_graph's own tids (need to check if already done), and add a debug assertion that every cross-graph read through the tid path matches the legacy fallback's returned pointer and shape bit-for-bit. If they diverge, we've identified the specific slot/op that needs different handling.
 
 **Status:** `SimplifiedLayerActivations` deletion remains blocked. The existing dual-dispatch (Option C) is bit-identical on all tested configs and closed the original design risk (cache divergence from mutations). Further deletion is cosmetic and costs more sessions to get right than it saves.
+
+## Session D proper — second attempt 2026-04-22 (post-M5.ζ), abandoned
+
+Re-attacked after M5.ζ (`531cda3`) landed. Called `populate_fwd_stack_bindings(*mForwardGraph)` at `execute_backward` entry so forward-produced activation tids get pre-bound into bwd's `mTensors`. Same Q3 ✓ / Q3.5 ✗ / GPT-OSS partial pattern as before.
+
+### New findings
+
+1. **Every canonical tid matches the legacy fallback.** Added instrumentation that compared `mTensors[tid]` (tid-path) vs `block_activation_ptr(L, slot)` (legacy-path) for every block-scope FwdStack tid. Ran on Q3.5 — divergence counts came back `ptr=0 shape=0 dtype=0 only_legacy=0 only_tid=0`. Every pointer, shape, and dtype matched. So the regression is NOT a simple per-tid mismatch.
+
+2. **Bisect by `out_ref->slot` narrows to Mapped-slot tids.** With `SUROGATE_XBIND_SKIP=0..26` (skip every named block slot), Q3.5 norm 2.1506 (still regressed). With `SUROGATE_XBIND_SKIP=0..63` (covers Mapped=64ish), Q3.5 norm 8.0431 (baseline). So the regression is triggered by populate binding tids whose producer's `TensorRef::slot` was left at its default `TensorSlot::Mapped` — not declared as a specific block slot in the DSL.
+
+3. **mSaved-clobber hypothesis was wrong.** Added a skip for `mTensors[tid].Data != nullptr` in populate (to preserve `mSaved` pre-binds for force-persist tids like LoRA hooks). Skip fired ~54 times at bwd entry on Q3.5, but regression persisted.
+
+4. **Shape-match check at the `resolve_tensor` fast path didn't help either.** The fast path at `compiled_ops_save.cpp:1256` only fires for FwdStack when `!ref.shape.empty()`; adding `cached.shape == ref.shape` as an extra gate (fall through to slot-dispatch view path when they mismatch) didn't change Q3.5 norm. So if shape was the issue, it wasn't reaching the fast path.
+
+### What this tells us
+
+The divergence isn't in what each `resolve_tensor` call returns — the tid-path and legacy-path return the same pointer/shape/dtype for every tid we can name. The regression must come from **a downstream consumer that reads state via a path other than `resolve_tensor`** — likely one of:
+
+- A direct `mTensors[tid]` access (bypassing `resolve_tensor`) that sees the populate-bound Tensor instead of the null / uninitialized state it depended on.
+- A `bind_tensor` or mutation through `block_activation_ptr` that updates `simplified_acts[L][slot]` but not the populate-bound `mTensors[tid]`, creating asymmetric caches mid-backward.
+- An op that reads the Tensor struct by value (not just `.Data`) and picks up stale Rank/Sizes from the populate (forward's canonical shape) vs what backward's own flow expects.
+
+Mapped-slot tids triggering the regression suggests path (3) — they're intermediates (views, concat outputs, etc.) whose backward usage may assume a different implicit shape than the forward producer declared.
+
+### Recommendation for the third attempt
+
+- **Instrument every `mTensors[tid]` read on the backward hot path**, not just `resolve_tensor` entries. `grep -rn "mTensors\[" csrc/src/runtime/` shows ~15 direct indexers; audit whether any of them expect `.Rank == 0` (no populate) and break when populate pre-fills.
+- **Confirm whether Mapped-slot tids need a separate handling rule.** They escape the slot-based populate path's special cases (BlockResidualAtt, MoE, etc.) but still get the generic `t.Data = fwd_stack_ptr + meta.offset` treatment. Maybe the right answer is to NOT populate Mapped-slot tids and let them continue resolving via the slow path.
+- **Consider whether replay_layer_forward's `mTensors` swap/restore interacts badly.** At backward entry my populate fills `mTensors`; replay swaps mTensors out for a fresh one, runs forward, swaps back. The swapped-back `mTensors` has the populate values — but any op during replay that wrote to `mTensors[tid]` (via tid cache) wouldn't reach the outer mTensors. Verify with a pointer snapshot at each boundary.
+
+**Status:** Still blocked. Three attempts so far; each narrowed the problem but none closed it. The current dual-dispatch stays. Session D proper remains cosmetic cleanup, not a correctness issue.
