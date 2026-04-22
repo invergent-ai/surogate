@@ -1819,6 +1819,23 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         bind_tensor("d_loss", mRunState.scratch().cross_entropy_dloss);
     }
 
+    // M5.β: pre-populate mTensors for every saved-source tid. mSaved was
+    // filled by persist_saved_layer_tensors at forward's layer_end; its
+    // entries hold the arena-backed (SaveForBwd / moe_saved) Tensors that
+    // backward ops need. The backward graph's Saved refs use the stripped
+    // name (`blocks[L].x` — no `saved.` prefix) as their tid key, so a
+    // single bind_tensor per saved entry routes every subsequent
+    // resolve_tensor through the cached mTensors[tid] path without
+    // touching the mSaved hashmap on the hot path. Metadata-only entries
+    // (Data == nullptr) stay on the slow path — try_resolve_saved_live
+    // handles them.
+    if (mSaved) {
+        for (const auto& kv : *mSaved) {
+            if (!kv.second.Data) continue;
+            bind_tensor(kv.first, kv.second);
+        }
+    }
+
     // Clear activation/non-block gradients for each micro-step.
     // When called from GraphExecutor::backward_with_hook(), the caller already zeroes these
     // buffers, so skip_zeroing=true avoids redundant GPU work.
