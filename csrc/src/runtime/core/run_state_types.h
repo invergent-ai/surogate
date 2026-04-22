@@ -17,48 +17,6 @@
 namespace modules {
 
 /**
- * @brief Simplified layer activations for forward/backward
- *
- * This mirrors sLLamaLayerActivations but with simplified structure.
- * Used for initial implementation - can be replaced with modular activations later.
- */
-struct SimplifiedLayerActivations {
-    // Backing storage indexed by dsl::TensorSlot. Only block-activation
-    // slot indices (BlockLN1 .. BlockMoeOut) are written — the rest of the
-    // enum range is zero-initialized Tensor{} padding (~4 KiB per layer).
-    //
-    // Access: acts[TensorSlot::BlockLN1] = ... / acts[TensorSlot::BlockLN1].Data
-    //
-    // Slot documentation (see TensorSlot enum):
-    //   BlockLN1RSTD/LN2RSTD: (B, T) FP32 - RMSNorm reciprocal std
-    //   BlockLN1/LN2: (B, T, C) - normalized input
-    //   BlockQRSTD/KRSTD: (B, T, Hq|Hkv) FP32 - optional QK-norm rstd (Qwen3)
-    //   BlockQKV: (B, T, QKV_C) - after QKV projection; pre-RoPE if qkv_rope used
-    //   BlockQKVRoPE: (B, T, QKV_C) - optional post-RoPE packed QKV
-    //   BlockLSE: (B, num_heads, T) - log-sum-exp from attention
-    //   BlockAtt: (B, T, Hq*Hs) - attention output (pre out-proj)
-    //   BlockAttOut: (B, T, C) - after output projection
-    //   BlockResidualAtt: (B, T, C) - residual + attention
-    //   BlockMLPUp: (B, T, 2*D) - gate+up projection
-    //   BlockSwiGLU: (B, T, D) - SwiGLU output
-    //   BlockMLPDown: (B, T, C) - down projection
-    //   BlockHOut: (B, T, C) - final block output (Gemma4)
-    //   BlockRouter*/Routing*/Expert*/Permuted*/Scatter*/MoeOut: MoE slots
-    //
-    // Mamba / SSM ops route per-layer tensors through resolve_tensor
-    // ("blocks[N].mamba_*") — no per-field struct storage needed.
-    static constexpr std::size_t kSize = static_cast<std::size_t>(dsl::TensorSlot::Mapped) + 1;
-    std::array<Tensor, kSize> slots{};
-
-    Tensor& operator[](dsl::TensorSlot s) {
-        return slots[static_cast<std::size_t>(s)];
-    }
-    const Tensor& operator[](dsl::TensorSlot s) const {
-        return slots[static_cast<std::size_t>(s)];
-    }
-};
-
-/**
  * @brief Simplified per-layer activation gradients (for simplified backward path)
  *
  * Mirrors the legacy LLamaRunState per-layer gradient buffers closely enough
@@ -88,8 +46,7 @@ struct SimplifiedLayerGradients {
     // ("d_blocks[N].mamba_*") — no per-field struct storage needed.
     static constexpr std::size_t kSize = static_cast<std::size_t>(dsl::TensorSlot::Mapped) + 1;
     std::array<Tensor, kSize> slots{};
-    /// Mirrors SimplifiedLayerActivations::persist_across_layer_end for
-    /// gradient slots backed by a persistent arena (Accumulator, BwdStack).
+    /// Gradient slots backed by a persistent arena (Accumulator, BwdStack).
     std::array<bool, kSize> persist_across_layer_end{};
 
     Tensor& operator[](dsl::TensorSlot s) {

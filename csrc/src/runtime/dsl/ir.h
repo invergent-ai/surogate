@@ -111,7 +111,7 @@ struct TensorInfo {
 
 /// @brief Scope of an activation slot
 enum class ActivationScope : std::uint8_t {
-    Block,           ///< Per-layer activation (in SimplifiedLayerActivations)
+    Block,           ///< Per-layer activation (resolves via mTensors[tid])
     Global,          ///< Global activation (in NonBlockActivations)
     Gradient,        ///< Per-layer gradient (in SimplifiedLayerGradients)
     GlobalGradient,  ///< Global gradient (in NonBlockGradientBuffers)

@@ -250,12 +250,6 @@ public:
     /// design/simplified-acts-deletion.md.
     Tensor* executor_tid_slot(int layer_idx, TensorSlot slot);
 
-    /// M5.γ migration shim (pre-dating Option C): tries the tid path,
-    /// falls back to `block_activation_ptr`. Retained for in-executor
-    /// callers that want a local one-liner; `block_activation_ptr` now
-    /// does the same internally via `executor_tid_slot`.
-    Tensor* block_slot_tensor(int layer_idx, TensorSlot slot);
-
 private:
     // Execute an MLP tile group in chunks along the sequence dimension.
     // Used when long_context mode is enabled to reduce peak MLP activation memory.

@@ -1124,11 +1124,6 @@ Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
     return t.Data ? &t : nullptr;
 }
 
-Tensor* CompiledExecutor::block_slot_tensor(int layer_idx, TensorSlot slot) {
-    if (Tensor* t = executor_tid_slot(layer_idx, slot)) return t;
-    return block_activation_ptr(mRunState, layer_idx, slot);
-}
-
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     auto& rs = mRunState;
     const int tid = ref.tensor_id;
