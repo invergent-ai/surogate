@@ -204,3 +204,19 @@ Bit-identical loss/norm on all 3 configs:
 - GPT-OSS: loss 1.7892 / norm 2.7561 — matches baseline
 
 Biggest remaining allocator win: the `output` buffer (~1.2 GiB on Q3's full-V lmhead path). Moving it into Persistent requires adding it as an external tid in `register_external_names`, same recipe the 3 rebound tids already follow.
+
+## 2026-04-22: output logits buffer routed to Persistent arena
+
+The `output` tensor (LM-head logits scratch used by `fused_lm_head_loss`) has no DSL tid — it's accessed directly by C++ op dispatchers — so the graph's Persistent sizing pass couldn't reserve space for it. Rather than spoof a synthetic tid, added an "extras" slab appended to the Persistent arena (same recipe as `wm_slab_bytes` and `lora_slab_bytes`): grow `mPhaseArenas.persistent_bytes` by `DslRunState::non_graph_persistent_extras_bytes()` before `allocate_phase_arenas`, then call `DslRunState::rebind_non_graph_persistent_to_arena(extras_base, extras_slab_bytes, stream)` after the other rebinds to copy/free/repoint `output`.
+
+| Model        | Peak before | Peak after | Δ mem     | Δ step |
+|--------------|------------:|-----------:|----------:|-------:|
+| Qwen3 0.6B   |       9,150 |  **9,148** | −2 MiB    | ≈noise |
+| Qwen3.5 0.8B |      14,934 | **14,932** | −2 MiB    | ≈noise |
+| GPT-OSS 20B  |      27,932 | **27,930** | −2 MiB    | ≈noise |
+
+Memory savings are negligible — and expected. Moving `output` from `mAllocator->allocate` to the arena is a pure source-of-allocation swap; both paths `cudaMalloc` the same ~150 MiB (Q3) / ~310 MiB (Q3.5) / ~26 MiB (GPT-OSS) under the default `lmhead_chunks=8`. The ~2 MiB delta is allocation-alignment overhead between `TensorAllocator`'s arena and the raw `cudaMalloc` backing `allocate_phase_arenas`.
+
+The architectural win is that the last sizeable `mAllocator->allocate` in `allocate_non_block_state` now goes through the arena; the only non-arena allocations remaining are `ln_final_rstd` / `freq_cis` / `d_embeddings` (small, skipped for later) and various scratch buffers in `allocate_scratch_buffers`.
+
+Bit-identical loss/norm on Q3 1-step (norm 3.4393 vs baseline 3.4389).

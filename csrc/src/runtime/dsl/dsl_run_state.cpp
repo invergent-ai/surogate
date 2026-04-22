@@ -772,6 +772,43 @@ void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& grap
     }
 }
 
+std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
+    // `output` is the only non-graph-tid persistent buffer today. It is sized
+    // at construction in `allocate_non_block_state`, so reading `.bytes()`
+    // here is authoritative for the current (B,T,V,lmhead_chunks,dtype).
+    return mNonBlockActivations.output.bytes();
+}
+
+void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::size_t bytes, cudaStream_t stream) {
+    if (base == nullptr || bytes == 0) return;
+
+    std::size_t consumed = 0;
+    auto rebind_into = [&](Tensor& t) {
+        if (t.Data == nullptr) return;
+        const std::size_t tbytes = t.bytes();
+        if (tbytes == 0 || consumed + tbytes > bytes) return;
+        std::byte* slot = base + consumed;
+        CUDA_CHECK(cudaMemcpyAsync(slot, t.Data, tbytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = t.Stats;
+        const int device = t.Device;
+        mAllocator->free(t);
+        t.Data = slot;
+        t.Device = device;
+        t.Stats = preserved_stats;
+        consumed += tbytes;
+    };
+
+    rebind_into(mNonBlockActivations.output);
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume non-graph-extras] consumed=" << consumed << " slab_bytes=" << bytes << "\n";
+        }
+    }
+}
+
 void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     // All sharing / sizing / stack-temp decisions come from the plan built
     // in the constructor — see buffer_plan.{h,cpp}. This function is a

@@ -1016,6 +1016,7 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 std::size_t lora_slab_bytes = 0;
                 std::size_t wm_slab_bytes = 0;
                 std::size_t base_persistent_bytes = 0;
+                std::size_t extras_slab_bytes = 0;
                 if (mPhaseArenas.persistent_bytes > 0) {
                     base_persistent_bytes = mWeights.rebindable_persistent_bytes(*mCompiledForward);
                     mPhaseArenas.persistent_bytes = base_persistent_bytes;
@@ -1027,6 +1028,13 @@ void GraphExecutor::compile_graphs(long B, long T) {
                         lora_slab_bytes = mLoRAWeights->total_persistent_bytes();
                         mPhaseArenas.persistent_bytes += lora_slab_bytes;
                     }
+                    // Non-graph persistent buffers (today: `output` logits
+                    // scratch). These have no tid in the compiled graph, so
+                    // the `persistent_tids` budget doesn't cover them; grow
+                    // the arena here and route via
+                    // rebind_non_graph_persistent_to_arena below.
+                    extras_slab_bytes = mRunState.non_graph_persistent_extras_bytes();
+                    mPhaseArenas.persistent_bytes += extras_slab_bytes;
                 }
                 // Accumulator slab clamps to what DslGradStore can actually
                 // rebind; ZeRO-2 / offloaded / streaming / cpu-training
@@ -1102,6 +1110,13 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mPhaseArenas.persistent_ptr != nullptr) {
                     mRunState.rebind_non_block_to_persistent_arena(*mCompiledForward,
                                                                    mPhaseArenas,
+                                                                   mRunState.MainStream);
+                }
+                if (extras_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
+                    std::byte* extras_base =
+                        mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes + lora_slab_bytes;
+                    mRunState.rebind_non_graph_persistent_to_arena(extras_base,
+                                                                   extras_slab_bytes,
                                                                    mRunState.MainStream);
                 }
                 // Route device-resident gradients into the Accumulator arena.
