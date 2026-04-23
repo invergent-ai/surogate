@@ -76,10 +76,12 @@ GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
     "post_attn_layernorm_weight": "ln_post_attn_weight",
     "post_attn_layernorm_y": "ln_post_attn",
     "post_attn_layernorm_rstd": "ln_post_attn_rstd",
-    # --- pre_ff_layernorm (standalone rmsnorm) -> ln2 ---
+    # --- pre_ff_layernorm (fused_residual_rmsnorm: res_att + pre_ff_norm) -> ln2 ---
     "pre_ff_layernorm_weight": "ln2_weight",
     "pre_ff_layernorm_y": "ln2",
     "pre_ff_layernorm_rstd": "ln2_rstd",
+    # Fused residual output becomes the canonical res_att slot.
+    "pre_ff_layernorm_res": "res_att",
     # --- mlp (GenericMLP with gelu, separate gate/up) ---
     "mlp_gate_weight": "mlp_gate_weight",
     "mlp_up_weight": "mlp_up_weight",
@@ -143,7 +145,11 @@ _GEMMA4_GELU_MLP_CONFIG = MLPConfig(
 
 
 def _sandwich_attn_phase(block, x, residual, position_ids):
-    """Sandwich norm attention phase: input_ln → attn → post_attn_ln → residual add.
+    """Sandwich norm attention phase: input_ln → attn → post_attn_ln.
+
+    Leaves the ``residual + h_post_attn = res_att`` add to the next phase so it
+    can fuse with ``pre_ff_layernorm`` via RMSNorm's two-arg fused_residual
+    path. Returns ``(residual, h_post_attn)`` — the caller composes the sum.
 
     Gemma4 uses zero residual between blocks (state flows through x, not residual).
     We still materialize the incoming hidden state into the canonical
@@ -161,17 +167,17 @@ def _sandwich_attn_phase(block, x, residual, position_ids):
     h = block.input_layernorm(residual)
     h = block.self_attn(h, position_ids)
     h = block.post_attn_layernorm(h)
-    # Gemma4 forms the post-attention residual with a raw add instead of the
-    # fused residual+rmsnorm op, so we must register the canonical slot
-    # explicitly or the compiler treats `res_att` as a generic mapped tensor.
-    block._register_activation("res_att", ("B", "T", "d_model"), share_policy="when_recomputed")
-    residual = block._add(residual, h, name="res_att")
-    return residual
+    return residual, h
 
 
-def _sandwich_mlp_phase(block, residual):
-    """Sandwich norm MLP phase: pre_ff_ln → mlp → post_ff_ln → residual add."""
-    h = block.pre_ff_layernorm(residual)
+def _sandwich_mlp_phase(block, residual, h_post_attn):
+    """Sandwich norm MLP phase.
+
+    Opens with fused ``res_att = residual + h_post_attn; h = pre_ff_rmsnorm(res_att)``
+    via RMSNorm's two-arg call — replaces a separate add + standalone rmsnorm,
+    removes one HBM round-trip per block.
+    """
+    residual, h = block.pre_ff_layernorm(residual, h_post_attn)
     h = block.mlp(h)
     h = block.post_ff_layernorm(h)
     residual = block._add(residual, h, name="res_mlp")
@@ -295,8 +301,8 @@ class Gemma4SlidingBlock(nn.Block):
 
     def forward(self, x, residual, position_ids, per_layer_input):
         _register_frozen_and_pli_params(self)
-        residual = _sandwich_attn_phase(self, x, residual, position_ids)
-        residual = _sandwich_mlp_phase(self, residual)
+        residual, h_post_attn = _sandwich_attn_phase(self, x, residual, position_ids)
+        residual = _sandwich_mlp_phase(self, residual, h_post_attn)
         if self.PLI_D > 0:
             residual = _per_layer_input_phase(self, residual, per_layer_input)
         return _finalize(self, residual)
@@ -307,18 +313,24 @@ class Gemma4SlidingBlock(nn.Block):
 # ============================================================================
 
 
-def _sandwich_moe_mlp_phase(block, residual):
+def _sandwich_moe_mlp_phase(block, residual, h_post_attn):
     """MLP + MoE parallel phase for Gemma4 MoE blocks.
 
     HF: MLP output → post_ff_norm_1, MoE(pre_MLP_residual) → post_ff_norm_2,
     combined = norm_1 + norm_2, then post_ff_norm + residual add.
+
+    Opens with fused ``res_att = residual + h_post_attn; h = pre_ff_rmsnorm(res_att)``
+    (matches the dense-MLP variant's fusion). The MoE branch shares the
+    same residual stream but runs its own norm, so we still reuse ``residual``
+    (now the res_att output) below.
     """
-    # MLP path
-    h = block.pre_ff_layernorm(residual)
+    # Fused residual add + pre_ff_layernorm: produces res_att (= residual +
+    # h_post_attn) and the pre_ff_normed output in one kernel.
+    residual, h = block.pre_ff_layernorm(residual, h_post_attn)
     mlp_out = block.mlp(h)
     mlp_normed = block.post_ff_layernorm_1(mlp_out)
 
-    # MoE path (routes on pre-MLP residual)
+    # MoE path (routes on pre-MLP residual = res_att)
     residual_flat = block._view(residual, [B * T, block.C], name="moe_residual_flat")
     moe_input = block.pre_ff_layernorm_2(residual_flat)
     moe_out = block.moe(moe_input)
@@ -391,8 +403,8 @@ class Gemma4SlidingMoEBlock(nn.Block):
 
     def forward(self, x, residual, position_ids, per_layer_input):
         self._register_param("layer_scalar", (1,), frozen=True, quantizable=False)
-        residual = _sandwich_attn_phase(self, x, residual, position_ids)
-        residual = _sandwich_moe_mlp_phase(self, residual)
+        residual, h_post_attn = _sandwich_attn_phase(self, x, residual, position_ids)
+        residual = _sandwich_moe_mlp_phase(self, residual, h_post_attn)
         return _finalize(self, residual)
 
 
@@ -462,8 +474,8 @@ class Gemma4FullMoEBlock(nn.Block):
 
     def forward(self, x, residual, position_ids, per_layer_input):
         self._register_param("layer_scalar", (1,), frozen=True, quantizable=False)
-        residual = _sandwich_attn_phase(self, x, residual, position_ids)
-        residual = _sandwich_moe_mlp_phase(self, residual)
+        residual, h_post_attn = _sandwich_attn_phase(self, x, residual, position_ids)
+        residual = _sandwich_moe_mlp_phase(self, residual, h_post_attn)
         return _finalize(self, residual)
 
 
@@ -529,8 +541,8 @@ class Gemma4FullBlock(nn.Block):
 
     def forward(self, x, residual, position_ids, per_layer_input):
         _register_frozen_and_pli_params(self)
-        residual = _sandwich_attn_phase(self, x, residual, position_ids)
-        residual = _sandwich_mlp_phase(self, residual)
+        residual, h_post_attn = _sandwich_attn_phase(self, x, residual, position_ids)
+        residual = _sandwich_mlp_phase(self, residual, h_post_attn)
         if self.PLI_D > 0:
             residual = _per_layer_input_phase(self, residual, per_layer_input)
         return _finalize(self, residual)
@@ -542,7 +554,12 @@ class Gemma4FullBlock(nn.Block):
 
 
 def _sandwich_shared_attn_phase(block, x, residual, position_ids, kv_source):
-    """Shared-KV attention: input_ln -> Q-only attn(kv_source) -> post_attn_ln -> residual."""
+    """Shared-KV attention: input_ln -> Q-only attn(kv_source) -> post_attn_ln.
+
+    Like _sandwich_attn_phase, leaves the res_att add to the caller so
+    _sandwich_mlp_phase can fuse it with pre_ff_layernorm. Returns
+    (residual, h_post_attn).
+    """
     fresh_zeros = block._zeros(["B", "T", "d_model"], name="fresh_zero")
     block._register_activation(
         "res_ffn",
@@ -554,9 +571,7 @@ def _sandwich_shared_attn_phase(block, x, residual, position_ids, kv_source):
     h = block.input_layernorm(residual)
     h = block.self_attn(h, position_ids, kv_source)
     h = block.post_attn_layernorm(h)
-    block._register_activation("res_att", ("B", "T", "d_model"), share_policy="when_recomputed")
-    residual = block._add(residual, h, name="res_att")
-    return residual
+    return residual, h
 
 
 class Gemma4SharedKVBlock(nn.Block):
@@ -627,14 +642,14 @@ class Gemma4SharedKVBlock(nn.Block):
 
     def forward(self, x, residual, position_ids, per_layer_input, kv_source):
         _register_frozen_and_pli_params(self)
-        residual = _sandwich_shared_attn_phase(
+        residual, h_post_attn = _sandwich_shared_attn_phase(
             self,
             x,
             residual,
             position_ids,
             kv_source,
         )
-        residual = _sandwich_mlp_phase(self, residual)
+        residual = _sandwich_mlp_phase(self, residual, h_post_attn)
         if self.PLI_D > 0:
             residual = _per_layer_input_phase(self, residual, per_layer_input)
         return _finalize(self, residual)
