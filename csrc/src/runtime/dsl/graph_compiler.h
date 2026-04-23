@@ -737,6 +737,15 @@ private:
     /// read TensorMeta::region to bake buffer offsets.
     void derive_regions(CompiledGraph& graph, bool is_backward);
 
+    /// Promote FwdStack tids read across layer boundaries to SaveForBwd so
+    /// the source layer's buffer survives later layers' FwdStack reuse.
+    /// Example: Gemma4 shared-KV layers read `blocks[L_source].qkv_rope` as
+    /// their `kv_source`; under shared-arena coloring the reading layer's
+    /// writes can overlap the source's bytes before flash-attention consumes
+    /// K/V, corrupting outputs. SaveForBwd is per-layer persistent, so this
+    /// restores the producer/consumer invariant across layers.
+    void promote_cross_layer_fwd_reads(CompiledGraph& graph);
+
     /// Flatten the phase tree to a linear instruction stream (M4). Emits
     /// PhaseEnter/PhaseExit around each phase, plus SegmentDispatch +
     /// PruneByLastUse for leaf phases (ops live at leaves). Shadow-only;
