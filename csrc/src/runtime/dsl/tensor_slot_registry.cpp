@@ -158,7 +158,6 @@ const char* slot_to_name(TensorSlot slot) {
         case TensorSlot::Losses: return "loss";
         case TensorSlot::DLoss: return "d_loss";
         case TensorSlot::Parameter: return "parameter";
-        case TensorSlot::Temporary: return "temporary";
         case TensorSlot::Saved: return "saved";
         case TensorSlot::Mapped: return "mapped";
     }
@@ -375,39 +374,6 @@ SharePolicy TensorSlotRegistry::get_share_policy(const std::string& name) const 
     return SharePolicy::PerLayer;  // Default
 }
 
-bool TensorSlotRegistry::should_share(const std::string& name, bool lora_only_mode, bool recompute_enabled) const {
-    auto entry = lookup(name);
-    if (!entry) {
-        // Default: share when recompute is enabled and will_recompute says so
-        return recompute_enabled && will_recompute(name, lora_only_mode);
-    }
-
-    switch (entry->share_policy) {
-        case SharePolicy::PerLayer:
-            // Never share - always allocate per-layer
-            return false;
-
-        case SharePolicy::WhenRecomputed:
-            // Share only if recompute is enabled AND will_recompute returns true
-            // This ensures we don't share when the tensor needs to be saved per-layer
-            return recompute_enabled && will_recompute(name, lora_only_mode);
-
-        case SharePolicy::AlwaysShare:
-            // Always share regardless of mode (use with caution)
-            // The caller must ensure this is safe for their use case
-            return true;
-
-        case SharePolicy::FFTShare: return recompute_enabled && !lora_only_mode;
-
-        case SharePolicy::LoRAShare: return recompute_enabled && lora_only_mode;
-
-        case SharePolicy::AlwaysRecompute: return recompute_enabled;
-    }
-
-    // Fallback (should not reach here)
-    return recompute_enabled && will_recompute(name, lora_only_mode);
-}
-
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -422,6 +388,19 @@ TensorSlot builtin_slot_from_name(const std::string& name) {
         return it->second;
     }
     return TensorSlot::Mapped;
+}
+
+TensorSlot resolve_slot_with_flat(const std::string& name, bool* out_is_flat_view) {
+    if (out_is_flat_view) *out_is_flat_view = false;
+    TensorSlot slot = builtin_slot_from_name(name);
+    if (slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
+        const TensorSlot base = builtin_slot_from_name(name.substr(0, name.size() - 5));
+        if (base != TensorSlot::Mapped) {
+            if (out_is_flat_view) *out_is_flat_view = true;
+            return base;
+        }
+    }
+    return slot;
 }
 
 }  // namespace dsl

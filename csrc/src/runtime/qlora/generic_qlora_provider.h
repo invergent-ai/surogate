@@ -82,6 +82,8 @@ public:
     qlora::IQuantizer* get_quantizer() const override;
     void auto_tune_offloading() override;
 
+    void consume_self_arena(cudaStream_t stream) override;
+
     // =========================================================================
     // Direct access to the underlying weight manager
     // =========================================================================

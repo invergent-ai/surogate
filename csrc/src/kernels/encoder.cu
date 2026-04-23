@@ -109,7 +109,18 @@ encoder_forward_kernel3_nowpe(floatX* out, const int* inp, const floatX* wte, in
     int t = (int)(bt % T);
     int c = (int)(idx % C);
     int ix = inp[b * T + t];
-    assert(0 <= ix && ix < V);
+    // Guardrail against upstream tokenizer / dataloader bugs feeding
+    // out-of-range token ids. An unchecked `ix` produces a wild load off
+    // `wte + ix*C`, surfacing asynchronously as a cudaErrorIllegalAddress
+    // in whichever kernel runs next — historically the crash appeared in
+    // ops far from the actual cause. __trap stops the offending thread
+    // cleanly; the per-thread printf tells us the bad id and its position
+    // so the upstream bug is obvious. Release builds keep the check; the
+    // cost is one integer comparison per vector lane.
+    if (!(0 <= ix && ix < V)) {
+        printf("[encoder_forward] out-of-range token id: ix=%d (vocab=%d) at b=%d t=%d\n", ix, V, b, t);
+        __trap();
+    }
     x128 wte128 = x128::load(wte + (long long)ix * C + c);
     wte128.store(out + (long long)b * T * C + (long long)t * C + c);
 }

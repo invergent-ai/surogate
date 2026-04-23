@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/core.h>
@@ -55,6 +56,19 @@ namespace dsl {
 // regenerate activations. The data lives on the stack; the caller (backward)
 // must restore the stack checkpoint after consuming the data.
 // ---------------------------------------------------------------------------
+
+// Clear-.Data helpers for Stack-backed gradient slots that Stack.restore
+// invalidates across layer boundaries. block_gradient_ptr routes tid-first
+// so the clear lands in mTensors[tid].
+static void clear_large_bwd_grad_stack_slots(dsl::DslRunState& rs, int L) {
+    auto clear = [&](TensorSlot s) {
+        if (Tensor* t = block_gradient_ptr(rs, L, s)) t->Data = nullptr;
+    };
+    clear(TensorSlot::BlockDQKV);
+    clear(TensorSlot::BlockDMLPUp);
+    clear(TensorSlot::BlockDSwiGLU);
+}
+
 void CompiledExecutor::replay_layer_forward(int layer_idx,
                                             long B,
                                             long T,
@@ -111,6 +125,9 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
     mCurrentGraph = &fwd_graph;
     mTensors.assign(static_cast<std::size_t>(fwd_graph.num_tensors), Tensor{});
     mNamedTensors.clear();
+    // Mirror the pre-bind that execute_forward does so replayed ops hit
+    // the mTensors[tid] cache and write to the arena.
+    populate_fwd_stack_bindings(fwd_graph);
 
     // Bind known inputs
     bind_tensor("token_ids", mRunState.Inputs);
@@ -146,7 +163,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
 
     // Collect tensor IDs produced within this layer's op range
     std::unordered_set<int> produced_ids;
-    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+    for (std::size_t idx = start; idx < end && idx < fwd_graph.ops.size(); ++idx) {
         for (const auto& out : fwd_graph.ops[idx].outputs) {
             if (out.tensor_id >= 0) {
                 produced_ids.insert(out.tensor_id);
@@ -156,7 +173,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
 
     // Pre-bind external inputs: tensors consumed by this layer but produced before it.
     // These include the layer's input residual, previous block outputs, RoPE freqs, etc.
-    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+    for (std::size_t idx = start; idx < end && idx < fwd_graph.ops.size(); ++idx) {
         for (const auto& inp : fwd_graph.ops[idx].inputs) {
             if (inp.tensor_id < 0) continue;
             if (produced_ids.count(inp.tensor_id)) continue;
@@ -181,22 +198,18 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             if (!resolved.Data && !inp.name.empty()) {
                 // Blocks-qualified: `blocks[N].<field>`
                 int lyr = -1;
-                std::string field;
-                if (parse_block_param(inp.name, lyr, field)) {
-                    const std::string base = strip_ssa_suffix(field);
-                    const TensorSlot slot = builtin_slot_from_name(base);
+                const TensorSlot slot = resolve_block_slot(inp.name, &lyr);
+                if (lyr >= 0) {
                     if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
                         resolved = *bp;
                     }
-                } else {
-                    // Unqualified global-level reference — try slot table first.
-                    const TensorSlot slot = builtin_slot_from_name(inp.name);
-                    if (Tensor* gp = global_activation_ptr(mRunState, slot)) {
-                        resolved = *gp;
-                    } else if (inp.name.find("freq_cis") != std::string::npos ||
-                               inp.name.find("rope_freqs") != std::string::npos) {
-                        resolved = mRunState.rope_freqs(inp.name);
-                    }
+                } else if (inp.name.find("freq_cis") != std::string::npos ||
+                           inp.name.find("rope_freqs") != std::string::npos) {
+                    // Rope frequencies come through unqualified global names;
+                    // inp.slot would be FreqCis and line 217 already handled
+                    // compile-classified refs. This fallback covers names the
+                    // compiler left as Mapped (e.g., qualified substring hits).
+                    resolved = mRunState.rope_freqs(inp.name);
                 }
 
                 // Cross-layer connector tensors: `layerN.<field>` (used by
@@ -277,8 +290,30 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             replay_tile_groups[tg.start_op_idx] = &tg;
         }
     }
-    for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
+    for (std::size_t idx = start; idx < end && idx < fwd_graph.ops.size(); ++idx) {
         const auto& op = fwd_graph.ops[idx];
+
+        // Scope assertion: replay_layer_forward(L) must only execute ops
+        // belonging to layer L. An op whose `layer_start` field is set to a
+        // different layer's index means the loop bounds disagree with the
+        // compiler's layer-membership tagging — historically this happened
+        // when `idx <= end` (inclusive) pulled layer L+1's deferred-residual
+        // fused_residual_rmsnorm into L's replay, clobbering L's activations
+        // under shared-FwdStack-arena routing. Gated on SUROGATE_CHECK_REPLAY_SCOPE
+        // to stay out of the hot path by default.
+        if (op.layer_start >= 0 && op.layer_start != layer_idx) {
+            if (const char* e = std::getenv("SUROGATE_CHECK_REPLAY_SCOPE"); e && (*e == '1' || *e == 'a')) {
+                std::fprintf(stderr,
+                             "[replay-scope] layer=%d replay running op idx=%zu with layer_start=%d (type=%s)\n",
+                             layer_idx,
+                             idx,
+                             op.layer_start,
+                             op_type_to_string(op.type));
+                if (*e == 'a') {
+                    throw std::runtime_error("SUROGATE_CHECK_REPLAY_SCOPE=abort: replay-scope violation");
+                }
+            }
+        }
 
         // Skip loss ops — these should never be replayed
         if (op.type == CompiledOpType::CrossEntropyLoss || op.type == CompiledOpType::FusedLMHeadLoss) {
@@ -302,6 +337,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // forward direction" — silently skip, preserving the old
             // replay_layer_forward `default: break` semantics.
             if (op.fn) {
+                check_op_io_aliasing(op, idx, "replay");
                 op.fn(*this, op, static_cast<const void*>(hook));
             }
         } catch (const std::exception& e) {
@@ -358,16 +394,11 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                     continue;
                 }
             }
-            // Fallback: resolve from simplified_acts via the shared block-activation
-            // dispatch. `builtin_slot_from_name()` maps every alias (`ln`, `ln_flat`,
-            // `qkv_rope`, `res_att`, …) to a TensorSlot; the helper routes it to
-            // the right RunState buffer. New slots are added in ONE place
-            // (tensor_slot_dispatch.cpp) rather than duplicated here.
+            // Fallback: resolve via the shared block-activation dispatch
+            // (slot-keyed lookup through tensor_slot_dispatch).
             int lyr = -1;
-            std::string field;
-            if (parse_block_param(name, lyr, field)) {
-                const std::string base = strip_ssa_suffix(field);
-                const TensorSlot slot = builtin_slot_from_name(base);
+            const TensorSlot slot = resolve_block_slot(name, &lyr);
+            if (lyr >= 0) {
                 if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
                     if (bp->Data) {
                         (*mSaved)[name] = *bp;
@@ -445,11 +476,79 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // before backward consumes the saved value.
             const std::size_t bytes = tensor.bytes();
             if (bytes == 0) continue;
-            void* persistent = nullptr;
-            CUDA_CHECK(cudaMallocAsync(&persistent, bytes, mRunState.MainStream));
+            // Prefer the replay-persist arena (stable pointer across CUDA graph
+            // captures/replays). Fall back to cudaMallocAsync for over-size
+            // requests — arena-exhausted fallback keeps the legacy semantics
+            // on the rare path where a single tensor exceeds the arena.
+            std::byte* persistent = allocate_replay_persist(bytes);
+            if (!persistent) {
+                void* raw = nullptr;
+                CUDA_CHECK(cudaMallocAsync(&raw, bytes, mRunState.MainStream));
+                persistent = static_cast<std::byte*>(raw);
+                mReplayCopiedBuffers.push_back(persistent);
+            }
             CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
-            tensor.Data = static_cast<std::byte*>(persistent);
-            mReplayCopiedBuffers.push_back(persistent);
+            tensor.Data = persistent;
+        }
+
+        // rstd / ln / attn_out / h_out slots live on the Stack. The
+        // save-capture loop above copies live .Data into mSaved; without
+        // the persist below, that .Data is the Stack pointer which
+        // Stack.restore invalidates. Copy into a persistent cudaMalloc
+        // buffer and rebind BOTH the slot AND any mSaved / mNamedTensors /
+        // mTensors entries that captured the old Stack ptr.
+        if (layer_idx >= 0) {
+            auto persist_stack_slot = [&](Tensor& slot, const std::string& slot_name) {
+                if (!slot.Data || slot.bytes() == 0) return;
+                if (!mRunState.Stack.owns(slot.Data)) return;
+                const std::size_t bytes = slot.bytes();
+                std::byte* stack_ptr = slot.Data;
+                std::byte* persistent_bytes_ptr = allocate_replay_persist(bytes);
+                if (!persistent_bytes_ptr) {
+                    void* raw = nullptr;
+                    CUDA_CHECK(cudaMallocAsync(&raw, bytes, mRunState.MainStream));
+                    persistent_bytes_ptr = static_cast<std::byte*>(raw);
+                    mReplayCopiedBuffers.push_back(persistent_bytes_ptr);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(persistent_bytes_ptr,
+                                           stack_ptr,
+                                           bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           mRunState.MainStream));
+                slot.Data = persistent_bytes_ptr;
+
+                if (mSaved) {
+                    auto it = mSaved->find(slot_name);
+                    if (it != mSaved->end() && it->second.Data == stack_ptr) {
+                        it->second.Data = persistent_bytes_ptr;
+                    }
+                }
+                if (auto nit = mNamedTensors.find(slot_name); nit != mNamedTensors.end()) {
+                    if (nit->second.Data == stack_ptr) nit->second.Data = persistent_bytes_ptr;
+                }
+                if (mCurrentGraph) {
+                    const int tid = mCurrentGraph->find_tensor_id(slot_name);
+                    if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() &&
+                        mTensors[static_cast<std::size_t>(tid)].Data == stack_ptr) {
+                        mTensors[static_cast<std::size_t>(tid)].Data = persistent_bytes_ptr;
+                    }
+                }
+            };
+            const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+            auto persist_by_slot = [&](TensorSlot s, const char* field_name) {
+                if (Tensor* t = block_activation_ptr(mRunState, layer_idx, s)) {
+                    persist_stack_slot(*t, prefix + field_name);
+                }
+            };
+            persist_by_slot(TensorSlot::BlockLN1RSTD, "ln1_rstd");
+            persist_by_slot(TensorSlot::BlockLN2RSTD, "ln2_rstd");
+            persist_by_slot(TensorSlot::BlockQRSTD, "q_rstd");
+            persist_by_slot(TensorSlot::BlockKRSTD, "k_rstd");
+            persist_by_slot(TensorSlot::BlockLSE, "lse");
+            persist_by_slot(TensorSlot::BlockAttOut, "att_out");
+            persist_by_slot(TensorSlot::BlockLN1, "ln1");
+            persist_by_slot(TensorSlot::BlockLN2, "ln2");
+            persist_by_slot(TensorSlot::BlockHOut, "h_out");
         }
     }
     // Now safe to restore — stack-resident data has been copied
@@ -521,6 +620,45 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mNamedTensors.clear();
+    // Pre-bind every FwdStack tid to its arena slot so block-scope
+    // Mapped-slot ops route through the arena at ensure_output_tensor
+    // instead of Stack temp_alloc.
+    populate_fwd_stack_bindings(graph);
+    // Register as active executor only after populate, so
+    // block_activation_ptr's tid-first path sees a coherent mTensors on
+    // every call.
+    mRunState.set_active_executor(this);
+    // Scrub mSaved entries pointing into the Stack arena or the
+    // replay-persist arena. Between steps both are reset — Stack top rolls
+    // back, replay-persist offset rewinds — so any saved Tensor whose Data
+    // lived in either region is now a dangling pointer. Persistent
+    // (cudaMalloc-backed) saves are preserved. Without this scrub, the
+    // next step's replay-layer persistence or backward dispatch iterates
+    // over step N-1's stale pointers and faults / silently reads garbage.
+    if (mSaved) {
+        const std::byte* rp_begin = mReplayPersistArena;
+        const std::byte* rp_end = rp_begin + mReplayPersistCapacity;
+        for (auto& [name, tensor] : *mSaved) {
+            if (!tensor.Data) continue;
+            const bool in_stack = mRunState.Stack.owns(tensor.Data);
+            const bool in_replay_persist = rp_begin && tensor.Data >= rp_begin && tensor.Data < rp_end;
+            if (in_stack || in_replay_persist) {
+                tensor.Data = nullptr;
+            }
+        }
+    }
+    // Reset replay-persist arena bump so step N's replays overwrite step N-1's
+    // slots. clear_replay_copied_refs resets during backward replay; this
+    // handles the eager (non-replay) forward path too, preventing monotonic
+    // arena growth on runs that never hit the backward-replay path.
+    mReplayPersistOffset = 0;
+    // Eagerly allocate the arena BEFORE any CUDA graph capture begins. If we
+    // let allocate_replay_persist() cudaMalloc lazily during backward, the
+    // first cudaMalloc happens inside the captured backward graph — CUDA
+    // stream capture doesn't allow synchronous host allocations, and the
+    // captured graph ends up with a stale pointer. Allocating here (outside
+    // any capture) gives a stable base pointer for all subsequent captures.
+    ensure_replay_persist_arena();
     mCurrentLayer = -1;
     mSegmentDispatchedUntil = 0;
 
@@ -562,6 +700,19 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
     }
 
+    // Layer-boundary bookkeeping. on_fwd_layer_start checkpoints the Stack
+    // and records the temp watermark so layer_end can restore both. Called
+    // from PhaseEnter / flat-ops-loop / tiled-MLP-start paths. The tiled-MLP
+    // end path has simpler cleanup (no MoE save, no stack-slot clears) and
+    // stays inline.
+    auto on_fwd_layer_start = [&](int L) {
+        if (L >= 0 && L < num_layers && !layer_active[static_cast<std::size_t>(L)]) {
+            layer_checkpoints[static_cast<std::size_t>(L)] = mRunState.Stack.checkpoint();
+            layer_temp_marks[static_cast<std::size_t>(L)] = mTemps.size();
+            layer_active[static_cast<std::size_t>(L)] = 1;
+        }
+        if (L >= 0) handle_layer_start(L);
+    };
     auto prune_stack_tensors = [&]() {
         // Prune flat tensor vector using pre-computed metadata (no string parsing)
         for (int id = 0; id < graph.num_tensors; ++id) {
@@ -585,6 +736,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
         }
     };
+
     // Detect if the stream is being captured (either by internal graphs via mCapturing,
     // or by an outer full-step graph from train_step_graphed in py_train.cpp).
     cudaStreamCaptureStatus fwd_capture_status = cudaStreamCaptureStatusNone;
@@ -633,6 +785,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                                  contains_ci_local(mConfig.ArchitectureName, "qwen3_5") ||
                                                  contains_ci_local(mConfig.ArchitectureName, "qwen3.5");
 
+    int arena_persists = 0;
+    int cudaMalloc_persists = 0;
     auto persist_saved_layer_tensors = [&](int layer_idx) {
         if (!mSaved || !mSaveList) {
             return;
@@ -656,15 +810,20 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (!src.Data) {
                 return false;
             }
+            // Skip under forward-stream capture: the cudaMemcpyAsync below
+            // captures src.Data at capture time, but the source lives on the
+            // Stack arena whose contents are regenerated per-step in ways
+            // that can drift the captured pointer. Meta-only save + replay
+            // regen in backward is the capture-safe path.
+            if (fwd_stream_capturing) {
+                return false;
+            }
             const size_t bytes = src.bytes();
             if (bytes == 0) {
                 return false;
             }
             auto buf_it = mMoeSavedBuffers.find(name);
             if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-                if (fwd_stream_capturing) {
-                    return false;
-                }
                 if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
@@ -705,37 +864,31 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 return std::nullopt;
             }
             const std::string base_field = strip_ssa_suffix(field);
-            auto& acts = mRunState.simplified_acts(resolved_layer);
-            if (base_field == "ln1_rstd" || base_field == "ln_rstd") return acts.ln1_rstd;
-            if (base_field == "ln2_rstd") return acts.ln2_rstd;
-            if (base_field == "q_rstd") return acts.q_rstd;
-            if (base_field == "k_rstd") return acts.k_rstd;
-            if (base_field == "lse") return acts.lse;
-            if (base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat")
-                return acts.ln1;
-            if (base_field == "ln2" || base_field == "ln2_flat") return acts.ln2;
-            if (base_field == "qkv" || base_field == "qkv_norm") return acts.qkv;
-            if (base_field == "qkv_rope") {
-                Tensor& src = acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-                return src;
+            // Special cases with field aliases not in the name→slot table or
+            // that need a shape override (qkv_norm, qkv_flat, swiglu_flat).
+            if (base_field == "qkv_norm") {
+                if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, TensorSlot::BlockQKV)) return *t;
+                return std::nullopt;
             }
             if (base_field == "qkv_flat") {
-                Tensor qkv = acts.qkv;
-                return view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
+                if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, TensorSlot::BlockQKV)) {
+                    Tensor qkv = *t;
+                    return view_tensor(qkv, {qkv.Sizes[0] * qkv.Sizes[1], qkv.Sizes[2]});
+                }
+                return std::nullopt;
             }
-            if (base_field == "att" || base_field == "att_flat") return acts.att;
-            if (base_field == "att_out" || base_field == "att_out_flat") return acts.att_out;
-            if (base_field == "mlp_up" || base_field == "mlp_up_flat") return acts.mlp_up;
-            if (base_field == "swiglu") return acts.swiglu;
             if (base_field == "swiglu_flat") {
-                Tensor swiglu = acts.swiglu;
-                return view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
+                if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, TensorSlot::BlockSwiGLU)) {
+                    Tensor swiglu = *t;
+                    return view_tensor(swiglu, {swiglu.Sizes[0] * swiglu.Sizes[1], swiglu.Sizes[2]});
+                }
+                return std::nullopt;
             }
-            if (base_field == "mlp_down" || base_field == "mlp_down_flat") return acts.mlp_down;
-            if (base_field == "res_att" || base_field == "residual_att") return acts.residual_att;
-            if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
-                Tensor& res = mRunState.get_residual(resolved_layer, mRunState.MainStream);
-                return res;
+            // Primary dispatch: name→slot table covers every alias.
+            // block_activation_ptr handles the qkv_rope fallback to qkv and
+            // the BlockResidualFFN managed-residual acquisition.
+            if (Tensor* t = block_activation_ptr(mRunState, resolved_layer, builtin_slot_from_name(base_field))) {
+                return *t;
             }
             return std::nullopt;
         };
@@ -794,33 +947,87 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (bytes == 0) {
                 continue;
             }
-            auto buf_it = mMoeSavedBuffers.find(name);
-            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-                if (fwd_stream_capturing) {
-                    // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
-                    // Skip this tensor — the outer capture warmup or
-                    // prepare_saved_buffers_for_capture should have pre-allocated it.
-                    continue;
+
+            // Arena-backed persist: when the phase-tree arenas are bound
+            // and the tid is classified as SaveForBwd, copy directly into
+            // the pre-allocated arena slot instead of cudaMalloc'ing a
+            // per-name persistent buffer. Skips cudaMalloc on the hot path.
+            void* dst_buffer = nullptr;
+            bool used_arena = false;
+            if (mPhaseArenas && mPhaseArenas->allocated && mCurrentGraph) {
+                const int tid = mCurrentGraph->find_tensor_id(name);
+                if (tid >= 0) {
+                    std::byte* arena_ptr = dsl::resolve_tid_in_arena(*mPhaseArenas, *mCurrentGraph, tid);
+                    if (arena_ptr != nullptr) {
+                        const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
+                        if (meta.region == dsl::RegionKind::SaveForBwd && meta.bytes >= bytes) {
+                            dst_buffer = arena_ptr;
+                            used_arena = true;
+                        }
+                    }
                 }
-                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                    CUDA_CHECK(cudaFree(buf_it->second));
-                }
-                void* new_buffer = nullptr;
-                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoeSavedBuffers[name] = new_buffer;
-                mMoeSavedSizes[name] = bytes;
             }
-            void* dst_buffer = mMoeSavedBuffers[name];
+
+            if (!used_arena) {
+                auto buf_it = mMoeSavedBuffers.find(name);
+                if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+                    if (fwd_stream_capturing) {
+                        // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
+                        // Skip this tensor — the outer capture warmup or
+                        // prepare_saved_buffers_for_capture should have pre-allocated it.
+                        continue;
+                    }
+                    if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
+                        CUDA_CHECK(cudaFree(buf_it->second));
+                    }
+                    void* new_buffer = nullptr;
+                    CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+                    mMoeSavedBuffers[name] = new_buffer;
+                    mMoeSavedSizes[name] = bytes;
+                }
+                dst_buffer = mMoeSavedBuffers[name];
+            }
+
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor = src;
             saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
             (*mSaved)[name] = saved_tensor;
             bind_tensor(name, saved_tensor);
             saved_count++;
+            if (used_arena) {
+                ++arena_persists;
+            } else {
+                ++cudaMalloc_persists;
+            }
         }
     };
 
-    // Bind known inputs (into both flat vector and write-through mirror)
+    // Layer-end bookkeeping shared by PhaseExit-FwdBlock and the flat-ops
+    // loop. Persists stack-backed saves before Stack.restore, prunes dead
+    // tensors, clears the per-layer stack-backed slots (rstd / ffn_temps).
+    // Defined here (after persist_saved_layer_tensors) so the capture
+    // resolves. The tiled-MLP path uses a simpler inline variant — no MoE
+    // save, no stack-slot clears — and is intentionally not routed through
+    // this helper.
+    auto on_fwd_layer_end = [&](int L) {
+        if (L >= 0 && L < num_layers && layer_active[static_cast<std::size_t>(L)]) {
+            if (mDebugDumpLayerFn) mDebugDumpLayerFn(L);
+            if (mConfig.NumExperts > 0) save_moe_layer_tensors(L);
+            persist_saved_layer_tensors(L);
+            mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
+            if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
+                mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
+            }
+            prune_stack_tensors();
+            layer_active[static_cast<std::size_t>(L)] = 0;
+        }
+        if (L >= 0) handle_layer_end(L);
+    };
+
+    // Bind known inputs (into both flat vector and write-through mirror).
+    // Binds every stable non-param global at entry so resolve_tensor finds
+    // them via mNamedTensors / mTensors[tid] without falling through to
+    // the slot switch. Each rs.X pointer is stable after allocation.
     bind_tensor("token_ids", mRunState.Inputs);
     bind_tensor("position_ids", mRunState.PositionIDs);
     if (mRunState.VisualPosMasks.Data) {
@@ -837,7 +1044,26 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             bind_tensor("deepstack_visual_embeds_" + std::to_string(i), mRunState.DeepstackVisualEmbeds[i]);
         }
     }
+    // encoded/x0 alias the same backing tensor; bind under both names.
     bind_tensor("x0", mRunState.non_block_activations().encoded);
+    bind_tensor("encoded", mRunState.non_block_activations().encoded);
+    // LM-head-adjacent globals (present in the compiled graph when the
+    // head is on the forward graph — no-op for heads split onto backward).
+    if (mRunState.non_block_activations().ln_final.Data) {
+        bind_tensor("ln_final", mRunState.non_block_activations().ln_final);
+        bind_tensor("xF", mRunState.non_block_activations().ln_final);
+    }
+    if (mRunState.non_block_activations().ln_final_rstd.Data) {
+        bind_tensor("ln_final_rstd", mRunState.non_block_activations().ln_final_rstd);
+    }
+    // Loss I/O — losses/targets have their own fixed runtime slots.
+    if (mRunState.Targets.Data) {
+        bind_tensor("targets", mRunState.Targets);
+    }
+    if (mRunState.Losses.Data) {
+        bind_tensor("loss", mRunState.Losses);
+        bind_tensor("losses", mRunState.Losses);
+    }
 
     // Ensure non-block weights are gathered if streaming/offload is enabled
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
@@ -1049,7 +1275,135 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     for (const auto& tg : graph.mlp_tile_groups) {
         tile_group_starts[tg.start_op_idx] = &tg;
     }
-    for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
+
+    // Stream-driven forward execution. Reuses the allocator, stack, and op
+    // dispatch; drives them from graph.instruction_stream instead of the
+    // flat ops list + op.layer_start/end flags. SegmentDispatch honors
+    // graph.layer_segments when mSplitAttentionGraphs is on. The flat-ops
+    // loop below remains the path when capturing (CUDA graph capture needs
+    // the single-pass op walk) or when the compiler did not emit an
+    // instruction stream.
+    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing;
+    if (stream_driven) {
+        if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
+            if (std::string(env) == "1") {
+                std::cerr << "[phase-interp] forward: stream-driven (" << graph.instruction_stream.size()
+                          << " instructions)\n";
+            }
+        }
+        for (const auto& inst : graph.instruction_stream) {
+            switch (inst.kind) {
+                case dsl::InstKind::PhaseEnter:
+                    if (inst.phase_kind == dsl::PhaseKind::FwdBlock && inst.block_index >= 0) {
+                        on_fwd_layer_start(inst.block_index);
+                        mCurrentLayer = inst.block_index;
+                    }
+                    break;
+                case dsl::InstKind::SegmentDispatch: {
+                    // Honor graph.layer_segments when split-attention is
+                    // active. Each layer's ops are dispatched as an ordered
+                    // list of graph-captured / eager segments.
+                    const int L = inst.block_index;
+                    const bool splits_disabled = std::getenv("SUROGATE_DISABLE_SPLIT_SEG") != nullptr;
+                    const bool use_splits = !splits_disabled && mSplitAttentionGraphs &&
+                                            inst.phase_kind == dsl::PhaseKind::FwdBlock && L >= 0 &&
+                                            static_cast<std::size_t>(L) < graph.layer_segments.size() &&
+                                            !graph.layer_segments[static_cast<std::size_t>(L)].empty();
+                    if (use_splits) {
+                        const auto& segs = graph.layer_segments[static_cast<std::size_t>(L)];
+                        for (std::size_t s = 0; s < segs.size(); ++s) {
+                            const auto& seg = segs[s];
+                            if (seg.eager) {
+                                const MlpTileGroup* tile_group = nullptr;
+                                for (const auto& tg : graph.mlp_tile_groups) {
+                                    if (tg.start_op_idx == seg.start_op) {
+                                        tile_group = &tg;
+                                        break;
+                                    }
+                                }
+                                if (tile_group) {
+                                    execute_tiled_mlp(graph, *tile_group, mB, mT, hook);
+                                } else {
+                                    for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                        dispatch_forward_op(graph.ops[i], hook);
+                                    }
+                                }
+                            } else {
+                                auto& sg = mFwdSegGraphs[static_cast<std::size_t>(L)][s];
+                                const bool is_capture = (sg.exec == nullptr);
+                                std::size_t saved_before = mSaved ? mSaved->size() : 0;
+                                auto run = [&]() {
+                                    for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
+                                        dispatch_forward_op(graph.ops[i], hook);
+                                    }
+                                };
+                                trace_or_execute_cuda_graph_with_stack(run,
+                                                                       mRunState.MainStream,
+                                                                       sg.exec,
+                                                                       true,
+                                                                       mRunState.Stack,
+                                                                       sg.checkpoint);
+                                if (is_capture) {
+                                    sg.post_checkpoint = mRunState.Stack.checkpoint();
+                                    sg.tensor_snapshot.clear();
+                                    sg.named_snapshot.clear();
+                                    sg.saved_snapshot.clear();
+                                    for (int tid = 0; tid < static_cast<int>(mTensors.size()); ++tid) {
+                                        if (mTensors[tid].Data) sg.tensor_snapshot.emplace_back(tid, mTensors[tid]);
+                                    }
+                                    for (const auto& [name, t] : mNamedTensors) {
+                                        if (t.Data) sg.named_snapshot.emplace_back(name, t);
+                                    }
+                                    if (mSaved && mSaved->size() > saved_before) {
+                                        for (const auto& [name, t] : *mSaved) {
+                                            sg.saved_snapshot.emplace_back(name, t);
+                                        }
+                                    }
+                                } else {
+                                    mRunState.Stack.restore(sg.post_checkpoint);
+                                    for (const auto& [tid, t] : sg.tensor_snapshot) {
+                                        if (static_cast<std::size_t>(tid) < mTensors.size()) mTensors[tid] = t;
+                                    }
+                                    for (const auto& [name, t] : sg.named_snapshot)
+                                        mNamedTensors[name] = t;
+                                    if (mSaved) {
+                                        for (const auto& [name, t] : sg.saved_snapshot) {
+                                            if (mSaved->find(name) == mSaved->end()) (*mSaved)[name] = t;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
+                            if (!full && !graph.required_mask.empty() && !graph.required_mask[i]) continue;
+                            const auto& op = graph.ops[i];
+                            if (!op.fn) continue;
+                            check_op_io_aliasing(op, i, "fwd");
+                            op.fn(*this, op, static_cast<const void*>(hook));
+                        }
+                    }
+                    break;
+                }
+                case dsl::InstKind::PruneByLastUse:
+                    // Pass-through mode: pruning happens at PhaseExit for FwdBlock,
+                    // matching today's layer_end semantics. Per-segment pruning is
+                    // a future optimization.
+                    break;
+                case dsl::InstKind::RecomputeBlock:
+                    // Forward direction: no-op. Recompute fires in backward
+                    // PhaseEnter BwdBlock via subsystem #7's handler.
+                    break;
+                case dsl::InstKind::PhaseExit:
+                    if (inst.phase_kind == dsl::PhaseKind::FwdBlock && inst.block_index >= 0) {
+                        on_fwd_layer_end(inst.block_index);
+                    }
+                    break;
+            }
+        }
+    }
+
+    for (std::size_t idx = 0; !stream_driven && idx < graph.ops.size(); ++idx) {
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
             continue;
         }
@@ -1062,14 +1416,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 // Handle layer start if the first op has one
                 const auto& first_op = graph.ops[tg.start_op_idx];
                 if (first_op.layer_start >= 0) {
-                    if (first_op.layer_start < num_layers &&
-                        !layer_active[static_cast<std::size_t>(first_op.layer_start)]) {
-                        layer_checkpoints[static_cast<std::size_t>(first_op.layer_start)] =
-                            mRunState.Stack.checkpoint();
-                        layer_temp_marks[static_cast<std::size_t>(first_op.layer_start)] = mTemps.size();
-                        layer_active[static_cast<std::size_t>(first_op.layer_start)] = 1;
-                    }
-                    handle_layer_start(first_op.layer_start);
+                    on_fwd_layer_start(first_op.layer_start);
                 }
                 execute_tiled_mlp(graph, tg, mB, mT, hook);
                 // Handle layer end if the last op has one
@@ -1113,12 +1460,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
         // Handle layer boundaries
         if (op.layer_start >= 0) {
-            if (op.layer_start < num_layers && !layer_active[static_cast<std::size_t>(op.layer_start)]) {
-                layer_checkpoints[static_cast<std::size_t>(op.layer_start)] = mRunState.Stack.checkpoint();
-                layer_temp_marks[static_cast<std::size_t>(op.layer_start)] = mTemps.size();
-                layer_active[static_cast<std::size_t>(op.layer_start)] = 1;
-            }
-            handle_layer_start(op.layer_start);
+            on_fwd_layer_start(op.layer_start);
 
             // Split-attention graph mode: pre-dispatch all layer ops via segments.
             // Non-attention segments are captured/replayed as CUDA graphs;
@@ -1240,6 +1582,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 throw std::runtime_error(std::string("CompiledExecutor: no dispatch fn for forward op type ") +
                                          op_type_to_string(op.type));
             }
+            check_op_io_aliasing(op, idx, "fwd");
             op.fn(*this, op, static_cast<const void*>(hook));
             check_nonfinite_refs(op, op.outputs);
             if (watch_tensor_enabled) {
@@ -1309,30 +1652,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
         // Handle layer end
         if (op.layer_end >= 0) {
-            if (op.layer_end < num_layers && layer_active[static_cast<std::size_t>(op.layer_end)]) {
-                // Debug dump per-layer tensors before shared buffers are overwritten.
-                if (mDebugDumpLayerFn) {
-                    mDebugDumpLayerFn(op.layer_end);
-                }
-                if (mConfig.NumExperts > 0) {
-                    save_moe_layer_tensors(op.layer_end);
-                }
-                // Persist stack-backed saved tensors for this layer before the stack is restored.
-                persist_saved_layer_tensors(op.layer_end);
-                mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(op.layer_end)]);
-                if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(op.layer_end)]) {
-                    mTemps.resize(layer_temp_marks[static_cast<std::size_t>(op.layer_end)]);
-                }
-                prune_stack_tensors();
-                if (mRunState.ffn_temps_on_stack()) {
-                    auto& acts = mRunState.simplified_acts(op.layer_end);
-                    acts.mlp_up.Data = nullptr;
-                    acts.swiglu.Data = nullptr;
-                }
-                // Note: cudnn_workspace is persistently allocated, don't clear
-                layer_active[static_cast<std::size_t>(op.layer_end)] = 0;
-            }
-            handle_layer_end(op.layer_end);
+            on_fwd_layer_end(op.layer_end);
         }
     }
 
@@ -1341,6 +1661,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         mRunState.temp_free(*it);
     }
     mTemps.clear();
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_ARENA_COVERAGE")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[arena-persist] arena=" << arena_persists << " cudaMalloc=" << cudaMalloc_persists << "\n";
+        }
+    }
 
     // Dump requested non-block tensors (e.g. xF/residual_final) after forward.
     // Per-layer block dumps are handled in the layer_end callback above.
@@ -1389,6 +1715,17 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         mWeightManager->release_embeddings(mRunState.MainStream);
         mWeightManager->release_final_norm(mRunState.MainStream);
     }
+
+    mRunState.set_active_executor(nullptr);
+
+    // Snapshot mTensors + mNamedTensors at the end of forward execution.
+    // Captures the authoritative per-tid runtime state produced by the
+    // forward dispatchers — including matmul_swiglu's live-buffer rebinds,
+    // store_tensor updates from metadata ops, Stack-backed temps, and view
+    // aliases. Restored at execute_backward entry so backward resolves
+    // route through the tid-cache fast path.
+    mForwardTensorsSnapshot = mTensors;
+    mForwardNamedTensorsSnapshot = mNamedTensors;
 }
 
 void CompiledExecutor::execute_backward(const CompiledGraph& graph,
@@ -1399,8 +1736,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         bool skip_zeroing) {
     mComm = &comm;
     mCurrentGraph = &graph;
-    mRunState.reset_simplified_gradients();
     mTemps.clear();
+    // Reset per-step bump cursor for bwd_cross_layer arena. Free any
+    // cudaMalloc fallbacks from the previous backward call — arena-backed
+    // pointers auto-reset via the bump cursor, but fallback allocations
+    // must be explicitly released.
+    mBwdCrossLayerBumpOffset = 0;
+    for (std::byte* ptr : mBwdCrossLayerFallbacks) {
+        if (ptr) {
+            (void)cudaFree(ptr);
+        }
+    }
+    mBwdCrossLayerFallbacks.clear();
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward
@@ -1414,14 +1761,94 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
     mMicroStep = micro_step;
-    if (!mPersistedBackwardTensors.empty()) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        for (auto* ptr : mPersistedBackwardTensors) {
-            if (ptr) {
-                cudaFree(ptr);
-            }
+
+    // Register as active executor. Forward activations reach backward via
+    // (a) mSaved pre-bind at backward entry for SaveForBwd tids,
+    // (b) replay_layer_forward for recompute tids, or (c) the snapshot/
+    // restore block below for FwdStack arena-resident tids.
+    mRunState.set_active_executor(this);
+
+    // Restore forward's end-state mTensors for FwdStack/SaveForBwd
+    // arena-resident tids. Restricts to arena-backed activations
+    // (exclude Stack-backed temps like ones/zeros/views whose Stack
+    // pointer would trigger `Stack.owns(t.Data)` at
+    // bwd_layer_end_cleanup's cross-layer persist, blowing the 64 MiB
+    // BwdCrossLayer arena budget). Arena-backed tids have stable
+    // cross-phase pointers, enabling the resolve_tensor tid-cache fast
+    // path for backward-consumed forward activations.
+    if (!mForwardTensorsSnapshot.empty() && mForwardGraph && mPhaseArenas) {
+        const std::size_t n =
+            std::min({mForwardTensorsSnapshot.size(), mTensors.size(), mForwardGraph->tensor_meta.size()});
+        std::byte* fwd_lo = mPhaseArenas->fwd_stack_ptr;
+        std::byte* fwd_hi = fwd_lo + mPhaseArenas->fwd_stack_bytes;
+        std::byte* save_lo = mPhaseArenas->save_for_bwd_ptr;
+        std::byte* save_hi = save_lo + mPhaseArenas->save_for_bwd_bytes;
+        const bool has_fwd = fwd_lo && mPhaseArenas->fwd_stack_bytes > 0;
+        const bool has_save = save_lo && mPhaseArenas->save_for_bwd_bytes > 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& meta = mForwardGraph->tensor_meta[i];
+            std::byte* data = mForwardTensorsSnapshot[i].Data;
+            if (!data) continue;
+            // Only restore arena-resident bindings: Stack-owned pointers would
+            // trigger bwd_layer_end_cleanup's cross-layer persist (Stack.owns
+            // → true), which allocates per-tid copies into the 64 MiB
+            // BwdCrossLayer arena and overflows on Q3.5's hybrid blocks.
+            // FwdStack-region tids live in fwd_stack arena; under no-recompute,
+            // finalize_save_for_bwd promotes some to SaveForBwd, whose bindings
+            // live in save_for_bwd arena.
+            const bool in_fwd = has_fwd && meta.region == dsl::RegionKind::FwdStack && data >= fwd_lo && data < fwd_hi;
+            const bool in_save =
+                has_save && meta.region == dsl::RegionKind::SaveForBwd && data >= save_lo && data < save_hi;
+            if (!in_fwd && !in_save) continue;
+            mTensors[i] = mForwardTensorsSnapshot[i];
         }
-        mPersistedBackwardTensors.clear();
+    }
+
+    // Seed mTensors[tid] with arena pointers for every block-scope
+    // gradient slot (and build the zero-list on first compile).
+    populate_bwd_stack_bindings(graph);
+
+    // Bind every stable non-param global into mTensors + mNamedTensors at
+    // backward entry so resolve_tensor finds them via the tid/name cache
+    // without falling through to the slot switch. Runtime pointers are
+    // stable across steps — each cleared mTensors slot is re-bound here.
+    bind_tensor("token_ids", mRunState.Inputs);
+    bind_tensor("position_ids", mRunState.PositionIDs);
+    bind_tensor("x0", mRunState.non_block_activations().encoded);
+    bind_tensor("encoded", mRunState.non_block_activations().encoded);
+    if (mRunState.non_block_activations().ln_final.Data) {
+        bind_tensor("ln_final", mRunState.non_block_activations().ln_final);
+        bind_tensor("xF", mRunState.non_block_activations().ln_final);
+    }
+    if (mRunState.non_block_activations().ln_final_rstd.Data) {
+        bind_tensor("ln_final_rstd", mRunState.non_block_activations().ln_final_rstd);
+    }
+    if (mRunState.Targets.Data) {
+        bind_tensor("targets", mRunState.Targets);
+    }
+    if (mRunState.Losses.Data) {
+        bind_tensor("loss", mRunState.Losses);
+        bind_tensor("losses", mRunState.Losses);
+    }
+    if (mRunState.scratch().cross_entropy_dloss.Data) {
+        bind_tensor("d_loss", mRunState.scratch().cross_entropy_dloss);
+    }
+
+    // Pre-populate mTensors for every saved-source tid. mSaved was filled
+    // by persist_saved_layer_tensors at forward's layer_end; its entries
+    // hold the arena-backed (SaveForBwd / moe_saved) Tensors that backward
+    // ops need. The backward graph's Saved refs use the stripped name
+    // (`blocks[L].x` — no `saved.` prefix) as their tid key, so a
+    // single bind_tensor per saved entry routes every subsequent
+    // resolve_tensor through the cached mTensors[tid] path without
+    // touching the mSaved hashmap on the hot path. Metadata-only entries
+    // (Data == nullptr) stay on the slow path — try_resolve_saved_live
+    // handles them.
+    if (mSaved) {
+        for (const auto& kv : *mSaved) {
+            if (!kv.second.Data) continue;
+            bind_tensor(kv.first, kv.second);
+        }
     }
 
     // Clear activation/non-block gradients for each micro-step.
@@ -1433,8 +1860,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             fill_zero(mRunState.non_block_gradients().d_embeddings, mRunState.MainStream);
         }
         if (mConfig.NumLayers > 0) {
-            fill_zero(mRunState.simplified_grads(static_cast<int>(mConfig.NumLayers) - 1).d_res_ffn,
-                      mRunState.MainStream);
+            if (Tensor* d_res_ffn =
+                    block_gradient_ptr(mRunState, static_cast<int>(mConfig.NumLayers) - 1, TensorSlot::BlockDResFFN)) {
+                fill_zero(*d_res_ffn, mRunState.MainStream);
+            }
         }
         mRunState.zero_activation_gradients(mRunState.MainStream);
     }
@@ -1465,13 +1894,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Save stack checkpoint at start of backward - we'll restore per-layer to manage memory
     auto initial_checkpoint = mRunState.Stack.checkpoint();
     int last_layer_restored = -1;
-    auto clear_shared_grads = [&](int layer_idx) {
-        // No-op: d_ln2, d_att, d_ln1 are fully overwritten by their respective
-        // backward ops before being read. Gradient data flows through mTensors[],
-        // not through the pre-allocated simplified_grads buffers. The matmul backward
-        // only temporarily remaps these pointers during LoRA hooks, then restores them.
-        (void)layer_idx;
-    };
     auto prune_stack_tensors = [&](int current_layer) {
         // Prune flat tensor vector using pre-computed metadata (no string parsing)
         for (int id = 0; id < graph.num_tensors; ++id) {
@@ -1539,11 +1961,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // `d_xN` / `d_residualN` are intentionally not mapped here — those are
     // the backward-input stubs that get computed on-the-fly.
     auto get_target_buffer = [&](const std::string& grad_of) -> Tensor* {
-        TensorSlot slot = builtin_slot_from_name(grad_of);
-        if (slot == TensorSlot::Mapped && grad_of.size() >= 5 && grad_of.compare(grad_of.size() - 5, 5, "_flat") == 0) {
-            slot = builtin_slot_from_name(grad_of.substr(0, grad_of.size() - 5));
-        }
-        switch (slot) {
+        switch (resolve_slot_with_flat(grad_of)) {
             case TensorSlot::LNFinal:
             case TensorSlot::FinalResidual: return &d_ln_final_buf;
             case TensorSlot::Encoded: return &d_embeddings_buf;
@@ -1590,20 +2008,28 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Gemma4 routes the block output through a dedicated h_out slot, so the top
     // of the backward chain must seed d_h_out rather than the MLP/down or
     // residual-attention buffers.
+    // Declared outside the if/else chain so the StackedBlocks fallback below
+    // can reference them for d_<name> binding.
+    Tensor* d_h_out = nullptr;
+    Tensor* d_mlp_down = nullptr;
+    Tensor* d_res_att = nullptr;
+    bool has_h_out_grad = false;
     if (mConfig.NumLayers > 0) {
         const int last_layer = static_cast<int>(mConfig.NumLayers) - 1;
-        auto& last_grads = mRunState.simplified_grads(last_layer);
-        const bool has_h_out_grad = last_grads.d_h_out.Data != nullptr;
+        d_h_out = block_gradient_ptr(mRunState, last_layer, TensorSlot::BlockDHOut);
+        d_mlp_down = block_gradient_ptr(mRunState, last_layer, TensorSlot::BlockDMLPDown);
+        d_res_att = block_gradient_ptr(mRunState, last_layer, TensorSlot::BlockDResAtt);
+        has_h_out_grad = d_h_out && d_h_out->Data;
         if (has_h_out_grad) {
-            bind_tensor("d_xN", last_grads.d_h_out);
-            bind_tensor("d_residualN", last_grads.d_h_out);
-            bind_tensor(fmt::format("d_blocks[{}].h_out", last_layer), last_grads.d_h_out);
+            bind_tensor("d_xN", *d_h_out);
+            bind_tensor("d_residualN", *d_h_out);
+            bind_tensor(fmt::format("d_blocks[{}].h_out", last_layer), *d_h_out);
         } else {
-            if (last_grads.d_mlp_down.Data) {
-                bind_tensor("d_xN", last_grads.d_mlp_down);
+            if (d_mlp_down && d_mlp_down->Data) {
+                bind_tensor("d_xN", *d_mlp_down);
             }
-            if (last_grads.d_res_att.Data) {
-                bind_tensor("d_residualN", last_grads.d_res_att);
+            if (d_res_att && d_res_att->Data) {
+                bind_tensor("d_residualN", *d_res_att);
             }
         }
 
@@ -1645,18 +2071,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 });
                 if (has_h_out_grad) {
                     for (const auto& [_, name] : stacked) {
-                        bind_tensor("d_" + name, last_grads.d_h_out);
+                        bind_tensor("d_" + name, *d_h_out);
                     }
                 } else if (stacked.size() == 1) {
-                    if (last_grads.d_res_att.Data) {
-                        bind_tensor("d_" + stacked[0].second, last_grads.d_res_att);
+                    if (d_res_att && d_res_att->Data) {
+                        bind_tensor("d_" + stacked[0].second, *d_res_att);
                     }
                 } else {
-                    if (last_grads.d_mlp_down.Data) {
-                        bind_tensor("d_" + stacked[0].second, last_grads.d_mlp_down);
+                    if (d_mlp_down && d_mlp_down->Data) {
+                        bind_tensor("d_" + stacked[0].second, *d_mlp_down);
                     }
-                    if (last_grads.d_res_att.Data) {
-                        bind_tensor("d_" + stacked[1].second, last_grads.d_res_att);
+                    if (d_res_att && d_res_att->Data) {
+                        bind_tensor("d_" + stacked[1].second, *d_res_att);
                     }
                 }
             }
@@ -1883,12 +2309,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 ++it;
             }
         }
-        for (auto& active_ptr : mPersistedBackwardTensors) {
-            if (active_ptr == ptr) {
-                active_ptr = nullptr;
-            }
-        }
-        CUDA_CHECK(cudaFreeAsync(ptr, mRunState.MainStream));
+        // Arena-backed pointers in the bwd_cross_layer arena are reclaimed
+        // by the per-step bump reset; nothing to free here.
         persisted_backward_refcount.erase(ptr);
     };
     auto release_persisted_backward_tid = [&](int tid) {
@@ -2073,7 +2495,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                        bwd_capture_status != cudaStreamCaptureStatusNone);
 
     std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
-    std::vector<bool> layer_seen_any(num_layers, false);
     for (const auto& op : graph.ops) {
         if (op.layer_start >= 0 && op.layer_start < num_layers) {
             layer_start_indices[op.layer_start] = &op - graph.ops.data();
@@ -2092,7 +2513,219 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
+    // Stream-driven backward execution (flag-gated pass-through mode).
+    // Minimal: no tiled MLP, no capture, no recompute, no bwd_filter / watch /
+    // op_profile — matches the Llama-only scope of the forward stream path.
+    const bool bwd_stream_driven =
+        !graph.instruction_stream.empty() && !bwd_stream_capturing && bwd_tile_group_starts.empty();
+
+    // Per-op layer-end cleanup (shared between SegmentDispatch inline and
+    // PhaseExit BwdBlock). Mirrors the flat-ops layer-end handler at lines
+    // 2767-2895. Idempotent via last_layer_restored - safe to call multiple
+    // times for the same layer. `idx` is the op index that triggered the
+    // cleanup (used by BwdCrossLayer persist to decide which tids survive).
+    auto bwd_layer_end_cleanup = [&](int L, std::size_t idx, bool capturing = false) {
+        if (L < 0 || L == last_layer_restored) return;
+        // Capture-unsafe work (BwdCrossLayer persist, handle_layer_end,
+        // debug dump, grad reduce/offload/notify) is skipped during CUDA
+        // stream capture — those APIs invalidate the capture. Stack.restore
+        // + slot clears still run so peak memory stays bounded.
+        if (!capturing) {
+            // BwdCrossLayer arena-backed persist.
+            std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
+            struct PendingPersist {
+                int tid;
+                std::byte* ptr;
+                std::size_t bytes;
+            };
+            std::vector<PendingPersist> pending;
+            for (const auto& [name, use_idx] : last_use) {
+                if (use_idx <= idx) continue;
+                int tid = graph.find_tensor_id(name);
+                if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+                const auto& t = mTensors[static_cast<std::size_t>(tid)];
+                if (t.Data && mRunState.Stack.owns(t.Data)) {
+                    pending.push_back({tid, t.Data, t.bytes()});
+                    auto key = reinterpret_cast<std::uintptr_t>(t.Data);
+                    auto it = max_bytes_by_ptr.find(key);
+                    if (it == max_bytes_by_ptr.end())
+                        max_bytes_by_ptr.emplace(key, t.bytes());
+                    else
+                        it->second = std::max(it->second, t.bytes());
+                }
+            }
+            if (!pending.empty()) {
+                if (env_enabled("SUROGATE_DEBUG_BACKWARD_PERSIST")) {
+                    std::size_t total_bytes = 0;
+                    for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr)
+                        total_bytes += nbytes;
+                    std::cerr << "[BWD_PERSIST] layer=" << L << " unique_ptrs=" << max_bytes_by_ptr.size()
+                              << " total_bytes=" << total_bytes << std::endl;
+                }
+                std::unordered_map<std::uintptr_t, std::byte*> persistent_by_ptr;
+                persistent_by_ptr.reserve(max_bytes_by_ptr.size());
+                for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
+                    if (nbytes == 0) continue;
+                    std::byte* arena_ptr = allocate_bwd_cross_layer(nbytes);
+                    auto* original = reinterpret_cast<const std::byte*>(ptr_key);
+                    CUDA_CHECK(
+                        cudaMemcpyAsync(arena_ptr, original, nbytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                    persistent_by_ptr.emplace(ptr_key, arena_ptr);
+                }
+                for (const auto& p : pending) {
+                    auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(p.ptr));
+                    if (it == persistent_by_ptr.end()) continue;
+                    release_persisted_backward_tid(p.tid);
+                    persisted_backward_by_tid[p.tid] = it->second;
+                    persisted_backward_refcount[it->second] += 1;
+                    mTensors[static_cast<std::size_t>(p.tid)].Data = it->second;
+                }
+                for (auto& [name, tensor] : mNamedTensors) {
+                    if (!tensor.Data) continue;
+                    auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(tensor.Data));
+                    if (it != persistent_by_ptr.end()) tensor.Data = it->second;
+                }
+            }
+
+            handle_layer_end(L);
+            if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
+
+            if (mGrads.is_streaming_grads()) {
+                if (mComm && mComm->world_size() > 1) {
+                    CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                    CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                    mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
+                }
+                mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
+            } else if (mComm && mComm->world_size() > 1) {
+                CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                mGrads.notify_block(L, mRunState.side_stream(), *mComm);
+            }
+        }
+
+        mRunState.Stack.restore(initial_checkpoint);
+        mTemps.clear();
+        prune_stack_tensors(L);
+        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
+        last_layer_restored = L;
+    };
+    if (bwd_stream_driven) {
+        if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
+            if (std::string(env) == "1") {
+                std::cerr << "[phase-interp] backward: stream-driven (" << graph.instruction_stream.size()
+                          << " instructions)\n";
+            }
+        }
+        for (const auto& inst : graph.instruction_stream) {
+            switch (inst.kind) {
+                case dsl::InstKind::PhaseEnter:
+                    if (inst.phase_kind == dsl::PhaseKind::BwdBlock && inst.block_index >= 0) {
+                        const int L = inst.block_index;
+                        handle_layer_start(L);
+                        if (mGrads.is_streaming_grads()) {
+                            mGrads.prepare_layer_grads(L, mRunState.MainStream);
+                            for (const auto& pname : mGrads.layer_grad_names(L)) {
+                                std::string gname = "d_" + pname;
+                                bool dummy = false;
+                                Tensor* grad = mGrads.get_param_grad(pname, dummy);
+                                if (grad) bind_tensor(gname, *grad);
+                            }
+                        }
+                        // Recompute runs via the explicit RecomputeBlock
+                        // instruction emitted immediately after.
+                    }
+                    break;
+
+                case dsl::InstKind::RecomputeBlock:
+                    // Explicit forward-block replay for gradient-checkpointed
+                    // backward. No-op when recompute is off. Idempotent per
+                    // block via mLastRecomputeLayer.
+                    if (mRecomputeEnabled && mRecomputeFn && inst.block_index >= 0 &&
+                        inst.block_index != mLastRecomputeLayer) {
+                        mRecomputeFn(inst.block_index, mB, mT, mRecomputeUseGraphs);
+                        mLastRecomputeLayer = inst.block_index;
+                    }
+                    break;
+
+                case dsl::InstKind::SegmentDispatch:
+                    for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
+                        const auto& op = graph.ops[i];
+                        if (skip_logits_grad && is_logits_grad_op(op)) continue;
+                        if (!op.fn) continue;
+
+                        // Per-op recompute trigger (MoE fix): mirrors the
+                        // flat-ops backward at lines 2600-2621. Some backward
+                        // ops live OUTSIDE any BwdBlock phase-tree bucket
+                        // (e.g., GPT-OSS's LM-head + MoE EP dispatch path in
+                        // the backward Prologue), so a PhaseEnter-only
+                        // recompute trigger misses them. Detect the op's
+                        // effective layer from its inputs/outputs and fire
+                        // recompute there. Idempotent via mLastRecomputeLayer.
+                        if (mRecomputeEnabled && mRecomputeFn) {
+                            const int non_grad_layer = op_layer_idx(op);
+                            const int any_layer = op_layer_idx_any(op);
+                            const int effective_layer_idx = (non_grad_layer >= 0) ? non_grad_layer : any_layer;
+                            if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
+                                mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
+                                mLastRecomputeLayer = effective_layer_idx;
+                            }
+                        }
+
+                        check_op_io_aliasing(op, i, "bwd");
+                        op.fn(*this, op, static_cast<const void*>(hook));
+                        // LM-head post-dispatch cleanup: free the d_logits payload
+                        // after the first matmul_backward (see line ~2372 comment).
+                        if (op.type == CompiledOpType::MatmulBackward && i == 1) {
+                            mRunState.temp_free(mRunState.non_block_activations().output);
+                            mTemps.clear();
+                            initial_checkpoint = mRunState.Stack.checkpoint();
+                        }
+                        // Inline prune per op to free Stack slots as soon as
+                        // a tid's last use passes. Prologue-heavy graphs (MoE,
+                        // hybrid Mamba) need per-op pruning; batching to a
+                        // single PruneByLastUse instruction would accumulate
+                        // hundreds of Prologue allocations before any gets
+                        // freed, producing a 3x+ Stack bloat.
+                        prune_by_last_use(i);
+
+                        // Per-op layer-end cleanup. Flat-ops does this after
+                        // each op with op.layer_end set (line 2767). Without
+                        // it, recompute-allocated forward activations
+                        // accumulate on Stack across Prologue ops, producing
+                        // 3x+ peak Stack usage on hybrid architectures. The
+                        // lambda is idempotent via last_layer_restored.
+                        if (op.layer_end >= 0) {
+                            bwd_layer_end_cleanup(op.layer_end, i);
+                        }
+                    }
+                    break;
+
+                case dsl::InstKind::PruneByLastUse:
+                    // Redundant with the inline prune_by_last_use above;
+                    // kept as a no-op so the instruction stream shape
+                    // remains stable for the static validator.
+                    break;
+
+                case dsl::InstKind::PhaseExit:
+                    // Phase-level cleanup (safety net - most BwdBlocks are
+                    // already drained by the inline per-op bwd_layer_end_cleanup
+                    // above when ops inside hit op.layer_end). Idempotent via
+                    // last_layer_restored, so the duplicate call is a no-op.
+                    if (inst.phase_kind == dsl::PhaseKind::BwdBlock && inst.block_index >= 0) {
+                        const std::size_t block_end =
+                            (inst.block_index < static_cast<int>(graph.layer_end_indices.size()))
+                                ? graph.layer_end_indices[static_cast<std::size_t>(inst.block_index)]
+                                : graph.ops.size();
+                        const std::size_t idx = block_end > 0 ? block_end - 1 : 0;
+                        bwd_layer_end_cleanup(inst.block_index, idx);
+                    }
+                    break;
+            }
+        }
+    }
+
+    for (std::size_t idx = 0; !bwd_stream_driven && idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
         if (skip_logits_grad && is_logits_grad_op(op)) {
@@ -2145,10 +2778,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     if (mRecomputeEnabled && mRecomputeFn) {
                         const int layer_idx = first_op.layer_start;
                         if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                            if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
-                                clear_shared_grads(layer_idx);
-                                layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                            }
                             mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
                             mLastRecomputeLayer = layer_idx;
                         }
@@ -2193,10 +2822,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                 idx,
                                 op_type_to_string(op.type));
                     }
-                    if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
-                        clear_shared_grads(layer_idx);
-                        layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                    }
                     mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
                     mLastRecomputeLayer = layer_idx;
                 }
@@ -2223,11 +2848,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             idx,
                             op_type_to_string(op.type));
                 }
-                if (effective_layer_idx < num_layers &&
-                    !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
-                    clear_shared_grads(effective_layer_idx);
-                    layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;
-                }
                 mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
                 mLastRecomputeLayer = effective_layer_idx;
             }
@@ -2243,6 +2863,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
                 throw std::runtime_error(oss.str());
             }
+            check_op_io_aliasing(op, idx, "bwd");
             op.fn(*this, op, static_cast<const void*>(hook));
             if (bwd_filter_matched && bwd_filter_dump && mDebugDumpFn) {
                 std::vector<std::string> dump_names;
@@ -2338,153 +2959,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             // If live cross-layer tensors exist on the stack, persist them to allocated memory first.
             prune_by_last_use(idx);
             if (op.layer_end >= 0 && op.layer_end != last_layer_restored) {
-                if (!bwd_stream_capturing) {
-                    // Persist any cross-layer tensors that still live on the stack.
-                    // These tensors (e.g., d_blocks[N].router_logits for MoE aux loss) have
-                    // last_use beyond the current layer, so they must survive stack restore.
-                    struct PendingBackwardPersist {
-                        std::string name;
-                        int tensor_id = -1;
-                        std::byte* original_ptr = nullptr;
-                        std::size_t bytes = 0;
-                    };
-
-                    std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
-                    std::unordered_map<std::uintptr_t, std::string> label_by_ptr;
-                    std::vector<PendingBackwardPersist> pending_persists;
-
-                    for (const auto& [name, use_idx] : last_use) {
-                        if (use_idx <= idx) continue;
-                        int tid = graph.find_tensor_id(name);
-                        if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-                        const auto& tensor = mTensors[static_cast<std::size_t>(tid)];
-                        if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
-                            PendingBackwardPersist pending;
-                            pending.name = name;
-                            pending.tensor_id = tid;
-                            pending.original_ptr = tensor.Data;
-                            pending.bytes = tensor.bytes();
-                            pending_persists.push_back(pending);
-                            const auto key = reinterpret_cast<std::uintptr_t>(tensor.Data);
-                            auto it = max_bytes_by_ptr.find(key);
-                            if (it == max_bytes_by_ptr.end()) {
-                                max_bytes_by_ptr.emplace(key, pending.bytes);
-                                label_by_ptr.emplace(key, name);
-                            } else {
-                                it->second = std::max(it->second, pending.bytes);
-                            }
-                        }
-                    }
-
-                    if (!pending_persists.empty()) {
-                        if (env_enabled("SUROGATE_DEBUG_BACKWARD_PERSIST")) {
-                            std::vector<std::pair<std::string, std::size_t>> debug_entries;
-                            debug_entries.reserve(max_bytes_by_ptr.size());
-                            std::size_t total_bytes = 0;
-                            for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
-                                total_bytes += nbytes;
-                                auto it = label_by_ptr.find(ptr_key);
-                                debug_entries.emplace_back(it != label_by_ptr.end() ? it->second : "<unknown>", nbytes);
-                            }
-                            std::sort(debug_entries.begin(), debug_entries.end(), [](const auto& a, const auto& b) {
-                                return a.second > b.second;
-                            });
-                            std::cerr << "[BWD_PERSIST] layer=" << op.layer_end
-                                      << " unique_ptrs=" << debug_entries.size() << " total_bytes=" << total_bytes
-                                      << std::endl;
-                            const std::size_t limit = std::min<std::size_t>(debug_entries.size(), 16);
-                            for (std::size_t i = 0; i < limit; ++i) {
-                                std::cerr << "  [" << i << "] " << debug_entries[i].first
-                                          << " bytes=" << debug_entries[i].second << std::endl;
-                            }
-                        }
-
-                        std::unordered_map<std::uintptr_t, std::byte*> persistent_by_ptr;
-                        persistent_by_ptr.reserve(max_bytes_by_ptr.size());
-
-                        for (const auto& [ptr_key, nbytes] : max_bytes_by_ptr) {
-                            if (nbytes == 0) {
-                                continue;
-                            }
-                            std::byte* persistent = nullptr;
-                            auto* original = reinterpret_cast<const std::byte*>(ptr_key);
-                            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&persistent), nbytes));
-                            CUDA_CHECK(cudaMemcpyAsync(persistent,
-                                                       original,
-                                                       nbytes,
-                                                       cudaMemcpyDeviceToDevice,
-                                                       mRunState.MainStream));
-                            persistent_by_ptr.emplace(ptr_key, persistent);
-                            mPersistedBackwardTensors.push_back(persistent);
-                        }
-
-                        for (const PendingBackwardPersist& pending : pending_persists) {
-                            auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(pending.original_ptr));
-                            if (it == persistent_by_ptr.end()) {
-                                continue;
-                            }
-                            release_persisted_backward_tid(pending.tensor_id);
-                            persisted_backward_by_tid[pending.tensor_id] = it->second;
-                            persisted_backward_refcount[it->second] += 1;
-                            mTensors[static_cast<std::size_t>(pending.tensor_id)].Data = it->second;
-                        }
-
-                        for (auto& [name, tensor] : mNamedTensors) {
-                            if (!tensor.Data) {
-                                continue;
-                            }
-                            auto it = persistent_by_ptr.find(reinterpret_cast<std::uintptr_t>(tensor.Data));
-                            if (it != persistent_by_ptr.end()) {
-                                tensor.Data = it->second;
-                            }
-                        }
-                    }
-
-                    // Release this layer's offloaded weights (if applicable)
-                    handle_layer_end(op.layer_end);
-
-                    // Dump backward-phase tensors for this layer before the stack
-                    // gets pruned or rebound. Runtime names are "d_blocks[N].<base>"
-                    // (e.g. d_blocks[3].qkv) — distinct from forward "blocks[N].<base>"
-                    // so the two phases write to separate files.
-                    if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(op.layer_end);
-
-                    if (mGrads.is_streaming_grads()) {
-                        // CPU-RAM centric: reduce (multi-GPU) then D2H to CPU
-                        if (mComm && mComm->world_size() > 1) {
-                            CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
-                            CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-                            mGrads.reduce_layer_grads(op.layer_end, mRunState.side_stream(), *mComm);
-                        }
-                        mGrads.offload_layer_grads(op.layer_end, mRunState.MainStream, mRunState.side_stream());
-                    } else if (mComm && mComm->world_size() > 1) {
-                        // Existing path: async gradient reduction on side_stream
-                        CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
-                        CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-                        mGrads.notify_block(op.layer_end, mRunState.side_stream(), *mComm);
-                    }
-                }
-
-                // During CUDA graph capture, we must still restore stack at each layer boundary
-                // to bound peak memory; only capture-unsafe work above is skipped.
-                mRunState.Stack.restore(initial_checkpoint);
-                mTemps.clear();
-                prune_stack_tensors(op.layer_end);
-                // Note: cudnn_workspace is persistently allocated, no need to clear
-                // Clear stack-allocated tensor pointers in simplified_acts/grads for this layer.
-                // These pointers become stale after checkpoint restore.
-                if (mRunState.ffn_temps_on_stack()) {
-                    auto& acts = mRunState.simplified_acts(op.layer_end);
-                    acts.mlp_up.Data = nullptr;
-                    acts.swiglu.Data = nullptr;
-                }
-                if (mRunState.large_bwd_temps_on_stack()) {
-                    auto& grads_to_clear = mRunState.simplified_grads(op.layer_end);
-                    grads_to_clear.d_qkv.Data = nullptr;
-                    grads_to_clear.d_mlp_up.Data = nullptr;
-                    grads_to_clear.d_swiglu.Data = nullptr;
-                }
-                last_layer_restored = op.layer_end;
+                bwd_layer_end_cleanup(op.layer_end, idx, bwd_stream_capturing);
             }
             // Every N ops as fallback (catches non-annotated layers)
             // NOTE: When recompute is disabled, we cannot aggressively prune tensors because
@@ -2562,16 +3037,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     prune_stack_tensors(-1);
     mTemps.clear();
 
-    // Free persisted cross-layer backward tensors
-    // Sync main stream first to ensure all consumers have completed
-    if (!mPersistedBackwardTensors.empty()) {
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        for (auto* ptr : mPersistedBackwardTensors) {
-            if (ptr) {
-                cudaFree(ptr);
-            }
-        }
-        mPersistedBackwardTensors.clear();
+    // Per-layer bwd_layer_end_cleanup nulls layer L's Stack-resident slots,
+    // but replay_layer_forward(L) writes blocks[L+1].ln1 / ln1_rstd via the
+    // end-of-layer fused residual+rmsnorm — a cross-layer side effect that
+    // the per-layer clear can't see. Since we process backward in reverse
+    // (27→0), layer L+1's cleanup has already run by the time layer L's
+    // replay pollutes blocks[L+1]. Sweep every layer here so no Stack-range
+    // pointer survives into the optimizer / next step.
+    for (int L = 0; L < static_cast<int>(mConfig.NumLayers); ++L) {
+        if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
     }
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
@@ -2585,6 +3059,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     if (mGrads.is_streaming_grads()) {
         mGrads.offload_non_block_grads(mRunState.MainStream);
     }
+
+    // Deregister on backward exit.
+    mRunState.set_active_executor(nullptr);
 }
 
 }  // namespace dsl

@@ -7,12 +7,16 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <fmt/format.h>
 #include "kernels/kernels.h"
 #include "runtime/core/model_config.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 #include "utilities/safetensors.h"
+#include "utilities/utils.h"
 
 namespace modules {
 
@@ -569,6 +573,118 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
     }
 
     return per_layer * static_cast<std::size_t>(mConfig.num_layers);
+}
+
+namespace {
+
+// Walk every allocated (.Data != nullptr) leaf Tensor/TensorShard in the
+// LoRA weights set. `visit` is invoked once per live leaf in a stable,
+// layer-major order so master and work traversals match offset-for-offset
+// when the same visitor stride is used on both. `TSet` is resolved to the
+// caller's const-qualification so the same walker serves both read-only
+// sizing and in-place rebinding.
+template <typename TSet, typename F>
+void for_each_lora_tensor(TSet& set, F&& visit) {
+    auto visit_layer = [&](auto& layer) {
+        if (!layer.has_value()) return;
+        if (layer->A.Data) visit(layer->A);
+        if (layer->B.Data) visit(layer->B);
+    };
+    auto visit_grouped = [&](auto& layer) {
+        if (!layer.has_value()) return;
+        if (layer->A.Data) visit(layer->A);
+        if (layer->B.Data) visit(layer->B);
+    };
+
+    for (auto& block : set.blocks) {
+        visit_layer(block.attention.q);
+        visit_layer(block.attention.k);
+        visit_layer(block.attention.v);
+        visit_layer(block.attention.o);
+
+        visit_layer(block.mlp.gate);
+        visit_layer(block.mlp.gate_up);
+        visit_layer(block.mlp.up);
+        visit_layer(block.mlp.down);
+
+        if (block.moe.shared.has_value()) {
+            visit_layer(block.moe.shared->gate);
+            visit_layer(block.moe.shared->gate_up);
+            visit_layer(block.moe.shared->up);
+            visit_layer(block.moe.shared->down);
+        }
+
+        if (block.moe.use_grouped) {
+            visit_grouped(block.moe.grouped.gate);
+            visit_grouped(block.moe.grouped.gate_up);
+            visit_grouped(block.moe.grouped.up);
+            visit_grouped(block.moe.grouped.down);
+        } else {
+            for (auto& expert : block.moe.experts) {
+                visit_layer(expert.gate);
+                visit_layer(expert.gate_up);
+                visit_layer(expert.up);
+                visit_layer(expert.down);
+            }
+        }
+
+        visit_layer(block.router);
+    }
+}
+
+}  // namespace
+
+std::size_t ModularLoRAWeightsManager::total_persistent_bytes() const {
+    if (!enabled()) return 0;
+    std::size_t total = 0;
+    for_each_lora_tensor(mMaster, [&](const Tensor& t) { total += t.bytes(); });
+    for_each_lora_tensor(mWork, [&](const Tensor& t) { total += t.bytes(); });
+    return total;
+}
+
+std::size_t ModularLoRAWeightsManager::rebind_to_persistent_arena(std::byte* arena_base,
+                                                                  std::size_t max_bytes,
+                                                                  cudaStream_t stream) {
+    if (!enabled()) return 0;
+    if (arena_base == nullptr || max_bytes == 0) return 0;
+
+    std::size_t cursor = 0;
+    std::size_t rebound = 0;
+
+    auto rebind_tensor = [&](auto& tensor) {
+        if (tensor.Data == nullptr) return;
+        const std::size_t bytes = tensor.bytes();
+        if (bytes == 0) return;
+        if (cursor + bytes > max_bytes) {
+            throw std::runtime_error("ModularLoRAWeightsManager::rebind_to_persistent_arena: slab capacity " +
+                                     std::to_string(max_bytes) + " exhausted at cursor " + std::to_string(cursor) +
+                                     " needing " + std::to_string(bytes));
+        }
+        std::byte* slot = arena_base + cursor;
+        CUDA_CHECK(cudaMemcpyAsync(slot, tensor.Data, bytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = tensor.Stats;
+        const int device = tensor.Device;
+        mAllocator->free(tensor);  // clears tensor.Data
+        tensor.Data = slot;
+        tensor.Device = device;
+        tensor.Stats = preserved_stats;
+        cursor += bytes;
+        ++rebound;
+    };
+
+    for_each_lora_tensor(mMaster, rebind_tensor);
+    for_each_lora_tensor(mWork, rebind_tensor);
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume lora_persistent] rebound=" << rebound << " bytes_used=" << cursor
+                      << " slab_bytes=" << max_bytes << "\n";
+        }
+    }
+
+    return cursor;
 }
 
 void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {

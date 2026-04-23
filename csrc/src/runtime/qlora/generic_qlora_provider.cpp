@@ -242,6 +242,10 @@ qlora::IQuantizer* GenericQLoRAProvider::get_quantizer() const {
     return mWeightMgr->quantizer();
 }
 
+void GenericQLoRAProvider::consume_self_arena(cudaStream_t stream) {
+    if (mWeightMgr) mWeightMgr->consume_self_arena(stream);
+}
+
 void GenericQLoRAProvider::auto_tune_offloading() {
     if (!mWeightMgr) return;
     auto* om = mWeightMgr->offload_manager();

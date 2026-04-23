@@ -9,8 +9,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <queue>
@@ -63,6 +65,16 @@ using Encoder = std::unordered_map<std::vector<uint8_t>, Rank, ByteVecHash>;
 
 // Temporary lookup that accepts ByteSpan keys (avoids allocations in hot loop).
 // Built once from the Encoder for the duration of a merge operation.
+//
+// Byte fallback (SentencePiece semantics, byte_fallback=true): single-byte
+// queries whose raw byte isn't in the vocab fall back to the rank of the
+// vocab entry named "<0xXX>". Gemma4-family tokenizers rely on this — only
+// 109/256 bytes exist as raw-byte vocab entries; the remaining 147 are
+// reachable only through their <0xXX> forms. Without this fallback, BPE's
+// final per-byte extraction emits RANK_MAX (0xFFFFFFFF) for any missing
+// byte, and that value propagates into input_ids as int32 = -1, which the
+// embedding kernel interprets as an out-of-range vocab lookup and crashes
+// with cudaErrorIllegalAddress.
 class EncoderLookup {
 public:
     explicit EncoderLookup(const Encoder& enc) {
@@ -70,15 +82,46 @@ public:
         for (const auto& [k, v] : enc) {
             map_[ByteSpan{k.data(), k.size()}] = v;
         }
+        byte_fallback_.fill(RANK_MAX);
+        // Populate each byte's fallback rank: raw single-byte entry in the
+        // vocab if present, else the "<0xXX>" byte-fallback token. Left as
+        // RANK_MAX if neither exists — such vocabs don't support all bytes
+        // and will still error loudly at bpe_merge time via the assert
+        // below (or via the final RANK_MAX guard in encode_piece).
+        for (int b = 0; b < 256; ++b) {
+            const auto byte = static_cast<uint8_t>(b);
+            auto it = map_.find(ByteSpan{&byte, 1});
+            if (it != map_.end()) {
+                byte_fallback_[b] = it->second;
+                continue;
+            }
+            // "<0x00>" through "<0xFF>" — SentencePiece convention.
+            char fb[7];
+            std::snprintf(fb, sizeof(fb), "<0x%02X>", b);
+            const auto* fb_bytes = reinterpret_cast<const uint8_t*>(fb);
+            auto fb_it = map_.find(ByteSpan{fb_bytes, 6});
+            if (fb_it != map_.end()) {
+                byte_fallback_[b] = fb_it->second;
+            }
+        }
     }
 
     Rank get(const uint8_t* data, size_t len) const {
         auto it = map_.find(ByteSpan{data, len});
-        return it != map_.end() ? it->second : RANK_MAX;
+        if (it != map_.end()) return it->second;
+        // Single-byte fallback (byte_fallback=true). Multi-byte misses stay
+        // RANK_MAX — BPE uses those as "not a merge candidate" signals.
+        if (len == 1) return byte_fallback_[data[0]];
+        return RANK_MAX;
+    }
+
+    Rank byte_fallback(uint8_t b) const {
+        return byte_fallback_[b];
     }
 
 private:
     std::unordered_map<ByteSpan, Rank, ByteSpanHash, ByteSpanEqual> map_;
+    std::array<Rank, 256> byte_fallback_{};
 };
 
 // ---- Small-piece BPE: O(mn) linear scan ----

@@ -522,6 +522,73 @@ ShapeEnv GraphCompiler::make_layer_env(int layer_idx) const {
     return env;
 }
 
+// Rewrite a shape computed with global dims to per-layer dims. The shape
+// fallbacks (resolve_tensor_shape / infer_known_tensor_shape) use
+// `mConfig.head_size()` / `mConfig.qkv_channels()` / etc. directly — wrong
+// for hybrid block types whose attn_dim / intermediate / mlp_up differ per
+// layer. Call this after any fallback-produced shape for a block-scoped
+// tensor whose field name maps to one of the per-layer-varying dims.
+// Gemma4 needs this for every full-attention block when the default is
+// sliding: `blocks[L].att` / `att_flat` / `qkv*` / `q*` / `mlp_up*` /
+// `swiglu*` would otherwise end up sized to the sliding defaults.
+void GraphCompiler::apply_per_layer_dim_override(std::vector<long>& shape,
+                                                 const std::string& base_field,
+                                                 int layer_idx) const {
+    if (shape.empty()) return;
+    if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= mPerLayerDims.size()) return;
+    const auto& pld = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
+    const long B = mB;
+    const long T = mT;
+    // QKV family — total channels across Q+K+V.
+    if (base_field == "qkv" || base_field == "qkv_rope" || base_field == "qkv_norm" || base_field == "qkv_normed") {
+        shape = {B, T, pld.qkv_channels};
+        return;
+    }
+    if (base_field == "qkv_flat" || base_field == "qkv_biased" || base_field == "qkv_normed_flat" ||
+        base_field == "qkv_norm_flat") {
+        shape = {B * T, pld.qkv_channels};
+        return;
+    }
+    // Q-only (shared-KV attention variants).
+    if (base_field == "q_flat" || base_field == "q_rn_flat" || base_field == "q_normed_flat" ||
+        base_field == "q_roped" || base_field == "q_normed") {
+        // Flat form is [B*T, attn_dim]; non-flat is [B, T, attn_dim]. Use
+        // shape.size() to decide — view ops may land here with either rank.
+        if (shape.size() == 2) {
+            shape = {B * T, pld.attn_dim};
+        } else {
+            shape = {B, T, pld.attn_dim};
+        }
+        return;
+    }
+    // Attention output (post-softmax, before projection).
+    if (base_field == "att") {
+        shape = {B, T, pld.attn_dim};
+        return;
+    }
+    if (base_field == "att_flat") {
+        shape = {B * T, pld.attn_dim};
+        return;
+    }
+    // MLP intermediate.
+    if (base_field == "mlp_up") {
+        shape = {B, T, pld.mlp_up};
+        return;
+    }
+    if (base_field == "mlp_up_flat") {
+        shape = {B * T, pld.mlp_up};
+        return;
+    }
+    if (base_field == "swiglu") {
+        shape = {B, T, pld.intermediate};
+        return;
+    }
+    if (base_field == "swiglu_flat") {
+        shape = {B * T, pld.intermediate};
+        return;
+    }
+}
+
 void GraphCompiler::update_dimensions(long B, long T) {
     mB = B;
     mT = T;
@@ -614,6 +681,18 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
             if (it != mExtraShapes.end()) {
                 ref.shape = it->second;
             }
+        }
+        // Hybrid per-layer override for saved refs. Both `resolve_shape`
+        // (with the global mShapeEnv) and `infer_known_tensor_shape`
+        // (hard-coded to global dims) produce the wrong size for block
+        // tids whose per-layer head_size / intermediate differs from the
+        // default. Gemma4's `saved.blocks[34].att_flat` (final layer
+        // forced to full_attention) would otherwise come out Hq*256 = 2048
+        // instead of the correct Hq*512 = 4096.
+        int parsed_layer_idx = -1;
+        std::string parsed_field;
+        if (parse_block_param(stripped, parsed_layer_idx, parsed_field)) {
+            apply_per_layer_dim_override(ref.shape, strip_ssa_suffix(parsed_field), parsed_layer_idx);
         }
         ref.tensor_id = assign_tensor_id(ref.name);
         return ref;
@@ -708,6 +787,18 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
             }
         }
 
+        // Final per-layer override for hybrid models. `resolve_tensor_shape`
+        // and its `infer_known_tensor_shape` fallback use the GLOBAL
+        // head_size / intermediate / mlp_up — wrong for hybrid blocks whose
+        // dims differ per layer (Gemma4's sliding vs. full_attention, last
+        // layer forced to full). The earlier per-layer override block at
+        // lines 648-672 only runs when `slot_entry->shape` is non-empty,
+        // which skips `att` / `att_flat` / `swiglu` / `qkv_norm*` since the
+        // slot registry stores slot-id only (no shape). Without this
+        // fallback, the backward graph's recompute scratch for a
+        // full-attention block comes out sliding-sized.
+        apply_per_layer_dim_override(ref.shape, base_field, layer_idx);
+
         ref.tensor_id = assign_tensor_id(ref.name);
         return ref;
     }
@@ -754,32 +845,11 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
             }
 
             // For hybrid models, apply per-layer dim overrides to match the
-            // forward activation shapes (parallels lines 577-603 for activations).
-            // Without this, gradient slots for hybrid-dim fields end up sized
-            // with global/default dims — downstream view_backward will claim
-            // more elements than the underlying allocation holds.
-            if (layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < mPerLayerDims.size() && !ref.shape.empty()) {
-                const auto& pld = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
-                const long B = mB;
-                const long T = mT;
-                if (base_field == "qkv" || base_field == "qkv_rope") {
-                    ref.shape = {B, T, pld.qkv_channels};
-                } else if (base_field == "qkv_flat" || base_field == "qkv_biased") {
-                    ref.shape = {B * T, pld.qkv_channels};
-                } else if (base_field == "att") {
-                    ref.shape = {B, T, pld.attn_dim};
-                } else if (base_field == "att_flat") {
-                    ref.shape = {B * T, pld.attn_dim};
-                } else if (base_field == "mlp_up") {
-                    ref.shape = {B, T, pld.mlp_up};
-                } else if (base_field == "mlp_up_flat") {
-                    ref.shape = {B * T, pld.mlp_up};
-                } else if (base_field == "swiglu") {
-                    ref.shape = {B, T, pld.intermediate};
-                } else if (base_field == "swiglu_flat") {
-                    ref.shape = {B * T, pld.intermediate};
-                }
-            }
+            // forward activation shapes. Without this, gradient slots for
+            // hybrid-dim fields end up sized with global/default dims —
+            // downstream view_backward will claim more elements than the
+            // underlying allocation holds.
+            apply_per_layer_dim_override(ref.shape, base_field, layer_idx);
 
             if (ref.shape.empty()) {
                 auto it = mExtraShapes.find(base);
@@ -989,13 +1059,45 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         attrs.rotary_dim = mConfig.head_size();
     }
 
-    // Shape attribute (direct shape or shape_like reference)
+    // Shape attribute (direct shape or shape_like reference). When the
+    // shape_like target's shape is known statically (via mExtraShapes or
+    // known-tensor inference), bake it into attrs.shape so view_backward's
+    // runtime dispatch uses the compile-time value and doesn't consult
+    // mTensors[shape_like_tid] at runtime. Runtime consultation would
+    // pick up the forward-canonical shape, but consumers expect an
+    // infer-path shape on Q3.5's Hq/Hkv attention views.
     if (auto* shape_attr = find_attr(op.attrs, "shape")) {
         attrs.shape = resolve_attr_shape(*shape_attr, env);
     } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
-        // Store the reference name for runtime lookup
         if (auto ref_name = attr_string(*shape_like_attr)) {
             attrs.shape_like = *ref_name;
+            std::string effective = attrs.shape_like;
+            const std::string saved_prefix = "saved.";
+            if (starts_with(effective, saved_prefix)) {
+                effective = effective.substr(saved_prefix.size());
+            }
+            std::vector<long> ref_shape;
+            auto it = mExtraShapes.find(effective);
+            if (it != mExtraShapes.end()) {
+                ref_shape = it->second;
+            } else if (!resolve_tensor_shape(effective, ref_shape)) {
+                infer_known_tensor_shape(effective, mConfig, mB, mT, ref_shape);
+            }
+            // Hybrid per-layer override. `resolve_tensor_shape` /
+            // `infer_known_tensor_shape` are wired to global dims; for
+            // block-scoped tensors whose per-layer attn_dim / intermediate /
+            // mlp_up differ from the default, ref_shape is wrong. Gemma4
+            // block 34 (final full-attention layer) would otherwise see
+            // view_backward's target_shape fall through to the sliding
+            // value Hq*256 instead of Hq*512.
+            int pl_layer_idx = -1;
+            std::string pl_field;
+            if (!ref_shape.empty() && parse_block_param(effective, pl_layer_idx, pl_field)) {
+                apply_per_layer_dim_override(ref_shape, strip_ssa_suffix(pl_field), pl_layer_idx);
+            }
+            if (!ref_shape.empty()) {
+                attrs.shape = std::move(ref_shape);
+            }
         }
     }
 
@@ -1565,6 +1667,1642 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
     }
 }
 
+// ============================================================================
+// Phase Tree — build from layer boundaries
+// ============================================================================
+
+const char* phase_kind_name(PhaseKind k) {
+    switch (k) {
+        case PhaseKind::Custom: return "Custom";
+        case PhaseKind::FwdBlockSeq: return "FwdBlockSeq";
+        case PhaseKind::BwdBlockSeq: return "BwdBlockSeq";
+        case PhaseKind::FwdBlock: return "FwdBlock";
+        case PhaseKind::BwdBlock: return "BwdBlock";
+    }
+    return "?";
+}
+
+namespace {
+
+void dump_phase_tree_rec(std::ostringstream& os, const PhaseNode& node, int indent) {
+    for (int i = 0; i < indent; ++i)
+        os << "  ";
+    const char* kind_str = phase_kind_name(node.kind);
+    os << kind_str;
+    if (!node.label.empty() && node.label != kind_str) {
+        os << " " << node.label;
+    }
+    os << " ops=[" << node.op_start << ".." << node.op_end << ") n=" << (node.op_end - node.op_start);
+    if (node.block_index >= 0) {
+        os << " block=" << node.block_index;
+    }
+    os << "\n";
+    for (const auto& child : node.children) {
+        dump_phase_tree_rec(os, child, indent + 1);
+    }
+}
+
+}  // namespace
+
+std::string dump_phase_tree(const PhaseNode& root) {
+    std::ostringstream os;
+    dump_phase_tree_rec(os, root, 0);
+    return os.str();
+}
+
+void GraphCompiler::build_phase_tree(CompiledGraph& graph, bool is_backward) {
+    const std::size_t num_layers = graph.layer_start_indices.size();
+    const std::size_t num_ops = graph.ops.size();
+
+    struct BlockRange {
+        int layer_idx;
+        std::size_t start;
+        std::size_t end;
+    };
+    std::vector<BlockRange> blocks;
+    blocks.reserve(num_layers);
+
+    // annotate_layer_boundaries uses SIZE_MAX as a "layer not seen" sentinel.
+    // For backward, layer_start_indices[L] decreases with L (layer N-1 runs
+    // first), so we sort by start-op to get execution order uniformly.
+    for (std::size_t L = 0; L < num_layers; ++L) {
+        auto s = graph.layer_start_indices[L];
+        auto e = graph.layer_end_indices[L];
+        if (s != SIZE_MAX && e != SIZE_MAX && s < e && e <= num_ops) {
+            blocks.push_back({static_cast<int>(L), s, e});
+        }
+    }
+    std::sort(blocks.begin(), blocks.end(), [](const BlockRange& a, const BlockRange& b) { return a.start < b.start; });
+
+    if (blocks.empty()) {
+        graph.phase_tree.reset();
+        return;
+    }
+
+    const std::size_t first_op = blocks.front().start;
+    const std::size_t last_op = blocks.back().end;
+
+    PhaseNode root;
+    root.kind = PhaseKind::Custom;
+    root.op_start = 0;
+    root.op_end = num_ops;
+    root.label = is_backward ? "BackwardCompile" : "ForwardCompile";
+
+    if (first_op > 0) {
+        PhaseNode prologue;
+        prologue.kind = PhaseKind::Custom;
+        prologue.op_start = 0;
+        prologue.op_end = first_op;
+        prologue.label = "Prologue";
+        root.children.push_back(std::move(prologue));
+    }
+
+    PhaseNode seq;
+    seq.kind = is_backward ? PhaseKind::BwdBlockSeq : PhaseKind::FwdBlockSeq;
+    seq.op_start = first_op;
+    seq.op_end = last_op;
+    seq.label = phase_kind_name(seq.kind);
+    seq.children.reserve(blocks.size());
+
+    // Grow each block's end to meet the next block's start so every op in
+    // [first_op, last_op) belongs to exactly one block (absorbs inter-block
+    // glue ops in hybrid architectures).
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        PhaseNode block;
+        block.kind = is_backward ? PhaseKind::BwdBlock : PhaseKind::FwdBlock;
+        block.block_index = blocks[i].layer_idx;
+        block.op_start = blocks[i].start;
+        block.op_end = (i + 1 < blocks.size()) ? blocks[i + 1].start : blocks[i].end;
+        {
+            std::ostringstream lbl;
+            lbl << phase_kind_name(block.kind) << "[" << block.block_index << "]";
+            block.label = lbl.str();
+        }
+        seq.children.push_back(std::move(block));
+    }
+
+    root.children.push_back(std::move(seq));
+
+    if (last_op < num_ops) {
+        PhaseNode epilogue;
+        epilogue.kind = PhaseKind::Custom;
+        epilogue.op_start = last_op;
+        epilogue.op_end = num_ops;
+        epilogue.label = "Epilogue";
+        root.children.push_back(std::move(epilogue));
+    }
+
+    graph.phase_tree = std::move(root);
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_TREE")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[phase-tree] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name
+                      << "):\n"
+                      << dump_phase_tree(*graph.phase_tree);
+        }
+    }
+}
+
+// ============================================================================
+// Region Derivation
+// ============================================================================
+
+const char* region_kind_name(RegionKind k) {
+    switch (k) {
+        case RegionKind::Unknown: return "Unknown";
+        case RegionKind::FwdStack: return "FwdStack";
+        case RegionKind::BwdStack: return "BwdStack";
+        case RegionKind::SaveForBwd: return "SaveForBwd";
+        case RegionKind::Accumulator: return "Accumulator";
+        case RegionKind::Persistent: return "Persistent";
+        case RegionKind::PersistentActivation: return "PersistentActivation";
+        case RegionKind::Recomputed: return "Recomputed";
+        case RegionKind::GatheredWeight: return "GatheredWeight";
+        case RegionKind::BwdCrossLayer: return "BwdCrossLayer";
+    }
+    return "?";
+}
+
+void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
+    // Map TensorKind (populated by classify_tensors) to a region, consulting
+    // block_layer_idx to distinguish block-scoped from global tensors. M2
+    // intentionally stops at this coarse classification; SaveForBwd detection
+    // (save-list integration) and Recomputed (recompute-plan integration)
+    // arrive in later milestones.
+    for (auto& meta : graph.tensor_meta) {
+        switch (meta.kind) {
+            case TensorKind::ForwardParam: meta.region = RegionKind::Persistent; break;
+            case TensorKind::ForwardActivation:
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::FwdStack : RegionKind::PersistentActivation;
+                break;
+            case TensorKind::ActivationGrad:
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::BwdStack : RegionKind::PersistentActivation;
+                break;
+            case TensorKind::ParamGrad:
+            case TensorKind::AccumTemp: meta.region = RegionKind::Accumulator; break;
+            case TensorKind::LossInput: meta.region = RegionKind::PersistentActivation; break;
+            case TensorKind::Scratch:
+                // Pessimistic default for un-typed intermediates (views,
+                // zeros, constants). Correct when the scratch dies within a
+                // block; M3 will re-verify against last-use spans.
+                meta.region = is_backward ? RegionKind::BwdStack : RegionKind::FwdStack;
+                break;
+            case TensorKind::Unknown:
+                // Includes cross-graph references (e.g., forward activations
+                // read by backward). Left as Unknown for now; save-list
+                // integration in a later milestone will promote these to
+                // SaveForBwd.
+                break;
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
+        if (std::string(env) == "1") {
+            std::array<int, 10> counts{};  // Indexed by RegionKind.
+            for (const auto& meta : graph.tensor_meta) {
+                counts[static_cast<std::size_t>(meta.region)]++;
+            }
+            std::cerr << "[regions] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):";
+            for (std::size_t i = 0; i < counts.size(); ++i) {
+                if (counts[i] > 0) {
+                    std::cerr << " " << region_kind_name(static_cast<RegionKind>(i)) << "=" << counts[i];
+                }
+            }
+            std::cerr << "\n";
+        }
+    }
+}
+
+// ============================================================================
+// Cross-layer FwdStack read promotion
+// ============================================================================
+
+void GraphCompiler::promote_cross_layer_fwd_reads(CompiledGraph& graph) {
+    // Scan forward ops for cross-layer reads: an op in layer L_op that
+    // references a tensor whose `block_layer_idx == L_src` (L_src != L_op)
+    // in a FwdStack region. Without promotion those tids share the same
+    // arena offset across layers, so layer L_op's writes can clobber
+    // layer L_src's bytes before L_op's later ops read them.
+    //
+    // Promotes the source tid to SaveForBwd (per-layer persistent storage).
+    // The reading op's own tid stays in FwdStack because its bytes are
+    // produced and consumed within its own layer.
+    const std::size_t num_layers = graph.layer_start_indices.size();
+    if (num_layers == 0) return;
+
+    auto op_to_layer = [&](std::size_t op_idx) -> int {
+        for (std::size_t L = 0; L < num_layers; ++L) {
+            const std::size_t s = graph.layer_start_indices[L];
+            const std::size_t e = (L < graph.layer_end_indices.size()) ? graph.layer_end_indices[L] : SIZE_MAX;
+            if (s == SIZE_MAX || e == SIZE_MAX) continue;
+            if (op_idx >= s && op_idx < e) return static_cast<int>(L);
+        }
+        return -1;
+    };
+
+    int promoted = 0;
+    std::vector<std::string> promoted_names;
+    for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+        const int op_layer = op_to_layer(i);
+        if (op_layer < 0) continue;
+        for (const auto& ref : graph.ops[i].inputs) {
+            if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= graph.tensor_meta.size()) continue;
+            auto& meta = graph.tensor_meta[static_cast<std::size_t>(ref.tensor_id)];
+            if (meta.block_layer_idx < 0) continue;             // global tensor
+            if (meta.block_layer_idx == op_layer) continue;     // same-layer read
+            if (meta.region != RegionKind::FwdStack) continue;  // already persistent
+            meta.region = RegionKind::SaveForBwd;
+            ++promoted;
+            if (std::getenv("SUROGATE_DEBUG_REGIONS")) {
+                promoted_names.emplace_back(graph.name_for_tensor_id(ref.tensor_id));
+            }
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
+        if (std::string(env) == "1" && promoted > 0) {
+            std::cerr << "[regions] cross-layer fwd promotion (" << graph.name << "): " << promoted
+                      << " tids promoted FwdStack→SaveForBwd";
+            for (const auto& n : promoted_names)
+                std::cerr << " " << n;
+            std::cerr << "\n";
+        }
+    }
+}
+
+// ============================================================================
+// Cross-graph SaveForBwd promotion
+// ============================================================================
+
+void finalize_save_for_bwd(CompiledGraph& fwd,
+                           CompiledGraph& bwd,
+                           std::optional<std::unordered_set<std::string>> save_names,
+                           bool fwd_per_layer_sections) {
+    // Tids are shared across the fwd+bwd pair (reset_tid_namespace contract).
+    const int num_tids = std::max(fwd.num_tensors, bwd.num_tensors);
+    if (num_tids <= 0) return;
+
+    std::vector<char> produced_in_fwd(num_tids, 0);
+    std::vector<char> consumed_in_bwd(num_tids, 0);
+
+    for (const auto& op : fwd.ops) {
+        for (const auto& ref : op.outputs) {
+            if (ref.tensor_id >= 0 && ref.tensor_id < num_tids) {
+                produced_in_fwd[ref.tensor_id] = 1;
+            }
+        }
+    }
+    for (const auto& op : bwd.ops) {
+        for (const auto& ref : op.inputs) {
+            if (ref.tensor_id >= 0 && ref.tensor_id < num_tids) {
+                consumed_in_bwd[ref.tensor_id] = 1;
+            }
+        }
+    }
+
+    auto promote = [](CompiledGraph& g, int tid) {
+        if (tid < 0 || tid >= g.num_tensors) return;
+        auto& meta = g.tensor_meta[static_cast<std::size_t>(tid)];
+        // Only block activations are SaveForBwd candidates. Guard rules out
+        // globals like TokenIDs that are consumed in bwd but stay Persistent.
+        if (!meta.is_blocks()) return;
+        if (meta.region == RegionKind::FwdStack || meta.region == RegionKind::BwdStack) {
+            meta.region = RegionKind::SaveForBwd;
+        }
+    };
+
+    // When save_names is provided, a tid that crosses the fwd→bwd
+    // boundary but is NOT in the runtime save list is satisfied via
+    // Stack residency, recompute, or forward replay — none need a
+    // SaveForBwd slot. Leave those tids in FwdStack/BwdStack. An empty
+    // set promotes nothing (valid in recompute modes). Nullopt disables
+    // filtering entirely (all fwd∧bwd-crossing block activations
+    // promoted, prior behavior). Name lookup uses fwd first (SaveForBwd
+    // sources are fwd activations), then bwd.
+    const bool filter_by_save_names = save_names.has_value();
+    auto in_save_list = [&](int tid) {
+        if (!filter_by_save_names) return true;
+        const auto& set = *save_names;
+        auto name = fwd.name_for_tensor_id(tid);
+        if (!name.empty() && set.count(std::string(name))) return true;
+        name = bwd.name_for_tensor_id(tid);
+        if (!name.empty() && set.count(std::string(name))) return true;
+        return false;
+    };
+
+    int promoted = 0;
+    int skipped_by_save_list = 0;
+    // Pass 1: promote fwd→bwd-crossing tids in save_list to SaveForBwd.
+    for (int tid = 0; tid < num_tids; ++tid) {
+        if (!(produced_in_fwd[tid] && consumed_in_bwd[tid])) continue;
+        if (!in_save_list(tid)) {
+            ++skipped_by_save_list;
+            continue;
+        }
+        promote(fwd, tid);
+        promote(bwd, tid);
+        ++promoted;
+    }
+
+    // Pass 2: flag retain_through_forward on recompute-replay candidates.
+    //
+    // Under recompute (empty/subset save list), block-scope FwdStack tids
+    // that are NOT promoted to SaveForBwd are regenerated by replay and
+    // read by backward — either directly (static bwd graph ref) or
+    // indirectly (LoRA backward hooks, per-slot reads).
+    // Hook-driven consumers don't appear in the bwd graph's ref list, so
+    // `consumed_in_bwd` is a lower bound: fwd→bwd crossers we find there
+    // need retention; other fwd-produced block-scope tids MIGHT also be
+    // hook-read but enumerating hooks at compile time is brittle. Choose
+    // the broader rule — retain every non-promoted block-scope FwdStack
+    // tid — so coloring behaves like the legacy Stack bump allocator
+    // (no within-block aliasing of forward-produced activations).
+    // Narrow the rule to recompute mode: under no-recompute, everything
+    // fwd→bwd-crossing is promoted to SaveForBwd, and ephemeral fwd-only
+    // tids don't need retention — retention there just bloats the arena.
+    //
+    // Detection: recompute mode runs finalize_save_for_bwd with an empty
+    // save name set (the call site at compile_graphs passes save_name_set
+    // unconditionally with fewer entries under recompute). Empty-set is
+    // the clean signal; save_names.empty() after the promotion pass.
+    int retained_through_fwd = 0;
+    const bool recompute_mode = filter_by_save_names && save_names && save_names->empty();
+    // Apply retain_through_forward to every block-scope FwdStack tid in two
+    // cases: (1) recompute_mode (empty save list + replay regenerates) — the
+    // original rule; (2) fwd_per_layer_sections (no-recompute) — per-layer
+    // sectioning stops cross-layer clobber, but within-layer coloring still
+    // reuses bytes for disjoint-lifetime tids. Under no-recompute,
+    // save_tensors runs after forward and captures per-slot arena
+    // pointers; if coloring reused those bytes mid-forward, the saved
+    // snapshot is the LATER tid's data, not the slot's. retain_through_forward
+    // extends live ranges to frame end so coloring cannot reuse.
+    if (recompute_mode || fwd_per_layer_sections) {
+        for (auto& meta : fwd.tensor_meta) {
+            if (!meta.is_blocks()) continue;
+            if (meta.region != RegionKind::FwdStack) continue;
+            if (!meta.retain_through_forward) {
+                meta.retain_through_forward = true;
+                ++retained_through_fwd;
+            }
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[regions] SaveForBwd promotion: " << promoted << " tids";
+            if (filter_by_save_names) {
+                std::cerr << " (skipped " << skipped_by_save_list << " not in save list, "
+                          << "retain_through_forward=" << retained_through_fwd << ")";
+            }
+            std::cerr << "\n";
+        }
+    }
+
+    // Re-run layout now that regions are finalized. The first pass in
+    // compile() baked offsets under stale regions (SaveForBwd candidates sat
+    // in FwdStack / BwdStack frames); re-running fixes them. Same path
+    // handles retain_through_forward tids — compute_layout consults the
+    // flag to extend their LayoutInfo.last_use.
+    if (promoted > 0 || retained_through_fwd > 0) {
+        for (auto& m : fwd.tensor_meta)
+            m.offset = SIZE_MAX;
+        for (auto& m : bwd.tensor_meta)
+            m.offset = SIZE_MAX;
+        compute_layout(fwd, /*is_backward=*/false, fwd_per_layer_sections);
+        compute_layout(bwd, /*is_backward=*/true, fwd_per_layer_sections);
+    }
+}
+
+// ============================================================================
+// Instruction Stream — emit from phase tree
+// ============================================================================
+
+const char* inst_kind_name(InstKind k) {
+    switch (k) {
+        case InstKind::PhaseEnter: return "PhaseEnter";
+        case InstKind::PhaseExit: return "PhaseExit";
+        case InstKind::SegmentDispatch: return "SegmentDispatch";
+        case InstKind::PruneByLastUse: return "PruneByLastUse";
+        case InstKind::RecomputeBlock: return "RecomputeBlock";
+    }
+    return "?";
+}
+
+namespace {
+
+void emit_phase(std::vector<Instruction>& out, const PhaseNode& node) {
+    out.push_back({InstKind::PhaseEnter, node.kind, node.block_index, node.op_start, node.op_end, false});
+
+    // Emit RecomputeBlock inside BwdBlock leaves so the forward-replay
+    // dispatch is explicit rather than inlined in PhaseEnter. Always
+    // emitted; the interpreter no-ops when mRecomputeEnabled is false.
+    if (node.kind == PhaseKind::BwdBlock && node.block_index >= 0) {
+        out.push_back({InstKind::RecomputeBlock, node.kind, node.block_index, node.op_start, node.op_end, false});
+    }
+
+    if (node.children.empty()) {
+        // Leaf phase: the ops in [op_start, op_end) are executed here. For M4
+        // we emit a single synthetic graph-captured segment; a later milestone
+        // will subdivide per CompiledGraph::layer_segments (split-attention
+        // mode around FlashAttention / capture-unsafe ops).
+        if (node.op_end > node.op_start) {
+            out.push_back({InstKind::SegmentDispatch, node.kind, node.block_index, node.op_start, node.op_end, false});
+            out.push_back({InstKind::PruneByLastUse, node.kind, node.block_index, node.op_start, node.op_end, false});
+        }
+    } else {
+        for (const auto& child : node.children) {
+            emit_phase(out, child);
+        }
+    }
+
+    out.push_back({InstKind::PhaseExit, node.kind, node.block_index, node.op_start, node.op_end, false});
+}
+
+}  // namespace
+
+std::string dump_instruction_stream(const std::vector<Instruction>& stream) {
+    std::ostringstream os;
+    int depth = 0;
+    for (const auto& inst : stream) {
+        if (inst.kind == InstKind::PhaseExit && depth > 0) --depth;
+        for (int i = 0; i < depth; ++i)
+            os << "  ";
+        os << inst_kind_name(inst.kind);
+        if (inst.kind == InstKind::PhaseEnter || inst.kind == InstKind::PhaseExit) {
+            os << " " << phase_kind_name(inst.phase_kind);
+            if (inst.block_index >= 0) os << "[" << inst.block_index << "]";
+        } else if (inst.kind == InstKind::RecomputeBlock) {
+            os << " block=" << inst.block_index;
+        } else {
+            os << " ops=[" << inst.op_start << ".." << inst.op_end << ")";
+            if (inst.kind == InstKind::SegmentDispatch) {
+                os << " mode=" << (inst.eager ? "eager" : "graph");
+            }
+        }
+        os << "\n";
+        if (inst.kind == InstKind::PhaseEnter) ++depth;
+    }
+    return os.str();
+}
+
+std::string validate_instruction_stream(const std::vector<Instruction>& stream, std::size_t num_ops) {
+    std::ostringstream errs;
+
+    // 1) Phase nesting: stack-tracked; each PhaseExit must match the
+    // most-recent PhaseEnter by kind + block_index.
+    std::vector<Instruction> nesting;
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        const auto& inst = stream[i];
+        if (inst.kind == InstKind::PhaseEnter) {
+            nesting.push_back(inst);
+        } else if (inst.kind == InstKind::PhaseExit) {
+            if (nesting.empty()) {
+                errs << "  unmatched PhaseExit at index " << i << "\n";
+                continue;
+            }
+            const auto& top = nesting.back();
+            if (top.phase_kind != inst.phase_kind || top.block_index != inst.block_index) {
+                errs << "  PhaseExit at " << i << " does not match enclosing PhaseEnter "
+                     << phase_kind_name(top.phase_kind) << "[" << top.block_index << "]\n";
+            }
+            nesting.pop_back();
+        }
+    }
+    if (!nesting.empty()) {
+        errs << "  " << nesting.size() << " unclosed PhaseEnter(s)\n";
+    }
+
+    // 2) SegmentDispatch coverage: exactly one per op.
+    std::vector<char> covered(num_ops, 0);
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        const auto& inst = stream[i];
+        if (inst.kind != InstKind::SegmentDispatch) continue;
+        if (inst.op_start > inst.op_end || inst.op_end > num_ops) {
+            errs << "  SegmentDispatch at " << i << " has invalid range [" << inst.op_start << ".." << inst.op_end
+                 << ")\n";
+            continue;
+        }
+        for (std::size_t op = inst.op_start; op < inst.op_end; ++op) {
+            if (covered[op]) {
+                errs << "  op " << op << " covered by multiple SegmentDispatches (second at " << i << ")\n";
+                break;  // report once per instruction
+            }
+            covered[op] = 1;
+        }
+    }
+    std::size_t uncovered = 0;
+    for (char c : covered) {
+        if (!c) ++uncovered;
+    }
+    if (uncovered > 0) {
+        errs << "  " << uncovered << " op(s) not covered by any SegmentDispatch\n";
+    }
+
+    // 3) PruneByLastUse ranges must be disjoint.
+    std::vector<char> pruned(num_ops, 0);
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        const auto& inst = stream[i];
+        if (inst.kind != InstKind::PruneByLastUse) continue;
+        if (inst.op_start > inst.op_end || inst.op_end > num_ops) continue;
+        for (std::size_t op = inst.op_start; op < inst.op_end; ++op) {
+            if (pruned[op]) {
+                errs << "  op " << op << " pruned by multiple PruneByLastUse ranges (second at " << i << ")\n";
+                break;
+            }
+            pruned[op] = 1;
+        }
+    }
+
+    return errs.str();
+}
+
+void GraphCompiler::emit_instruction_stream(CompiledGraph& graph) {
+    graph.instruction_stream.clear();
+    if (!graph.phase_tree.has_value()) return;
+    emit_phase(graph.instruction_stream, *graph.phase_tree);
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_INSTR_STREAM")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[instr-stream] (" << graph.name << "):\n"
+                      << dump_instruction_stream(graph.instruction_stream);
+            const std::string errs = validate_instruction_stream(graph.instruction_stream, graph.ops.size());
+            if (errs.empty()) {
+                std::cerr << "[instr-stream] validator: OK (" << graph.instruction_stream.size()
+                          << " instructions over " << graph.ops.size() << " ops)\n";
+            } else {
+                std::cerr << "[instr-stream] validator: ERRORS\n" << errs;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Shadow-mode Layout (design/buffer-runtime-v4.md, M3)
+// ============================================================================
+
+namespace {
+
+struct LayoutInfo {
+    std::size_t bytes = 0;
+    std::size_t first_use = SIZE_MAX;
+    std::size_t last_use = 0;
+    bool live = false;  ///< Produced or consumed by an op in this graph
+};
+
+std::size_t bytes_for_ref(const TensorRef& ref) {
+    if (ref.shape.empty()) return 0;
+    std::size_t elems = 1;
+    for (long d : ref.shape) {
+        if (d <= 0) return 0;  // unresolved / placeholder
+        elems *= static_cast<std::size_t>(d);
+    }
+    return elems * static_cast<std::size_t>(get_dtype_size(ref.dtype));
+}
+
+/// Max-clique-sum over a frame's tids: at each op index, sum bytes of tids
+/// whose lifetime covers that index. For 1D interval graphs this IS the
+/// optimal peak achievable by any coloring.
+std::size_t frame_optimal_peak(const std::vector<int>& tids,
+                               const std::vector<LayoutInfo>& info,
+                               std::size_t frame_first,
+                               std::size_t frame_last) {
+    if (tids.empty() || frame_last < frame_first) return 0;
+    std::size_t peak = 0;
+    for (std::size_t t = frame_first; t <= frame_last; ++t) {
+        std::size_t live = 0;
+        for (int tid : tids) {
+            const auto& ti = info[static_cast<std::size_t>(tid)];
+            if (ti.first_use <= t && t <= ti.last_use) {
+                live += ti.bytes;
+            }
+        }
+        peak = std::max(peak, live);
+    }
+    return peak;
+}
+
+/// First-fit-by-offset greedy for 1D-interval coloring. Returns per-tid
+/// frame-local byte offsets; sets peak_out to the bytes consumed. Non-optimal
+/// but correct (no two live tensors share bytes) and close to the max-clique
+/// peak for typical transformer-block activation patterns.
+std::vector<std::size_t>
+color_frame(const std::vector<int>& tids, const std::vector<LayoutInfo>& info, std::size_t& peak_out) {
+    std::vector<std::size_t> offsets(tids.size(), SIZE_MAX);
+    if (tids.empty()) {
+        peak_out = 0;
+        return offsets;
+    }
+
+    std::vector<std::size_t> order(tids.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        const auto& ia = info[static_cast<std::size_t>(tids[a])];
+        const auto& ib = info[static_cast<std::size_t>(tids[b])];
+        if (ia.first_use != ib.first_use) return ia.first_use < ib.first_use;
+        return ia.bytes > ib.bytes;  // prefer larger tensors first at same first_use
+    });
+
+    struct Slot {
+        std::size_t off, size, last;
+    };
+    std::vector<Slot> live;
+    std::size_t peak = 0;
+
+    for (std::size_t idx : order) {
+        const auto& ti = info[static_cast<std::size_t>(tids[idx])];
+
+        // Expire slots freed strictly before ti.first_use.
+        live.erase(std::remove_if(live.begin(), live.end(), [&](const Slot& s) { return s.last < ti.first_use; }),
+                   live.end());
+
+        std::sort(live.begin(), live.end(), [](const Slot& a, const Slot& b) { return a.off < b.off; });
+
+        // Find smallest gap of size >= ti.bytes.
+        std::size_t off = 0;
+        for (const auto& s : live) {
+            if (off + ti.bytes <= s.off) break;
+            off = std::max(off, s.off + s.size);
+        }
+
+        offsets[idx] = off;
+        live.push_back({off, ti.bytes, ti.last_use});
+        peak = std::max(peak, off + ti.bytes);
+    }
+
+    peak_out = peak;
+    return offsets;
+}
+
+/// FNV-1a 64-bit. Mixed in a stable, platform-independent way so all ranks
+/// produce the same hash for the same graph — prerequisite for the
+/// cross-rank layout determinism assertion in design/buffer-runtime-v4.md.
+constexpr std::uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
+constexpr std::uint64_t kFnvPrime = 0x100000001b3ULL;
+
+std::uint64_t fnv1a_mix(std::uint64_t h, std::uint64_t v) {
+    // Little-endian byte order so the hash is portable across ranks.
+    for (int i = 0; i < 8; ++i) {
+        h ^= static_cast<std::uint64_t>((v >> (i * 8)) & 0xff);
+        h *= kFnvPrime;
+    }
+    return h;
+}
+
+std::string fmt_bytes(std::size_t b) {
+    std::ostringstream os;
+    if (b >= (1ULL << 30)) {
+        os << (b / double(1ULL << 30)) << "GB";
+    } else if (b >= (1ULL << 20)) {
+        os << (b / double(1ULL << 20)) << "MB";
+    } else if (b >= (1ULL << 10)) {
+        os << (b / double(1ULL << 10)) << "KB";
+    } else {
+        os << b << "B";
+    }
+    return os.str();
+}
+
+}  // namespace
+
+std::uint64_t compute_layout_hash(const CompiledGraph& graph) {
+    std::uint64_t h = kFnvOffset;
+    // Per-tid (region, block_layer_idx, offset, bytes) quadruple. Tids are
+    // indexed positionally and assigned deterministically by the compiler,
+    // so iterating in order is rank-identical.
+    for (const auto& meta : graph.tensor_meta) {
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.region));
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.block_layer_idx + 1));
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.offset));
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(meta.bytes));
+    }
+    // Per-region peaks: any drift here shows up even if tid sets happened to
+    // match (unlikely but cheap to guard against).
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.persistent_bytes));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.persistent_activation_bytes));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.accumulator_bytes));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.fwd_stack_peak));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.bwd_stack_peak));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.save_for_bwd_bytes));
+    for (std::size_t b : graph.save_for_bwd_block_bytes) {
+        h = fnv1a_mix(h, static_cast<std::uint64_t>(b));
+    }
+    return h;
+}
+
+void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_sections) {
+    const std::size_t num_tids = static_cast<std::size_t>(graph.num_tensors);
+    std::vector<LayoutInfo> info(num_tids);
+
+    for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+        const auto& op = graph.ops[i];
+        auto visit = [&](const TensorRef& ref) {
+            if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
+            auto& ti = info[static_cast<std::size_t>(ref.tensor_id)];
+            ti.first_use = std::min(ti.first_use, i);
+            ti.last_use = std::max(ti.last_use, i);
+            ti.live = true;
+            // Take max over refs. A tid can be referenced via views of
+            // different rank and — more importantly — via refs that
+            // resolved to different dtypes. The forward output of an op
+            // whose compile-time ref is left at the default BF16 dtype
+            // followed by a backward-graph ref whose resolution correctly
+            // sets FP32 must size the physical buffer to the larger of
+            // the two, otherwise the arena slice is half the size the
+            // kernel actually writes and the tail overflows into the
+            // next slot.
+            ti.bytes = std::max(ti.bytes, bytes_for_ref(ref));
+        };
+        for (const auto& ref : op.inputs)
+            visit(ref);
+        for (const auto& ref : op.outputs)
+            visit(ref);
+    }
+
+    // Extend live ranges for tids flagged retain_through_forward by
+    // finalize_save_for_bwd — these are backward-read forward activations
+    // that recompute regenerates via replay. Their arena bytes must stay
+    // exclusive through the full forward op range so later-forward-op
+    // outputs can't clobber them. (Legacy Stack bump allocator does this
+    // automatically; arena coloring needs the extension.)
+    if (!graph.ops.empty()) {
+        const std::size_t frame_end = graph.ops.size() - 1;
+        for (std::size_t tid = 0; tid < num_tids; ++tid) {
+            if (!info[tid].live) continue;
+            if (!graph.tensor_meta[tid].retain_through_forward) continue;
+            info[tid].last_use = std::max(info[tid].last_use, frame_end);
+        }
+    }
+
+    // Mirror the sizes onto TensorMeta so later passes (coverage validator,
+    // eventual interpreter) don't need LayoutInfo.
+    for (std::size_t tid = 0; tid < num_tids; ++tid) {
+        graph.tensor_meta[tid].bytes = info[tid].bytes;
+    }
+
+    const std::size_t num_layers = graph.layer_start_indices.size();
+
+    // Bucket live tids by (region, block). SaveForBwd is treated per-block
+    // (each block has its own persistent slot); FwdStack / BwdStack coloring
+    // is per-frame (frames don't coexist, so offsets are frame-local).
+    std::vector<int> persistent_tids;
+    std::vector<int> persistent_activation_tids;
+    std::vector<int> accumulator_tids;
+    std::vector<std::vector<int>> fwd_frame(num_layers);
+    std::vector<std::vector<int>> bwd_frame(num_layers);
+    std::vector<std::vector<int>> save_for_bwd(num_layers);
+
+    for (std::size_t tid = 0; tid < num_tids; ++tid) {
+        const auto& meta = graph.tensor_meta[tid];
+        const auto& ti = info[tid];
+        if (!ti.live || ti.bytes == 0) continue;
+        auto block_bucket = [&](std::vector<std::vector<int>>& buckets) {
+            if (meta.block_layer_idx >= 0 && static_cast<std::size_t>(meta.block_layer_idx) < num_layers) {
+                buckets[static_cast<std::size_t>(meta.block_layer_idx)].push_back(static_cast<int>(tid));
+            }
+        };
+        switch (meta.region) {
+            case RegionKind::Persistent: persistent_tids.push_back(static_cast<int>(tid)); break;
+            case RegionKind::PersistentActivation: persistent_activation_tids.push_back(static_cast<int>(tid)); break;
+            case RegionKind::Accumulator: accumulator_tids.push_back(static_cast<int>(tid)); break;
+            case RegionKind::FwdStack: block_bucket(fwd_frame); break;
+            case RegionKind::BwdStack: block_bucket(bwd_frame); break;
+            case RegionKind::SaveForBwd: block_bucket(save_for_bwd); break;
+            default: break;
+        }
+    }
+
+    // Build tid → (slot, layer_idx) map so coloring can collapse aliased
+    // views (e.g., blocks[L].swiglu + blocks[L].swiglu_flat share
+    // TensorSlot::BlockSwiGLU). Runtime resolves all such refs through one
+    // arena offset per slot, so the coloring must treat them as a single
+    // allocation or arena consumption will corrupt.
+    auto is_block_scope_slot = [](TensorSlot s) {
+        switch (s) {
+            case TensorSlot::Mapped:
+            case TensorSlot::Parameter:
+            case TensorSlot::Saved:
+            case TensorSlot::TokenIDs:
+            case TensorSlot::PositionIDs:
+            case TensorSlot::Targets:
+            case TensorSlot::Losses:
+            case TensorSlot::DLoss:
+            case TensorSlot::Encoded:
+            case TensorSlot::LNFinal:
+            case TensorSlot::LNFinalRSTD:
+            case TensorSlot::FinalResidual:
+            case TensorSlot::FreqCis: return false;
+            default: return true;
+        }
+    };
+    struct TidSlotInfo {
+        TensorSlot slot = TensorSlot::Mapped;
+        int layer_idx = -1;
+        bool set = false;
+    };
+    std::vector<TidSlotInfo> tid_slot(num_tids);
+    auto record_ref = [&](const TensorRef& ref, bool is_output) {
+        if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
+        auto& rec = tid_slot[static_cast<std::size_t>(ref.tensor_id)];
+        if (!rec.set || (is_output && is_block_scope_slot(ref.slot))) {
+            rec.slot = ref.slot;
+            rec.layer_idx = ref.layer_idx;
+            rec.set = true;
+        }
+    };
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.outputs)
+            record_ref(ref, true);
+        for (const auto& ref : op.inputs)
+            record_ref(ref, false);
+    }
+
+    // Collapse slot-aliased tids within each FwdStack/BwdStack frame into
+    // coloring groups. Each group contributes ONE entry to the coloring
+    // input — its representative tid — with bytes = max across members
+    // and live range = union across members. The resulting offset is
+    // propagated to every member after coloring.
+    struct AliasGroup {
+        int representative_tid = -1;
+        std::vector<int> member_tids;  // includes representative
+    };
+    auto collapse_frame_aliases = [&](std::vector<std::vector<int>>& frames) -> std::vector<std::vector<AliasGroup>> {
+        std::vector<std::vector<AliasGroup>> per_layer_groups(frames.size());
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            auto& tids = frames[L];
+            std::unordered_map<int, std::size_t> slot_to_group_idx;
+            std::vector<AliasGroup>& groups = per_layer_groups[L];
+            std::vector<int> collapsed_tids;
+            for (int tid : tids) {
+                const auto& rec = tid_slot[static_cast<std::size_t>(tid)];
+                if (rec.set && is_block_scope_slot(rec.slot) && rec.layer_idx == static_cast<int>(L)) {
+                    const int key = static_cast<int>(rec.slot);
+                    auto it = slot_to_group_idx.find(key);
+                    if (it == slot_to_group_idx.end()) {
+                        slot_to_group_idx[key] = groups.size();
+                        AliasGroup g;
+                        g.representative_tid = tid;
+                        g.member_tids.push_back(tid);
+                        groups.push_back(std::move(g));
+                        collapsed_tids.push_back(tid);
+                    } else {
+                        groups[it->second].member_tids.push_back(tid);
+                    }
+                } else {
+                    // Not slot-aliased — keep as a one-tid "group" so the
+                    // post-coloring propagation loop is uniform.
+                    AliasGroup g;
+                    g.representative_tid = tid;
+                    g.member_tids.push_back(tid);
+                    groups.push_back(std::move(g));
+                    collapsed_tids.push_back(tid);
+                }
+            }
+            tids = std::move(collapsed_tids);
+            // Update the representative's coloring info to reflect the union
+            // of member live ranges and max bytes.
+            for (auto& g : groups) {
+                if (g.member_tids.size() <= 1) continue;
+                auto& rep_info = info[static_cast<std::size_t>(g.representative_tid)];
+                for (int member : g.member_tids) {
+                    if (member == g.representative_tid) continue;
+                    const auto& mi = info[static_cast<std::size_t>(member)];
+                    rep_info.first_use = std::min(rep_info.first_use, mi.first_use);
+                    rep_info.last_use = std::max(rep_info.last_use, mi.last_use);
+                    rep_info.bytes = std::max(rep_info.bytes, mi.bytes);
+                }
+                // Keep bytes on tensor_meta in sync with the union size —
+                // downstream readers use meta.bytes for arena sizing.
+                graph.tensor_meta[static_cast<std::size_t>(g.representative_tid)].bytes = rep_info.bytes;
+            }
+        }
+        return per_layer_groups;
+    };
+    auto fwd_alias_groups = collapse_frame_aliases(fwd_frame);
+    auto bwd_alias_groups = collapse_frame_aliases(bwd_frame);
+
+    // Bump: sort by tid for deterministic ordering across ranks.
+    auto bump_sort = [](std::vector<int>& tids) {
+        std::sort(tids.begin(), tids.end());
+    };
+    bump_sort(persistent_tids);
+    bump_sort(persistent_activation_tids);
+    bump_sort(accumulator_tids);
+    for (auto& v : save_for_bwd)
+        bump_sort(v);
+
+    // Align each bump-allocated offset to `kBumpAlignment`. Without this,
+    // a tensor with `bytes` not divisible by the alignment leaves the
+    // cursor at a fractional offset and every subsequent tensor is
+    // misaligned. cuBLASLt (BF16 tensor-core matmul) and vectorized init
+    // kernels (fill_normal float4/bf16x4) both require >=16-byte aligned
+    // pointers. Gemma4's per-layer `layer_scalar` is 2 bytes (bf16
+    // scalar), so without this, every weight after block[0].layer_scalar
+    // is placed at a misaligned offset in the Persistent arena.
+    constexpr std::size_t kBumpAlignment = 16;
+    auto align_up = [](std::size_t n, std::size_t a) {
+        return (n + a - 1) & ~(a - 1);
+    };
+    auto bump_assign = [&](const std::vector<int>& tids) -> std::size_t {
+        std::size_t offset = 0;
+        for (int tid : tids) {
+            graph.tensor_meta[static_cast<std::size_t>(tid)].offset = offset;
+            offset = align_up(offset + info[static_cast<std::size_t>(tid)].bytes, kBumpAlignment);
+        }
+        return offset;
+    };
+
+    const std::size_t persistent_bytes = bump_assign(persistent_tids);
+    const std::size_t persistent_activation_bytes = bump_assign(persistent_activation_tids);
+    const std::size_t accumulator_bytes = bump_assign(accumulator_tids);
+    std::size_t save_for_bwd_bytes = 0;
+    std::vector<std::size_t> save_for_bwd_block_bytes(num_layers, 0);
+    for (std::size_t L = 0; L < num_layers; ++L) {
+        const std::size_t block_sz = bump_assign(save_for_bwd[L]);
+        save_for_bwd_block_bytes[L] = block_sz;
+        save_for_bwd_bytes += block_sz;
+    }
+
+    // Per-frame coloring with optional per-layer sectioning.
+    //
+    // Under `section_per_layer`, each layer gets its own
+    // [L*peak, (L+1)*peak) slice of the arena, so every (L, SLOT) pair
+    // resolves to a distinct address. This is the correctness
+    // requirement for FwdStack under recompute: replay of layer K
+    // regenerates layer K's activations to the arena, and subsequent
+    // backward ops for layer K read them. If two layers shared arena bytes,
+    // an interleaved backward op that reads layer K's activation after
+    // another layer's replay had overwritten the shared bytes would get
+    // stale data. Legacy Stack avoided this via per-layer checkpoints.
+    //
+    // Without sectioning, frames share arena bytes (nested-stack
+    // semantics — frames don't coexist). BwdStack is a per-layer scratch
+    // that the layer-sequential backward dispatch frees before moving to
+    // the next layer, so sharing across layers is safe.
+    //
+    // Memory cost of sectioning: num_layers × peak_per_frame. Within a
+    // layer's section, different slots still share bytes when their live
+    // ranges are disjoint (per-frame coloring preserved).
+    auto color_frames = [&](const std::vector<std::vector<int>>& frames,
+                            const std::vector<std::vector<AliasGroup>>& alias_groups,
+                            bool section_per_layer) -> std::pair<std::size_t, std::size_t> {
+        std::size_t naive_max = 0;
+        std::size_t coloring_per_frame_peak = 0;
+        std::vector<std::size_t> per_layer_peak(frames.size(), 0);
+        std::vector<std::vector<std::size_t>> per_layer_offsets(frames.size());
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            const auto& tids = frames[L];
+            std::size_t naive = 0;
+            for (int tid : tids)
+                naive += info[static_cast<std::size_t>(tid)].bytes;
+            naive_max = std::max(naive_max, naive);
+
+            std::size_t peak = 0;
+            per_layer_offsets[L] = color_frame(tids, info, peak);
+            per_layer_peak[L] = peak;
+            coloring_per_frame_peak = std::max(coloring_per_frame_peak, peak);
+        }
+        const std::size_t stride = section_per_layer ? coloring_per_frame_peak : 0;
+        std::size_t total_bytes = section_per_layer ? 0 : coloring_per_frame_peak;
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            const auto& tids = frames[L];
+            const std::size_t base = section_per_layer ? L * stride : 0;
+            for (std::size_t i = 0; i < tids.size(); ++i) {
+                graph.tensor_meta[static_cast<std::size_t>(tids[i])].offset = base + per_layer_offsets[L][i];
+            }
+            if (L < alias_groups.size()) {
+                for (const auto& g : alias_groups[L]) {
+                    if (g.member_tids.size() <= 1) continue;
+                    const std::size_t rep_off =
+                        graph.tensor_meta[static_cast<std::size_t>(g.representative_tid)].offset;
+                    for (int member : g.member_tids) {
+                        if (member == g.representative_tid) continue;
+                        graph.tensor_meta[static_cast<std::size_t>(member)].offset = rep_off;
+                        graph.tensor_meta[static_cast<std::size_t>(member)].bytes =
+                            graph.tensor_meta[static_cast<std::size_t>(g.representative_tid)].bytes;
+                    }
+                }
+            }
+            if (section_per_layer) {
+                total_bytes = std::max(total_bytes, base + per_layer_peak[L]);
+            }
+        }
+        return {naive_max, total_bytes};
+    };
+
+    // FwdStack and BwdStack: per-frame coloring, single shared arena per
+    // region. Matches design/buffer-runtime-v4.md §Region vocabulary:
+    // FwdStack is a nested phase scope re-entered fresh per block;
+    // recompute's `Recomputed[i]` lands in the same arena just-in-time
+    // during BwdBlock[i] replay. Peak = max over layers, not sum.
+    //
+    // Correctness prerequisite: replay_layer_forward must iterate ops
+    // with a half-open [start, end) range so it doesn't execute layer
+    // L+1's first op (qwen3's deferred-residual fused_residual_rmsnorm
+    // computes layer L+1's LN1 from layer L's residual and MLP-down
+    // outputs) as part of layer L's replay. Under shared arena, that
+    // extra op overwrote layer L's just-replayed LN1 before layer L's
+    // backward ops read it. See the `idx < end` bound in
+    // compiled_ops_execute.cpp.
+    auto [fwd_naive, fwd_colored] =
+        color_frames(fwd_frame, fwd_alias_groups, /*section_per_layer=*/(fwd_per_layer_sections && !is_backward));
+    auto [bwd_naive, bwd_colored] = color_frames(bwd_frame, bwd_alias_groups, /*section_per_layer=*/false);
+
+    // Expose peaks for compute_arena_sizes.
+    graph.persistent_bytes = persistent_bytes;
+    graph.persistent_activation_bytes = persistent_activation_bytes;
+    graph.accumulator_bytes = accumulator_bytes;
+    graph.fwd_stack_peak = fwd_colored;
+    graph.bwd_stack_peak = bwd_colored;
+    graph.save_for_bwd_bytes = save_for_bwd_bytes;
+    graph.save_for_bwd_block_bytes = std::move(save_for_bwd_block_bytes);
+
+    // Compute optimal peak per frame (max-clique-sum) for comparison vs our
+    // first-fit-by-offset coloring. Reports how close the greedy is to the
+    // theoretical bound.
+    auto frame_optimal = [&](const std::vector<std::vector<int>>& frames) -> std::size_t {
+        std::size_t best = 0;
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            const auto s = graph.layer_start_indices[L];
+            const auto e = graph.layer_end_indices[L];
+            if (s == SIZE_MAX || e == SIZE_MAX || s >= e) continue;
+            best = std::max(best, frame_optimal_peak(frames[L], info, s, e - 1));
+        }
+        return best;
+    };
+    const std::size_t fwd_optimal = frame_optimal(fwd_frame);
+    const std::size_t bwd_optimal = frame_optimal(bwd_frame);
+
+    // Liveness validator. Per-frame coloring packs multiple tids into the
+    // same arena bytes when their live ranges are disjoint — safe by
+    // construction, unsafe if liveness analysis missed a producer/consumer
+    // edge. Walks every frame; for each pair of tids whose
+    // [offset, offset+bytes) intervals overlap, asserts their
+    // [first_use, last_use] intervals are disjoint. Any violation is a
+    // compile-time bug that would corrupt memory at arena consumption time.
+    std::size_t coloring_violations = 0;
+    auto check_frame = [&](const std::vector<std::vector<int>>& frames, const char* where) {
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            const auto& tids = frames[L];
+            for (std::size_t i = 0; i < tids.size(); ++i) {
+                const auto& mi = graph.tensor_meta[static_cast<std::size_t>(tids[i])];
+                const auto& ti = info[static_cast<std::size_t>(tids[i])];
+                for (std::size_t j = i + 1; j < tids.size(); ++j) {
+                    const auto& mj = graph.tensor_meta[static_cast<std::size_t>(tids[j])];
+                    const auto& tj = info[static_cast<std::size_t>(tids[j])];
+                    const std::size_t ai_end = mi.offset + mi.bytes;
+                    const std::size_t aj_end = mj.offset + mj.bytes;
+                    // Bytes ranges disjoint?
+                    if (ai_end <= mj.offset || aj_end <= mi.offset) continue;
+                    // Bytes overlap: live ranges must be disjoint.
+                    const bool lives_disjoint = ti.last_use < tj.first_use || tj.last_use < ti.first_use;
+                    if (lives_disjoint) continue;
+                    ++coloring_violations;
+                    std::cerr << "[coloring-violation] " << where << " L=" << L << " tid=" << tids[i]
+                              << " name=" << graph.name_for_tensor_id(tids[i]) << " [off=" << mi.offset
+                              << ",bytes=" << mi.bytes << ",live=" << ti.first_use << ".." << ti.last_use << "]"
+                              << " vs tid=" << tids[j] << " name=" << graph.name_for_tensor_id(tids[j])
+                              << " [off=" << mj.offset << ",bytes=" << mj.bytes << ",live=" << tj.first_use << ".."
+                              << tj.last_use << "] — bytes overlap AND live ranges overlap\n";
+                }
+            }
+        }
+    };
+    // Slot-aliasing validator. The coloring collapse above should have made
+    // every (layer, block-scope slot) group share one offset — this check
+    // confirms and catches regressions.
+    std::size_t alias_offset_splits = 0;
+    auto check_slot_aliases = [&](const std::vector<std::vector<int>>& frames, const char* where) {
+        for (std::size_t L = 0; L < frames.size(); ++L) {
+            // Group this layer's FwdStack/BwdStack tids by their block-scope slot.
+            std::unordered_map<int, std::vector<int>> by_slot;  // key = int(TensorSlot)
+            for (int tid : frames[L]) {
+                const auto& rec = tid_slot[static_cast<std::size_t>(tid)];
+                if (!rec.set) continue;
+                if (!is_block_scope_slot(rec.slot)) continue;
+                if (rec.layer_idx != static_cast<int>(L)) continue;
+                by_slot[static_cast<int>(rec.slot)].push_back(tid);
+            }
+            for (auto& [slot_int, group] : by_slot) {
+                if (group.size() < 2) continue;
+                const auto& first_meta = graph.tensor_meta[static_cast<std::size_t>(group.front())];
+                for (std::size_t i = 1; i < group.size(); ++i) {
+                    const auto& mi = graph.tensor_meta[static_cast<std::size_t>(group[i])];
+                    if (mi.offset != first_meta.offset) {
+                        ++alias_offset_splits;
+                        std::cerr << "[coloring-alias-split] " << where << " L=" << L << " slot=" << slot_int
+                                  << " tid=" << group.front() << "(" << graph.name_for_tensor_id(group.front())
+                                  << ",off=" << first_meta.offset << ") vs tid=" << group[i] << "("
+                                  << graph.name_for_tensor_id(group[i]) << ",off=" << mi.offset
+                                  << ") — runtime slot-aliased but compile-time offsets differ\n";
+                    }
+                }
+            }
+        }
+    };
+    // Cross-frame coloring validator. Under shared-arena forward mode
+    // (`section_per_layer=false`, enabled when recompute is on), different
+    // layer frames share the same FwdStack offset space. Same-slot sharing
+    // across layers is INTENTIONAL under recompute: layer L's forward
+    // tensors are regenerated by backward replay, not kept live in the
+    // arena past layer L's execution. The only unsafe case is a tid whose
+    // RAW consumers extend past its producing layer — a genuine cross-layer
+    // forward read (Gemma4 shared-KV's `kv_source = blocks[L_src].qkv_rope`
+    // is the canonical example). retain_through_forward inflates every
+    // FwdStack tid's last_use to frame-end for save-snapshot correctness, so
+    // the raw op-scan last_use has to be recomputed here to distinguish true
+    // cross-layer readers from retention artifacts.
+    std::size_t cross_frame_violations = 0;
+    std::ostringstream cross_frame_diag;
+    if (!is_backward) {
+        // Raw live ranges derived from ops only — no retain_through_forward
+        // extension. Only these expose genuine cross-layer forward reads.
+        std::vector<std::size_t> raw_first(num_tids, SIZE_MAX);
+        std::vector<std::size_t> raw_last(num_tids, 0);
+        std::vector<char> raw_live(num_tids, 0);
+        for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+            const auto& op = graph.ops[i];
+            auto visit = [&](const TensorRef& ref) {
+                if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
+                const std::size_t tid = static_cast<std::size_t>(ref.tensor_id);
+                raw_first[tid] = std::min(raw_first[tid], i);
+                raw_last[tid] = std::max(raw_last[tid], i);
+                raw_live[tid] = 1;
+            };
+            for (const auto& ref : op.inputs)
+                visit(ref);
+            for (const auto& ref : op.outputs)
+                visit(ref);
+        }
+
+        // Flag tids whose raw consumers span past the producing layer — true
+        // cross-layer forward readers. Only these need cross-frame coloring
+        // protection. Everything else participates in the legitimate
+        // retain-through-forward + same-slot cross-layer reuse pattern.
+        std::vector<char> is_cross_reader(num_tids, 0);
+        for (std::size_t tid = 0; tid < num_tids; ++tid) {
+            if (!raw_live[tid]) continue;
+            const auto& meta = graph.tensor_meta[tid];
+            if (meta.region != RegionKind::FwdStack) continue;
+            if (meta.block_layer_idx < 0) continue;
+            const std::size_t L = static_cast<std::size_t>(meta.block_layer_idx);
+            if (L >= num_layers) continue;
+            const std::size_t layer_end =
+                (graph.layer_end_indices[L] != SIZE_MAX) ? graph.layer_end_indices[L] : raw_last[tid];
+            if (raw_last[tid] >= layer_end) {
+                is_cross_reader[tid] = 1;
+            }
+        }
+
+        const bool section_per_layer = fwd_per_layer_sections;
+        if (!section_per_layer) {
+            // Walk FwdStack tids; flag only when a cross-reader shares bytes
+            // with another tid whose raw live range overlaps it.
+            std::vector<int> fwd_tids;
+            for (const auto& frame : fwd_frame) {
+                for (int tid : frame)
+                    fwd_tids.push_back(tid);
+            }
+            for (std::size_t i = 0; i < fwd_tids.size(); ++i) {
+                const int ti_id = fwd_tids[i];
+                const auto& mi = graph.tensor_meta[static_cast<std::size_t>(ti_id)];
+                for (std::size_t j = i + 1; j < fwd_tids.size(); ++j) {
+                    const int tj_id = fwd_tids[j];
+                    const auto& mj = graph.tensor_meta[static_cast<std::size_t>(tj_id)];
+                    if (mi.block_layer_idx == mj.block_layer_idx) continue;  // same-frame handled elsewhere
+                    if (!is_cross_reader[ti_id] && !is_cross_reader[tj_id]) continue;
+                    const std::size_t ai_end = mi.offset + mi.bytes;
+                    const std::size_t aj_end = mj.offset + mj.bytes;
+                    if (ai_end <= mj.offset || aj_end <= mi.offset) continue;
+                    const std::size_t i_first = raw_first[ti_id], i_last = raw_last[ti_id];
+                    const std::size_t j_first = raw_first[tj_id], j_last = raw_last[tj_id];
+                    const bool lives_disjoint = i_last < j_first || j_last < i_first;
+                    if (lives_disjoint) continue;
+                    if (cross_frame_violations < 10) {
+                        cross_frame_diag << "[cross-frame-violation] " << graph.name << " tid=" << ti_id
+                                         << " name=" << graph.name_for_tensor_id(ti_id)
+                                         << " layer=" << mi.block_layer_idx << " [off=" << mi.offset
+                                         << ",bytes=" << mi.bytes << ",raw_live=" << i_first << ".." << i_last << "]"
+                                         << " vs tid=" << tj_id << " name=" << graph.name_for_tensor_id(tj_id)
+                                         << " layer=" << mj.block_layer_idx << " [off=" << mj.offset
+                                         << ",bytes=" << mj.bytes << ",raw_live=" << j_first << ".." << j_last
+                                         << "] — bytes overlap AND raw live ranges overlap"
+                                         << " (cross_reader: i=" << (is_cross_reader[ti_id] ? "y" : "n")
+                                         << " j=" << (is_cross_reader[tj_id] ? "y" : "n") << ")\n";
+                    }
+                    ++cross_frame_violations;
+                }
+            }
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_CHECK_FRAME_COLORING")) {
+        if (std::string(env) == "1") {
+            check_frame(fwd_frame, is_backward ? "bwd.fwd_frame?" : "fwd_frame");
+            check_frame(bwd_frame, is_backward ? "bwd_frame" : "fwd.bwd_frame?");
+            check_slot_aliases(fwd_frame, is_backward ? "bwd.fwd_frame?" : "fwd_frame");
+            check_slot_aliases(bwd_frame, is_backward ? "bwd_frame" : "fwd.bwd_frame?");
+            std::cerr << "[coloring-check] graph='" << graph.name << "' pairwise_violations=" << coloring_violations
+                      << " alias_offset_splits=" << alias_offset_splits
+                      << " cross_frame_violations=" << cross_frame_violations << "\n";
+        }
+    }
+
+    if (cross_frame_violations > 0) {
+        std::cerr << cross_frame_diag.str();
+        throw std::runtime_error(
+            "GraphCompiler::compute_layout: cross-frame arena coloring violation in graph '" + graph.name + "' (" +
+            std::to_string(cross_frame_violations) +
+            " overlap(s)). A forward activation produced in one layer shares arena bytes with another "
+            "layer's tensor whose live range overlaps it, which corrupts cross-layer reads at runtime. "
+            "Fix the IR (e.g., mark the source tensor with a persistent share policy, or add its tid to "
+            "promote_cross_layer_fwd_reads) rather than silencing this check.");
+    }
+
+    // Populate CompiledGraph::slot_tid_by_layer so downstream dispatchers
+    // can resolve (layer_idx, slot) → tid in O(1) instead of constructing
+    // "blocks[L].<slot_name>" and hitting tensor_name_to_id. tid_slot
+    // above already carries the canonical (slot, layer) for every tid;
+    // fold it into the per-layer array.
+    {
+        constexpr std::size_t kSlotCount = static_cast<std::size_t>(TensorSlot::Mapped) + 1;
+        graph.slot_tid_by_layer.assign(num_layers, {});
+        for (auto& row : graph.slot_tid_by_layer) {
+            row.fill(-1);
+        }
+        for (std::size_t tid = 0; tid < num_tids; ++tid) {
+            const auto& rec = tid_slot[tid];
+            if (!rec.set) continue;
+            if (rec.layer_idx < 0 || static_cast<std::size_t>(rec.layer_idx) >= num_layers) continue;
+            const auto slot_idx = static_cast<std::size_t>(rec.slot);
+            if (slot_idx >= kSlotCount) continue;
+            // First writer wins; downstream ops that reference the same
+            // (layer, slot) with aliased tids resolve to the producer's
+            // canonical tid because record_ref favors outputs over inputs.
+            if (graph.slot_tid_by_layer[static_cast<std::size_t>(rec.layer_idx)][slot_idx] < 0) {
+                graph.slot_tid_by_layer[static_cast<std::size_t>(rec.layer_idx)][slot_idx] = static_cast<int>(tid);
+            }
+        }
+    }
+
+    // Layout hash — determinism check point for distributed runs (Phase 2
+    // step 5). Every rank running the same compile must produce the same
+    // 64-bit value; callers can cross-rank-compare via NCCL/MPI allreduce.
+    graph.layout_hash = compute_layout_hash(graph);
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
+        if (std::string(env) == "1") {
+            std::cerr << "[layout] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):\n"
+                      << "  Persistent           = " << fmt_bytes(persistent_bytes) << "\n"
+                      << "  PersistentActivation = " << fmt_bytes(persistent_activation_bytes) << "\n"
+                      << "  Accumulator  = " << fmt_bytes(accumulator_bytes) << "\n"
+                      << "  SaveForBwd   = " << fmt_bytes(save_for_bwd_bytes) << "\n"
+                      << "  FwdStack     = " << fmt_bytes(fwd_colored) << " (naive " << fmt_bytes(fwd_naive)
+                      << ", optimal " << fmt_bytes(fwd_optimal) << ")\n"
+                      << "  BwdStack     = " << fmt_bytes(bwd_colored) << " (naive " << fmt_bytes(bwd_naive)
+                      << ", optimal " << fmt_bytes(bwd_optimal) << ")\n"
+                      << "  layout_hash  = 0x" << std::hex << graph.layout_hash << std::dec << "\n";
+        }
+    }
+}
+
+// ============================================================================
+// Phase Arenas — allocation skeleton
+// ============================================================================
+
+void compute_arena_sizes(PhaseArenas& arenas,
+                         const CompiledGraph& fwd,
+                         const CompiledGraph& bwd,
+                         int num_layers,
+                         std::size_t stack_bytes,
+                         std::size_t bwd_cross_layer_bytes,
+                         std::size_t moe_saved_bytes) {
+    // UnifiedStack arena sizing. The design calls for Stack to be backed
+    // by the phase-arena bookkeeping, but the adoption sequence
+    // (cudaMalloc → memcpy-rebase → free original) briefly holds two
+    // Stack-sized buffers on-device; on Qwen3 0.6B that's +1.1 GiB
+    // transient, past the `<2% peak-memory` benchmark gate. Skip the
+    // adoption (unified_stack_bytes = 0) and keep the allocator-owned
+    // Stack as-is — functionally equivalent (Stack pointers are valid
+    // either way), and steady-state memory is unchanged.
+    (void)stack_bytes;
+    arenas.unified_stack_bytes = 0;
+    arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
+    arenas.moe_saved_bytes = moe_saved_bytes;
+
+    // Persistent (weights) + Accumulator (grads): both default-on. The
+    // executor clamps each to what its owner can actually rebind —
+    // rebindable_persistent_bytes (base + WM) and rebindable_accumulator_bytes
+    // (grad store) drop the slab to zero when the config (QLoRA, streaming,
+    // sharding, offload) keeps storage elsewhere.
+    arenas.persistent_bytes = std::max(fwd.persistent_bytes, bwd.persistent_bytes);
+    arenas.persistent_activation_bytes = std::max(fwd.persistent_activation_bytes, bwd.persistent_activation_bytes);
+    arenas.accumulator_bytes = std::max(fwd.accumulator_bytes, bwd.accumulator_bytes);
+
+    // FwdStack, BwdStack: single-arena routing per the plan — FwdStack
+    // arena sized to the max forward frame peak, BwdStack to the max
+    // backward frame peak, both reused across layers. Replay regenerates
+    // each layer's activations into the arena just-in-time before
+    // backward ops read, matching `Recomputed[i]` in
+    // design/buffer-runtime-v4.md.
+    arenas.fwd_stack_bytes = fwd.fwd_stack_peak;
+    arenas.bwd_stack_bytes = bwd.bwd_stack_peak;
+
+    // SaveForBwd: per-block slots persist across the fwd-exit / bwd-entry
+    // boundary. finalize_save_for_bwd populates the same tids in both
+    // compiles, so per-block sizes should match; take max as a safety.
+    arenas.save_for_bwd_block_bases.assign(static_cast<std::size_t>(num_layers), 0);
+    std::size_t total = 0;
+    for (int L = 0; L < num_layers; ++L) {
+        const auto idx = static_cast<std::size_t>(L);
+        const std::size_t fwd_bytes = idx < fwd.save_for_bwd_block_bytes.size() ? fwd.save_for_bwd_block_bytes[idx] : 0;
+        const std::size_t bwd_bytes = idx < bwd.save_for_bwd_block_bytes.size() ? bwd.save_for_bwd_block_bytes[idx] : 0;
+        arenas.save_for_bwd_block_bases[idx] = total;
+        total += std::max(fwd_bytes, bwd_bytes);
+    }
+    arenas.save_for_bwd_bytes = total;
+}
+
+namespace {
+
+void cuda_malloc_or_die(std::byte** out, std::size_t bytes, const char* label) {
+    if (bytes == 0) {
+        *out = nullptr;
+        return;
+    }
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(out), bytes);
+    if (err != cudaSuccess) {
+        std::ostringstream oss;
+        oss << "allocate_phase_arenas: cudaMalloc(" << bytes << ") for " << label
+            << " failed: " << cudaGetErrorString(err);
+        throw std::runtime_error(oss.str());
+    }
+}
+
+}  // namespace
+
+void allocate_phase_arenas(PhaseArenas& arenas) {
+    if (arenas.allocated) return;
+    cuda_malloc_or_die(&arenas.persistent_ptr, arenas.persistent_bytes, "persistent");
+    cuda_malloc_or_die(&arenas.persistent_activation_ptr, arenas.persistent_activation_bytes, "persistent_activation");
+    cuda_malloc_or_die(&arenas.accumulator_ptr, arenas.accumulator_bytes, "accumulator");
+    cuda_malloc_or_die(&arenas.fwd_stack_ptr, arenas.fwd_stack_bytes, "fwd_stack");
+    cuda_malloc_or_die(&arenas.bwd_stack_ptr, arenas.bwd_stack_bytes, "bwd_stack");
+    cuda_malloc_or_die(&arenas.save_for_bwd_ptr, arenas.save_for_bwd_bytes, "save_for_bwd");
+    cuda_malloc_or_die(&arenas.unified_stack_ptr, arenas.unified_stack_bytes, "unified_stack");
+    cuda_malloc_or_die(&arenas.bwd_cross_layer_ptr, arenas.bwd_cross_layer_bytes, "bwd_cross_layer");
+    cuda_malloc_or_die(&arenas.moe_saved_ptr, arenas.moe_saved_bytes, "moe_saved");
+    arenas.allocated = true;
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
+        if (std::string(env) == "1") {
+            auto mb = [](std::size_t b) {
+                return b / double(1ULL << 20);
+            };
+            std::cerr << "[arena] allocated:\n"
+                      << "  Persistent    = " << mb(arenas.persistent_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.persistent_ptr) << "\n"
+                      << "  PersistentAct = " << mb(arenas.persistent_activation_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.persistent_activation_ptr) << "\n"
+                      << "  Accumulator   = " << mb(arenas.accumulator_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.accumulator_ptr) << "\n"
+                      << "  FwdStack      = " << mb(arenas.fwd_stack_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.fwd_stack_ptr) << "\n"
+                      << "  BwdStack      = " << mb(arenas.bwd_stack_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.bwd_stack_ptr) << "\n"
+                      << "  SaveForBwd    = " << mb(arenas.save_for_bwd_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.save_for_bwd_ptr) << "\n"
+                      << "  UnifiedStack  = " << mb(arenas.unified_stack_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.unified_stack_ptr) << "\n"
+                      << "  TOTAL         = "
+                      << mb(arenas.persistent_bytes + arenas.persistent_activation_bytes + arenas.accumulator_bytes +
+                            arenas.fwd_stack_bytes + arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes +
+                            arenas.unified_stack_bytes)
+                      << " MB\n";
+        }
+    }
+}
+
+std::byte* resolve_tid_in_arena(const PhaseArenas& arenas, const CompiledGraph& graph, int tid) {
+    if (!arenas.allocated || tid < 0 || tid >= graph.num_tensors) return nullptr;
+    const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.offset == SIZE_MAX) return nullptr;
+    switch (meta.region) {
+        case RegionKind::Persistent: return arenas.persistent_ptr + meta.offset;
+        case RegionKind::PersistentActivation: return arenas.persistent_activation_ptr + meta.offset;
+        case RegionKind::Accumulator: return arenas.accumulator_ptr + meta.offset;
+        case RegionKind::FwdStack: return arenas.fwd_stack_ptr + meta.offset;  // frame-local offset
+        case RegionKind::BwdStack: return arenas.bwd_stack_ptr + meta.offset;
+        case RegionKind::SaveForBwd:
+            if (meta.block_layer_idx < 0 ||
+                static_cast<std::size_t>(meta.block_layer_idx) >= arenas.save_for_bwd_block_bases.size()) {
+                return nullptr;
+            }
+            return arenas.save_for_bwd_ptr +
+                   arenas.save_for_bwd_block_bases[static_cast<std::size_t>(meta.block_layer_idx)] + meta.offset;
+        default: return nullptr;
+    }
+}
+
+ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledGraph& graph) {
+    ArenaCoverage cov;
+    if (!arenas.allocated) return cov;
+
+    auto region_capacity = [&](RegionKind k) -> std::size_t {
+        switch (k) {
+            case RegionKind::Persistent: return arenas.persistent_bytes;
+            case RegionKind::PersistentActivation: return arenas.persistent_activation_bytes;
+            case RegionKind::Accumulator: return arenas.accumulator_bytes;
+            case RegionKind::FwdStack: return arenas.fwd_stack_bytes;
+            case RegionKind::BwdStack: return arenas.bwd_stack_bytes;
+            case RegionKind::SaveForBwd: return arenas.save_for_bwd_bytes;
+            default: return 0;
+        }
+    };
+
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region == RegionKind::Unknown) continue;
+        ++cov.total;
+        if (meta.offset == SIZE_MAX || meta.bytes == 0) continue;
+        switch (meta.region) {
+            case RegionKind::Persistent:
+            case RegionKind::PersistentActivation:
+            case RegionKind::Accumulator:
+            case RegionKind::FwdStack:
+            case RegionKind::BwdStack: {
+                const std::size_t end = meta.offset + meta.bytes;
+                if (end > region_capacity(meta.region)) {
+                    ++cov.size_exceeded;
+                } else {
+                    ++cov.covered;
+                }
+                break;
+            }
+            case RegionKind::SaveForBwd: {
+                if (meta.block_layer_idx < 0) break;
+                const auto L = static_cast<std::size_t>(meta.block_layer_idx);
+                if (L >= arenas.save_for_bwd_block_bases.size()) break;
+                const std::size_t slot_base = arenas.save_for_bwd_block_bases[L];
+                const std::size_t slot_end = (L + 1 < arenas.save_for_bwd_block_bases.size())
+                                                 ? arenas.save_for_bwd_block_bases[L + 1]
+                                                 : arenas.save_for_bwd_bytes;
+                const std::size_t slot_size = slot_end - slot_base;
+                if (meta.offset + meta.bytes > slot_size) {
+                    ++cov.size_exceeded;
+                } else {
+                    ++cov.covered;
+                }
+                break;
+            }
+            default: break;
+        }
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_ARENA_COVERAGE")) {
+        if (std::string(env) == "1") {
+            const double pct =
+                cov.total > 0 ? (100.0 * static_cast<double>(cov.covered) / static_cast<double>(cov.total)) : 0.0;
+            std::cerr << "[arena-coverage] " << graph.name << ": " << cov.covered << "/" << cov.total << " tids ("
+                      << pct << "%)";
+            if (cov.size_exceeded > 0) {
+                std::cerr << "  size_exceeded=" << cov.size_exceeded;
+            }
+            std::cerr << "\n";
+        }
+    }
+    return cov;
+}
+
+std::optional<BakedOperand> baked_view(const CompiledGraph& graph, const TensorRef& ref) {
+    const int tid = ref.tensor_id;
+    if (tid < 0 || tid >= graph.num_tensors) return std::nullopt;
+    const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.region == RegionKind::Unknown) return std::nullopt;
+    if (meta.offset == SIZE_MAX) return std::nullopt;
+    return BakedOperand{meta.region, meta.block_layer_idx, meta.offset, meta.bytes, ref.dtype};
+}
+
+OpOperandCoverage validate_op_operand_coverage(const PhaseArenas& arenas, const CompiledGraph& graph) {
+    OpOperandCoverage cov{};
+
+    auto region_allocated = [&](RegionKind k) {
+        switch (k) {
+            case RegionKind::Persistent: return arenas.persistent_ptr != nullptr;
+            case RegionKind::PersistentActivation: return arenas.persistent_activation_ptr != nullptr;
+            case RegionKind::Accumulator: return arenas.accumulator_ptr != nullptr;
+            case RegionKind::FwdStack: return arenas.fwd_stack_ptr != nullptr;
+            case RegionKind::BwdStack: return arenas.bwd_stack_ptr != nullptr;
+            case RegionKind::SaveForBwd: return arenas.save_for_bwd_ptr != nullptr;
+            case RegionKind::BwdCrossLayer: return arenas.bwd_cross_layer_ptr != nullptr;
+            default: return false;
+        }
+    };
+
+    auto score = [&](const TensorRef& ref, std::size_t& total, std::size_t& covered) {
+        ++total;
+        auto bv = baked_view(graph, ref);
+        if (!bv) return;
+        if (!region_allocated(bv->region)) return;
+        ++covered;
+        const auto region_idx = static_cast<std::size_t>(bv->region);
+        if (region_idx < cov.by_region.size()) ++cov.by_region[region_idx];
+    };
+
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.inputs)
+            score(ref, cov.total_inputs, cov.covered_inputs);
+        for (const auto& ref : op.outputs)
+            score(ref, cov.total_outputs, cov.covered_outputs);
+    }
+
+    if (const char* env = std::getenv("SUROGATE_DEBUG_OPERAND_COVERAGE")) {
+        if (std::string(env) == "1") {
+            const std::size_t total = cov.total_inputs + cov.total_outputs;
+            const std::size_t covered = cov.covered_inputs + cov.covered_outputs;
+            const double pct = total > 0 ? (100.0 * static_cast<double>(covered) / static_cast<double>(total)) : 0.0;
+            std::cerr << "[operand-coverage] " << graph.name << ": " << covered << "/" << total << " operands (" << pct
+                      << "%) in=" << cov.covered_inputs << "/" << cov.total_inputs << " out=" << cov.covered_outputs
+                      << "/" << cov.total_outputs;
+            for (std::size_t r = 0; r < cov.by_region.size(); ++r) {
+                if (cov.by_region[r] == 0) continue;
+                std::cerr << " " << region_kind_name(static_cast<RegionKind>(r)) << "=" << cov.by_region[r];
+            }
+            std::cerr << "\n";
+        }
+    }
+    return cov;
+}
+
+void release_phase_arenas(PhaseArenas& arenas) {
+    if (!arenas.allocated) return;
+    auto free_ptr = [](std::byte*& p) {
+        if (p) {
+            cudaFree(p);
+            p = nullptr;
+        }
+    };
+    free_ptr(arenas.persistent_ptr);
+    free_ptr(arenas.persistent_activation_ptr);
+    free_ptr(arenas.accumulator_ptr);
+    free_ptr(arenas.fwd_stack_ptr);
+    free_ptr(arenas.bwd_stack_ptr);
+    free_ptr(arenas.save_for_bwd_ptr);
+    free_ptr(arenas.unified_stack_ptr);
+    free_ptr(arenas.bwd_cross_layer_ptr);
+    free_ptr(arenas.moe_saved_ptr);
+    arenas.persistent_bytes = 0;
+    arenas.persistent_activation_bytes = 0;
+    arenas.accumulator_bytes = 0;
+    arenas.fwd_stack_bytes = 0;
+    arenas.bwd_stack_bytes = 0;
+    arenas.save_for_bwd_bytes = 0;
+    arenas.unified_stack_bytes = 0;
+    arenas.bwd_cross_layer_bytes = 0;
+    arenas.moe_saved_bytes = 0;
+    arenas.save_for_bwd_block_bases.clear();
+    arenas.allocated = false;
+}
+
+// ============================================================================
+// Debuggability surface (design/buffer-runtime-v4.md, P4.7)
+// ============================================================================
+
+std::string CompiledGraph::describe_tensor_id(int tid) const {
+    if (tid < 0 || static_cast<std::size_t>(tid) >= tensor_meta.size()) {
+        std::ostringstream oss;
+        oss << "<tid=" << tid << " unknown>";
+        return oss.str();
+    }
+    const auto& meta = tensor_meta[static_cast<std::size_t>(tid)];
+    const auto name = name_for_tensor_id(tid);
+    std::ostringstream oss;
+    oss << "tid=" << tid;
+    if (!name.empty()) oss << " name='" << name << "'";
+    oss << " kind=" << tensor_kind_name(meta.kind);
+    oss << " region=" << region_kind_name(meta.region);
+    if (meta.block_layer_idx >= 0) oss << " block=" << meta.block_layer_idx;
+    if (meta.offset != SIZE_MAX) {
+        oss << " offset=" << meta.offset;
+    }
+    if (meta.bytes > 0) {
+        oss << " bytes=" << meta.bytes;
+    }
+    return oss.str();
+}
+
+/// Env-gated full tid-table dump (SUROGATE_DEBUG_TID_TABLE=1). Emits one line
+/// per tid so a user can grep for a specific tensor's region/offset/size after
+/// compile. Tids without a name (external-only references) still emit their
+/// meta so they can be diagnosed when they surface in error messages.
+static void maybe_dump_tid_table(const CompiledGraph& graph) {
+    const char* env = std::getenv("SUROGATE_DEBUG_TID_TABLE");
+    if (!env || std::string(env) != "1") return;
+    std::cerr << "[tid-table] " << graph.name << " (" << graph.num_tensors << " tids):\n";
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        std::cerr << "  " << graph.describe_tensor_id(tid) << "\n";
+    }
+}
+
 void CompiledGraph::compute_layer_segments() {
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
@@ -1653,11 +3391,28 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
         return true;
     }
 
+    // Lift per-layer dim overrides into a local helper so every path that
+    // writes `mTensorShapes` applies them consistently. The global mShapeEnv
+    // has default head_size / qkv_channels / intermediate / mlp_up; for
+    // block-scoped tensors on hybrid architectures these need per-layer
+    // values.
+    auto maybe_override_for_block_scope = [&](std::vector<long>& s) {
+        int nli = -1;
+        std::string nf;
+        std::string strip_name(name);
+        if (starts_with(strip_name, "d_")) strip_name = strip_name.substr(2);
+        if (starts_with(strip_name, kSavedPrefix)) strip_name = strip_name.substr(kSavedPrefix.size());
+        if (parse_block_param(strip_name, nli, nf)) {
+            apply_per_layer_dim_override(s, strip_ssa_suffix(nf), nli);
+        }
+    };
+
     // Check IR tensor info
     auto check_tensor_info = [&](const std::unordered_map<std::string, TensorInfo>& tensors, const char* source) {
         auto it = tensors.find(name);
         if (it != tensors.end() && !it->second.shape.empty()) {
             shape = resolve_shape(it->second.shape, mShapeEnv);
+            maybe_override_for_block_scope(shape);
             TensorShape ts;
             ts.dims = shape;
             ts.inferred = false;
@@ -1682,6 +3437,7 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
 
     // Try pattern-based inference for known tensor names
     if (infer_known_tensor_shape(name, mConfig, mB, mT, shape)) {
+        maybe_override_for_block_scope(shape);
         TensorShape ts;
         ts.dims = shape;
         ts.inferred = true;
@@ -2804,8 +4560,7 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
                 parse_block_param(stripped, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(stripped);
             auto slot_entry = mSlotRegistry.lookup(field_name);
             if (slot_entry.has_value() && slot_entry->slot != TensorSlot::Mapped &&
-                slot_entry->slot != TensorSlot::Temporary && slot_entry->slot != TensorSlot::Saved &&
-                slot_entry->slot != TensorSlot::Parameter) {
+                slot_entry->slot != TensorSlot::Saved && slot_entry->slot != TensorSlot::Parameter) {
                 recognized = true;
             }
         }
@@ -3202,6 +4957,19 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
         for (std::size_t i = 0; i < op.outputs.size(); ++i) {
             auto ref = resolve_tensor_ref(op.outputs[i], true, op, *env_ptr);
             bool shape_is_default_fallback = false;
+
+            // Op-semantic dtype overrides that are independent of the slot
+            // routing path. The per-slot resolution above may stamp a
+            // default/activation dtype on output refs whose op produces a
+            // different dtype — e.g., FlashAttention's LSE is FP32, but a
+            // BlockLSE-slotted ref leaves resolve_tensor_ref with BF16.
+            // The per-frame coloring reads `ref.dtype` to size the arena
+            // slice; a BF16-typed LSE yields a half-sized allocation,
+            // overflowing into the next slot when the FP32 kernel writes.
+            // Patch the dtype here, where we know the op semantics.
+            if (compiled.type == CompiledOpType::FlashAttention && i == 1) {
+                ref.dtype = ETensorDType::FP32;
+            }
 
             // Fix dtype and shape for outputs based on operation type
             // This is needed for Mapped tensors that don't have predefined slots
@@ -4054,6 +5822,10 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Annotate layer boundaries for prefetch
     annotate_layer_boundaries(result);
 
+    // Build phase tree. Runs after annotate_layer_boundaries so
+    // layer_{start,end}_indices are populated.
+    build_phase_tree(result, is_backward);
+
     // Register external tensor names (init bindings, MoE side-channel, param gradients)
     // that may not appear in any op's TensorRef but are used at runtime.
     register_external_names(result);
@@ -4093,6 +5865,28 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // (Phase 0: data-only; callers still use legacy string predicates until
     // Phase 1 flips them.)
     classify_tensors(result);
+
+    // Derive region assignment. Runs after classify_tensors so
+    // TensorMeta::kind is populated.
+    derive_regions(result, is_backward);
+
+    // Promote cross-layer forward reads to SaveForBwd (forward graph only).
+    // Must run before compute_layout so promoted tids end up in the right
+    // region buckets. Backward already has bwd_cross_layer infrastructure.
+    if (!is_backward) {
+        promote_cross_layer_fwd_reads(result);
+    }
+
+    // Compute per-region peak bytes and bake TensorMeta::offset. Re-run
+    // by finalize_save_for_bwd() once cross-graph region promotion is
+    // applied.
+    compute_layout(result, is_backward, /*fwd_per_layer_sections=*/!mOptions.recompute_enabled());
+
+    // Flatten the phase tree to a linear instruction stream.
+    emit_instruction_stream(result);
+
+    // Debuggability dump (P4.7). Runs after every compile for inspection.
+    maybe_dump_tid_table(result);
 
     // ========================================================================
     // Detect MLP tile groups for long-context tiled execution

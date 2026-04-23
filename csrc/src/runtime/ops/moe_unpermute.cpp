@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <sstream>
 #include <stdexcept>
@@ -28,8 +29,11 @@ void CompiledExecutor::dispatch_moe_unpermute(const CompiledOp& op) {
     // The mlp_down buffer has shape (B, T, C) which equals [num_tokens, hidden_size]
     // when viewed as 2D. This buffer survives layer boundary cleanup.
     int layer_idx = mCurrentLayer >= 0 ? mCurrentLayer : 0;
-    auto& acts = mRunState.simplified_acts(layer_idx);
-    Tensor out = view_tensor(acts.mlp_down, {static_cast<long>(num_tokens), static_cast<long>(hidden_size)});
+    Tensor* mlp_down_ptr = executor_tid_slot(layer_idx, TensorSlot::BlockMLPDown);
+    if (!mlp_down_ptr) {
+        throw std::runtime_error("moe_unpermute: mlp_down slot unavailable for layer " + std::to_string(layer_idx));
+    }
+    Tensor out = view_tensor(*mlp_down_ptr, {static_cast<long>(num_tokens), static_cast<long>(hidden_size)});
 
     if (expert_out.DType == ETensorDType::BF16) {
         if (routing_weights.DType == ETensorDType::FP32) {

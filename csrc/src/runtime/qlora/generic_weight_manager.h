@@ -374,6 +374,30 @@ public:
         return mFrozenWeights;
     }
 
+    /// Total bytes of every device-resident Tensor this manager owns —
+    /// quantized (data/scales/meta/meta2), dequant_buffer, and
+    /// full_precision. Skips offloaded weights (backing tensors on pinned
+    /// CPU) and any tensor still unallocated. Dedups aliased pointers.
+    [[nodiscard]] std::size_t total_persistent_bytes() const;
+
+    /// Route every device-resident owned Tensor through a slab at
+    /// `arena_base`. Walks `mWeights` in deterministic order,
+    /// memcpy+free+rebind each eligible Tensor's `.Data`. Aliased pointers
+    /// share a single slab slot. Returns bytes consumed (<= max_bytes).
+    std::size_t rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream);
+
+    /// Self-managed arena. Computes `total_persistent_bytes()`, allocates
+    /// one dedicated cudaMalloc buffer at that size, and rebinds all
+    /// eligible tensors into it. Skips when free GPU memory can't absorb
+    /// the transient 2× peak (gpt-oss-20B-class configs on a single
+    /// 32 GB GPU typically hit the skip). Called post-`import_and_quantize`
+    /// because the QLoRA provider doesn't exist yet at `compile_graphs` —
+    /// the shared Persistent arena can't size this slab upfront.
+    void consume_self_arena(cudaStream_t stream);
+
+    /// Release the self-managed arena (destructor cleanup).
+    void release_self_arena();
+
 private:
     // =========================================================================
     // Internal helpers
@@ -426,6 +450,13 @@ private:
     /// Allocated lazily on first use, sized for the largest weight that needs
     /// transpose. Reused across all transpose dequant calls.
     Tensor mTransposeTemp;
+
+    /// Self-managed arena backing owned tensors. Non-null only when
+    /// `consume_self_arena` succeeded. Freed in destructor /
+    /// `release_self_arena`. All arena-backed owned tensors hold pointers
+    /// into this buffer.
+    std::byte* mSelfArena = nullptr;
+    std::size_t mSelfArenaBytes = 0;
 };
 
 }  // namespace qlora

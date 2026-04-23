@@ -6,9 +6,12 @@
 #include "runtime/dsl/dsl_weight_manager.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <regex>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_set>
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
@@ -17,6 +20,7 @@
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/tensor.h"
+#include "utilities/utils.h"
 
 #include <cuda_runtime.h>
 
@@ -589,7 +593,24 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
     for (int i = 0; i < kNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx && status.version == mVersion) {
-            // Already fetched and up-to-date
+            // Already fetched and up-to-date. But `entry.work` pointers for
+            // this layer's params may have been set to a DIFFERENT slot by
+            // a prior gather_block(layer_idx) and later invalidated when
+            // that slot was reused for a different layer. Re-point each
+            // entry.work to this slot's buffer so callers resolve to the
+            // up-to-date content. Non-monotonic backward orders (e.g.
+            // Q3.5 hybrid's attention-pass-then-linear-pass) rely on
+            // this: at handle_layer_start(L) in the attention pass, the
+            // forward prefetch state may still be valid for L, but
+            // entry.work may point at a slot that has since been
+            // overwritten.
+            for (const auto& name : mBlockParamNames[layer_idx]) {
+                auto wit = mWeights.find(name);
+                if (wit == mWeights.end()) continue;
+                auto bit = mPrefetchBuffers[i].find(name);
+                if (bit == mPrefetchBuffers[i].end()) continue;
+                wit->second.work = bit->second;
+            }
             return;
         }
         if (status.is_ready && buf_idx < 0) {
@@ -605,7 +626,6 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
             CUDA_CHECK(cudaStreamWaitEvent(stream, status.done_event, 0));
         }
     }
-
     auto& status = mPrefetchStatus[buf_idx];
     // Wait for MainStream to finish reading this buffer before overwriting
     CUDA_CHECK(cudaStreamWaitEvent(stream, status.release_event, 0));
@@ -879,6 +899,142 @@ void DslWeightManager::iterate_tensors(const std::function<void(std::string, con
             callback(name, TensorShard(it->second.master));
         }
     }
+}
+
+namespace {
+
+// True when `t` is a device-resident Tensor backed by a `cudaMalloc`
+// allocation (as opposed to pinned CPU / zero-copy / uninitialized).
+// `Device >= 0` is the signal the allocator sets for on-device buffers;
+// pinned and host allocations leave it at -1.
+bool is_device_resident(const Tensor& t) {
+    return t.Data != nullptr && t.Device >= 0;
+}
+
+}  // namespace
+
+std::size_t DslWeightManager::total_persistent_bytes() const {
+    std::size_t total = 0;
+    std::unordered_set<const std::byte*> seen;  // dedupe master/work/prefetch aliases
+    auto count_if_eligible = [&](const Tensor& t) {
+        if (!is_device_resident(t)) return;
+        if (!seen.insert(t.Data).second) return;
+        total += t.bytes();
+    };
+    for (const auto& kv : mWeights) {
+        const auto& entry = kv.second;
+        count_if_eligible(entry.master);
+        count_if_eligible(entry.work);
+    }
+    // Include streaming prefetch buffers. Entries within a slot alias a
+    // shared per-base-name device buffer — the seen-set dedup counts
+    // each distinct buffer once across both slots.
+    for (const auto& slot_map : mPrefetchBuffers) {
+        for (const auto& kv : slot_map) {
+            count_if_eligible(kv.second);
+        }
+    }
+    return total;
+}
+
+std::size_t
+DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream) {
+    if (arena_base == nullptr || max_bytes == 0) return 0;
+
+    std::size_t cursor = 0;
+    std::size_t rebound_master = 0;
+    std::size_t rebound_work = 0;
+    std::size_t skipped_offloaded = 0;
+    std::size_t skipped_streaming = 0;
+
+    // Track rebound buffers by original Data pointer so aliased entries
+    // (master == work when !separate_work) rebind to a single slab slot
+    // and only free once.
+    std::unordered_map<const std::byte*, std::byte*> rebind_map;
+
+    auto rebind_one = [&](Tensor& t) -> bool {
+        if (!is_device_resident(t)) return false;
+        std::byte* orig = t.Data;
+        auto cached = rebind_map.find(orig);
+        if (cached != rebind_map.end()) {
+            // Alias: another entry already rebound this buffer — just
+            // repoint Data to the arena slot. Do NOT re-free.
+            t.Data = cached->second;
+            return true;
+        }
+        const std::size_t bytes = t.bytes();
+        if (bytes == 0) return false;
+        if (cursor + bytes > max_bytes) {
+            throw std::runtime_error("DslWeightManager::rebind_to_persistent_arena: slab capacity " +
+                                     std::to_string(max_bytes) + " exhausted at cursor " + std::to_string(cursor) +
+                                     " needing " + std::to_string(bytes));
+        }
+        std::byte* slot = arena_base + cursor;
+        CUDA_CHECK(cudaMemcpyAsync(slot, orig, bytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = t.Stats;
+        const int device = t.Device;
+        mAllocator->free(t);  // clears t.Data
+        t.Data = slot;
+        t.Device = device;
+        t.Stats = preserved_stats;
+        cursor += bytes;
+        rebind_map.emplace(orig, slot);
+        return true;
+    };
+
+    for (const auto& name : mParamOrder) {
+        auto it = mWeights.find(name);
+        if (it == mWeights.end()) continue;
+        auto& entry = it->second;
+        // Master: skip when pinned CPU (offloaded) — can't arena-back host
+        // storage. Streaming-sharded masters are still device-resident
+        // (the local shard lives on-device), so they do rebind.
+        if (is_device_resident(entry.master)) {
+            if (rebind_one(entry.master)) {
+                ++rebound_master;
+            }
+        } else if (entry.master.Data != nullptr) {
+            ++skipped_offloaded;
+        }
+        // Work: streaming block weights have `.Data == nullptr` until
+        // `gather_block` fills a prefetch slot. The underlying buffers
+        // are rebound below as part of mPrefetchBuffers; the per-entry
+        // `entry.work` field gets rewritten on every gather so we don't
+        // touch it here.
+        if (is_device_resident(entry.work)) {
+            if (rebind_one(entry.work)) {
+                ++rebound_work;
+            }
+        } else if (entry.work.Data == nullptr && entry.is_block && (mStreamWeights || mConfig.offload_master)) {
+            ++skipped_streaming;
+        }
+    }
+
+    // Prefetch slots. Each slot holds one Tensor per base-param name
+    // (aliased across layers within the slot). The dedup map ensures
+    // one memcpy+free per unique buffer; repeat entries repoint .Data
+    // to the slot they first landed in.
+    std::size_t rebound_prefetch = 0;
+    for (auto& slot_map : mPrefetchBuffers) {
+        for (auto& kv : slot_map) {
+            if (rebind_one(kv.second)) {
+                ++rebound_prefetch;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume dsl_wm_persistent] rebound_master=" << rebound_master
+                      << " rebound_work=" << rebound_work << " rebound_prefetch=" << rebound_prefetch
+                      << " skipped_offloaded=" << skipped_offloaded << " skipped_streaming=" << skipped_streaming
+                      << " bytes_used=" << cursor << " slab_bytes=" << max_bytes << "\n";
+        }
+    }
+
+    return cursor;
 }
 
 void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaStream_t stream) {

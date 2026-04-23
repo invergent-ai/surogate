@@ -30,6 +30,24 @@ void CompiledExecutor::dispatch_embedding(const CompiledOp& op) {
         emb_dim = static_cast<int>(emb.Sizes[1]);
     }
 
+    // Bounds checks — compile-time invariants that turn future layout bugs
+    // into clean compile-path errors instead of async illegal-memory-access
+    // reports in the encoder kernel.
+    const long expected_tokens = mB * mT;
+    if (token_ids.nelem() < static_cast<std::size_t>(expected_tokens)) {
+        throw std::runtime_error(
+            "dispatch_embedding: token_ids buffer too small — have " + std::to_string(token_ids.nelem()) +
+            " elements, need mB*mT=" + std::to_string(expected_tokens) + " (B=" + std::to_string(mB) +
+            ", T=" + std::to_string(mT) + ", input='" + op.inputs[0].name + "')");
+    }
+    const long expected_out_elems = mB * mT * emb_dim;
+    if (out.nelem() < static_cast<std::size_t>(expected_out_elems)) {
+        throw std::runtime_error("dispatch_embedding: output buffer too small — have " + std::to_string(out.nelem()) +
+                                 " elements, need mB*mT*C=" + std::to_string(expected_out_elems) +
+                                 " (B=" + std::to_string(mB) + ", T=" + std::to_string(mT) +
+                                 ", C=" + std::to_string(emb_dim) + ", output='" + op.outputs[0].name + "')");
+    }
+
     encoder_forward(out,
                     token_ids,
                     emb,

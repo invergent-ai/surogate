@@ -1627,7 +1627,6 @@ inline void backward_lora_mlp_up_gate_fused(
                                      cudaMemcpyDeviceToDevice,
                                      stream));
 
-        // --- Phase 3: fused dx accumulation ---
         // Concatenate A_up and A_gate into A_cat = [A_up; A_gate] (contiguous rows)
         CUDA_CHECK(cudaMemcpyAsync(A_cat.Data,
                                    lora_up.A.Data,

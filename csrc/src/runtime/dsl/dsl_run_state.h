@@ -30,6 +30,10 @@ class FP8ScalingState;
 
 namespace dsl {
 
+class CompiledExecutor;  // forward decl — see runtime/executor/compiled_ops.h
+struct CompiledGraph;    // forward decl — see runtime/dsl/graph_compiler.h
+struct PhaseArenas;      // forward decl — see runtime/dsl/graph_compiler.h
+
 // DSL run state for graph execution (activation buffers, scratch, etc).
 class DslRunState final : public IRunState {
 public:
@@ -54,6 +58,29 @@ public:
     /// backward graph is compiled and peak-modelled more accurately).
     void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
 
+    /// Redirect Stack to an externally-owned device buffer. Does not take
+    /// ownership — caller must ensure the buffer outlives this DslRunState
+    /// or call unbind_external_stack() first. mStackBuffer is unchanged,
+    /// so unbinding restores the original backing. Stack must be empty
+    /// (no live allocations) at call time.
+    void rebase_stack_to_external(std::byte* ptr, std::size_t bytes);
+
+    /// Restore Stack to the previously-owned mStackBuffer. Inverse of
+    /// rebase_stack_to_external. Stack must be empty. Fails if the original
+    /// was freed via free_allocator_stack_buffer.
+    void unbind_external_stack();
+
+    /// Free the TensorAllocator-owned Stack buffer allocated at construction.
+    /// After this call, unbind_external_stack is invalid — Stack must stay on
+    /// the external buffer for the rest of this DslRunState's lifetime.
+    /// Typically called right after rebase_stack_to_external + adopt_external_stack.
+    void free_allocator_stack_buffer();
+
+    /// Take ownership of an externally-rebased Stack buffer. The buffer is
+    /// cudaFree'd in ~DslRunState, outliving any GraphExecutor that handed it
+    /// over. Only call after rebase_stack_to_external.
+    void adopt_external_stack(std::byte* ptr, std::size_t bytes);
+
     /// Reallocate the DSL stack at `new_size_bytes`, freeing the old buffer
     /// first so VRAM is actually reclaimed (otherwise `TensorAllocator`
     /// retains the old allocation until its own destructor runs).
@@ -73,12 +100,22 @@ public:
     long shrink_stack_to_high_water_mark(long safety_bytes = 64L * 1024 * 1024,
                                          long min_savings_bytes = 128L * 1024 * 1024);
 
-    modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) {
-        return mSimplifiedActivations[layer_idx];
+    /// `block_activation_ptr` / `block_gradient_ptr` consult this back-ref
+    /// to route slot lookups through the executor's tid-keyed mTensors
+    /// cache. Set by the executor at `execute_forward` /
+    /// `execute_backward` / `replay_layer_forward` entry, cleared at exit.
+    /// Returns nullptr when no executor is active (e.g., pre-execute
+    /// paths, model init).
+    void set_active_executor(CompiledExecutor* exec) {
+        mActiveExecutor = exec;
     }
-    modules::SimplifiedLayerGradients& simplified_grads(int layer_idx) {
-        return mSimplifiedGradients[layer_idx];
+    CompiledExecutor* active_executor() const {
+        return mActiveExecutor;
     }
+    /// Delegate helper: returns `exec->executor_tid_slot(layer_idx, slot)`
+    /// when an executor is active, nullptr otherwise. Implemented in
+    /// dsl_run_state.cpp to keep this header free of compiled_ops.h.
+    Tensor* active_executor_slot(int layer_idx, TensorSlot slot);
     modules::SimplifiedQuantGradients& simplified_quant_grads() {
         return mSimplifiedQuantGrads;
     }
@@ -111,16 +148,15 @@ public:
         mFP8BufferReadyFlags = FP8Ready_None;
     }
 
-    void reset_simplified_gradients();
-
     /// @brief Zero all activation gradient buffers (d_res_ffn, d_res_att) for all layers.
     /// Call this at the start of each backward pass to prevent stale gradients from accumulating.
     void zero_activation_gradients(cudaStream_t stream);
 
-    /// @brief Get the number of layers for gradient iteration
-    std::size_t num_gradient_layers() const {
-        return mSimplifiedGradients.size();
-    }
+    /// Set the (ptr, bytes) list of activation-gradient buffers to zero
+    /// at bwd entry. Called by CompiledExecutor::populate_bwd_stack_
+    /// bindings once per compile; the device-side arrays are re-used
+    /// across steps. No-op for count=0.
+    void set_activation_grad_zero_list(const std::vector<std::uint64_t>& ptrs, const std::vector<std::uint64_t>& sizes);
 
     modules::NonBlockActivations& non_block_activations() {
         return mNonBlockActivations;
@@ -133,6 +169,27 @@ public:
     }
     Tensor& rope_freqs(std::string_view name);
     const Tensor& rope_freqs(std::string_view name) const;
+
+    /// Move every non-block activation / gradient / rope buffer whose tid is
+    /// Persistent-region into the pre-sized Persistent arena. Mirrors the
+    /// weight-rebind pattern in DslParamStore: copy device-resident bytes to
+    /// `arenas.persistent_ptr + meta.offset`, free the allocator-owned
+    /// buffer, and repoint the Tensor at the arena slot. Called on every
+    /// `compile_graphs` recompile (not gated) so rebind re-fires if the
+    /// Persistent arena is re-allocated under a new (B,T).
+    void
+    rebind_non_block_to_persistent_arena(const CompiledGraph& graph, const PhaseArenas& arenas, cudaStream_t stream);
+
+    /// Bytes needed for non-graph persistent buffers that don't have a tid
+    /// in the compiled graph (today: the `output` logits scratch used by
+    /// `fused_lm_head_loss`). Used by `GraphExecutor` to grow the Persistent
+    /// arena beyond the `ForwardParam` / wm / lora slabs.
+    std::size_t non_graph_persistent_extras_bytes() const;
+
+    /// Rebind non-graph-tid persistent buffers (`output`) into the arena
+    /// slab at `base`. Bump-allocated in a fixed order; caller must have
+    /// reserved exactly `non_graph_persistent_extras_bytes()`.
+    void rebind_non_graph_persistent_to_arena(std::byte* base, std::size_t bytes, cudaStream_t stream);
 
     Tensor& get_residual(int layer_idx, cudaStream_t stream);
     Tensor& get_final_residual();
@@ -177,16 +234,6 @@ public:
     /// @brief Check if any recomputation is enabled
     bool recompute_enabled() const {
         return mRecomputeLevel != RecomputeLevel::None;
-    }
-
-    /// @brief Get temporary rstd buffer for recomputation (avoids overwriting saved values)
-    Tensor& recompute_rstd() {
-        return mRecomputeRstd;
-    }
-
-    /// @brief Get temporary LSE buffer for recomputation (avoids overwriting saved values)
-    Tensor& recompute_lse() {
-        return mRecomputeLSE;
     }
 
     cudaStream_t side_stream() const {
@@ -304,10 +351,9 @@ public:
     }
 
 private:
+    CompiledExecutor* mActiveExecutor = nullptr;  // unowned back-ref
+
     void allocate_non_block_state(const PretrainedConfig& cfg);
-    void allocate_simplified_activations(const PretrainedConfig& cfg);
-    void allocate_simplified_gradients(const PretrainedConfig& cfg);
-    void build_activation_grad_zero_segments();
     void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);
     void allocate_scratch_buffers(const PretrainedConfig& cfg);
     void allocate_residual_buffers(const PretrainedConfig& cfg, bool offload_residuals);
@@ -317,6 +363,11 @@ private:
     std::shared_ptr<TensorAllocator> mAllocator;
     DslRuntimeConfig mRuntimeConfig;
     Tensor mStackBuffer{};
+
+    // If non-null, DslRunState owns this buffer and cudaFree's it in ~dtor.
+    // Set by adopt_external_stack when GraphExecutor transfers the Stack arena.
+    std::byte* mOwnedExternalStack = nullptr;
+    std::size_t mOwnedExternalStackBytes = 0;
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
     bool mLoraOnlyMode = false;
     bool mPrequantized = false;
@@ -340,33 +391,18 @@ private:
     BufferPlan mBufferPlan;
     std::vector<Tensor> mPerLayerRopeFreqs;
 
-    std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
-    std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
-    std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradientsBase;
-
     // Precomputed list of activation-gradient buffers to zero at the start of backward.
     // Stored as device arrays of (ptr, bytes) to zero in a single kernel launch.
     Tensor mActGradZeroPtrs{};
     Tensor mActGradZeroSizes{};
     int mActGradZeroCount = 0;
 
-    // Shared gradient buffers (when recompute_block=true)
-    std::array<Tensor, 2> mSharedDResFFN{};   ///< Alternating buffers for d_res_ffn
-    std::array<Tensor, 2> mSharedDMlpDown{};  ///< Alternating buffers for d_mlp_down
-    Tensor mSharedDResAtt{};
-    Tensor mSharedDAttOut{};
-    Tensor mSharedDLn2{};
-    Tensor mSharedDAtt{};
-    Tensor mSharedDLn1{};
     modules::SimplifiedQuantGradients mSimplifiedQuantGrads;
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     uint8_t mFP8BufferReadyFlags = 0;
     Tensor mFP8ForwardStats{};
     Tensor mGradQuantStats{};
 
-    // Temporary buffers for recomputation (to avoid overwriting saved activations)
-    Tensor mRecomputeRstd{};  ///< Temp buffer for rstd during recomputation [B, T]
-    Tensor mRecomputeLSE{};   ///< Temp buffer for LSE during recomputation [B, Hq, T]
     std::unique_ptr<modules::FP8ScalingState> mFP8ScalingState;
 
     std::unique_ptr<modules::ResidualManager> mResidualManager;

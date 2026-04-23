@@ -367,15 +367,24 @@ CompiledExecutor::~CompiledExecutor() {
         mMoEExpertOffsetsGPU = nullptr;
         mMoEExpertOffsetsGPUSize = 0;
     }
+    if (mReplayPersistArena) {
+        cudaFree(mReplayPersistArena);
+        mReplayPersistArena = nullptr;
+        mReplayPersistCapacity = 0;
+        mReplayPersistOffset = 0;
+    }
 
-    // Free persistent MoE saved tensor buffers
+    // Free persistent MoE saved tensor buffers. Arena-backed entries are
+    // skipped — their storage is owned by mPhaseArenas.
     for (auto& [name, buffer] : mMoeSavedBuffers) {
-        if (buffer) {
-            cudaFree(buffer);
-        }
+        if (!buffer) continue;
+        auto ab_it = mMoeSavedArenaBacked.find(name);
+        const bool arena_backed = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+        if (!arena_backed) cudaFree(buffer);
     }
     mMoeSavedBuffers.clear();
     mMoeSavedSizes.clear();
+    mMoeSavedArenaBacked.clear();
 
     // EP per-layer state, LLEP state, shared buffers, buffer pool, and
     // the weight-transfer stream are all owned by mEpStrategy and released
@@ -383,18 +392,19 @@ CompiledExecutor::~CompiledExecutor() {
 }
 
 void CompiledExecutor::clear_replay_copied_refs() {
-    if (mReplayCopiedBuffers.empty()) {
-        return;
-    }
+    // Arena-backed replay persists: bump offset reset so the next replay
+    // overwrites this layer's persistent copies. The arena pointer stays
+    // stable, matching captured-graph expectations. References to those
+    // pointers in mTensors / mNamedTensors / mSaved are scrubbed below.
+    const std::byte* arena_begin = mReplayPersistArena;
+    const std::byte* arena_end = arena_begin + mReplayPersistOffset;
+    mReplayPersistOffset = 0;
 
     auto points_to_replay_copy = [&](const std::byte* data) -> bool {
-        if (!data) {
-            return false;
-        }
+        if (!data) return false;
+        if (arena_begin && data >= arena_begin && data < arena_end) return true;
         for (void* ptr : mReplayCopiedBuffers) {
-            if (data == static_cast<const std::byte*>(ptr)) {
-                return true;
-            }
+            if (data == static_cast<const std::byte*>(ptr)) return true;
         }
         return false;
     };
@@ -451,6 +461,74 @@ void CompiledExecutor::set_recompute_fn(std::function<void(int, long, long, bool
 void CompiledExecutor::set_recompute_enabled(bool enabled) {
     mRecomputeEnabled = enabled;
     mLastRecomputeLayer = -1;
+}
+
+CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t nbytes) {
+    MoeSavedAlloc result;
+    if (nbytes == 0) return result;
+    if (mPhaseArenas && mPhaseArenas->allocated && mPhaseArenas->moe_saved_ptr &&
+        mMoeSavedBumpOffset + nbytes <= mPhaseArenas->moe_saved_bytes) {
+        result.ptr = mPhaseArenas->moe_saved_ptr + mMoeSavedBumpOffset;
+        result.arena_backed = true;
+        mMoeSavedBumpOffset += nbytes;
+        return result;
+    }
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, nbytes));
+    result.ptr = static_cast<std::byte*>(raw);
+    result.arena_backed = false;
+    return result;
+}
+
+void CompiledExecutor::ensure_replay_persist_arena() {
+    // 256 MiB is a conservative upper bound — one layer's worth of
+    // stack-backed replay persistence (typically 9 slots × up to 8 MiB for
+    // (B, T, C) bf16 ≈ 40 MiB) plus margin for larger models. Too-large
+    // single requests fall back to caller's cudaMallocAsync. Must be called
+    // OUTSIDE any CUDA stream capture — cudaMalloc during capture is illegal.
+    if (mReplayPersistArena) return;
+    constexpr std::size_t kArenaBytes = 256ull * 1024 * 1024;
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, kArenaBytes));
+    mReplayPersistArena = static_cast<std::byte*>(raw);
+    mReplayPersistCapacity = kArenaBytes;
+}
+
+std::byte* CompiledExecutor::allocate_replay_persist(std::size_t bytes) {
+    if (bytes == 0) return nullptr;
+    ensure_replay_persist_arena();
+    // 16-byte alignment for the next bump (matches CUDA alignment expectations).
+    constexpr std::size_t kAlign = 16;
+    const std::size_t aligned_offset = (mReplayPersistOffset + kAlign - 1) & ~(kAlign - 1);
+    if (aligned_offset + bytes > mReplayPersistCapacity) {
+        // Arena exhausted — caller will fall back to cudaMallocAsync.
+        return nullptr;
+    }
+    std::byte* p = mReplayPersistArena + aligned_offset;
+    mReplayPersistOffset = aligned_offset + bytes;
+    return p;
+}
+
+std::byte* CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
+    if (nbytes == 0) return nullptr;
+    if (!mPhaseArenas || !mPhaseArenas->allocated || !mPhaseArenas->bwd_cross_layer_ptr) {
+        throw std::runtime_error("allocate_bwd_cross_layer: bwd_cross_layer arena not allocated");
+    }
+    if (mBwdCrossLayerBumpOffset + nbytes <= mPhaseArenas->bwd_cross_layer_bytes) {
+        std::byte* ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
+        mBwdCrossLayerBumpOffset += nbytes;
+        return ptr;
+    }
+    // Arena exhausted — fall back to cudaMalloc. Tracked in
+    // `mBwdCrossLayerFallbacks` and freed at the start of the next backward
+    // call (alongside the bump offset reset in execute_backward).
+    // This triggers on hybrid models whose per-layer attn_dim / intermediate
+    // variance grows the cross-layer persist past the fixed arena budget;
+    // Gemma4-E2B with correct full-attention per-layer dims lands here.
+    std::byte* ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&ptr, nbytes));
+    mBwdCrossLayerFallbacks.push_back(ptr);
+    return reinterpret_cast<std::byte*>(ptr);
 }
 
 void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache) {
@@ -526,20 +604,15 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     }
 
     int layer_idx = -1;
-    std::string field;
-    if (!parse_block_param(lookup_name, layer_idx, field)) {
-        return nullptr;
-    }
-    const std::string base_field = strip_ssa_suffix(field);
+    const TensorSlot slot = resolve_block_slot(lookup_name, &layer_idx);
     if (layer_idx < 0 || layer_idx >= mConfig.NumLayers) {
         return nullptr;
     }
 
-    // Route through the shared slot-dispatch helpers: builtin_slot_from_name()
-    // is the single name->slot table, and block_activation_ptr/block_gradient_ptr
-    // are the single slot->RunState-buffer tables. Any new slot is added to
-    // tensor_slot_dispatch.cpp only; this function stays trivial.
-    const TensorSlot slot = builtin_slot_from_name(base_field);
+    // Route through the shared slot-dispatch helpers: resolve_block_slot()
+    // covers name parsing + slot lookup; block_activation_ptr /
+    // block_gradient_ptr are the single slot->RunState-buffer tables. Any new
+    // slot is added to tensor_slot_dispatch.cpp only; this function stays trivial.
     if (is_grad_block_name) {
         return block_gradient_ptr(mRunState, layer_idx, slot);
     }
@@ -554,10 +627,21 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
     if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
+        // Ensure the current layer's weights are present in a prefetch slot.
+        // For strict-reverse backward orders (Q3 pure attention), the prior
+        // layer_start's prefetch already did this and gather_block(layer_idx)
+        // early-returns (but re-points entry.work to the holding slot).
+        // For non-monotonic orders (Q3.5 hybrid: all attention layers
+        // first, then linear), the prior prefetch is for a layer that
+        // won't actually run next, so the current layer may not be in
+        // any slot — this call synchronously gathers it.
+        if (mComm) {
+            mWeightManager->gather_block(layer_idx, *mComm, mRunState.side_stream());
+        }
         mWeightManager->wait_for_gather(layer_idx, mRunState.MainStream);
     }
 
-    // Prefetch next layer in the current traversal direction
+    // Prefetch next layer in the current traversal direction.
     const int next_layer = layer_idx + mPrefetchDirection;
     if (next_layer >= 0 && next_layer < static_cast<int>(mConfig.NumLayers) && !mCapturing) {
         if (mWeightManager && mWeightManager->needs_block_gather()) {

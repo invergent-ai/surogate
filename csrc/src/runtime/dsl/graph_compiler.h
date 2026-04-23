@@ -11,8 +11,10 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "runtime/dsl/dsl_runtime_config.h"
@@ -227,7 +229,7 @@ struct CompiledAttrs {
     bool allow_quant = false;
 
     // Activation-slot alias point. The matmul dispatch uses this to rebind
-    // ``simplified_acts`` entries (``qkv``/``att_out``/``mlp_up``/
+    // block-scope slot entries (``qkv`` / ``att_out`` / ``mlp_up`` /
     // ``mlp_down``) to the freshly-produced matmul output so backward
     // replay reads the live buffer. Only a handful of ``ForwardHookPoint``
     // values are consumed for this purpose; they are not invoked as
@@ -355,6 +357,30 @@ enum class TensorKind : uint8_t {
     Scratch,            ///< Everything else (zeros, constants, unknown intermediates)
 };
 
+/// Typed memory region (design/buffer-runtime-v4.md, M2). Each tensor is
+/// assigned to exactly one region by derive_regions(). Shadow-only in M2; the
+/// layout pass (M3) consumes region + block_layer_idx to bake buffer offsets.
+enum class RegionKind : std::uint8_t {
+    Unknown = 0,           ///< Not yet classified (includes cross-graph forward activations in backward)
+    FwdStack,              ///< Block-scoped forward activation (bump arena; nested FwdBlock frames)
+    BwdStack,              ///< Block-scoped backward gradient / temporary (bump arena)
+    SaveForBwd,            ///< Forward activation persisted across block boundary for backward
+    Accumulator,           ///< Gradient accumulator (parameter grad + autodiff accum temps)
+    Persistent,            ///< Training-wide parameters (weights). Slab layout is owner-controlled
+                           ///< (DslParamStore / DslWeightManager / LoRA) with runtime-chosen offsets,
+                           ///< NOT the compile-time `meta.offset` (which would collide with non-weight
+                           ///< tids when WM/QLoRA clamps DslParamStore's slab to zero).
+    PersistentActivation,  ///< Training-wide non-block activations / I/O buffers (encoded, xF,
+                           ///< ln_final_rstd, output, freq_cis, d_ln_final, loss inputs). Separate
+                           ///< from Persistent because compile-time offsets are authoritative here:
+                           ///< arena base is a fixed region and rebind writes at `base + meta.offset`.
+    Recomputed,            ///< Forward activation replayed during backward (reuses FwdStack arena)
+    GatheredWeight,        ///< ZeRO-3 all-gathered weight shards (unused in Llama prototype)
+    BwdCrossLayer,  ///< Backward-produced tensor consumed by a later backward block (MoE aux-loss; unused in Llama)
+};
+
+const char* region_kind_name(RegionKind k);
+
 struct TensorMeta {
     static constexpr uint8_t kCrossLayer = 1 << 0;  // name starts with "layer"
     static constexpr uint8_t kMoeOffsets = 1 << 1;  // name == "moe_expert_offsets"
@@ -370,6 +396,33 @@ struct TensorMeta {
     int base_param_tid = -1;     ///< ParamGrad -> tid of the parameter
     int base_producer_tid = -1;  ///< ActivationGrad -> tid of the forward activation
     int base_grad_tid = -1;      ///< AccumTemp -> tid of the non-accum parent gradient
+
+    // Region assignment (populated by derive_regions() after classify_tensors).
+    RegionKind region = RegionKind::Unknown;
+
+    // Shadow-mode baked offset (populated by compute_layout()). Interpretation
+    // depends on region:
+    //   - Persistent / Accumulator: byte offset in the respective arena
+    //   - FwdStack / BwdStack:      frame-local offset (runtime adds frame base)
+    //   - SaveForBwd:               byte offset within SaveForBwd[block_layer_idx]
+    // SIZE_MAX means "not assigned" (no bytes, or not in current graph).
+    std::size_t offset = SIZE_MAX;
+
+    /// Size in bytes of the tid's storage (populated by compute_layout). Zero
+    /// for unassigned / dtype-unresolved tids.
+    std::size_t bytes = 0;
+
+    /// Backward-read-without-save-list-promotion flag. Set by
+    /// finalize_save_for_bwd for tids produced in forward and consumed in
+    /// backward that the save list filter excluded (recompute-mode
+    /// candidates). Under arena consumption these tids CANNOT be aliased
+    /// with later-forward-op outputs — replay produces them and backward
+    /// reads them after the rest of the forward frame has executed, so
+    /// their bytes must remain exclusive through the full forward op range.
+    /// The legacy Stack bump allocator preserves them automatically (no
+    /// reuse); arena coloring needs this flag to lengthen LayoutInfo's
+    /// last_use to the frame end.
+    bool retain_through_forward = false;
 
     bool is_cross_layer() const {
         return flags & kCrossLayer;
@@ -418,6 +471,78 @@ struct MlpTileGroup {
 };
 
 // ============================================================================
+// Phase Tree (design/buffer-runtime-v4.md)
+// ============================================================================
+
+/// Structural phase kinds. A phase bounds a contiguous op range
+/// [op_start, op_end). Children are nested scopes (e.g., FwdBlockSeq contains
+/// FwdBlock[i]).
+enum class PhaseKind : std::uint8_t {
+    Custom,       ///< Generic scope (prologue/epilogue; root wrapper)
+    FwdBlockSeq,  ///< Forward block sequence; fwd arena root
+    BwdBlockSeq,  ///< Backward block sequence; bwd arena root
+    FwdBlock,     ///< Single forward block; block_index set
+    BwdBlock,     ///< Single backward block; block_index set
+};
+
+const char* phase_kind_name(PhaseKind k);
+
+struct PhaseNode {
+    PhaseKind kind = PhaseKind::Custom;
+    std::size_t op_start = 0;         ///< Inclusive op index
+    std::size_t op_end = 0;           ///< Exclusive op index
+    int block_index = -1;             ///< FwdBlock/BwdBlock only; -1 otherwise
+    std::vector<PhaseNode> children;  ///< Nested scopes; op ranges are sub-ranges of parent
+    std::string label;                ///< Debug label (e.g., "FwdBlock[3]")
+};
+
+/// Pretty-print a phase tree for validation.
+std::string dump_phase_tree(const PhaseNode& root);
+
+// ============================================================================
+// Instruction Stream
+// ============================================================================
+
+/// Flat-stream primitives emitted from the phase tree. Subsumes today's
+/// implicit layer-boundary behavior (stack checkpoint/restore, save-list
+/// prep, last-use pruning). Shadow-only in M4: emitted into CompiledGraph
+/// but not yet consumed at runtime. The interpreter in M5 will execute
+/// these instructions against baked offsets.
+enum class InstKind : std::uint8_t {
+    PhaseEnter,       ///< Enter a phase (stack checkpoint if FwdBlock/BwdBlock).
+    PhaseExit,        ///< Exit a phase (stack restore if FwdBlock/BwdBlock).
+    SegmentDispatch,  ///< Execute ops [op_start, op_end); graph-captured or eager.
+    PruneByLastUse,   ///< Release tensors whose last-use falls in [op_start, op_end).
+    RecomputeBlock,   ///< Replay forward block (block_index) into FwdStack before backward dispatch.
+};
+
+const char* inst_kind_name(InstKind k);
+
+struct Instruction {
+    InstKind kind = InstKind::PhaseEnter;
+
+    // PhaseEnter / PhaseExit payload:
+    PhaseKind phase_kind = PhaseKind::Custom;
+    int block_index = -1;  ///< >= 0 for FwdBlock/BwdBlock
+
+    // SegmentDispatch / PruneByLastUse payload:
+    std::size_t op_start = 0;
+    std::size_t op_end = 0;
+    bool eager = false;  ///< SegmentDispatch only: true = eager, false = graph-captured
+};
+
+/// Pretty-print an instruction stream for validation.
+std::string dump_instruction_stream(const std::vector<Instruction>& stream);
+
+/// Static invariant check for an instruction stream. Verifies:
+///   - PhaseEnter and PhaseExit are balanced and properly nested.
+///   - SegmentDispatch op ranges cover [0, num_ops) exactly once (no gaps or
+///     overlaps) — i.e., the flat-stream partitioning is complete.
+///   - PruneByLastUse ranges are disjoint (no double-prune).
+/// Returns empty string on success; otherwise a human-readable error list.
+std::string validate_instruction_stream(const std::vector<Instruction>& stream, std::size_t num_ops);
+
+// ============================================================================
 // Compiled Graph
 // ============================================================================
 
@@ -464,6 +589,44 @@ struct CompiledGraph {
         return tensor_id_to_name[static_cast<std::size_t>(tid)];
     }
 
+    /// Debuggability (P4.7): tid -> TensorMeta with region/offset/bytes
+    /// pre-resolved. Pair with name_for_tensor_id() for error messages and
+    /// debug dumps. Returns nullptr when tid is out of range.
+    const TensorMeta* meta_for_tensor_id(int tid) const {
+        if (tid < 0 || static_cast<std::size_t>(tid) >= tensor_meta.size()) {
+            return nullptr;
+        }
+        return &tensor_meta[static_cast<std::size_t>(tid)];
+    }
+
+    /// Reverse lookup table `(layer_idx, slot) -> tid`, populated by
+    /// compute_layout. Row layout:
+    /// `slot_tid_by_layer[layer_idx][static_cast<std::size_t>(slot)]`.
+    /// Returns -1 when the (layer, slot) pair has no tid in this graph.
+    std::vector<std::array<int, static_cast<std::size_t>(TensorSlot::Mapped) + 1>> slot_tid_by_layer;
+
+    int slot_to_tid(int layer_idx, TensorSlot slot) const {
+        if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= slot_tid_by_layer.size()) {
+            return -1;
+        }
+        const auto slot_idx = static_cast<std::size_t>(slot);
+        if (slot_idx >= slot_tid_by_layer[static_cast<std::size_t>(layer_idx)].size()) {
+            return -1;
+        }
+        return slot_tid_by_layer[static_cast<std::size_t>(layer_idx)][slot_idx];
+    }
+
+    /// Debuggability (P4.7): name -> TensorMeta via name_to_id + meta_for_tensor_id.
+    const TensorMeta* meta_for_name(const std::string& name) const {
+        int tid = find_tensor_id(name);
+        return tid >= 0 ? meta_for_tensor_id(tid) : nullptr;
+    }
+
+    /// Debuggability (P4.7): format "tid=5 name='blocks[3].ln1' region=FwdStack
+    /// block=3 offset=0x1000 bytes=32768". Intended for error messages and
+    /// exception rewrites. Returns "<tid=N unknown>" when tid is invalid.
+    std::string describe_tensor_id(int tid) const;
+
     // MLP tile groups for long-context tiled execution.
     // When non-empty, the executor processes these op ranges in T-chunks.
     // Forward groups: view → matmul_up → view → swiglu → view → matmul_down → view
@@ -479,6 +642,35 @@ struct CompiledGraph {
     /// Populate layer_segments by scanning each layer for FlashAttention ops.
     /// Call after annotate_layer_boundaries().
     void compute_layer_segments();
+
+    /// Shadow-mode phase tree (design/buffer-runtime-v4.md). Built post-hoc by
+    /// GraphCompiler::build_phase_tree() after annotate_layer_boundaries().
+    /// Validates that the phase reconstruction covers every op and nests
+    /// cleanly. Empty optional if the graph has no layer boundaries (e.g.,
+    /// non-block-stacked compiles).
+    std::optional<PhaseNode> phase_tree;
+
+    /// Per-region peak bytes populated by compute_layout().
+    /// Consumed by compute_arena_sizes() to size the phase arenas.
+    std::size_t persistent_bytes = 0;
+    std::size_t persistent_activation_bytes = 0;
+    std::size_t accumulator_bytes = 0;
+    std::size_t fwd_stack_peak = 0;  // max over frames
+    std::size_t bwd_stack_peak = 0;  // max over frames
+    std::size_t save_for_bwd_bytes = 0;
+    std::vector<std::size_t> save_for_bwd_block_bytes;  // per-block sizes
+
+    /// FNV-1a 64-bit hash of the fully-baked layout (populated by
+    /// compute_layout). Mixes every tid's (region, block_layer_idx, offset,
+    /// bytes) plus the per-region peaks. Intended for distributed
+    /// determinism checks — all ranks running the same compile should
+    /// produce byte-identical hashes. `0` if compute_layout has not run.
+    std::uint64_t layout_hash = 0;
+
+    /// Shadow-mode instruction stream emitted from the phase tree (M4).
+    /// Flat linear sequence of primitives that would drive the M5 interpreter.
+    /// Empty if phase_tree is empty.
+    std::vector<Instruction> instruction_stream;
 
     // Statistics
     std::size_t total_ops = 0;
@@ -532,6 +724,35 @@ private:
 
     void annotate_layer_boundaries(CompiledGraph& graph);
 
+    /// Build the phase tree from layer boundary indices. Must be called
+    /// after annotate_layer_boundaries(). The tree wraps a prologue (ops
+    /// before the first layer), a FwdBlockSeq/BwdBlockSeq containing
+    /// per-layer FwdBlock/BwdBlock nodes, and an epilogue. When
+    /// `SUROGATE_DEBUG_PHASE_TREE=1` is set, the tree is dumped to stderr.
+    void build_phase_tree(CompiledGraph& graph, bool is_backward);
+
+    /// Assign each tid a RegionKind based on TensorMeta::kind + block_layer_idx
+    /// (populated by classify_tensors). Shadow-only in M2: consumed only by the
+    /// debug dump gated on `SUROGATE_DEBUG_REGIONS=1`. M3's layout pass will
+    /// read TensorMeta::region to bake buffer offsets.
+    void derive_regions(CompiledGraph& graph, bool is_backward);
+
+    /// Promote FwdStack tids read across layer boundaries to SaveForBwd so
+    /// the source layer's buffer survives later layers' FwdStack reuse.
+    /// Example: Gemma4 shared-KV layers read `blocks[L_source].qkv_rope` as
+    /// their `kv_source`; under shared-arena coloring the reading layer's
+    /// writes can overlap the source's bytes before flash-attention consumes
+    /// K/V, corrupting outputs. SaveForBwd is per-layer persistent, so this
+    /// restores the producer/consumer invariant across layers.
+    void promote_cross_layer_fwd_reads(CompiledGraph& graph);
+
+    /// Flatten the phase tree to a linear instruction stream (M4). Emits
+    /// PhaseEnter/PhaseExit around each phase, plus SegmentDispatch +
+    /// PruneByLastUse for leaf phases (ops live at leaves). Shadow-only;
+    /// M5's interpreter consumes this stream. Dump gated on
+    /// `SUROGATE_DEBUG_INSTR_STREAM=1`.
+    void emit_instruction_stream(CompiledGraph& graph);
+
     // Shape validation methods
     struct TensorShape {
         std::vector<long> dims;
@@ -565,6 +786,12 @@ private:
     std::vector<BlockTypeDims> mPerLayerDims;
     ShapeEnv make_layer_env(int layer_idx) const;
 
+    /// Rewrite a global-dims shape into per-layer dims when the field name
+    /// matches a per-layer-varying slot (qkv / att / q* / mlp_up / swiglu
+    /// and their _flat / _norm / _normed variants). No-op for non-hybrid
+    /// models (mPerLayerDims empty) or unrecognized fields.
+    void apply_per_layer_dim_override(std::vector<long>& shape, const std::string& base_field, int layer_idx) const;
+
     // Tensor ID assignment state (per-compile, reset at start of compile())
     std::unordered_map<std::string, int> mTensorIdMap;  // name -> tensor_id
     int mNextTensorId = 0;
@@ -585,6 +812,168 @@ private:
     // only; callers still use the legacy predicates until Phase 1 flips them).
     void classify_tensors(CompiledGraph& graph);
 };
+
+/// Layout peaks + offset baking. For each region, computes offsets and peak bytes:
+///   - Persistent, Accumulator, SaveForBwd: bump (sum of tensor bytes)
+///   - FwdStack, BwdStack: per-block-frame first-fit-by-offset coloring
+/// Writes TensorMeta::offset for every live tid and populates
+/// graph.layout_hash for distributed determinism checks. Dump gated on
+/// `SUROGATE_DEBUG_LAYOUT=1`.
+void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_sections = false);
+
+/// Recompute the FNV-1a 64-bit layout hash from tensor_meta + peaks. Called
+/// internally by compute_layout(); exposed so distributed init can
+/// cross-check graph.layout_hash across ranks (NCCL/MPI allreduce on the
+/// 64-bit value; any mismatch means coloring / region assignment diverged
+/// and the ranks would run incompatible buffer plans).
+std::uint64_t compute_layout_hash(const CompiledGraph& graph);
+
+/// Phase-tree arena allocator. Allocates one flat device buffer per region
+/// family. Sizes computed from TensorMeta::offset + bytes across both fwd
+/// and bwd compiles — the union size, since fwd and bwd frames reuse the
+/// same stack arenas at different times.
+struct PhaseArenas {
+    std::byte* persistent_ptr = nullptr;
+    std::size_t persistent_bytes = 0;
+
+    // PersistentActivation: training-wide non-block activations / I/O buffers.
+    // Arena base is a fixed region; rebind writes at `base + meta.offset`.
+    // Separate from the Persistent arena so WM/LoRA/QLoRA can claim the
+    // Persistent arena without colliding with compile-time activation offsets.
+    std::byte* persistent_activation_ptr = nullptr;
+    std::size_t persistent_activation_bytes = 0;
+
+    std::byte* accumulator_ptr = nullptr;
+    std::size_t accumulator_bytes = 0;
+
+    // FwdStack / BwdStack: peak across all block frames (frames don't coexist).
+    std::byte* fwd_stack_ptr = nullptr;
+    std::size_t fwd_stack_bytes = 0;
+
+    std::byte* bwd_stack_ptr = nullptr;
+    std::size_t bwd_stack_bytes = 0;
+
+    // SaveForBwd: concatenated per-block slots. Block i's save slot starts at
+    // save_for_bwd_ptr + save_for_bwd_block_bases[i].
+    std::byte* save_for_bwd_ptr = nullptr;
+    std::size_t save_for_bwd_bytes = 0;
+    std::vector<std::size_t> save_for_bwd_block_bases;
+
+    // Unified stack arena. Sized to match the DeviceMemoryStack capacity
+    // so DslRunState.Stack can be rebased onto this buffer via
+    // set_stack_buffer(). Separate from fwd_stack_bytes / bwd_stack_bytes
+    // because those are block-local coloring peaks and don't cover
+    // non-block ops (LM-head d_logits, embeddings, prologue temps).
+    std::byte* unified_stack_ptr = nullptr;
+    std::size_t unified_stack_bytes = 0;
+
+    // BwdCrossLayer arena. Bump-allocator destination for tids produced
+    // during backward that survive past their block's layer_end
+    // (d_router_logits for MoE aux-loss, cross-layer d_residuals).
+    std::byte* bwd_cross_layer_ptr = nullptr;
+    std::size_t bwd_cross_layer_bytes = 0;
+
+    // MoE-saved arena. Cross-step monotonic bump allocator for the
+    // name-keyed persistent buffers MoE routing saves at layer boundaries
+    // (compiled_ops_save.cpp save_moe_layer_tensors +
+    // prepare_saved_buffers_for_capture + persist_saved_source_now).
+    std::byte* moe_saved_ptr = nullptr;
+    std::size_t moe_saved_bytes = 0;
+
+    bool allocated = false;
+};
+
+/// Compute arena sizes from baked offsets in both graphs. Must be called after
+/// finalize_save_for_bwd(). Does NOT cudaMalloc — just populates sizes.
+void compute_arena_sizes(PhaseArenas& arenas,
+                         const CompiledGraph& fwd,
+                         const CompiledGraph& bwd,
+                         int num_layers,
+                         std::size_t stack_bytes = 0,
+                         std::size_t bwd_cross_layer_bytes = 0,
+                         std::size_t moe_saved_bytes = 0);
+
+/// cudaMalloc all arenas at their computed sizes. arenas.allocated is set to
+/// true on success. Safe to call only after compute_arena_sizes().
+void allocate_phase_arenas(PhaseArenas& arenas);
+
+/// cudaFree all arenas and reset pointers.
+void release_phase_arenas(PhaseArenas& arenas);
+
+/// Resolve a tid to its arena-backed device pointer (what the pointer WOULD
+/// be if the arena was consumed for this region). Returns nullptr if:
+///   - arenas is not allocated
+///   - tid is out of range
+///   - TensorMeta::region is not an arena-backed region
+///   - TensorMeta::offset is SIZE_MAX (unassigned)
+///   - region is FwdStack/BwdStack but the block_layer_idx is invalid
+/// Caller supplies the block contexts so block-scoped regions resolve to the
+/// correct frame base; pass -1 when outside a block.
+std::byte* resolve_tid_in_arena(const PhaseArenas& arenas, const CompiledGraph& graph, int tid);
+
+/// Shadow-mode validator reporting how well the arena plan covers the graph's
+/// live tids. Self-contained — uses TensorMeta::{region, offset, bytes}
+/// populated by compute_layout(); no runtime state required. Logs when
+/// `SUROGATE_DEBUG_ARENA_COVERAGE=1`.
+struct ArenaCoverage {
+    std::size_t covered = 0;        // tids whose region has an allocated arena slot
+    std::size_t total = 0;          // tids with region != Unknown
+    std::size_t size_exceeded = 0;  // offset+bytes past the arena's capacity
+};
+ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledGraph& graph);
+
+/// Op-operand coverage audit. Counts how many TensorRef uses (across all
+/// ops' inputs + outputs) index a tid that would be served by a baked
+/// arena read — i.e. meta.region != Unknown AND the corresponding arena
+/// is allocated.
+///
+/// Distinct from ArenaCoverage, which counts distinct tids. Operands are
+/// the reads that actually matter at dispatch time: one tid consumed by N
+/// ops contributes N here.
+struct OpOperandCoverage {
+    std::size_t covered_inputs = 0;   ///< op.inputs entries with an arena-served tid
+    std::size_t covered_outputs = 0;  ///< op.outputs entries with an arena-served tid
+    std::size_t total_inputs = 0;
+    std::size_t total_outputs = 0;
+    std::array<std::size_t, 10> by_region{};  ///< per-RegionKind count of covered operands
+};
+OpOperandCoverage validate_op_operand_coverage(const PhaseArenas& arenas, const CompiledGraph& graph);
+
+/// Hot-path accessor for the baked (region, offset, bytes, dtype) operand
+/// view. Resolves `ref.tensor_id` against `graph.tensor_meta`. `dtype`
+/// comes from the ref (per-use overrides are legal), everything else from
+/// the tid. Returns nullopt if the tid is out of range, the region is
+/// Unknown, or the offset is unassigned.
+struct BakedOperand {
+    RegionKind region;
+    int block_layer_idx;
+    std::size_t offset;
+    std::size_t bytes;
+    ETensorDType dtype;
+};
+std::optional<BakedOperand> baked_view(const CompiledGraph& graph, const TensorRef& ref);
+
+/// Cross-graph SaveForBwd promotion. derive_regions() runs per-direction
+/// and cannot see across the pair, so block activations that are produced
+/// in forward and consumed in backward land in FwdStack / BwdStack. This
+/// pass walks both graphs, identifies shared tids, and promotes their
+/// region to SaveForBwd in both compiles, then re-runs compute_layout()
+/// on both so offsets reflect the final region assignment. Safe to call
+/// once per (forward, backward) compile pair; idempotent.
+///
+/// When `save_names` is provided, promotion is restricted to tids whose
+/// name appears in the set — matching the runtime save list
+/// (GraphExecutor::mSaveList). Tids that cross the fwd→bwd boundary but
+/// are NOT in the save list (handled via Stack or recompute at runtime)
+/// stay in FwdStack / BwdStack. Passing an empty set promotes zero tids
+/// (valid in recompute/forward-replay modes where the runtime never
+/// consumes arena-backed saves). Passing
+/// `std::nullopt` disables filtering entirely, preserving prior behavior
+/// for callers that haven't plumbed the save list.
+void finalize_save_for_bwd(CompiledGraph& fwd,
+                           CompiledGraph& bwd,
+                           std::optional<std::unordered_set<std::string>> save_names = std::nullopt,
+                           bool fwd_per_layer_sections = false);
 
 }  // namespace dsl
 

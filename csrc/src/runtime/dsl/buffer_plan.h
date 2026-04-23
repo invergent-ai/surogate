@@ -5,7 +5,7 @@
 //
 // Historically, `DslRunState::allocate_simplified_{activations,gradients}`
 // computed per-slot sharing/sizing decisions inline at runtime-init time
-// (re-reading `RuntimeOptions`, querying `TensorSlotRegistry::should_share`,
+// (re-reading `RuntimeOptions`, querying the slot registry's share policy,
 // resolving hybrid dims, etc.). That made the decisions hard to reason about
 // in isolation and mixed policy with mechanism.
 //
@@ -44,32 +44,16 @@ struct CompiledGraph;  // fwd — defined in graph_compiler.h; used by stack-siz
 /// be sized and shared. Built once per (B, T, options) via `BufferPlan::build`,
 /// then consumed by `DslRunState` during allocation.
 struct BufferPlan {
-    // ---------------- Activation sharing decisions ----------------
-    bool share_ln1 = false;
-    bool share_ln2 = false;
-    bool share_qkv = false;
-    bool share_att = false;  ///< when true, also shares `lse`
-    bool share_att_out = false;
-    bool share_mlp_up = false;
-    bool share_swiglu = false;
-    bool share_residual_att = false;
-    bool share_mlp_down = false;
-    bool share_qk_rstd = false;  ///< only meaningful when `use_qk_norm`
-
-    // ---------------- Gradient sharing decisions ----------------
-    bool share_grads = false;          ///< d_ln1/d_ln2/d_res_att/d_att_out shared
-    bool share_d_att = false;          ///< d_att shared only when attn dims are uniform
-    bool share_res_ffn_grad = false;   ///< alternating d_res_ffn[0/1]
-    bool share_mlp_down_grad = false;  ///< alternating d_mlp_down[0/1]
-
     // ---------------- Stack-based temps ----------------
     bool ffn_temps_on_stack = false;
     bool can_recompute_ffn_temps = false;
     bool large_bwd_temps_on_stack = false;
 
     // ---------------- QKV / qkv_rope ----------------
-    bool allocate_shared_qkv_rope = false;  ///< lora_only && recompute && use_qk_norm
-    bool need_separate_qkv_rope = false;    ///< recompute && use_qk_norm
+    // allocate_shared_qkv_rope removed (was part of forward-activation
+    // sharing; the per-layer qkv_rope buffer is now always allocated
+    // when need_separate_qkv_rope is true).
+    bool need_separate_qkv_rope = false;  ///< recompute && use_qk_norm
 
     // ---------------- Slot availability ----------------
     bool has_mlp_up_slot = false;
@@ -105,8 +89,6 @@ struct BufferPlan {
 
     /// Empty for homogeneous models.
     std::vector<BlockTypeDims> per_layer_dims;
-    /// KV-source layers whose QKV must be persisted (not shared).
-    std::unordered_set<int> kv_source_layers;
 
     ETensorDType act_dtype = ETensorDType::BF16;
     ETensorDType grad_dtype = ETensorDType::BF16;
@@ -114,9 +96,6 @@ struct BufferPlan {
     // ---------------- Accessors ----------------
     [[nodiscard]] bool has_per_layer_dims() const {
         return !per_layer_dims.empty();
-    }
-    [[nodiscard]] bool is_kv_source(int layer_idx) const {
-        return kv_source_layers.count(layer_idx) > 0;
     }
     [[nodiscard]] bool has_moe() const {
         return NumExperts > 0;

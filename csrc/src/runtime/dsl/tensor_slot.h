@@ -67,8 +67,6 @@ enum class TensorSlot : std::uint8_t {
     DLoss,
     // Named parameter (uses name lookup)
     Parameter,
-    // Temporary (stack-allocated)
-    Temporary,
     // Saved tensor (from forward pass)
     Saved,
     // Already in tensor map

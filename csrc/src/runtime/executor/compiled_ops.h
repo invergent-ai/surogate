@@ -187,8 +187,24 @@ public:
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
     void set_save_list(const std::vector<std::string>* save_list);
+
+    /// Bind phase-tree arenas. When set and arenas are allocated,
+    /// persist_saved_layer_tensors writes SaveForBwd tids directly into the
+    /// pre-allocated arena slot instead of cudaMalloc'ing per-name buffers.
+    void set_phase_arenas(dsl::PhaseArenas* arenas) {
+        mPhaseArenas = arenas;
+        mBwdZeroListBuilt = false;  // arena pointers changed; rebuild on next bwd
+    }
     void set_forward_plan(std::vector<LayerForwardPlan>* plan) {
         mForwardPlan = plan;
+    }
+
+    /// Share the forward compiled graph so execute_backward can pre-bind
+    /// cross-graph forward-activation tids (region=Unknown in the bwd
+    /// graph, but FwdStack in the fwd graph) into mTensors at backward
+    /// entry via snapshot/restore.
+    void set_forward_graph(const CompiledGraph* graph) {
+        mForwardGraph = graph;
     }
 
     // For embedding backward (requires CPU-side inputs for deterministic bucketing)
@@ -224,6 +240,21 @@ public:
     // This avoids cudaMalloc during capture when recompute requires persistent saves.
     void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list,
                                            const CompiledGraph* capture_graph = nullptr);
+
+    /// Tid-only slot resolver: returns `&mTensors[tid]` when slot_to_tid
+    /// resolves AND the tid has populated Data. Returns nullptr otherwise.
+    /// `DslRunState::active_executor_slot` calls this through the
+    /// active-executor back-reference so `block_activation_ptr` can
+    /// dispatch tid-first without recursion.
+    Tensor* executor_tid_slot(int layer_idx, TensorSlot slot);
+
+    /// Non-guarded variant: returns &mTensors[tid] for any valid tid
+    /// regardless of Data state. Writers (mutation sites that set `.Data`
+    /// or call temp_acquire on the returned pointer) need this; the
+    /// guarded variant rejects null-Data entries which makes it unusable
+    /// for "allocate then bind" patterns. Safe because populate_bwd_
+    /// stack_bindings seeds shape/dtype at bwd entry.
+    Tensor* executor_tid_slot_binding(int layer_idx, TensorSlot slot);
 
 private:
     // Execute an MLP tile group in chunks along the sequence dimension.
@@ -364,6 +395,52 @@ private:
     // Tensor resolution (pre-resolved, O(1) lookup)
     Tensor& resolve_tensor(const TensorRef& ref);
     Tensor& ensure_output_tensor(const TensorRef& ref);
+
+    /// Runtime check gated on SUROGATE_CHECK_OP_IO_ALIASING. Two independent
+    /// validators, both logged and (when the env is set to "abort") fatal:
+    ///   (1) Within-op aliasing. cuBLAS GEMM and similar kernels have
+    ///       undefined behavior when input and output share bytes; this
+    ///       catches compile-time coloring that under-reserves a tid.
+    ///   (2) Read-after-write provenance. Tracks the tid that last wrote
+    ///       each (Data, bytes) range in a provenance map; when a later
+    ///       op reads a range whose last-write tid differs from its own
+    ///       input tid, flag. Catches cross-op/cross-layer clobbers
+    ///       where the address is structurally shared by multiple tids
+    ///       (e.g., single-arena FwdStack with all layers' BlockLN1
+    ///       routed to one offset) and a scope bug let one tid's write
+    ///       overwrite another's still-live data.
+    void check_op_io_aliasing(const CompiledOp& op, std::size_t op_idx, const char* phase);
+
+    /// Tid-baked operand binder. Returns the Tensor in
+    /// `mTensors[tid]` after ensuring it points at the arena-backed
+    /// storage for this tid. Handles the arena-backed regions
+    /// (Persistent, Accumulator, FwdStack, BwdStack, SaveForBwd) by
+    /// materializing `{arena_ptr + meta.offset, ref.shape, ref.dtype}`
+    /// into `mTensors[tid]` on first access. Returns nullptr for tids
+    /// that:
+    ///   - have no assigned region (Unknown) or offset (SIZE_MAX);
+    ///   - live in a region not yet migrated (BwdCrossLayer, MoeSaved —
+    ///     those use name-keyed bookkeeping that can't be tid-baked
+    ///     from a simple offset);
+    ///   - have a SaveForBwd slot but `block_layer_idx < 0` (malformed).
+    /// Subsequent calls for the same tid return the cached Tensor without
+    /// re-constructing it. Caller must fall through to existing dispatch
+    /// (mNamedTensors, slot helpers) when this returns nullptr.
+    ///
+    /// Initially wired only as a shortcut inside `resolve_tensor()`; the
+    /// design doc at `design/tid-baked-dispatch.md` sequences the
+    /// follow-on milestones that make this the authoritative path.
+    Tensor* bind_from_region(int tid, const TensorRef& ref);
+
+    /// Pre-populate `mTensors[tid]` for every FwdStack tid in `graph` with
+    /// an arena-backed Tensor (`Data = fwd_stack_ptr + meta.offset`,
+    /// shape/dtype from the producing op output ref). Runs after every
+    /// `mTensors.assign` so block-scope forward ops dispatched via the
+    /// Mapped-slot path hit the `mTensors[tid].Data` cache in
+    /// `ensure_output_tensor` and skip `mRunState.temp_alloc()`.
+    void populate_fwd_stack_bindings(const CompiledGraph& graph);
+    void populate_bwd_stack_bindings(const CompiledGraph& graph);
+
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
 
@@ -445,6 +522,7 @@ private:
     bool mRecomputeUseGraphs = true;
     int mLastRecomputeLayer = -1;
     NCCLCommunicator* mComm = nullptr;
+    const CompiledGraph* mForwardGraph = nullptr;  // set via set_forward_graph
 
     // Caches
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8Cache = nullptr;
@@ -453,7 +531,40 @@ private:
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4CacheT = nullptr;
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
     const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
-    std::unordered_set<std::string> mSaveSet;             // Fast lookup for save list
+    dsl::PhaseArenas* mPhaseArenas = nullptr;             // Non-owning; set via set_phase_arenas
+    // Per-step bump cursor into the bwd_cross_layer arena. Reset at the
+    // start of each backward call; advanced by allocate_bwd_cross_layer.
+    std::size_t mBwdCrossLayerBumpOffset = 0;
+    // cudaMalloc fallbacks taken when the arena is exhausted (hybrid models
+    // with large per-layer attn_dim variance can overflow the fixed-size
+    // arena). Freed at the start of each backward call alongside the bump
+    // offset reset.
+    std::vector<std::byte*> mBwdCrossLayerFallbacks;
+
+    // Cross-step monotonic bump cursor into the moe_saved arena. Never
+    // reset — MoE save buffers are keyed by name and persist for the
+    // executor's lifetime. Size growth re-bumps (same semantics as the
+    // cudaFree+cudaMalloc cycle, which also wastes the old buffer).
+    std::size_t mMoeSavedBumpOffset = 0;
+    std::unordered_map<std::string, bool> mMoeSavedArenaBacked;
+
+    /// Allocate `nbytes` in `mPhaseArenas.bwd_cross_layer_ptr`. The arena
+    /// is sized at 64 MiB (see graph_executor.cpp) and reset per step.
+    /// Throws when the arena isn't bound. On exhaustion, falls back to
+    /// cudaMalloc; the fallback pointers are tracked in
+    /// `mBwdCrossLayerFallbacks` and released at the start of the next
+    /// backward call.
+    std::byte* allocate_bwd_cross_layer(std::size_t nbytes);
+
+    /// Allocate `nbytes` for an MoE save buffer. Cross-step monotonic bump in
+    /// mPhaseArenas.moe_saved_ptr; cudaMalloc fallback when arena exhausted or
+    /// unbound. Caller owns cudaFree of non-arena_backed pointers.
+    struct MoeSavedAlloc {
+        std::byte* ptr = nullptr;
+        bool arena_backed = false;
+    };
+    MoeSavedAlloc allocate_moe_saved(std::size_t nbytes);
+    std::unordered_set<std::string> mSaveSet;  // Fast lookup for save list
     std::vector<LayerForwardPlan>* mForwardPlan = nullptr;
     std::function<void(const std::vector<std::string>&, int)> mDebugDumpFn;
     std::function<void(int)> mDebugDumpLayerFn;
@@ -482,8 +593,52 @@ private:
     std::size_t mDeferredReplayTempMark = 0;
     std::vector<void*> mReplayCopiedBuffers;  // persistent copies of stack-resident saved tensors
 
+    // Pre-allocated arena used by replay_layer_forward's stack-to-persistent
+    // copies. The arena's base pointer is stable across CUDA graph captures
+    // and replays (unlike cudaMallocAsync inside a captured graph, which
+    // bakes a capture-time pointer that's re-allocated at replay, yielding
+    // stale pointers in captured kernels). Bump-allocated; offset reset at
+    // each replay-layer entry so only the current layer's copies occupy
+    // the arena.
+    std::byte* mReplayPersistArena = nullptr;
+    std::size_t mReplayPersistCapacity = 0;
+    std::size_t mReplayPersistOffset = 0;
+
+    /// Bump-allocate `bytes` from the replay-persist arena. Allocates the
+    /// arena lazily on first call, rounded up to at least 256 MiB. Returns
+    /// nullptr if the request is larger than what the arena can provide
+    /// (caller falls back to cudaMallocAsync).
+    std::byte* allocate_replay_persist(std::size_t bytes);
+
+    /// Pre-allocate the replay-persist arena if not yet allocated. Must be
+    /// called outside any CUDA stream capture (cudaMalloc during capture
+    /// is illegal). Called by execute_forward at step entry so subsequent
+    /// backward capture sees a stable arena base pointer.
+    void ensure_replay_persist_arena();
+
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;
+
+    // Provenance map for SUROGATE_CHECK_OP_IO_ALIASING's read-after-write
+    // validator. Keys are byte-range start pointers; values are the
+    // (slot, layer_idx) pair of the last output written there plus
+    // diagnostic metadata. Reads compare (slot, layer_idx) — not tid —
+    // so legitimate slot-alias views (e.g., `blocks[0].x_flat` reading a
+    // buffer just written as `blocks[0].ln1`, both resolving to
+    // BlockLN1) don't trigger. A genuine violation is same address, same
+    // slot, but DIFFERENT layer — under shared-arena routing that means
+    // layer M's write landed where layer N still expected its own data.
+    // Populated only when the env flag is active.
+    struct ProvenanceEntry {
+        int slot = 0;
+        int layer_idx = -1;
+        int tid = -1;
+        std::size_t op_idx = 0;
+        std::size_t bytes = 0;
+        std::string name;
+        std::string phase;
+    };
+    std::unordered_map<const std::byte*, ProvenanceEntry> mProvenance;
 
     // Integer-indexed tensor storage (flat vector indexed by compile-time tensor IDs).
     // Indexed by TensorRef::tensor_id assigned during graph compilation.
@@ -491,6 +646,16 @@ private:
     std::vector<Tensor> mTensors;
     // Name-indexed tensor overrides for cases where multiple tensor names share one tensor_id/slot.
     std::unordered_map<std::string, Tensor> mNamedTensors;
+    // Snapshot of forward's end-state mTensors / mNamedTensors, taken at
+    // execute_forward exit (before save_tensors). Restored into mTensors /
+    // mNamedTensors at execute_backward entry so backward ops see forward's
+    // authoritative runtime pointers — including matmul_swiglu's live-buffer
+    // rebinds, Stack-backed temps, and Mapped-slot intermediates.
+    std::vector<Tensor> mForwardTensorsSnapshot;
+    std::unordered_map<std::string, Tensor> mForwardNamedTensorsSnapshot;
+    /// Guard so populate_bwd_stack_bindings builds the activation-gradient
+    /// zero list once per compile (not once per bwd step).
+    bool mBwdZeroListBuilt = false;
     std::vector<bool> mSaveMask;  // Per-tensor-id: true if in save list (for prune)
     const CompiledGraph* mCurrentGraph = nullptr;
 
@@ -519,12 +684,25 @@ private:
         }
     }
 
+    /// Invalidate cached Tensor entries for a slot whose backing storage
+    /// is about to be freed (e.g. a Stack-allocated slot at layer_end).
+    /// Erases mNamedTensors[name] AND nulls mTensors[tid].Data so
+    /// resolve_tensor / ensure_output_tensor re-resolve on next access
+    /// rather than returning a dangling pointer. Safe on unknown names.
+    void invalidate_cached_slot(const std::string& name) {
+        if (!name.empty()) {
+            mNamedTensors.erase(name);
+        }
+        if (mCurrentGraph) {
+            const int id = mCurrentGraph->find_tensor_id(name);
+            if (id >= 0 && id < static_cast<int>(mTensors.size())) {
+                mTensors[static_cast<std::size_t>(id)].Data = nullptr;
+            }
+        }
+    }
+
     // Gradient accumulation tracking (set of gradient tensor names that need accumulation)
     std::unordered_set<std::string> mAccumulateTensors;
-
-    // Cross-layer backward tensors persisted from stack to cudaMalloc.
-    // Freed at end of backward pass.
-    std::vector<std::byte*> mPersistedBackwardTensors;
 
     // Persistent storage for MoE expert_offsets (needs to survive from forward to backward)
     std::vector<int> mMoEExpertOffsetsData;

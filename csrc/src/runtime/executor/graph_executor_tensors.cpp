@@ -10,6 +10,8 @@
 
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
+#include "runtime/dsl/tensor_slot_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/dsl/ir.h"
 #include "utilities/tensor.h"
@@ -45,62 +47,18 @@ Tensor* resolve_block_activation_tensor(ExecState& st,
         return &it->second;
     };
 
-    auto& acts = st.rs.simplified_acts(layer_idx);
-    if (field == "ln1") return map_tensor(acts.ln1);
-    if (field == "ln1_rstd") return map_tensor(acts.ln1_rstd);
-    if (field == "ln2") return map_tensor(acts.ln2);
-    if (field == "ln2_rstd") return map_tensor(acts.ln2_rstd);
-    if (field == "q_rstd") return map_tensor(acts.q_rstd);
-    if (field == "k_rstd") return map_tensor(acts.k_rstd);
-    if (field == "ln1_flat") return map_tensor(acts.ln1);
-    if (field == "ln2_flat") return map_tensor(acts.ln2);
-    if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased") {
-        return map_tensor(acts.qkv);
+    // Dispatch via the shared slot helpers — every field alias (`ln1_flat`,
+    // `qkv_biased`, etc.) is in the name→slot table, and block_activation_ptr
+    // handles the qkv_rope fallback internally.
+    const TensorSlot slot = builtin_slot_from_name(field);
+    if (Tensor* t = block_activation_ptr(st.rs, layer_idx, slot)) {
+        return map_tensor(*t);
     }
-    if (field == "qkv_rope") {
-        if (acts.qkv_rope.Data) {
-            return map_tensor(acts.qkv_rope);
-        }
-        return map_tensor(acts.qkv);
-    }
-    if (field == "lse") return map_tensor(acts.lse);
-    if (field == "att" || field == "att_flat") return map_tensor(acts.att);
-    if (field == "att_out" || field == "att_out_flat") return map_tensor(acts.att_out);
-    if (field == "res_att") return map_tensor(acts.residual_att);
-    if (field == "mlp_up" || field == "mlp_up_flat") return map_tensor(acts.mlp_up);
-    if (field == "swiglu") return map_tensor(acts.swiglu);
-    if (field == "mlp_down" || field == "mlp_down_flat") return map_tensor(acts.mlp_down);
-    if (field == "res_ffn" || field == "res_in") {
-        Tensor& res = st.rs.get_residual(layer_idx, st.rs.MainStream);
-        return map_tensor(res);
-    }
-
     return nullptr;
 }
 
 Tensor* block_activation_base_ptr(DslRunState& rs, int layer_idx, const std::string& field) {
-    auto& acts = rs.simplified_acts(layer_idx);
-    if (field == "ln1" || field == "ln1_flat") return &acts.ln1;
-    if (field == "ln1_rstd") return &acts.ln1_rstd;
-    if (field == "ln2" || field == "ln2_flat") return &acts.ln2;
-    if (field == "ln2_rstd") return &acts.ln2_rstd;
-    if (field == "q_rstd") return &acts.q_rstd;
-    if (field == "k_rstd") return &acts.k_rstd;
-    if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased") return &acts.qkv;
-    if (field == "qkv_rope") {
-        return acts.qkv_rope.Data ? &acts.qkv_rope : &acts.qkv;
-    }
-    if (field == "lse") return &acts.lse;
-    if (field == "att" || field == "att_flat") return &acts.att;
-    if (field == "att_out" || field == "att_out_flat") return &acts.att_out;
-    if (field == "res_att") return &acts.residual_att;
-    if (field == "mlp_up" || field == "mlp_up_flat") return &acts.mlp_up;
-    if (field == "swiglu") return &acts.swiglu;
-    if (field == "mlp_down" || field == "mlp_down_flat") return &acts.mlp_down;
-    if (field == "res_ffn" || field == "res_in") {
-        return &rs.get_residual(layer_idx, rs.MainStream);
-    }
-    return nullptr;
+    return block_activation_ptr(rs, layer_idx, builtin_slot_from_name(field));
 }
 
 Tensor* resolve_recomputed_block_tensor(ExecState& st, const std::string& name) {
@@ -148,34 +106,11 @@ Tensor* resolve_block_activation_base(ExecState& st, const std::string& name) {
         return &it->second;
     };
 
-    auto& acts = st.rs.simplified_acts(layer_idx);
-    if (field == "ln1" || field == "ln1_flat") return map_tensor(acts.ln1);
-    if (field == "ln1_rstd") return map_tensor(acts.ln1_rstd);
-    if (field == "ln2" || field == "ln2_flat") return map_tensor(acts.ln2);
-    if (field == "ln2_rstd") return map_tensor(acts.ln2_rstd);
-    if (field == "q_rstd") return map_tensor(acts.q_rstd);
-    if (field == "k_rstd") return map_tensor(acts.k_rstd);
-    if (field == "qkv" || field == "qkv_flat" || field == "qkv_biased") {
-        return map_tensor(acts.qkv);
+    // Same dispatch as resolve_block_activation_tensor but without shape/dtype
+    // view wrapping — callers here pre-infer the shape and bind directly.
+    if (Tensor* t = block_activation_ptr(st.rs, layer_idx, builtin_slot_from_name(field))) {
+        return map_tensor(*t);
     }
-    if (field == "qkv_rope") {
-        if (acts.qkv_rope.Data) {
-            return map_tensor(acts.qkv_rope);
-        }
-        return map_tensor(acts.qkv);
-    }
-    if (field == "lse") return map_tensor(acts.lse);
-    if (field == "att" || field == "att_flat") return map_tensor(acts.att);
-    if (field == "att_out" || field == "att_out_flat") return map_tensor(acts.att_out);
-    if (field == "res_att") return map_tensor(acts.residual_att);
-    if (field == "mlp_up" || field == "mlp_up_flat") return map_tensor(acts.mlp_up);
-    if (field == "swiglu") return map_tensor(acts.swiglu);
-    if (field == "mlp_down" || field == "mlp_down_flat") return map_tensor(acts.mlp_down);
-    if (field == "res_ffn" || field == "res_in") {
-        Tensor& res = st.rs.get_residual(layer_idx, st.rs.MainStream);
-        return map_tensor(res);
-    }
-
     return nullptr;
 }
 
@@ -212,33 +147,16 @@ Tensor* resolve_block_gradient_tensor(ExecState& st,
         return &it->second;
     };
 
-    auto& grads = st.rs.simplified_grads(layer_idx);
-    if (field == "ln1" || field == "ln1_flat") return map_tensor(grads.d_ln1);
-    if (field == "qkv" || field == "qkv_rope" || field == "qkv_flat" || field == "qkv_biased") {
-        return map_tensor(grads.d_qkv);
+    // Look up the gradient slot. The name→slot table already encodes the
+    // activation→gradient mapping (qkv_rope → BlockDQKV, att_flat → BlockDAtt,
+    // etc.), so the same field name as the activation side maps to the
+    // correct BlockD* slot. Separate d_att_out / d_res_att storage is
+    // handled by block_gradient_ptr — in standard transformers the two
+    // are aliased, in hybrid they're independent buffers.
+    const std::string grad_field = "d_" + field;
+    if (Tensor* t = block_gradient_ptr(st.rs, layer_idx, builtin_slot_from_name(grad_field))) {
+        return map_tensor(*t);
     }
-    if (field == "att" || field == "att_flat") return map_tensor(grads.d_att);
-    if (field == "att_out" || field == "att_out_flat") {
-        // Separate storage: d_att_out is the gradient of the O-proj output,
-        // d_res_att is the gradient of the residual input to the block.
-        // In standard transformers (res_att = x + att_out) they're equal;
-        // in hybrid architectures (Nemotron-H) they're independent.
-        return map_tensor(grads.d_att_out);
-    }
-    if (field == "swiglu") {
-        return map_tensor(grads.d_swiglu);
-    }
-    if (field == "mlp_up") {
-        return map_tensor(grads.d_mlp_up);
-    }
-    if (field == "mlp_down" || field == "mlp_down_flat") {
-        return map_tensor(grads.d_mlp_down);
-    }
-    if (field == "h_out") return map_tensor(grads.d_h_out);
-    if (field == "ln2" || field == "ln2_flat") return map_tensor(grads.d_ln2);
-    if (field == "res_att") return map_tensor(grads.d_res_att);
-    if (field == "res_ffn" || field == "res_in") return map_tensor(grads.d_res_ffn);
-
     return nullptr;
 }
 

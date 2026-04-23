@@ -143,6 +143,24 @@ public:
      */
     [[nodiscard]] std::size_t num_parameters() const;
 
+    /// Total bytes of LoRA adapter storage (master + work, over every
+    /// layer / projection / MoE expert). `GraphExecutor::compile_graphs`
+    /// reads this to extend `mPhaseArenas.persistent_bytes` before
+    /// allocating the arena. Zero when LoRA is disabled.
+    [[nodiscard]] std::size_t total_persistent_bytes() const;
+
+    /// Route LoRA adapter storage through a slab of the Persistent arena.
+    /// For each allocated master and work tensor, `cudaMemcpyAsync` the
+    /// current bytes into the slab at a bump offset, `mAllocator->free`
+    /// the original buffer, and rebind `.Data` to the slab offset. Must
+    /// be called after `allocate_phase_arenas` AND after the base-weight
+    /// and DslWeightManager rebinds (so earlier slots are already backing
+    /// their owners). `arena_base` is expected to be the offset
+    /// immediately past those regions; `max_bytes` is the capacity
+    /// reserved for LoRA (matches `total_persistent_bytes()`). Returns
+    /// actual bytes consumed (<= max_bytes).
+    std::size_t rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream);
+
     // ITensorContainer interface
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 

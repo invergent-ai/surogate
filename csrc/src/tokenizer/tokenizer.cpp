@@ -193,9 +193,26 @@ struct Tokenizer::Impl {
             out.push_back(static_cast<int32_t>(it->second));
             return;
         }
-        // BPE merge
+        // BPE merge — byte fallback inside EncoderLookup::get covers bytes
+        // that only exist in the vocab as "<0xXX>" forms. Defense in depth:
+        // any RANK_MAX that slips through here means the vocab doesn't have
+        // a byte at all, which would silently land as -1 in input_ids and
+        // crash the embedding kernel at runtime. Surface it at tokenize
+        // time with a clear error instead.
         auto ranks = byte_pair_encode(reinterpret_cast<const uint8_t*>(piece.data()), piece.size(), *encoder_lookup);
         for (Rank r : ranks) {
+            if (r == RANK_MAX) {
+                std::string hex;
+                for (size_t i = 0; i < piece.size() && i < 16; ++i) {
+                    char buf[4];
+                    std::snprintf(buf, sizeof(buf), "%02X ", static_cast<unsigned char>(piece[i]));
+                    hex += buf;
+                }
+                throw std::runtime_error("Tokenizer::encode_piece: BPE produced an unresolvable byte sequence "
+                                         "(piece_len=" +
+                                         std::to_string(piece.size()) + ", hex=" + hex +
+                                         "). Vocab is missing raw-byte and <0xXX> entries for at least one byte.");
+            }
             out.push_back(static_cast<int32_t>(r));
         }
     }

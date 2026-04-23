@@ -196,7 +196,7 @@ void NorMuonOptimizer::init_state(dsl::DslModel& model, cudaStream_t stream) {
                              stream);
     }
 
-    // Phase 3: allocate NorMuon state tensors
+    // allocate NorMuon state tensors
     if (state.normuon_state_elems > 0) {
         state.momentum_quantiles = model.mAllocator->allocate(ETensorDType::FP32, "normuon_mom_q", {256});
         std::vector<float> h_mom_q(256);

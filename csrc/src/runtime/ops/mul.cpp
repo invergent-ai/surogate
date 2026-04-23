@@ -75,36 +75,33 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
             throw std::runtime_error("dispatch_mul: unsupported dtype");
         }
     } else if (small->nelem() == 1) {
-        // Scalar broadcast: out = big * scalar_value
-        // Read the scalar from device memory
-        float scale_val = 0.0f;
-        if (small->DType == ETensorDType::BF16) {
-            nv_bfloat16 h_val;
-            CUDA_CHECK(cudaMemcpyAsync(&h_val,
-                                       small->Data,
-                                       sizeof(nv_bfloat16),
-                                       cudaMemcpyDeviceToHost,
-                                       mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            scale_val = static_cast<float>(h_val);
-        } else if (small->DType == ETensorDType::FP32) {
-            CUDA_CHECK(
-                cudaMemcpyAsync(&scale_val, small->Data, sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        }
+        // Scalar broadcast: out = big * scalar. The scalar lives on device;
+        // copying it to host here would sync the stream (fine eagerly, fatal
+        // under CUDA graph capture — cudaStreamSynchronize is unsupported on
+        // a capturing stream). Reuse scale_rows with N=1 so the kernel reads
+        // the scalar via device pointer and we never touch the host.
         const long n = static_cast<long>(big->nelem());
         if (big->DType == ETensorDType::BF16) {
-            moe_scale_forward(out.get<nv_bfloat16>(),
-                              big->get<nv_bfloat16>(),
-                              scale_val,
-                              static_cast<int>(n),
-                              mRunState.MainStream);
+            scale_rows(out.get<nv_bfloat16>(),
+                       big->get<nv_bfloat16>(),
+                       small->get<nv_bfloat16>(),
+                       /*N=*/1,
+                       /*M=*/n,
+                       mRunState.MainStream);
+        } else if (big->DType == ETensorDType::FP16) {
+            scale_rows(out.get<half>(),
+                       big->get<half>(),
+                       small->get<half>(),
+                       /*N=*/1,
+                       /*M=*/n,
+                       mRunState.MainStream);
         } else if (big->DType == ETensorDType::FP32) {
-            moe_scale_forward(out.get<float>(),
-                              big->get<float>(),
-                              scale_val,
-                              static_cast<int>(n),
-                              mRunState.MainStream);
+            scale_rows(out.get<float>(),
+                       big->get<float>(),
+                       small->get<float>(),
+                       /*N=*/1,
+                       /*M=*/n,
+                       mRunState.MainStream);
         } else {
             throw std::runtime_error("dispatch_mul scalar: unsupported dtype");
         }
@@ -213,39 +210,37 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], d_b);
     } else if (scalar_broadcast) {
         // Scalar broadcast backward: forward was big * scalar -> out
-        // d_big = d_out * scalar_value, d_scalar = sum(d_out * big)
-        float scale_val = 0.0f;
-        if (small->DType == ETensorDType::BF16) {
-            nv_bfloat16 h_val;
-            CUDA_CHECK(cudaMemcpyAsync(&h_val,
-                                       small->Data,
-                                       sizeof(nv_bfloat16),
-                                       cudaMemcpyDeviceToHost,
-                                       mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            scale_val = static_cast<float>(h_val);
-        } else if (small->DType == ETensorDType::FP32) {
-            CUDA_CHECK(
-                cudaMemcpyAsync(&scale_val, small->Data, sizeof(float), cudaMemcpyDeviceToHost, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        }
+        // d_big = d_out * scalar, d_scalar = sum(d_out * big). Same constraint
+        // as the forward path — the scalar lives on device and we must NOT
+        // sync the stream to read it (capture-unsafe). scale_rows with N=1
+        // does the d_big multiply via device pointer.
         int d_big_idx = big_input_idx;
         int d_small_idx = 1 - big_input_idx;
-        // d_big = d_out * scalar
         Tensor d_big = allocate_like(static_cast<std::size_t>(d_big_idx), *big);
         const long n = static_cast<long>(big->nelem());
         if (d_out.DType == ETensorDType::BF16) {
-            moe_scale_forward(d_big.get<nv_bfloat16>(),
-                              d_out.get<nv_bfloat16>(),
-                              scale_val,
-                              static_cast<int>(n),
-                              mRunState.MainStream);
+            scale_rows(d_big.get<nv_bfloat16>(),
+                       d_out.get<nv_bfloat16>(),
+                       small->get<nv_bfloat16>(),
+                       /*N=*/1,
+                       /*M=*/n,
+                       mRunState.MainStream);
+        } else if (d_out.DType == ETensorDType::FP16) {
+            scale_rows(d_big.get<half>(),
+                       d_out.get<half>(),
+                       small->get<half>(),
+                       /*N=*/1,
+                       /*M=*/n,
+                       mRunState.MainStream);
         } else if (d_out.DType == ETensorDType::FP32) {
-            moe_scale_forward(d_big.get<float>(),
-                              d_out.get<float>(),
-                              scale_val,
-                              static_cast<int>(n),
-                              mRunState.MainStream);
+            scale_rows(d_big.get<float>(),
+                       d_out.get<float>(),
+                       small->get<float>(),
+                       /*N=*/1,
+                       /*M=*/n,
+                       mRunState.MainStream);
+        } else {
+            throw std::runtime_error("dispatch_mul_backward scalar: unsupported dtype");
         }
         if (op.outputs.size() > static_cast<std::size_t>(d_big_idx) && !op.outputs[d_big_idx].name.empty())
             store_tensor(op.outputs[d_big_idx], d_big);

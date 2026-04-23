@@ -45,6 +45,74 @@
 
 namespace dsl {
 
+namespace {
+
+// Per-block MoE slots (router_logits, routing_weights, permuted_input,
+// expert_*, moe_out, ...) have dedicated TensorSlot enum values. The
+// name-based tail covers MoE side-channels deliberately NOT modelled as
+// per-block slots: `moe_expert_offsets` / `moe_gather_indices` (global
+// scratch) and `ep_*` (expert-parallel internal comms). To add a new MoE
+// tensor, extend the TensorSlot enum or update the tail list here.
+// Slot-registry predicates shared by prepare_saved_buffers_for_capture and
+// save_tensors. Both need to know whether a tensor's declared slot is
+// `Shared` (memory hint) or `Mapped` (no backing buffer in the registry,
+// so saves must be copied). Collapsed into free functions here because
+// both call sites had byte-identical lambdas.
+std::optional<bool> is_shared_slot(const TensorSlotRegistry* registry, const std::string& name) {
+    if (!registry) return std::nullopt;
+    int layer_idx = -1;
+    std::string base_field;
+    resolve_block_slot(name, &layer_idx, nullptr, &base_field);
+    if (layer_idx >= 0) {
+        if (auto entry = registry->lookup(base_field)) {
+            return entry->memory_hint == ActivationMemoryHint::Shared;
+        }
+        return std::nullopt;
+    }
+    if (auto entry = registry->lookup(strip_ssa_suffix(name))) {
+        return entry->memory_hint == ActivationMemoryHint::Shared;
+    }
+    return std::nullopt;
+}
+
+std::optional<bool> is_mapped_slot(const TensorSlotRegistry* registry, const std::string& name) {
+    if (!registry) return std::nullopt;
+    int layer_idx = -1;
+    std::string base_field;
+    resolve_block_slot(name, &layer_idx, nullptr, &base_field);
+    if (layer_idx >= 0) {
+        if (auto entry = registry->lookup(base_field)) {
+            return entry->slot == TensorSlot::Mapped;
+        }
+        return std::nullopt;
+    }
+    if (auto entry = registry->lookup(strip_ssa_suffix(name))) {
+        return entry->slot == TensorSlot::Mapped;
+    }
+    return std::nullopt;
+}
+
+bool is_moe_tensor_name(const std::string& n) {
+    switch (resolve_block_slot(n)) {
+        case TensorSlot::BlockRouterLogits:
+        case TensorSlot::BlockRouterProbs:
+        case TensorSlot::BlockRoutingWeights:
+        case TensorSlot::BlockRoutingIndices:
+        case TensorSlot::BlockPermutedInput:
+        case TensorSlot::BlockScatterIndices:
+        case TensorSlot::BlockExpertGateUp:
+        case TensorSlot::BlockExpertAct:
+        case TensorSlot::BlockExpertDown:
+        case TensorSlot::BlockMoeOut: return true;
+        default: break;
+    }
+    // Global MoE side-channels (not modelled as per-block slots).
+    const std::string probe = strip_ssa_suffix(n);
+    return probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
+}
+
+}  // namespace
+
 // Historical note: `strip_autodiff_accum_suffix` and
 // `should_alias_autodiff_accum_name` lived here. Both were name-based
 // heuristics that attempted to detect autodiff accumulator variants
@@ -114,18 +182,19 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
             continue;
         }
 
-        // Allocate or resize persistent buffer if needed
+        // Allocate or resize persistent buffer if needed (arena bump with
+        // cudaMalloc fallback).
         auto buf_it = mMoeSavedBuffers.find(name);
         if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-            // Free old buffer if exists
             if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                CUDA_CHECK(cudaFree(buf_it->second));
+                auto ab_it = mMoeSavedArenaBacked.find(name);
+                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
             }
-            // Allocate new buffer
-            void* new_buffer = nullptr;
-            CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-            mMoeSavedBuffers[name] = new_buffer;
+            auto a = allocate_moe_saved(bytes);
+            mMoeSavedBuffers[name] = a.ptr;
             mMoeSavedSizes[name] = bytes;
+            mMoeSavedArenaBacked[name] = a.arena_backed;
         }
 
         // Copy data to persistent buffer
@@ -181,41 +250,6 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
 
-    auto is_shared_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
-                return entry->memory_hint == ActivationMemoryHint::Shared;
-            }
-            return std::nullopt;
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->memory_hint == ActivationMemoryHint::Shared;
-        }
-        return std::nullopt;
-    };
-
-    auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int lid = -1;
-        std::string fld;
-        if (parse_block_param(name, lid, fld)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(fld))) {
-                return entry->slot == TensorSlot::Mapped;
-            }
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->slot == TensorSlot::Mapped;
-        }
-        return std::nullopt;
-    };
-
     auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist) -> bool {
         if (force_persist) {
             return true;
@@ -223,11 +257,11 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (!recompute_enabled || prefer_live) {
             return false;
         }
-        auto mapped = is_mapped_slot(name);
+        auto mapped = is_mapped_slot(mSlotRegistry, name);
         if (mapped.has_value() && mapped.value()) {
             return true;
         }
-        auto shared = is_shared_slot(name);
+        auto shared = is_shared_slot(mSlotRegistry, name);
         if (shared.has_value()) {
             return shared.value();
         }
@@ -249,24 +283,14 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
                           << std::endl;
             }
             if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                CUDA_CHECK(cudaFree(buf_it->second));
+                auto ab_it = mMoeSavedArenaBacked.find(name);
+                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
             }
-            void* new_buffer = nullptr;
-            cudaError_t alloc_err = cudaMalloc(&new_buffer, bytes);
-            if (alloc_err != cudaSuccess) {
-                std::size_t free_bytes = 0;
-                std::size_t total_bytes = 0;
-                (void)cudaMemGetInfo(&free_bytes, &total_bytes);
-                std::ostringstream oss;
-                oss << "CompiledExecutor::prepare_saved_buffers_for_capture: cudaMalloc failed for saved tensor '"
-                    << name << "' (" << bytes << " bytes, " << static_cast<double>(bytes) / (1024.0 * 1024.0) << " MiB)"
-                    << ", free=" << static_cast<double>(free_bytes) / (1024.0 * 1024.0) << " MiB"
-                    << ", total=" << static_cast<double>(total_bytes) / (1024.0 * 1024.0) << " MiB"
-                    << ", error=" << cudaGetErrorString(alloc_err);
-                throw std::runtime_error(oss.str());
-            }
-            mMoeSavedBuffers[name] = new_buffer;
+            auto a = allocate_moe_saved(bytes);
+            mMoeSavedBuffers[name] = a.ptr;
             mMoeSavedSizes[name] = bytes;
+            mMoeSavedArenaBacked[name] = a.arena_backed;
         }
     };
 
@@ -291,17 +315,10 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         }
 
         // Global / IO slots via the shared helper. `_flat` aliases aren't in
-        // the static name→slot table (they have distinct 2D shapes) — detect
-        // them by suffix and flatten after resolution.
-        TensorSlot glob_slot = builtin_slot_from_name(name);
+        // the static name→slot table (they have distinct 2D shapes);
+        // `resolve_slot_with_flat` handles the suffix stripping centrally.
         bool name_is_flat = false;
-        if (glob_slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
-            TensorSlot base_slot = builtin_slot_from_name(name.substr(0, name.size() - 5));
-            if (global_activation_ptr(mRunState, base_slot)) {
-                glob_slot = base_slot;
-                name_is_flat = true;
-            }
-        }
+        TensorSlot glob_slot = resolve_slot_with_flat(name, &name_is_flat);
         if (Tensor* t = global_activation_ptr(mRunState, glob_slot)) {
             return name_is_flat ? flatten_2d(*t) : *t;
         }
@@ -316,16 +333,11 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         }
 
         int layer_idx = -1;
-        std::string field;
-        if (!parse_block_param(name, layer_idx, field)) {
-            return std::nullopt;
-        }
+        bool is_flat = false;
+        const TensorSlot slot = resolve_block_slot(name, &layer_idx, &is_flat);
         if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
             return std::nullopt;
         }
-        const std::string base_field = strip_ssa_suffix(field);
-        const bool is_flat = (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0);
-        const TensorSlot slot = builtin_slot_from_name(base_field);
 
         // Block-scope activation (including MoE slots) via the shared helper.
         // `is_flat` applies a 2D view when the caller requested `<field>_flat`
@@ -369,7 +381,9 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         std::vector<long> shape;
         ETensorDType dtype = ETensorDType::BF16;
         if (mConfig.NumLayers > 0) {
-            dtype = mRunState.simplified_acts(0).ln1.DType;
+            if (Tensor* ln1 = block_activation_ptr(mRunState, 0, TensorSlot::BlockLN1)) {
+                dtype = ln1->DType;
+            }
         }
 
         // Dispatch the per-slot shape formula. `base_field` at this point has
@@ -464,66 +478,18 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (!mLoRAConfig) {
             return false;
         }
-        int layer_idx = -1;
-        std::string field;
-        if (!parse_block_param(tensor_name, layer_idx, field)) {
-            return false;
-        }
-        const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+        const TensorSlot slot = resolve_block_slot(tensor_name);
         return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
     };
     auto is_forced_persist_global = [&](const std::string& n) -> bool {
-        TensorSlot slot = builtin_slot_from_name(n);
-        if (slot == TensorSlot::Mapped && n.size() >= 5 && n.compare(n.size() - 5, 5, "_flat") == 0) {
-            slot = builtin_slot_from_name(n.substr(0, n.size() - 5));
-        }
-        switch (slot) {
+        switch (resolve_slot_with_flat(n)) {
             case TensorSlot::LNFinal:
             case TensorSlot::LNFinalRSTD:
             case TensorSlot::FinalResidual: return true;
             default: return false;
         }
     };
-    auto is_moe_tensor_name = [&](const std::string& n) -> bool {
-        // Per-block MoE slots (router_logits, routing_weights, permuted_input,
-        // expert_*, moe_out, …) all have dedicated TensorSlot enum values —
-        // dispatched via `builtin_slot_from_name(probe)` in one place.
-        //
-        // The name-based tail covers MoE side-channels that are deliberately
-        // NOT modelled as per-block TensorSlot values:
-        //
-        //   * `moe_expert_offsets`, `moe_gather_indices` — global host/device
-        //     scratch tensors shared across layers (see `register_external_names`
-        //     in graph_compiler). They have no per-block backing buffer in
-        //     SimplifiedLayerActivations, so they can't fit the block-slot
-        //     model. Kept name-based until the runtime either adds a
-        //     `GlobalMoeOffsets` / `GlobalMoeGather` slot group or migrates
-        //     them behind a dedicated MoE-metadata helper.
-        //   * `ep_*` — expert-parallel internal communication names produced
-        //     by runtime EP code. These never touch the slot registry; they
-        //     are pure C++ bookkeeping and don't need a TensorSlot.
-        //
-        // If a new MoE tensor shows up, decide first whether it's per-block
-        // (extend the TensorSlot enum + this switch) or global/EP (add to
-        // the name-based tail below, with the same reasoning).
-        int lid = -1;
-        std::string field;
-        const std::string probe = parse_block_param(n, lid, field) ? strip_ssa_suffix(field) : strip_ssa_suffix(n);
-        switch (builtin_slot_from_name(probe)) {
-            case TensorSlot::BlockRouterLogits:
-            case TensorSlot::BlockRouterProbs:
-            case TensorSlot::BlockRoutingWeights:
-            case TensorSlot::BlockRoutingIndices:
-            case TensorSlot::BlockPermutedInput:
-            case TensorSlot::BlockScatterIndices:
-            case TensorSlot::BlockExpertGateUp:
-            case TensorSlot::BlockExpertAct:
-            case TensorSlot::BlockExpertDown:
-            case TensorSlot::BlockMoeOut: return true;
-            default: break;
-        }
-        return probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
-    };
+    // is_moe_tensor_name hoisted to file-scope helper above.
 
     for (const auto& name : save_list) {
         if (mWeights.has(name)) {
@@ -575,10 +541,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             const long T = (mT > 0) ? mT : mRunState.T;
             const long C = mConfig.HiddenSize;
             if (B > 0 && T > 0 && C > 0) {
-                TensorSlot slot = builtin_slot_from_name(name);
-                if (slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
-                    slot = builtin_slot_from_name(name.substr(0, name.size() - 5));
-                }
+                TensorSlot slot = resolve_slot_with_flat(name);
                 const std::size_t elem_bf16 = static_cast<std::size_t>(get_dtype_size(ETensorDType::BF16));
                 std::size_t nbytes = 0;
                 switch (slot) {
@@ -694,43 +657,6 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         return mSlotRegistry->will_recompute(strip_ssa_suffix(tensor_name), lora_only_mode);
     };
 
-    // Helper to copy tensor to persistent buffer when needed in recompute mode.
-    // Returns true if tensor was copied to persistent storage, false if metadata-only save.
-    auto is_shared_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
-                return entry->memory_hint == ActivationMemoryHint::Shared;
-            }
-            return std::nullopt;
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->memory_hint == ActivationMemoryHint::Shared;
-        }
-        return std::nullopt;
-    };
-
-    auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
-        if (!mSlotRegistry) {
-            return std::nullopt;
-        }
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
-                return entry->slot == TensorSlot::Mapped;
-            }
-        }
-        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
-            return entry->slot == TensorSlot::Mapped;
-        }
-        return std::nullopt;
-    };
-
     auto should_persist = [&](const std::string& name, bool prefer_live, bool force_persist_name) -> bool {
         if (force_persist || force_persist_name) {
             return true;
@@ -738,12 +664,12 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (!recompute_enabled || prefer_live) {
             return false;
         }
-        auto mapped = is_mapped_slot(name);
+        auto mapped = is_mapped_slot(mSlotRegistry, name);
         if (mapped.has_value() && mapped.value()) {
             // Slot resolves to Mapped: no persistent buffer, so saved data must be copied.
             return true;
         }
-        auto shared = is_shared_slot(name);
+        auto shared = is_shared_slot(mSlotRegistry, name);
         if (shared.has_value()) {
             return shared.value();
         }
@@ -782,12 +708,14 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                     return;
                 }
                 if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                    CUDA_CHECK(cudaFree(buf_it->second));
+                    auto ab_it = mMoeSavedArenaBacked.find(name);
+                    const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+                    if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
                 }
-                void* new_buffer = nullptr;
-                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoeSavedBuffers[name] = new_buffer;
+                auto a = allocate_moe_saved(bytes);
+                mMoeSavedBuffers[name] = a.ptr;
                 mMoeSavedSizes[name] = bytes;
+                mMoeSavedArenaBacked[name] = a.arena_backed;
             }
             void* dst_buffer = mMoeSavedBuffers[name];
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
@@ -814,12 +742,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (!mLoRAConfig) {
             return false;
         }
-        int layer_idx = -1;
-        std::string field;
-        if (!parse_block_param(tensor_name, layer_idx, field)) {
-            return false;
-        }
-        const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+        const TensorSlot slot = resolve_block_slot(tensor_name);
         return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
     };
 
@@ -830,11 +753,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     auto is_forced_persist_global = [&](const std::string& n) -> bool {
         // Resolve the slot, honouring `_flat` suffix aliases that aren't in
         // the static name→slot table (they carry their own 2D shape).
-        TensorSlot slot = builtin_slot_from_name(n);
-        if (slot == TensorSlot::Mapped && n.size() >= 5 && n.compare(n.size() - 5, 5, "_flat") == 0) {
-            slot = builtin_slot_from_name(n.substr(0, n.size() - 5));
-        }
-        switch (slot) {
+        switch (resolve_slot_with_flat(n)) {
             case TensorSlot::LNFinal:  // covers xF, ln_final, xF_flat, ln_final_flat
             case TensorSlot::LNFinalRSTD:
             case TensorSlot::FinalResidual: return true;
@@ -872,36 +791,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             }
         }
         if (found_tensor) {
-            // Same MoE predicate as `is_moe_tensor_name` in the sibling
-            // prepare_saved_buffers_for_capture method — kept inline here
-            // instead of lifted to a shared helper because the two lambdas
-            // live in different scopes. See the commentary on
-            // `is_moe_tensor_name` for the MoE-side-channel deferral
-            // (moe_expert_offsets / moe_gather_indices / ep_* remain
-            // name-based by design; everything per-block is enum-driven).
-            int moe_lid = -1;
-            std::string moe_field;
-            const std::string moe_probe =
-                parse_block_param(name, moe_lid, moe_field) ? strip_ssa_suffix(moe_field) : strip_ssa_suffix(name);
-            bool is_moe_tensor = false;
-            switch (builtin_slot_from_name(moe_probe)) {
-                case TensorSlot::BlockRouterLogits:
-                case TensorSlot::BlockRouterProbs:
-                case TensorSlot::BlockRoutingWeights:
-                case TensorSlot::BlockRoutingIndices:
-                case TensorSlot::BlockPermutedInput:
-                case TensorSlot::BlockScatterIndices:
-                case TensorSlot::BlockExpertGateUp:
-                case TensorSlot::BlockExpertAct:
-                case TensorSlot::BlockExpertDown:
-                case TensorSlot::BlockMoeOut: is_moe_tensor = true; break;
-                default: break;
-            }
-            if (!is_moe_tensor) {
-                is_moe_tensor =
-                    moe_probe == "moe_expert_offsets" || moe_probe == "moe_gather_indices" || name.rfind("ep_", 0) == 0;
-            }
-            const bool force_persist = is_moe_tensor && mConfig.NumExperts > 0;
+            const bool force_persist = is_moe_tensor_name(name) && mConfig.NumExperts > 0;
             save_tensor_with_policy(name, *found_tensor, prefer_live, force_persist || force_persist_name);
             continue;
         }
@@ -918,17 +808,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         // (xF_flat, ln_final_flat, …) carry their own 2D shape in the DSL
         // layout so they're NOT added to the static name→slot table — that
         // would clobber the 2D shape with the 3D parent's shape at compile
-        // time. Handle them here by stripping the suffix and flattening.
-        TensorSlot glob_slot = builtin_slot_from_name(name);
+        // time. `resolve_slot_with_flat` handles the suffix stripping.
         bool is_flat_view = false;
-        if (glob_slot == TensorSlot::Mapped && name.size() >= 5 && name.compare(name.size() - 5, 5, "_flat") == 0) {
-            const std::string base_name = name.substr(0, name.size() - 5);
-            TensorSlot base_slot = builtin_slot_from_name(base_name);
-            if (global_activation_ptr(mRunState, base_slot)) {
-                glob_slot = base_slot;
-                is_flat_view = true;
-            }
-        }
+        TensorSlot glob_slot = resolve_slot_with_flat(name, &is_flat_view);
         if (Tensor* t = global_activation_ptr(mRunState, glob_slot)) {
             if (is_flat_view && t->Rank >= 3) {
                 Tensor flat = view_tensor(*t, {t->Sizes[0] * t->Sizes[1], t->Sizes[2]});
@@ -950,11 +832,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
 
         // Block-scope fields.
         int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            const std::string base_field = strip_ssa_suffix(field);
-            const bool is_flat = (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0);
-            const TensorSlot slot = builtin_slot_from_name(base_field);
+        bool is_flat = false;
+        const TensorSlot slot = resolve_block_slot(name, &layer_idx, &is_flat);
+        if (layer_idx >= 0) {
             if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
                 if (is_flat && t->Rank >= 3) {
                     Tensor flat = view_tensor(*t, {t->Sizes[0] * t->Sizes[1], t->Sizes[2]});
@@ -1050,13 +930,12 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
     }
 
     int layer_idx = -1;
-    std::string field;
-    if (parse_block_param(name, layer_idx, field)) {
-        if (layer_idx < 0 || layer_idx >= static_cast<int>(mConfig.NumLayers)) {
+    std::string base_field;
+    const TensorSlot slot = resolve_block_slot(name, &layer_idx, nullptr, &base_field);
+    if (layer_idx >= 0) {
+        if (layer_idx >= static_cast<int>(mConfig.NumLayers)) {
             return nullptr;
         }
-        const std::string base_field = strip_ssa_suffix(field);
-        const TensorSlot slot = builtin_slot_from_name(base_field);
         if (Tensor* t = block_activation_ptr(mRunState, layer_idx, slot)) {
             return map_view(*t);
         }
@@ -1070,6 +949,345 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
     }
 
     return nullptr;
+}
+
+Tensor* CompiledExecutor::bind_from_region(int tid, const TensorRef& ref) {
+    if (tid < 0 || !mCurrentGraph) return nullptr;
+    if (static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+
+    Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
+    if (cached.Data) return &cached;  // already bound by a prior op or helper
+
+    const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.offset == SIZE_MAX) return nullptr;
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return nullptr;
+
+    std::byte* base = nullptr;
+    switch (meta.region) {
+        case dsl::RegionKind::Persistent:
+            if (mPhaseArenas->persistent_ptr) {
+                base = mPhaseArenas->persistent_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::PersistentActivation:
+            if (mPhaseArenas->persistent_activation_ptr) {
+                base = mPhaseArenas->persistent_activation_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::Accumulator:
+            if (mPhaseArenas->accumulator_ptr) {
+                base = mPhaseArenas->accumulator_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::FwdStack:
+            if (mPhaseArenas->fwd_stack_ptr) {
+                base = mPhaseArenas->fwd_stack_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::BwdStack:
+            if (mPhaseArenas->bwd_stack_ptr) {
+                base = mPhaseArenas->bwd_stack_ptr + meta.offset;
+            }
+            break;
+        case dsl::RegionKind::SaveForBwd: {
+            if (!mPhaseArenas->save_for_bwd_ptr) break;
+            if (meta.block_layer_idx < 0) break;
+            const auto L = static_cast<std::size_t>(meta.block_layer_idx);
+            if (L >= mPhaseArenas->save_for_bwd_block_bases.size()) break;
+            base = mPhaseArenas->save_for_bwd_ptr + mPhaseArenas->save_for_bwd_block_bases[L] + meta.offset;
+            break;
+        }
+        default:
+            // BwdCrossLayer / MoeSaved / Unknown: not migrated to tid-baked
+            // access yet; caller falls back to existing name/slot dispatch.
+            break;
+    }
+
+    if (!base) return nullptr;
+
+    cached.Data = base;
+    cached.DType = ref.dtype;
+    cached.Stats = nullptr;
+    const int rank = static_cast<int>(ref.shape.size());
+    cached.Rank = rank;
+    for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+        cached.Sizes[i] = (i < rank) ? ref.shape[i] : 1;
+    }
+    // Device inherited from the current CUDA context; every arena pointer
+    // was cudaMalloc'd on the executor's device.
+    int device = 0;
+    (void)cudaGetDevice(&device);
+    cached.Device = device;
+    return &cached;
+}
+
+void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return;
+    const bool has_fwd_arena = mPhaseArenas->fwd_stack_ptr && mPhaseArenas->fwd_stack_bytes > 0;
+    const bool has_save_arena = mPhaseArenas->save_for_bwd_ptr && mPhaseArenas->save_for_bwd_bytes > 0;
+    if (!has_fwd_arena && !has_save_arena) return;
+    // During execute_backward this is invoked on the forward graph to
+    // pre-bind fwd-activation tids into bwd's mTensors via the shared tid
+    // namespace. bwd.num_tensors >= fwd.num_tensors, so allow
+    // graph.num_tensors <= mTensors.size().
+    if (static_cast<std::size_t>(graph.num_tensors) > mTensors.size()) return;
+
+    // Per-tid producing output ref — the canonical shape/dtype source.
+    // Last writer wins; the compiler's SSA invariant means there is at
+    // most one.
+    std::vector<const TensorRef*> producer(static_cast<std::size_t>(graph.num_tensors), nullptr);
+    for (const auto& op : graph.ops) {
+        for (const auto& out : op.outputs) {
+            if (out.tensor_id >= 0 && out.tensor_id < graph.num_tensors) {
+                producer[static_cast<std::size_t>(out.tensor_id)] = &out;
+            }
+        }
+    }
+
+    int device = 0;
+    (void)cudaGetDevice(&device);
+
+    std::size_t bound = 0;
+    std::size_t skipped_no_producer = 0;
+    std::size_t skipped_no_shape = 0;
+    std::size_t skipped_no_offset = 0;
+    std::size_t skipped_non_arena_slot = 0;
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        // Route FwdStack → fwd_stack arena; SaveForBwd → save_for_bwd arena
+        // (per-layer base + meta.offset). Under no-recompute,
+        // finalize_save_for_bwd promotes block activations that backward
+        // reads into SaveForBwd; their mTensors binding has to come from
+        // this populate since nothing else writes them before use.
+        std::byte* base_ptr = nullptr;
+        if (meta.region == dsl::RegionKind::FwdStack && has_fwd_arena) {
+            base_ptr = mPhaseArenas->fwd_stack_ptr;
+        } else if (meta.region == dsl::RegionKind::SaveForBwd && has_save_arena) {
+            if (meta.block_layer_idx >= 0 &&
+                static_cast<std::size_t>(meta.block_layer_idx) < mPhaseArenas->save_for_bwd_block_bases.size()) {
+                base_ptr = mPhaseArenas->save_for_bwd_ptr +
+                           mPhaseArenas->save_for_bwd_block_bases[static_cast<std::size_t>(meta.block_layer_idx)];
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if (meta.offset == SIZE_MAX) {
+            ++skipped_no_offset;
+            continue;
+        }
+        const TensorRef* out_ref = producer[static_cast<std::size_t>(tid)];
+        if (!out_ref) {
+            ++skipped_no_producer;
+            continue;
+        }
+        if (out_ref->shape.empty()) {
+            ++skipped_no_shape;
+            continue;
+        }
+        Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+        const int layer = meta.block_layer_idx;
+        // BlockResidualFFN lives on the managed residual stream, not the
+        // FwdStack arena; `rs.get_residual(layer)` returns its canonical
+        // handle. Every other arena-backed tid (FwdStack or SaveForBwd;
+        // including MoE slots and BlockMoeOut's view over BlockMLPDown)
+        // takes its Data from `base_ptr + meta.offset` — the coloring
+        // gives each slot its own offset, so generic binding produces the
+        // right pointer with the producing op's shape/dtype.
+        if (out_ref->slot == dsl::TensorSlot::BlockResidualFFN && layer >= 0) {
+            const Tensor& r = mRunState.get_residual(layer, mRunState.MainStream);
+            if (r.Data) {
+                t = r;
+                ++bound;
+                continue;
+            }
+        }
+
+        t.Data = base_ptr + meta.offset;
+        t.DType = out_ref->dtype;
+        t.Rank = static_cast<int>(out_ref->shape.size());
+        for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+            t.Sizes[i] = (i < t.Rank) ? out_ref->shape[i] : 1;
+        }
+        t.Device = device;
+        t.Stats = nullptr;
+        ++bound;
+    }
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume fwd_stack tid] graph=" << graph.name << " bound=" << bound
+                      << " skipped_no_producer=" << skipped_no_producer << " skipped_no_shape=" << skipped_no_shape
+                      << " skipped_no_offset=" << skipped_no_offset
+                      << " skipped_non_arena_slot=" << skipped_non_arena_slot << "\n";
+        }
+    }
+}
+
+void CompiledExecutor::populate_bwd_stack_bindings(const CompiledGraph& graph) {
+    // Seed mTensors[tid] for the 11 named block-gradient slots via
+    // slot_to_tid lookup, using bwd_stack_ptr + meta.offset for Data and
+    // the producer TensorRef for shape/dtype. Mirror of populate_fwd_
+    // stack_bindings scoped to named gradient slots — Mapped-slot
+    // intermediate tids (transposes, flattened views, etc.) must NOT be
+    // pre-bound because their ops write Data via store_tensor with
+    // kernel-computed pointers; pre-binding would stale-read before
+    // store_tensor fires.
+    //
+    // Stack-init slots (DQKV/DMLPUp/DSwiGLU under large_bwd_temps_on_
+    // stack or when DSL doesn't define the slot) get shape/dtype but
+    // Data=nullptr so temp_acquire allocates Stack on first access.
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return;
+    if (!mPhaseArenas->bwd_stack_ptr || mPhaseArenas->bwd_stack_bytes == 0) return;
+    if (static_cast<std::size_t>(graph.num_tensors) > mTensors.size()) return;
+
+    static constexpr dsl::TensorSlot kSlots[] = {
+        dsl::TensorSlot::BlockDLN1,
+        dsl::TensorSlot::BlockDLN2,
+        dsl::TensorSlot::BlockDQKV,
+        dsl::TensorSlot::BlockDAtt,
+        dsl::TensorSlot::BlockDAttOut,
+        dsl::TensorSlot::BlockDMLPUp,
+        dsl::TensorSlot::BlockDSwiGLU,
+        dsl::TensorSlot::BlockDMLPDown,
+        dsl::TensorSlot::BlockDHOut,
+        dsl::TensorSlot::BlockDResAtt,
+        dsl::TensorSlot::BlockDResFFN,
+    };
+
+    const auto& plan = mRunState.buffer_plan();
+    auto is_stack_init_slot = [&](dsl::TensorSlot s) {
+        switch (s) {
+            case dsl::TensorSlot::BlockDMLPUp: return plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot;
+            case dsl::TensorSlot::BlockDSwiGLU: return plan.large_bwd_temps_on_stack || !plan.has_swiglu_slot;
+            case dsl::TensorSlot::BlockDQKV: return plan.large_bwd_temps_on_stack;
+            default: return false;
+        }
+    };
+
+    std::vector<const TensorRef*> producer(static_cast<std::size_t>(graph.num_tensors), nullptr);
+    for (const auto& op : graph.ops) {
+        for (const auto& out : op.outputs) {
+            if (out.tensor_id >= 0 && out.tensor_id < graph.num_tensors) {
+                producer[static_cast<std::size_t>(out.tensor_id)] = &out;
+            }
+        }
+    }
+
+    // Set-membership check for the kSlots list (tiny, flat scan is fine).
+    auto slot_in_list = [&](dsl::TensorSlot s) {
+        for (auto sl : kSlots) {
+            if (sl == s) return true;
+        }
+        return false;
+    };
+
+    int device = 0;
+    (void)cudaGetDevice(&device);
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+
+    // Iterate ALL tids, not just slot_to_tid canonicals. Multiple tids can
+    // map to the same (layer, slot) — `d_qkv`, `d_qkv_rope`,
+    // `d_qkv_rope_flat` all share BlockDQKV. `slot_to_tid` only stores
+    // one canonical tid per slot, so binding only that tid leaves the
+    // aliased ones at default (Data=nullptr, Device=-1). When the aliased
+    // tid's op runs, `temp_acquire` trips "target.Device=-1". Iterating
+    // all tids here catches every one whose producer's slot is in our
+    // pre-bind set. Shows up on Gemma4 (d_qkv / d_qkv_rope separate tids
+    // with same BwdStack offset after within-frame coloring); Qwen3 only
+    // uses one of the names so this loop is a no-op there.
+    const int num_tids = graph.num_tensors;
+    for (int tid = 0; tid < num_tids; ++tid) {
+        if (static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != dsl::RegionKind::BwdStack) continue;
+        if (meta.offset == SIZE_MAX) continue;
+        if (meta.block_layer_idx < 0) continue;
+        const TensorRef* out_ref = producer[static_cast<std::size_t>(tid)];
+        if (!out_ref || out_ref->shape.empty()) continue;
+        if (!slot_in_list(out_ref->slot)) continue;
+
+        Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+        const bool stack_init = is_stack_init_slot(out_ref->slot);
+        t.Data = stack_init ? nullptr : (mPhaseArenas->bwd_stack_ptr + meta.offset);
+        t.DType = out_ref->dtype;
+        t.Rank = static_cast<int>(out_ref->shape.size());
+        for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+            t.Sizes[i] = (i < t.Rank) ? out_ref->shape[i] : 1;
+        }
+        t.Device = device;
+        t.Stats = nullptr;
+    }
+
+    // Build the activation-gradient zero list once per compile. Zeroes
+    // d_res_ffn (all layers except last), d_res_att, d_att_out, d_h_out
+    // — these are accumulation targets where stale values leak into the
+    // first backward read. DslRunState caches the device arrays.
+    if (!mBwdZeroListBuilt) {
+        std::vector<std::uint64_t> ptrs;
+        std::vector<std::uint64_t> sizes;
+        std::unordered_set<std::byte*> seen;
+        auto add = [&](const Tensor& t) {
+            if (!t.Data) return;
+            const std::size_t b = static_cast<std::size_t>(t.bytes());
+            if (b == 0) return;
+            if (!seen.insert(t.Data).second) return;
+            ptrs.push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.Data)));
+            sizes.push_back(static_cast<std::uint64_t>(b));
+        };
+        auto lookup = [&](int L, dsl::TensorSlot s) -> const Tensor* {
+            const int tid = graph.slot_to_tid(L, s);
+            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+            return &mTensors[static_cast<std::size_t>(tid)];
+        };
+        for (int L = 0; L < num_layers; ++L) {
+            // d_res_ffn for the last layer is zeroed separately (it receives the loss gradient).
+            if (L + 1 < num_layers) {
+                if (const Tensor* t = lookup(L, dsl::TensorSlot::BlockDResFFN)) add(*t);
+            }
+            for (dsl::TensorSlot s :
+                 {dsl::TensorSlot::BlockDResAtt, dsl::TensorSlot::BlockDAttOut, dsl::TensorSlot::BlockDHOut}) {
+                if (const Tensor* t = lookup(L, s)) add(*t);
+            }
+        }
+        mRunState.set_activation_grad_zero_list(ptrs, sizes);
+        mBwdZeroListBuilt = true;
+    }
+}
+
+Tensor* CompiledExecutor::executor_tid_slot_binding(int layer_idx, TensorSlot slot) {
+    if (!mCurrentGraph || slot == TensorSlot::Mapped) return nullptr;
+    int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
+    if (tid < 0 && mForwardGraph && mForwardGraph != mCurrentGraph) {
+        tid = mForwardGraph->slot_to_tid(layer_idx, slot);
+    }
+    if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+    return &mTensors[static_cast<std::size_t>(tid)];
+}
+
+Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
+    if (!mCurrentGraph) return nullptr;
+    // Mapped is the wildcard slot — block_activation_ptr(..., Mapped)
+    // returns nullptr (is_block_activation_slot(Mapped) == false), so the
+    // tid-first path must do the same. Without this guard, slot_to_tid
+    // returns the first Mapped tid per layer (arbitrary, often a 1D
+    // Mamba-style decay vector or similar) and the caller gets a
+    // shape-wrong tensor.
+    if (slot == TensorSlot::Mapped) return nullptr;
+    int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
+    // Forward-only slots (res_att, ln2, ln2_rstd, etc.) don't appear in
+    // the backward graph's slot→tid map because no backward op declares
+    // them as an output with that slot tag — they're forward activations
+    // consumed during bwd via snapshot/restore. Fall through to the
+    // forward graph's map (shared tid namespace) so the tid-cache lookup
+    // still succeeds during backward.
+    if (tid < 0 && mForwardGraph && mForwardGraph != mCurrentGraph) {
+        tid = mForwardGraph->slot_to_tid(layer_idx, slot);
+    }
+    if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+    Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+    return t.Data ? &t : nullptr;
 }
 
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
@@ -1090,7 +1308,47 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     };
 
-    if (!ref.name.empty()) {
+    // Bypass mNamedTensors for Stack-backed slots. Covers ln1, ln2,
+    // qk-norm rstd, LSE, attn_out and h_out — all same-layer
+    // producer/consumer, FP32/dtype, small shape.
+    const bool bypass_named_for_rstd = [&]() {
+        switch (ref.slot) {
+            case TensorSlot::BlockLN1RSTD:
+            case TensorSlot::BlockLN2RSTD:
+            case TensorSlot::BlockQRSTD:
+            case TensorSlot::BlockKRSTD:
+            case TensorSlot::BlockLSE:
+            case TensorSlot::BlockLN1:
+            case TensorSlot::BlockLN2:
+            case TensorSlot::BlockAttOut:
+            case TensorSlot::BlockHOut: return true;
+            default: return false;
+        }
+    }();
+
+    // Tid-baked fast paths for arena-backed regions.
+    // persist_saved_layer_tensors / populate_fwd_stack_bindings write the
+    // arena Tensor into mTensors[tid]; returning cached here skips the
+    // mNamedTensors hashmap lookup and the slot switch below.
+    //   - SaveForBwd fires regardless of ref.shape (canonical shape).
+    //   - FwdStack fires only when ref.shape is non-empty (caller
+    //     declared a view that the pre-bind already materialized); an
+    //     empty-shape ref falls through to the canonical-shape cached
+    //     path at the tail.
+    if (tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
+        const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
+        const bool is_save_for_bwd = meta.region == dsl::RegionKind::SaveForBwd;
+        const bool is_fwd_stack = meta.region == dsl::RegionKind::FwdStack && !ref.shape.empty();
+        if (is_save_for_bwd || is_fwd_stack) {
+            Tensor& cached = mTensors[static_cast<std::size_t>(tid)];
+            if (cached.Data) {
+                log_tensor(cached, is_save_for_bwd ? "baked_save" : "region_fwd_stack_cached");
+                return cached;
+            }
+        }
+    }
+
+    if (!ref.name.empty() && !bypass_named_for_rstd) {
         auto name_it = mNamedTensors.find(ref.name);
         if (name_it != mNamedTensors.end() && name_it->second.Data) {
             log_tensor(name_it->second, "named");
@@ -1123,45 +1381,17 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
-        ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
-        // Need to create a view from the base tensor
-        if (ref.name.find("att_flat") != std::string::npos && ref.layer_idx == 4) {
-            fprintf(stderr,
-                    "[RESOLVE] %s slot=%d layer=%d shape=[%ld,%ld] tid=%d\n",
-                    ref.name.c_str(),
-                    (int)ref.slot,
-                    ref.layer_idx,
-                    ref.shape.size() > 0 ? ref.shape[0] : -1,
-                    ref.shape.size() > 1 ? ref.shape[1] : -1,
-                    tid);
-        }
-        Tensor* base = nullptr;
-        switch (ref.slot) {
-            case TensorSlot::TokenIDs: base = &rs.Inputs; break;
-            case TensorSlot::PositionIDs: base = &rs.PositionIDs; break;
-            case TensorSlot::Targets: base = &rs.Targets; break;
-            case TensorSlot::Losses: base = &rs.Losses; break;
-            case TensorSlot::DLoss: base = &rs.scratch().cross_entropy_dloss; break;
-            case TensorSlot::FreqCis: base = &rs.rope_freqs(ref.name); break;
-            case TensorSlot::BlockDLN1: base = &rs.simplified_grads(ref.layer_idx).d_ln1; break;
-            case TensorSlot::BlockDQKV: base = &rs.simplified_grads(ref.layer_idx).d_qkv; break;
-            case TensorSlot::BlockDAtt: base = &rs.simplified_grads(ref.layer_idx).d_att; break;
-            case TensorSlot::BlockDSwiGLU: base = &rs.simplified_grads(ref.layer_idx).d_swiglu; break;
-            case TensorSlot::BlockDMLPUp: base = &rs.simplified_grads(ref.layer_idx).d_mlp_up; break;
-            case TensorSlot::BlockDMLPDown: base = &rs.simplified_grads(ref.layer_idx).d_mlp_down; break;
-            case TensorSlot::BlockDLN2: base = &rs.simplified_grads(ref.layer_idx).d_ln2; break;
-            case TensorSlot::BlockDResAtt: base = &rs.simplified_grads(ref.layer_idx).d_res_att; break;
-            case TensorSlot::BlockDAttOut: base = &rs.simplified_grads(ref.layer_idx).d_att_out; break;
-            case TensorSlot::BlockDResFFN: base = &rs.simplified_grads(ref.layer_idx).d_res_ffn; break;
-            case TensorSlot::BlockLN1: base = &rs.simplified_acts(ref.layer_idx).ln1; break;
-            case TensorSlot::BlockLN2: base = &rs.simplified_acts(ref.layer_idx).ln2; break;
-            case TensorSlot::BlockQKV: base = &rs.simplified_acts(ref.layer_idx).qkv; break;
-            case TensorSlot::BlockAtt: base = &rs.simplified_acts(ref.layer_idx).att; break;
-            case TensorSlot::BlockAttOut: base = &rs.simplified_acts(ref.layer_idx).att_out; break;
-            case TensorSlot::BlockMLPUp: base = &rs.simplified_acts(ref.layer_idx).mlp_up; break;
-            case TensorSlot::BlockSwiGLU: base = &rs.simplified_acts(ref.layer_idx).swiglu; break;
-            case TensorSlot::BlockMLPDown: base = &rs.simplified_acts(ref.layer_idx).mlp_down; break;
-            default: break;
+        ref.slot != TensorSlot::Parameter) {
+        // Delegate Block*/MoE*/BlockD*/global slot dispatch to the shared
+        // helpers (same pattern as resolve_tensor at the call site below).
+        // Targets/Losses/DLoss reach the mNamedTensors cache via entry-time
+        // bind_tensor calls; only FreqCis still needs a name-keyed lookup
+        // (names vary per-block: freq_cis, rope_freqs_0, rope_freqs_1, ...).
+        Tensor* base = block_activation_ptr(rs, ref.layer_idx, ref.slot);
+        if (!base) base = block_gradient_ptr(rs, ref.layer_idx, ref.slot);
+        if (!base) base = global_activation_ptr(rs, ref.slot);
+        if (!base && ref.slot == TensorSlot::FreqCis) {
+            base = &rs.rope_freqs(ref.name);
         }
         if (base && base->Data) {
             Tensor view = view_for_shape(*base, ref.shape, ref.name);
@@ -1175,54 +1405,26 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 
     // Check flat tensor vector first for cached/aliased tensors (e.g., view_backward aliases).
     // This is critical because view_backward stores aliases, and subsequent ops
-    // (like rmsnorm_backward) must use that aliased tensor, not the pre-allocated simplified_grads buffer.
+    // (like rmsnorm_backward) must use that aliased tensor, not a fresh temp.
     if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
         log_tensor(mTensors[static_cast<std::size_t>(tid)], "cached");
         return mTensors[static_cast<std::size_t>(tid)];
     }
 
+    // Delegate Block*/MoE*/BlockD* slot dispatch to the shared helpers in
+    // tensor_slot_dispatch.h — the switch below used to duplicate all of
+    // block_activation_ptr + block_gradient_ptr, drifting out of sync when
+    // new slots were added. Now each new Block* slot is a one-line change
+    // in tensor_slot_dispatch.cpp.
+    if (Tensor* bp = block_activation_ptr(rs, ref.layer_idx, ref.slot)) return *bp;
+    if (Tensor* bp = block_gradient_ptr(rs, ref.layer_idx, ref.slot)) return *bp;
+    if (Tensor* gp = global_activation_ptr(rs, ref.slot)) return *gp;
+
     switch (ref.slot) {
-        case TensorSlot::TokenIDs: return rs.Inputs;
-        case TensorSlot::PositionIDs: return rs.PositionIDs;
-        case TensorSlot::Targets: return rs.Targets;
-        case TensorSlot::Losses: return rs.Losses;
-        case TensorSlot::DLoss: return rs.scratch().cross_entropy_dloss;
-        case TensorSlot::Encoded: return rs.non_block_activations().encoded;
-        case TensorSlot::LNFinal: return rs.non_block_activations().ln_final;
-        case TensorSlot::LNFinalRSTD: return rs.non_block_activations().ln_final_rstd;
-        case TensorSlot::FinalResidual: return rs.get_final_residual();
+        // Targets / Losses / DLoss are bound at execute_forward /
+        // execute_backward entry via bind_tensor and resolved by the
+        // mNamedTensors / mTensors[tid] fast paths above.
         case TensorSlot::FreqCis: return rs.rope_freqs(ref.name);
-        case TensorSlot::BlockLN1: return rs.simplified_acts(ref.layer_idx).ln1;
-        case TensorSlot::BlockLN1RSTD: return rs.simplified_acts(ref.layer_idx).ln1_rstd;
-        case TensorSlot::BlockLN2: return rs.simplified_acts(ref.layer_idx).ln2;
-        case TensorSlot::BlockLN2RSTD: return rs.simplified_acts(ref.layer_idx).ln2_rstd;
-        case TensorSlot::BlockQRSTD: return rs.simplified_acts(ref.layer_idx).q_rstd;
-        case TensorSlot::BlockKRSTD: return rs.simplified_acts(ref.layer_idx).k_rstd;
-        case TensorSlot::BlockQKV: return rs.simplified_acts(ref.layer_idx).qkv;
-        case TensorSlot::BlockQKVRoPE: {
-            auto& acts = rs.simplified_acts(ref.layer_idx);
-            return acts.qkv_rope.Data ? acts.qkv_rope : acts.qkv;
-        }
-        case TensorSlot::BlockLSE: return rs.simplified_acts(ref.layer_idx).lse;
-        case TensorSlot::BlockAtt: return rs.simplified_acts(ref.layer_idx).att;
-        case TensorSlot::BlockAttOut: return rs.simplified_acts(ref.layer_idx).att_out;
-        case TensorSlot::BlockResidualAtt: return rs.simplified_acts(ref.layer_idx).residual_att;
-        case TensorSlot::BlockMLPUp: return rs.simplified_acts(ref.layer_idx).mlp_up;
-        case TensorSlot::BlockSwiGLU: return rs.simplified_acts(ref.layer_idx).swiglu;
-        case TensorSlot::BlockMLPDown: return rs.simplified_acts(ref.layer_idx).mlp_down;
-        case TensorSlot::BlockHOut: return rs.simplified_acts(ref.layer_idx).h_out;
-        case TensorSlot::BlockResidualFFN: return rs.get_residual(ref.layer_idx, rs.MainStream);
-        case TensorSlot::BlockDLN1: return rs.simplified_grads(ref.layer_idx).d_ln1;
-        case TensorSlot::BlockDQKV: return rs.simplified_grads(ref.layer_idx).d_qkv;
-        case TensorSlot::BlockDAtt: return rs.simplified_grads(ref.layer_idx).d_att;
-        case TensorSlot::BlockDSwiGLU: return rs.simplified_grads(ref.layer_idx).d_swiglu;
-        case TensorSlot::BlockDMLPUp: return rs.simplified_grads(ref.layer_idx).d_mlp_up;
-        case TensorSlot::BlockDMLPDown: return rs.simplified_grads(ref.layer_idx).d_mlp_down;
-        case TensorSlot::BlockDHOut: return rs.simplified_grads(ref.layer_idx).d_h_out;
-        case TensorSlot::BlockDLN2: return rs.simplified_grads(ref.layer_idx).d_ln2;
-        case TensorSlot::BlockDResAtt: return rs.simplified_grads(ref.layer_idx).d_res_att;
-        case TensorSlot::BlockDAttOut: return rs.simplified_grads(ref.layer_idx).d_att_out;
-        case TensorSlot::BlockDResFFN: return rs.simplified_grads(ref.layer_idx).d_res_ffn;
         case TensorSlot::Parameter: return mWeights.get(ref.name);
         case TensorSlot::Saved:
             if (mSaved) {
@@ -1296,9 +1498,218 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             }
             throw std::runtime_error("CompiledExecutor: tensor not found: " + ref.name);
         }
-        case TensorSlot::Temporary: throw std::runtime_error("CompiledExecutor: temporary slot requires allocation");
     }
-    throw std::runtime_error("CompiledExecutor: invalid tensor slot");
+    // P4.7 error rewriter: include tid context when available, so users see
+    // "invalid tensor slot for tid=12 name='blocks[3].att' region=FwdStack"
+    // instead of the bare "invalid tensor slot".
+    std::ostringstream oss;
+    oss << "CompiledExecutor: invalid tensor slot";
+    if (mCurrentGraph && ref.tensor_id >= 0) {
+        oss << " (" << mCurrentGraph->describe_tensor_id(ref.tensor_id) << ")";
+    } else if (!ref.name.empty()) {
+        oss << " (name='" << ref.name << "')";
+    }
+    throw std::runtime_error(oss.str());
+}
+
+void CompiledExecutor::check_op_io_aliasing(const CompiledOp& op, std::size_t op_idx, const char* phase) {
+    static const int mode = []() {
+        const char* e = std::getenv("SUROGATE_CHECK_OP_IO_ALIASING");
+        if (!e) return 0;
+        const std::string v(e);
+        if (v == "1" || v == "on") return 1;
+        if (v == "abort") return 2;
+        return 0;
+    }();
+    if (mode == 0) return;
+
+    // Metadata-only reshape ops are *supposed* to share input/output buffers
+    // (the "output" is just a differently-shaped view of the input). No
+    // kernel writes actually happen.
+    switch (op.type) {
+        case CompiledOpType::View:
+        case CompiledOpType::ViewBackward:
+        case CompiledOpType::Narrow:
+        case CompiledOpType::NarrowBackward:
+        case CompiledOpType::Transpose:
+        case CompiledOpType::Split:
+        case CompiledOpType::Concat: return;
+        default: break;
+    }
+
+    struct RefPtr {
+        std::byte* data = nullptr;
+        std::size_t bytes = 0;
+        const TensorRef* ref = nullptr;
+    };
+    auto resolve_range = [&](const TensorRef& ref) -> RefPtr {
+        RefPtr out;
+        out.ref = &ref;
+        // Skip refs the compiler deliberately left abstract — checking them
+        // requires allocating, which would perturb normal execution.
+        if (ref.tensor_id < 0) return out;
+        try {
+            Tensor t = resolve_tensor(ref);
+            if (!t.Data) return out;
+            // Derive the view's real byte footprint. ref.shape (when set)
+            // captures per-use shape overrides; fall back to the resolved
+            // tensor's own shape otherwise.
+            std::size_t nelem = 0;
+            if (!ref.shape.empty()) {
+                nelem = 1;
+                for (long d : ref.shape)
+                    nelem *= static_cast<std::size_t>(d);
+            } else {
+                nelem = static_cast<std::size_t>(t.nelem());
+            }
+            if (nelem == 0) return out;
+            out.data = t.Data;
+            out.bytes = nelem * static_cast<std::size_t>(get_dtype_size(t.DType));
+        } catch (...) {
+            // resolve_tensor throws on unresolvable refs — not a bug for the
+            // check, just a ref that doesn't have runtime storage yet.
+        }
+        return out;
+    };
+
+    std::vector<RefPtr> inputs;
+    inputs.reserve(op.inputs.size());
+    for (const auto& inp : op.inputs) {
+        RefPtr rp = resolve_range(inp);
+        if (rp.data && rp.bytes > 0) inputs.push_back(rp);
+    }
+    std::vector<RefPtr> outputs;
+    outputs.reserve(op.outputs.size());
+    for (const auto& out : op.outputs) {
+        RefPtr rp = resolve_range(out);
+        if (rp.data && rp.bytes > 0) outputs.push_back(rp);
+    }
+
+    bool any_alias = false;
+    for (const auto& i : inputs) {
+        for (const auto& o : outputs) {
+            std::byte* i_end = i.data + i.bytes;
+            std::byte* o_end = o.data + o.bytes;
+            if (i_end <= o.data || o_end <= i.data) continue;
+            any_alias = true;
+            std::fprintf(stderr,
+                         "[op-io-alias] %s op_idx=%zu type=%s input='%s'#%d ptr=%p bytes=%zu "
+                         "vs output='%s'#%d ptr=%p bytes=%zu\n",
+                         phase,
+                         op_idx,
+                         op_type_to_string(op.type),
+                         i.ref->name.c_str(),
+                         i.ref->tensor_id,
+                         static_cast<void*>(i.data),
+                         i.bytes,
+                         o.ref->name.c_str(),
+                         o.ref->tensor_id,
+                         static_cast<void*>(o.data),
+                         o.bytes);
+        }
+    }
+
+    // Read-after-write provenance. Before the op runs, check each input
+    // against the map: if the buffer was last written with a DIFFERENT
+    // (slot, layer_idx) than the input declares, a prior op clobbered
+    // this tid's still-needed data. Comparing on (slot, layer_idx) not
+    // tid avoids false positives on slot aliases (e.g., `x_flat` is a
+    // different tid than `ln1` but both resolve to BlockLN1). Then
+    // publish this op's outputs into the map.
+    bool raw_violation = false;
+    auto is_activation_slot = [](TensorSlot s) {
+        // Forward-activation block slots only. Gradient chain slots
+        // (BlockD*) intentionally share storage at different backward
+        // stages — `d_mlp_down` → `d_att_out` → `d_res_ffn` reusing
+        // the same physical buffer is by-design. Parameters / Mapped
+        // don't route via the arena-shared pointer either.
+        switch (s) {
+            case TensorSlot::BlockLN1:
+            case TensorSlot::BlockLN1RSTD:
+            case TensorSlot::BlockLN2:
+            case TensorSlot::BlockLN2RSTD:
+            case TensorSlot::BlockQRSTD:
+            case TensorSlot::BlockKRSTD:
+            case TensorSlot::BlockQKV:
+            case TensorSlot::BlockQKVRoPE:
+            case TensorSlot::BlockLSE:
+            case TensorSlot::BlockAtt:
+            case TensorSlot::BlockAttOut:
+            case TensorSlot::BlockMLPUp:
+            case TensorSlot::BlockSwiGLU:
+            case TensorSlot::BlockMLPDown:
+            case TensorSlot::BlockHOut: return true;
+            default: return false;
+        }
+    };
+    // For `slot == Saved` refs (backward reads of forward activations
+    // via the save list), parse the name to recover the real slot.
+    // Without this, backward-graph reads look like Saved and slip past
+    // the activation-slot filter.
+    auto effective_slot = [&](const TensorRef& ref, int& out_layer) -> TensorSlot {
+        out_layer = ref.layer_idx;
+        if (ref.slot != TensorSlot::Saved) return ref.slot;
+        int lyr = -1;
+        const TensorSlot s = resolve_block_slot(ref.name, &lyr, nullptr, nullptr);
+        if (lyr >= 0) out_layer = lyr;
+        return s;
+    };
+    for (const auto& i : inputs) {
+        if (i.ref->tensor_id < 0) continue;
+        if (i.ref->is_gradient) continue;
+        int i_layer = -1;
+        const TensorSlot i_slot = effective_slot(*i.ref, i_layer);
+        if (!is_activation_slot(i_slot)) continue;
+        auto it = mProvenance.find(i.data);
+        if (it == mProvenance.end()) continue;
+        const auto& prov = it->second;
+        const bool same_slot = (prov.slot == static_cast<int>(i_slot)) && (prov.layer_idx == i_layer);
+        if (same_slot) continue;
+        // Different (slot, layer) wrote here last — genuine clobber
+        // under shared-arena routing. Require prior write bytes to
+        // fully cover this input's range (avoid partial-overlap noise).
+        if (prov.bytes < i.bytes) continue;
+        raw_violation = true;
+        std::fprintf(stderr,
+                     "[op-io-alias] RAW %s op_idx=%zu type=%s input='%s'#%d slot=%d L=%d ptr=%p bytes=%zu "
+                     "last-written by '%s' slot=%d L=%d (tid=%d op_idx=%zu phase=%s bytes=%zu)\n",
+                     phase,
+                     op_idx,
+                     op_type_to_string(op.type),
+                     i.ref->name.c_str(),
+                     i.ref->tensor_id,
+                     static_cast<int>(i_slot),
+                     i_layer,
+                     static_cast<void*>(i.data),
+                     i.bytes,
+                     prov.name.c_str(),
+                     prov.slot,
+                     prov.layer_idx,
+                     prov.tid,
+                     prov.op_idx,
+                     prov.phase.c_str(),
+                     prov.bytes);
+    }
+    for (const auto& o : outputs) {
+        if (o.ref->tensor_id < 0) continue;
+        if (o.ref->is_gradient) continue;
+        int o_layer = -1;
+        const TensorSlot o_slot = effective_slot(*o.ref, o_layer);
+        if (!is_activation_slot(o_slot)) continue;
+        ProvenanceEntry entry;
+        entry.slot = static_cast<int>(o_slot);
+        entry.layer_idx = o_layer;
+        entry.tid = o.ref->tensor_id;
+        entry.op_idx = op_idx;
+        entry.bytes = o.bytes;
+        entry.name = o.ref->name;
+        entry.phase = phase ? phase : "";
+        mProvenance[o.data] = entry;
+    }
+
+    if ((any_alias || raw_violation) && mode == 2) {
+        throw std::runtime_error("SUROGATE_CHECK_OP_IO_ALIASING=abort: see [op-io-alias] log");
+    }
 }
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
@@ -1344,9 +1755,8 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
 
     // Fast path: pre-allocated block slots with existing data bypass string parsing.
     // This covers most activation and gradient outputs during forward/backward.
-    // Only Mapped/Temporary/Parameter/Saved slots need the string-heavy resolution below.
-    if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Temporary && ref.slot != TensorSlot::Parameter &&
-        ref.slot != TensorSlot::Saved) {
+    // Only Mapped/Parameter/Saved slots need the string-heavy resolution below.
+    if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Saved) {
         Tensor& t = resolve_tensor(ref);
         if (t.Data) {
             Tensor resolved = t;
@@ -1384,12 +1794,11 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         }
         if (const Tensor* base = try_get_tensor_fuzzy(normalized_name)) {
             // try_get_tensor_fuzzy can legitimately return a pointer to a Tensor
-            // with `Data == nullptr` — e.g., a simplified_grads slot that was
-            // allocated lazily / configured for recompute and isn't populated
-            // yet. Running an op against such a tensor silently corrupts
-            // memory (illegal access at kernel dispatch). Only accept this
-            // resolution when the buffer is real; otherwise fall through to
-            // fresh allocation.
+            // with `Data == nullptr` — e.g., a slot allocated lazily /
+            // configured for recompute and not yet populated. Running an op
+            // against such a tensor silently corrupts memory (illegal access
+            // at kernel dispatch). Only accept this resolution when the
+            // buffer is real; otherwise fall through to fresh allocation.
             if (base->Data) {
                 Tensor resolved = *base;
                 if (!ref.shape.empty() && shape_nelem(ref.shape) == static_cast<std::size_t>(base->nelem())) {
@@ -1485,9 +1894,28 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     }
 
     // For pre-allocated slots, just return the tensor
-    if (ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Temporary) {
+    if (ref.slot != TensorSlot::Mapped) {
         Tensor& t = resolve_tensor(ref);
         if (!t.Data) {
+            // `resolve_tensor` can return a slot-canonical `mTensors[tid]`
+            // that was cleared by the `last_use` cleanup between
+            // `populate_bwd_stack_bindings` and this call. When the canonical
+            // tid's last use is at an op earlier than the current op — as
+            // happens on Gemma4 where `d_blocks[L].qkv_rope` (canonical for
+            // BlockDQKV) is last-used before `qkv_rope_backward` fires for
+            // `d_blocks[L].qkv` — the Tensor comes back default-constructed
+            // (Device=-1, Rank=0), which trips the temp_acquire device check.
+            // Re-populate shape/dtype/device from the ref before acquiring.
+            if (t.Device == -1 && !ref.shape.empty()) {
+                int dev = 0;
+                (void)cudaGetDevice(&dev);
+                t.Device = dev;
+                t.DType = ref.dtype;
+                t.Rank = static_cast<int>(ref.shape.size());
+                for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+                    t.Sizes[i] = (i < t.Rank) ? ref.shape[i] : 1;
+                }
+            }
             mRunState.temp_acquire(t);
             mTemps.push_back(t);
         }

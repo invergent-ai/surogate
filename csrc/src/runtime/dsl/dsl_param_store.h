@@ -24,6 +24,8 @@ namespace dsl {
 
 struct Module;
 struct Graph;
+struct CompiledGraph;
+struct PhaseArenas;
 class DslWeightManager;
 }  // namespace dsl
 
@@ -82,6 +84,28 @@ public:
     const std::vector<std::string>& param_names() const {
         return mParamOrder;
     }
+
+    /// Route locally-allocated parameter storage through the Persistent
+    /// arena. For each mParams entry whose tid has `RegionKind::Persistent`
+    /// with a baked offset, copies the tensor's bytes to
+    /// `arenas.persistent_ptr + meta.offset`, frees the original per-weight
+    /// allocation, and rebinds `entry.tensor.Data` to the arena offset.
+    /// External (QLoRA) and weight-manager-managed entries are skipped —
+    /// their rebinds live on `QLoRAWeightProvider` / `DslWeightManager` /
+    /// `ModularLoRAWeightsManager` respectively. Must be called after
+    /// arenas are allocated and parameter tensors contain their final
+    /// values (i.e., after `import_weights`).
+    void rebind_to_persistent_arena(const CompiledGraph& graph, const PhaseArenas& arenas, cudaStream_t stream);
+
+    /// Bytes actually needed in the Persistent arena given the set of
+    /// locally-allocated (non-external, non-weight-manager-managed) params
+    /// in this store. Computed as max(offset + bytes) across those params'
+    /// tids in `graph`. Zero if no rebindable param exists. Used by
+    /// `GraphExecutor::compile_graphs` to clamp the Persistent arena size
+    /// — `compute_arena_sizes` bases its estimate on every ForwardParam
+    /// tid in the graph, but QLoRA-external and weight-manager-managed
+    /// params should not consume arena bytes (their storage is elsewhere).
+    std::size_t rebindable_persistent_bytes(const CompiledGraph& graph) const;
 
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 

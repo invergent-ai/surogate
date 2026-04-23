@@ -13,6 +13,7 @@
 
 #include <filesystem>
 #include <cstring>
+#include <functional>
 #include <fmt/format.h>
 
 #include "py_train.h"
@@ -1886,6 +1887,212 @@ NB_MODULE(_surogate, m) {
             "- min_savings_mb: skip resize if savings are below this (default 128).\n\n"
             "Returns: list of (new_size_bytes, old_size_bytes) per rank;\n"
             "new_size_bytes == 0 means the rank kept its existing stack.")
+        // ============================================================================
+        // Phase-tree / region / layout debug surface
+        //   (design/buffer-runtime-v4.md Phase 4; exposed via `surogate debug tensor-*`)
+        // ============================================================================
+        .def(
+            "get_debug_tensor_layout",
+            [](MultiGPUPyTrainer* trainer) {
+                auto entries = trainer->get_debug_tensor_layout();
+                nb::list out;
+                for (const auto& e : entries) {
+                    nb::dict r;
+                    r["graph"] = dsl::debug_graph_kind_name(e.graph);
+                    r["tid"] = e.tid;
+                    r["name"] = e.name;
+                    r["kind"] = e.kind;
+                    r["region"] = e.region;
+                    r["block_layer_idx"] = e.block_layer_idx;
+                    r["offset"] = e.offset;
+                    r["bytes"] = e.bytes;
+                    r["offset_assigned"] = e.offset_assigned;
+                    r["retain_through_forward"] = e.retain_through_forward;
+                    r["base_param_tid"] = e.base_param_tid;
+                    r["base_producer_tid"] = e.base_producer_tid;
+                    r["base_grad_tid"] = e.base_grad_tid;
+                    r["is_blocks"] = e.is_blocks;
+                    r["is_d_blocks"] = e.is_d_blocks;
+                    r["is_cross_layer"] = e.is_cross_layer;
+                    r["is_moe_offsets"] = e.is_moe_offsets;
+                    r["is_moe_gather"] = e.is_moe_gather;
+                    out.append(std::move(r));
+                }
+                return out;
+            },
+            "Per-tid layout across forward + backward compiled graphs.\n\n"
+            "Each entry is a dict with fields:\n"
+            "  graph, tid, name, kind, region, block_layer_idx, offset, bytes,\n"
+            "  offset_assigned, retain_through_forward, base_param_tid,\n"
+            "  base_producer_tid, base_grad_tid, is_blocks, is_d_blocks,\n"
+            "  is_cross_layer, is_moe_offsets, is_moe_gather.")
+        .def(
+            "get_debug_arena_summary",
+            [](MultiGPUPyTrainer* trainer) {
+                auto s = trainer->get_debug_arena_summary();
+                auto graph_arena_to_dict = [](const dsl::DebugGraphArena& g) {
+                    nb::dict d;
+                    d["graph"] = dsl::debug_graph_kind_name(g.graph);
+                    d["name"] = g.name;
+                    d["num_tensors"] = g.num_tensors;
+                    d["num_ops"] = g.num_ops;
+                    d["persistent_bytes"] = g.persistent_bytes;
+                    d["accumulator_bytes"] = g.accumulator_bytes;
+                    d["fwd_stack_peak"] = g.fwd_stack_peak;
+                    d["bwd_stack_peak"] = g.bwd_stack_peak;
+                    d["save_for_bwd_bytes"] = g.save_for_bwd_bytes;
+                    nb::list block_bytes;
+                    for (auto b : g.save_for_bwd_block_bytes) {
+                        block_bytes.append(b);
+                    }
+                    d["save_for_bwd_block_bytes"] = block_bytes;
+                    d["layout_hash"] = g.layout_hash;
+                    d["tids_covered"] = g.tids_covered;
+                    d["tids_total"] = g.tids_total;
+                    d["tids_size_exceeded"] = g.tids_size_exceeded;
+                    d["covered_inputs"] = g.covered_inputs;
+                    d["covered_outputs"] = g.covered_outputs;
+                    d["total_inputs"] = g.total_inputs;
+                    d["total_outputs"] = g.total_outputs;
+                    nb::list regions;
+                    for (const auto& rc : g.regions) {
+                        nb::dict rd;
+                        rd["region"] = rc.region;
+                        rd["tid_count"] = rc.tid_count;
+                        rd["tid_bytes"] = rc.tid_bytes;
+                        regions.append(std::move(rd));
+                    }
+                    d["regions"] = regions;
+                    return d;
+                };
+                nb::dict r;
+                r["arenas_allocated"] = s.arenas_allocated;
+                r["arena_persistent_bytes"] = s.arena_persistent_bytes;
+                r["arena_persistent_activation_bytes"] = s.arena_persistent_activation_bytes;
+                r["arena_accumulator_bytes"] = s.arena_accumulator_bytes;
+                r["arena_fwd_stack_bytes"] = s.arena_fwd_stack_bytes;
+                r["arena_bwd_stack_bytes"] = s.arena_bwd_stack_bytes;
+                r["arena_save_for_bwd_bytes"] = s.arena_save_for_bwd_bytes;
+                r["arena_unified_stack_bytes"] = s.arena_unified_stack_bytes;
+                r["arena_bwd_cross_layer_bytes"] = s.arena_bwd_cross_layer_bytes;
+                r["arena_moe_saved_bytes"] = s.arena_moe_saved_bytes;
+                nb::list bases;
+                for (auto b : s.arena_save_for_bwd_block_bases) {
+                    bases.append(b);
+                }
+                r["arena_save_for_bwd_block_bases"] = bases;
+                r["forward"] = graph_arena_to_dict(s.forward);
+                r["backward"] = graph_arena_to_dict(s.backward);
+                return r;
+            },
+            "Aggregate arena sizes + per-graph coverage + per-region tid counts.\n"
+            "Returns dict with `arena_*_bytes` (what was cudaMalloc'd) plus `forward`\n"
+            "and `backward` sub-dicts containing per-graph stats.")
+        .def(
+            "get_debug_phase_tree",
+            [](MultiGPUPyTrainer* trainer, bool is_backward) {
+                auto t = trainer->get_debug_phase_tree(is_backward);
+                std::function<nb::dict(const dsl::DebugPhaseNode&)> node_to_dict =
+                    [&node_to_dict](const dsl::DebugPhaseNode& n) {
+                        nb::dict d;
+                        d["kind"] = n.kind;
+                        d["label"] = n.label;
+                        d["op_start"] = n.op_start;
+                        d["op_end"] = n.op_end;
+                        d["block_index"] = n.block_index;
+                        nb::list children;
+                        for (const auto& c : n.children) {
+                            children.append(node_to_dict(c));
+                        }
+                        d["children"] = children;
+                        return d;
+                    };
+                nb::dict r;
+                r["graph"] = dsl::debug_graph_kind_name(t.graph);
+                r["present"] = t.present;
+                r["root"] = t.present ? node_to_dict(t.root) : nb::dict();
+                nb::list insts;
+                for (const auto& inst : t.instruction_stream) {
+                    nb::dict id;
+                    id["kind"] = inst.kind;
+                    id["phase_kind"] = inst.phase_kind;
+                    id["block_index"] = inst.block_index;
+                    id["op_start"] = inst.op_start;
+                    id["op_end"] = inst.op_end;
+                    id["eager"] = inst.eager;
+                    insts.append(std::move(id));
+                }
+                r["instruction_stream"] = insts;
+                return r;
+            },
+            nb::arg("is_backward") = false,
+            "Phase tree + flattened instruction stream for one graph.\n"
+            "Returns dict with keys {graph, present, root, instruction_stream}.\n"
+            "`present` is False when the graph has no phase tree (non-block-stacked compiles).")
+        .def(
+            "get_debug_static_aliasing",
+            [](MultiGPUPyTrainer* trainer) {
+                auto pairs = trainer->get_debug_static_aliasing();
+                nb::list out;
+                for (const auto& p : pairs) {
+                    nb::dict r;
+                    r["graph"] = dsl::debug_graph_kind_name(p.graph);
+                    r["region"] = p.region;
+                    r["block_layer_idx"] = p.block_layer_idx;
+                    r["tid_a"] = p.tid_a;
+                    r["name_a"] = p.name_a;
+                    r["offset_a"] = p.offset_a;
+                    r["bytes_a"] = p.bytes_a;
+                    r["tid_b"] = p.tid_b;
+                    r["name_b"] = p.name_b;
+                    r["offset_b"] = p.offset_b;
+                    r["bytes_b"] = p.bytes_b;
+                    r["overlap_bytes"] = p.overlap_bytes;
+                    out.append(std::move(r));
+                }
+                return out;
+            },
+            "Tid pairs whose arena byte ranges overlap within the same coloring bucket.\n"
+            "Under correct compilation this is empty (modulo intentional `alias_of`).")
+        .def(
+            "get_debug_tensor_resolution",
+            [](MultiGPUPyTrainer* trainer, const std::string& name, int tid, bool is_backward) {
+                auto res = trainer->get_debug_tensor_resolution(name, tid, is_backward);
+                nb::dict r;
+                r["found"] = res.found;
+                r["graph"] = dsl::debug_graph_kind_name(res.graph);
+                r["description"] = res.description;
+                r["first_write_op"] = res.first_write_op;
+                r["last_use_op"] = res.last_use_op;
+                nb::list path;
+                for (const auto& p : res.phase_path) {
+                    path.append(p);
+                }
+                r["phase_path"] = path;
+                nb::dict entry;
+                entry["graph"] = dsl::debug_graph_kind_name(res.entry.graph);
+                entry["tid"] = res.entry.tid;
+                entry["name"] = res.entry.name;
+                entry["kind"] = res.entry.kind;
+                entry["region"] = res.entry.region;
+                entry["block_layer_idx"] = res.entry.block_layer_idx;
+                entry["offset"] = res.entry.offset;
+                entry["bytes"] = res.entry.bytes;
+                entry["offset_assigned"] = res.entry.offset_assigned;
+                entry["retain_through_forward"] = res.entry.retain_through_forward;
+                entry["base_param_tid"] = res.entry.base_param_tid;
+                entry["base_producer_tid"] = res.entry.base_producer_tid;
+                entry["base_grad_tid"] = res.entry.base_grad_tid;
+                r["entry"] = entry;
+                return r;
+            },
+            nb::arg("name") = std::string{},
+            nb::arg("tid") = -1,
+            nb::arg("is_backward") = false,
+            "Single-tensor provenance lookup.\n\n"
+            "If `name` is non-empty, resolves via the graph's name->tid map; otherwise\n"
+            "uses `tid` directly. Returns dict with keys {found, graph, entry,\n"
+            "description, first_write_op, last_use_op, phase_path}.")
         .def_static(
             "create_multinode",
             [](int ngpu,

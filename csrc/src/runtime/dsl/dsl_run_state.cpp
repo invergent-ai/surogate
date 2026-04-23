@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "runtime/attention/attention_backend.h"
+#include "runtime/executor/compiled_ops.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "runtime/training/runtime_options.h"
@@ -27,6 +29,7 @@
 #include "runtime/core/fp8_scaling_state.h"
 #include "runtime/core/matmul_context.h"
 #include "runtime/core/model_config.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "utilities/dtype.h"
 #include "utilities/utils.h"
 
@@ -373,9 +376,6 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                                     mGradDtype);
 
     allocate_non_block_state(config);
-    allocate_simplified_activations(config);
-    allocate_simplified_gradients(config);
-    build_activation_grad_zero_segments();
     allocate_simplified_quant_buffers(config, options);
     allocate_residual_buffers(config, options.OffloadResidual);
     allocate_scratch_buffers(config);
@@ -395,6 +395,12 @@ DslRunState::~DslRunState() {
         (void)cudaFreeHost(mMoEStatsHost);
         mMoEStatsHost = nullptr;
     }
+    // Free any phase-arena Stack buffer we adopted ownership of.
+    if (mOwnedExternalStack) {
+        (void)cudaFree(mOwnedExternalStack);
+        mOwnedExternalStack = nullptr;
+        mOwnedExternalStackBytes = 0;
+    }
 }
 
 void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark) {
@@ -408,6 +414,46 @@ void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::Alloc
     }
 }
 
+void DslRunState::rebase_stack_to_external(std::byte* ptr, std::size_t bytes) {
+    if (!ptr || bytes == 0) {
+        throw std::runtime_error("DslRunState::rebase_stack_to_external: invalid buffer");
+    }
+    if (Stack.bytes_used() != 0) {
+        throw std::runtime_error("DslRunState::rebase_stack_to_external: Stack is not empty");
+    }
+    Stack = DeviceMemoryStack(ptr, bytes, DeviceId);
+}
+
+void DslRunState::unbind_external_stack() {
+    if (Stack.bytes_used() != 0) {
+        throw std::runtime_error("DslRunState::unbind_external_stack: Stack is not empty");
+    }
+    if (!mStackBuffer.Data) {
+        throw std::runtime_error("DslRunState::unbind_external_stack: no original stack buffer");
+    }
+    Stack = DeviceMemoryStack(mStackBuffer.Data, static_cast<std::size_t>(mStackBuffer.bytes()), DeviceId);
+}
+
+void DslRunState::free_allocator_stack_buffer() {
+    if (!mStackBuffer.Data) return;
+    mAllocator->free(mStackBuffer);
+    mStackBuffer = Tensor{};
+}
+
+void DslRunState::adopt_external_stack(std::byte* ptr, std::size_t bytes) {
+    if (!ptr || bytes == 0) {
+        throw std::runtime_error("DslRunState::adopt_external_stack: invalid buffer");
+    }
+    // Free any previously-adopted buffer first.
+    if (mOwnedExternalStack) {
+        cudaFree(mOwnedExternalStack);
+        mOwnedExternalStack = nullptr;
+        mOwnedExternalStackBytes = 0;
+    }
+    mOwnedExternalStack = ptr;
+    mOwnedExternalStackBytes = bytes;
+}
+
 void DslRunState::resize_stack_to(long new_size_bytes) {
     if (new_size_bytes <= 0) {
         throw std::runtime_error("DslRunState::resize_stack_to: non-positive size");
@@ -415,12 +461,27 @@ void DslRunState::resize_stack_to(long new_size_bytes) {
     // Free the old buffer *before* requesting the new one. The TensorAllocator
     // retains tracked allocations until its destructor runs, so a naive
     // allocate+swap would leak the pre-resize buffer to the end of the run
-    // and briefly hold 2x VRAM on tight-memory setups.
-    mAllocator->free(mStackBuffer);
+    // and briefly hold 2x VRAM on tight-memory setups. Branch on which owner
+    // currently backs the Stack: allocator buffer vs adopted arena.
+    const bool adopted = (mOwnedExternalStack != nullptr);
     Stack = DeviceMemoryStack();
-    Tensor new_stack =
-        mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {new_size_bytes});
-    set_stack_buffer(std::move(new_stack));
+    if (adopted) {
+        // Adopted arena (cudaMalloc'd by allocate_phase_arenas, ownership handed
+        // to this run state). Free + re-cudaMalloc at the new size, re-adopt.
+        cudaFree(mOwnedExternalStack);
+        mOwnedExternalStack = nullptr;
+        mOwnedExternalStackBytes = 0;
+        void* new_ptr = nullptr;
+        CUDA_CHECK(cudaMalloc(&new_ptr, static_cast<std::size_t>(new_size_bytes)));
+        mOwnedExternalStack = static_cast<std::byte*>(new_ptr);
+        mOwnedExternalStackBytes = static_cast<std::size_t>(new_size_bytes);
+        Stack = DeviceMemoryStack(mOwnedExternalStack, mOwnedExternalStackBytes, DeviceId);
+    } else {
+        mAllocator->free(mStackBuffer);
+        Tensor new_stack =
+            mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {new_size_bytes});
+        set_stack_buffer(std::move(new_stack));
+    }
 }
 
 long DslRunState::shrink_stack_to_high_water_mark(long safety_bytes, long min_savings_bytes) {
@@ -429,13 +490,20 @@ long DslRunState::shrink_stack_to_high_water_mark(long safety_bytes, long min_sa
         // Stack has never seen an allocation — nothing to measure.
         return 0;
     }
-    const long current = static_cast<long>(mStackBuffer.bytes());
+    // Read capacity from the Stack itself so this works for both
+    // allocator-owned (mStackBuffer) and adopted-arena (mOwnedExternalStack)
+    // backings. Resize handles each ownership path internally.
+    const long current = static_cast<long>(Stack.capacity());
     const long target = peak + safety_bytes;
     if (current - target < min_savings_bytes) {
         return 0;
     }
     resize_stack_to(target);
     return target;
+}
+
+Tensor* DslRunState::active_executor_slot(int layer_idx, TensorSlot slot) {
+    return mActiveExecutor ? mActiveExecutor->executor_tid_slot(layer_idx, slot) : nullptr;
 }
 
 Tensor& DslRunState::get_residual(int layer_idx, cudaStream_t stream) {
@@ -593,433 +661,207 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
         mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
 }
 
-void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
-    // All sharing / sizing / stack-temp decisions come from the plan built
-    // in the constructor — see buffer_plan.{h,cpp}. This function is a
-    // mechanical walk over the plan: any NEW sharing or sizing decision
-    // belongs in `BufferPlan::build`, not here. Re-reading `mRecomputeLevel`,
-    // `mLoraOnlyMode`, `mRuntimeConfig`, or `mSlotRegistry` directly inside
-    // the allocator would re-introduce the policy/mechanism split the plan
-    // was introduced to eliminate.
-    const auto& plan = mBufferPlan;
-    const long B = plan.B;
-    const long T = plan.T;
-    const long C = plan.C;
-    const long Hq = plan.Hq;
-    const long Hkv = plan.Hkv;
-    const long AttnDim = plan.AttnDim;  // max across hybrid layers
-    const long QKV = plan.QKV;          // max across hybrid layers
-    const long M = plan.M;              // max across hybrid layers
-    const long MUp = plan.MUp;          // max across hybrid layers
-    const long NumExperts = plan.NumExperts;
-    const long TopK = plan.TopK;
-    const long MoeM = plan.MoeM;
-    const long MoeMUp = plan.MoeMUp;
-    const bool use_qk_norm = plan.use_qk_norm;
-    const bool recompute_enabled = plan.recompute_enabled;
+void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& graph,
+                                                       const PhaseArenas& arenas,
+                                                       cudaStream_t stream) {
+    if (!arenas.allocated || arenas.persistent_activation_ptr == nullptr || arenas.persistent_activation_bytes == 0)
+        return;
 
-    const auto dtype = plan.act_dtype;
-    const auto kind = EAllocationType::ON_DEVICE;
+    std::size_t rebound = 0;
+    std::size_t skipped_no_tid = 0;
+    std::size_t skipped_non_persistent = 0;
+    std::size_t skipped_size_mismatch = 0;
 
-    Tensor shared_ln1{}, shared_ln2{}, shared_qkv{}, shared_qkv_rope{};
-    Tensor shared_att{}, shared_att_out{}, shared_lse{};
-    Tensor shared_q_rstd{}, shared_k_rstd{};
-    Tensor shared_mlp_up{}, shared_swiglu{}, shared_residual_att{}, shared_mlp_down{};
-
-    // Allocation tag = `<canonical_slot_name>_shared`. The canonical name
-    // comes from `builtin_slot_name()` (reverse of `kSlotMappings`) so
-    // renaming a slot propagates to every alloc tag automatically.
-    auto shared_tag = [](TensorSlot s) -> std::string {
-        return std::string(builtin_slot_name(s)) + "_shared";
+    auto try_rebind = [&](const char* name, Tensor& t) {
+        if (t.Data == nullptr) return;
+        const int tid = graph.find_tensor_id(name);
+        if (tid < 0) {
+            ++skipped_no_tid;
+            return;
+        }
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != RegionKind::PersistentActivation || meta.offset == SIZE_MAX) {
+            ++skipped_non_persistent;
+            return;
+        }
+        const std::size_t tensor_bytes = t.bytes();
+        if (tensor_bytes == 0 || meta.bytes < tensor_bytes ||
+            meta.offset + tensor_bytes > arenas.persistent_activation_bytes) {
+            ++skipped_size_mismatch;
+            return;
+        }
+        std::byte* arena_ptr = arenas.persistent_activation_ptr + meta.offset;
+        CUDA_CHECK(cudaMemcpyAsync(arena_ptr, t.Data, tensor_bytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = t.Stats;
+        const int device = t.Device;
+        mAllocator->free(t);
+        t.Data = arena_ptr;
+        t.Device = device;
+        t.Stats = preserved_stats;
+        ++rebound;
     };
 
-    if (plan.share_ln1)
-        shared_ln1 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN1).c_str(), kind, {B, T, C});
-    if (plan.share_ln2)
-        shared_ln2 = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockLN2).c_str(), kind, {B, T, C});
-    if (plan.share_qkv) {
-        shared_qkv = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKV).c_str(), kind, {B, T, QKV});
-    }
-    // In LoRA mode with recompute, we still need a separate qkv_rope buffer when
-    // QK-norm is used.  Without it, RoPE is applied in-place on the shared qkv buffer,
-    // so the persisted "qkv" actually contains post-rope values.  During backward
-    // recompute the saved-tensor lookup returns this post-rope value as input to the
-    // qk_norm_rope recompute op, causing norm+rope to be applied twice (→ NaN for MRoPE).
-    // A single shared buffer is sufficient since recompute runs one layer at a time.
-    if (plan.allocate_shared_qkv_rope) {
-        shared_qkv_rope = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockQKVRoPE).c_str(), kind, {B, T, QKV});
-    }
-    if (plan.share_qk_rstd) {
-        // plan.share_qk_rstd already subsumes use_qk_norm (see BufferPlan::build).
-        shared_q_rstd =
-            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockQRSTD).c_str(), kind, {B, T, Hq});
-        shared_k_rstd =
-            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockKRSTD).c_str(), kind, {B, T, Hkv});
-    }
-    // LSE sharing: only in lora_only mode. FFT needs per-layer LSE for bit-exact gradients.
-    if (plan.share_att) {
-        shared_lse =
-            mAllocator->allocate(ETensorDType::FP32, shared_tag(TensorSlot::BlockLSE).c_str(), kind, {B, Hq, T});
-    }
-    if (plan.share_att) {
-        shared_att = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAtt).c_str(), kind, {B, T, AttnDim});
-    }
-    if (plan.share_att_out) {
-        shared_att_out = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockAttOut).c_str(), kind, {B, T, C});
-    }
-    // att_out sharing is handled by share_att when recompute is enabled.
-    if (plan.share_mlp_up && !plan.ffn_temps_on_stack && plan.has_mlp_up_slot) {
-        shared_mlp_up = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPUp).c_str(), kind, {B, T, MUp});
-    }
-    if (plan.share_swiglu && !plan.ffn_temps_on_stack && plan.has_swiglu_slot) {
-        shared_swiglu = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockSwiGLU).c_str(), kind, {B, T, M});
-    }
-    if (plan.share_residual_att) {
-        shared_residual_att =
-            mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockResidualAtt).c_str(), kind, {B, T, C});
-    }
-    if (plan.share_mlp_down) {
-        shared_mlp_down = mAllocator->allocate(dtype, shared_tag(TensorSlot::BlockMLPDown).c_str(), kind, {B, T, C});
-    }
-
-    mSimplifiedActivations.resize(cfg.NumLayers);
-    for (int i = 0; i < cfg.NumLayers; ++i) {
-        auto& acts = mSimplifiedActivations[i];
-
-        // Per-layer dimensions for hybrid models — accessors fall back to the
-        // shared (max) value for homogeneous models.
-        const long lQKV = plan.layer_qkv(i);
-        const long lAttnDim = plan.layer_attn_dim(i);
-        const long lMUp = plan.layer_mlp_up(i);
-        const long lM = plan.layer_intermediate(i);
-
-        // Per-layer allocation tag = canonical slot name; shared buffers are
-        // already created above with the `<slot>_shared` tag.
-        auto tag = [](TensorSlot s) {
-            return builtin_slot_name(s);
-        };
-
-        acts.ln1_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN1RSTD), kind, {B, T});
-        acts.ln1 =
-            plan.share_ln1 ? shared_ln1 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN1), kind, {B, T, C});
-
-        acts.ln2_rstd = mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLN2RSTD), kind, {B, T});
-        acts.ln2 =
-            plan.share_ln2 ? shared_ln2 : mAllocator->allocate(dtype, tag(TensorSlot::BlockLN2), kind, {B, T, C});
-
-        if (use_qk_norm) {
-            acts.q_rstd = plan.share_qk_rstd
-                              ? shared_q_rstd
-                              : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockQRSTD), kind, {B, T, Hq});
-            acts.k_rstd =
-                plan.share_qk_rstd
-                    ? shared_k_rstd
-                    : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockKRSTD), kind, {B, T, Hkv});
-        } else {
-            acts.q_rstd = {};
-            acts.k_rstd = {};
+    // Multiple names may route to the same backing buffer (SSA aliases). We
+    // only rebind once per buffer; subsequent attempts see Data==nullptr (after
+    // free) and no-op.
+    auto try_rebind_aliases = [&](std::initializer_list<const char*> names, Tensor& t) {
+        for (const char* n : names) {
+            if (t.Data == nullptr) return;  // already rebound via earlier alias
+            try_rebind(n, t);
         }
+    };
 
-        // KV source layers (referenced by shared-KV attention in other layers)
-        // MUST have their own non-shared QKV buffers so the data survives until
-        // the consumer layer reads it.
-        const bool is_kv_src = plan.is_kv_source(i);
-        acts.qkv = (plan.share_qkv && !is_kv_src)
-                       ? shared_qkv
-                       : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKV), kind, {B, T, lQKV});
-        if (plan.need_separate_qkv_rope) {
-            acts.qkv_rope = (shared_qkv_rope.Data && !is_kv_src)
-                                ? shared_qkv_rope
-                                : mAllocator->allocate(dtype, tag(TensorSlot::BlockQKVRoPE), kind, {B, T, lQKV});
-        } else {
-            acts.qkv_rope = {};
-        }
+    // "x0" is the SSA output of the main embedding op; "encoded" is the
+    // slot-registry alias. "xF" is the final-norm SSA output; "ln_final" is
+    // the slot alias. Register both so we match whichever tid the graph kept.
+    try_rebind_aliases({"encoded", "x0"}, mNonBlockActivations.encoded);
+    try_rebind_aliases({"ln_final", "xF"}, mNonBlockActivations.ln_final);
+    try_rebind_aliases({"ln_final_rstd"}, mNonBlockActivations.ln_final_rstd);
+    try_rebind_aliases({"output"}, mNonBlockActivations.output);
+    try_rebind_aliases({"freq_cis"}, mNonBlockActivations.freq_cis);
+    try_rebind_aliases({"d_ln_final"}, mNonBlockGradients.d_ln_final);
+    // `d_embeddings` / `d_encoded` / `d_x0` tids exist but aren't classified
+    // Persistent in the graph (ActivationGrad→Persistent rule doesn't fire
+    // for them in practice), so this buffer is rebound via the extras slab
+    // instead. See `rebind_non_graph_persistent_to_arena`.
 
-        acts.lse = plan.share_att
-                       ? shared_lse
-                       : mAllocator->allocate(ETensorDType::FP32, tag(TensorSlot::BlockLSE), kind, {B, Hq, T});
-        acts.att = plan.share_att ? shared_att
-                                  : mAllocator->allocate(dtype, tag(TensorSlot::BlockAtt), kind, {B, T, lAttnDim});
-        acts.att_out = plan.share_att_out ? shared_att_out
-                                          : mAllocator->allocate(dtype, tag(TensorSlot::BlockAttOut), kind, {B, T, C});
-
-        acts.residual_att = plan.share_residual_att
-                                ? shared_residual_att
-                                : mAllocator->allocate(dtype, tag(TensorSlot::BlockResidualAtt), kind, {B, T, C});
-
-        // Skip mlp_up/swiglu allocation when the DSL layout doesn't define these slots
-        // (e.g., GatedMLP which uses stack-based temps instead of pre-allocated buffers).
-        if (plan.ffn_temps_on_stack || !plan.has_mlp_up_slot) {
-            acts.mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
-        } else {
-            acts.mlp_up = plan.share_mlp_up
-                              ? shared_mlp_up
-                              : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPUp), kind, {B, T, lMUp});
-        }
-        if (plan.ffn_temps_on_stack || !plan.has_swiglu_slot) {
-            acts.swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
-        } else {
-            acts.swiglu = plan.share_swiglu
-                              ? shared_swiglu
-                              : mAllocator->allocate(dtype, tag(TensorSlot::BlockSwiGLU), kind, {B, T, lM});
-        }
-
-        acts.mlp_down = plan.share_mlp_down
-                            ? shared_mlp_down
-                            : mAllocator->allocate(dtype, tag(TensorSlot::BlockMLPDown), kind, {B, T, C});
-        // Dedicated per-layer block output slot used by Gemma4 (keeps the
-        // block's final h_out separate from the MLP's mlp_down so the
-        // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
-        // dependency that drives MLP LoRA gradients).
-        acts.h_out = mAllocator->allocate(dtype, tag(TensorSlot::BlockHOut), kind, {B, T, C});
-
-        if (NumExperts > 0) {
-            const long num_tokens = B * T;
-            const long total_tokens = num_tokens * TopK;
-            // MoE slot tags now come from the TensorSlot enum — same reverse
-            // mapping used for every other block slot. Adding a new MoE slot
-            // is a one-line change in `kSlotMappings`/`slot_to_name`.
-            acts.router_logits =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterLogits), kind, {num_tokens, NumExperts});
-            acts.router_probs =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockRouterProbs), kind, {num_tokens, NumExperts});
-            acts.routing_weights =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockRoutingWeights), kind, {num_tokens, TopK});
-            acts.routing_indices = mAllocator->allocate(ETensorDType::INT32,
-                                                        tag(TensorSlot::BlockRoutingIndices),
-                                                        kind,
-                                                        {num_tokens, TopK});
-            acts.permuted_input =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockPermutedInput), kind, {total_tokens, C});
-            acts.scatter_indices =
-                mAllocator->allocate(ETensorDType::INT32, tag(TensorSlot::BlockScatterIndices), kind, {total_tokens});
-            acts.expert_gate_up =
-                mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertGateUp), kind, {total_tokens, MoeMUp});
-            acts.expert_act = mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertAct), kind, {total_tokens, MoeM});
-            acts.expert_down = mAllocator->allocate(dtype, tag(TensorSlot::BlockExpertDown), kind, {total_tokens, C});
-            acts.moe_out = view_tensor(acts.mlp_down, {num_tokens, C});
-        } else {
-            acts.router_logits = {};
-            acts.router_probs = {};
-            acts.routing_weights = {};
-            acts.routing_indices = {};
-            acts.permuted_input = {};
-            acts.scatter_indices = {};
-            acts.expert_gate_up = {};
-            acts.expert_act = {};
-            acts.expert_down = {};
-            acts.moe_out = {};
-        }
+    for (std::size_t i = 0; i < mPerLayerRopeFreqs.size(); ++i) {
+        const std::string name = "rope_freqs_layer" + std::to_string(i);
+        try_rebind(name.c_str(), mPerLayerRopeFreqs[i]);
     }
 
-    // Allocate temporary buffers for recomputation
-    // This prevents overwriting saved values when recomputing forward activations
-    if (recompute_enabled) {
-        mRecomputeRstd = mAllocator->allocate(ETensorDType::FP32, "recompute_rstd", kind, {B, T});
-        // LSE buffer for attention recomputation - same shape as acts.lse [B, Hq, T]
-        mRecomputeLSE = mAllocator->allocate(ETensorDType::FP32, "recompute_lse", kind, {B, Hq, T});
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume non-block] rebound=" << rebound << " skipped_no_tid=" << skipped_no_tid
+                      << " skipped_non_persistent=" << skipped_non_persistent
+                      << " skipped_size_mismatch=" << skipped_size_mismatch
+                      << " arena_bytes=" << arenas.persistent_activation_bytes << "\n";
+        }
     }
 }
 
-void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
-    // Like allocate_simplified_activations, this is a mechanical walk over
-    // the plan — new decisions belong in BufferPlan::build, not here.
-    const auto& plan = mBufferPlan;
-    const long B = plan.B;
-    const long T = plan.T;
-    const long C = plan.C;
-    const long AttnDim = plan.AttnDim;  // max across hybrid layers
-    const long QKV = plan.QKV;
-    const long M = plan.M;
-    const long MUp = plan.MUp;
-
-    const auto dtype = plan.grad_dtype;
-    const auto kind = EAllocationType::ON_DEVICE;
-
-    // Allocate shared gradient buffers if recompute_block is enabled
-    if (plan.share_grads && !mSharedDResAtt.Data) {
-        if (plan.share_res_ffn_grad) {
-            mSharedDResFFN[0] = mAllocator->allocate(dtype, "d_res_ffn_a", kind, {B, T, C});
-            mSharedDResFFN[1] = mAllocator->allocate(dtype, "d_res_ffn_b", kind, {B, T, C});
-        }
-        if (plan.share_mlp_down_grad) {
-            mSharedDMlpDown[0] = mAllocator->allocate(dtype, "d_mlp_down_a", kind, {B, T, C});
-            mSharedDMlpDown[1] = mAllocator->allocate(dtype, "d_mlp_down_b", kind, {B, T, C});
-        }
-        mSharedDResAtt = mAllocator->allocate(dtype, "d_res_att_shared", kind, {B, T, C});
-        if (plan.is_hybrid) {
-            mSharedDAttOut = mAllocator->allocate(dtype, "d_att_out_shared", kind, {B, T, C});
-        } else {
-            mSharedDAttOut = mSharedDResAtt;
-        }
-        mSharedDLn2 = mAllocator->allocate(dtype, "d_ln2_shared", kind, {B, T, C});
-        if (plan.share_d_att) {
-            mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttnDim});
-        }
-        mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
+std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
+    // Persistent buffers that don't have a graph tid today. The list here
+    // must stay in lockstep with the rebind order in
+    // `rebind_non_graph_persistent_to_arena` — same tensors, same order,
+    // so bump-allocated offsets are deterministic.
+    std::size_t total = 0;
+    total += mNonBlockActivations.output.bytes();
+    total += mNonBlockActivations.ln_final_rstd.bytes();
+    total += mNonBlockActivations.freq_cis.bytes();
+    total += mNonBlockGradients.d_embeddings.bytes();
+    for (const auto& rf : mPerLayerRopeFreqs) {
+        total += rf.bytes();
     }
-
-    mSimplifiedGradients.resize(cfg.NumLayers);
-    for (int i = 0; i < cfg.NumLayers; ++i) {
-        auto& g = mSimplifiedGradients[i];
-
-        const long lQKV = plan.layer_qkv(i);
-        const long lAttnDim = plan.layer_attn_dim(i);
-        const long lMUp = plan.layer_mlp_up(i);
-        const long lM = plan.layer_intermediate(i);
-
-        g.d_res_ffn = plan.share_res_ffn_grad ? mSharedDResFFN[static_cast<std::size_t>(i % 2)]
-                                              : mAllocator->allocate(dtype, "d_res_ffn", kind, {B, T, C});
-        g.d_res_att = plan.share_grads ? mSharedDResAtt : mAllocator->allocate(dtype, "d_res_att", kind, {B, T, C});
-        g.d_att_out = plan.is_hybrid ? (plan.share_grads ? mSharedDAttOut
-                                                         : mAllocator->allocate(dtype, "d_att_out", kind, {B, T, C}))
-                                     : g.d_res_att;
-        g.d_ln2 = plan.share_grads ? mSharedDLn2 : mAllocator->allocate(dtype, "d_ln2", kind, {B, T, C});
-
-        if (plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot) {
-            g.d_mlp_up = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lMUp});
-        } else {
-            g.d_mlp_up = mAllocator->allocate(dtype, "d_mlp_up", kind, {B, T, lMUp});
-        }
-        if (plan.large_bwd_temps_on_stack || !plan.has_swiglu_slot) {
-            g.d_swiglu = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lM});
-        } else {
-            g.d_swiglu = mAllocator->allocate(dtype, "d_swiglu", kind, {B, T, lM});
-        }
-        if (plan.large_bwd_temps_on_stack) {
-            g.d_qkv = Tensor::from_pointer(nullptr, DeviceId, dtype, std::vector<long>{B, T, lQKV});
-        } else {
-            g.d_qkv = mAllocator->allocate(dtype, "d_qkv", kind, {B, T, lQKV});
-        }
-
-        g.d_mlp_down = plan.share_mlp_down_grad ? mSharedDMlpDown[static_cast<std::size_t>(i % 2)]
-                                                : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
-        // Per-layer h_out gradient (Gemma4: block's final-output grad,
-        // separate from MLP's d_mlp_down so the backward chain doesn't
-        // collide across the MLP / _finalize split).
-        g.d_h_out = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
-        g.d_att = plan.share_d_att ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
-        g.d_ln1 = plan.share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
-    }
-
-    // Preserve the original buffer pointers so we can restore them if the
-    // compiled executor temporarily aliases gradients to stack-backed temps.
-    mSimplifiedGradientsBase = mSimplifiedGradients;
+    // Device scratch buffers — small individually but several per model.
+    // `bytes()` relies on the DType field being a valid enum; tensors that
+    // may be left default-constructed (DType uninitialized — e.g.
+    // encoder_bwd_scratch in LoRA-only mode) are gated on Data != nullptr
+    // via `.has_value()` to avoid throwing "Invalid dtype" from
+    // get_dtype_size. Quant-grad tensors are skipped because their `.Stats`
+    // field is pointer arithmetic into mGradQuantStats — rebinding would
+    // orphan the Stats link.
+    auto safe_bytes = [](const Tensor& t) -> std::size_t {
+        return t.has_value() ? t.bytes() : 0;
+    };
+    total += safe_bytes(mScratch.rmsnorm_scratch);
+    total += safe_bytes(mScratch.matmul_bias_scratch);
+    total += safe_bytes(mScratch.norm_buffer);
+    total += safe_bytes(mScratch.matmul_scales);
+    total += safe_bytes(mScratch.cross_entropy_dloss);
+    total += safe_bytes(mScratch.cross_entropy_logsumexp);
+    total += safe_bytes(mScratch.cross_entropy_chunk_logsumexp);
+    total += safe_bytes(mScratch.encoder_bwd_scratch);
+    // `cudnn_workspace` is NOT migrated: the rebind pattern transiently
+    // holds both the mAllocator buffer and the arena slot until
+    // `rebind_non_graph_persistent_to_arena` runs. On GPT-OSS that
+    // workspace is ~574 MiB, and the benchmark gate's peak-memory poll
+    // catches the spike — a +574 MiB regression vs mAllocator-only. Q3's
+    // cudnn_workspace is smaller (~192 MiB) and hides under other peaks.
+    // Moving cudnn to the arena requires allocating arena before run-
+    // state scratch buffers, which is a larger ordering refactor.
+    return total;
 }
 
-void DslRunState::reset_simplified_gradients() {
-    if (mSimplifiedGradientsBase.size() != mSimplifiedGradients.size()) {
-        return;
+void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::size_t bytes, cudaStream_t stream) {
+    if (base == nullptr || bytes == 0) return;
+
+    std::size_t consumed = 0;
+    auto rebind_into = [&](Tensor& t) {
+        if (t.Data == nullptr) return;
+        const std::size_t tbytes = t.bytes();
+        if (tbytes == 0 || consumed + tbytes > bytes) return;
+        std::byte* slot = base + consumed;
+        CUDA_CHECK(cudaMemcpyAsync(slot, t.Data, tbytes, cudaMemcpyDeviceToDevice, stream));
+        float* preserved_stats = t.Stats;
+        const int device = t.Device;
+        mAllocator->free(t);
+        t.Data = slot;
+        t.Device = device;
+        t.Stats = preserved_stats;
+        consumed += tbytes;
+    };
+
+    // Order must match `non_graph_persistent_extras_bytes`.
+    rebind_into(mNonBlockActivations.output);
+    rebind_into(mNonBlockActivations.ln_final_rstd);
+    rebind_into(mNonBlockActivations.freq_cis);
+    rebind_into(mNonBlockGradients.d_embeddings);
+    for (auto& rf : mPerLayerRopeFreqs) {
+        rebind_into(rf);
     }
-    for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
-        auto& dst = mSimplifiedGradients[i];
-        const auto& src = mSimplifiedGradientsBase[i];
+    rebind_into(mScratch.rmsnorm_scratch);
+    rebind_into(mScratch.matmul_bias_scratch);
+    rebind_into(mScratch.norm_buffer);
+    rebind_into(mScratch.matmul_scales);
+    rebind_into(mScratch.cross_entropy_dloss);
+    rebind_into(mScratch.cross_entropy_logsumexp);
+    rebind_into(mScratch.cross_entropy_chunk_logsumexp);
+    rebind_into(mScratch.encoder_bwd_scratch);
 
-        dst.d_res_ffn.Data = src.d_res_ffn.Data;
-        dst.d_res_att.Data = src.d_res_att.Data;
-        dst.d_att_out.Data = src.d_att_out.Data;
-        dst.d_ln2.Data = src.d_ln2.Data;
-        dst.d_mlp_up.Data = src.d_mlp_up.Data;
-        dst.d_swiglu.Data = src.d_swiglu.Data;
-        dst.d_mlp_down.Data = src.d_mlp_down.Data;
-        dst.d_att.Data = src.d_att.Data;
-        dst.d_qkv.Data = src.d_qkv.Data;
-        dst.d_ln1.Data = src.d_ln1.Data;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        dst.d_mamba_normed.Data = src.d_mamba_normed.Data;
-        dst.d_mamba_gated.Data = src.d_mamba_gated.Data;
-        dst.d_mamba_scan_out.Data = src.d_mamba_scan_out.Data;
-        dst.d_mamba_u.Data = src.d_mamba_u.Data;
-        dst.d_mamba_delta.Data = src.d_mamba_delta.Data;
-        dst.d_mamba_B.Data = src.d_mamba_B.Data;
-        dst.d_mamba_C.Data = src.d_mamba_C.Data;
-        dst.d_mamba_conv_out.Data = src.d_mamba_conv_out.Data;
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
+        if (std::string(dbg) == "1") {
+            std::cerr << "[arena-consume non-graph-extras] consumed=" << consumed << " slab_bytes=" << bytes << "\n";
+        }
     }
 }
 
 void DslRunState::zero_activation_gradients(cudaStream_t stream) {
-    // Zero activation gradient buffers to prevent stale gradients from accumulating.
-    // Use a single kernel launch over a precomputed (ptr, bytes) list to reduce graph-node
-    // overhead vs many separate cudaMemsetAsync calls.
+    // Zero activation gradient buffers to prevent stale gradients from
+    // accumulating. Uses a single kernel launch over a precomputed
+    // (ptr, bytes) list built lazily at first bwd entry (see
+    // CompiledExecutor::populate_bwd_stack_bindings).
     if (mActGradZeroCount > 0 && mActGradZeroPtrs.Data && mActGradZeroSizes.Data) {
         zero_device_segments(reinterpret_cast<const std::uint64_t*>(mActGradZeroPtrs.Data),
                              reinterpret_cast<const std::uint64_t*>(mActGradZeroSizes.Data),
                              mActGradZeroCount,
                              stream);
-        return;
-    }
-
-    // Fallback: should not normally happen.
-    for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
-        auto& g = mSimplifiedGradients[i];
-        if (i < mSimplifiedGradients.size() - 1 && g.d_res_ffn.Data) fill_zero(g.d_res_ffn, stream);
-        if (g.d_res_att.Data) fill_zero(g.d_res_att, stream);
-        if (g.d_att_out.Data) fill_zero(g.d_att_out, stream);
     }
 }
 
-void DslRunState::build_activation_grad_zero_segments() {
-    mActGradZeroPtrs = {};
-    mActGradZeroSizes = {};
-    mActGradZeroCount = 0;
-
-    if (!mAllocator) {
+void DslRunState::set_activation_grad_zero_list(const std::vector<std::uint64_t>& ptrs,
+                                                const std::vector<std::uint64_t>& sizes) {
+    if (ptrs.size() != sizes.size()) return;
+    const int count = static_cast<int>(ptrs.size());
+    if (count == 0) {
+        mActGradZeroCount = 0;
         return;
     }
-    if (mSimplifiedGradientsBase.empty()) {
-        return;
+    const long bytes = static_cast<long>(static_cast<std::size_t>(count) * sizeof(std::uint64_t));
+    if (!mActGradZeroPtrs.Data || mActGradZeroCount != count) {
+        mActGradZeroPtrs =
+            mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_ptrs", EAllocationType::ON_DEVICE, {bytes});
+        mActGradZeroSizes =
+            mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_sizes", EAllocationType::ON_DEVICE, {bytes});
     }
-
-    std::vector<std::uint64_t> ptrs;
-    std::vector<std::uint64_t> sizes;
-    ptrs.reserve(mSimplifiedGradientsBase.size() * 8);
-    sizes.reserve(mSimplifiedGradientsBase.size() * 8);
-
-    std::unordered_set<std::byte*> seen;
-    seen.reserve(mSimplifiedGradientsBase.size() * 8);
-
-    auto add = [&](const Tensor& t) {
-        if (!t.Data) return;
-        const std::size_t bytes = static_cast<std::size_t>(t.bytes());
-        if (bytes == 0) return;
-        if (!seen.insert(t.Data).second) return;
-        ptrs.push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.Data)));
-        sizes.push_back(static_cast<std::uint64_t>(bytes));
-    };
-
-    const std::size_t n_layers = mSimplifiedGradientsBase.size();
-    for (std::size_t i = 0; i < n_layers; ++i) {
-        const auto& g = mSimplifiedGradientsBase[i];
-        // d_res_ffn for the last layer is zeroed separately (it receives the loss gradient).
-        if (i + 1 < n_layers) {
-            add(g.d_res_ffn);
-        }
-        // Residual gradients can be used as accumulation targets (multiple branches).
-        // Other activation gradients are expected to be overwritten (beta=0 / memcpy) within
-        // the backward graph and don't need blanket zeroing.
-        add(g.d_res_att);
-        add(g.d_att_out);
-        // d_h_out is an accumulation target for the next block's backward
-        // (gemma4 routes block output through a dedicated h_out slot to
-        // avoid mlp_down collision). Without zeroing, garbage in d_h_out
-        // leaks into the first backward that reads it (→ NaN cascade).
-        add(g.d_h_out);
-    }
-
-    mActGradZeroCount = static_cast<int>(ptrs.size());
-    if (mActGradZeroCount <= 0) {
-        return;
-    }
-
-    const long bytes = static_cast<long>(static_cast<std::size_t>(mActGradZeroCount) * sizeof(std::uint64_t));
-    mActGradZeroPtrs =
-        mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_ptrs", EAllocationType::ON_DEVICE, {bytes});
-    mActGradZeroSizes =
-        mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_sizes", EAllocationType::ON_DEVICE, {bytes});
-
     CUDA_CHECK(cudaMemcpy(mActGradZeroPtrs.Data, ptrs.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
     CUDA_CHECK(
         cudaMemcpy(mActGradZeroSizes.Data, sizes.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    mActGradZeroCount = count;
 }
 
 void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options) {
@@ -1109,8 +951,21 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long QKV = D * (Hq + 2 * Hkv);
     const long C_attn = static_cast<long>(cfg.attn_out_channels());
 
+    // Size the shared rmsnorm backward scratch for the MAX C across every
+    // rmsnorm application in the model. HiddenSize alone underestimates on
+    // hybrid models like Gemma4: q_norm / k_norm operate on tensors with
+    // last-dim C = Hq*head_size, which for full-attention layers exceeds
+    // HiddenSize (Gemma4-E2B: 4096 for full, 2048 for sliding,
+    // HiddenSize = 1536). Without this max, rmsnorm_backward for a
+    // full-attention q_norm throws "scratch buffer too small".
+    long rmsnorm_scratch_max_c = C;
+    if (mRuntimeConfig.has_per_layer_dims()) {
+        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
+            rmsnorm_scratch_max_c = std::max(rmsnorm_scratch_max_c, static_cast<long>(pld.attn_dim));
+        }
+    }
     const long rmsnorm_scratch_bytes =
-        static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(C), DeviceProp));
+        static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(rmsnorm_scratch_max_c), DeviceProp));
     mScratch.rmsnorm_scratch = mAllocator->allocate(ETensorDType::BYTE,
                                                     "rmsnorm_scratch",
                                                     EAllocationType::ON_DEVICE,

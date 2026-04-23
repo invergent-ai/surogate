@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include "runtime/executor/graph_executor_internal.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/core/forward_hooks.h"
@@ -283,6 +284,20 @@ public:
         return mCompiledBackward.get();
     }
 
+    /// Access the compiled forward graph (nullptr if not yet compiled).
+    /// Paired with `compiled_backward()` for debuggability tooling that
+    /// needs layout / region / phase-tree state post-compile.
+    const CompiledGraph* compiled_forward() const {
+        return mCompiledForward.get();
+    }
+
+    /// Access the phase-tree arena allocator for debuggability tooling.
+    /// Sizes come from the baked layout; use together with
+    /// `dsl::validate_arena_coverage` / `dsl::validate_op_operand_coverage`.
+    const dsl::PhaseArenas& phase_arenas() const {
+        return mPhaseArenas;
+    }
+
     /// Compile the forward + backward graph pair for the given (B, T) if
     /// they aren't already compiled for those dimensions. Safe to call
     /// multiple times. Public surface around the private `compile_graphs`.
@@ -428,8 +443,23 @@ private:
     long mCompiledB = 0;
     long mCompiledT = 0;
 
+    // Phase-tree arena allocator. Holds 5 cudaMalloc'd device buffers
+    // sized from the baked layout in mCompiledForward / mCompiledBackward.
+    dsl::PhaseArenas mPhaseArenas;
+
+    // True when mRunState.Stack has been rebased onto
+    // mPhaseArenas.unified_stack_ptr. The Stack must be unbound before the
+    // arena is released.
+    bool mStackRebasedToArena = false;
+
     void init_compiled_execution();
     void compile_graphs(long B, long T);
+
+    /// Dump per-layer (slot, tid, region, offset, bytes) for the
+    /// block-activation canonical names. Consumed when
+    /// SUROGATE_DEBUG_ACT_OFFSETS=1. Runs once per (B,T) recompile.
+    void dump_simplified_activation_offsets();
+
     void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);
     void execute_backward(long B,
                           long T,

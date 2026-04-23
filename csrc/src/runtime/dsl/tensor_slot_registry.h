@@ -106,20 +106,6 @@ public:
     /// @brief Get the share policy for a slot
     SharePolicy get_share_policy(const std::string& name) const;
 
-    /// @brief Determine if a slot should be shared across layers given the current mode
-    /// @param name Tensor name
-    /// @param lora_only_mode True if in LoRA-only mode (not FFT mode)
-    /// @param recompute_enabled True if recompute is enabled
-    /// @return True if the slot should use shared allocation across layers
-    ///
-    /// This method evaluates the slot's share_policy to determine if sharing is safe:
-    /// - PerLayer: Never share (return false)
-    /// - WhenRecomputed: Share only if will_recompute() returns true
-    /// - AlwaysShare: Always share (return true)
-    /// - FFTShare: Share only in FFT mode (when lora_only_mode is false)
-    /// - LoRAShare: Share only in LoRA mode (when lora_only_mode is true)
-    bool should_share(const std::string& name, bool lora_only_mode, bool recompute_enabled) const;
-
     /// @brief Check if the registry has been initialized from a DSL layout
     bool has_dsl_layout() const {
         return mHasDslLayout;
@@ -147,6 +133,32 @@ const char* builtin_slot_name(TensorSlot slot);
 /// @brief Map a slot name to TensorSlot enum for fast runtime dispatch
 /// @return TensorSlot::Mapped if not a known slot (will use dynamic lookup)
 TensorSlot builtin_slot_from_name(const std::string& name);
+
+/// Resolve `name` to a TensorSlot, treating a `_flat` suffix as an alias of
+/// the underlying (non-flat) slot when the suffixed name isn't registered
+/// directly. Names like `xF_flat`/`ln_final_flat` carry their own 2D shape in
+/// the DSL layout and aren't in the static name→slot table; this helper makes
+/// them route to the parent slot (LNFinal) while telling the caller via
+/// `*out_is_flat_view` that a 2D view is required.
+///
+/// Returns `TensorSlot::Mapped` if neither the suffixed nor the base name
+/// resolves.
+TensorSlot resolve_slot_with_flat(const std::string& name, bool* out_is_flat_view = nullptr);
+
+/// Block-scope variant: parses `blocks[N].<field>` (or `blocks.N.field`,
+/// `layerN.field`), strips the SSA numeric suffix, and returns the resulting
+/// slot. Block `_flat` aliases (`ln1_flat`, `qkv_flat`, ...) are in the
+/// name→slot table directly and resolve to the same slot as their 3D base;
+/// `*out_is_flat_view` is set to true whenever the stripped field name ends
+/// in `_flat`, so callers that need a 2D view of the underlying 3D buffer
+/// can flatten accordingly.
+///
+/// Returns `TensorSlot::Mapped` (and leaves outputs untouched) when `name`
+/// is not block-qualified.
+TensorSlot resolve_block_slot(const std::string& name,
+                              int* out_layer_idx = nullptr,
+                              bool* out_is_flat_view = nullptr,
+                              std::string* out_base_field = nullptr);
 
 }  // namespace dsl
 

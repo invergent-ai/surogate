@@ -339,6 +339,22 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     // constraint — resize up if so. Shrinking is deliberately skipped to
     // avoid churn on the allocator.
     // ------------------------------------------------------------------
+    // Wire LoRA weights and weight manager onto the executor BEFORE
+    // compile, so compile_graphs can size the Persistent arena's LoRA
+    // and DslWeightManager slabs upfront. set_lora_state /
+    // set_weight_manager are idempotent pointer-setters — LoRA's full
+    // state (grads / run_state) is populated with a second call below.
+    if (lora_enabled()) {
+        mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
+                                  mLoRAWeights.get(),
+                                  /*grads=*/nullptr,
+                                  /*run_state=*/nullptr);
+    }
+    if (mWeightManager) {
+        if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
+            exec->set_weight_manager(mWeightManager.get());
+        }
+    }
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
         exec->ensure_graphs_compiled(B, T);
         const long needed =
@@ -363,13 +379,6 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     if (mModelConfig.NumExperts > 0) {
         float aux_coef = mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->router_aux_loss_coef : 0.01f;
         mRunState->set_moe_config(mModelConfig.NumExperts, aux_coef);
-    }
-
-    // Wire weight manager for streaming/sharding
-    if (mWeightManager) {
-        if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
-            exec->set_weight_manager(mWeightManager.get());
-        }
     }
 
     if (lora_enabled()) {

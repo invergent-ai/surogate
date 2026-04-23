@@ -30,6 +30,7 @@
 #include "runtime/dsl/dsl_model.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/executor/graph_executor.h"
 #include "runtime/optimizers/normuon.h"
 
 namespace {
@@ -1392,6 +1393,113 @@ std::vector<std::pair<std::string, long>> MultiGPUPyTrainer::get_stack_info(int 
     std::vector<std::pair<std::string, long>> result;
     run_work([&result](sThreadContext& ctx) { result = ctx.Model->get_run_state().Stack.get_allocation_stats(); },
              gpu_id);
+    return result;
+}
+
+// =============================================================================
+// Phase-tree / region / layout introspection (design/buffer-runtime-v4.md).
+// =============================================================================
+//
+// Each getter captures the trainer's (B, T) and force-compiles the forward +
+// backward DSL graphs before collecting. The debug collectors read
+// `CompiledGraph::tensor_meta` + `phase_tree`, which are only populated by
+// `compile_graphs()`, and the trainer constructor itself does NOT trigger
+// that — it happens lazily on first forward/backward. Noop for non-DSL
+// models (the dynamic_cast to DslModel fails harmlessly).
+
+std::vector<dsl::DebugTensorEntry> MultiGPUPyTrainer::get_debug_tensor_layout() {
+    std::vector<dsl::DebugTensorEntry> result;
+    const long b = B;
+    const long t = T;
+    run_work(
+        [&result, b, t](sThreadContext& ctx) {
+            auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!m) {
+                return;
+            }
+            if (auto* exec = m->graph_executor()) {
+                exec->ensure_graphs_compiled(b, t);
+            }
+            result = dsl::collect_tensor_layout(*m);
+        },
+        /*gpu_id=*/0);
+    return result;
+}
+
+dsl::DebugArenaSummary MultiGPUPyTrainer::get_debug_arena_summary() {
+    dsl::DebugArenaSummary result{};
+    const long b = B;
+    const long t = T;
+    run_work(
+        [&result, b, t](sThreadContext& ctx) {
+            auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!m) {
+                return;
+            }
+            if (auto* exec = m->graph_executor()) {
+                exec->ensure_graphs_compiled(b, t);
+            }
+            result = dsl::collect_arena_summary(*m);
+        },
+        /*gpu_id=*/0);
+    return result;
+}
+
+dsl::DebugPhaseTree MultiGPUPyTrainer::get_debug_phase_tree(bool is_backward) {
+    dsl::DebugPhaseTree result;
+    const long b = B;
+    const long t = T;
+    run_work(
+        [&result, is_backward, b, t](sThreadContext& ctx) {
+            auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!m) {
+                return;
+            }
+            if (auto* exec = m->graph_executor()) {
+                exec->ensure_graphs_compiled(b, t);
+            }
+            result = dsl::collect_phase_tree(*m, is_backward);
+        },
+        /*gpu_id=*/0);
+    return result;
+}
+
+std::vector<dsl::DebugAliasingPair> MultiGPUPyTrainer::get_debug_static_aliasing() {
+    std::vector<dsl::DebugAliasingPair> result;
+    const long b = B;
+    const long t = T;
+    run_work(
+        [&result, b, t](sThreadContext& ctx) {
+            auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!m) {
+                return;
+            }
+            if (auto* exec = m->graph_executor()) {
+                exec->ensure_graphs_compiled(b, t);
+            }
+            result = dsl::collect_static_aliasing(*m);
+        },
+        /*gpu_id=*/0);
+    return result;
+}
+
+dsl::DebugTensorResolution
+MultiGPUPyTrainer::get_debug_tensor_resolution(const std::string& name, int tid, bool is_backward) {
+    dsl::DebugTensorResolution result;
+    const long b = B;
+    const long t = T;
+    run_work(
+        [&result, &name, tid, is_backward, b, t](sThreadContext& ctx) {
+            auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!m) {
+                return;
+            }
+            if (auto* exec = m->graph_executor()) {
+                exec->ensure_graphs_compiled(b, t);
+            }
+            result = dsl::resolve_tensor(*m, name, tid, is_backward);
+        },
+        /*gpu_id=*/0);
     return result;
 }
 

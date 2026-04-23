@@ -44,6 +44,7 @@ class NorMuonOptimizer;
 namespace dsl {
 
 class IGraphExecutor;
+class GraphExecutor;
 class DslParamStore;
 class DslGradStore;
 class DslRunState;
@@ -136,6 +137,13 @@ public:
     [[nodiscard]] DslWeightManager* weight_manager() {
         return mWeightManager.get();
     }
+
+    /// Debuggability (design/buffer-runtime-v4.md Phase 4 debug surface):
+    /// read-only access to the concrete graph executor so tooling can reach
+    /// the compiled forward/backward graphs + phase arenas without friending.
+    /// Returns nullptr if no executor has been constructed yet.
+    [[nodiscard]] const GraphExecutor* graph_executor() const;
+    [[nodiscard]] GraphExecutor* graph_executor();
 
     modules::ModularLoRAWeightsManager& lora_weights();
     modules::ModularLoRAGradsManager& lora_grads();
