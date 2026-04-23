@@ -374,8 +374,8 @@ CompiledExecutor::~CompiledExecutor() {
         mReplayPersistOffset = 0;
     }
 
-    // Free persistent MoE saved tensor buffers (Phase 3 #6 flip: skip
-    // arena-backed entries; their storage is owned by mPhaseArenas).
+    // Free persistent MoE saved tensor buffers. Arena-backed entries are
+    // skipped — their storage is owned by mPhaseArenas.
     for (auto& [name, buffer] : mMoeSavedBuffers) {
         if (!buffer) continue;
         auto ab_it = mMoeSavedArenaBacked.find(name);
