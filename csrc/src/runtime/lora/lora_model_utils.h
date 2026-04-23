@@ -221,8 +221,19 @@ inline void apply_lora_contribution(Tensor& output,
                stream);
     }
 
-    // Scale intermediate so we can use GEMM accumulate for B @ intermediate^T.
-    if (scaling != 1.0f) {
+    // Whether we can fold `scaling` into the B-matmul's alpha (no separate
+    // scale kernel needed). Requires BF16 everywhere because the alpha/beta
+    // path in matmul(...) only supports BF16 — FP32/FP8 paths fall back to
+    // the accumulate-based API which ignores alpha != 1.0.
+    const bool fold_scaling_into_alpha = (output.DType == ETensorDType::BF16 && lora.B.DType == ETensorDType::BF16 &&
+                                          intermediate.DType == ETensorDType::BF16);
+
+    // Scale intermediate only when we can't fold the scale into the B-matmul
+    // alpha. For BF16 we pass alpha=scaling to the B-GEMM (Unsloth-style fold)
+    // and skip this pre-scale. Saves one kernel launch per LoRA target per
+    // forward and another per backward (~7 LoRA targets × 35 layers × 2
+    // (fwd/bwd) × gas ≈ 500+ launches/step avoided).
+    if (scaling != 1.0f && !fold_scaling_into_alpha) {
         vector_add_sr(intermediate,
                       intermediate,
                       intermediate,
@@ -231,6 +242,7 @@ inline void apply_lora_contribution(Tensor& output,
                       /*seed=*/0,
                       stream);
     }
+    const float b_alpha = fold_scaling_into_alpha ? scaling : 1.0f;
 
     if (output_offset < 0 || output_offset + out_features > total_out_features) {
         // Skip: offset out of bounds for this output tensor.
@@ -246,20 +258,38 @@ inline void apply_lora_contribution(Tensor& output,
 
     // Packed destination: accumulate directly.
     if (!prefer_explicit_add && output_offset == 0 && out_features == total_out_features) {
-        matmul(output,
-               lora.B,
-               intermediate,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               handle,
-               workspace,
-               out_features,
-               BT,
-               rank,
-               EMMTranspose::TN,
-               /*accumulate=*/true,
-               stream);
+        if (fold_scaling_into_alpha) {
+            matmul(output,
+                   lora.B,
+                   intermediate,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   handle,
+                   workspace,
+                   out_features,
+                   BT,
+                   rank,
+                   EMMTranspose::TN,
+                   /*alpha=*/b_alpha,
+                   /*beta=*/1.0f,
+                   stream);
+        } else {
+            matmul(output,
+                   lora.B,
+                   intermediate,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   handle,
+                   workspace,
+                   out_features,
+                   BT,
+                   rank,
+                   EMMTranspose::TN,
+                   /*accumulate=*/true,
+                   stream);
+        }
         return;
     }
 
