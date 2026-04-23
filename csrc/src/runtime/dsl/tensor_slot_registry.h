@@ -106,9 +106,6 @@ public:
     /// @brief Get the share policy for a slot
     SharePolicy get_share_policy(const std::string& name) const;
 
-    // should_share removed (Phase 4 M5): no callers after
-    // BufferPlan::build dropped its share_for lambda.
-
     /// @brief Check if the registry has been initialized from a DSL layout
     bool has_dsl_layout() const {
         return mHasDslLayout;

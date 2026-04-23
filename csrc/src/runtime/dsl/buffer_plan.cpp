@@ -52,8 +52,6 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.NumLayers = cfg.NumLayers;
 
     // Hybrid dims: max dims across all layers drive max-buffer sizing.
-    // Uniformity booleans were only used by forward- and gradient-activation
-    // sharing, both gone (Phase 4 M5 cleanup).
     p.per_layer_dims = runtime_config.per_layer_dims;
     if (!p.per_layer_dims.empty()) {
         for (const auto& pld : p.per_layer_dims) {
@@ -84,12 +82,6 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.has_swiglu_slot =
         p.has_dsl_layout && slot_registry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
 
-    // Forward-activation sharing decisions removed as part of Phase 4
-    // M5 cleanup (commit d3ec195). Every layer now allocates its own
-    // per-slot buffer; the share_* booleans are gone. Per-slot
-    // hybrid-uniformity checks (uniform_qkv, uniform_attn, etc.) were
-    // only used to disable sharing — no longer relevant.
-
     // ---------------- FFN temps on stack ----------------
     // Only safe when both mlp_up and swiglu are recomputable — otherwise the
     // backward pass can't reconstruct them and we'd have to fall back to
@@ -99,14 +91,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.ffn_temps_on_stack = p.recompute_enabled && p.lora_only && p.can_recompute_ffn_temps;
 
     // ---------------- qkv_rope ----------------
-    // Separate per-layer qkv_rope whenever recompute is on and QK-norm is
-    // used; allocate_shared_qkv_rope was part of forward-activation
-    // sharing and is gone (Phase 4 M5 cleanup).
+    // Separate per-layer qkv_rope whenever recompute is on and QK-norm
+    // is used.
     p.need_separate_qkv_rope = p.recompute_enabled && p.use_qk_norm;
 
-    // ---------------- Gradient sharing ----------------
-    // All gradient-sharing removed as part of Phase 4 M5 cleanup — every
-    // layer allocates its own d_* buffer.
+    // ---------------- Stack-resident backward temps ----------------
     p.large_bwd_temps_on_stack = p.recompute_enabled;
 
     return p;

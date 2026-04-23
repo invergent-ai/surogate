@@ -6,8 +6,8 @@
 // expert weights from native GPUs to helper GPUs.
 //
 // Supports two transfer modes:
-//   1. BF16 transfer: send dequantized BF16 weights (Phase 3, always works)
-//   2. Quantized transfer: send raw quantized bytes + scales (Phase 4, 2-8x less bandwidth)
+//   1. BF16 transfer: send dequantized BF16 weights
+//   2. Quantized transfer: send raw quantized bytes + scales
 
 #ifndef SUROGATE_SRC_RUNTIME_EP_WEIGHT_TRANSFER_H
 #define SUROGATE_SRC_RUNTIME_EP_WEIGHT_TRANSFER_H

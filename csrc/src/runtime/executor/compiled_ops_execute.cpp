@@ -58,8 +58,8 @@ namespace dsl {
 // ---------------------------------------------------------------------------
 
 // Clear-.Data helpers for Stack-backed gradient slots that Stack.restore
-// invalidates across layer boundaries. Post-M5.δ, block_gradient_ptr
-// routes tid-first so the clear lands in mTensors[tid].
+// invalidates across layer boundaries. block_gradient_ptr routes tid-first
+// so the clear lands in mTensors[tid].
 static void clear_large_bwd_grad_stack_slots(dsl::DslRunState& rs, int L) {
     auto clear = [&](TensorSlot s) {
         if (Tensor* t = block_gradient_ptr(rs, L, s)) t->Data = nullptr;
@@ -125,8 +125,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
     mCurrentGraph = &fwd_graph;
     mTensors.assign(static_cast<std::size_t>(fwd_graph.num_tensors), Tensor{});
     mNamedTensors.clear();
-    // M5.γ prereq: mirror the pre-bind that execute_forward does so
-    // replayed ops hit the mTensors[tid] cache and write to the arena.
+    // Mirror the pre-bind that execute_forward does so replayed ops hit
+    // the mTensors[tid] cache and write to the arena.
     populate_fwd_stack_bindings(fwd_graph);
 
     // Bind known inputs
@@ -491,12 +491,12 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             tensor.Data = persistent;
         }
 
-        // Phase 4 M3 Phase A: rstd / ln / attn_out / h_out slots live on
-        // the Stack. The save-capture loop above copies live .Data into
-        // mSaved; without the persist below, that .Data is the Stack
-        // pointer which Stack.restore invalidates. Copy into a persistent
-        // cudaMalloc buffer and rebind BOTH the slot AND any mSaved /
-        // mNamedTensors / mTensors entries that captured the old Stack ptr.
+        // rstd / ln / attn_out / h_out slots live on the Stack. The
+        // save-capture loop above copies live .Data into mSaved; without
+        // the persist below, that .Data is the Stack pointer which
+        // Stack.restore invalidates. Copy into a persistent cudaMalloc
+        // buffer and rebind BOTH the slot AND any mSaved / mNamedTensors /
+        // mTensors entries that captured the old Stack ptr.
         if (layer_idx >= 0) {
             auto persist_stack_slot = [&](Tensor& slot, const std::string& slot_name) {
                 if (!slot.Data || slot.bytes() == 0) return;
@@ -948,9 +948,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 continue;
             }
 
-            // Arena-backed persist (M5.d): when the phase-tree arenas are
-            // bound and the tid is classified as SaveForBwd, copy directly
-            // into the pre-allocated arena slot instead of cudaMalloc'ing a
+            // Arena-backed persist: when the phase-tree arenas are bound
+            // and the tid is classified as SaveForBwd, copy directly into
+            // the pre-allocated arena slot instead of cudaMalloc'ing a
             // per-name persistent buffer. Skips cudaMalloc on the hot path.
             void* dst_buffer = nullptr;
             bool used_arena = false;
@@ -1025,9 +1025,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     };
 
     // Bind known inputs (into both flat vector and write-through mirror).
-    // M5.α: bind every stable non-param global at entry so resolve_tensor
-    // finds them via mNamedTensors / mTensors[tid] without falling through
-    // to the slot switch. Each rs.X pointer is stable after allocation.
+    // Binds every stable non-param global at entry so resolve_tensor finds
+    // them via mNamedTensors / mTensors[tid] without falling through to
+    // the slot switch. Each rs.X pointer is stable after allocation.
     bind_tensor("token_ids", mRunState.Inputs);
     bind_tensor("position_ids", mRunState.PositionIDs);
     if (mRunState.VisualPosMasks.Data) {
@@ -1276,14 +1276,13 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         tile_group_starts[tg.start_op_idx] = &tg;
     }
 
-    // Stream-driven forward execution. Reuses today's allocator, stack, and
-    // op dispatch; drives them from graph.instruction_stream instead of the
-    // flat ops list + op.layer_start/end flags. Phase 3 subsystem #1 flip:
-    // SegmentDispatch honors graph.layer_segments when mSplitAttentionGraphs
-    // is on, replicating today's per-segment graph-capture-or-eager dispatch.
-    // The flat-ops loop below remains the path when capturing (CUDA graph
-    // capture needs the single-pass op walk) or when the compiler did not
-    // emit an instruction stream.
+    // Stream-driven forward execution. Reuses the allocator, stack, and op
+    // dispatch; drives them from graph.instruction_stream instead of the
+    // flat ops list + op.layer_start/end flags. SegmentDispatch honors
+    // graph.layer_segments when mSplitAttentionGraphs is on. The flat-ops
+    // loop below remains the path when capturing (CUDA graph capture needs
+    // the single-pass op walk) or when the compiler did not emit an
+    // instruction stream.
     const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing;
     if (stream_driven) {
         if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
@@ -1301,11 +1300,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     }
                     break;
                 case dsl::InstKind::SegmentDispatch: {
-                    // Phase 3 subsystem #1 flip: honor graph.layer_segments when
-                    // split-attention is active. Each layer's ops are dispatched
-                    // as an ordered list of graph-captured / eager segments
-                    // (replicates compiled_ops_execute.cpp:1228-1325 semantics
-                    // in the stream-driven path).
+                    // Honor graph.layer_segments when split-attention is
+                    // active. Each layer's ops are dispatched as an ordered
+                    // list of graph-captured / eager segments.
                     const int L = inst.block_index;
                     const bool splits_disabled = std::getenv("SUROGATE_DISABLE_SPLIT_SEG") != nullptr;
                     const bool use_splits = !splits_disabled && mSplitAttentionGraphs &&
@@ -1740,7 +1737,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mComm = &comm;
     mCurrentGraph = &graph;
     mTemps.clear();
-    // Phase 3 subsystem #4: reset per-step bump cursor for bwd_cross_layer arena.
+    // Reset per-step bump cursor for bwd_cross_layer arena.
     mBwdCrossLayerBumpOffset = 0;
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
@@ -1802,8 +1799,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // gradient slot (and build the zero-list on first compile).
     populate_bwd_stack_bindings(graph);
 
-    // M5.α: bind every stable non-param global into mTensors + mNamedTensors
-    // at backward entry so resolve_tensor finds them via the tid/name cache
+    // Bind every stable non-param global into mTensors + mNamedTensors at
+    // backward entry so resolve_tensor finds them via the tid/name cache
     // without falling through to the slot switch. Runtime pointers are
     // stable across steps — each cleared mTensors slot is re-bound here.
     bind_tensor("token_ids", mRunState.Inputs);
@@ -1828,11 +1825,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         bind_tensor("d_loss", mRunState.scratch().cross_entropy_dloss);
     }
 
-    // M5.β: pre-populate mTensors for every saved-source tid. mSaved was
-    // filled by persist_saved_layer_tensors at forward's layer_end; its
-    // entries hold the arena-backed (SaveForBwd / moe_saved) Tensors that
-    // backward ops need. The backward graph's Saved refs use the stripped
-    // name (`blocks[L].x` — no `saved.` prefix) as their tid key, so a
+    // Pre-populate mTensors for every saved-source tid. mSaved was filled
+    // by persist_saved_layer_tensors at forward's layer_end; its entries
+    // hold the arena-backed (SaveForBwd / moe_saved) Tensors that backward
+    // ops need. The backward graph's Saved refs use the stripped name
+    // (`blocks[L].x` — no `saved.` prefix) as their tid key, so a
     // single bind_tensor per saved entry routes every subsequent
     // resolve_tensor through the cached mTensors[tid] path without
     // touching the mSaved hashmap on the hot path. Metadata-only entries
@@ -2507,7 +2504,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    // Stream-driven backward execution (M5.d, flag-gated pass-through mode).
+    // Stream-driven backward execution (flag-gated pass-through mode).
     // Minimal: no tiled MLP, no capture, no recompute, no bwd_filter / watch /
     // op_profile — matches the Llama-only scope of the forward stream path.
     const bool bwd_stream_driven =
@@ -2525,7 +2522,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         // stream capture — those APIs invalidate the capture. Stack.restore
         // + slot clears still run so peak memory stays bounded.
         if (!capturing) {
-            // BwdCrossLayer persist (Phase 3 #4 arena-backed).
+            // BwdCrossLayer arena-backed persist.
             std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
             struct PendingPersist {
                 int tid;
@@ -2626,16 +2623,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                 if (grad) bind_tensor(gname, *grad);
                             }
                         }
-                        // Phase 3 subsystem #7 flip: recompute moved out of
-                        // PhaseEnter into the explicit RecomputeBlock
+                        // Recompute runs via the explicit RecomputeBlock
                         // instruction emitted immediately after.
                     }
                     break;
 
                 case dsl::InstKind::RecomputeBlock:
-                    // Phase 3 subsystem #7: explicit forward-block replay for
-                    // gradient-checkpointed backward. No-op when recompute is
-                    // off. Idempotent per block via mLastRecomputeLayer.
+                    // Explicit forward-block replay for gradient-checkpointed
+                    // backward. No-op when recompute is off. Idempotent per
+                    // block via mLastRecomputeLayer.
                     if (mRecomputeEnabled && mRecomputeFn && inst.block_index >= 0 &&
                         inst.block_index != mLastRecomputeLayer) {
                         mRecomputeFn(inst.block_index, mB, mT, mRecomputeUseGraphs);
@@ -2676,12 +2672,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             mTemps.clear();
                             initial_checkpoint = mRunState.Stack.checkpoint();
                         }
-                        // Phase 3 subsystem #5 revised: inline prune per op to
-                        // free Stack slots as soon as a tid's last use passes.
-                        // Batching pruning to the PruneByLastUse instruction
-                        // caused a 3x+ Stack bloat on Prologue-heavy graphs
-                        // (MoE, hybrid Mamba) because hundreds of Prologue ops
-                        // accumulate before any gets freed.
+                        // Inline prune per op to free Stack slots as soon as
+                        // a tid's last use passes. Prologue-heavy graphs (MoE,
+                        // hybrid Mamba) need per-op pruning; batching to a
+                        // single PruneByLastUse instruction would accumulate
+                        // hundreds of Prologue allocations before any gets
+                        // freed, producing a 3x+ Stack bloat.
                         prune_by_last_use(i);
 
                         // Per-op layer-end cleanup. Flat-ops does this after
@@ -2697,10 +2693,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     break;
 
                 case dsl::InstKind::PruneByLastUse:
-                    // Phase 3 subsystem #5: redundant with the inline
-                    // prune_by_last_use above; kept as a no-op so the
-                    // instruction stream shape remains stable for
-                    // validation / M5.c's static validator.
+                    // Redundant with the inline prune_by_last_use above;
+                    // kept as a no-op so the instruction stream shape
+                    // remains stable for the static validator.
                     break;
 
                 case dsl::InstKind::PhaseExit:
@@ -3056,7 +3051,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mGrads.offload_non_block_grads(mRunState.MainStream);
     }
 
-    // M5.γ Option C: deregister on backward exit.
+    // Deregister on backward exit.
     mRunState.set_active_executor(nullptr);
 }
 

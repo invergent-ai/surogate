@@ -532,13 +532,13 @@ private:
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
     const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
     dsl::PhaseArenas* mPhaseArenas = nullptr;             // Non-owning; set via set_phase_arenas
-    // Phase 3 subsystem #4: per-step bump cursor into the bwd_cross_layer arena.
-    // Reset at the start of each backward call; advanced by allocate_bwd_cross_layer.
+    // Per-step bump cursor into the bwd_cross_layer arena. Reset at the
+    // start of each backward call; advanced by allocate_bwd_cross_layer.
     std::size_t mBwdCrossLayerBumpOffset = 0;
 
-    // Phase 3 subsystem #6: cross-step monotonic bump cursor into moe_saved
-    // arena. Never reset - MoE save buffers are keyed by name + persist for the
-    // executor's lifetime. Size growth re-bumps (same semantics as today's
+    // Cross-step monotonic bump cursor into the moe_saved arena. Never
+    // reset — MoE save buffers are keyed by name and persist for the
+    // executor's lifetime. Size growth re-bumps (same semantics as the
     // cudaFree+cudaMalloc cycle, which also wastes the old buffer).
     std::size_t mMoeSavedBumpOffset = 0;
     std::unordered_map<std::string, bool> mMoeSavedArenaBacked;
@@ -678,15 +678,11 @@ private:
         }
     }
 
-    /// Phase 4 M3 prerequisite. Invalidate cached Tensor entries for a slot
-    /// whose backing storage is about to be freed (e.g. a Stack-allocated
-    /// simplified-activation slot at layer_end). Erases mNamedTensors[name]
-    /// AND nulls mTensors[tid].Data so resolve_tensor / ensure_output_tensor
-    /// on the next access re-resolve rather than returning a dangling
-    /// pointer. Safe on unknown names. Required before extending the
-    /// ffn_temps_on_stack pattern to slots whose backward consumers read
-    /// them via resolve_tensor(op.inputs[...]) — otherwise the
-    /// mNamedTensors cache survives Stack.restore with a stale pointer.
+    /// Invalidate cached Tensor entries for a slot whose backing storage
+    /// is about to be freed (e.g. a Stack-allocated slot at layer_end).
+    /// Erases mNamedTensors[name] AND nulls mTensors[tid].Data so
+    /// resolve_tensor / ensure_output_tensor re-resolve on next access
+    /// rather than returning a dangling pointer. Safe on unknown names.
     void invalidate_cached_slot(const std::string& name) {
         if (!name.empty()) {
             mNamedTensors.erase(name);

@@ -374,10 +374,6 @@ SharePolicy TensorSlotRegistry::get_share_policy(const std::string& name) const 
     return SharePolicy::PerLayer;  // Default
 }
 
-// should_share removed (Phase 4 M5): its only caller was the
-// share_for lambda in BufferPlan::build, which was deleted along
-// with all forward-activation share_* flags.
-
 // ============================================================================
 // Utility Functions
 // ============================================================================

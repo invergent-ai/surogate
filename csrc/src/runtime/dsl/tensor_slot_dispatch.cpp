@@ -62,13 +62,9 @@ constexpr bool is_block_gradient_slot(TensorSlot s) {
 Tensor* block_activation_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
     if (layer_idx < 0) return nullptr;
 
-    // M5.η (post-Session-D+): mTensors[tid] is the sole source of truth for
-    // block activations. Non-arena special cases (managed residual stream,
-    // in-place QKVRoPE fallback) route directly to their owners. Callers
-    // that query an unbound slot at a phase where no executor is active
-    // (compile-time probes, debug dumps) get nullptr and are expected to
-    // handle it — every hot-path caller reaches here with an active
-    // executor whose mTensors already holds the authoritative binding.
+    // mTensors[tid] is the source of truth for block activations. Special
+    // cases: managed residual stream and in-place QKVRoPE fallback route
+    // directly to their owners. Returns nullptr when no executor is active.
     if (Tensor* t = rs.active_executor_slot(layer_idx, slot)) {
         return t;
     }
@@ -84,11 +80,10 @@ Tensor* block_activation_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
 Tensor* block_gradient_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
     if (layer_idx < 0) return nullptr;
     if (!is_block_gradient_slot(slot)) return nullptr;
-    // M5.δ: mTensors[tid] is the sole source of truth for gradient
-    // activations. populate_bwd_stack_bindings seeds arena-backed tids
-    // at bwd entry; Stack-backed gradient tids get Data via temp_acquire
-    // on first use. When no executor is active (compile-time probes),
-    // there is no binding and nullptr is returned.
+    // mTensors[tid] is the source of truth for gradient activations.
+    // Arena-backed tids are seeded by populate_bwd_stack_bindings at bwd
+    // entry; Stack-backed gradient tids get Data via temp_acquire on first
+    // use. Returns nullptr when no executor is active.
     if (auto* exec = rs.active_executor()) {
         return exec->executor_tid_slot_binding(layer_idx, slot);
     }

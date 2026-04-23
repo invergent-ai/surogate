@@ -44,21 +44,6 @@ struct CompiledGraph;  // fwd — defined in graph_compiler.h; used by stack-siz
 /// be sized and shared. Built once per (B, T, options) via `BufferPlan::build`,
 /// then consumed by `DslRunState` during allocation.
 struct BufferPlan {
-    // Forward-activation sharing (share_ln1, share_ln2, share_qkv,
-    // share_att, share_att_out, share_mlp_up, share_swiglu,
-    // share_residual_att, share_mlp_down, share_qk_rstd) was removed
-    // as part of the Phase 4 M5 cleanup — every layer now allocates
-    // its own per-slot buffer. See commit d3ec195.
-
-    // ---------------- Gradient sharing decisions ----------------
-    // All gradient-sharing booleans (share_grads, share_d_att,
-    // share_res_ffn_grad, share_mlp_down_grad) were removed as part of
-    // Phase 4 M5 cleanup — every layer now allocates its own d_* buffer.
-    // Cross-layer write patterns (layer N+1's LN1 backward writing into
-    // layer N's d_mlp_down) are correct against dedicated per-layer
-    // buffers — the buffer the writer aims at is independent of any
-    // other layer's.
-
     // ---------------- Stack-based temps ----------------
     bool ffn_temps_on_stack = false;
     bool can_recompute_ffn_temps = false;

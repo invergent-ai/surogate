@@ -429,27 +429,21 @@ private:
     long mCompiledB = 0;
     long mCompiledT = 0;
 
-    // Phase-tree arena allocator (design/buffer-runtime-v4.md, M5.d).
-    // Gated on SUROGATE_USE_PHASE_ARENAS=1. Holds 5 cudaMalloc'd device buffers
-    // sized from the baked layout in mCompiledForward / mCompiledBackward. No
-    // runtime consumer yet; future work (tensor resolution override) will
-    // redirect mTensors[tid] pointers to arena_base + TensorMeta::offset.
+    // Phase-tree arena allocator. Holds 5 cudaMalloc'd device buffers
+    // sized from the baked layout in mCompiledForward / mCompiledBackward.
     dsl::PhaseArenas mPhaseArenas;
 
-    // Phase 3 subsystem #3 (Stack checkpoint/restore flip): when true,
-    // mRunState.Stack was rebased to mPhaseArenas.unified_stack_ptr and must
-    // be unbound before the arena is released.
+    // True when mRunState.Stack has been rebased onto
+    // mPhaseArenas.unified_stack_ptr. The Stack must be unbound before the
+    // arena is released.
     bool mStackRebasedToArena = false;
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);
 
-    /// Phase 4 M3 groundwork. Dumps per-layer (slot, tid, region, offset,
-    /// bytes) for the simplified-activation canonical names. Consumed
-    /// when SUROGATE_DEBUG_ACT_OFFSETS=1. Runs once per (B,T) recompile.
-    /// Intent: let us see exactly how the per-frame coloring colors
-    /// the slots we'd need to migrate, before designing the runtime
-    /// frame discipline.
+    /// Dump per-layer (slot, tid, region, offset, bytes) for the
+    /// block-activation canonical names. Consumed when
+    /// SUROGATE_DEBUG_ACT_OFFSETS=1. Runs once per (B,T) recompile.
     void dump_simplified_activation_offsets();
 
     void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);

@@ -182,8 +182,8 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
             continue;
         }
 
-        // Allocate or resize persistent buffer if needed (Phase 3 subsystem #6
-        // flip: arena bump + cudaMalloc fallback).
+        // Allocate or resize persistent buffer if needed (arena bump with
+        // cudaMalloc fallback).
         auto buf_it = mMoeSavedBuffers.find(name);
         if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
             if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
@@ -1021,9 +1021,9 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     const bool has_fwd_arena = mPhaseArenas->fwd_stack_ptr && mPhaseArenas->fwd_stack_bytes > 0;
     const bool has_save_arena = mPhaseArenas->save_for_bwd_ptr && mPhaseArenas->save_for_bwd_bytes > 0;
     if (!has_fwd_arena && !has_save_arena) return;
-    // Session D: during execute_backward we invoke this on the forward
-    // graph to pre-bind fwd-activation tids into bwd's mTensors via the
-    // shared tid namespace. bwd.num_tensors >= fwd.num_tensors, so allow
+    // During execute_backward this is invoked on the forward graph to
+    // pre-bind fwd-activation tids into bwd's mTensors via the shared tid
+    // namespace. bwd.num_tensors >= fwd.num_tensors, so allow
     // graph.num_tensors <= mTensors.size().
     if (static_cast<std::size_t>(graph.num_tensors) > mTensors.size()) return;
 
@@ -1253,12 +1253,12 @@ Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
     // shape-wrong tensor.
     if (slot == TensorSlot::Mapped) return nullptr;
     int tid = mCurrentGraph->slot_to_tid(layer_idx, slot);
-    // Session D+: forward-only slots (res_att, ln2, ln2_rstd, etc.) don't
-    // appear in the backward graph's slot→tid map because no backward op
-    // declares them as an output with that slot tag — they're forward
-    // activations consumed during bwd via snapshot/restore. Fall through
-    // to the forward graph's map (shared tid namespace) so the tid-cache
-    // lookup still succeeds during backward.
+    // Forward-only slots (res_att, ln2, ln2_rstd, etc.) don't appear in
+    // the backward graph's slot→tid map because no backward op declares
+    // them as an output with that slot tag — they're forward activations
+    // consumed during bwd via snapshot/restore. Fall through to the
+    // forward graph's map (shared tid namespace) so the tid-cache lookup
+    // still succeeds during backward.
     if (tid < 0 && mForwardGraph && mForwardGraph != mCurrentGraph) {
         tid = mForwardGraph->slot_to_tid(layer_idx, slot);
     }
@@ -1285,9 +1285,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     };
 
-    // Phase 4 M3 Phase A: bypass mNamedTensors for Stack-backed slots.
-    // Covers ln1, ln2, qk-norm rstd, LSE, attn_out and h_out — all
-    // same-layer producer/consumer, FP32/dtype, small shape.
+    // Bypass mNamedTensors for Stack-backed slots. Covers ln1, ln2,
+    // qk-norm rstd, LSE, attn_out and h_out — all same-layer
+    // producer/consumer, FP32/dtype, small shape.
     const bool bypass_named_for_rstd = [&]() {
         switch (ref.slot) {
             case TensorSlot::BlockLN1RSTD:
@@ -1303,10 +1303,10 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }();
 
-    // Tid-baked fast paths for arena-backed regions (Phase 4 M2 +
-    // M5.γ). persist_saved_layer_tensors / populate_fwd_stack_bindings
-    // write the arena Tensor into mTensors[tid]; returning cached here
-    // skips the mNamedTensors hashmap lookup and the slot switch below.
+    // Tid-baked fast paths for arena-backed regions.
+    // persist_saved_layer_tensors / populate_fwd_stack_bindings write the
+    // arena Tensor into mTensors[tid]; returning cached here skips the
+    // mNamedTensors hashmap lookup and the slot switch below.
     //   - SaveForBwd fires regardless of ref.shape (canonical shape).
     //   - FwdStack fires only when ref.shape is non-empty (caller
     //     declared a view that the pre-bind already materialized); an
@@ -1361,10 +1361,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         ref.slot != TensorSlot::Parameter) {
         // Delegate Block*/MoE*/BlockD*/global slot dispatch to the shared
         // helpers (same pattern as resolve_tensor at the call site below).
-        // Targets/Losses/DLoss are covered by the M5.α entry bindings and
-        // reach the mNamedTensors cache before this block; only FreqCis
-        // still needs a name-keyed lookup (names vary per-block: freq_cis,
-        // rope_freqs_0, rope_freqs_1, ...).
+        // Targets/Losses/DLoss reach the mNamedTensors cache via entry-time
+        // bind_tensor calls; only FreqCis still needs a name-keyed lookup
+        // (names vary per-block: freq_cis, rope_freqs_0, rope_freqs_1, ...).
         Tensor* base = block_activation_ptr(rs, ref.layer_idx, ref.slot);
         if (!base) base = block_gradient_ptr(rs, ref.layer_idx, ref.slot);
         if (!base) base = global_activation_ptr(rs, ref.slot);
@@ -1399,9 +1398,9 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     if (Tensor* gp = global_activation_ptr(rs, ref.slot)) return *gp;
 
     switch (ref.slot) {
-        // Targets / Losses / DLoss cases removed in M5.α — bound at
-        // execute_forward / execute_backward entry via bind_tensor and
-        // resolved by the mNamedTensors / mTensors[tid] fast paths above.
+        // Targets / Losses / DLoss are bound at execute_forward /
+        // execute_backward entry via bind_tensor and resolved by the
+        // mNamedTensors / mTensors[tid] fast paths above.
         case TensorSlot::FreqCis: return rs.rope_freqs(ref.name);
         case TensorSlot::Parameter: return mWeights.get(ref.name);
         case TensorSlot::Saved:

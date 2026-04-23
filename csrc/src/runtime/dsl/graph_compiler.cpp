@@ -993,11 +993,9 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
     // shape_like target's shape is known statically (via mExtraShapes or
     // known-tensor inference), bake it into attrs.shape so view_backward's
     // runtime dispatch uses the compile-time value and doesn't consult
-    // mTensors[shape_like_tid] at runtime. That runtime consultation was
-    // the blocker for Session D proper: when populate_fwd_stack_bindings
-    // pre-bound the shape_like tid, view_backward picked up the
-    // forward-canonical shape even though the consumer expected a
-    // different (infer-path) shape on Q3.5's Hq/Hkv attention views.
+    // mTensors[shape_like_tid] at runtime. Runtime consultation would
+    // pick up the forward-canonical shape, but consumers expect an
+    // infer-path shape on Q3.5's Hq/Hkv attention views.
     if (auto* shape_attr = find_attr(op.attrs, "shape")) {
         attrs.shape = resolve_attr_shape(*shape_attr, env);
     } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
@@ -1588,7 +1586,7 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
 }
 
 // ============================================================================
-// Phase Tree (design/buffer-runtime-v4.md) — shadow-mode build
+// Phase Tree — build from layer boundaries
 // ============================================================================
 
 const char* phase_kind_name(PhaseKind k) {
@@ -1724,7 +1722,7 @@ void GraphCompiler::build_phase_tree(CompiledGraph& graph, bool is_backward) {
 }
 
 // ============================================================================
-// Region Derivation (design/buffer-runtime-v4.md, M2) — shadow-mode compat
+// Region Derivation
 // ============================================================================
 
 const char* region_kind_name(RegionKind k) {
@@ -1793,7 +1791,7 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
 }
 
 // ============================================================================
-// Cross-graph SaveForBwd promotion (design/buffer-runtime-v4.md, M5.a)
+// Cross-graph SaveForBwd promotion
 // ============================================================================
 
 void finalize_save_for_bwd(CompiledGraph& fwd,
@@ -1936,7 +1934,7 @@ void finalize_save_for_bwd(CompiledGraph& fwd,
 }
 
 // ============================================================================
-// Instruction Stream (design/buffer-runtime-v4.md, M4) — shadow-mode emit
+// Instruction Stream — emit from phase tree
 // ============================================================================
 
 const char* inst_kind_name(InstKind k) {
@@ -1955,9 +1953,9 @@ namespace {
 void emit_phase(std::vector<Instruction>& out, const PhaseNode& node) {
     out.push_back({InstKind::PhaseEnter, node.kind, node.block_index, node.op_start, node.op_end, false});
 
-    // Phase 3 subsystem #7: emit RecomputeBlock inside BwdBlock leaves so the
-    // forward-replay dispatch is explicit rather than inlined in PhaseEnter.
-    // Always emitted; the interpreter no-ops when mRecomputeEnabled is false.
+    // Emit RecomputeBlock inside BwdBlock leaves so the forward-replay
+    // dispatch is explicit rather than inlined in PhaseEnter. Always
+    // emitted; the interpreter no-ops when mRecomputeEnabled is false.
     if (node.kind == PhaseKind::BwdBlock && node.block_index >= 0) {
         out.push_back({InstKind::RecomputeBlock, node.kind, node.block_index, node.op_start, node.op_end, false});
     }
@@ -2552,7 +2550,7 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
         color_frames(fwd_frame, fwd_alias_groups, /*section_per_layer=*/(fwd_per_layer_sections && !is_backward));
     auto [bwd_naive, bwd_colored] = color_frames(bwd_frame, bwd_alias_groups, /*section_per_layer=*/false);
 
-    // Expose peaks for compute_arena_sizes (M5.d).
+    // Expose peaks for compute_arena_sizes.
     graph.persistent_bytes = persistent_bytes;
     graph.accumulator_bytes = accumulator_bytes;
     graph.fwd_stack_peak = fwd_colored;
@@ -2576,14 +2574,13 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     const std::size_t fwd_optimal = frame_optimal(fwd_frame);
     const std::size_t bwd_optimal = frame_optimal(bwd_frame);
 
-    // Liveness validator (Phase 3 step 4 prereq). Per-frame coloring packs
-    // multiple tids into the same arena bytes when their live ranges are
-    // disjoint — safe by construction, unsafe if liveness analysis missed a
-    // producer/consumer edge. Walks every frame; for each pair of tids
-    // whose [offset, offset+bytes) intervals overlap, asserts their
+    // Liveness validator. Per-frame coloring packs multiple tids into the
+    // same arena bytes when their live ranges are disjoint — safe by
+    // construction, unsafe if liveness analysis missed a producer/consumer
+    // edge. Walks every frame; for each pair of tids whose
+    // [offset, offset+bytes) intervals overlap, asserts their
     // [first_use, last_use] intervals are disjoint. Any violation is a
-    // compile-time bug that would corrupt memory at arena consumption time
-    // (the trap behind the M3 first-strike's NaN-from-step-0 failure).
+    // compile-time bug that would corrupt memory at arena consumption time.
     std::size_t coloring_violations = 0;
     auto check_frame = [&](const std::vector<std::vector<int>>& frames, const char* where) {
         for (std::size_t L = 0; L < frames.size(); ++L) {
@@ -2655,11 +2652,11 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
         }
     }
 
-    // M5.γ migration: populate CompiledGraph::slot_tid_by_layer so
-    // downstream dispatchers can resolve (layer_idx, slot) → tid in O(1)
-    // instead of constructing "blocks[L].<slot_name>" and hitting
-    // tensor_name_to_id. tid_slot above already carries the canonical
-    // (slot, layer) for every tid; fold it into the per-layer array.
+    // Populate CompiledGraph::slot_tid_by_layer so downstream dispatchers
+    // can resolve (layer_idx, slot) → tid in O(1) instead of constructing
+    // "blocks[L].<slot_name>" and hitting tensor_name_to_id. tid_slot
+    // above already carries the canonical (slot, layer) for every tid;
+    // fold it into the per-layer array.
     {
         constexpr std::size_t kSlotCount = static_cast<std::size_t>(TensorSlot::Mapped) + 1;
         graph.slot_tid_by_layer.assign(num_layers, {});
@@ -2702,7 +2699,7 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
 }
 
 // ============================================================================
-// Phase Arenas (design/buffer-runtime-v4.md, M5.d) — allocation skeleton
+// Phase Arenas — allocation skeleton
 // ============================================================================
 
 void compute_arena_sizes(PhaseArenas& arenas,
@@ -5529,9 +5526,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Annotate layer boundaries for prefetch
     annotate_layer_boundaries(result);
 
-    // Build shadow-mode phase tree (design/buffer-runtime-v4.md, milestone M1).
-    // Runs after annotate_layer_boundaries so layer_{start,end}_indices are
-    // populated. Not consulted at runtime yet.
+    // Build phase tree. Runs after annotate_layer_boundaries so
+    // layer_{start,end}_indices are populated.
     build_phase_tree(result, is_backward);
 
     // Register external tensor names (init bindings, MoE side-channel, param gradients)
@@ -5574,18 +5570,16 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Phase 1 flips them.)
     classify_tensors(result);
 
-    // Derive shadow-mode region assignment (design/buffer-runtime-v4.md, M2).
-    // Runs after classify_tensors so TensorMeta::kind is populated.
+    // Derive region assignment. Runs after classify_tensors so
+    // TensorMeta::kind is populated.
     derive_regions(result, is_backward);
 
-    // Shadow-mode layout (design/buffer-runtime-v4.md, M3 / M5.b). Uses
-    // regions from M2 plus per-tid lifetimes to compute per-region peak
-    // bytes and bake TensorMeta::offset. Re-run by finalize_save_for_bwd()
-    // once cross-graph region promotion is applied.
+    // Compute per-region peak bytes and bake TensorMeta::offset. Re-run
+    // by finalize_save_for_bwd() once cross-graph region promotion is
+    // applied.
     compute_layout(result, is_backward, /*fwd_per_layer_sections=*/!mOptions.recompute_enabled());
 
-    // Flatten the phase tree to a linear instruction stream (M4). The M5
-    // interpreter will consume this stream; for now it is shadow-only.
+    // Flatten the phase tree to a linear instruction stream.
     emit_instruction_stream(result);
 
     // Debuggability dump (P4.7). Runs after every compile for inspection.

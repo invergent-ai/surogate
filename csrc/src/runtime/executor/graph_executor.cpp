@@ -924,10 +924,9 @@ void GraphExecutor::compile_graphs(long B, long T) {
             mCompiledBackward->compute_layer_segments();
         }
 
-        // Cross-graph region fixup (design/buffer-runtime-v4.md, M5.a):
-        // promote forward activations consumed by backward to SaveForBwd in
-        // both compiles. Filtered to match the runtime save-snapshot path
-        // at compiled_ops_execute.cpp.
+        // Cross-graph region fixup: promote forward activations consumed by
+        // backward to SaveForBwd in both compiles. Filtered to match the
+        // runtime save-snapshot path at compiled_ops_execute.cpp.
         //
         // When recompute is active, the forward-replay branch at
         // compiled_ops_execute.cpp pre-empts arena-backed saves entirely:
@@ -965,15 +964,11 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                        /*fwd_per_layer_sections=*/!recompute_active);
         }
 
-        // Phase-tree arena allocation (M5.d). Sized from baked offsets;
-        // gated on SUROGATE_USE_PHASE_ARENAS=1 because it adds a second copy
-        // of persistent+accumulator memory (no consumer yet). Re-allocate on
-        // each (B, T) recompile — sizes may change if shapes change.
+        // Phase-tree arena allocation. Sized from baked offsets. Re-allocated
+        // on each (B, T) recompile — sizes may change if shapes change.
         //
-        // Phase 3 subsystem #3: if SUROGATE_USE_PHASE_STACK=1, additionally
-        // rebase mRunState.Stack onto the unified_stack arena (sized to match
-        // the existing Stack capacity). This is the first subsystem flip to
-        // actually route Qwen3's runtime allocations through an arena buffer.
+        // When SUROGATE_USE_PHASE_STACK=1, also rebase mRunState.Stack onto
+        // the unified_stack arena (sized to match the existing Stack capacity).
 
         // Stack was rebased + adopted by DslRunState in a prior compile; keep
         // it there across (B,T) recompiles. The adopted buffer is owned by
@@ -984,14 +979,13 @@ void GraphExecutor::compile_graphs(long B, long T) {
         if (mCompiledForward && mCompiledBackward) {
             {
                 const std::size_t stack_bytes = mRunState.Stack.capacity();
-                // Phase 3 subsystem #4: bwd_cross_layer arena. Fixed 64 MiB;
-                // the per-step bump resets at backward start. 0 bytes for dense
-                // transformers (typical), < 16 MiB for small-MoE aux-loss.
-                // Interpreter falls back to cudaMalloc if arena is insufficient.
+                // bwd_cross_layer arena. Fixed 64 MiB; the per-step bump
+                // resets at backward start. 0 bytes for dense transformers
+                // (typical), < 16 MiB for small-MoE aux-loss. Interpreter
+                // falls back to cudaMalloc if arena is insufficient.
                 const std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
-                // Phase 3 subsystem #6: moe_saved arena sized 256 MiB when
-                // NumExperts > 0. Cross-step monotonic bump; cudaMalloc
-                // fallback on exhaustion.
+                // moe_saved arena sized 256 MiB when NumExperts > 0.
+                // Cross-step monotonic bump; cudaMalloc fallback on exhaustion.
                 const std::size_t moe_saved_bytes = mConfig.NumExperts > 0 ? 256ULL * 1024 * 1024 : 0;
                 dsl::compute_arena_sizes(mPhaseArenas,
                                          *mCompiledForward,
@@ -1072,10 +1066,8 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     mRunState.free_allocator_stack_buffer();
                     mStackRebasedToArena = true;
                 }
-                // Phase 4 M3 groundwork: dump per-layer per-slot
-                // (offset, bytes, region) for the simplified-activation
-                // slots. Lets us sanity-check the coloring before designing
-                // the runtime frame discipline that full migration needs.
+                // Debug dump: per-layer per-slot (offset, bytes, region).
+                // Sanity-check the coloring output.
                 if (const char* dbg = std::getenv("SUROGATE_DEBUG_ACT_OFFSETS")) {
                     if (std::string(dbg) == "1" && mCompiledForward) {
                         dump_simplified_activation_offsets();

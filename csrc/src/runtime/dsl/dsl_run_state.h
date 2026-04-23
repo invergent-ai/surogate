@@ -58,11 +58,11 @@ public:
     /// backward graph is compiled and peak-modelled more accurately).
     void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
 
-    /// Redirect Stack to an externally-owned device buffer (Phase 3 subsystem
-    /// #3 flip: Stack-arena). Does not take ownership — caller must ensure the
-    /// buffer outlives this DslRunState or call unbind_external_stack() first.
-    /// mStackBuffer is unchanged, so unbinding restores the original backing.
-    /// Stack must be empty (no live allocations) at call time.
+    /// Redirect Stack to an externally-owned device buffer. Does not take
+    /// ownership — caller must ensure the buffer outlives this DslRunState
+    /// or call unbind_external_stack() first. mStackBuffer is unchanged,
+    /// so unbinding restores the original backing. Stack must be empty
+    /// (no live allocations) at call time.
     void rebase_stack_to_external(std::byte* ptr, std::size_t bytes);
 
     /// Restore Stack to the previously-owned mStackBuffer. Inverse of
@@ -351,7 +351,7 @@ public:
     }
 
 private:
-    CompiledExecutor* mActiveExecutor = nullptr;  // M5.γ Option C back-ref; unowned
+    CompiledExecutor* mActiveExecutor = nullptr;  // unowned back-ref
 
     void allocate_non_block_state(const PretrainedConfig& cfg);
     void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);
@@ -397,7 +397,6 @@ private:
     Tensor mActGradZeroSizes{};
     int mActGradZeroCount = 0;
 
-    // Shared gradient buffers removed entirely (Phase 4 M5 cleanup).
     modules::SimplifiedQuantGradients mSimplifiedQuantGrads;
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
     uint8_t mFP8BufferReadyFlags = 0;
