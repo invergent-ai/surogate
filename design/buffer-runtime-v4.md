@@ -8,7 +8,7 @@ Supersedes schema-per-block and SSA+coloring plans. This revision incorporates c
 
 ## Status (keep updated)
 
-Last refresh: 2026-04-22 (Session D proper shipped). Grep for `Status (keep updated)` to find and update this section after any milestone lands.
+Last refresh: 2026-04-23 (M5.δ SimplifiedLayerGradients deletion shipped). Grep for `Status (keep updated)` to find and update this section after any milestone lands.
 
 Legend: ✅ shipped • 🟡 in progress • ⬜ not started • ❌ abandoned
 
@@ -44,7 +44,7 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 Phase 5+                                                                 ⬜ not planned
 ```
 
-**Phase 4 closed** (M6 passed 2026-04-22). Post-M6 legacy-allocator cleanup (3 commits) dropped **2.7 GiB / 3.8 GiB / 1.9 GiB** on Qwen3 / Qwen3.5 / GPT-OSS — every block-scope simplified_acts slot is now arena-backed; `mAllocator->allocate` for block slots is gone. See buffer-runtime-v4-benchmark.md §"post-M6: legacy allocator cleanup". Follow-up on 2026-04-22 added `rebind_non_block_to_persistent_arena` (2026-04-22 §): 3 non-block tids (`x0`, `xF`, `d_ln_final`) rebound; a further 16/48/0 MiB on Q3/Q3.5/GPT-OSS. Remaining non-block tensors (`output`, `freq_cis`, `ln_final_rstd`, `d_embeddings`) are not yet DSL-op outputs so the arena doesn't size for them — future work registers them via `register_external_names`. Remaining M5 sub-milestones (M5.δ, M5.ε) are cosmetic cleanup; all functional work done.
+**Phase 4 closed** (M6 passed 2026-04-22). Post-M6 legacy-allocator cleanup (3 commits) dropped **2.7 GiB / 3.8 GiB / 1.9 GiB** on Qwen3 / Qwen3.5 / GPT-OSS — every block-scope simplified_acts slot is now arena-backed; `mAllocator->allocate` for block slots is gone. See buffer-runtime-v4-benchmark.md §"post-M6: legacy allocator cleanup". Follow-up on 2026-04-22 added `rebind_non_block_to_persistent_arena` (2026-04-22 §): 3 non-block tids (`x0`, `xF`, `d_ln_final`) rebound; a further 16/48/0 MiB on Q3/Q3.5/GPT-OSS. Remaining non-block tensors (`output`, `freq_cis`, `ln_final_rstd`, `d_embeddings`) are not yet DSL-op outputs so the arena doesn't size for them — future work registers them via `register_external_names`. M5.δ shipped 2026-04-23 (SimplifiedLayerGradients deleted, commits a17ddcc..9f69aae); only M5.ε cleanup sweep remains as cosmetic polish.
 
 **M5.ζ — no-recompute NaN fix (shipped 2026-04-22, commit `531cda3`).** The pre-existing no-recompute NaN (pre-dated this branch, see [design/norecompute-nan-investigation.md](norecompute-nan-investigation.md)) is fixed with three tightly-coupled compile-time changes — *no* runtime-dispatch refactor was needed after all.
 
@@ -75,9 +75,20 @@ After four abandoned populate-at-bwd-entry attempts, the unblock turned out to b
 2. **`19662ef` — cross-graph `slot_to_tid` fallback.** Forward-only slots (`res_att`, `ln2`, `ln1_rstd`, …) aren't declared as output by any backward op, so the bwd graph's slot→tid map has no entry for them. Since fwd/bwd share the tid namespace, `executor_tid_slot` falls back to `mForwardGraph->slot_to_tid` when the current graph misses. Dropped hot-path `simplified_acts` fallback fires from 15 → 6 per session (all remaining 6 either return nullptr or hit null-guarded callers).
 3. **`03c56b8` → `f677dc8` + `b2b3bef`** — five-commit deletion sequence: `block_activation_ptr` fallback branch, `populate_fwd_stack_bindings` reads, `consume_fwdstack_arena`, `mSimplifiedActivations` storage, `SimplifiedLayerActivations` struct, `block_slot_tensor` shim. `populate_fwd_stack_bindings` and snapshot/restore extended to cover `SaveForBwd` arena for no-recompute parity.
 
-**Current position (2026-04-22):** Phase 4 M5.γ closed. `mTensors[tid]` is the sole source of truth for block activations; `block_activation_ptr` is 10 lines (tid lookup + `BlockResidualFFN` → managed residual + `BlockQKVRoPE` → `BlockQKV` fallback). Net ~480 lines deleted. Validation bit-identical on Q3/Q3.5/GPT-OSS (recompute) and Q3 no-recompute. Postmortem: `design/simplified-acts-deletion.md` §"Deletion landed 2026-04-22".
+**Current position (2026-04-23):** Phase 4 M5.γ + M5.δ closed. `mTensors[tid]` is the sole source of truth for both block activations AND block gradients. `block_activation_ptr` is 10 lines (tid lookup + `BlockResidualFFN` → managed residual + `BlockQKVRoPE` → `BlockQKV` fallback); `block_gradient_ptr` is ~5 lines (slot filter + tid-first binding). Net ~680 lines deleted (~480 activations + ~200 gradients). Validation bit-identical on Q3/Q3.5/GPT-OSS (recompute) and Q3 no-recompute. Postmortems: `design/simplified-acts-deletion.md` §"Deletion landed 2026-04-22" (activations) and §"Full deletion shipped 2026-04-23" (gradients).
 
-**Next step:** M5.δ (views + gradient leftovers) and M5.ε (cleanup sweep) remain — cosmetic-only.
+### M5.δ — gradient-side deletion (shipped 2026-04-23)
+
+Mirrors the activation-side sequence but added two insights that the prior sessions' aborts missed:
+
+1. **`is_block_gradient_slot` guard must fire BEFORE `executor_tid_slot_binding`.** `resolve_tensor` calls `block_gradient_ptr` with the current ref's slot (which may be an activation); without the guard, the binding call for an activation slot returns an empty `Tensor{}` with garbage DType, propagating wrong dtypes downstream. This was the root cause of the "expected BF16, got F32" regression in early attempts.
+2. **Arena populate must iterate named gradient slots via `slot_to_tid`, NOT all BwdStack-region tids.** Mapped-slot intermediate tids (transposes, flattened views, etc.) are in the BwdStack region but their ops write `Data` via `store_tensor` with kernel-computed pointers; pre-binding them stale-reads before `store_tensor` fires. This was the root cause of the Q3.5/GPT-OSS norm collapse (0.67 / 250) in unrestricted populate attempts.
+
+Stack-init slots (`DQKV`/`DMLPUp`/`DSwiGLU` under `plan.large_bwd_temps_on_stack` or missing DSL slots) get shape/dtype + `Data=nullptr` so `temp_acquire` still fires via the tid-first `block_gradient_ptr` path. `DAttOut`/`DResAtt` alias (non-hybrid models) is preserved by the compiler's coloring giving them the same arena offset when lifetimes permit — no explicit alias plumbing needed in the tid cache.
+
+The zero-list build moved from DslRunState init to `populate_bwd_stack_bindings` (once per compile, guarded by `mBwdZeroListBuilt`). `DslRunState::set_activation_grad_zero_list` receives the precomputed `(ptrs, sizes)` device arrays; `zero_activation_gradients` issues a single `zero_device_segments` launch.
+
+**Next step:** only M5.ε (cleanup sweep) remains — cosmetic-only.
 
 **Kill criteria status:** none hit. Phase 1's role unification (`MatmulRole` typed ID) composes with all outcomes and is the fallback safety net.
 
