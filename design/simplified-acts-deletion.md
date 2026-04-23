@@ -417,4 +417,53 @@ Validation:
 - Q3.5: norm 8.0429 (base 8.0438)
 - GPT-OSS: norm 2.7559 (base 2.7561)
 
-**Remaining:** the `SimplifiedLayerGradients` struct and `allocate_simplified_gradients` + `consume_bwdstack_arena` still exist. Full deletion requires moving the per-layer hybrid shape/alias logic out of allocate_simplified_gradients into a structure populate can consume directly (or threading TensorMeta to include alias info). Scope is small-to-medium; not on the critical path since runtime is already all-mTensors.
+### Update 2026-04-23 — arena-based populate (commit `2f537bf`)
+
+`populate_bwd_stack_bindings` now seeds `mTensors[tid]` directly from
+`bwd_stack_ptr + meta.offset + producer TensorRef's shape/dtype`. No more
+reads of `simplified_grads[L][slot]` at bwd entry. Validation:
+
+- Q3: norm 3.4393 (base 3.4389)
+- Q3.5: norm 8.0442 (base 8.0438)
+- GPT-OSS: norm 2.7561 (base 2.7561) — exact match
+- Q3 no-recompute: 36.9k tps / 444 ms
+
+**The key insight** that made arena populate work: iterate the **11 named
+block-gradient slots via `slot_to_tid`**, not all BwdStack-region tids.
+Mapped-slot intermediate tids (transposes, flattened views, …) live in
+BwdStack region but must NOT be pre-bound — their ops write Data via
+`store_tensor` with kernel-computed pointers, and pre-binding stale-reads
+before `store_tensor` fires. This was the root cause of every
+`arena-only` regression I attempted (Q3.5 norm 0.67, GPT-OSS 250).
+Restricting populate to the named-slot allowlist matches
+`simplified_grads` semantics without reading it.
+
+**Stack-init slot handling:** DQKV/DMLPUp/DSwiGLU under
+`plan.large_bwd_temps_on_stack` or `!plan.has_mlp_up_slot /
+has_swiglu_slot` get shape/dtype but `Data=nullptr` so `temp_acquire`
+allocates Stack on first access via `block_gradient_ptr`'s tid-first
+path (same as before).
+
+### Remaining — struct deletion
+
+`SimplifiedLayerGradients` / `mSimplifiedGradients` / `simplified_grads()`
+still exist because two init-time helpers read them:
+
+- `build_activation_grad_zero_segments` builds the batched
+  `zero_device_segments` list from simplified_grads at DslRunState init.
+- `zero_activation_gradients`'s fallback loop iterates
+  simplified_grads to fill_zero per layer.
+
+Deleting the struct requires:
+1. Move `build_activation_grad_zero_segments` (or an equivalent) to run
+   after populate_bwd_stack_bindings with access to the backward graph,
+   caching the result on `CompiledExecutor`.
+2. Rewrite `zero_activation_gradients`'s fallback to iterate
+   `mTensors[tid]` via `slot_to_tid(L, BlockDResFFN|BlockDResAtt|
+   BlockDAttOut)`.
+3. Drop `allocate_simplified_gradients` and `consume_bwdstack_arena`
+   (neither is read on the hot path anymore).
+
+Scope: medium (2–3 commits). Not on the critical path — runtime is
+all-mTensors, simplified_grads is a latent init-time structure with no
+hot-path role.
