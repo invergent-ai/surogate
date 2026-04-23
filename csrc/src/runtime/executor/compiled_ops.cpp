@@ -482,6 +482,10 @@ CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t
     return result;
 }
 
+void CompiledExecutor::prepare_replay_persist_arena_for_capture() {
+    ensure_replay_persist_arena();
+}
+
 void CompiledExecutor::ensure_replay_persist_arena() {
     // 256 MiB is a conservative upper bound — one layer's worth of
     // stack-backed replay persistence (typically 9 slots × up to 8 MiB for

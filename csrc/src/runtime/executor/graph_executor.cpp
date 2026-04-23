@@ -1247,7 +1247,12 @@ void GraphExecutor::execute_forward(long B,
     // ops run eagerly while other segments can still use CUDA graphs.
     const bool has_capture_unsafe_ops = graph_has_capture_unsafe_ops(mCompiledForward.get());
     // When doc masking or capture-unsafe ops are present, use split-attention mode.
-    const bool doc_masking_active = (mCuSeqlensGpu != nullptr);
+    const bool doc_masking_active_raw = (mCuSeqlensGpu != nullptr);
+    // Phase-0 discovery knob: bypass the doc-masking gate so we can catalog
+    // capture-unsafe call sites. Intentionally NOT capture-correct yet —
+    // used only for running the runtime under capture to surface violations.
+    const bool force_full_capture = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
+    const bool doc_masking_active = doc_masking_active_raw && !force_full_capture;
     const bool has_tiled_mlp = mCompiledForward && !mCompiledForward->mlp_tile_groups.empty();
     const bool needs_split = doc_masking_active || has_capture_unsafe_ops || has_tiled_mlp;
     const bool use_split_attention = needs_split && mOptions.UseCudaGraphs && !in_capture;
@@ -1270,6 +1275,8 @@ void GraphExecutor::execute_forward(long B,
         // inside save_tensors (which is not allowed during capture).
         mCompiledExecutor->set_dimensions(B, T);
         mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
+        // Preallocate the replay-persist arena (256 MiB cudaMalloc) outside capture.
+        mCompiledExecutor->prepare_replay_persist_arena_for_capture();
 
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
@@ -1344,7 +1351,8 @@ void GraphExecutor::execute_backward(long B,
                              capture_status != cudaStreamCaptureStatusNone);
     const bool has_capture_unsafe_ops =
         graph_has_capture_unsafe_ops(mCompiledForward ? mCompiledForward.get() : mCompiledBackward.get());
-    const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr);
+    const bool force_full_capture_bwd = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
+    const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr) && !force_full_capture_bwd;
     const bool has_capture_unsafe_bwd = has_capture_unsafe_ops;
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
@@ -1364,6 +1372,7 @@ void GraphExecutor::execute_backward(long B,
         prime_fp8_weight_cache({});
         prime_fp8_weight_cache_transposed({});
         prime_fp4_weight_cache({});
+        mCompiledExecutor->prepare_replay_persist_arena_for_capture();
     }
 
     auto run_ops = [&]() {

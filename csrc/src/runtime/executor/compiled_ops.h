@@ -241,6 +241,11 @@ public:
     void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list,
                                            const CompiledGraph* capture_graph = nullptr);
 
+    // Public entry to preallocate the replay-persist arena outside any CUDA
+    // stream capture. Needed when full-step graph capture includes paths
+    // that would otherwise lazy-allocate via allocate_replay_persist.
+    void prepare_replay_persist_arena_for_capture();
+
     /// Tid-only slot resolver: returns `&mTensors[tid]` when slot_to_tid
     /// resolves AND the tid has populated Data. Returns nullptr otherwise.
     /// `DslRunState::active_executor_slot` calls this through the
