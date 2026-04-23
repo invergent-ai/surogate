@@ -362,3 +362,85 @@ Arena preallocation (V1 fix) ships as Phase 1. V2 blocks further discovery —
 proceed directly to Phase 2 implementation. Phase 4 decision (pad-to-seq_len vs
 device-pointer) to be made after Phase 3 is in-flight when we can measure
 overhead of the pad-to-seq_len approach.
+
+## Phase 2 attempt 1 — findings (reverted, not shipped)
+
+Attempted the "auto-detect + save via existing persistent-buffer path"
+approach. The detection pass works correctly (identified `scale_8` /
+`per_layer_inputs` as the only cross-layer global in Gemma4-E2B). The
+runtime plumbing to persist it into `mSaved` via `force_persist_name` got
+past V2 under force-capture (scale_8 resolves correctly during replay, the
+persistent buffer pointer is valid). **But even in normal non-force-capture
+mode, the combined change broke forward correctness — step 0 loss jumped
+from 3.63 to 18.21 and diverged to NaN by step 3.**
+
+**What was changed (all reverted)**:
+- `TensorMeta::cross_layer_global` field + detection in
+  `promote_cross_layer_fwd_reads`: find non-blocks tensors, produced by an
+  op, consumed by ops in ≥2 layers.
+- `CompiledGraph::cross_layer_global_names()` helper.
+- `GraphExecutor::compile_graphs` unioning those names into `mSaveList`
+  and the `save_name_arg` passed to `finalize_save_for_bwd`.
+- `save_tensors` + `prepare_saved_buffers_for_capture`: treat
+  `cross_layer_global` tensors as `force_persist_name` → preallocate
+  buffer, memcpy each step.
+- `save_tensors` skip-if-already-saved exemption for cross-layer globals
+  (so the persistent buffer refreshes each step).
+
+**What broke (not fully root-caused before reverting)**:
+- With all gates properly narrowed (no region change, `promote()` helper
+  still rejects non-block tensors, no other surgery), forward-at-step-0
+  already showed loss 18 vs. clean-baseline 3.63. The correctness damage
+  starts at the very first forward — not a backward-path issue.
+- Hypothesis (unverified): adding a tensor name to `mSaveList` interacts
+  with an earlier bookkeeping step that affects forward execution — e.g.,
+  a layout or allocator decision that changes when a name becomes part of
+  the save set. The `fwd_per_layer_sections`/`retain_through_forward`
+  mechanism, or some arena-coloring pass driven by the compiled-forward
+  save list, seems the likely suspect.
+
+**Lessons for Phase 2 attempt 2**:
+1. The existing `force_persist_name` / `mMoeSavedBuffers` path is not
+   safe to feed with arbitrary new tensor names — it couples to compiler
+   assumptions about which tensors are in the save list.
+2. A safer design for cross-layer globals may need a **separate mechanism**
+   instead of reusing `mSaved` + `mSaveList`:
+   - Dedicated "model-scope persistent activation" slot category
+     (compiler + allocator aware, outside the FwdStack arena from the
+     start so no stack rollback concern). Similar to option (b) from the
+     original Phase 2 design — heavier surgery but decouples from the
+     save-list plumbing.
+   - Or: bind the cross-layer-global directly during `replay_layer_forward`
+     from a known-good source (the compiler can emit a side table
+     `cross_layer_global_tids` that the replay path consults), without
+     routing through `mSaved`.
+3. Before ANY new code, build a diff-regression harness that runs a short
+   training with `surogate debug diff` and flags >1e-3 loss divergence on
+   the first few steps. Would have caught this within minutes rather than
+   after the whole pipeline was touched.
+
+**Recommended next attempt**: option (b) from Phase 2 design — new region
+category. Larger surgery, but isolates cross-layer globals from the
+existing save-list machinery that has baked-in assumptions we didn't fully
+reverse-engineer.
+
+## Phase 2 attempt 2 — design (not started)
+
+TBD. Options:
+- **(B)** Model-scope persistent activation slot: compiler classifies
+  cross-layer globals and allocates them in a persistent arena separate
+  from FwdStack/SaveForBwd/PersistentActivation. Runtime `mTensors[tid]`
+  points at this arena throughout fwd and bwd. `replay_layer_forward`
+  reads directly from `mTensors[tid]` without going through `mSaved`.
+  Advantage: zero coupling to the save list. Estimated 3–5 days.
+- **(C)** Compiler emits a side table `cross_layer_global_sources` mapping
+  cross-layer-global tid → its producer op index. `replay_layer_forward`
+  consults this table to re-execute the producer from its model-scope
+  inputs before running the layer's op range. Advantage: no extra
+  persistent storage; cross-layer globals are regenerated like other
+  replay activations. Disadvantage: producer might depend on inputs that
+  are themselves invalidated under capture — needs transitive analysis.
+  Estimated 4–6 days.
+
+Decision between (B) and (C) deferred to next session after the diff
+regression harness is built.
