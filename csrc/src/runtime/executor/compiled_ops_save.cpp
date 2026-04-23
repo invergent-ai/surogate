@@ -1121,13 +1121,20 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
 }
 
 void CompiledExecutor::populate_bwd_stack_bindings(const CompiledGraph& graph) {
-    // Seed mTensors[tid] from simplified_grads[L][slot] for every block-
-    // scope gradient slot. simplified_grads encodes per-layer shape/dtype
-    // (including hybrid per-layer dims and the non-hybrid DAttOut→DResAtt
-    // aliasing) plus consume_bwdstack_arena's arena pointer assignments;
-    // deriving this from TensorMeta alone misses those distinctions and
-    // regresses Q3.5 / GPT-OSS. Post-populate, block_gradient_ptr's tid-
-    // first path routes every caller through mTensors[tid].
+    // Seed mTensors[tid] for the 11 named block-gradient slots via
+    // slot_to_tid lookup, using bwd_stack_ptr + meta.offset for Data and
+    // the producer TensorRef for shape/dtype. Mirror of populate_fwd_
+    // stack_bindings scoped to named gradient slots — Mapped-slot
+    // intermediate tids (transposes, flattened views, etc.) must NOT be
+    // pre-bound because their ops write Data via store_tensor with
+    // kernel-computed pointers; pre-binding would stale-read before
+    // store_tensor fires.
+    //
+    // Stack-init slots (DQKV/DMLPUp/DSwiGLU under large_bwd_temps_on_
+    // stack or when DSL doesn't define the slot) get shape/dtype but
+    // Data=nullptr so temp_acquire allocates Stack on first access.
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return;
+    if (!mPhaseArenas->bwd_stack_ptr || mPhaseArenas->bwd_stack_bytes == 0) return;
     if (static_cast<std::size_t>(graph.num_tensors) > mTensors.size()) return;
 
     static constexpr dsl::TensorSlot kSlots[] = {
@@ -1144,14 +1151,49 @@ void CompiledExecutor::populate_bwd_stack_bindings(const CompiledGraph& graph) {
         dsl::TensorSlot::BlockDResFFN,
     };
 
+    const auto& plan = mRunState.buffer_plan();
+    auto is_stack_init_slot = [&](dsl::TensorSlot s) {
+        switch (s) {
+            case dsl::TensorSlot::BlockDMLPUp: return plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot;
+            case dsl::TensorSlot::BlockDSwiGLU: return plan.large_bwd_temps_on_stack || !plan.has_swiglu_slot;
+            case dsl::TensorSlot::BlockDQKV: return plan.large_bwd_temps_on_stack;
+            default: return false;
+        }
+    };
+
+    std::vector<const TensorRef*> producer(static_cast<std::size_t>(graph.num_tensors), nullptr);
+    for (const auto& op : graph.ops) {
+        for (const auto& out : op.outputs) {
+            if (out.tensor_id >= 0 && out.tensor_id < graph.num_tensors) {
+                producer[static_cast<std::size_t>(out.tensor_id)] = &out;
+            }
+        }
+    }
+
+    int device = 0;
+    (void)cudaGetDevice(&device);
+
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     for (int L = 0; L < num_layers; ++L) {
         for (dsl::TensorSlot slot : kSlots) {
             const int tid = graph.slot_to_tid(L, slot);
             if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-            const Tensor& src = mRunState.simplified_grads(L)[slot];
-            if (src.Rank == 0) continue;
-            mTensors[static_cast<std::size_t>(tid)] = src;
+            const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+            if (meta.region != dsl::RegionKind::BwdStack) continue;
+            if (meta.offset == SIZE_MAX) continue;
+            const TensorRef* out_ref = producer[static_cast<std::size_t>(tid)];
+            if (!out_ref || out_ref->shape.empty()) continue;
+
+            Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+            const bool stack_init = is_stack_init_slot(slot);
+            t.Data = stack_init ? nullptr : (mPhaseArenas->bwd_stack_ptr + meta.offset);
+            t.DType = out_ref->dtype;
+            t.Rank = static_cast<int>(out_ref->shape.size());
+            for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+                t.Sizes[i] = (i < t.Rank) ? out_ref->shape[i] : 1;
+            }
+            t.Device = device;
+            t.Stats = nullptr;
         }
     }
 }
