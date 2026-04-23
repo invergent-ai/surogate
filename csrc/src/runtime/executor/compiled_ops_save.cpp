@@ -1383,7 +1383,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
 
     // Check flat tensor vector first for cached/aliased tensors (e.g., view_backward aliases).
     // This is critical because view_backward stores aliases, and subsequent ops
-    // (like rmsnorm_backward) must use that aliased tensor, not the pre-allocated simplified_grads buffer.
+    // (like rmsnorm_backward) must use that aliased tensor, not a fresh temp.
     if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
         log_tensor(mTensors[static_cast<std::size_t>(tid)], "cached");
         return mTensors[static_cast<std::size_t>(tid)];
@@ -1772,12 +1772,11 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         }
         if (const Tensor* base = try_get_tensor_fuzzy(normalized_name)) {
             // try_get_tensor_fuzzy can legitimately return a pointer to a Tensor
-            // with `Data == nullptr` — e.g., a simplified_grads slot that was
-            // allocated lazily / configured for recompute and isn't populated
-            // yet. Running an op against such a tensor silently corrupts
-            // memory (illegal access at kernel dispatch). Only accept this
-            // resolution when the buffer is real; otherwise fall through to
-            // fresh allocation.
+            // with `Data == nullptr` — e.g., a slot allocated lazily /
+            // configured for recompute and not yet populated. Running an op
+            // against such a tensor silently corrupts memory (illegal access
+            // at kernel dispatch). Only accept this resolution when the
+            // buffer is real; otherwise fall through to fresh allocation.
             if (base->Data) {
                 Tensor resolved = *base;
                 if (!ref.shape.empty() && shape_nelem(ref.shape) == static_cast<std::size_t>(base->nelem())) {

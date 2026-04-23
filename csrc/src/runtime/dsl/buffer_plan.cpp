@@ -147,7 +147,7 @@ long BufferPlan::plan_stack_peak_bytes() const {
     }
 
     // Backward temps: d_qkv, d_mlp_up, d_swiglu, d_up (all live simultaneously).
-    // d_up is gated on has_mlp_up_slot, matching allocate_simplified_gradients.
+    // d_up is gated on has_mlp_up_slot (matches the gradient-slot allowlist).
     long bwd_peak = 0;
     if (large_bwd_temps_on_stack) {
         bwd_peak += align_stack_bytes(bytes_of(B * T * QKV, grad_dtype));  // d_qkv

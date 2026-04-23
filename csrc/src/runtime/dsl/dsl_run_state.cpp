@@ -458,36 +458,6 @@ void DslRunState::resize_stack_to(long new_size_bytes) {
     if (new_size_bytes <= 0) {
         throw std::runtime_error("DslRunState::resize_stack_to: non-positive size");
     }
-    // Scrub any simplified_acts / simplified_grads slot whose .Data still
-    // points into the old Stack range. Both allocator-owned and adopted-arena
-    // buffers are freed+reallocated below, so cached pointers (e.g., the
-    // stack-resident rstd / ln / h_out slots) would dangle otherwise — step 1
-    // replay faults with illegal access whenever the new allocation overlaps
-    // the freed region.
-    const bool debug = std::getenv("SUROGATE_DEBUG_STACK_RESIZE") != nullptr;
-    std::size_t scrubbed = 0;
-    auto scrub_slot_array = [&](auto& per_layer_array, const char* where) {
-        for (std::size_t L = 0; L < per_layer_array.size(); ++L) {
-            auto& slots = per_layer_array[L].slots;
-            for (std::size_t s = 0; s < slots.size(); ++s) {
-                if (slots[s].Data && Stack.owns(slots[s].Data)) {
-                    if (debug) {
-                        fprintf(stderr,
-                                "[stack-resize] scrub %s layer=%zu slot=%zu ptr=%p\n",
-                                where,
-                                L,
-                                s,
-                                static_cast<void*>(slots[s].Data));
-                    }
-                    slots[s].Data = nullptr;
-                    ++scrubbed;
-                }
-            }
-        }
-    };
-    if (debug) {
-        fprintf(stderr, "[stack-resize] new_size=%ld scrubbed=%zu\n", new_size_bytes, scrubbed);
-    }
     // Free the old buffer *before* requesting the new one. The TensorAllocator
     // retains tracked allocations until its destructor runs, so a naive
     // allocate+swap would leak the pre-resize buffer to the end of the run

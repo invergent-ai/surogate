@@ -100,13 +100,12 @@ public:
     long shrink_stack_to_high_water_mark(long safety_bytes = 64L * 1024 * 1024,
                                          long min_savings_bytes = 128L * 1024 * 1024);
 
-    /// M5.γ Option C: `block_activation_ptr` consults this back-ref to
-    /// route slot lookups through the executor's tid-keyed mTensors cache
-    /// before falling back to the simplified_acts struct. Set by the
-    /// executor at `execute_forward`/`execute_backward`/`replay_layer_forward`
-    /// entry, cleared at exit. Returns nullptr when no executor is active
-    /// (e.g., pre-execute paths, model init). See
-    /// design/simplified-acts-deletion.md.
+    /// `block_activation_ptr` / `block_gradient_ptr` consult this back-ref
+    /// to route slot lookups through the executor's tid-keyed mTensors
+    /// cache. Set by the executor at `execute_forward` /
+    /// `execute_backward` / `replay_layer_forward` entry, cleared at exit.
+    /// Returns nullptr when no executor is active (e.g., pre-execute
+    /// paths, model init).
     void set_active_executor(CompiledExecutor* exec) {
         mActiveExecutor = exec;
     }

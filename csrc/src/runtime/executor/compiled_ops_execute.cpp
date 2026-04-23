@@ -394,11 +394,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                     continue;
                 }
             }
-            // Fallback: resolve from simplified_acts via the shared block-activation
-            // dispatch. `builtin_slot_from_name()` maps every alias (`ln`, `ln_flat`,
-            // `qkv_rope`, `res_att`, …) to a TensorSlot; the helper routes it to
-            // the right RunState buffer. New slots are added in ONE place
-            // (tensor_slot_dispatch.cpp) rather than duplicated here.
+            // Fallback: resolve via the shared block-activation dispatch
+            // (slot-keyed lookup through tensor_slot_dispatch).
             int lyr = -1;
             const TensorSlot slot = resolve_block_slot(name, &lyr);
             if (lyr >= 0) {
@@ -623,15 +620,13 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mNamedTensors.clear();
-    // M5.γ prereq: pre-bind every FwdStack tid to its arena slot so
-    // block-scope Mapped-slot ops route through the arena at
-    // ensure_output_tensor instead of Stack temp_alloc.
+    // Pre-bind every FwdStack tid to its arena slot so block-scope
+    // Mapped-slot ops route through the arena at ensure_output_tensor
+    // instead of Stack temp_alloc.
     populate_fwd_stack_bindings(graph);
-    // M5.γ Option C: register as active executor ONLY after populate, so
+    // Register as active executor only after populate, so
     // block_activation_ptr's tid-first path sees a coherent mTensors on
-    // every call (pre-populate callers during the cleanup block above
-    // safely fall through to simplified_acts — which still carries the
-    // previous step's arena pointers, all stable addresses).
+    // every call.
     mRunState.set_active_executor(this);
     // Scrub mSaved entries pointing into the Stack arena or the
     // replay-persist arena. Between steps both are reset — Stack top rolls
@@ -1724,22 +1719,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         mWeightManager->release_final_norm(mRunState.MainStream);
     }
 
-    // M5.γ Option C: deregister. block_activation_ptr falls back to
-    // simplified_acts for any callers that run between execute_*
-    // invocations (e.g., GraphExecutor prologue / epilogue code).
     mRunState.set_active_executor(nullptr);
 
-    // M5.ζ+ / Session D proper: snapshot mTensors + mNamedTensors at the
-    // end of forward execution. Captures the authoritative per-tid
-    // runtime state produced by the forward dispatchers — including
-    // matmul_swiglu's live-buffer rebinds, store_tensor updates from
-    // metadata ops, Stack-backed temps, and view aliases. Restored at
-    // execute_backward entry so backward resolves route through the
-    // tid-cache fast path instead of relying on the slot-dispatch
-    // fallback. Prior Session D proper attempts re-populated from
-    // arena offsets at bwd entry, overwriting forward's mutations
-    // and regressing Q3.5 (norm 8.04→2.15) and GPT-OSS (norm
-    // 2.73→180); snapshotting forward's actual state sidesteps that.
+    // Snapshot mTensors + mNamedTensors at the end of forward execution.
+    // Captures the authoritative per-tid runtime state produced by the
+    // forward dispatchers — including matmul_swiglu's live-buffer rebinds,
+    // store_tensor updates from metadata ops, Stack-backed temps, and view
+    // aliases. Restored at execute_backward entry so backward resolves
+    // route through the tid-cache fast path.
     mForwardTensorsSnapshot = mTensors;
     mForwardNamedTensorsSnapshot = mNamedTensors;
 }
@@ -1769,26 +1756,20 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mLastRecomputeLayer = -1;
     mMicroStep = micro_step;
 
-    // M5.γ Option C: register as active executor. No cross-graph populate
-    // here — see design/simplified-acts-deletion.md for why the apparently-
-    // straightforward "fwd produces, bwd doesn't" partition still
-    // regresses on GPT-OSS (norm 2.73 → 180) and Qwen3.5 (norm 8.04 → 15)
-    // even when restricted to the kFwdStackConsumeSlots allowlist. Forward
-    // activations reach backward via (a) mSaved pre-bind at backward entry
-    // for SaveForBwd tids, (b) replay_layer_forward for recompute tids, or
-    // (c) block_activation_ptr's simplified_acts fallback.
+    // Register as active executor. Forward activations reach backward via
+    // (a) mSaved pre-bind at backward entry for SaveForBwd tids,
+    // (b) replay_layer_forward for recompute tids, or (c) the snapshot/
+    // restore block below for FwdStack arena-resident tids.
     mRunState.set_active_executor(this);
 
-    // M5.ζ+ / Session D proper: restore forward's end-state mTensors for
-    // FwdStack-region tids only. Restricts to arena-backed activations
+    // Restore forward's end-state mTensors for FwdStack/SaveForBwd
+    // arena-resident tids. Restricts to arena-backed activations
     // (exclude Stack-backed temps like ones/zeros/views whose Stack
     // pointer would trigger `Stack.owns(t.Data)` at
     // bwd_layer_end_cleanup's cross-layer persist, blowing the 64 MiB
     // BwdCrossLayer arena budget). Arena-backed tids have stable
-    // cross-phase pointers so restoring them is safe, and enables the
-    // resolve_tensor tid-cache fast path for backward-consumed forward
-    // activations (eliminates the slot-dispatch fallback that
-    // Session D proper wants to remove).
+    // cross-phase pointers, enabling the resolve_tensor tid-cache fast
+    // path for backward-consumed forward activations.
     if (!mForwardTensorsSnapshot.empty() && mForwardGraph && mPhaseArenas) {
         const std::size_t n =
             std::min({mForwardTensorsSnapshot.size(), mTensors.size(), mForwardGraph->tensor_meta.size()});
@@ -1817,10 +1798,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    // M5.δ: seed mTensors[tid] from simplified_grads for every block-scope
-    // gradient slot. Phase 1 of the gradient-side SimplifiedLayerGradients
-    // deletion — mutation sites below mirror their writes to both caches
-    // so either can be read authoritatively during the transition.
+    // Seed mTensors[tid] with arena pointers for every block-scope
+    // gradient slot (and build the zero-list on first compile).
     populate_bwd_stack_bindings(graph);
 
     // M5.α: bind every stable non-param global into mTensors + mNamedTensors
@@ -1909,13 +1888,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Save stack checkpoint at start of backward - we'll restore per-layer to manage memory
     auto initial_checkpoint = mRunState.Stack.checkpoint();
     int last_layer_restored = -1;
-    auto clear_shared_grads = [&](int layer_idx) {
-        // No-op: d_ln2, d_att, d_ln1 are fully overwritten by their respective
-        // backward ops before being read. Gradient data flows through mTensors[],
-        // not through the pre-allocated simplified_grads buffers. The matmul backward
-        // only temporarily remaps these pointers during LoRA hooks, then restores them.
-        (void)layer_idx;
-    };
     auto prune_stack_tensors = [&](int current_layer) {
         // Prune flat tensor vector using pre-computed metadata (no string parsing)
         for (int id = 0; id < graph.num_tensors; ++id) {
@@ -2517,7 +2489,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                        bwd_capture_status != cudaStreamCaptureStatusNone);
 
     std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
-    std::vector<bool> layer_seen_any(num_layers, false);
     for (const auto& op : graph.ops) {
         if (op.layer_start >= 0 && op.layer_start < num_layers) {
             layer_start_indices[op.layer_start] = &op - graph.ops.data();
@@ -2655,10 +2626,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                 if (grad) bind_tensor(gname, *grad);
                             }
                         }
-                        if (L < num_layers && !layer_seen_any[static_cast<std::size_t>(L)]) {
-                            clear_shared_grads(L);
-                            layer_seen_any[static_cast<std::size_t>(L)] = true;
-                        }
                         // Phase 3 subsystem #7 flip: recompute moved out of
                         // PhaseEnter into the explicit RecomputeBlock
                         // instruction emitted immediately after.
@@ -2695,11 +2662,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             const int any_layer = op_layer_idx_any(op);
                             const int effective_layer_idx = (non_grad_layer >= 0) ? non_grad_layer : any_layer;
                             if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
-                                if (effective_layer_idx < num_layers &&
-                                    !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
-                                    clear_shared_grads(effective_layer_idx);
-                                    layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;
-                                }
                                 mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
                                 mLastRecomputeLayer = effective_layer_idx;
                             }
@@ -2812,10 +2774,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     if (mRecomputeEnabled && mRecomputeFn) {
                         const int layer_idx = first_op.layer_start;
                         if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
-                            if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
-                                clear_shared_grads(layer_idx);
-                                layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                            }
                             mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
                             mLastRecomputeLayer = layer_idx;
                         }
@@ -2860,10 +2818,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                 idx,
                                 op_type_to_string(op.type));
                     }
-                    if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
-                        clear_shared_grads(layer_idx);
-                        layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
-                    }
                     mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
                     mLastRecomputeLayer = layer_idx;
                 }
@@ -2889,11 +2843,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                             layer_idx_any,
                             idx,
                             op_type_to_string(op.type));
-                }
-                if (effective_layer_idx < num_layers &&
-                    !layer_seen_any[static_cast<std::size_t>(effective_layer_idx)]) {
-                    clear_shared_grads(effective_layer_idx);
-                    layer_seen_any[static_cast<std::size_t>(effective_layer_idx)] = true;
                 }
                 mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
                 mLastRecomputeLayer = effective_layer_idx;

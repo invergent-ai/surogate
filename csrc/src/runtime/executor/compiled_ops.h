@@ -188,7 +188,7 @@ public:
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
     void set_save_list(const std::vector<std::string>* save_list);
 
-    /// Bind phase-tree arenas (M5.d). When set and arenas are allocated,
+    /// Bind phase-tree arenas. When set and arenas are allocated,
     /// persist_saved_layer_tensors writes SaveForBwd tids directly into the
     /// pre-allocated arena slot instead of cudaMalloc'ing per-name buffers.
     void set_phase_arenas(dsl::PhaseArenas* arenas) {
@@ -199,11 +199,10 @@ public:
         mForwardPlan = plan;
     }
 
-    /// M5.γ Session D: share the forward compiled graph so execute_backward
-    /// can pre-bind cross-graph forward-activation tids (region=Unknown in
-    /// the bwd graph, but FwdStack in the fwd graph) into mTensors at
-    /// backward entry. Without this, bwd ops that read forward activations
-    /// fall through to block_activation_ptr's simplified_acts legacy path.
+    /// Share the forward compiled graph so execute_backward can pre-bind
+    /// cross-graph forward-activation tids (region=Unknown in the bwd
+    /// graph, but FwdStack in the fwd graph) into mTensors at backward
+    /// entry via snapshot/restore.
     void set_forward_graph(const CompiledGraph* graph) {
         mForwardGraph = graph;
     }
@@ -242,13 +241,11 @@ public:
     void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list,
                                            const CompiledGraph* capture_graph = nullptr);
 
-    /// M5.γ Option C tid-only slot resolver: returns `&mTensors[tid]` when
-    /// slot_to_tid resolves AND the tid has populated Data. Returns
-    /// nullptr otherwise — does NOT fall back to simplified_acts.
+    /// Tid-only slot resolver: returns `&mTensors[tid]` when slot_to_tid
+    /// resolves AND the tid has populated Data. Returns nullptr otherwise.
     /// `DslRunState::active_executor_slot` calls this through the
     /// active-executor back-reference so `block_activation_ptr` can
-    /// dispatch tid-first without recursion. See
-    /// design/simplified-acts-deletion.md.
+    /// dispatch tid-first without recursion.
     Tensor* executor_tid_slot(int layer_idx, TensorSlot slot);
 
     /// Non-guarded variant: returns &mTensors[tid] for any valid tid
@@ -414,7 +411,7 @@ private:
     ///       overwrite another's still-live data.
     void check_op_io_aliasing(const CompiledOp& op, std::size_t op_idx, const char* phase);
 
-    /// Phase 4 M5.0 — tid-baked operand binder. Returns the Tensor in
+    /// Tid-baked operand binder. Returns the Tensor in
     /// `mTensors[tid]` after ensuring it points at the arena-backed
     /// storage for this tid. Handles the arena-backed regions
     /// (Persistent, Accumulator, FwdStack, BwdStack, SaveForBwd) by
@@ -435,14 +432,12 @@ private:
     /// follow-on milestones that make this the authoritative path.
     Tensor* bind_from_region(int tid, const TensorRef& ref);
 
-    /// M5.γ prereq: pre-populate `mTensors[tid]` for every FwdStack tid in
-    /// `graph` with an arena-backed Tensor (`Data = fwd_stack_ptr +
-    /// meta.offset`, shape/dtype from the producing op output ref). Runs
-    /// after every `mTensors.assign` so block-scope forward ops dispatched
-    /// via the Mapped-slot path hit the `mTensors[tid].Data` cache in
-    /// `ensure_output_tensor` and skip `mRunState.temp_alloc()`. Equivalent
-    /// to `consume_fwdstack_arena` for the allowlisted slots but covers
-    /// every FwdStack tid the compiler assigned an offset for.
+    /// Pre-populate `mTensors[tid]` for every FwdStack tid in `graph` with
+    /// an arena-backed Tensor (`Data = fwd_stack_ptr + meta.offset`,
+    /// shape/dtype from the producing op output ref). Runs after every
+    /// `mTensors.assign` so block-scope forward ops dispatched via the
+    /// Mapped-slot path hit the `mTensors[tid].Data` cache in
+    /// `ensure_output_tensor` and skip `mRunState.temp_alloc()`.
     void populate_fwd_stack_bindings(const CompiledGraph& graph);
     void populate_bwd_stack_bindings(const CompiledGraph& graph);
 
@@ -527,7 +522,7 @@ private:
     bool mRecomputeUseGraphs = true;
     int mLastRecomputeLayer = -1;
     NCCLCommunicator* mComm = nullptr;
-    const CompiledGraph* mForwardGraph = nullptr;  // M5.γ Session D: set via set_forward_graph
+    const CompiledGraph* mForwardGraph = nullptr;  // set via set_forward_graph
 
     // Caches
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8Cache = nullptr;
@@ -645,18 +640,15 @@ private:
     std::vector<Tensor> mTensors;
     // Name-indexed tensor overrides for cases where multiple tensor names share one tensor_id/slot.
     std::unordered_map<std::string, Tensor> mNamedTensors;
-    // M5.ζ+ / Session D proper: snapshot of forward's end-state mTensors /
-    // mNamedTensors, taken at execute_forward exit (before save_tensors).
-    // Restored into mTensors / mNamedTensors at execute_backward entry so
-    // backward ops see forward's authoritative runtime pointers — including
-    // matmul_swiglu's live-buffer rebinds, Stack-backed temps, and Mapped-slot
-    // intermediates. Prior Session D proper attempts tried populating from
-    // the arena offsets at bwd entry, which overwrote forward's mutations
-    // with stale arena pointers and regressed Q3.5 norm 8.04 → 2.15.
+    // Snapshot of forward's end-state mTensors / mNamedTensors, taken at
+    // execute_forward exit (before save_tensors). Restored into mTensors /
+    // mNamedTensors at execute_backward entry so backward ops see forward's
+    // authoritative runtime pointers — including matmul_swiglu's live-buffer
+    // rebinds, Stack-backed temps, and Mapped-slot intermediates.
     std::vector<Tensor> mForwardTensorsSnapshot;
     std::unordered_map<std::string, Tensor> mForwardNamedTensorsSnapshot;
-    /// M5.δ: guard so populate_bwd_stack_bindings builds the activation-
-    /// gradient zero list once per compile (not once per bwd step).
+    /// Guard so populate_bwd_stack_bindings builds the activation-gradient
+    /// zero list once per compile (not once per bwd step).
     bool mBwdZeroListBuilt = false;
     std::vector<bool> mSaveMask;  // Per-tensor-id: true if in save list (for prune)
     const CompiledGraph* mCurrentGraph = nullptr;

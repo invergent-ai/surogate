@@ -364,7 +364,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     Tensor* d_residual_stream = d_residual_next;
 
     // Resolve d_input to canonical gradient buffer BEFORE the kernel, so the kernel
-    // writes directly to the correct simplified_grads buffer. This eliminates
+    // writes directly to the correct block-gradient slot. This eliminates
     // post-kernel D2D copies that were mirroring data between graph slots and
     // pre-allocated gradient buffers.
     Tensor* d_input_ptr = nullptr;

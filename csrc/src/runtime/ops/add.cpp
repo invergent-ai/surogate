@@ -78,11 +78,9 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     Tensor& d_out = resolve_tensor(op.inputs[0]);
 
     // For pre-allocated gradient slots (like d_res_ffn, d_res_att), we must copy the
-    // upstream gradient into the original simplified_grads buffer. Simply aliasing
+    // upstream gradient into the block-gradient slot's backing buffer. Simply aliasing
     // the data pointer causes shared storage between residual and branch gradients,
     // which breaks LoRA (it does in-place dx accumulation).
-    // IMPORTANT: We must get the base tensor directly from simplified_grads(), not via
-    // resolve_tensor(), because resolve_tensor() may return a cached view from mTensors.
     auto assign_output = [&](const TensorRef& ref) {
         if (!ref.name.empty() && mCurrentGraph) {
             // Classifier-backed resolution: only route into the parameter-grad

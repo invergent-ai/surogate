@@ -229,7 +229,7 @@ struct CompiledAttrs {
     bool allow_quant = false;
 
     // Activation-slot alias point. The matmul dispatch uses this to rebind
-    // ``simplified_acts`` entries (``qkv``/``att_out``/``mlp_up``/
+    // block-scope slot entries (``qkv`` / ``att_out`` / ``mlp_up`` /
     // ``mlp_down``) to the freshly-produced matmul output so backward
     // replay reads the live buffer. Only a handful of ``ForwardHookPoint``
     // values are consumed for this purpose; they are not invoked as
