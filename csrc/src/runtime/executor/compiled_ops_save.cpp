@@ -1175,31 +1175,49 @@ void CompiledExecutor::populate_bwd_stack_bindings(const CompiledGraph& graph) {
         }
     }
 
+    // Set-membership check for the kSlots list (tiny, flat scan is fine).
+    auto slot_in_list = [&](dsl::TensorSlot s) {
+        for (auto sl : kSlots) {
+            if (sl == s) return true;
+        }
+        return false;
+    };
+
     int device = 0;
     (void)cudaGetDevice(&device);
-
     const int num_layers = static_cast<int>(mConfig.NumLayers);
-    for (int L = 0; L < num_layers; ++L) {
-        for (dsl::TensorSlot slot : kSlots) {
-            const int tid = graph.slot_to_tid(L, slot);
-            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-            const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
-            if (meta.region != dsl::RegionKind::BwdStack) continue;
-            if (meta.offset == SIZE_MAX) continue;
-            const TensorRef* out_ref = producer[static_cast<std::size_t>(tid)];
-            if (!out_ref || out_ref->shape.empty()) continue;
 
-            Tensor& t = mTensors[static_cast<std::size_t>(tid)];
-            const bool stack_init = is_stack_init_slot(slot);
-            t.Data = stack_init ? nullptr : (mPhaseArenas->bwd_stack_ptr + meta.offset);
-            t.DType = out_ref->dtype;
-            t.Rank = static_cast<int>(out_ref->shape.size());
-            for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
-                t.Sizes[i] = (i < t.Rank) ? out_ref->shape[i] : 1;
-            }
-            t.Device = device;
-            t.Stats = nullptr;
+    // Iterate ALL tids, not just slot_to_tid canonicals. Multiple tids can
+    // map to the same (layer, slot) — `d_qkv`, `d_qkv_rope`,
+    // `d_qkv_rope_flat` all share BlockDQKV. `slot_to_tid` only stores
+    // one canonical tid per slot, so binding only that tid leaves the
+    // aliased ones at default (Data=nullptr, Device=-1). When the aliased
+    // tid's op runs, `temp_acquire` trips "target.Device=-1". Iterating
+    // all tids here catches every one whose producer's slot is in our
+    // pre-bind set. Shows up on Gemma4 (d_qkv / d_qkv_rope separate tids
+    // with same BwdStack offset after within-frame coloring); Qwen3 only
+    // uses one of the names so this loop is a no-op there.
+    const int num_tids = graph.num_tensors;
+    for (int tid = 0; tid < num_tids; ++tid) {
+        if (static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.region != dsl::RegionKind::BwdStack) continue;
+        if (meta.offset == SIZE_MAX) continue;
+        if (meta.block_layer_idx < 0) continue;
+        const TensorRef* out_ref = producer[static_cast<std::size_t>(tid)];
+        if (!out_ref || out_ref->shape.empty()) continue;
+        if (!slot_in_list(out_ref->slot)) continue;
+
+        Tensor& t = mTensors[static_cast<std::size_t>(tid)];
+        const bool stack_init = is_stack_init_slot(out_ref->slot);
+        t.Data = stack_init ? nullptr : (mPhaseArenas->bwd_stack_ptr + meta.offset);
+        t.DType = out_ref->dtype;
+        t.Rank = static_cast<int>(out_ref->shape.size());
+        for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
+            t.Sizes[i] = (i < t.Rank) ? out_ref->shape[i] : 1;
         }
+        t.Device = device;
+        t.Stats = nullptr;
     }
 
     // Build the activation-gradient zero list once per compile. Zeroes
@@ -1879,41 +1897,15 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
     if (ref.slot != TensorSlot::Mapped) {
         Tensor& t = resolve_tensor(ref);
         if (!t.Data) {
-            // Multiple tids can share the same slot in the registry
-            // (`d_qkv` / `d_qkv_rope` / `d_qkv_rope_flat` all map to
-            // BlockDQKV). `populate_bwd_stack_bindings` binds only the
-            // slot_to_tid canonical tid per (layer, slot); aliased tids
-            // arrive here with a default-constructed Tensor whose
-            // `Device == -1`, which then trips the temp_acquire device
-            // mismatch. First try aliasing to the slot's canonical tid
-            // (they share BwdStack offset, so the bytes are already
-            // allocated there); if that tid is also unbound, fall back to
-            // populating shape/dtype/device from the ref so temp_acquire
-            // can Stack-allocate a fresh slot.
-            if (t.Device == -1 && ref.layer_idx >= 0 && mCurrentGraph) {
-                const int canonical_tid = mCurrentGraph->slot_to_tid(ref.layer_idx, ref.slot);
-                if (canonical_tid >= 0 && canonical_tid != ref.tensor_id &&
-                    static_cast<std::size_t>(canonical_tid) < mTensors.size()) {
-                    const Tensor& sibling = mTensors[static_cast<std::size_t>(canonical_tid)];
-                    if (sibling.Data) {
-                        t.Data = sibling.Data;
-                        t.Device = sibling.Device;
-                        t.DType = ref.dtype;
-                        t.Rank = static_cast<int>(ref.shape.size());
-                        for (int i = 0; i < MAX_TENSOR_DIM; ++i) {
-                            t.Sizes[i] = (i < t.Rank) ? ref.shape[i] : 1;
-                        }
-                        if (!ref.shape.empty()) {
-                            Tensor view = view_tensor(t, ref.shape);
-                            if (tid >= 0) {
-                                mTensors[static_cast<std::size_t>(tid)] = view;
-                                return mTensors[static_cast<std::size_t>(tid)];
-                            }
-                        }
-                        return t;
-                    }
-                }
-            }
+            // `resolve_tensor` can return a slot-canonical `mTensors[tid]`
+            // that was cleared by the `last_use` cleanup between
+            // `populate_bwd_stack_bindings` and this call. When the canonical
+            // tid's last use is at an op earlier than the current op — as
+            // happens on Gemma4 where `d_blocks[L].qkv_rope` (canonical for
+            // BlockDQKV) is last-used before `qkv_rope_backward` fires for
+            // `d_blocks[L].qkv` — the Tensor comes back default-constructed
+            // (Device=-1, Rank=0), which trips the temp_acquire device check.
+            // Re-populate shape/dtype/device from the ref before acquiring.
             if (t.Device == -1 && !ref.shape.empty()) {
                 int dev = 0;
                 (void)cudaGetDevice(&dev);

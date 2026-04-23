@@ -3226,11 +3226,28 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
         return true;
     }
 
+    // Lift per-layer dim overrides into a local helper so every path that
+    // writes `mTensorShapes` applies them consistently. The global mShapeEnv
+    // has default head_size / qkv_channels / intermediate / mlp_up; for
+    // block-scoped tensors on hybrid architectures these need per-layer
+    // values.
+    auto maybe_override_for_block_scope = [&](std::vector<long>& s) {
+        int nli = -1;
+        std::string nf;
+        std::string strip_name(name);
+        if (starts_with(strip_name, "d_")) strip_name = strip_name.substr(2);
+        if (starts_with(strip_name, kSavedPrefix)) strip_name = strip_name.substr(kSavedPrefix.size());
+        if (parse_block_param(strip_name, nli, nf)) {
+            apply_per_layer_dim_override(s, strip_ssa_suffix(nf), nli);
+        }
+    };
+
     // Check IR tensor info
     auto check_tensor_info = [&](const std::unordered_map<std::string, TensorInfo>& tensors, const char* source) {
         auto it = tensors.find(name);
         if (it != tensors.end() && !it->second.shape.empty()) {
             shape = resolve_shape(it->second.shape, mShapeEnv);
+            maybe_override_for_block_scope(shape);
             TensorShape ts;
             ts.dims = shape;
             ts.inferred = false;
@@ -3255,23 +3272,7 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
 
     // Try pattern-based inference for known tensor names
     if (infer_known_tensor_shape(name, mConfig, mB, mT, shape)) {
-        // Per-layer dim override for hybrid models. `infer_known_tensor_shape`
-        // uses the global head_size / qkv_channels / intermediate; for
-        // block-scoped tensors on hybrid architectures (Gemma4's sliding vs.
-        // full_attention), the correct per-layer dims come from
-        // `mPerLayerDims[layer_idx]`. Apply BEFORE caching so downstream
-        // lookups (including backward-graph shape_like resolution) pick up
-        // the per-layer value — not the sliding default.
-        int name_layer = -1;
-        std::string name_field;
-        {
-            std::string strip_name(name);
-            if (starts_with(strip_name, "d_")) strip_name = strip_name.substr(2);
-            if (starts_with(strip_name, kSavedPrefix)) strip_name = strip_name.substr(kSavedPrefix.size());
-            if (parse_block_param(strip_name, name_layer, name_field)) {
-                apply_per_layer_dim_override(shape, strip_ssa_suffix(name_field), name_layer);
-            }
-        }
+        maybe_override_for_block_scope(shape);
         TensorShape ts;
         ts.dims = shape;
         ts.inferred = true;
