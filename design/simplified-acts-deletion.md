@@ -444,26 +444,32 @@ has_swiglu_slot` get shape/dtype but `Data=nullptr` so `temp_acquire`
 allocates Stack on first access via `block_gradient_ptr`'s tid-first
 path (same as before).
 
-### Remaining — struct deletion
+### Full deletion shipped 2026-04-23 (commit `9f69aae`)
 
-`SimplifiedLayerGradients` / `mSimplifiedGradients` / `simplified_grads()`
-still exist because two init-time helpers read them:
+Moved the zero-list build into `populate_bwd_stack_bindings` (once per
+compile, guarded by `mBwdZeroListBuilt`). `DslRunState` gains
+`set_activation_grad_zero_list` which the executor calls to populate
+the device-side `(ptrs, sizes)` arrays; `zero_activation_gradients`
+issues a single `zero_device_segments` launch reading those arrays.
 
-- `build_activation_grad_zero_segments` builds the batched
-  `zero_device_segments` list from simplified_grads at DslRunState init.
-- `zero_activation_gradients`'s fallback loop iterates
-  simplified_grads to fill_zero per layer.
+Removed in `9f69aae`:
+- `modules::SimplifiedLayerGradients` struct
+- `DslRunState::mSimplifiedGradients` + `simplified_grads(L)` accessor
+- `DslRunState::allocate_simplified_gradients`
+- `DslRunState::build_activation_grad_zero_segments`
+- `GraphExecutor::consume_bwdstack_arena` + `kBwdStackConsumeSlots`
+  + call site
+- `scrub_slot_array(mSimplifiedGradients)` in stack-resize
+- `allocate_simplified_gradients` call in init
 
-Deleting the struct requires:
-1. Move `build_activation_grad_zero_segments` (or an equivalent) to run
-   after populate_bwd_stack_bindings with access to the backward graph,
-   caching the result on `CompiledExecutor`.
-2. Rewrite `zero_activation_gradients`'s fallback to iterate
-   `mTensors[tid]` via `slot_to_tid(L, BlockDResFFN|BlockDResAtt|
-   BlockDAttOut)`.
-3. Drop `allocate_simplified_gradients` and `consume_bwdstack_arena`
-   (neither is read on the hot path anymore).
+Net: ~200 LOC removed in the final commit, ~500 LOC across the full
+M5.δ series.
 
-Scope: medium (2–3 commits). Not on the critical path — runtime is
-all-mTensors, simplified_grads is a latent init-time structure with no
-hot-path role.
+Validation:
+- Q3: norm 3.4386 (base 3.4389)
+- Q3.5: norm 8.0431 (base 8.0438)
+- GPT-OSS: norm 2.7558 (base 2.7561)
+- Q3 no-recompute: 36.9k tps / 444 ms (base 36.9k / 444 ms)
+
+`SimplifiedLayerGradients` is fully deleted. `mTensors[tid]` is the
+sole source of truth for block gradients.

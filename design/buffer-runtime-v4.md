@@ -37,7 +37,7 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   ├── Session D: reorder set_active_executor + fwd-graph setter   ✅ ca48fbc
 │   │   ├── Session D proper unblock: snapshot/restore at bwd entry     ✅ ab463bf
 │   │   └── SimplifiedLayerActivations deletion (5-commit series)       ✅ 19662ef..b2b3bef — see design/simplified-acts-deletion.md
-│   ├── M5.δ  views + gradient leftovers                                🟡 gradient tid-first shipped (a17ddcc..1e4d801); struct deletion remains
+│   ├── M5.δ  views + gradient leftovers                                ✅ done (a17ddcc..9f69aae) — SimplifiedLayerGradients deleted
 │   ├── M5.ε  cleanup sweep                                             ⬜ not started
 │   └── M5.ζ  no-recompute NaN fix (compile-time 3-change combo)        ✅ 531cda3 — see below
 └── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ✅ passed 2026-04-22 — see buffer-runtime-v4-benchmark.md §"M6 gate"
