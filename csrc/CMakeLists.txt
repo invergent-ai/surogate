@@ -314,6 +314,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/bias_add.cpp
     src/runtime/ops/matmul.cpp
     src/runtime/ops/swiglu.cpp
+    src/runtime/ops/gelu_glu.cpp
     src/runtime/ops/matmul_swiglu.cpp
     src/runtime/ops/qkv_qk_norm.cpp
     src/runtime/ops/qkv_qk_norm_rope.cpp
@@ -414,6 +415,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/encoder.cu
     src/kernels/matmul.cpp
     src/kernels/swiglu.cu
+    src/kernels/gelu_glu.cu
     src/kernels/activation.cu
     src/kernels/fast_lora_silu.cu
     src/kernels/moe_kernels.cu

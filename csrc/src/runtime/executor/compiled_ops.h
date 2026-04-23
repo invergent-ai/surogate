@@ -295,6 +295,7 @@ public:
     void dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook);
     void dispatch_bias_add(const CompiledOp& op);
     void dispatch_swiglu(const CompiledOp& op);
+    void dispatch_gelu_glu(const CompiledOp& op);
     void dispatch_gpt_oss_moe_act(const CompiledOp& op);
     void dispatch_silu(const CompiledOp& op);
     void dispatch_gelu(const CompiledOp& op);
@@ -331,6 +332,7 @@ public:
     void dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook);
     void dispatch_bias_add_backward(const CompiledOp& op);
     void dispatch_swiglu_backward(const CompiledOp& op);
+    void dispatch_gelu_glu_backward(const CompiledOp& op);
     void dispatch_gpt_oss_moe_act_backward(const CompiledOp& op);
     void dispatch_silu_backward(const CompiledOp& op);
     void dispatch_gelu_backward(const CompiledOp& op);

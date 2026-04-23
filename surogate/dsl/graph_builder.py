@@ -404,6 +404,24 @@ class GraphBuilder:
         )
         return self._make_output(out)
 
+    def gelu_glu(self, gate: str | GraphRef, up: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+        """Fused GELU-tanh gated activation: out = gelu_tanh(gate) * up.
+
+        Matches HuggingFace ``gelu_pytorch_tanh`` on the gate — drop-in
+        replacement for the ``gelu(gate) + mul(gate_act, up)`` pair in
+        GatedMLP configurations with ``activation=GELU`` and separate
+        gate/up projections (Gemma4-style).
+        """
+        out = out_name if out_name else self._fresh_name("gelu_glu")
+        self._add_node(
+            GraphNode(
+                op="gelu_glu",
+                inputs=[self._resolve_input(gate), self._resolve_input(up)],
+                outputs=[out],
+            )
+        )
+        return self._make_output(out)
+
     # =========================================================================
     # Fused Operations
     # =========================================================================

@@ -71,6 +71,7 @@ FWD_WRAP(fwd_add, dispatch_add)
 FWD_WRAP_HOOK(fwd_matmul, dispatch_matmul)
 FWD_WRAP(fwd_bias_add, dispatch_bias_add)
 FWD_WRAP(fwd_swiglu, dispatch_swiglu)
+FWD_WRAP(fwd_gelu_glu, dispatch_gelu_glu)
 FWD_WRAP(fwd_gpt_oss_moe_act, dispatch_gpt_oss_moe_act)
 FWD_WRAP(fwd_silu, dispatch_silu)
 FWD_WRAP(fwd_gelu, dispatch_gelu)
@@ -117,6 +118,7 @@ BWD_WRAP(bwd_add, dispatch_add_backward)
 BWD_WRAP_HOOK(bwd_matmul, dispatch_matmul_backward)
 BWD_WRAP(bwd_bias_add, dispatch_bias_add_backward)
 BWD_WRAP(bwd_swiglu, dispatch_swiglu_backward)
+BWD_WRAP(bwd_gelu_glu, dispatch_gelu_glu_backward)
 BWD_WRAP(bwd_gpt_oss_moe_act, dispatch_gpt_oss_moe_act_backward)
 BWD_WRAP(bwd_silu, dispatch_silu_backward)
 BWD_WRAP(bwd_gelu, dispatch_gelu_backward)
@@ -226,6 +228,8 @@ REGISTER_OP("bias_add", BiasAdd, ::dsl::fwd_bias_add, nullptr);
 REGISTER_OP("bias_add_backward", BiasAddBackward, nullptr, ::dsl::bwd_bias_add);
 REGISTER_OP("swiglu", SwiGLU, ::dsl::fwd_swiglu, nullptr);
 REGISTER_OP("swiglu_backward", SwiGLUBackward, nullptr, ::dsl::bwd_swiglu);
+REGISTER_OP("gelu_glu", GeluGlu, ::dsl::fwd_gelu_glu, nullptr);
+REGISTER_OP("gelu_glu_backward", GeluGluBackward, nullptr, ::dsl::bwd_gelu_glu);
 REGISTER_OP("gpt_oss_moe_act", GptOssMoeAct, ::dsl::fwd_gpt_oss_moe_act, nullptr);
 REGISTER_OP("gpt_oss_moe_act_backward", GptOssMoeActBackward, nullptr, ::dsl::bwd_gpt_oss_moe_act);
 REGISTER_OP("silu", Silu, ::dsl::fwd_silu, nullptr);

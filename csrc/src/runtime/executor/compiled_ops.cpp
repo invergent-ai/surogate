@@ -241,6 +241,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MatmulBias: return "matmul_bias";
         case CompiledOpType::BiasAdd: return "bias_add";
         case CompiledOpType::SwiGLU: return "swiglu";
+        case CompiledOpType::GeluGlu: return "gelu_glu";
         case CompiledOpType::GptOssMoeAct: return "gpt_oss_moe_act";
         case CompiledOpType::Silu: return "silu";
         case CompiledOpType::Gelu: return "gelu";
@@ -276,6 +277,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MatmulBackward: return "matmul_backward";
         case CompiledOpType::BiasAddBackward: return "bias_add_backward";
         case CompiledOpType::SwiGLUBackward: return "swiglu_backward";
+        case CompiledOpType::GeluGluBackward: return "gelu_glu_backward";
         case CompiledOpType::GptOssMoeActBackward: return "gpt_oss_moe_act_backward";
         case CompiledOpType::SiluBackward: return "silu_backward";
         case CompiledOpType::GeluBackward: return "gelu_backward";
