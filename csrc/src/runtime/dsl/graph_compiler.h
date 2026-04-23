@@ -777,6 +777,12 @@ private:
     std::vector<BlockTypeDims> mPerLayerDims;
     ShapeEnv make_layer_env(int layer_idx) const;
 
+    /// Rewrite a global-dims shape into per-layer dims when the field name
+    /// matches a per-layer-varying slot (qkv / att / q* / mlp_up / swiglu
+    /// and their _flat / _norm / _normed variants). No-op for non-hybrid
+    /// models (mPerLayerDims empty) or unrecognized fields.
+    void apply_per_layer_dim_override(std::vector<long>& shape, const std::string& base_field, int layer_idx) const;
+
     // Tensor ID assignment state (per-compile, reset at start of compile())
     std::unordered_map<std::string, int> mTensorIdMap;  // name -> tensor_id
     int mNextTensorId = 0;

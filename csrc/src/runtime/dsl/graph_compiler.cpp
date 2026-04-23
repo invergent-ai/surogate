@@ -522,6 +522,73 @@ ShapeEnv GraphCompiler::make_layer_env(int layer_idx) const {
     return env;
 }
 
+// Rewrite a shape computed with global dims to per-layer dims. The shape
+// fallbacks (resolve_tensor_shape / infer_known_tensor_shape) use
+// `mConfig.head_size()` / `mConfig.qkv_channels()` / etc. directly — wrong
+// for hybrid block types whose attn_dim / intermediate / mlp_up differ per
+// layer. Call this after any fallback-produced shape for a block-scoped
+// tensor whose field name maps to one of the per-layer-varying dims.
+// Gemma4 needs this for every full-attention block when the default is
+// sliding: `blocks[L].att` / `att_flat` / `qkv*` / `q*` / `mlp_up*` /
+// `swiglu*` would otherwise end up sized to the sliding defaults.
+void GraphCompiler::apply_per_layer_dim_override(std::vector<long>& shape,
+                                                 const std::string& base_field,
+                                                 int layer_idx) const {
+    if (shape.empty()) return;
+    if (layer_idx < 0 || static_cast<std::size_t>(layer_idx) >= mPerLayerDims.size()) return;
+    const auto& pld = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
+    const long B = mB;
+    const long T = mT;
+    // QKV family — total channels across Q+K+V.
+    if (base_field == "qkv" || base_field == "qkv_rope" || base_field == "qkv_norm" || base_field == "qkv_normed") {
+        shape = {B, T, pld.qkv_channels};
+        return;
+    }
+    if (base_field == "qkv_flat" || base_field == "qkv_biased" || base_field == "qkv_normed_flat" ||
+        base_field == "qkv_norm_flat") {
+        shape = {B * T, pld.qkv_channels};
+        return;
+    }
+    // Q-only (shared-KV attention variants).
+    if (base_field == "q_flat" || base_field == "q_rn_flat" || base_field == "q_normed_flat" ||
+        base_field == "q_roped" || base_field == "q_normed") {
+        // Flat form is [B*T, attn_dim]; non-flat is [B, T, attn_dim]. Use
+        // shape.size() to decide — view ops may land here with either rank.
+        if (shape.size() == 2) {
+            shape = {B * T, pld.attn_dim};
+        } else {
+            shape = {B, T, pld.attn_dim};
+        }
+        return;
+    }
+    // Attention output (post-softmax, before projection).
+    if (base_field == "att") {
+        shape = {B, T, pld.attn_dim};
+        return;
+    }
+    if (base_field == "att_flat") {
+        shape = {B * T, pld.attn_dim};
+        return;
+    }
+    // MLP intermediate.
+    if (base_field == "mlp_up") {
+        shape = {B, T, pld.mlp_up};
+        return;
+    }
+    if (base_field == "mlp_up_flat") {
+        shape = {B * T, pld.mlp_up};
+        return;
+    }
+    if (base_field == "swiglu") {
+        shape = {B, T, pld.intermediate};
+        return;
+    }
+    if (base_field == "swiglu_flat") {
+        shape = {B * T, pld.intermediate};
+        return;
+    }
+}
+
 void GraphCompiler::update_dimensions(long B, long T) {
     mB = B;
     mT = T;
@@ -614,6 +681,18 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
             if (it != mExtraShapes.end()) {
                 ref.shape = it->second;
             }
+        }
+        // Hybrid per-layer override for saved refs. Both `resolve_shape`
+        // (with the global mShapeEnv) and `infer_known_tensor_shape`
+        // (hard-coded to global dims) produce the wrong size for block
+        // tids whose per-layer head_size / intermediate differs from the
+        // default. Gemma4's `saved.blocks[34].att_flat` (final layer
+        // forced to full_attention) would otherwise come out Hq*256 = 2048
+        // instead of the correct Hq*512 = 4096.
+        int parsed_layer_idx = -1;
+        std::string parsed_field;
+        if (parse_block_param(stripped, parsed_layer_idx, parsed_field)) {
+            apply_per_layer_dim_override(ref.shape, strip_ssa_suffix(parsed_field), parsed_layer_idx);
         }
         ref.tensor_id = assign_tensor_id(ref.name);
         return ref;
@@ -708,6 +787,18 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
             }
         }
 
+        // Final per-layer override for hybrid models. `resolve_tensor_shape`
+        // and its `infer_known_tensor_shape` fallback use the GLOBAL
+        // head_size / intermediate / mlp_up — wrong for hybrid blocks whose
+        // dims differ per layer (Gemma4's sliding vs. full_attention, last
+        // layer forced to full). The earlier per-layer override block at
+        // lines 648-672 only runs when `slot_entry->shape` is non-empty,
+        // which skips `att` / `att_flat` / `swiglu` / `qkv_norm*` since the
+        // slot registry stores slot-id only (no shape). Without this
+        // fallback, the backward graph's recompute scratch for a
+        // full-attention block comes out sliding-sized.
+        apply_per_layer_dim_override(ref.shape, base_field, layer_idx);
+
         ref.tensor_id = assign_tensor_id(ref.name);
         return ref;
     }
@@ -754,32 +845,11 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
             }
 
             // For hybrid models, apply per-layer dim overrides to match the
-            // forward activation shapes (parallels lines 577-603 for activations).
-            // Without this, gradient slots for hybrid-dim fields end up sized
-            // with global/default dims — downstream view_backward will claim
-            // more elements than the underlying allocation holds.
-            if (layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < mPerLayerDims.size() && !ref.shape.empty()) {
-                const auto& pld = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
-                const long B = mB;
-                const long T = mT;
-                if (base_field == "qkv" || base_field == "qkv_rope") {
-                    ref.shape = {B, T, pld.qkv_channels};
-                } else if (base_field == "qkv_flat" || base_field == "qkv_biased") {
-                    ref.shape = {B * T, pld.qkv_channels};
-                } else if (base_field == "att") {
-                    ref.shape = {B, T, pld.attn_dim};
-                } else if (base_field == "att_flat") {
-                    ref.shape = {B * T, pld.attn_dim};
-                } else if (base_field == "mlp_up") {
-                    ref.shape = {B, T, pld.mlp_up};
-                } else if (base_field == "mlp_up_flat") {
-                    ref.shape = {B * T, pld.mlp_up};
-                } else if (base_field == "swiglu") {
-                    ref.shape = {B, T, pld.intermediate};
-                } else if (base_field == "swiglu_flat") {
-                    ref.shape = {B * T, pld.intermediate};
-                }
-            }
+            // forward activation shapes. Without this, gradient slots for
+            // hybrid-dim fields end up sized with global/default dims —
+            // downstream view_backward will claim more elements than the
+            // underlying allocation holds.
+            apply_per_layer_dim_override(ref.shape, base_field, layer_idx);
 
             if (ref.shape.empty()) {
                 auto it = mExtraShapes.find(base);
@@ -1012,6 +1082,18 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 ref_shape = it->second;
             } else if (!resolve_tensor_shape(effective, ref_shape)) {
                 infer_known_tensor_shape(effective, mConfig, mB, mT, ref_shape);
+            }
+            // Hybrid per-layer override. `resolve_tensor_shape` /
+            // `infer_known_tensor_shape` are wired to global dims; for
+            // block-scoped tensors whose per-layer attn_dim / intermediate /
+            // mlp_up differ from the default, ref_shape is wrong. Gemma4
+            // block 34 (final full-attention layer) would otherwise see
+            // view_backward's target_shape fall through to the sliding
+            // value Hq*256 instead of Hq*512.
+            int pl_layer_idx = -1;
+            std::string pl_field;
+            if (!ref_shape.empty() && parse_block_param(effective, pl_layer_idx, pl_field)) {
+                apply_per_layer_dim_override(ref_shape, strip_ssa_suffix(pl_field), pl_layer_idx);
             }
             if (!ref_shape.empty()) {
                 attrs.shape = std::move(ref_shape);
@@ -3173,6 +3255,23 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
 
     // Try pattern-based inference for known tensor names
     if (infer_known_tensor_shape(name, mConfig, mB, mT, shape)) {
+        // Per-layer dim override for hybrid models. `infer_known_tensor_shape`
+        // uses the global head_size / qkv_channels / intermediate; for
+        // block-scoped tensors on hybrid architectures (Gemma4's sliding vs.
+        // full_attention), the correct per-layer dims come from
+        // `mPerLayerDims[layer_idx]`. Apply BEFORE caching so downstream
+        // lookups (including backward-graph shape_like resolution) pick up
+        // the per-layer value — not the sliding default.
+        int name_layer = -1;
+        std::string name_field;
+        {
+            std::string strip_name(name);
+            if (starts_with(strip_name, "d_")) strip_name = strip_name.substr(2);
+            if (starts_with(strip_name, kSavedPrefix)) strip_name = strip_name.substr(kSavedPrefix.size());
+            if (parse_block_param(strip_name, name_layer, name_field)) {
+                apply_per_layer_dim_override(shape, strip_ssa_suffix(name_field), name_layer);
+            }
+        }
         TensorShape ts;
         ts.dims = shape;
         ts.inferred = true;

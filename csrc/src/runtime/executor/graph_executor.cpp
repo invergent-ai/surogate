@@ -981,8 +981,10 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 const std::size_t stack_bytes = mRunState.Stack.capacity();
                 // bwd_cross_layer arena. Fixed 64 MiB; the per-step bump
                 // resets at backward start. 0 bytes for dense transformers
-                // (typical), < 16 MiB for small-MoE aux-loss. Interpreter
-                // falls back to cudaMalloc if arena is insufficient.
+                // (typical), < 16 MiB for small-MoE aux-loss.
+                // `CompiledExecutor::allocate_bwd_cross_layer` falls back to
+                // cudaMalloc when this arena is exhausted (hybrid models
+                // with large per-layer attn_dim variance can overflow).
                 const std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
                 // moe_saved arena sized 256 MiB when NumExperts > 0.
                 // Cross-step monotonic bump; cudaMalloc fallback on exhaustion.

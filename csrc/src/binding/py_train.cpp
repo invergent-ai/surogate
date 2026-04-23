@@ -30,6 +30,7 @@
 #include "runtime/dsl/dsl_model.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/executor/graph_executor.h"
 #include "runtime/optimizers/normuon.h"
 
 namespace {

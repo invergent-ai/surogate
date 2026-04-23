@@ -535,6 +535,11 @@ private:
     // Per-step bump cursor into the bwd_cross_layer arena. Reset at the
     // start of each backward call; advanced by allocate_bwd_cross_layer.
     std::size_t mBwdCrossLayerBumpOffset = 0;
+    // cudaMalloc fallbacks taken when the arena is exhausted (hybrid models
+    // with large per-layer attn_dim variance can overflow the fixed-size
+    // arena). Freed at the start of each backward call alongside the bump
+    // offset reset.
+    std::vector<std::byte*> mBwdCrossLayerFallbacks;
 
     // Cross-step monotonic bump cursor into the moe_saved arena. Never
     // reset — MoE save buffers are keyed by name and persist for the
@@ -544,10 +549,11 @@ private:
     std::unordered_map<std::string, bool> mMoeSavedArenaBacked;
 
     /// Allocate `nbytes` in `mPhaseArenas.bwd_cross_layer_ptr`. The arena
-    /// is sized at 64 MiB (see graph_executor.cpp) and reset per step;
-    /// throws when exhausted or when the arena isn't bound, so any
-    /// overflow surfaces immediately instead of silently degrading to
-    /// per-step cudaMalloc.
+    /// is sized at 64 MiB (see graph_executor.cpp) and reset per step.
+    /// Throws when the arena isn't bound. On exhaustion, falls back to
+    /// cudaMalloc; the fallback pointers are tracked in
+    /// `mBwdCrossLayerFallbacks` and released at the start of the next
+    /// backward call.
     std::byte* allocate_bwd_cross_layer(std::size_t nbytes);
 
     /// Allocate `nbytes` for an MoE save buffer. Cross-step monotonic bump in

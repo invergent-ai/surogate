@@ -1737,8 +1737,17 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mComm = &comm;
     mCurrentGraph = &graph;
     mTemps.clear();
-    // Reset per-step bump cursor for bwd_cross_layer arena.
+    // Reset per-step bump cursor for bwd_cross_layer arena. Free any
+    // cudaMalloc fallbacks from the previous backward call — arena-backed
+    // pointers auto-reset via the bump cursor, but fallback allocations
+    // must be explicitly released.
     mBwdCrossLayerBumpOffset = 0;
+    for (std::byte* ptr : mBwdCrossLayerFallbacks) {
+        if (ptr) {
+            (void)cudaFree(ptr);
+        }
+    }
+    mBwdCrossLayerFallbacks.clear();
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward

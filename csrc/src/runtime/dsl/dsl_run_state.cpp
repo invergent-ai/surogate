@@ -951,8 +951,21 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     const long QKV = D * (Hq + 2 * Hkv);
     const long C_attn = static_cast<long>(cfg.attn_out_channels());
 
+    // Size the shared rmsnorm backward scratch for the MAX C across every
+    // rmsnorm application in the model. HiddenSize alone underestimates on
+    // hybrid models like Gemma4: q_norm / k_norm operate on tensors with
+    // last-dim C = Hq*head_size, which for full-attention layers exceeds
+    // HiddenSize (Gemma4-E2B: 4096 for full, 2048 for sliding,
+    // HiddenSize = 1536). Without this max, rmsnorm_backward for a
+    // full-attention q_norm throws "scratch buffer too small".
+    long rmsnorm_scratch_max_c = C;
+    if (mRuntimeConfig.has_per_layer_dims()) {
+        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
+            rmsnorm_scratch_max_c = std::max(rmsnorm_scratch_max_c, static_cast<long>(pld.attn_dim));
+        }
+    }
     const long rmsnorm_scratch_bytes =
-        static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(C), DeviceProp));
+        static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(rmsnorm_scratch_max_c), DeviceProp));
     mScratch.rmsnorm_scratch = mAllocator->allocate(ETensorDType::BYTE,
                                                     "rmsnorm_scratch",
                                                     EAllocationType::ON_DEVICE,

@@ -514,15 +514,21 @@ std::byte* CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
     if (!mPhaseArenas || !mPhaseArenas->allocated || !mPhaseArenas->bwd_cross_layer_ptr) {
         throw std::runtime_error("allocate_bwd_cross_layer: bwd_cross_layer arena not allocated");
     }
-    if (mBwdCrossLayerBumpOffset + nbytes > mPhaseArenas->bwd_cross_layer_bytes) {
-        throw std::runtime_error("allocate_bwd_cross_layer: arena (" +
-                                 std::to_string(mPhaseArenas->bwd_cross_layer_bytes / (1024 * 1024)) +
-                                 " MiB) exhausted requesting " + std::to_string(nbytes / (1024 * 1024)) +
-                                 " MiB at offset " + std::to_string(mBwdCrossLayerBumpOffset));
+    if (mBwdCrossLayerBumpOffset + nbytes <= mPhaseArenas->bwd_cross_layer_bytes) {
+        std::byte* ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
+        mBwdCrossLayerBumpOffset += nbytes;
+        return ptr;
     }
-    std::byte* ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
-    mBwdCrossLayerBumpOffset += nbytes;
-    return ptr;
+    // Arena exhausted — fall back to cudaMalloc. Tracked in
+    // `mBwdCrossLayerFallbacks` and freed at the start of the next backward
+    // call (alongside the bump offset reset in execute_backward).
+    // This triggers on hybrid models whose per-layer attn_dim / intermediate
+    // variance grows the cross-layer persist past the fixed arena budget;
+    // Gemma4-E2B with correct full-attention per-layer dims lands here.
+    std::byte* ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&ptr, nbytes));
+    mBwdCrossLayerFallbacks.push_back(ptr);
+    return reinterpret_cast<std::byte*>(ptr);
 }
 
 void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache) {
