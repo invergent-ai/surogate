@@ -21,6 +21,7 @@
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "runtime/optimizers/optimizer_config.h"
+#include "runtime/dsl/dsl_debug.h"
 
 class DataLoader;
 class IModel;
@@ -134,6 +135,29 @@ public:
 
     std::vector<std::pair<std::string, sSegmentMemory>> get_allocations(int gpu_id);
     std::vector<std::pair<std::string, long>> get_stack_info(int gpu_id);
+
+    // ============================================================================
+    // Phase-tree / region / layout introspection (design/buffer-runtime-v4.md
+    // Phase 4 debug surface). All getters run a read-only work item on rank 0
+    // and return structured data for the `surogate debug tensor-*` subcommands.
+    // ============================================================================
+
+    //! Per-tid layout across forward + backward graphs.
+    std::vector<dsl::DebugTensorEntry> get_debug_tensor_layout();
+
+    //! Arena sizes + per-graph coverage / per-region counts.
+    dsl::DebugArenaSummary get_debug_arena_summary();
+
+    //! Phase tree + flattened instruction stream for one graph.
+    dsl::DebugPhaseTree get_debug_phase_tree(bool is_backward);
+
+    //! Tids whose arena byte ranges overlap within the same coloring bucket.
+    //! Empty under correct compilation (modulo intentional `alias_of`).
+    std::vector<dsl::DebugAliasingPair> get_debug_static_aliasing();
+
+    //! Single-tensor provenance lookup. If `name` is empty, uses `tid`;
+    //! otherwise resolves via the graph's name→tid map.
+    dsl::DebugTensorResolution get_debug_tensor_resolution(const std::string& name, int tid, bool is_backward);
 
     /// Shrink the DSL stack on every rank to the measured high-water mark plus
     /// `safety_bytes`, provided the savings exceed `min_savings_bytes`.

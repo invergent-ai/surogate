@@ -284,6 +284,20 @@ public:
         return mCompiledBackward.get();
     }
 
+    /// Access the compiled forward graph (nullptr if not yet compiled).
+    /// Paired with `compiled_backward()` for debuggability tooling that
+    /// needs layout / region / phase-tree state post-compile.
+    const CompiledGraph* compiled_forward() const {
+        return mCompiledForward.get();
+    }
+
+    /// Access the phase-tree arena allocator for debuggability tooling.
+    /// Sizes come from the baked layout; use together with
+    /// `dsl::validate_arena_coverage` / `dsl::validate_op_operand_coverage`.
+    const dsl::PhaseArenas& phase_arenas() const {
+        return mPhaseArenas;
+    }
+
     /// Compile the forward + backward graph pair for the given (B, T) if
     /// they aren't already compiled for those dimensions. Safe to call
     /// multiple times. Public surface around the private `compile_graphs`.

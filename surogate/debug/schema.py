@@ -51,6 +51,16 @@ class Tag(str, Enum):
     TENSOR = "TENSOR"
     GAP = "GAP"
 
+    # Phase-tree / region / layout introspection (design/buffer-runtime-v4.md)
+    TENSOR_LAYOUT = "TENSOR_LAYOUT"  # One per tid, per graph; layout + region
+    TENSOR_ARENA = "TENSOR_ARENA"  # Per-graph arena totals + coverage
+    TENSOR_REGION = "TENSOR_REGION"  # Per-region tid-count + byte total
+    TENSOR_PHASE = "TENSOR_PHASE"  # Phase-tree node (recursive via `path`)
+    TENSOR_INSTR = "TENSOR_INSTR"  # Instruction-stream entry
+    TENSOR_ALIAS_STATIC = "TENSOR_ALIAS_STATIC"  # Overlapping byte ranges in one graph
+    TENSOR_ALIAS_RUNTIME = "TENSOR_ALIAS_RUNTIME"  # Op-io-alias runtime warning
+    TENSOR_RESOLVE = "TENSOR_RESOLVE"  # Single-tensor provenance
+
     # Terminal
     SUMMARY = "SUMMARY"
     ERROR = "ERROR"

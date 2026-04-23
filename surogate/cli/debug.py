@@ -1,17 +1,23 @@
 """`surogate debug` command — introspection + diagnostics for DSL models.
 
 Subcommands:
-    weights      Static audit: HF safetensors keys vs DSL expected params.
-    registry     Static audit: which tensor names in the IR have no DSL declaration.
-    activations  Per-layer forward activation stats from a single step.
-    gradients    Per-step, per-param, and per-intermediate backward gradient stats.
-    diff         Layer-by-layer numerical diff vs HuggingFace transformers reference.
+    weights             Static audit: HF safetensors keys vs DSL expected params.
+    registry            Static audit: which tensor names in the IR have no DSL declaration.
+    activations         Per-layer forward activation stats from a single step.
+    gradients           Per-step, per-param, and per-intermediate backward gradient stats.
+    diff                Layer-by-layer numerical diff vs HuggingFace transformers reference.
+    tensor-layout       Per-tid layout + region assignment across fwd + bwd graphs.
+    tensor-arena        Arena sizes + coverage + per-region tid counts.
+    tensor-aliasing     Overlapping byte ranges (static) or runtime op-io aliasing events.
+    tensor-resolve      Single-tensor provenance: region, offset, phase path, first/last op.
 
 Every subcommand writes a JSONL file + a .header.json sidecar. One record per
 line, tagged for grep; see ``surogate/debug/schema.py`` for the vocabulary.
 
 Example:
-    surogate debug weights examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml
+    surogate debug weights        examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml
+    surogate debug tensor-layout  examples/sft/qwen3/qwen3-lora-bf16.yaml
+    surogate debug tensor-resolve examples/sft/qwen3/qwen3-lora-bf16.yaml --name blocks[3].ln1
 """
 
 import argparse
@@ -108,6 +114,59 @@ def prepare_command_parser(parser=None):
         "one GPU). 'cuda' forces single-device load. Default: 'auto'.",
     )
 
+    # =========================================================================
+    # tensor-* — phase-tree / region / layout / aliasing introspection
+    # (design/buffer-runtime-v4.md Phase 4 debug surface)
+    # =========================================================================
+
+    p_layout = sub.add_parser(
+        "tensor-layout",
+        help="Per-tid layout + region assignment across fwd + bwd compiled graphs",
+    )
+    _add_config_arg(p_layout)
+    p_layout.add_argument("--hub_token", type=str, default=None, help="HuggingFace Hub token for private models")
+
+    p_arena = sub.add_parser(
+        "tensor-arena",
+        help="Arena sizes + per-graph coverage + per-region tid counts",
+    )
+    _add_config_arg(p_arena)
+    p_arena.add_argument("--hub_token", type=str, default=None, help="HuggingFace Hub token for private models")
+
+    p_alias = sub.add_parser(
+        "tensor-aliasing",
+        help="Tensor aliasing audit — static (compile-only scan) or runtime (one-step op-io check)",
+    )
+    _add_config_arg(p_alias)
+    p_alias.add_argument("--hub_token", type=str, default=None, help="HuggingFace Hub token for private models")
+    p_alias.add_argument(
+        "--mode",
+        choices=("static", "runtime"),
+        default="static",
+        help="static: compile-only overlap scan (default). runtime: run one fwd+bwd step with "
+        "SUROGATE_CHECK_OP_IO_ALIASING=log and parse the emitted events.",
+    )
+
+    p_resolve = sub.add_parser(
+        "tensor-resolve",
+        help="Single-tensor provenance: region, offset, phase path, first-write/last-use op",
+    )
+    _add_config_arg(p_resolve)
+    p_resolve.add_argument("--hub_token", type=str, default=None, help="HuggingFace Hub token for private models")
+    p_resolve.add_argument("--name", type=str, default=None, help="Tensor name (e.g. 'blocks[3].ln1')")
+    p_resolve.add_argument(
+        "--tid",
+        type=int,
+        default=-1,
+        help="Tensor ID (alternative to --name). Use -1 to rely on --name.",
+    )
+    p_resolve.add_argument(
+        "--graph",
+        choices=("forward", "backward"),
+        default=None,
+        help="Limit lookup to one graph. Default: both (emit one record per graph hit).",
+    )
+
     return parser
 
 
@@ -150,6 +209,38 @@ def _dispatch(args: argparse.Namespace) -> int:
             rtol=args.rtol,
             atol=args.atol,
             ref_device_map=args.ref_device_map,
+        )
+
+    if args.subcommand == "tensor-layout":
+        from surogate.debug.tensor_layout import run_tensor_layout
+
+        return run_tensor_layout(args.config, output=args.output, hub_token=args.hub_token)
+
+    if args.subcommand == "tensor-arena":
+        from surogate.debug.tensor_arena import run_tensor_arena
+
+        return run_tensor_arena(args.config, output=args.output, hub_token=args.hub_token)
+
+    if args.subcommand == "tensor-aliasing":
+        from surogate.debug.tensor_aliasing import run_tensor_aliasing
+
+        return run_tensor_aliasing(
+            args.config,
+            output=args.output,
+            hub_token=args.hub_token,
+            mode=args.mode,
+        )
+
+    if args.subcommand == "tensor-resolve":
+        from surogate.debug.tensor_resolve import run_tensor_resolve
+
+        return run_tensor_resolve(
+            args.config,
+            output=args.output,
+            hub_token=args.hub_token,
+            name=args.name,
+            tid=args.tid,
+            graph=args.graph,
         )
 
     logger.error("no debug subcommand specified; try `surogate debug --help`")

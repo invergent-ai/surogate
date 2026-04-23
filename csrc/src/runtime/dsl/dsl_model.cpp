@@ -1259,6 +1259,14 @@ DslModel::DslModel(const PretrainedConfig& config,
 
 DslModel::~DslModel() = default;
 
+const GraphExecutor* DslModel::graph_executor() const {
+    return dynamic_cast<const GraphExecutor*>(mExecutor.get());
+}
+
+GraphExecutor* DslModel::graph_executor() {
+    return dynamic_cast<GraphExecutor*>(mExecutor.get());
+}
+
 modules::ModularLoRAWeightsManager& DslModel::lora_weights() {
     if (!mLoRAWeights) {
         throw std::runtime_error("DSL model: LoRA not enabled");
