@@ -994,10 +994,13 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                          stack_bytes,
                                          bwd_cross_layer_bytes,
                                          moe_saved_bytes);
-                // Persistent arena is sized in three slabs:
+                // Persistent arena holds only weight-like storage (weights,
+                // WM master/work/prefetch, LoRA master/work, non-graph extras)
+                // in four slabs:
                 //   [0, base)                = base-weight region (layout offsets)
                 //   [base, base+wm)          = DslWeightManager master/work/prefetch
                 //   [base+wm, base+wm+lora)  = LoRA adapter master/work
+                //   [...+extras)             = non-graph persistent extras
                 // Base-weight bytes clamp to what DslParamStore can actually
                 // rebind — layout estimates over every ForwardParam tid, but
                 // QLoRA-external and weight-manager-managed params live in
@@ -1007,6 +1010,10 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // (GenericWeightManager::consume_self_arena) — not part of
                 // this slab layout because the provider isn't wired until
                 // after compile_graphs runs.
+                // Non-block activations (encoded/xF/ln_final_rstd/output/
+                // freq_cis/d_ln_final) live in a separate
+                // `persistent_activation` arena whose offsets come directly
+                // from the compiler — no slab math needed.
                 std::size_t lora_slab_bytes = 0;
                 std::size_t wm_slab_bytes = 0;
                 std::size_t base_persistent_bytes = 0;
@@ -1085,7 +1092,7 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     std::byte* lora_base = mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes;
                     mLoRAWeights->rebind_to_persistent_arena(lora_base, lora_slab_bytes, mRunState.MainStream);
                 }
-                if (mPhaseArenas.persistent_ptr != nullptr) {
+                if (mPhaseArenas.persistent_activation_ptr != nullptr) {
                     mRunState.rebind_non_block_to_persistent_arena(*mCompiledForward,
                                                                    mPhaseArenas,
                                                                    mRunState.MainStream);

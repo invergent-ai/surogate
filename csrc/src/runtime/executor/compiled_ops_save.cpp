@@ -969,6 +969,11 @@ Tensor* CompiledExecutor::bind_from_region(int tid, const TensorRef& ref) {
                 base = mPhaseArenas->persistent_ptr + meta.offset;
             }
             break;
+        case dsl::RegionKind::PersistentActivation:
+            if (mPhaseArenas->persistent_activation_ptr) {
+                base = mPhaseArenas->persistent_activation_ptr + meta.offset;
+            }
+            break;
         case dsl::RegionKind::Accumulator:
             if (mPhaseArenas->accumulator_ptr) {
                 base = mPhaseArenas->accumulator_ptr + meta.offset;

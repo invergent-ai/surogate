@@ -664,7 +664,8 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
 void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& graph,
                                                        const PhaseArenas& arenas,
                                                        cudaStream_t stream) {
-    if (!arenas.allocated || arenas.persistent_ptr == nullptr || arenas.persistent_bytes == 0) return;
+    if (!arenas.allocated || arenas.persistent_activation_ptr == nullptr || arenas.persistent_activation_bytes == 0)
+        return;
 
     std::size_t rebound = 0;
     std::size_t skipped_no_tid = 0;
@@ -679,16 +680,17 @@ void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& grap
             return;
         }
         const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
-        if (meta.region != RegionKind::Persistent || meta.offset == SIZE_MAX) {
+        if (meta.region != RegionKind::PersistentActivation || meta.offset == SIZE_MAX) {
             ++skipped_non_persistent;
             return;
         }
         const std::size_t tensor_bytes = t.bytes();
-        if (tensor_bytes == 0 || meta.bytes < tensor_bytes || meta.offset + tensor_bytes > arenas.persistent_bytes) {
+        if (tensor_bytes == 0 || meta.bytes < tensor_bytes ||
+            meta.offset + tensor_bytes > arenas.persistent_activation_bytes) {
             ++skipped_size_mismatch;
             return;
         }
-        std::byte* arena_ptr = arenas.persistent_ptr + meta.offset;
+        std::byte* arena_ptr = arenas.persistent_activation_ptr + meta.offset;
         CUDA_CHECK(cudaMemcpyAsync(arena_ptr, t.Data, tensor_bytes, cudaMemcpyDeviceToDevice, stream));
         float* preserved_stats = t.Stats;
         const int device = t.Device;
@@ -735,7 +737,7 @@ void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& grap
             std::cerr << "[arena-consume non-block] rebound=" << rebound << " skipped_no_tid=" << skipped_no_tid
                       << " skipped_non_persistent=" << skipped_non_persistent
                       << " skipped_size_mismatch=" << skipped_size_mismatch
-                      << " arena_bytes=" << arenas.persistent_bytes << "\n";
+                      << " arena_bytes=" << arenas.persistent_activation_bytes << "\n";
         }
     }
 }

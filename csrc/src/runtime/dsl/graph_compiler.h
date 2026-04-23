@@ -361,15 +361,22 @@ enum class TensorKind : uint8_t {
 /// assigned to exactly one region by derive_regions(). Shadow-only in M2; the
 /// layout pass (M3) consumes region + block_layer_idx to bake buffer offsets.
 enum class RegionKind : std::uint8_t {
-    Unknown = 0,     ///< Not yet classified (includes cross-graph forward activations in backward)
-    FwdStack,        ///< Block-scoped forward activation (bump arena; nested FwdBlock frames)
-    BwdStack,        ///< Block-scoped backward gradient / temporary (bump arena)
-    SaveForBwd,      ///< Forward activation persisted across block boundary for backward
-    Accumulator,     ///< Gradient accumulator (parameter grad + autodiff accum temps)
-    Persistent,      ///< Training-wide (parameters, token ids, losses, FP8 amax history)
-    Recomputed,      ///< Forward activation replayed during backward (reuses FwdStack arena)
-    GatheredWeight,  ///< ZeRO-3 all-gathered weight shards (unused in Llama prototype)
-    BwdCrossLayer,   ///< Backward-produced tensor consumed by a later backward block (MoE aux-loss; unused in Llama)
+    Unknown = 0,           ///< Not yet classified (includes cross-graph forward activations in backward)
+    FwdStack,              ///< Block-scoped forward activation (bump arena; nested FwdBlock frames)
+    BwdStack,              ///< Block-scoped backward gradient / temporary (bump arena)
+    SaveForBwd,            ///< Forward activation persisted across block boundary for backward
+    Accumulator,           ///< Gradient accumulator (parameter grad + autodiff accum temps)
+    Persistent,            ///< Training-wide parameters (weights). Slab layout is owner-controlled
+                           ///< (DslParamStore / DslWeightManager / LoRA) with runtime-chosen offsets,
+                           ///< NOT the compile-time `meta.offset` (which would collide with non-weight
+                           ///< tids when WM/QLoRA clamps DslParamStore's slab to zero).
+    PersistentActivation,  ///< Training-wide non-block activations / I/O buffers (encoded, xF,
+                           ///< ln_final_rstd, output, freq_cis, d_ln_final, loss inputs). Separate
+                           ///< from Persistent because compile-time offsets are authoritative here:
+                           ///< arena base is a fixed region and rebind writes at `base + meta.offset`.
+    Recomputed,            ///< Forward activation replayed during backward (reuses FwdStack arena)
+    GatheredWeight,        ///< ZeRO-3 all-gathered weight shards (unused in Llama prototype)
+    BwdCrossLayer,  ///< Backward-produced tensor consumed by a later backward block (MoE aux-loss; unused in Llama)
 };
 
 const char* region_kind_name(RegionKind k);
@@ -644,8 +651,9 @@ struct CompiledGraph {
     std::optional<PhaseNode> phase_tree;
 
     /// Per-region peak bytes populated by compute_layout().
-    /// Consumed by compute_arena_sizes() to size the 5 phase arenas.
+    /// Consumed by compute_arena_sizes() to size the phase arenas.
     std::size_t persistent_bytes = 0;
+    std::size_t persistent_activation_bytes = 0;
     std::size_t accumulator_bytes = 0;
     std::size_t fwd_stack_peak = 0;  // max over frames
     std::size_t bwd_stack_peak = 0;  // max over frames
@@ -812,6 +820,13 @@ std::uint64_t compute_layout_hash(const CompiledGraph& graph);
 struct PhaseArenas {
     std::byte* persistent_ptr = nullptr;
     std::size_t persistent_bytes = 0;
+
+    // PersistentActivation: training-wide non-block activations / I/O buffers.
+    // Arena base is a fixed region; rebind writes at `base + meta.offset`.
+    // Separate from the Persistent arena so WM/LoRA/QLoRA can claim the
+    // Persistent arena without colliding with compile-time activation offsets.
+    std::byte* persistent_activation_ptr = nullptr;
+    std::size_t persistent_activation_bytes = 0;
 
     std::byte* accumulator_ptr = nullptr;
     std::size_t accumulator_bytes = 0;

@@ -1733,6 +1733,7 @@ const char* region_kind_name(RegionKind k) {
         case RegionKind::SaveForBwd: return "SaveForBwd";
         case RegionKind::Accumulator: return "Accumulator";
         case RegionKind::Persistent: return "Persistent";
+        case RegionKind::PersistentActivation: return "PersistentActivation";
         case RegionKind::Recomputed: return "Recomputed";
         case RegionKind::GatheredWeight: return "GatheredWeight";
         case RegionKind::BwdCrossLayer: return "BwdCrossLayer";
@@ -1750,14 +1751,14 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
         switch (meta.kind) {
             case TensorKind::ForwardParam: meta.region = RegionKind::Persistent; break;
             case TensorKind::ForwardActivation:
-                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::FwdStack : RegionKind::Persistent;
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::FwdStack : RegionKind::PersistentActivation;
                 break;
             case TensorKind::ActivationGrad:
-                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::BwdStack : RegionKind::Persistent;
+                meta.region = (meta.block_layer_idx >= 0) ? RegionKind::BwdStack : RegionKind::PersistentActivation;
                 break;
             case TensorKind::ParamGrad:
             case TensorKind::AccumTemp: meta.region = RegionKind::Accumulator; break;
-            case TensorKind::LossInput: meta.region = RegionKind::Persistent; break;
+            case TensorKind::LossInput: meta.region = RegionKind::PersistentActivation; break;
             case TensorKind::Scratch:
                 // Pessimistic default for un-typed intermediates (views,
                 // zeros, constants). Correct when the scratch dies within a
@@ -1775,7 +1776,7 @@ void GraphCompiler::derive_regions(CompiledGraph& graph, bool is_backward) {
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
         if (std::string(env) == "1") {
-            std::array<int, 9> counts{};  // Indexed by RegionKind.
+            std::array<int, 10> counts{};  // Indexed by RegionKind.
             for (const auto& meta : graph.tensor_meta) {
                 counts[static_cast<std::size_t>(meta.region)]++;
             }
@@ -2238,6 +2239,7 @@ std::uint64_t compute_layout_hash(const CompiledGraph& graph) {
     // Per-region peaks: any drift here shows up even if tid sets happened to
     // match (unlikely but cheap to guard against).
     h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.persistent_bytes));
+    h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.persistent_activation_bytes));
     h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.accumulator_bytes));
     h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.fwd_stack_peak));
     h = fnv1a_mix(h, static_cast<std::uint64_t>(graph.bwd_stack_peak));
@@ -2304,6 +2306,7 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     // (each block has its own persistent slot); FwdStack / BwdStack coloring
     // is per-frame (frames don't coexist, so offsets are frame-local).
     std::vector<int> persistent_tids;
+    std::vector<int> persistent_activation_tids;
     std::vector<int> accumulator_tids;
     std::vector<std::vector<int>> fwd_frame(num_layers);
     std::vector<std::vector<int>> bwd_frame(num_layers);
@@ -2320,6 +2323,7 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
         };
         switch (meta.region) {
             case RegionKind::Persistent: persistent_tids.push_back(static_cast<int>(tid)); break;
+            case RegionKind::PersistentActivation: persistent_activation_tids.push_back(static_cast<int>(tid)); break;
             case RegionKind::Accumulator: accumulator_tids.push_back(static_cast<int>(tid)); break;
             case RegionKind::FwdStack: block_bucket(fwd_frame); break;
             case RegionKind::BwdStack: block_bucket(bwd_frame); break;
@@ -2442,6 +2446,7 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
         std::sort(tids.begin(), tids.end());
     };
     bump_sort(persistent_tids);
+    bump_sort(persistent_activation_tids);
     bump_sort(accumulator_tids);
     for (auto& v : save_for_bwd)
         bump_sort(v);
@@ -2456,6 +2461,7 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     };
 
     const std::size_t persistent_bytes = bump_assign(persistent_tids);
+    const std::size_t persistent_activation_bytes = bump_assign(persistent_activation_tids);
     const std::size_t accumulator_bytes = bump_assign(accumulator_tids);
     std::size_t save_for_bwd_bytes = 0;
     std::vector<std::size_t> save_for_bwd_block_bytes(num_layers, 0);
@@ -2552,6 +2558,7 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
 
     // Expose peaks for compute_arena_sizes.
     graph.persistent_bytes = persistent_bytes;
+    graph.persistent_activation_bytes = persistent_activation_bytes;
     graph.accumulator_bytes = accumulator_bytes;
     graph.fwd_stack_peak = fwd_colored;
     graph.bwd_stack_peak = bwd_colored;
@@ -2686,7 +2693,8 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
         if (std::string(env) == "1") {
             std::cerr << "[layout] " << (is_backward ? "backward" : "forward") << " compile (" << graph.name << "):\n"
-                      << "  Persistent   = " << fmt_bytes(persistent_bytes) << "\n"
+                      << "  Persistent           = " << fmt_bytes(persistent_bytes) << "\n"
+                      << "  PersistentActivation = " << fmt_bytes(persistent_activation_bytes) << "\n"
                       << "  Accumulator  = " << fmt_bytes(accumulator_bytes) << "\n"
                       << "  SaveForBwd   = " << fmt_bytes(save_for_bwd_bytes) << "\n"
                       << "  FwdStack     = " << fmt_bytes(fwd_colored) << " (naive " << fmt_bytes(fwd_naive)
@@ -2728,6 +2736,7 @@ void compute_arena_sizes(PhaseArenas& arenas,
     // (grad store) drop the slab to zero when the config (QLoRA, streaming,
     // sharding, offload) keeps storage elsewhere.
     arenas.persistent_bytes = std::max(fwd.persistent_bytes, bwd.persistent_bytes);
+    arenas.persistent_activation_bytes = std::max(fwd.persistent_activation_bytes, bwd.persistent_activation_bytes);
     arenas.accumulator_bytes = std::max(fwd.accumulator_bytes, bwd.accumulator_bytes);
 
     // FwdStack, BwdStack: single-arena routing per the plan — FwdStack
@@ -2775,6 +2784,7 @@ void cuda_malloc_or_die(std::byte** out, std::size_t bytes, const char* label) {
 void allocate_phase_arenas(PhaseArenas& arenas) {
     if (arenas.allocated) return;
     cuda_malloc_or_die(&arenas.persistent_ptr, arenas.persistent_bytes, "persistent");
+    cuda_malloc_or_die(&arenas.persistent_activation_ptr, arenas.persistent_activation_bytes, "persistent_activation");
     cuda_malloc_or_die(&arenas.accumulator_ptr, arenas.accumulator_bytes, "accumulator");
     cuda_malloc_or_die(&arenas.fwd_stack_ptr, arenas.fwd_stack_bytes, "fwd_stack");
     cuda_malloc_or_die(&arenas.bwd_stack_ptr, arenas.bwd_stack_bytes, "bwd_stack");
@@ -2792,6 +2802,8 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
             std::cerr << "[arena] allocated:\n"
                       << "  Persistent    = " << mb(arenas.persistent_bytes) << " MB @ "
                       << static_cast<void*>(arenas.persistent_ptr) << "\n"
+                      << "  PersistentAct = " << mb(arenas.persistent_activation_bytes) << " MB @ "
+                      << static_cast<void*>(arenas.persistent_activation_ptr) << "\n"
                       << "  Accumulator   = " << mb(arenas.accumulator_bytes) << " MB @ "
                       << static_cast<void*>(arenas.accumulator_ptr) << "\n"
                       << "  FwdStack      = " << mb(arenas.fwd_stack_bytes) << " MB @ "
@@ -2803,8 +2815,9 @@ void allocate_phase_arenas(PhaseArenas& arenas) {
                       << "  UnifiedStack  = " << mb(arenas.unified_stack_bytes) << " MB @ "
                       << static_cast<void*>(arenas.unified_stack_ptr) << "\n"
                       << "  TOTAL         = "
-                      << mb(arenas.persistent_bytes + arenas.accumulator_bytes + arenas.fwd_stack_bytes +
-                            arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes + arenas.unified_stack_bytes)
+                      << mb(arenas.persistent_bytes + arenas.persistent_activation_bytes + arenas.accumulator_bytes +
+                            arenas.fwd_stack_bytes + arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes +
+                            arenas.unified_stack_bytes)
                       << " MB\n";
         }
     }
@@ -2816,6 +2829,7 @@ std::byte* resolve_tid_in_arena(const PhaseArenas& arenas, const CompiledGraph& 
     if (meta.offset == SIZE_MAX) return nullptr;
     switch (meta.region) {
         case RegionKind::Persistent: return arenas.persistent_ptr + meta.offset;
+        case RegionKind::PersistentActivation: return arenas.persistent_activation_ptr + meta.offset;
         case RegionKind::Accumulator: return arenas.accumulator_ptr + meta.offset;
         case RegionKind::FwdStack: return arenas.fwd_stack_ptr + meta.offset;  // frame-local offset
         case RegionKind::BwdStack: return arenas.bwd_stack_ptr + meta.offset;
@@ -2837,6 +2851,7 @@ ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledG
     auto region_capacity = [&](RegionKind k) -> std::size_t {
         switch (k) {
             case RegionKind::Persistent: return arenas.persistent_bytes;
+            case RegionKind::PersistentActivation: return arenas.persistent_activation_bytes;
             case RegionKind::Accumulator: return arenas.accumulator_bytes;
             case RegionKind::FwdStack: return arenas.fwd_stack_bytes;
             case RegionKind::BwdStack: return arenas.bwd_stack_bytes;
@@ -2852,6 +2867,7 @@ ArenaCoverage validate_arena_coverage(const PhaseArenas& arenas, const CompiledG
         if (meta.offset == SIZE_MAX || meta.bytes == 0) continue;
         switch (meta.region) {
             case RegionKind::Persistent:
+            case RegionKind::PersistentActivation:
             case RegionKind::Accumulator:
             case RegionKind::FwdStack:
             case RegionKind::BwdStack: {
@@ -2913,6 +2929,7 @@ OpOperandCoverage validate_op_operand_coverage(const PhaseArenas& arenas, const 
     auto region_allocated = [&](RegionKind k) {
         switch (k) {
             case RegionKind::Persistent: return arenas.persistent_ptr != nullptr;
+            case RegionKind::PersistentActivation: return arenas.persistent_activation_ptr != nullptr;
             case RegionKind::Accumulator: return arenas.accumulator_ptr != nullptr;
             case RegionKind::FwdStack: return arenas.fwd_stack_ptr != nullptr;
             case RegionKind::BwdStack: return arenas.bwd_stack_ptr != nullptr;
@@ -2966,6 +2983,7 @@ void release_phase_arenas(PhaseArenas& arenas) {
         }
     };
     free_ptr(arenas.persistent_ptr);
+    free_ptr(arenas.persistent_activation_ptr);
     free_ptr(arenas.accumulator_ptr);
     free_ptr(arenas.fwd_stack_ptr);
     free_ptr(arenas.bwd_stack_ptr);
@@ -2974,6 +2992,7 @@ void release_phase_arenas(PhaseArenas& arenas) {
     free_ptr(arenas.bwd_cross_layer_ptr);
     free_ptr(arenas.moe_saved_ptr);
     arenas.persistent_bytes = 0;
+    arenas.persistent_activation_bytes = 0;
     arenas.accumulator_bytes = 0;
     arenas.fwd_stack_bytes = 0;
     arenas.bwd_stack_bytes = 0;
