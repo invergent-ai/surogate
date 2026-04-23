@@ -17,45 +17,6 @@
 namespace modules {
 
 /**
- * @brief Simplified per-layer activation gradients (for simplified backward path)
- *
- * Mirrors the legacy LLamaRunState per-layer gradient buffers closely enough
- * for the modular "simplified" backward implementation in model/modular_model.h.
- */
-struct SimplifiedLayerGradients {
-    // Backing storage indexed by dsl::TensorSlot. Only BlockD* slot indices
-    // (BlockDLN1 .. BlockDResFFN) are written — the rest of the enum range
-    // is zero-initialized Tensor{} padding.
-    //
-    // Access: grads[TensorSlot::BlockDLN1] = ... / grads[TensorSlot::BlockDLN1].Data
-    //
-    // Slot documentation:
-    //   BlockDResFFN: (B, T, C) gradient w.r.t. (residual_att + mlp_down)
-    //   BlockDResAtt: (B, T, C) gradient w.r.t. residual input to attention
-    //   BlockDAttOut: (B, T, C) gradient w.r.t. attention output projection
-    //   BlockDLN2: (B, T, C) gradient w.r.t. LN2 output
-    //   BlockDMLPUp: (B, T, 2*D) gradient w.r.t. MLP up output
-    //   BlockDSwiGLU: (B, T, D) gradient w.r.t. SwiGLU output
-    //   BlockDMLPDown: (B, T, C) gradient w.r.t. MLP down output
-    //   BlockDHOut: (B, T, C) gradient w.r.t. block final output (Gemma4)
-    //   BlockDAtt: (B, T, Hq*Hs) gradient w.r.t. attention output
-    //   BlockDQKV: (B, T, QKV_C) gradient w.r.t. QKV (post RoPE)
-    //   BlockDLN1: (B, T, C) gradient w.r.t. LN1 output
-    //
-    // Mamba / SSM gradients route through resolve_tensor
-    // ("d_blocks[N].mamba_*") — no per-field struct storage needed.
-    static constexpr std::size_t kSize = static_cast<std::size_t>(dsl::TensorSlot::Mapped) + 1;
-    std::array<Tensor, kSize> slots{};
-
-    Tensor& operator[](dsl::TensorSlot s) {
-        return slots[static_cast<std::size_t>(s)];
-    }
-    const Tensor& operator[](dsl::TensorSlot s) const {
-        return slots[static_cast<std::size_t>(s)];
-    }
-};
-
-/**
  * @brief Optional quantized backward gradients used by FP8/int8 matmuls.
  *
  * These are scratch/shared across layers in the simplified backward path.

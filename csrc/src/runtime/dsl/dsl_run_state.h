@@ -117,9 +117,6 @@ public:
     /// when an executor is active, nullptr otherwise. Implemented in
     /// dsl_run_state.cpp to keep this header free of compiled_ops.h.
     Tensor* active_executor_slot(int layer_idx, TensorSlot slot);
-    modules::SimplifiedLayerGradients& simplified_grads(int layer_idx) {
-        return mSimplifiedGradients[layer_idx];
-    }
     modules::SimplifiedQuantGradients& simplified_quant_grads() {
         return mSimplifiedQuantGrads;
     }
@@ -156,10 +153,11 @@ public:
     /// Call this at the start of each backward pass to prevent stale gradients from accumulating.
     void zero_activation_gradients(cudaStream_t stream);
 
-    /// @brief Get the number of layers for gradient iteration
-    std::size_t num_gradient_layers() const {
-        return mSimplifiedGradients.size();
-    }
+    /// Set the (ptr, bytes) list of activation-gradient buffers to zero
+    /// at bwd entry. Called by CompiledExecutor::populate_bwd_stack_
+    /// bindings once per compile; the device-side arrays are re-used
+    /// across steps. No-op for count=0.
+    void set_activation_grad_zero_list(const std::vector<std::uint64_t>& ptrs, const std::vector<std::uint64_t>& sizes);
 
     modules::NonBlockActivations& non_block_activations() {
         return mNonBlockActivations;
@@ -357,8 +355,6 @@ private:
     CompiledExecutor* mActiveExecutor = nullptr;  // M5.γ Option C back-ref; unowned
 
     void allocate_non_block_state(const PretrainedConfig& cfg);
-    void allocate_simplified_gradients(const PretrainedConfig& cfg);
-    void build_activation_grad_zero_segments();
     void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);
     void allocate_scratch_buffers(const PretrainedConfig& cfg);
     void allocate_residual_buffers(const PretrainedConfig& cfg, bool offload_residuals);
@@ -395,8 +391,6 @@ private:
     /// allocate_simplified_{activations,gradients}. See buffer_plan.h.
     BufferPlan mBufferPlan;
     std::vector<Tensor> mPerLayerRopeFreqs;
-
-    std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;
 
     // Precomputed list of activation-gradient buffers to zero at the start of backward.
     // Stored as device arrays of (ptr, bytes) to zero in a single kernel launch.

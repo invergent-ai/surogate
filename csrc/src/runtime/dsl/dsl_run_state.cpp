@@ -376,8 +376,6 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                                     mGradDtype);
 
     allocate_non_block_state(config);
-    allocate_simplified_gradients(config);
-    build_activation_grad_zero_segments();
     allocate_simplified_quant_buffers(config, options);
     allocate_residual_buffers(config, options.OffloadResidual);
     allocate_scratch_buffers(config);
@@ -487,7 +485,6 @@ void DslRunState::resize_stack_to(long new_size_bytes) {
             }
         }
     };
-    scrub_slot_array(mSimplifiedGradients, "simplified_grads");
     if (debug) {
         fprintf(stderr, "[stack-resize] new_size=%ld scrubbed=%zu\n", new_size_bytes, scrubbed);
     }
@@ -861,155 +858,38 @@ void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::siz
     }
 }
 
-void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
-    // Like allocate_simplified_activations, this is a mechanical walk over
-    // the plan — new decisions belong in BufferPlan::build, not here.
-    const auto& plan = mBufferPlan;
-    const long B = plan.B;
-    const long T = plan.T;
-    const long C = plan.C;
-
-    const auto dtype = plan.grad_dtype;
-    const auto kind = EAllocationType::ON_DEVICE;
-
-    mSimplifiedGradients.resize(cfg.NumLayers);
-    for (int i = 0; i < cfg.NumLayers; ++i) {
-        auto& g = mSimplifiedGradients[i];
-
-        const long lQKV = plan.layer_qkv(i);
-        const long lAttnDim = plan.layer_attn_dim(i);
-        const long lMUp = plan.layer_mlp_up(i);
-        const long lM = plan.layer_intermediate(i);
-
-        auto stack_or_alloc_grad = [&](TensorSlot slot, bool on_stack, const char* name, std::vector<long> shape) {
-            g[slot] = on_stack ? Tensor::from_pointer(nullptr, DeviceId, dtype, shape)
-                               : mAllocator->allocate(dtype, name, kind, shape);
-        };
-
-        // Block-scope activation grads. Stack-init (Data=nullptr); the
-        // BwdStack arena is routed to these slots in
-        // `GraphExecutor::consume_bwdstack_arena`, which then calls
-        // `refresh_simplified_gradients_base()` so subsequent
-        // `reset_simplified_gradients` calls restore to arena pointers.
-        // BwdStack coloring shares bytes across layers
-        // (section_per_layer=false) because backward frames don't
-        // coexist — each layer overwrites the previous layer's slot.
-        // Hybrid (Nemotron-H) keeps d_att_out independent; standard
-        // transformers alias it to d_res_att.
-        auto stack_init_grad = [&](TensorSlot slot, std::vector<long> shape) {
-            g[slot] = Tensor::from_pointer(nullptr, DeviceId, dtype, shape);
-        };
-        stack_init_grad(TensorSlot::BlockDResFFN, {B, T, C});
-        stack_init_grad(TensorSlot::BlockDResAtt, {B, T, C});
-        if (plan.is_hybrid) {
-            stack_init_grad(TensorSlot::BlockDAttOut, {B, T, C});
-        } else {
-            g[TensorSlot::BlockDAttOut] = g[TensorSlot::BlockDResAtt];
-        }
-        stack_init_grad(TensorSlot::BlockDLN2, {B, T, C});
-
-        stack_or_alloc_grad(TensorSlot::BlockDMLPUp,
-                            plan.large_bwd_temps_on_stack || !plan.has_mlp_up_slot,
-                            "d_mlp_up",
-                            {B, T, lMUp});
-        stack_or_alloc_grad(TensorSlot::BlockDSwiGLU,
-                            plan.large_bwd_temps_on_stack || !plan.has_swiglu_slot,
-                            "d_swiglu",
-                            {B, T, lM});
-        stack_or_alloc_grad(TensorSlot::BlockDQKV, plan.large_bwd_temps_on_stack, "d_qkv", {B, T, lQKV});
-
-        stack_init_grad(TensorSlot::BlockDMLPDown, {B, T, C});
-        stack_init_grad(TensorSlot::BlockDHOut, {B, T, C});
-        stack_init_grad(TensorSlot::BlockDAtt, {B, T, lAttnDim});
-        stack_init_grad(TensorSlot::BlockDLN1, {B, T, C});
-    }
-}
-
 void DslRunState::zero_activation_gradients(cudaStream_t stream) {
-    // Zero activation gradient buffers to prevent stale gradients from accumulating.
-    // Use a single kernel launch over a precomputed (ptr, bytes) list to reduce graph-node
-    // overhead vs many separate cudaMemsetAsync calls.
+    // Zero activation gradient buffers to prevent stale gradients from
+    // accumulating. Uses a single kernel launch over a precomputed
+    // (ptr, bytes) list built lazily at first bwd entry (see
+    // CompiledExecutor::populate_bwd_stack_bindings).
     if (mActGradZeroCount > 0 && mActGradZeroPtrs.Data && mActGradZeroSizes.Data) {
         zero_device_segments(reinterpret_cast<const std::uint64_t*>(mActGradZeroPtrs.Data),
                              reinterpret_cast<const std::uint64_t*>(mActGradZeroSizes.Data),
                              mActGradZeroCount,
                              stream);
-        return;
-    }
-
-    // Fallback: should not normally happen.
-    for (std::size_t i = 0; i < mSimplifiedGradients.size(); ++i) {
-        auto& g = mSimplifiedGradients[i];
-        if (i < mSimplifiedGradients.size() - 1 && g[TensorSlot::BlockDResFFN].Data) {
-            fill_zero(g[TensorSlot::BlockDResFFN], stream);
-        }
-        if (g[TensorSlot::BlockDResAtt].Data) fill_zero(g[TensorSlot::BlockDResAtt], stream);
-        if (g[TensorSlot::BlockDAttOut].Data) fill_zero(g[TensorSlot::BlockDAttOut], stream);
     }
 }
 
-void DslRunState::build_activation_grad_zero_segments() {
-    mActGradZeroPtrs = {};
-    mActGradZeroSizes = {};
-    mActGradZeroCount = 0;
-
-    if (!mAllocator) {
+void DslRunState::set_activation_grad_zero_list(const std::vector<std::uint64_t>& ptrs,
+                                                const std::vector<std::uint64_t>& sizes) {
+    if (ptrs.size() != sizes.size()) return;
+    const int count = static_cast<int>(ptrs.size());
+    if (count == 0) {
+        mActGradZeroCount = 0;
         return;
     }
-    if (mSimplifiedGradients.empty()) {
-        return;
+    const long bytes = static_cast<long>(static_cast<std::size_t>(count) * sizeof(std::uint64_t));
+    if (!mActGradZeroPtrs.Data || mActGradZeroCount != count) {
+        mActGradZeroPtrs =
+            mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_ptrs", EAllocationType::ON_DEVICE, {bytes});
+        mActGradZeroSizes =
+            mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_sizes", EAllocationType::ON_DEVICE, {bytes});
     }
-
-    std::vector<std::uint64_t> ptrs;
-    std::vector<std::uint64_t> sizes;
-    ptrs.reserve(mSimplifiedGradients.size() * 8);
-    sizes.reserve(mSimplifiedGradients.size() * 8);
-
-    std::unordered_set<std::byte*> seen;
-    seen.reserve(mSimplifiedGradients.size() * 8);
-
-    auto add = [&](const Tensor& t) {
-        if (!t.Data) return;
-        const std::size_t bytes = static_cast<std::size_t>(t.bytes());
-        if (bytes == 0) return;
-        if (!seen.insert(t.Data).second) return;
-        ptrs.push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.Data)));
-        sizes.push_back(static_cast<std::uint64_t>(bytes));
-    };
-
-    const std::size_t n_layers = mSimplifiedGradients.size();
-    for (std::size_t i = 0; i < n_layers; ++i) {
-        const auto& g = mSimplifiedGradients[i];
-        // d_res_ffn for the last layer is zeroed separately (it receives the loss gradient).
-        if (i + 1 < n_layers) {
-            add(g[TensorSlot::BlockDResFFN]);
-        }
-        // Residual gradients can be used as accumulation targets (multiple branches).
-        // Other activation gradients are expected to be overwritten (beta=0 / memcpy) within
-        // the backward graph and don't need blanket zeroing.
-        add(g[TensorSlot::BlockDResAtt]);
-        add(g[TensorSlot::BlockDAttOut]);
-        // d_h_out is an accumulation target for the next block's backward
-        // (gemma4 routes block output through a dedicated h_out slot to
-        // avoid mlp_down collision). Without zeroing, garbage in d_h_out
-        // leaks into the first backward that reads it (→ NaN cascade).
-        add(g[TensorSlot::BlockDHOut]);
-    }
-
-    mActGradZeroCount = static_cast<int>(ptrs.size());
-    if (mActGradZeroCount <= 0) {
-        return;
-    }
-
-    const long bytes = static_cast<long>(static_cast<std::size_t>(mActGradZeroCount) * sizeof(std::uint64_t));
-    mActGradZeroPtrs =
-        mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_ptrs", EAllocationType::ON_DEVICE, {bytes});
-    mActGradZeroSizes =
-        mAllocator->allocate(ETensorDType::BYTE, "dsl_act_grad_zero_sizes", EAllocationType::ON_DEVICE, {bytes});
-
     CUDA_CHECK(cudaMemcpy(mActGradZeroPtrs.Data, ptrs.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
     CUDA_CHECK(
         cudaMemcpy(mActGradZeroSizes.Data, sizes.data(), static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    mActGradZeroCount = count;
 }
 
 void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options) {

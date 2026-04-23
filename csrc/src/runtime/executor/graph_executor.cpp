@@ -1084,11 +1084,6 @@ void GraphExecutor::compile_graphs(long B, long T) {
                         dump_simplified_activation_offsets();
                     }
                 }
-                // BwdStack arena consumption still routes simplified_grads
-                // to per-layer offsets — that struct hasn't been deleted yet.
-                if (mPhaseArenas.bwd_stack_ptr != nullptr) {
-                    consume_bwdstack_arena();
-                }
                 // Rebind each slab into its reserved region of the
                 // Persistent arena. Each call is a no-op when its owner
                 // is absent or has nothing device-resident to rebind.
@@ -1130,75 +1125,6 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // Resize split-attention segment graph storage when dimensions change
         if (mCompiledForward && mCompiledBackward) {
             mCompiledExecutor->resize_segment_graphs(*mCompiledForward, *mCompiledBackward);
-        }
-    }
-}
-
-namespace {
-
-struct BwdStackConsumeSlot {
-    dsl::TensorSlot slot;
-    const char* name;
-};
-
-// Block-scope BwdStack slots that simplified_grads tracks. These are the
-// per-layer activation gradients that used to be mAllocator-backed in
-// allocate_simplified_gradients; the BwdStack arena colors them all into
-// a single shared frame (section_per_layer=false).
-constexpr BwdStackConsumeSlot kBwdStackConsumeSlots[] = {
-    {dsl::TensorSlot::BlockDResFFN, "d_res_ffn"},
-    {dsl::TensorSlot::BlockDResAtt, "d_res_att"},
-    {dsl::TensorSlot::BlockDAttOut, "d_att_out"},
-    {dsl::TensorSlot::BlockDLN2, "d_ln2"},
-    {dsl::TensorSlot::BlockDMLPDown, "d_mlp_down"},
-    {dsl::TensorSlot::BlockDHOut, "d_h_out"},
-    {dsl::TensorSlot::BlockDAtt, "d_att"},
-    {dsl::TensorSlot::BlockDLN1, "d_ln1"},
-};
-
-}  // namespace
-
-void GraphExecutor::consume_bwdstack_arena() {
-    if (!mCompiledBackward) return;
-    if (!mPhaseArenas.bwd_stack_ptr || mPhaseArenas.bwd_stack_bytes == 0) return;
-    const int num_layers = static_cast<int>(mConfig.NumLayers);
-    std::size_t overridden = 0;
-    std::size_t skipped_non_bwdstack = 0;
-    std::size_t skipped_undersized = 0;
-    for (int L = 0; L < num_layers; ++L) {
-        auto& grads = mRunState.simplified_grads(L);
-        for (const auto& entry : kBwdStackConsumeSlots) {
-            Tensor& slot = grads[entry.slot];
-            if (slot.Rank == 0) continue;
-            const int tid = mCompiledBackward->slot_to_tid(L, entry.slot);
-            if (tid < 0) continue;
-            const auto& meta = mCompiledBackward->tensor_meta[static_cast<std::size_t>(tid)];
-            if (meta.region != dsl::RegionKind::BwdStack || meta.offset == SIZE_MAX) {
-                ++skipped_non_bwdstack;
-                continue;
-            }
-            const std::size_t runtime_bytes =
-                static_cast<std::size_t>(slot.nelem()) * static_cast<std::size_t>(get_dtype_size(slot.DType));
-            if (meta.bytes < runtime_bytes) {
-                ++skipped_undersized;
-                continue;
-            }
-            if (meta.offset + runtime_bytes > mPhaseArenas.bwd_stack_bytes) {
-                throw std::runtime_error("consume_bwdstack_arena: offset " + std::to_string(meta.offset) + " + bytes " +
-                                         std::to_string(runtime_bytes) + " exceeds arena " +
-                                         std::to_string(mPhaseArenas.bwd_stack_bytes) + " for blocks[" +
-                                         std::to_string(L) + "]." + entry.name);
-            }
-            slot.Data = mPhaseArenas.bwd_stack_ptr + meta.offset;
-            ++overridden;
-        }
-    }
-    if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
-        if (std::string(dbg) == "1") {
-            std::cerr << "[arena-consume bwd_stack] overridden=" << overridden
-                      << " skipped_non_bwdstack=" << skipped_non_bwdstack
-                      << " skipped_undersized=" << skipped_undersized << " bwd_bytes=" << mPhaseArenas.bwd_stack_bytes
-                      << "\n";
         }
     }
 }

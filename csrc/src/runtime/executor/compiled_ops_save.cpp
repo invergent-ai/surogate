@@ -1196,6 +1196,41 @@ void CompiledExecutor::populate_bwd_stack_bindings(const CompiledGraph& graph) {
             t.Stats = nullptr;
         }
     }
+
+    // Build the activation-gradient zero list once per compile. Zeroes
+    // d_res_ffn (all layers except last), d_res_att, d_att_out, d_h_out
+    // — these are accumulation targets where stale values leak into the
+    // first backward read. DslRunState caches the device arrays.
+    if (!mBwdZeroListBuilt) {
+        std::vector<std::uint64_t> ptrs;
+        std::vector<std::uint64_t> sizes;
+        std::unordered_set<std::byte*> seen;
+        auto add = [&](const Tensor& t) {
+            if (!t.Data) return;
+            const std::size_t b = static_cast<std::size_t>(t.bytes());
+            if (b == 0) return;
+            if (!seen.insert(t.Data).second) return;
+            ptrs.push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.Data)));
+            sizes.push_back(static_cast<std::uint64_t>(b));
+        };
+        auto lookup = [&](int L, dsl::TensorSlot s) -> const Tensor* {
+            const int tid = graph.slot_to_tid(L, s);
+            if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) return nullptr;
+            return &mTensors[static_cast<std::size_t>(tid)];
+        };
+        for (int L = 0; L < num_layers; ++L) {
+            // d_res_ffn for the last layer is zeroed separately (it receives the loss gradient).
+            if (L + 1 < num_layers) {
+                if (const Tensor* t = lookup(L, dsl::TensorSlot::BlockDResFFN)) add(*t);
+            }
+            for (dsl::TensorSlot s :
+                 {dsl::TensorSlot::BlockDResAtt, dsl::TensorSlot::BlockDAttOut, dsl::TensorSlot::BlockDHOut}) {
+                if (const Tensor* t = lookup(L, s)) add(*t);
+            }
+        }
+        mRunState.set_activation_grad_zero_list(ptrs, sizes);
+        mBwdZeroListBuilt = true;
+    }
 }
 
 Tensor* CompiledExecutor::executor_tid_slot_binding(int layer_idx, TensorSlot slot) {

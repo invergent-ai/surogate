@@ -193,6 +193,7 @@ public:
     /// pre-allocated arena slot instead of cudaMalloc'ing per-name buffers.
     void set_phase_arenas(dsl::PhaseArenas* arenas) {
         mPhaseArenas = arenas;
+        mBwdZeroListBuilt = false;  // arena pointers changed; rebuild on next bwd
     }
     void set_forward_plan(std::vector<LayerForwardPlan>* plan) {
         mForwardPlan = plan;
@@ -654,6 +655,9 @@ private:
     // with stale arena pointers and regressed Q3.5 norm 8.04 → 2.15.
     std::vector<Tensor> mForwardTensorsSnapshot;
     std::unordered_map<std::string, Tensor> mForwardNamedTensorsSnapshot;
+    /// M5.δ: guard so populate_bwd_stack_bindings builds the activation-
+    /// gradient zero list once per compile (not once per bwd step).
+    bool mBwdZeroListBuilt = false;
     std::vector<bool> mSaveMask;  // Per-tensor-id: true if in save list (for prune)
     const CompiledGraph* mCurrentGraph = nullptr;
 

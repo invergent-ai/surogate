@@ -452,16 +452,6 @@ private:
     /// frame discipline.
     void dump_simplified_activation_offsets();
 
-    /// Mirror of consume_fwdstack_arena for the backward side: route block-
-    /// scope BwdStack simplified_grads slots to `bwd_stack_ptr + meta.offset`.
-    /// BwdStack coloring shares bytes across layers (section_per_layer=false)
-    /// because backward frames don't coexist — each layer's grad writes
-    /// overwrite the previous layer's. After this runs,
-    /// `DslRunState::refresh_simplified_gradients_base` must be called so
-    /// the reset-at-backward-entry snapshot captures arena pointers instead
-    /// of the pre-arena nullptrs.
-    void consume_bwdstack_arena();
-
     void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);
     void execute_backward(long B,
                           long T,
