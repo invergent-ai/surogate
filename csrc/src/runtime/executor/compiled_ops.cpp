@@ -621,10 +621,21 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
     if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
+        // Ensure the current layer's weights are present in a prefetch slot.
+        // For strict-reverse backward orders (Q3 pure attention), the prior
+        // layer_start's prefetch already did this and gather_block(layer_idx)
+        // early-returns (but re-points entry.work to the holding slot).
+        // For non-monotonic orders (Q3.5 hybrid: all attention layers
+        // first, then linear), the prior prefetch is for a layer that
+        // won't actually run next, so the current layer may not be in
+        // any slot — this call synchronously gathers it.
+        if (mComm) {
+            mWeightManager->gather_block(layer_idx, *mComm, mRunState.side_stream());
+        }
         mWeightManager->wait_for_gather(layer_idx, mRunState.MainStream);
     }
 
-    // Prefetch next layer in the current traversal direction
+    // Prefetch next layer in the current traversal direction.
     const int next_layer = layer_idx + mPrefetchDirection;
     if (next_layer >= 0 && next_layer < static_cast<int>(mConfig.NumLayers) && !mCapturing) {
         if (mWeightManager && mWeightManager->needs_block_gather()) {

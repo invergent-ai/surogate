@@ -593,7 +593,24 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
     for (int i = 0; i < kNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx && status.version == mVersion) {
-            // Already fetched and up-to-date
+            // Already fetched and up-to-date. But `entry.work` pointers for
+            // this layer's params may have been set to a DIFFERENT slot by
+            // a prior gather_block(layer_idx) and later invalidated when
+            // that slot was reused for a different layer. Re-point each
+            // entry.work to this slot's buffer so callers resolve to the
+            // up-to-date content. Non-monotonic backward orders (e.g.
+            // Q3.5 hybrid's attention-pass-then-linear-pass) rely on
+            // this: at handle_layer_start(L) in the attention pass, the
+            // forward prefetch state may still be valid for L, but
+            // entry.work may point at a slot that has since been
+            // overwritten.
+            for (const auto& name : mBlockParamNames[layer_idx]) {
+                auto wit = mWeights.find(name);
+                if (wit == mWeights.end()) continue;
+                auto bit = mPrefetchBuffers[i].find(name);
+                if (bit == mPrefetchBuffers[i].end()) continue;
+                wit->second.work = bit->second;
+            }
             return;
         }
         if (status.is_ready && buf_idx < 0) {
@@ -609,7 +626,6 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
             CUDA_CHECK(cudaStreamWaitEvent(stream, status.done_event, 0));
         }
     }
-
     auto& status = mPrefetchStatus[buf_idx];
     // Wait for MainStream to finish reading this buffer before overwriting
     CUDA_CHECK(cudaStreamWaitEvent(stream, status.release_event, 0));
