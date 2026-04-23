@@ -8,7 +8,7 @@ Supersedes schema-per-block and SSA+coloring plans. This revision incorporates c
 
 ## Status (keep updated)
 
-Last refresh: 2026-04-23 (M5.δ SimplifiedLayerGradients deletion shipped; only M5.ε cosmetic sweep remains). Grep for `Status (keep updated)` to find and update this section after any milestone lands.
+Last refresh: 2026-04-23 (M5.ε cosmetic sweep shipped; M5 fully complete). Grep for `Status (keep updated)` to find and update this section after any milestone lands.
 
 Legend: ✅ shipped • 🟡 in progress • ⬜ not started • ❌ abandoned
 
@@ -17,9 +17,9 @@ Phase 0 — Audits                                                        ✅ do
 Phase 1 — Phase tree IR + region derivation + role unification          ✅ done
 Phase 2 — Compile-time layout + within-frame coloring                   ✅ done
 Phase 3 — Runtime-architecture migration + benchmark gate               ✅ done (arena consumption shipped; benchmark gate run at 3976cdb)
-Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-plan.md) 🟡 HERE (M5.ε cosmetic sweep only)
+Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-plan.md) ✅ done
 ├── M4a-e: arena routing default-on (Persistent + Accumulator + LoRA)   ✅ done (56904e8 closes out)
-├── M5: tid-baked dispatch (design/tid-baked-dispatch.md)               🟡 (M5.α–δ shipped; M5.ε cosmetic)
+├── M5: tid-baked dispatch (design/tid-baked-dispatch.md)               ✅ done (M5.α–ε shipped)
 │   ├── M5.0  bind_from_region framework                                ✅ b4c34e2
 │   ├── M5.α  globals bind-on-entry                                     ✅ 3309879
 │   ├── M5.β  mSaved pre-bind at backward entry                         ✅ 80f0bf5
@@ -45,7 +45,7 @@ Phase 4 — Delete the legacy machinery (see design/buffer-runtime-v4-phase4-pla
 │   │   ├── delete reset/refresh + mSimplifiedGradientsBase              ✅ 1e4d801
 │   │   ├── arena-based populate (no simplified_grads at bwd entry)    ✅ 2f537bf
 │   │   └── delete SimplifiedLayerGradients + alloc + consume_bwdstack  ✅ 9f69aae
-│   ├── M5.ε  cleanup sweep                                             ⬜ not started (cosmetic: stale comments, unused helpers)
+│   ├── M5.ε  cleanup sweep                                             ✅ done (stale comments + unused helpers pruned)
 │   └── M5.ζ  no-recompute NaN fix (compile-time 3-change combo)        ✅ 531cda3 — see below
 └── M6: re-run benchmark gate (3 models, memory ±2% + throughput)       ✅ passed 2026-04-22 — see buffer-runtime-v4-benchmark.md §"M6 gate"
 Phase 5+                                                                 ⬜ not planned
