@@ -2451,11 +2451,23 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     for (auto& v : save_for_bwd)
         bump_sort(v);
 
+    // Align each bump-allocated offset to `kBumpAlignment`. Without this,
+    // a tensor with `bytes` not divisible by the alignment leaves the
+    // cursor at a fractional offset and every subsequent tensor is
+    // misaligned. cuBLASLt (BF16 tensor-core matmul) and vectorized init
+    // kernels (fill_normal float4/bf16x4) both require >=16-byte aligned
+    // pointers. Gemma4's per-layer `layer_scalar` is 2 bytes (bf16
+    // scalar), so without this, every weight after block[0].layer_scalar
+    // is placed at a misaligned offset in the Persistent arena.
+    constexpr std::size_t kBumpAlignment = 16;
+    auto align_up = [](std::size_t n, std::size_t a) {
+        return (n + a - 1) & ~(a - 1);
+    };
     auto bump_assign = [&](const std::vector<int>& tids) -> std::size_t {
         std::size_t offset = 0;
         for (int tid : tids) {
             graph.tensor_meta[static_cast<std::size_t>(tid)].offset = offset;
-            offset += info[static_cast<std::size_t>(tid)].bytes;
+            offset = align_up(offset + info[static_cast<std::size_t>(tid)].bytes, kBumpAlignment);
         }
         return offset;
     };
