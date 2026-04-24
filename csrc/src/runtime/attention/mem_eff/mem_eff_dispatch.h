@@ -195,6 +195,21 @@ void lse_gather_runtime_to_kernel(float* lse_kernel,
                                   int T,
                                   cudaStream_t stream);
 
+// Varlen-flat delta gather: the backward kernel resets batch_id=0 and
+// reads delta at [head, q_packed] with offset
+// head*delta_strideH + cu_seqlens[doc] + q_in_doc. Writes delta_flat
+// in that exact layout from delta_runtime [B, num_heads, T] via
+// cu_seqlens.
+void delta_gather_runtime_to_flat(float* delta_flat,
+                                  const float* delta_runtime,
+                                  const int32_t* cu_seqlens,
+                                  int num_docs,
+                                  int num_heads,
+                                  int max_doc_seqlen,
+                                  int delta_strideH,
+                                  int T,
+                                  cudaStream_t stream);
+
 void mqa_reduce_kv_bf16(const void* dk_partial,
                         const void* dv_partial,
                         void* dk_out,

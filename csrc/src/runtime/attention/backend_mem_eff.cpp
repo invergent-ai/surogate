@@ -242,25 +242,21 @@ public:
         const int64_t lse_strideB = static_cast<int64_t>(Hq) * lse_dim;
         const int64_t lse_strideH = lse_dim;
 
-        // Delta: [num_batches, Hq, lse_dim] fp32 (matches LSE layout —
-        // the kernel reads delta_strideH alongside lse_strideH).
-        float* delta_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(lse_kernel_elems * sizeof(float)));
+        // Delta target layout in varlen mode is DIFFERENT from LSE's.
+        // The backward kernel resets batch_id=0 and reads delta at
+        //   offset = cu_seqlens[doc] + head_id * delta_strideH + q_in_doc
+        // so delta must be flat [num_heads, delta_strideH] with each
+        // head's region holding global packed positions [0, total_q).
+        // Use delta_strideH = total_q = B*T to index global q directly
+        // without overlap. The allocation is Hq*total_q floats — the
+        // same order of magnitude as LSE but laid out flat-per-head
+        // rather than doc-nested.
+        const long total_q = static_cast<long>(p.B) * T;
+        const long delta_flat_elems = static_cast<long>(Hq) * total_q;
+        float* delta_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(delta_flat_elems * sizeof(float)));
 
-        // Delta-compute kernel mirrors the kernel's LSE layout so the
-        // kernel reads from the same [doc, head, q_in_doc] positions it
-        // wrote during fwd. Since `out`/`d_out` are in runtime dense
-        // [B, T, H, Hs] layout, we scatter-index the packed tokens via
-        // cu_seqlens — but delta is per-query so for a prototype we
-        // compute it into the kernel layout directly.
-        //
-        // compute_delta_bf16 is dense: it iterates over [num_batches,
-        // num_heads, num_queries] with strides indexing into dense
-        // out/d_out. That doesn't work for packed — instead, delta is
-        // computed by the kernel when kKernelComputesDelta is true, OR
-        // we need a packed-aware delta kernel. Fall back to launching
-        // the delta kernel with num_batches=B (dense), num_queries=T,
-        // and writing into a dense-layout delta, then gather to the
-        // kernel layout via cu_seqlens like we did for LSE.
+        // Compute delta in dense [B, num_heads, T] layout, then gather
+        // into the flat varlen layout above via cu_seqlens.
         const long delta_dense_elems = static_cast<long>(p.B) * Hq * T;
         float* delta_dense_ptr =
             reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(delta_dense_elems * sizeof(float)));
@@ -280,14 +276,15 @@ public:
                                               Hq * T,
                                               T,
                                               p.stream);
-        // Gather delta_dense [B, Hq, T] into delta [num_docs, Hq, lse_dim].
-        surogate::mem_eff::lse_gather_runtime_to_kernel(delta_ptr,
+        // Gather delta_dense [B, Hq, T] into flat [Hq, total_q] layout
+        // with delta_strideH = total_q.
+        surogate::mem_eff::delta_gather_runtime_to_flat(delta_ptr,
                                                         delta_dense_ptr,
                                                         p.cu_seqlens,
                                                         num_batches,
                                                         Hq,
                                                         max_seqlen,
-                                                        lse_dim,
+                                                        /*delta_strideH=*/static_cast<int>(total_q),
                                                         T,
                                                         p.stream);
 
@@ -353,8 +350,12 @@ public:
 
         args.lse_strideB = lse_strideB;
         args.lse_strideH = lse_strideH;
-        args.delta_strideB = static_cast<int64_t>(Hq) * lse_dim;
-        args.delta_strideH = lse_dim;
+        // Delta: flat [Hq, total_q]. batch_id is reset to 0 inside the
+        // kernel's varlen branch, so delta_strideB is dead; only
+        // delta_strideH matters and must equal total_q so each head's
+        // region holds contiguous global packed positions.
+        args.delta_strideB = static_cast<int64_t>(Hq) * total_q;
+        args.delta_strideH = static_cast<int64_t>(total_q);
 
         if (is_mqa) {
             // dQ writes interleaved d_qkv, strideM=HtotQKV*Hs.

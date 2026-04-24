@@ -1154,6 +1154,74 @@ Pending hypotheses for follow-up:
 Both require more targeted bisection than the allocated Phase 4
 budget permits; parking as V6 for a future sweep.
 
+### Phase 4 attempt 6 — mem_eff varlen delta layout bug
+
+Third capture-safety bug fixed this sweep. Fixes a significant
+latent correctness issue in normal-mode backward that was masking
+itself as "bf16 noise":
+
+#### Bug C — delta tensor layout mismatch in mem_eff varlen backward
+
+The mem_eff backward kernel, in varlen mode, resets `batch_id = 0`
+inside `advance_to_block`
+([kernel_backward.h:727](../csrc/src/runtime/attention/mem_eff/kernel_backward.h#L727)),
+then reads delta at
+
+```
+delta_ptr + q_start + 0 * delta_strideB + head_id * delta_strideH + q_in_doc
+```
+
+So delta is expected in **flat** `[num_heads, delta_strideH]` layout
+with each head's region holding global packed query positions
+`[0, total_q)` indexed directly by `cu_seqlens[doc] + q_in_doc`.
+This differs from LSE, which the forward kernel writes in
+`[num_docs, num_heads, lse_dim]` layout (batch_id is NOT reset in
+forward).
+
+Our backend previously reused `lse_gather_runtime_to_kernel` to
+populate delta, producing a `[num_docs, num_heads, lse_dim]` layout
+and setting `delta_strideH = lse_dim`. The kernel's reads then
+landed on wrong values (per-doc nested memory instead of per-head
+flat), propagating corrupted delta into dQ/dK/dV computations.
+
+**Fix**:
+
+* New kernel
+  [`delta_gather_runtime_to_flat`](../csrc/src/runtime/attention/mem_eff/mem_eff_lse_xform.cu):
+  writes delta at `[head * delta_strideH + cu_seqlens[doc] +
+  q_in_doc]`, matching the kernel's varlen read pattern.
+* Backend allocates delta as `Hq * total_q` floats (not `num_docs *
+  Hq * lse_dim`) and sets `delta_strideH = total_q` so each head's
+  region has exactly enough room for all packed positions without
+  overlap.
+
+**Validation** (gas=2 mini, normal mode):
+
+| step | before fix | after fix |
+|------|------------|-----------|
+| 0 | loss 3.4390 / norm 1.31 | loss 3.4390 / norm 1.31 |
+| 1 | loss 4.0821 / norm **1.81e13** | loss 4.0821 / norm **1.73** |
+| 2 | loss 4.6228 / norm 1.72 | loss 4.6121 / norm 2.03 |
+
+Step 1's grad-norm drops by 13 orders of magnitude (from
+catastrophic but clip-absorbed to sane). Step 2 loss converges ~1e-2
+closer to the "true" trajectory.
+
+Full Gemma4 gas=1 still stable (force-capture harness at mini size
+passes bit-exact to 1e-3).
+
+**Residual under force-capture + gas>1**: The grad-norm blowup
+remains present specifically under `SUROGATE_FORCE_FULL_GRAPH_CAPTURE=1`.
+Bisected to the `set_doc_masking` pinning of `effective_max_seqlen = total_q`:
+disabling that pin drops step-0 grad norm from 1.13e32 back to 1.31
+(matches normal mode), at the cost of later-step loss drift because
+the captured kernel grid no longer covers growth in actual
+max_seqlen. The pin is structurally necessary for cross-step
+stability; the root cause of its interaction with mem_eff backward
+beyond the delta layout remains to be found. Parking the pin+capture
+interaction investigation separately; the delta layout fix ships
+regardless.
+
 #### Remaining work (memory budget + cleanup)
 
 1. **CMake wiring.** Add the 72 `mem_eff/**/*.cu` source files to
