@@ -376,6 +376,14 @@ enum class RegionKind : std::uint8_t {
                            ///< ln_final_rstd, output, freq_cis, d_ln_final, loss inputs). Separate
                            ///< from Persistent because compile-time offsets are authoritative here:
                            ///< arena base is a fixed region and rebind writes at `base + meta.offset`.
+    ModelScopePersistent,  ///< Forward intermediate produced outside any block (e.g. Gemma4
+                           ///< PLI phase outputs: scale_*, pli_proj_rn_flat, pli_narrow_layer*,
+                           ///< per_layer_inputs) AND read by at least one backward op. Keeps a
+                           ///< stable per-step address so step-N+1's graph-replay refresh
+                           ///< save_tensors can still resolve it — the plain Stack-temp
+                           ///< allocation from ensure_output_tensor would be overwritten by
+                           ///< later per-layer temp_allocs. Gated by `cross_layer_global` flag
+                           ///< in TensorMeta. Arena lives in PhaseArenas.model_scope_persistent_*.
     Recomputed,            ///< Forward activation replayed during backward (reuses FwdStack arena)
     GatheredWeight,        ///< ZeRO-3 all-gathered weight shards (unused in Llama prototype)
     BwdCrossLayer,  ///< Backward-produced tensor consumed by a later backward block (MoE aux-loss; unused in Llama)
@@ -666,6 +674,7 @@ struct CompiledGraph {
     /// Consumed by compute_arena_sizes() to size the phase arenas.
     std::size_t persistent_bytes = 0;
     std::size_t persistent_activation_bytes = 0;
+    std::size_t model_scope_persistent_bytes = 0;
     std::size_t accumulator_bytes = 0;
     std::size_t fwd_stack_peak = 0;  // max over frames
     std::size_t bwd_stack_peak = 0;  // max over frames
@@ -854,6 +863,18 @@ struct PhaseArenas {
     // Persistent arena without colliding with compile-time activation offsets.
     std::byte* persistent_activation_ptr = nullptr;
     std::size_t persistent_activation_bytes = 0;
+
+    // ModelScopePersistent: forward intermediates produced outside any block
+    // AND read by backward (e.g., Gemma4 PLI pli_proj_rn_flat that feeds
+    // rmsnorm_backward's x input; pli_narrow_layer* per-layer slices of
+    // per_layer_inputs). Separate from PersistentActivation because those
+    // are I/O-like buffers with stable compile-time offsets, while this
+    // region holds live intermediates whose Stack-temp-alloc would be
+    // overwritten by later temp_allocs before backward reads them. Arena
+    // base is a fixed region; rebind at `base + meta.offset` makes the
+    // forward producer write into the persistent slot directly.
+    std::byte* model_scope_persistent_ptr = nullptr;
+    std::size_t model_scope_persistent_bytes = 0;
 
     std::byte* accumulator_ptr = nullptr;
     std::size_t accumulator_bytes = 0;

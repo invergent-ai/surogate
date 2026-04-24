@@ -612,3 +612,74 @@ mechanics are clean.
 Committed in the session: `scripts/loss_diff_harness.sh` now uses a
 dynamic `/tmp/harness_metrics_$$.jsonl` path for `SUROGATE_METRICS_PATH`
 to avoid PermissionError when prior runs locked the default path.
+
+## Phase 2 attempt 4 — ModelScopePersistent region + PersistentActivation arena binding
+
+### Surgery (this session)
+
+**New `RegionKind::ModelScopePersistent`** (fully wired — arena field on
+`PhaseArenas`, peak on `CompiledGraph`, allocate/release, layout bucket +
+bump, coverage validator, debug dump, `resolve_tid_in_arena` case). Kept
+even though the final fix doesn't use a separate arena — the plumbing
+is clean infrastructure for future refinement if intermediate model-
+scope tensors ever need isolation from I/O buffers.
+
+**Actual fix** (pivoted mid-session):
+1. `finalize_save_for_bwd` flags model-scope fwd tensors (`block_layer_idx<0`,
+   `produced_in_fwd`, `consumed_in_bwd`) that are already in
+   `PersistentActivation` as `cross_layer_global`.
+2. `GraphExecutor::compile_graphs` post-finalize extends this to tids in
+   `mSaveList` (covers tensors the DSL saves even when backward doesn't
+   directly consume them — e.g., `pli_narrow_layer*` compiler-synthesized
+   outputs).
+3. `populate_fwd_stack_bindings` gains a new branch: for
+   `PersistentActivation` tids with `cross_layer_global`, bind
+   `mTensors[tid].Data = persistent_activation_ptr + meta.offset`.
+
+This routes the intermediate model-scope tensors through the
+`PersistentActivation` arena that was already allocated but whose runtime
+binding only covered named buffers (`x0`/`xF`/`ln_final`/…) via
+`rebind_non_block_to_persistent_arena`. Now intermediate tids like
+`pli_proj_rn_flat`, `scale_8`, and `pli_narrow_layer*` get stable arena
+pointers that don't get overwritten by later `temp_allocs`.
+
+### Validation
+
+- Normal mode harness: green (loss 3.6317 / 3.7640 / 3.5727 unchanged).
+- Force-capture (`SUROGATE_FORCE_FULL_GRAPH_CAPTURE=1`): V3 (pli_proj_rn_flat
+  rmsnorm_backward IMA) is **cleared**. Training no longer crashes in
+  the PLI-RMSNorm backward path.
+
+### V4 surfaces
+
+Next failure under force-capture: `dispatch_mul_backward: unsupported
+broadcast pattern. a.name=blocks[34].pli_gate_act a.shape=[4096,256]
+b.name=blocks[34].pli_flat b.shape=[2,2048,1536]`.
+
+`pli_flat` has shape `[2,2048,1536]` (the block-input residual shape,
+`[B,T,C]`) when it should be `[B*T, PLI_D] = [4096,256]`. Under normal
+mode this works — under force-capture, the block-scoped `pli_flat` tid
+gets the wrong Sizes in its `Tensor` struct by the time `mul_backward`
+reads them.
+
+Hypothesis: `pli_flat` is a compiler-alias view of `per_layer_input`.
+Its TID binding under capture is reading from a different producer's
+TensorRef shape (maybe the upstream `h_flat` or residual view) due to
+tid aliasing. Unrelated to the PersistentActivation binding we added —
+it's a block-scope tid and doesn't go through our new branch.
+
+This is V4, not V3. Deferred — the harness guardrail catches it within
+2 minutes of any change.
+
+### Scope-level observation after four attempts
+
+Each V reveals a distinct forward-to-backward capture invariant:
+- V1: arena malloc during capture (fixed P0/P1)
+- V2: cross-layer globals missing from replay resolver (fixed P2 attempt 2)
+- V3: model-scope intermediate forward activations not arena-bound (fixed P2 attempt 4)
+- V4: block-scope view-aliased tensor shape corruption under capture (open)
+
+Expect V5+ to follow similar patterns. The harness + incremental-fix
+strategy has proven much more reliable than batch-changing and crashing
+into walls. Each attempt ships ~200 LoC and clears one class of
+invariant.

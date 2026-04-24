@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -164,7 +165,16 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         } else if (big->Rank == 2 && small->Rank == 2 && big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
             broadcast = true;
         } else {
-            throw std::runtime_error("dispatch_mul_backward: unsupported broadcast pattern");
+            std::ostringstream oss;
+            oss << "dispatch_mul_backward: unsupported broadcast pattern. "
+                << "a.name=" << op.inputs[1].name << " a.shape=[";
+            for (int i = 0; i < a.Rank; ++i)
+                oss << a.Sizes[i] << (i + 1 < a.Rank ? "," : "");
+            oss << "] b.name=" << op.inputs[2].name << " b.shape=[";
+            for (int i = 0; i < b.Rank; ++i)
+                oss << b.Sizes[i] << (i + 1 < b.Rank ? "," : "");
+            oss << "]";
+            throw std::runtime_error(oss.str());
         }
     }
 

@@ -962,6 +962,33 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                        *mCompiledBackward,
                                        std::move(save_name_arg),
                                        /*fwd_per_layer_sections=*/!recompute_active);
+
+            // Flag PersistentActivation tids whose names appear in
+            // mSaveList (the runtime save list) as cross_layer_global.
+            // Under force-capture, save_tensors runs both during capture
+            // (live mTensors works) and again at step N>0 replay to
+            // refresh mSaved pointers — that refresh finds mTensors[tid]
+            // null for intermediates like `pli_narrow_layer*` that are in
+            // mSaveList but aren't consumed by bwd ops (so
+            // finalize_save_for_bwd's consumed_in_bwd detection misses
+            // them). Flagging routes them through populate_fwd_stack_bindings'
+            // PersistentActivation branch so their Data points into a
+            // stable arena slot instead of a stack temp. Block-scoped
+            // tensors are excluded — they have their own arena-residency
+            // logic in FwdStack/SaveForBwd bindings.
+            for (const auto& name : mSaveList) {
+                int tid = mCompiledForward->find_tensor_id(name);
+                if (tid < 0 || tid >= mCompiledForward->num_tensors) continue;
+                auto& fmeta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
+                if (fmeta.is_blocks()) continue;
+                if (fmeta.block_layer_idx >= 0) continue;
+                if (fmeta.region != dsl::RegionKind::PersistentActivation) continue;
+                if (fmeta.cross_layer_global) continue;
+                fmeta.cross_layer_global = true;
+                if (tid < mCompiledBackward->num_tensors) {
+                    mCompiledBackward->tensor_meta[static_cast<std::size_t>(tid)].cross_layer_global = true;
+                }
+            }
         }
 
         // Phase-tree arena allocation. Sized from baked offsets. Re-allocated

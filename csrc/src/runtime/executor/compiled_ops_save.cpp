@@ -974,6 +974,11 @@ Tensor* CompiledExecutor::bind_from_region(int tid, const TensorRef& ref) {
                 base = mPhaseArenas->persistent_activation_ptr + meta.offset;
             }
             break;
+        case dsl::RegionKind::ModelScopePersistent:
+            if (mPhaseArenas->model_scope_persistent_ptr) {
+                base = mPhaseArenas->model_scope_persistent_ptr + meta.offset;
+            }
+            break;
         case dsl::RegionKind::Accumulator:
             if (mPhaseArenas->accumulator_ptr) {
                 base = mPhaseArenas->accumulator_ptr + meta.offset;
@@ -1025,7 +1030,12 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
     if (!mPhaseArenas || !mPhaseArenas->allocated) return;
     const bool has_fwd_arena = mPhaseArenas->fwd_stack_ptr && mPhaseArenas->fwd_stack_bytes > 0;
     const bool has_save_arena = mPhaseArenas->save_for_bwd_ptr && mPhaseArenas->save_for_bwd_bytes > 0;
-    if (!has_fwd_arena && !has_save_arena) return;
+    const bool has_msp_arena =
+        mPhaseArenas->model_scope_persistent_ptr && mPhaseArenas->model_scope_persistent_bytes > 0;
+    const bool has_pact_arena =
+        mPhaseArenas->persistent_activation_ptr && mPhaseArenas->persistent_activation_bytes > 0;
+    if (!has_fwd_arena && !has_save_arena && !has_msp_arena && !has_pact_arena) return;
+    (void)has_msp_arena;  // currently same binding policy as FwdStack / SaveForBwd
     // During execute_backward this is invoked on the forward graph to
     // pre-bind fwd-activation tids into bwd's mTensors via the shared tid
     // namespace. bwd.num_tensors >= fwd.num_tensors, so allow
@@ -1070,6 +1080,18 @@ void CompiledExecutor::populate_fwd_stack_bindings(const CompiledGraph& graph) {
             } else {
                 continue;
             }
+        } else if (meta.region == dsl::RegionKind::ModelScopePersistent && has_msp_arena) {
+            base_ptr = mPhaseArenas->model_scope_persistent_ptr;
+        } else if (meta.region == dsl::RegionKind::PersistentActivation && has_pact_arena && meta.cross_layer_global) {
+            // Intermediate model-scope activations flagged as
+            // cross_layer_global — those consumed by backward ops that
+            // would otherwise see stale Data under force-capture because
+            // rebind_non_block_to_persistent_arena only covers the named
+            // buffers (x0/xF/ln_final/…). Gated by the flag so unrelated
+            // PersistentActivation tids (e.g. output buffers with their
+            // own shape semantics) aren't rebound by producer TensorRef
+            // shape here — those stay on their existing alloc path.
+            base_ptr = mPhaseArenas->persistent_activation_ptr;
         } else {
             continue;
         }
