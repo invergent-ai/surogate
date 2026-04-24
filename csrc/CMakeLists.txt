@@ -537,6 +537,10 @@ set(MEM_EFF_SOURCES
     # dispatcher picks them as a fast path.
     ${MEM_EFF_DIR}/kernels/cutlassF_bf16_aligned.cu
     ${MEM_EFF_DIR}/mem_eff_dispatch.cu
+    # BF16 backward: k65536 variant (128x64 and 64x64 blocks, unbounded K).
+    ${MEM_EFF_DIR}/kernels/cutlassB_bf16_aligned_k65536.cu
+    ${MEM_EFF_DIR}/mem_eff_backward.cu
+    ${MEM_EFF_DIR}/mem_eff_delta.cu
 )
 add_library(mem_eff STATIC ${MEM_EFF_SOURCES})
 set_target_properties(mem_eff PROPERTIES POSITION_INDEPENDENT_CODE ON)
