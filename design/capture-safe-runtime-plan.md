@@ -933,7 +933,49 @@ dispatcher is decided.
   correctness target. Gated on a `hasattr` check for the Python
   binding — tests skip cleanly until the binding lands.
 
-### Remaining work (follow-up sessions)
+### Phase 4 attempt 2 — mem_eff backend shipped; V5 cleared at small config
+
+**Status: V5 drift eliminated.** mem_eff now serves forward + backward
+for every Gemma4 attention layer (MHA and MQA Hkv=1), replacing the
+per-doc-slicing SDPAAttention path that drove attempt-6's step-2
+loss divergence.
+
+#### Commits
+
+* `1748b21` — extraction + compat shim + dispatcher skeleton
+* `d226f94` — forward kernel wired, 16/16 pytest bit-compat vs PyTorch
+* `a3f2ce5` — backend registered at priority 95 (MQA via k_strideH=0)
+* `ef19593` — backward kernel + delta precompute (MHA only)
+* `1dc26fd` — MQA backward live (LSE scatter/gather, dQ scatter, dK/dV reduce)
+* `5224313` — output_accum sizing fix (NaN at step 2 if under-sized)
+* `444367e` — revert plan-time stack bounds to sidestep a fragmentation cliff
+
+#### Validation
+
+Small-config harness
+[scripts/force_capture_mini_harness.sh](../scripts/force_capture_mini_harness.sh)
+on
+[examples/sft/gemma4/gemma4-e2b-lora-mini.yaml](../examples/sft/gemma4/gemma4-e2b-lora-mini.yaml)
+(bs=1, seq_len=1024, gas=1, 3 steps):
+
+| step | normal | force-capture | diff | status |
+|------|-----------|-----------|-----------|-----|
+| 0 | 3.1749 | 3.1749 | 0 | bit-exact |
+| 1 | 3.7533 | 3.7538 | 5e-4 | within bf16 tol |
+| 2 | 4.2568 | 4.2563 | 5e-4 | within bf16 tol |
+
+Compare to attempt-6 at the same config size: force-capture step-2
+loss diverged to 5.88 vs normal 3.66 (silent corruption). With
+mem_eff, the two modes now match to the floor of bf16 precision. V5
+is closed.
+
+Full-config (bs=2, seq_len=2048) force-capture still blocked on a
+memory-budget issue unrelated to correctness: the ~9.3 GiB stack-arena
+`cudaMalloc` fails when the CUDA caching allocator is already fragmented
+by model weights + LoRA state + optimizer moments. Mini-config runs
+fine because the stack only needs ~2 GiB.
+
+#### Remaining work (memory budget + cleanup)
 
 1. **CMake wiring.** Add the 72 `mem_eff/**/*.cu` source files to
    `surogate-common` target (or a new static library). Need to set
