@@ -272,6 +272,23 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                 }
             }
 
+            // Tid-based fallback: inputs from model-scope ops (e.g., the
+            // Gemma4 PLI `scale_N` → `narrow_pli_L` chain) are often
+            // compiled with empty ref.name (TensorRef optimizes named-slot
+            // strings away when the slot resolves by tid alone) AND aren't
+            // in saved_named_tensors. They DO live in saved_tensors[tid]
+            // after the swap, as long as prune_stack_tensors didn't evict
+            // them during forward — which the `cross_layer_global` flag
+            // prevents via mSaveMask. Without this branch, the chain above
+            // misses them and throws "tensor not found".
+            if (!resolved.Data && inp.tensor_id >= 0 &&
+                static_cast<std::size_t>(inp.tensor_id) < saved_tensors.size()) {
+                const Tensor& t = saved_tensors[static_cast<std::size_t>(inp.tensor_id)];
+                if (t.Data) {
+                    resolved = t;
+                }
+            }
+
             if (resolved.Data) {
                 store_tensor(inp, resolved);
                 if (!inp.name.empty()) {
@@ -697,6 +714,18 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (sid >= 0) {
                 mSaveMask[static_cast<std::size_t>(sid)] = true;
             }
+        }
+    }
+    // Cross-layer globals (model-scope tensors consumed by multiple layers,
+    // e.g. Gemma4 per_layer_inputs) must NOT be pruned at layer-end — each
+    // subsequent layer's compiler-synthesized narrow op reads them, and the
+    // forward-to-backward snapshot carry-over also depends on them staying
+    // in mTensors. They aren't in the runtime save list, so mark them in
+    // the mask directly. Narrow: only preserves the tensor across layer
+    // boundaries; does not trigger save_tensors or any other persistence.
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        if (graph.tensor_meta[static_cast<std::size_t>(tid)].cross_layer_global) {
+            mSaveMask[static_cast<std::size_t>(tid)] = true;
         }
     }
 
@@ -1799,7 +1828,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             const bool in_fwd = has_fwd && meta.region == dsl::RegionKind::FwdStack && data >= fwd_lo && data < fwd_hi;
             const bool in_save =
                 has_save && meta.region == dsl::RegionKind::SaveForBwd && data >= save_lo && data < save_hi;
-            if (!in_fwd && !in_save) continue;
+            // Cross-layer globals (e.g. Gemma4 per_layer_inputs) aren't in
+            // either arena at runtime — their data is stack-temp-alloc'd at
+            // forward time — but they must still be visible to backward
+            // resolution. The snapshot carries the pointer (which remains
+            // valid under the unified_stack-rebase regime); restore it.
+            const bool is_clg = meta.cross_layer_global && mRunState.Stack.owns(data);
+            if (!in_fwd && !in_save && !is_clg) continue;
             mTensors[i] = mForwardTensorsSnapshot[i];
         }
     }

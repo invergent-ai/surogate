@@ -424,23 +424,96 @@ category. Larger surgery, but isolates cross-layer globals from the
 existing save-list machinery that has baked-in assumptions we didn't fully
 reverse-engineer.
 
-## Phase 2 attempt 2 — design (not started)
+## Phase 2 attempt 2 — shipped
 
-TBD. Options:
-- **(B)** Model-scope persistent activation slot: compiler classifies
-  cross-layer globals and allocates them in a persistent arena separate
-  from FwdStack/SaveForBwd/PersistentActivation. Runtime `mTensors[tid]`
-  points at this arena throughout fwd and bwd. `replay_layer_forward`
-  reads directly from `mTensors[tid]` without going through `mSaved`.
-  Advantage: zero coupling to the save list. Estimated 3–5 days.
-- **(C)** Compiler emits a side table `cross_layer_global_sources` mapping
-  cross-layer-global tid → its producer op index. `replay_layer_forward`
-  consults this table to re-execute the producer from its model-scope
-  inputs before running the layer's op range. Advantage: no extra
-  persistent storage; cross-layer globals are regenerated like other
-  replay activations. Disadvantage: producer might depend on inputs that
-  are themselves invalidated under capture — needs transitive analysis.
-  Estimated 4–6 days.
+Took a minimal-surgery approach based on what the runtime already had and
+what attempt 1 taught us.
 
-Decision between (B) and (C) deferred to next session after the diff
-regression harness is built.
+### The actual root cause (attempt 1 got close; attempt 2 nailed it)
+
+Under force-capture, `replay_layer_forward` threw `tensor not found: scale_8`
+during the backward pass of the last block. Three independent runtime facts
+combine into the bug:
+
+1. `scale_8` (Gemma4 `per_layer_inputs`) is a **model-scope tensor consumed
+   by every layer** via compiler-synthesized `narrow_pli_L` ops
+   ([py_compiler.py:1079](../surogate/dsl/py_compiler.py#L1079)).
+2. The compiler leaves many forward op output `TensorRef::name`s empty
+   (they resolve by slot/tid alone), so `store_tensor` never adds an
+   `mNamedTensors["scale_8"]` entry. `saved_named_tensors` — the pre-replay
+   snapshot — is missing it.
+3. `prune_stack_tensors` at layer-end evicts any `mTensors[tid]` whose
+   `Data` satisfies `Stack.owns(p) && !Stack.is_live(p)`. Arena-placed
+   tensors trigger this (the unified_stack rebase put all arenas inside
+   the Stack's backing memory, but `is_live` only tracks mAlloc records).
+   So by layer 1's end, `scale_8`'s `mTensors[22].Data` is already nulled.
+
+`replay_layer_forward`'s fallback chain was name-based only — it never
+looked up by tid — so the tensor became unreachable.
+
+### The fix — three narrow changes
+
+1. **Compile-time flag** ([graph_compiler.cpp](../csrc/src/runtime/dsl/graph_compiler.cpp)):
+   Pass 2 added to `promote_cross_layer_fwd_reads` detects tensors with
+   `block_layer_idx < 0` that are produced by an op in the graph AND
+   consumed by ops in ≥2 distinct layers. Flagged as `cross_layer_global`
+   on `TensorMeta`. Gemma4-E2B reports 1 such tensor: `scale_8`.
+
+2. **Runtime mask extension** ([compiled_ops_execute.cpp:727](../csrc/src/runtime/executor/compiled_ops_execute.cpp#L727)):
+   `mSaveMask[tid]` is additionally set for every `cross_layer_global`
+   tid. `prune_stack_tensors` already skips save-mask entries, so this
+   alone keeps the tensor alive across layer boundaries during forward.
+   No `mSaveList` / `save_tensors` coupling (which was the source of
+   attempt-1's stale-data regression).
+
+3. **Tid-based fallback + snapshot carry-over**
+   ([compiled_ops_execute.cpp](../csrc/src/runtime/executor/compiled_ops_execute.cpp)):
+   - `execute_backward` now carries the forward snapshot across for
+     tensors with `cross_layer_global=true && Stack.owns(data)`, not just
+     FwdStack/SaveForBwd arena ranges. (Their data lives in stack temps,
+     not the persistent arenas — but the pointer is stable because the
+     Stack isn't rolled back between fwd and bwd.)
+   - `replay_layer_forward` gains a tid-indexed fallback at the bottom of
+     its external-input resolver: if `saved_tensors[inp.tensor_id].Data`
+     is non-null, bind it. Handles both named and unnamed cross-layer
+     globals transparently.
+
+### Validation
+
+- `loss_diff_harness.sh` (3-step run + baseline-band check) passes in
+  normal mode: step 0/1/2 losses 3.63/3.76/3.57 as before.
+- bs=1 gas=8 regression check: 3.57/3.57 — normal operation.
+- Force-capture harness (`SUROGATE_FORCE_FULL_GRAPH_CAPTURE=1`): **V2
+  (scale_8 not found) is cleared.** Next violation surfaces — V3 —
+  documented below.
+
+### V3 surfaces next
+
+Under force-capture with attempt-2 applied, training now crashes with
+`cudaErrorIllegalAddress` in `rmsnorm_backward_kernel10` at
+[csrc/src/kernels/rmsnorm.cu:974](../csrc/src/kernels/rmsnorm.cu#L974).
+This is a separate class of failure from V2:
+
+- V2 was about a **model-scope tensor** (`scale_8`) that should survive
+  but was being evicted → resolver couldn't find it.
+- V3 is about a **block-scope tensor** (the RMSNorm input — likely
+  `blocks[L].ln1` or equivalent) whose pointer has been invalidated by
+  the time backward reads it. The resolver probably *finds* the tensor,
+  but the pointer refers to memory that's been reused/rolled back.
+
+Likely root cause: the `mForwardTensorsSnapshot` restore in
+`execute_backward` restricts to FwdStack and SaveForBwd arenas. Block
+activations in neither region (temp-alloc'd from Stack, not arena-placed)
+don't get restored. They need the same fix that `cross_layer_global`
+tensors got — but scoped to block activations.
+
+## Phase 2 attempt 3 — V3 fix (next session)
+
+Extend the `is_clg` "Stack.owns" carry-over to all block-scope tensors
+that are read by backward ops. Or equivalently: add block tids to
+`mSaveMask` when they're consumed in backward (similar to the mSaveMask
+extension we just did for cross_layer_global). Expected smaller surgery
+than V2 — the mechanics are the same.
+
+The **loss-diff harness** stays red/green for V3 work too: any change
+that breaks normal-mode training fails the harness within 2 minutes.

@@ -1921,13 +1921,66 @@ void GraphCompiler::promote_cross_layer_fwd_reads(CompiledGraph& graph) {
         }
     }
 
+    // Second pass: flag model-scope tensors consumed by ops in multiple
+    // layers as `cross_layer_global`. These are produced outside any block
+    // (e.g., Gemma4 per_layer_inputs in the PLI phase) and consumed by
+    // every layer via compiler-synthesized narrow/view ops. Without this
+    // flag, layer-end pruning in prune_stack_tensors evicts them from
+    // mTensors after the first layer finishes, making them unresolvable
+    // during backward (and specifically during replay_layer_forward under
+    // gradient-checkpointing recompute). The runtime's mSaveMask extension
+    // consults this flag to preserve the tid across layer boundaries.
+    const std::size_t num_tensors_n = graph.tensor_meta.size();
+    std::vector<char> produced_here(num_tensors_n, 0);
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.outputs) {
+            if (ref.tensor_id >= 0 && static_cast<std::size_t>(ref.tensor_id) < num_tensors_n) {
+                produced_here[ref.tensor_id] = 1;
+            }
+        }
+    }
+    std::unordered_map<int, std::unordered_set<int>> consumer_layers;
+    for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+        const int op_layer = op_to_layer(i);
+        if (op_layer < 0) continue;  // model-scope op, not per-layer
+        for (const auto& ref : graph.ops[i].inputs) {
+            if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tensors_n) continue;
+            const auto& meta = graph.tensor_meta[static_cast<std::size_t>(ref.tensor_id)];
+            if (meta.is_blocks()) continue;           // block-scoped: handled by pass 1
+            if (meta.block_layer_idx >= 0) continue;  // cross-layer block read: handled by pass 1
+            if (!produced_here[ref.tensor_id]) continue;
+            consumer_layers[ref.tensor_id].insert(op_layer);
+        }
+    }
+    int clg_count = 0;
+    std::vector<std::string> clg_names_dbg;
+    for (const auto& [tid, layers] : consumer_layers) {
+        if (layers.size() < 2) continue;
+        auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+        if (meta.cross_layer_global) continue;
+        meta.cross_layer_global = true;
+        ++clg_count;
+        if (std::getenv("SUROGATE_DEBUG_REGIONS")) {
+            clg_names_dbg.emplace_back(graph.name_for_tensor_id(tid));
+        }
+    }
+
     if (const char* env = std::getenv("SUROGATE_DEBUG_REGIONS")) {
-        if (std::string(env) == "1" && promoted > 0) {
-            std::cerr << "[regions] cross-layer fwd promotion (" << graph.name << "): " << promoted
-                      << " tids promoted FwdStack→SaveForBwd";
-            for (const auto& n : promoted_names)
-                std::cerr << " " << n;
-            std::cerr << "\n";
+        if (std::string(env) == "1") {
+            if (promoted > 0) {
+                std::cerr << "[regions] cross-layer fwd promotion (" << graph.name << "): " << promoted
+                          << " tids promoted FwdStack→SaveForBwd";
+                for (const auto& n : promoted_names)
+                    std::cerr << " " << n;
+                std::cerr << "\n";
+            }
+            if (clg_count > 0) {
+                std::cerr << "[regions] cross-layer-global flagged (" << graph.name << "): " << clg_count
+                          << " model-scope tids";
+                for (const auto& n : clg_names_dbg)
+                    std::cerr << " " << n;
+                std::cerr << "\n";
+            }
         }
     }
 }

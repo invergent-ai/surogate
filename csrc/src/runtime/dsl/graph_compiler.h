@@ -426,6 +426,16 @@ struct TensorMeta {
     /// last_use to the frame end.
     bool retain_through_forward = false;
 
+    /// Model-scope tensor (not a block-scoped activation) that's produced by
+    /// an op in the forward graph and consumed by ops in more than one
+    /// layer (e.g., Gemma4 `per_layer_inputs` — PLI tensor sliced per layer
+    /// via compiler-synthesized narrow ops). Populated by pass 2 of
+    /// `promote_cross_layer_fwd_reads`. Used by the executor's `mSaveMask`
+    /// builder to keep the tensor alive across layer boundaries, and by
+    /// `execute_backward`'s fwd-snapshot restore to carry the pointer into
+    /// backward without blowing the BwdCrossLayer arena budget.
+    bool cross_layer_global = false;
+
     bool is_cross_layer() const {
         return flags & kCrossLayer;
     }
