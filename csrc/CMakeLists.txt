@@ -330,6 +330,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/attention/backend_flash_varlen.cpp
     src/runtime/attention/backend_custom.cpp
     src/runtime/attention/backend_sdpa.cpp
+    src/runtime/attention/backend_mem_eff.cpp
     src/runtime/attention/attention_cudnn.cpp
     src/runtime/attention/flash_attn_varlen.cpp
     src/runtime/attention/flash_attn_scatter.cu

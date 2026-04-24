@@ -1,0 +1,167 @@
+// Capture-safe attention backend built on the ported PyTorch
+// mem-efficient attention kernel (cutlass, BF16, SM80 ABI, GMEM variant
+// with unbounded head_dim). Priority 95: above flash-varlen (90) but
+// below cuDNN (100). It's selected when flash-varlen's Hs<=256 gate
+// rejects and cu_seqlens is present (the packed-sequence case where
+// SDPA's per-doc Python slicing is capture-unsafe).
+//
+// Forward only for this prototype. Backward pass is the next wiring
+// step; SDPA stays registered until both directions land.
+
+#include "runtime/attention/attention_backend.h"
+#include "runtime/attention/mem_eff/mem_eff_dispatch.h"
+#include "runtime/dsl/dsl_run_state.h"
+#include "utilities/tensor.h"
+
+#include <cuda_bf16.h>
+
+#include <cstdint>
+#include <stdexcept>
+
+namespace dsl {
+namespace {
+
+class MemEffAttention final : public AttentionBackend {
+public:
+    const char* name() const override {
+        return "mem_eff";
+    }
+
+    int priority() const override {
+        // Above flash-varlen (90) so we win for Hs>256 cases where
+        // flash-varlen would reject. Below cuDNN (100).
+        return 95;
+    }
+
+    bool supports(const AttentionParams& p) const override {
+        auto reject = [&](const char* reason) {
+            if (const char* dbg = std::getenv("SUROGATE_DEBUG_ATTN_SELECT")) {
+                if (dbg[0] == '1') {
+                    std::fprintf(stderr,
+                                 "[mem_eff reject] %s (Hq=%d Hkv=%d Hs=%d varlen=%s)\n",
+                                 reason,
+                                 p.Hq,
+                                 p.Hkv,
+                                 p.Hs,
+                                 p.cu_seqlens ? "yes" : "no");
+                }
+            }
+            return false;
+        };
+        if (p.Hs <= 0) return reject("Hs<=0");
+        if (p.dtype != ETensorDType::BF16) return reject("not bf16");
+        // GQA (Hq != Hkv) is not supported by the underlying kernel
+        // without a KV broadcast pre-step; skip for now and let
+        // flash-varlen / SDPA handle those cases until we add broadcast.
+        // Supports MHA (Hq==Hkv) and MQA (Hkv==1) via k_strideH=0.
+        // True GQA with Hkv>1 && Hkv<Hq needs a head-group stride the
+        // kernel doesn't expose; reject those cases for now.
+        if (p.Hkv != p.Hq && p.Hkv != 1) return reject("GQA with Hkv>1 not supported");
+        // Only claim the cu_seqlens case initially — this is where SDPA
+        // is the worst fit (per-doc slicing). Dense non-varlen stays on
+        // cuDNN / flash-varlen which are already capture-safe.
+        if (p.cu_seqlens == nullptr) return reject("no cu_seqlens");
+        if (p.run_state == nullptr || p.temps == nullptr) return reject("no run_state/temps");
+        // Backward not yet wired — let flash-varlen or SDPA handle it
+        // until the backward kernel lands. Detect backward by looking
+        // at d_qkv/d_out (forward leaves them null).
+        if (p.d_qkv.Data != nullptr || p.d_out.Data != nullptr) return reject("backward not implemented");
+        return true;
+    }
+
+    void forward(AttentionParams& p) override {
+        DslRunState& rs = *p.run_state;
+        std::vector<Tensor>& temps = *p.temps;
+
+        // Compute layout from AttentionParams shape fields.
+        const int B = p.B;
+        const int T = p.T;
+        const int Hq = p.Hq;
+        const int Hkv = p.Hkv;
+        const int Hs = p.Hs;
+        const int HtotQKV = Hq + 2 * Hkv;
+
+        // qkv is [B, T, Hq+2*Hkv, Hs] contiguous in BF16. Strides (elem).
+        const int32_t q_strideM = HtotQKV * Hs;
+        const int32_t q_strideH = Hs;
+        const int64_t q_strideB = static_cast<int64_t>(T) * HtotQKV * Hs;
+
+        auto* qkv_ptr = p.qkv.get<nv_bfloat16>();
+        const void* q_ptr = qkv_ptr;
+        const void* k_ptr = qkv_ptr + Hq * Hs;
+        const void* v_ptr = qkv_ptr + (Hq + Hkv) * Hs;
+
+        // Output is [B, T, Hq, Hs] contiguous BF16.
+        void* out_ptr = p.out.get<nv_bfloat16>();
+        const int32_t o_strideM = Hq * Hs;
+
+        // GMEM variant needs a caller-provided FP32 accumulator.
+        // Packed layout: sized by num_docs * max_doc_seqlen (over-
+        // provisioned vs. total_doc_tokens but matches the kernel's
+        // per-doc indexing). Pushed to temps so the executor frees it
+        // at op end (capture-safe since temp_alloc uses the stack
+        // arena, not cudaMalloc, once the arena is preallocated).
+        const int max_seqlen = p.max_doc_seqlen;
+        const int num_batches = p.num_docs;
+        const long accum_elems = static_cast<long>(num_batches) * static_cast<long>(max_seqlen) *
+                                 static_cast<long>(Hq) * static_cast<long>(Hs);
+        Tensor accum = rs.temp_alloc(ETensorDType::FP32, {accum_elems}, "mem_eff_output_accum");
+        temps.push_back(accum);
+
+        surogate::mem_eff::ForwardArgs args;
+        args.q_ptr = q_ptr;
+        args.k_ptr = k_ptr;
+        args.v_ptr = v_ptr;
+        args.out_ptr = out_ptr;
+        args.lse_ptr = p.lse.Data ? p.lse.get<float>() : nullptr;
+        args.output_accum_ptr = accum.get<float>();
+
+        args.num_queries = max_seqlen;
+        args.num_keys = max_seqlen;
+        args.num_batches = num_batches;
+        args.num_heads = Hq;
+        args.head_dim_qk = Hs;
+        args.head_dim_v = Hs;
+
+        args.q_strideM = q_strideM;
+        args.q_strideH = q_strideH;
+        args.q_strideB = q_strideB;
+        args.k_strideM = q_strideM;
+        // MQA (Hkv==1, Hq>1): every Q head reads the single K/V head.
+        // Setting strideH=0 makes the kernel's per-head pointer advance
+        // (head_id * strideH) collapse to zero — exactly the MQA
+        // semantics.
+        args.k_strideH = (Hkv == 1 && Hq > 1) ? 0 : q_strideH;
+        args.k_strideB = q_strideB;
+        args.v_strideM = q_strideM;
+        args.v_strideH = (Hkv == 1 && Hq > 1) ? 0 : q_strideH;
+        args.v_strideB = q_strideB;
+        args.o_strideM = o_strideM;
+
+        args.seqstart_q_ptr = p.cu_seqlens;
+        args.seqstart_k_ptr = p.cu_seqlens;
+        args.seqlen_k_ptr = nullptr;
+
+        args.causal = true;
+        args.window_size = std::max(p.window_size, 0);
+        args.softmax_scale = p.softmax_scale > 0.0f ? p.softmax_scale : (1.0f / std::sqrt(static_cast<float>(Hs)));
+        args.stream = p.stream;
+
+        surogate::mem_eff::forward_bf16_sm80(args);
+    }
+
+    void backward(AttentionParams& p) override {
+        (void)p;
+        throw std::runtime_error("mem_eff backend: backward not implemented yet");
+    }
+};
+
+struct MemEffAttentionAutoRegister {
+    MemEffAttentionAutoRegister() {
+        AttentionBackendRegistry::instance().add(std::make_unique<MemEffAttention>());
+    }
+};
+const MemEffAttentionAutoRegister _mem_eff_attention_auto_register;
+
+}  // namespace
+}  // namespace dsl
