@@ -31,7 +31,7 @@ public:
     int priority() const override {
         // Above flash-varlen (90) so we win for Hs>256 cases where
         // flash-varlen would reject. Below cuDNN (100).
-        return 95;
+        return attention_priority::kMemEff;
     }
 
     bool supports(const AttentionParams& p) const override {

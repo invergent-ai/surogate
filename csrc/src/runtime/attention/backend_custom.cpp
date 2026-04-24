@@ -227,8 +227,9 @@ public:
     }
 
     bool supports(const AttentionParams& p) const override {
-        // Disabled pending a correctness fix. Sliding attention now routes to
-        // the SDPA math backend, which applies the same local causal mask.
+        // Disabled pending a correctness fix. Sliding attention now routes
+        // to flash-varlen's window_size_left path, which applies the same
+        // local causal mask via FlashAttention varlen.
         (void)p;
         return false;
     }

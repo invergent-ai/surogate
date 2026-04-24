@@ -28,9 +28,9 @@ class DslRunState;  // forward decl — backends go through the params struct
 /// Selection priorities for the built-in backends. Higher wins.
 namespace attention_priority {
 constexpr int kCuDNN = 100;
+constexpr int kMemEff = 95;
 constexpr int kFlashVarlen = 90;
 constexpr int kCustom = 80;
-constexpr int kSDPA = 10;
 }  // namespace attention_priority
 
 /// All tensors + execution context needed to run a single
