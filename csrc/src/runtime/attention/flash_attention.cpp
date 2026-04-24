@@ -546,12 +546,42 @@ std::vector<Operation> flash_attention_backward(const BackwardRuleContext& ctx) 
 //
 // Inputs from autodiff: [d_out, out, lse, qkv, sinks?]
 //   qkv shape = [B, T, Hq + 2*Hkv, Hs]
+/// Forward stack bound covering the mem_eff backend's temps
+/// (flash-varlen's forward has no appreciable stack temps). Called at
+/// compile time regardless of which backend will be selected at run
+/// time — the sizing must fit the mem_eff case so the stack arena is
+/// large enough.
+// Max head_dim across layers. BufferPlan's ``AttnDim`` is the max of
+// per-layer ``Hq * head_size``; dividing by ``Hq`` recovers the max
+// head_size.
+static long max_head_size(const BufferPlan& plan) {
+    if (plan.Hq <= 0) return 0;
+    return plan.AttnDim / plan.Hq;
+}
+
+long flash_attention_forward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    (void)op;
+    const long Hq = plan.Hq;
+    const long Hs = max_head_size(plan);
+    if (Hq <= 0 || Hs <= 0) return 0;
+    constexpr long FP32 = 4;
+    const long total_q = plan.B * plan.T;
+
+    long bytes = 0;
+    bytes += align_stack_bytes(total_q * Hq * Hs * FP32);  // mem_eff output_accum
+    bytes += align_stack_bytes(total_q * Hq * FP32);       // mem_eff lse scratch (upper bound: lse_dim<=T)
+    return bytes;
+}
+
 long flash_attention_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
-    if (op.inputs.size() < 4 || op.inputs[3].shape.size() < 4) return 0;
-    const auto& qkv_shape = op.inputs[3].shape;
+    (void)op;
+    // Fall back to plan dims: at plan time, op.inputs[3].shape is often
+    // empty (shape env not yet resolved). We want the worst-case size
+    // across all attention layers anyway since the arena gets sized to
+    // the peak.
     const long Hq = plan.Hq;
     const long Hkv = plan.Hkv;
-    const long Hs = qkv_shape[qkv_shape.size() - 1];
+    const long Hs = max_head_size(plan);
     if (Hq <= 0 || Hs <= 0) return 0;
 
     constexpr long BF16 = 2, FP32 = 4;
@@ -560,20 +590,45 @@ long flash_attention_backward_stack_bound(const CompiledOp& op, const BufferPlan
     const long padded_total = total_q + 128;
     const long Hs_rounded = Hs <= 128 ? ((Hs + 31) / 32) * 32 : ((Hs + 63) / 64) * 64;
 
-    long bytes = 0;
-    bytes += align_stack_bytes(padded_total * Hq * Hs_rounded * FP32);  // dq_accum
-    bytes += align_stack_bytes(padded_total * Hq * FP32);               // dsoftmax
+    // Flash-varlen's temp footprint.
+    long flash_varlen_bytes = 0;
+    flash_varlen_bytes += align_stack_bytes(padded_total * Hq * Hs_rounded * FP32);  // dq_accum
+    flash_varlen_bytes += align_stack_bytes(padded_total * Hq * FP32);               // dsoftmax
     if (Hq != Hkv) {
-        bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dk_expanded
-        bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dv_expanded
+        flash_varlen_bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dk_expanded
+        flash_varlen_bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dv_expanded
     }
-    return bytes;
+
+    // mem_eff backward's temp footprint — fires for Hs > 256 layers
+    // where flash-varlen's Hs<=256 cap rejects (and, after priority
+    // upgrade, for many MHA/MQA varlen cases too). The mem_eff backend
+    // allocates via rs.temp_alloc so these end up in the same stack
+    // arena flash-varlen targets.
+    //
+    // Fwd: lse_scratch + output_accum.
+    // Bwd: lse_scratch + delta + delta_dense + workspace; MQA also
+    //      allocates 3 x [B*T, Hq, Hs] BF16 partial-grad scratches.
+    long mem_eff_bytes = 0;
+    const long lse_scratch_bytes = total_q * Hq * FP32;            // pessimistic: lse_dim <= T
+    mem_eff_bytes += align_stack_bytes(lse_scratch_bytes);         // lse scratch
+    mem_eff_bytes += align_stack_bytes(lse_scratch_bytes);         // delta (kernel layout)
+    mem_eff_bytes += align_stack_bytes(total_q * Hq * FP32);       // delta_dense
+    mem_eff_bytes += align_stack_bytes(total_q * Hq * Hs * FP32);  // kernel workspace upper bound
+    const bool mem_eff_might_be_mqa = (Hkv != Hq);
+    if (mem_eff_might_be_mqa) {
+        mem_eff_bytes += 3 * align_stack_bytes(total_q * Hq * Hs * BF16);  // dq/dk/dv partials
+    }
+
+    // The backend is selected at runtime; compile-time sizing must
+    // accommodate whichever fires. Take the max.
+    return std::max(flash_varlen_bytes, mem_eff_bytes);
 }
 
 }  // namespace dsl
 
 REGISTER_AUTODIFF("flash_attention", ::dsl::flash_attention_backward);
 REGISTER_AUTODIFF("flash_attention_qkv", ::dsl::flash_attention_backward);
+REGISTER_STACK_BOUND("flash_attention", FlashAttention, ::dsl::flash_attention_forward_stack_bound);
 REGISTER_STACK_BOUND("flash_attention_backward", FlashAttentionBackward, ::dsl::flash_attention_backward_stack_bound);
 
 // ---------------------------------------------------------------------------

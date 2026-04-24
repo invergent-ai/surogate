@@ -34,6 +34,8 @@ public:
     }
 
     bool supports(const AttentionParams& p) const override {
+        // Opt-out for debugging / A-B tests against flash_varlen/SDPA.
+        if (std::getenv("SUROGATE_DISABLE_MEM_EFF")) return false;
         auto reject = [&](const char* reason) {
             if (const char* dbg = std::getenv("SUROGATE_DEBUG_ATTN_SELECT")) {
                 if (dbg[0] == '1') {
@@ -91,16 +93,17 @@ public:
         void* out_ptr = p.out.get<nv_bfloat16>();
         const int32_t o_strideM = Hq * Hs;
 
-        // GMEM variant needs a caller-provided FP32 accumulator.
-        // Packed layout: sized by num_docs * max_doc_seqlen (over-
-        // provisioned vs. total_doc_tokens but matches the kernel's
-        // per-doc indexing). Pushed to temps so the executor frees it
-        // at op end (capture-safe since temp_alloc uses the stack
-        // arena, not cudaMalloc, once the arena is preallocated).
+        // GMEM variant needs a caller-provided FP32 accumulator. Size
+        // = max(num_docs * max_seqlen, B*T) * Hq * Hs floats so the
+        // kernel's per-doc indexing [q_abs = q_start + query_start_in_doc]
+        // always lands in-bounds. num_docs * max_seqlen can be larger
+        // than B*T when packing is sparse; B*T is the worst case for
+        // capture-pinned runs. max() covers both.
         const int max_seqlen = p.max_doc_seqlen;
         const int num_batches = p.num_docs;
-        const long accum_elems = static_cast<long>(num_batches) * static_cast<long>(max_seqlen) *
-                                 static_cast<long>(Hq) * static_cast<long>(Hs);
+        const long packed_elems = static_cast<long>(num_batches) * max_seqlen;
+        const long dense_elems = static_cast<long>(B) * T;
+        const long accum_elems = std::max(packed_elems, dense_elems) * Hq * Hs;
         Tensor accum = rs.temp_alloc(ETensorDType::FP32, {accum_elems}, "mem_eff_output_accum");
         temps.push_back(accum);
 
