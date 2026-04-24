@@ -507,13 +507,64 @@ activations in neither region (temp-alloc'd from Stack, not arena-placed)
 don't get restored. They need the same fix that `cross_layer_global`
 tensors got — but scoped to block activations.
 
-## Phase 2 attempt 3 — V3 fix (next session)
+## Phase 2 attempt 3 — V3 investigation (did not ship)
 
-Extend the `is_clg` "Stack.owns" carry-over to all block-scope tensors
-that are read by backward ops. Or equivalently: add block tids to
-`mSaveMask` when they're consumed in backward (similar to the mSaveMask
-extension we just did for cross_layer_global). Expected smaller surgery
-than V2 — the mechanics are the same.
+Pinpointed V3: `pli_proj_rn_flat` (PLI RMSNorm's `x` input, a model-scope
+tensor in the Gemma4 PLI phase) has `Data=(nil)` when the backward
+`rmsnorm_backward_kernel10` runs. Verified by instrumenting both
+`dispatch_rmsnorm_backward` and `dispatch_fused_residual_rmsnorm_backward`
+— the last successful call went to block 0's RMSNorm with valid pointers,
+then `pli_proj_rn_flat` showed `x.Data=(nil) rstd.Data=(nil)`.
 
-The **loss-diff harness** stays red/green for V3 work too: any change
-that breaks normal-mode training fails the harness within 2 minutes.
+Tried: broaden the `cross_layer_global` classification to flag every
+model-scope forward-produced tensor consumed anywhere (drops V2's
+"≥2 consumer layers" constraint → 55 flagged tids, including the PLI
+narrow outputs `pli_narrow_layer0..34`). Runtime harness green in
+normal mode, but force-capture hit **a new error**:
+`CompiledExecutor: cannot save tensor pli_narrow_layer21` at save-list
+iteration in `save_tensors`. Traced to `mTensors[tid].Data == nullptr`
+at save time — the pruner's `mSaveMask` gate was correctly true, yet
+`mTensors[1516].Data` was never populated. Diag loop showed the narrow
+op never wrote to that tid — even though the op declares it as output
+and `dispatch_narrow` calls `store_tensor(op.outputs[0], out)`.
+
+Two possibilities remain (not yet resolved):
+- The narrow op's output `TensorRef::tensor_id` is `-1` in the compiled
+  form (`store_tensor` skips `mTensors` when tid < 0, only updates
+  `mNamedTensors`). The compile-time flag sees these names but runtime
+  doesn't route their storage through mTensors[tid].
+- Normal mode succeeds at this same save because a different resolver
+  path fires. Need to compare save-list iteration behaviour between
+  modes.
+
+Reverted attempt 3 without shipping. Committed attempt 2 (`ef8595c`)
+stands as the clean progress point — V2 cleared, harness green.
+
+### Next session — concrete plan for V3
+
+1. **Diagnose**: add a compile-time assertion/log to confirm whether the
+   synthesized `narrow_pli_L` ops produce `TensorRef` entries with
+   `tensor_id >= 0`. If tid is -1, that's the bug root: fix the py_compiler
+   or C++ compile pass to assign tids.
+2. **If tid assigned but store_tensor doesn't fire**: trace the narrow
+   dispatch — maybe `ensure_output_tensor` returns a reference whose
+   `mTensors[tid]` write is overwritten later.
+3. **Alternative narrower fix**: skip the broadening; instead, add
+   `pli_proj_rn_flat` specifically as a `cross_layer_global` (it's the
+   only model-scope tensor we've observed backward reading). That's
+   fragile but ships.
+4. **Harness-guarded**: the loss-diff harness stays the guardrail. Any
+   compile-time tagging change that breaks normal-mode training fails
+   within 2 minutes.
+
+### Scope-level takeaway
+
+Each V corresponds to a distinct class of forward-to-backward
+invariant that capture breaks. V1 (arena malloc) fixed; V2 (model-scope
+cross-layer globals) fixed; V3 (model-scope single-consumer tensors like
+`pli_proj_rn_flat`) open. There may be a V4+ (block-scope activations
+not covered by the existing FwdStack/SaveForBwd restore). Expect 3–5
+total iterations before force-capture trains cleanly.
+
+The **loss-diff harness** (`scripts/loss_diff_harness.sh`) is the
+persistent guardrail — run it red/green around every change.
