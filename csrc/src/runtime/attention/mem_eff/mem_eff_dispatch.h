@@ -171,6 +171,30 @@ void compute_delta_bf16(const void* out,
 // BF16; outputs are strided bf16 pointers into the interleaved
 // d_qkv[..., Hkv:Hkv+1, :] / [..., Hkv+1:Hkv+2, :] regions (strideM =
 // HtotQKV * Hs so successive tokens land at the right offset).
+// LSE layout conversion helpers. The cutlass kernel writes / reads LSE
+// in [num_docs, num_heads, lse_dim] layout (lse_dim = ceil8(max_seqlen)).
+// Our runtime exposes LSE as [B, num_heads, T]. Scatter runs after the
+// forward kernel; gather runs before the backward kernel.
+void lse_scatter_kernel_to_runtime(const float* lse_kernel,
+                                   float* lse_runtime,
+                                   const int32_t* cu_seqlens,
+                                   int num_docs,
+                                   int num_heads,
+                                   int max_doc_seqlen,
+                                   int lse_dim,
+                                   int T,
+                                   cudaStream_t stream);
+
+void lse_gather_runtime_to_kernel(float* lse_kernel,
+                                  const float* lse_runtime,
+                                  const int32_t* cu_seqlens,
+                                  int num_docs,
+                                  int num_heads,
+                                  int max_doc_seqlen,
+                                  int lse_dim,
+                                  int T,
+                                  cudaStream_t stream);
+
 void mqa_reduce_kv_bf16(const void* dk_partial,
                         const void* dv_partial,
                         void* dk_out,

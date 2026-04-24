@@ -542,6 +542,7 @@ set(MEM_EFF_SOURCES
     ${MEM_EFF_DIR}/mem_eff_backward.cu
     ${MEM_EFF_DIR}/mem_eff_delta.cu
     ${MEM_EFF_DIR}/mem_eff_mqa_reduce.cu
+    ${MEM_EFF_DIR}/mem_eff_lse_xform.cu
 )
 add_library(mem_eff STATIC ${MEM_EFF_SOURCES})
 set_target_properties(mem_eff PROPERTIES POSITION_INDEPENDENT_CODE ON)

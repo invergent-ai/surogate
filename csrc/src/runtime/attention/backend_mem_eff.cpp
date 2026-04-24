@@ -62,16 +62,6 @@ public:
         // cuDNN / flash-varlen which are already capture-safe.
         if (p.cu_seqlens == nullptr) return reject("no cu_seqlens");
         if (p.run_state == nullptr || p.temps == nullptr) return reject("no run_state/temps");
-        // MQA backward has two correctness obstacles still to resolve:
-        //   1. LSE stride alignment (kernel wants strideH % 8 == 0).
-        //   2. dQ scatter + dK/dV reduce path vs. the kernel's
-        //      per-Q-head writes. The scaffolding is in the forward
-        //      below but produces shape-mismatched LSE reads until we
-        //      allocate LSE with padded stride in the forward path.
-        // Safe path for now: let flash-varlen / SDPA handle MQA
-        // backward. Forward is still served by mem_eff.
-        const bool is_backward = (p.d_qkv.Data != nullptr || p.d_out.Data != nullptr);
-        if (is_backward && p.Hkv != p.Hq) return reject("MQA backward pending LSE stride fix");
         return true;
     }
 
@@ -114,12 +104,23 @@ public:
         Tensor accum = rs.temp_alloc(ETensorDType::FP32, {accum_elems}, "mem_eff_output_accum");
         temps.push_back(accum);
 
+        // LSE scratch: the cutlass kernel writes [num_docs, Hq, lse_dim]
+        // but our runtime's p.lse is [B, Hq, T]. Allocate a scratch LSE
+        // sized to the kernel's layout, hand it to the kernel, and
+        // scatter into p.lse via cu_seqlens-indexed positions so the
+        // rest of the runtime sees values in the layout it expects.
+        const int lse_dim = (max_seqlen + 7) / 8 * 8;
+        const long lse_kernel_elems = static_cast<long>(num_batches) * Hq * lse_dim;
+        Tensor lse_kernel_tensor = rs.temp_alloc(ETensorDType::FP32, {lse_kernel_elems}, "mem_eff_lse_scratch");
+        temps.push_back(lse_kernel_tensor);
+        float* lse_kernel_ptr = lse_kernel_tensor.get<float>();
+
         surogate::mem_eff::ForwardArgs args;
         args.q_ptr = q_ptr;
         args.k_ptr = k_ptr;
         args.v_ptr = v_ptr;
         args.out_ptr = out_ptr;
-        args.lse_ptr = p.lse.Data ? p.lse.get<float>() : nullptr;
+        args.lse_ptr = lse_kernel_ptr;
         args.output_accum_ptr = accum.get<float>();
 
         args.num_queries = max_seqlen;
@@ -154,6 +155,19 @@ public:
         args.stream = p.stream;
 
         surogate::mem_eff::forward_bf16_sm80(args);
+
+        // Scatter scratch LSE into runtime's dense [B, Hq, T] layout.
+        if (p.lse.Data) {
+            surogate::mem_eff::lse_scatter_kernel_to_runtime(lse_kernel_ptr,
+                                                             p.lse.get<float>(),
+                                                             p.cu_seqlens,
+                                                             num_batches,
+                                                             Hq,
+                                                             max_seqlen,
+                                                             lse_dim,
+                                                             T,
+                                                             p.stream);
+        }
     }
 
     void backward(AttentionParams& p) override {
@@ -184,27 +198,62 @@ public:
         const int64_t o_strideH = Hs;
         const int64_t o_strideB = static_cast<int64_t>(T) * Hq * Hs;
 
-        // LSE is [num_docs, Hq, max_seqlen] fp32 (saved by forward).
-        float* lse_ptr = p.lse.Data ? p.lse.get<float>() : nullptr;
-        if (lse_ptr == nullptr) {
+        // p.lse is in runtime layout [B, Hq, T] (saved from forward).
+        // The kernel needs [num_docs, Hq, lse_dim] layout — gather from
+        // the runtime layout into a scratch buffer before launch.
+        if (p.lse.Data == nullptr) {
             throw std::runtime_error("mem_eff backend: backward requires saved LSE from forward");
         }
-        const int64_t lse_strideB = static_cast<int64_t>(Hq) * max_seqlen;
-        const int64_t lse_strideH = max_seqlen;
+        const int lse_dim = (max_seqlen + 7) / 8 * 8;
+        const long lse_kernel_elems = static_cast<long>(num_batches) * Hq * lse_dim;
+        Tensor lse_kernel_tensor = rs.temp_alloc(ETensorDType::FP32, {lse_kernel_elems}, "mem_eff_bwd_lse_scratch");
+        temps.push_back(lse_kernel_tensor);
+        float* lse_ptr = lse_kernel_tensor.get<float>();
+        surogate::mem_eff::lse_gather_runtime_to_kernel(lse_ptr,
+                                                        p.lse.get<float>(),
+                                                        p.cu_seqlens,
+                                                        num_batches,
+                                                        Hq,
+                                                        max_seqlen,
+                                                        lse_dim,
+                                                        T,
+                                                        p.stream);
+        const int64_t lse_strideB = static_cast<int64_t>(Hq) * lse_dim;
+        const int64_t lse_strideH = lse_dim;
 
-        // Delta = sum(out * d_out, dim=-1). [num_batches, num_heads, num_queries].
+        // Delta: [num_batches, Hq, lse_dim] fp32 (matches LSE layout —
+        // the kernel reads delta_strideH alongside lse_strideH).
         Tensor delta =
             rs.temp_alloc(ETensorDType::FP32,
-                          {static_cast<long>(num_batches), static_cast<long>(Hq), static_cast<long>(max_seqlen)},
+                          {static_cast<long>(num_batches), static_cast<long>(Hq), static_cast<long>(lse_dim)},
                           "mem_eff_bwd_delta");
         temps.push_back(delta);
 
+        // Delta-compute kernel mirrors the kernel's LSE layout so the
+        // kernel reads from the same [doc, head, q_in_doc] positions it
+        // wrote during fwd. Since `out`/`d_out` are in runtime dense
+        // [B, T, H, Hs] layout, we scatter-index the packed tokens via
+        // cu_seqlens — but delta is per-query so for a prototype we
+        // compute it into the kernel layout directly.
+        //
+        // compute_delta_bf16 is dense: it iterates over [num_batches,
+        // num_heads, num_queries] with strides indexing into dense
+        // out/d_out. That doesn't work for packed — instead, delta is
+        // computed by the kernel when kKernelComputesDelta is true, OR
+        // we need a packed-aware delta kernel. Fall back to launching
+        // the delta kernel with num_batches=B (dense), num_queries=T,
+        // and writing into a dense-layout delta, then gather to the
+        // kernel layout via cu_seqlens like we did for LSE.
+        Tensor delta_dense = rs.temp_alloc(ETensorDType::FP32,
+                                           {static_cast<long>(p.B), static_cast<long>(Hq), static_cast<long>(T)},
+                                           "mem_eff_bwd_delta_dense");
+        temps.push_back(delta_dense);
         surogate::mem_eff::compute_delta_bf16(out_ptr,
                                               d_out_ptr,
-                                              delta.get<float>(),
-                                              num_batches,
+                                              delta_dense.get<float>(),
+                                              /*num_batches=*/p.B,
                                               Hq,
-                                              max_seqlen,
+                                              /*num_queries=*/T,
                                               Hs,
                                               o_strideB,
                                               o_strideM,
@@ -212,9 +261,19 @@ public:
                                               o_strideB,
                                               o_strideM,
                                               o_strideH,
-                                              Hq * max_seqlen,
-                                              max_seqlen,
+                                              Hq * T,
+                                              T,
                                               p.stream);
+        // Gather delta_dense [B, Hq, T] into delta [num_docs, Hq, lse_dim].
+        surogate::mem_eff::lse_gather_runtime_to_kernel(delta.get<float>(),
+                                                        delta_dense.get<float>(),
+                                                        p.cu_seqlens,
+                                                        num_batches,
+                                                        Hq,
+                                                        max_seqlen,
+                                                        lse_dim,
+                                                        T,
+                                                        p.stream);
 
         // Build BackwardArgs and probe workspace size via the kernel's
         // own helper. Allocate workspace, zero if required, then launch.
@@ -223,9 +282,12 @@ public:
         // For MQA: write backward dK/dV into a separate [total, Hq, Hs]
         // scratch buffer, then reduce across Hq heads into d_qkv's
         // single Hkv slot. For MHA: write directly into d_qkv sections.
+        // total_tokens = B*T is the PACKED layout size (d_qkv sits in
+        // this space); num_docs*max_seqlen would over-count for docs
+        // shorter than max.
         nv_bfloat16* d_k_target = nullptr;
         nv_bfloat16* d_v_target = nullptr;
-        const long total_tokens = static_cast<long>(num_batches) * max_seqlen;
+        const long total_tokens = static_cast<long>(p.B) * T;
         if (is_mqa) {
             Tensor dk_partial = rs.temp_alloc(ETensorDType::BF16,
                                               {total_tokens, static_cast<long>(Hq), static_cast<long>(Hs)},
@@ -280,8 +342,8 @@ public:
 
         args.lse_strideB = lse_strideB;
         args.lse_strideH = lse_strideH;
-        args.delta_strideB = static_cast<int64_t>(Hq) * max_seqlen;
-        args.delta_strideH = max_seqlen;
+        args.delta_strideB = static_cast<int64_t>(Hq) * lse_dim;
+        args.delta_strideH = lse_dim;
 
         if (is_mqa) {
             // dQ writes interleaved d_qkv, strideM=HtotQKV*Hs.
