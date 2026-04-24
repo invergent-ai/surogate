@@ -541,6 +541,7 @@ set(MEM_EFF_SOURCES
     ${MEM_EFF_DIR}/kernels/cutlassB_bf16_aligned_k65536.cu
     ${MEM_EFF_DIR}/mem_eff_backward.cu
     ${MEM_EFF_DIR}/mem_eff_delta.cu
+    ${MEM_EFF_DIR}/mem_eff_mqa_reduce.cu
 )
 add_library(mem_eff STATIC ${MEM_EFF_SOURCES})
 set_target_properties(mem_eff PROPERTIES POSITION_INDEPENDENT_CODE ON)

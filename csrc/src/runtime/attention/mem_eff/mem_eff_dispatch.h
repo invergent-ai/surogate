@@ -166,5 +166,22 @@ void compute_delta_bf16(const void* out,
                         long delta_strideH,
                         cudaStream_t stream);
 
+// MQA (Hkv=1) post-processing: accumulate Hq per-head K/V gradients
+// into a single Hkv slot. Inputs are contiguous [total_tokens, Hq, Hs]
+// BF16; outputs are strided bf16 pointers into the interleaved
+// d_qkv[..., Hkv:Hkv+1, :] / [..., Hkv+1:Hkv+2, :] regions (strideM =
+// HtotQKV * Hs so successive tokens land at the right offset).
+void mqa_reduce_kv_bf16(const void* dk_partial,
+                        const void* dv_partial,
+                        void* dk_out,
+                        void* dv_out,
+                        int total_tokens,
+                        int Hq,
+                        int Hs,
+                        int partial_strideM,
+                        int partial_strideH,
+                        int out_strideM,
+                        cudaStream_t stream);
+
 }  // namespace mem_eff
 }  // namespace surogate

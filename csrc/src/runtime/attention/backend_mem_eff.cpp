@@ -62,13 +62,16 @@ public:
         // cuDNN / flash-varlen which are already capture-safe.
         if (p.cu_seqlens == nullptr) return reject("no cu_seqlens");
         if (p.run_state == nullptr || p.temps == nullptr) return reject("no run_state/temps");
-        // Backward with MQA (Hkv!=Hq) needs a separate grad K/V buffer +
-        // reduce, not yet wired. MHA backward works via the same
-        // interleaved d_qkv layout as forward.
+        // MQA backward has two correctness obstacles still to resolve:
+        //   1. LSE stride alignment (kernel wants strideH % 8 == 0).
+        //   2. dQ scatter + dK/dV reduce path vs. the kernel's
+        //      per-Q-head writes. The scaffolding is in the forward
+        //      below but produces shape-mismatched LSE reads until we
+        //      allocate LSE with padded stride in the forward path.
+        // Safe path for now: let flash-varlen / SDPA handle MQA
+        // backward. Forward is still served by mem_eff.
         const bool is_backward = (p.d_qkv.Data != nullptr || p.d_out.Data != nullptr);
-        if (is_backward && p.Hkv != p.Hq) {
-            return reject("MQA backward not yet implemented (need KV-grad reduce)");
-        }
+        if (is_backward && p.Hkv != p.Hq) return reject("MQA backward pending LSE stride fix");
         return true;
     }
 
@@ -215,6 +218,30 @@ public:
 
         // Build BackwardArgs and probe workspace size via the kernel's
         // own helper. Allocate workspace, zero if required, then launch.
+        const bool is_mqa = (Hkv == 1 && Hq > 1);
+
+        // For MQA: write backward dK/dV into a separate [total, Hq, Hs]
+        // scratch buffer, then reduce across Hq heads into d_qkv's
+        // single Hkv slot. For MHA: write directly into d_qkv sections.
+        nv_bfloat16* d_k_target = nullptr;
+        nv_bfloat16* d_v_target = nullptr;
+        const long total_tokens = static_cast<long>(num_batches) * max_seqlen;
+        if (is_mqa) {
+            Tensor dk_partial = rs.temp_alloc(ETensorDType::BF16,
+                                              {total_tokens, static_cast<long>(Hq), static_cast<long>(Hs)},
+                                              "mem_eff_bwd_dk_partial");
+            Tensor dv_partial = rs.temp_alloc(ETensorDType::BF16,
+                                              {total_tokens, static_cast<long>(Hq), static_cast<long>(Hs)},
+                                              "mem_eff_bwd_dv_partial");
+            temps.push_back(dk_partial);
+            temps.push_back(dv_partial);
+            d_k_target = dk_partial.get<nv_bfloat16>();
+            d_v_target = dv_partial.get<nv_bfloat16>();
+        } else {
+            d_k_target = d_qkv_ptr + Hq * Hs;
+            d_v_target = d_qkv_ptr + (Hq + Hkv) * Hs;
+        }
+
         surogate::mem_eff::BackwardArgs args;
         args.q_ptr = qkv_ptr;
         args.k_ptr = qkv_ptr + Hq * Hs;
@@ -223,8 +250,8 @@ public:
         args.d_out_ptr = d_out_ptr;
         args.lse_ptr = lse_ptr;
         args.d_q_ptr = d_qkv_ptr;
-        args.d_k_ptr = d_qkv_ptr + Hq * Hs;
-        args.d_v_ptr = d_qkv_ptr + (Hq + Hkv) * Hs;
+        args.d_k_ptr = d_k_target;
+        args.d_v_ptr = d_v_target;
         args.delta_ptr = delta.get<float>();
 
         args.num_queries = max_seqlen;
@@ -238,10 +265,11 @@ public:
         args.q_strideH = q_strideH;
         args.q_strideB = q_strideB;
         args.k_strideM = q_strideM;
-        args.k_strideH = q_strideH;
+        // MQA: broadcast K/V via strideH=0 (see forward).
+        args.k_strideH = is_mqa ? 0 : q_strideH;
         args.k_strideB = q_strideB;
         args.v_strideM = q_strideM;
-        args.v_strideH = q_strideH;
+        args.v_strideH = is_mqa ? 0 : q_strideH;
         args.v_strideB = q_strideB;
 
         args.o_strideB = o_strideB;
@@ -255,13 +283,42 @@ public:
         args.delta_strideB = static_cast<int64_t>(Hq) * max_seqlen;
         args.delta_strideH = max_seqlen;
 
-        args.gQKV_strideM_multiplier = 3;  // interleaved Q/K/V: gQ_strideM = 3*H*Hs (MHA: HtotQKV=3*Hq)
-        args.gQ_strideH = q_strideH;
-        args.gK_strideH = q_strideH;
-        args.gV_strideH = q_strideH;
-        args.gQ_strideB = q_strideB;
-        args.gK_strideB = q_strideB;
-        args.gV_strideB = q_strideB;
+        if (is_mqa) {
+            // dQ writes interleaved d_qkv, strideM=HtotQKV*Hs.
+            // Kernel computes gQ_strideM = multiplier * num_heads *
+            // head_dim. For HtotQKV=(Hq+2), we need
+            // multiplier * Hq * Hs == HtotQKV * Hs. No integer
+            // multiplier satisfies this for general Hq,Hkv — so we
+            // configure multiplier=1, and the kernel will see
+            // gQ_strideM = Hq * Hs. That's wrong for interleaved dQ.
+            //
+            // Fix: write dQ into a separate [total, Hq, Hs] scratch
+            // buffer too, then scatter-copy into d_qkv's Q section
+            // before mqa-reducing K/V.
+            Tensor dq_partial = rs.temp_alloc(ETensorDType::BF16,
+                                              {total_tokens, static_cast<long>(Hq), static_cast<long>(Hs)},
+                                              "mem_eff_bwd_dq_partial");
+            temps.push_back(dq_partial);
+            args.d_q_ptr = dq_partial.get<nv_bfloat16>();
+            args.gQKV_strideM_multiplier = 1;
+            args.gQ_strideH = Hs;
+            args.gK_strideH = Hs;
+            args.gV_strideH = Hs;
+            args.gQ_strideB = 0;  // varlen path ignores gQ_strideB when cu_seqlens is set
+            args.gK_strideB = 0;
+            args.gV_strideB = 0;
+        } else {
+            // MHA: Hkv==Hq so HtotQKV = 3*Hq. Set multiplier=3 so the
+            // kernel's gQ_strideM = 3 * Hq * Hs matches the interleaved
+            // layout.
+            args.gQKV_strideM_multiplier = 3;
+            args.gQ_strideH = q_strideH;
+            args.gK_strideH = q_strideH;
+            args.gV_strideH = q_strideH;
+            args.gQ_strideB = q_strideB;
+            args.gK_strideB = q_strideB;
+            args.gV_strideB = q_strideB;
+        }
 
         args.cu_seqlens_q_ptr = p.cu_seqlens;
         args.cu_seqlens_k_ptr = p.cu_seqlens;
@@ -284,6 +341,48 @@ public:
         }
 
         surogate::mem_eff::backward_bf16_sm80(args);
+
+        if (is_mqa) {
+            // The kernel wrote dQ into the [total, Hq, Hs] scratch and
+            // dK/dV into [total, Hq, Hs] scratches. Now:
+            //   1. Copy dQ scratch into d_qkv's Q section (interleaved).
+            //   2. Reduce dK/dV scratches across Hq into d_qkv's K/V
+            //      section (single Hkv=1 slot).
+            auto* dq_partial = static_cast<const nv_bfloat16*>(args.d_q_ptr);
+            auto* dk_partial = static_cast<const nv_bfloat16*>(args.d_k_ptr);
+            auto* dv_partial = static_cast<const nv_bfloat16*>(args.d_v_ptr);
+
+            // Scatter dQ: partial [total, Hq, Hs] → d_qkv[:, :Hq, :]
+            //   partial_strideM = Hq * Hs, partial_strideH = Hs.
+            //   out_strideM = (Hq + 2*Hkv) * Hs = HtotQKV * Hs.
+            // We can reuse the mqa_reduce kernel as a "scatter copy" by
+            // passing Hq=1 (identity) per head — but it's simpler to
+            // just do a 2D memcpy. cudaMemcpy2DAsync handles stride-
+            // mismatched copies cheaply.
+            CUDA_CHECK(cudaMemcpy2DAsync(/*dst=*/d_qkv_ptr,
+                                         /*dpitch=*/static_cast<std::size_t>(HtotQKV) * Hs * sizeof(nv_bfloat16),
+                                         /*src=*/dq_partial,
+                                         /*spitch=*/static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),
+                                         /*width=*/static_cast<std::size_t>(Hq) * Hs * sizeof(nv_bfloat16),
+                                         /*height=*/static_cast<std::size_t>(total_tokens),
+                                         cudaMemcpyDeviceToDevice,
+                                         p.stream));
+
+            // Reduce dK/dV across Hq heads into d_qkv's K/V slot.
+            nv_bfloat16* dk_out = d_qkv_ptr + Hq * Hs;
+            nv_bfloat16* dv_out = d_qkv_ptr + (Hq + Hkv) * Hs;
+            surogate::mem_eff::mqa_reduce_kv_bf16(dk_partial,
+                                                  dv_partial,
+                                                  dk_out,
+                                                  dv_out,
+                                                  static_cast<int>(total_tokens),
+                                                  Hq,
+                                                  Hs,
+                                                  /*partial_strideM=*/Hq * Hs,
+                                                  /*partial_strideH=*/Hs,
+                                                  /*out_strideM=*/HtotQKV * Hs,
+                                                  p.stream);
+        }
     }
 };
 
