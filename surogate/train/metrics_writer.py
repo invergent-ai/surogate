@@ -32,6 +32,12 @@ class MetricsWriter:
         self._file.write(json.dumps(entry) + "\n")
         self._file.flush()
 
+    def log_config(self, **config):
+        entry = {"type": "config", "ts": time.time()}
+        entry.update(config)
+        self._file.write(json.dumps(entry) + "\n")
+        self._file.flush()
+
     def close(self):
         if self._file and not self._file.closed:
             self._file.close()
