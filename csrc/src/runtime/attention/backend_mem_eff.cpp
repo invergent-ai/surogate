@@ -230,6 +230,12 @@ public:
         const int lse_dim = (max_seqlen + 7) / 8 * 8;
         const long lse_kernel_elems = static_cast<long>(num_batches) * Hq * lse_dim;
         float* lse_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(lse_kernel_elems * sizeof(float)));
+        // Zero padding slots before gather: the gather only writes
+        // [0, doc_len) per doc, and the backward kernel's softmax
+        // recompute reads the [doc_len, lse_dim) tail during
+        // exp(scores - lse). NaN/Inf there from a prior op poisons
+        // dV across the whole doc after mqa_reduce_kv.
+        CUDA_CHECK(cudaMemsetAsync(lse_ptr, 0, lse_kernel_elems * sizeof(float), p.stream));
         surogate::mem_eff::lse_gather_runtime_to_kernel(lse_ptr,
                                                         p.lse.get<float>(),
                                                         p.cu_seqlens,
@@ -313,6 +319,12 @@ public:
                 reinterpret_cast<nv_bfloat16*>(exec->mem_eff_scratch_alloc(partial_elems * sizeof(nv_bfloat16)));
             d_v_target =
                 reinterpret_cast<nv_bfloat16*>(exec->mem_eff_scratch_alloc(partial_elems * sizeof(nv_bfloat16)));
+            // Zero dK/dV partials: varlen kernel writes only positions
+            // inside doc boundaries; mqa_reduce_kv_bf16 sums across Hq,
+            // so stale NaN/Inf in any head on an untouched position
+            // poisons the reduced K/V slot.
+            CUDA_CHECK(cudaMemsetAsync(d_k_target, 0, partial_elems * sizeof(nv_bfloat16), p.stream));
+            CUDA_CHECK(cudaMemsetAsync(d_v_target, 0, partial_elems * sizeof(nv_bfloat16), p.stream));
         } else {
             d_k_target = d_qkv_ptr + Hq * Hs;
             d_v_target = d_qkv_ptr + (Hq + Hkv) * Hs;
