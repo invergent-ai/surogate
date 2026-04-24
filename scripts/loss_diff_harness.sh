@@ -22,6 +22,10 @@ HARNESS_LOG=/tmp/loss_diff_harness.log
 
 cp examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml "$HARNESS_CFG"
 sed -i 's/max_steps: 50/max_steps: 3/' "$HARNESS_CFG"
+# Metrics path must be writable by the invoking user; default
+# /tmp/surogate_metrics.jsonl can be locked when prior runs wrote it
+# as another user.
+printf '\nsurogate_metrics_path: /tmp/harness_metrics_%s.jsonl\n' "$$" >> "$HARNESS_CFG"
 
 # Empirical baseline bands chosen to catch gross regression (the attempt-1
 # failure mode was loss 18 at step 0) without false positives on normal
@@ -31,7 +35,11 @@ sed -i 's/max_steps: 50/max_steps: 3/' "$HARNESS_CFG"
 BAND_LO="3.0"
 BAND_HI="4.5"
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1} env "$@" timeout 180 .venv/bin/surogate sft "$HARNESS_CFG" > "$HARNESS_LOG" 2>&1
+METRICS_PATH="/tmp/harness_metrics_$$.jsonl"
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1} \
+    SUROGATE_METRICS_PATH="$METRICS_PATH" \
+    env "$@" timeout 180 .venv/bin/surogate sft "$HARNESS_CFG" > "$HARNESS_LOG" 2>&1
+trap 'rm -f "$METRICS_PATH"' EXIT
 
 rc=$?
 if [[ $rc -ne 0 ]]; then

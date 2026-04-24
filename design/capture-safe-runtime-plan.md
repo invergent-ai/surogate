@@ -540,31 +540,75 @@ Two possibilities remain (not yet resolved):
 Reverted attempt 3 without shipping. Committed attempt 2 (`ef8595c`)
 stands as the clean progress point — V2 cleared, harness green.
 
-### Next session — concrete plan for V3
+### V3 deep-dive (2026-04-24 session)
 
-1. **Diagnose**: add a compile-time assertion/log to confirm whether the
-   synthesized `narrow_pli_L` ops produce `TensorRef` entries with
-   `tensor_id >= 0`. If tid is -1, that's the bug root: fix the py_compiler
-   or C++ compile pass to assign tids.
-2. **If tid assigned but store_tensor doesn't fire**: trace the narrow
-   dispatch — maybe `ensure_output_tensor` returns a reference whose
-   `mTensors[tid]` write is overwritten later.
-3. **Alternative narrower fix**: skip the broadening; instead, add
-   `pli_proj_rn_flat` specifically as a `cross_layer_global` (it's the
-   only model-scope tensor we've observed backward reading). That's
-   fragile but ships.
-4. **Harness-guarded**: the loss-diff harness stays the guardrail. Any
-   compile-time tagging change that breaks normal-mode training fails
-   within 2 minutes.
+Traced V3 across four distinct clear-sites for `mTensors[tid]` that
+collectively evict model-scope forward tensors before the refresh
+`save_tensors` call reads them:
 
-### Scope-level takeaway
+1. **Forward pruner** (`prune_stack_tensors` at fwd layer-end,
+   [compiled_ops_execute.cpp:745](../csrc/src/runtime/executor/compiled_ops_execute.cpp#L745)):
+   clears entries whose Data satisfies `Stack.owns && !is_live` — arena-
+   placed tensors inside the unified_stack buffer trip this. Already
+   gated by `mSaveMask`, which attempt 2 extends via `cross_layer_global`.
+2. **execute_backward mTensors.assign** (`compiled_ops_execute.cpp:1810`):
+   unconditionally clears `mTensors` at backward entry. Only FwdStack +
+   SaveForBwd arena tids are restored from `mForwardTensorsSnapshot`. CLG
+   tids also need restore (attempt 2 added this).
+3. **Backward pruner** (`prune_stack_tensors` in execute_backward,
+   [compiled_ops_execute.cpp:1941](../csrc/src/runtime/executor/compiled_ops_execute.cpp#L1941)):
+   similar `Stack.owns && !is_live` check but *no* mSaveMask gate.
+   Clears restored CLG pointers.
+4. **prune_by_last_use** (compiled_ops_execute.cpp:2381): clears tids
+   whose last-use index equals the current bwd op. No save/CLG gate.
 
-Each V corresponds to a distinct class of forward-to-backward
-invariant that capture breaks. V1 (arena malloc) fixed; V2 (model-scope
-cross-layer globals) fixed; V3 (model-scope single-consumer tensors like
-`pli_proj_rn_flat`) open. There may be a V4+ (block-scope activations
-not covered by the existing FwdStack/SaveForBwd restore). Expect 3–5
-total iterations before force-capture trains cleanly.
+Attempt 3 fix: widen all four sites to honor `cross_layer_global`, and
+extend the flag set via `graph_executor.cpp` post-finalize loop over
+`mSaveList` — because under recompute, `save_names` passed into
+`finalize_save_for_bwd` is empty (by design), so the compile-time pass
+doesn't see the real save list. The graph_executor loop sees it.
 
-The **loss-diff harness** (`scripts/loss_diff_harness.sh`) is the
-persistent guardrail — run it red/green around every change.
+This works through V2 and V3 for `pli_proj_rn_flat`, but surfaces a
+**V4**: segfault in `dispatch_narrow` during `replay_layer_forward`
+(called during backward recompute). Cause: preserving `mTensors[tid]`
+for pli_narrow_layer* keeps a stale pointer that points into stack
+memory that's been reused by subsequent temp_allocs. The narrow op then
+`cudaMemcpy2DAsync`'s from stale memory and crashes.
+
+The real insight: our preservation only blocks pruner CLEARS, not the
+underlying staleness. Stack memory gets reused even when we keep
+pointers alive. To ship V3 correctly, model-scope forward tensors read
+by backward either need:
+
+- **(a)** a persistent arena that isn't overwritten between forward
+  temp_allocs and backward reads (similar to SaveForBwd but indexed by
+  something other than block_layer_idx), **or**
+- **(b)** an explicit memcpy into a persistent buffer at the point where
+  forward last writes them (same as `save_tensors` force_persist_name
+  does for block saves — but that path is already buggy for narrow-op
+  outputs where the compiler strips `TensorRef::name`), **or**
+- **(c)** re-compute them via replay_layer_forward but with a tid-aware
+  resolver that correctly traces back to their model-scope producers.
+
+Each of these is a 3–5 day implementation with significant cross-cutting
+changes. Reverted attempt 3 working tree; committed ef8595c stands.
+
+### Session bottom line
+
+Phase 2 attempt 3 made the fix architecturally clearer but exposed that
+V3+ requires a structural change to how model-scope forward tensors
+survive fwd→bwd under capture. Whack-a-mole pruner-skipping creates
+use-after-free risks when stack memory is reused.
+
+For the next session, recommended approach is **option (a)**: add a new
+region `ModelScopePersistent` with its own arena. Forward ops producing
+model-scope tensors consumed by backward get tids in this region, with
+stable offsets. No pruning, no temp_alloc overlap, no snapshot-carry
+gymnastics. The allocator + compiler changes are non-trivial but the
+mechanics are clean.
+
+### Harness-script hygiene
+
+Committed in the session: `scripts/loss_diff_harness.sh` now uses a
+dynamic `/tmp/harness_metrics_$$.jsonl` path for `SUROGATE_METRICS_PATH`
+to avoid PermissionError when prior runs locked the default path.
