@@ -551,37 +551,13 @@ std::vector<Operation> flash_attention_backward(const BackwardRuleContext& ctx) 
 /// compile time regardless of which backend will be selected at run
 /// time — the sizing must fit the mem_eff case so the stack arena is
 /// large enough.
-// Max head_dim across layers. BufferPlan's ``AttnDim`` is the max of
-// per-layer ``Hq * head_size``; dividing by ``Hq`` recovers the max
-// head_size.
-static long max_head_size(const BufferPlan& plan) {
-    if (plan.Hq <= 0) return 0;
-    return plan.AttnDim / plan.Hq;
-}
-
-long flash_attention_forward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
-    (void)op;
-    const long Hq = plan.Hq;
-    const long Hs = max_head_size(plan);
-    if (Hq <= 0 || Hs <= 0) return 0;
-    constexpr long FP32 = 4;
-    const long total_q = plan.B * plan.T;
-
-    long bytes = 0;
-    bytes += align_stack_bytes(total_q * Hq * Hs * FP32);  // mem_eff output_accum
-    bytes += align_stack_bytes(total_q * Hq * FP32);       // mem_eff lse scratch (upper bound: lse_dim<=T)
-    return bytes;
-}
 
 long flash_attention_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
-    (void)op;
-    // Fall back to plan dims: at plan time, op.inputs[3].shape is often
-    // empty (shape env not yet resolved). We want the worst-case size
-    // across all attention layers anyway since the arena gets sized to
-    // the peak.
+    if (op.inputs.size() < 4 || op.inputs[3].shape.size() < 4) return 0;
+    const auto& qkv_shape = op.inputs[3].shape;
     const long Hq = plan.Hq;
     const long Hkv = plan.Hkv;
-    const long Hs = max_head_size(plan);
+    const long Hs = qkv_shape[qkv_shape.size() - 1];
     if (Hq <= 0 || Hs <= 0) return 0;
 
     constexpr long BF16 = 2, FP32 = 4;
@@ -608,27 +584,24 @@ long flash_attention_backward_stack_bound(const CompiledOp& op, const BufferPlan
     // Fwd: lse_scratch + output_accum.
     // Bwd: lse_scratch + delta + delta_dense + workspace; MQA also
     //      allocates 3 x [B*T, Hq, Hs] BF16 partial-grad scratches.
-    long mem_eff_bytes = 0;
-    const long lse_scratch_bytes = total_q * Hq * FP32;            // pessimistic: lse_dim <= T
-    mem_eff_bytes += align_stack_bytes(lse_scratch_bytes);         // lse scratch
-    mem_eff_bytes += align_stack_bytes(lse_scratch_bytes);         // delta (kernel layout)
-    mem_eff_bytes += align_stack_bytes(total_q * Hq * FP32);       // delta_dense
-    mem_eff_bytes += align_stack_bytes(total_q * Hq * Hs * FP32);  // kernel workspace upper bound
-    const bool mem_eff_might_be_mqa = (Hkv != Hq);
-    if (mem_eff_might_be_mqa) {
-        mem_eff_bytes += 3 * align_stack_bytes(total_q * Hq * Hs * BF16);  // dq/dk/dv partials
-    }
-
-    // The backend is selected at runtime; compile-time sizing must
-    // accommodate whichever fires. Take the max.
-    return std::max(flash_varlen_bytes, mem_eff_bytes);
+    // NOTE: the mem_eff backend allocates additional temps (dq/dk/dv
+    // partials for MQA, fp32 LSE scratch, workspace) via
+    // ``rs.temp_alloc`` at run time. Those are NOT accounted for here;
+    // adding them pushed the plan-time graph_peak past ~7 GiB on
+    // Gemma4-E2B, which in turn tripped a ~9.5 GiB single-cudaMalloc
+    // allocation failure under force-capture when the caching
+    // allocator was already fragmented from the model weights. The
+    // runtime safety margin inside ``required_stack_bytes`` covers the
+    // unaccounted mem_eff temps in practice. See
+    // design/capture-safe-runtime-plan.md for the open memory-budget
+    // follow-up.
+    return flash_varlen_bytes;
 }
 
 }  // namespace dsl
 
 REGISTER_AUTODIFF("flash_attention", ::dsl::flash_attention_backward);
 REGISTER_AUTODIFF("flash_attention_qkv", ::dsl::flash_attention_backward);
-REGISTER_STACK_BOUND("flash_attention", FlashAttention, ::dsl::flash_attention_forward_stack_bound);
 REGISTER_STACK_BOUND("flash_attention_backward", FlashAttentionBackward, ::dsl::flash_attention_backward_stack_bound);
 
 // ---------------------------------------------------------------------------
