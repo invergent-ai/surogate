@@ -246,6 +246,21 @@ public:
     // that would otherwise lazy-allocate via allocate_replay_persist.
     void prepare_replay_persist_arena_for_capture();
 
+    // mem_eff attention backend's per-op scratch arena. Holds the
+    // transient buffers (forward output_accum + lse_scratch; backward
+    // delta + delta_dense + lse_scratch + MQA dQ/dK/dV partials +
+    // kernel workspace) so they don't need to come out of the main
+    // stack arena — which inflated graph_peak_stack and tripped a
+    // caching-allocator fragmentation cliff at 9.3 GiB on Gemma4-E2B.
+    //
+    // Use pattern:
+    //   prepare_mem_eff_scratch_for_capture(bytes)  // outside capture
+    //   mem_eff_scratch_reset()                     // at op start
+    //   ptr = mem_eff_scratch_alloc(bytes)          // bump-alloc
+    void prepare_mem_eff_scratch_for_capture(std::size_t bytes);
+    void mem_eff_scratch_reset();
+    std::byte* mem_eff_scratch_alloc(std::size_t bytes);
+
     /// Tid-only slot resolver: returns `&mTensors[tid]` when slot_to_tid
     /// resolves AND the tid has populated Data. Returns nullptr otherwise.
     /// `DslRunState::active_executor_slot` calls this through the
@@ -610,6 +625,13 @@ private:
     std::byte* mReplayPersistArena = nullptr;
     std::size_t mReplayPersistCapacity = 0;
     std::size_t mReplayPersistOffset = 0;
+
+    // mem_eff scratch arena (see prepare_mem_eff_scratch_for_capture
+    // header doc above). Bump-allocated; offset reset at each attention
+    // op entry so each op owns the whole arena for its scratches.
+    std::byte* mMemEffScratchArena = nullptr;
+    std::size_t mMemEffScratchCapacity = 0;
+    std::size_t mMemEffScratchOffset = 0;
 
     /// Bump-allocate `bytes` from the replay-persist arena. Allocates the
     /// arena lazily on first call, rounded up to at least 256 MiB. Returns

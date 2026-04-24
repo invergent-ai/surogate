@@ -11,6 +11,7 @@
 #include "runtime/attention/attention_backend.h"
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 #include "runtime/dsl/dsl_run_state.h"
+#include "runtime/executor/compiled_ops.h"
 #include "utilities/tensor.h"
 
 #include <cuda_bf16.h>
@@ -70,6 +71,12 @@ public:
     void forward(AttentionParams& p) override {
         DslRunState& rs = *p.run_state;
         std::vector<Tensor>& temps = *p.temps;
+        (void)temps;  // scratches now come from the mem_eff arena, not temp_alloc.
+        CompiledExecutor* exec = rs.active_executor();
+        if (!exec) {
+            throw std::runtime_error("mem_eff forward: no active executor");
+        }
+        exec->mem_eff_scratch_reset();
 
         // Compute layout from AttentionParams shape fields.
         const int B = p.B;
@@ -94,18 +101,23 @@ public:
         const int32_t o_strideM = Hq * Hs;
 
         // GMEM variant needs a caller-provided FP32 accumulator. Size
-        // = max(num_docs * max_seqlen, B*T) * Hq * Hs floats so the
-        // kernel's per-doc indexing [q_abs = q_start + query_start_in_doc]
-        // always lands in-bounds. num_docs * max_seqlen can be larger
-        // than B*T when packing is sparse; B*T is the worst case for
-        // capture-pinned runs. max() covers both.
-        const int max_seqlen = p.max_doc_seqlen;
+        // = max(num_docs * effective_max_seqlen, B*T) * Hq * Hs floats.
+        // B*T alone is insufficient when the kernel's per-block writes
+        // (kQueriesPerBlock per step) overshoot a short doc's end into
+        // "padding" tokens the kernel expects in the accum buffer.
+        //
+        // effective_max_seqlen is capped at T because a doc never
+        // spans more than one batch row in the packed layout. Without
+        // this cap, force-capture's cu_seqlens pinning (max_seqlen
+        // pinned to total_q = B*T) inflated the accum from ~140 MiB
+        // to ~940 MiB per attention op for Gemma4 bs=2, seq=2048 —
+        // right at the boundary of the persistent mem_eff arena.
+        const int max_seqlen = std::min(p.max_doc_seqlen, T);
         const int num_batches = p.num_docs;
         const long packed_elems = static_cast<long>(num_batches) * max_seqlen;
         const long dense_elems = static_cast<long>(B) * T;
         const long accum_elems = std::max(packed_elems, dense_elems) * Hq * Hs;
-        Tensor accum = rs.temp_alloc(ETensorDType::FP32, {accum_elems}, "mem_eff_output_accum");
-        temps.push_back(accum);
+        float* accum_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(accum_elems * sizeof(float)));
 
         // LSE scratch: the cutlass kernel writes [num_docs, Hq, lse_dim]
         // but our runtime's p.lse is [B, Hq, T]. Allocate a scratch LSE
@@ -114,9 +126,7 @@ public:
         // rest of the runtime sees values in the layout it expects.
         const int lse_dim = (max_seqlen + 7) / 8 * 8;
         const long lse_kernel_elems = static_cast<long>(num_batches) * Hq * lse_dim;
-        Tensor lse_kernel_tensor = rs.temp_alloc(ETensorDType::FP32, {lse_kernel_elems}, "mem_eff_lse_scratch");
-        temps.push_back(lse_kernel_tensor);
-        float* lse_kernel_ptr = lse_kernel_tensor.get<float>();
+        float* lse_kernel_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(lse_kernel_elems * sizeof(float)));
 
         surogate::mem_eff::ForwardArgs args;
         args.q_ptr = q_ptr;
@@ -124,7 +134,7 @@ public:
         args.v_ptr = v_ptr;
         args.out_ptr = out_ptr;
         args.lse_ptr = lse_kernel_ptr;
-        args.output_accum_ptr = accum.get<float>();
+        args.output_accum_ptr = accum_ptr;
 
         args.num_queries = max_seqlen;
         args.num_keys = max_seqlen;
@@ -176,6 +186,12 @@ public:
     void backward(AttentionParams& p) override {
         DslRunState& rs = *p.run_state;
         std::vector<Tensor>& temps = *p.temps;
+        (void)temps;
+        CompiledExecutor* exec = rs.active_executor();
+        if (!exec) {
+            throw std::runtime_error("mem_eff backward: no active executor");
+        }
+        exec->mem_eff_scratch_reset();
 
         const int T = p.T;
         const int Hq = p.Hq;
@@ -183,7 +199,11 @@ public:
         const int Hs = p.Hs;
         const int HtotQKV = Hq + 2 * Hkv;
         const int num_batches = p.num_docs;
-        const int max_seqlen = p.max_doc_seqlen;
+        // Cap to T (sequence_len) for the same reason as the forward:
+        // force-capture's cu_seqlens pinning can set p.max_doc_seqlen
+        // to total_q=B*T, which inflates the LSE scratch / delta /
+        // num_queries argument despite no doc ever exceeding T tokens.
+        const int max_seqlen = std::min(p.max_doc_seqlen, T);
 
         // qkv and d_qkv share the interleaved [B, T, Hq+2*Hkv, Hs]
         // layout. Slice pointers for each of q/k/v and d_q/d_k/d_v.
@@ -209,9 +229,7 @@ public:
         }
         const int lse_dim = (max_seqlen + 7) / 8 * 8;
         const long lse_kernel_elems = static_cast<long>(num_batches) * Hq * lse_dim;
-        Tensor lse_kernel_tensor = rs.temp_alloc(ETensorDType::FP32, {lse_kernel_elems}, "mem_eff_bwd_lse_scratch");
-        temps.push_back(lse_kernel_tensor);
-        float* lse_ptr = lse_kernel_tensor.get<float>();
+        float* lse_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(lse_kernel_elems * sizeof(float)));
         surogate::mem_eff::lse_gather_runtime_to_kernel(lse_ptr,
                                                         p.lse.get<float>(),
                                                         p.cu_seqlens,
@@ -226,11 +244,7 @@ public:
 
         // Delta: [num_batches, Hq, lse_dim] fp32 (matches LSE layout —
         // the kernel reads delta_strideH alongside lse_strideH).
-        Tensor delta =
-            rs.temp_alloc(ETensorDType::FP32,
-                          {static_cast<long>(num_batches), static_cast<long>(Hq), static_cast<long>(lse_dim)},
-                          "mem_eff_bwd_delta");
-        temps.push_back(delta);
+        float* delta_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(lse_kernel_elems * sizeof(float)));
 
         // Delta-compute kernel mirrors the kernel's LSE layout so the
         // kernel reads from the same [doc, head, q_in_doc] positions it
@@ -247,13 +261,12 @@ public:
         // the delta kernel with num_batches=B (dense), num_queries=T,
         // and writing into a dense-layout delta, then gather to the
         // kernel layout via cu_seqlens like we did for LSE.
-        Tensor delta_dense = rs.temp_alloc(ETensorDType::FP32,
-                                           {static_cast<long>(p.B), static_cast<long>(Hq), static_cast<long>(T)},
-                                           "mem_eff_bwd_delta_dense");
-        temps.push_back(delta_dense);
+        const long delta_dense_elems = static_cast<long>(p.B) * Hq * T;
+        float* delta_dense_ptr =
+            reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(delta_dense_elems * sizeof(float)));
         surogate::mem_eff::compute_delta_bf16(out_ptr,
                                               d_out_ptr,
-                                              delta_dense.get<float>(),
+                                              delta_dense_ptr,
                                               /*num_batches=*/p.B,
                                               Hq,
                                               /*num_queries=*/T,
@@ -268,8 +281,8 @@ public:
                                               T,
                                               p.stream);
         // Gather delta_dense [B, Hq, T] into delta [num_docs, Hq, lse_dim].
-        surogate::mem_eff::lse_gather_runtime_to_kernel(delta.get<float>(),
-                                                        delta_dense.get<float>(),
+        surogate::mem_eff::lse_gather_runtime_to_kernel(delta_ptr,
+                                                        delta_dense_ptr,
                                                         p.cu_seqlens,
                                                         num_batches,
                                                         Hq,
@@ -291,17 +304,12 @@ public:
         nv_bfloat16* d_k_target = nullptr;
         nv_bfloat16* d_v_target = nullptr;
         const long total_tokens = static_cast<long>(p.B) * T;
+        const long partial_elems = total_tokens * Hq * Hs;
         if (is_mqa) {
-            Tensor dk_partial = rs.temp_alloc(ETensorDType::BF16,
-                                              {total_tokens, static_cast<long>(Hq), static_cast<long>(Hs)},
-                                              "mem_eff_bwd_dk_partial");
-            Tensor dv_partial = rs.temp_alloc(ETensorDType::BF16,
-                                              {total_tokens, static_cast<long>(Hq), static_cast<long>(Hs)},
-                                              "mem_eff_bwd_dv_partial");
-            temps.push_back(dk_partial);
-            temps.push_back(dv_partial);
-            d_k_target = dk_partial.get<nv_bfloat16>();
-            d_v_target = dv_partial.get<nv_bfloat16>();
+            d_k_target =
+                reinterpret_cast<nv_bfloat16*>(exec->mem_eff_scratch_alloc(partial_elems * sizeof(nv_bfloat16)));
+            d_v_target =
+                reinterpret_cast<nv_bfloat16*>(exec->mem_eff_scratch_alloc(partial_elems * sizeof(nv_bfloat16)));
         } else {
             d_k_target = d_qkv_ptr + Hq * Hs;
             d_v_target = d_qkv_ptr + (Hq + Hkv) * Hs;
@@ -317,7 +325,7 @@ public:
         args.d_q_ptr = d_qkv_ptr;
         args.d_k_ptr = d_k_target;
         args.d_v_ptr = d_v_target;
-        args.delta_ptr = delta.get<float>();
+        args.delta_ptr = delta_ptr;
 
         args.num_queries = max_seqlen;
         args.num_keys = max_seqlen;
@@ -360,11 +368,7 @@ public:
             // Fix: write dQ into a separate [total, Hq, Hs] scratch
             // buffer too, then scatter-copy into d_qkv's Q section
             // before mqa-reducing K/V.
-            Tensor dq_partial = rs.temp_alloc(ETensorDType::BF16,
-                                              {total_tokens, static_cast<long>(Hq), static_cast<long>(Hs)},
-                                              "mem_eff_bwd_dq_partial");
-            temps.push_back(dq_partial);
-            args.d_q_ptr = dq_partial.get<nv_bfloat16>();
+            args.d_q_ptr = exec->mem_eff_scratch_alloc(partial_elems * sizeof(nv_bfloat16));
             args.gQKV_strideM_multiplier = 1;
             args.gQ_strideH = Hs;
             args.gK_strideH = Hs;
@@ -396,10 +400,7 @@ public:
 
         const std::size_t ws_bytes = surogate::mem_eff::backward_workspace_bytes(args);
         if (ws_bytes > 0) {
-            const long ws_elems = static_cast<long>(ws_bytes / sizeof(float));
-            Tensor workspace = rs.temp_alloc(ETensorDType::FP32, {ws_elems}, "mem_eff_bwd_workspace");
-            temps.push_back(workspace);
-            args.workspace_ptr = workspace.get<float>();
+            args.workspace_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(ws_bytes));
             if (surogate::mem_eff::backward_workspace_needs_zero(args)) {
                 cudaMemsetAsync(args.workspace_ptr, 0, ws_bytes, p.stream);
             }

@@ -1304,6 +1304,11 @@ void GraphExecutor::execute_forward(long B,
         mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
         // Preallocate the replay-persist arena (256 MiB cudaMalloc) outside capture.
         mCompiledExecutor->prepare_replay_persist_arena_for_capture();
+        // Preallocate the mem_eff attention scratch arena (~256 MiB) so
+        // backend_mem_eff's per-op temps don't need temp_alloc from the
+        // stack arena. One attention op at a time, so ~128 MiB per op
+        // peak is enough; 256 MiB gives comfortable margin.
+        mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
 
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
@@ -1400,6 +1405,7 @@ void GraphExecutor::execute_backward(long B,
         prime_fp8_weight_cache_transposed({});
         prime_fp4_weight_cache({});
         mCompiledExecutor->prepare_replay_persist_arena_for_capture();
+        mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
     }
 
     auto run_ops = [&]() {

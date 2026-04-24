@@ -375,6 +375,12 @@ CompiledExecutor::~CompiledExecutor() {
         mReplayPersistCapacity = 0;
         mReplayPersistOffset = 0;
     }
+    if (mMemEffScratchArena) {
+        cudaFree(mMemEffScratchArena);
+        mMemEffScratchArena = nullptr;
+        mMemEffScratchCapacity = 0;
+        mMemEffScratchOffset = 0;
+    }
 
     // Free persistent MoE saved tensor buffers. Arena-backed entries are
     // skipped — their storage is owned by mPhaseArenas.
@@ -498,6 +504,49 @@ void CompiledExecutor::ensure_replay_persist_arena() {
     CUDA_CHECK(cudaMalloc(&raw, kArenaBytes));
     mReplayPersistArena = static_cast<std::byte*>(raw);
     mReplayPersistCapacity = kArenaBytes;
+}
+
+void CompiledExecutor::prepare_mem_eff_scratch_for_capture(std::size_t bytes) {
+    if (bytes == 0) return;
+    if (mMemEffScratchArena && mMemEffScratchCapacity >= bytes) return;
+    if (mMemEffScratchArena) {
+        cudaFree(mMemEffScratchArena);
+        mMemEffScratchArena = nullptr;
+        mMemEffScratchCapacity = 0;
+        mMemEffScratchOffset = 0;
+    }
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, bytes));
+    mMemEffScratchArena = static_cast<std::byte*>(raw);
+    mMemEffScratchCapacity = bytes;
+    mMemEffScratchOffset = 0;
+}
+
+void CompiledExecutor::mem_eff_scratch_reset() {
+    mMemEffScratchOffset = 0;
+}
+
+std::byte* CompiledExecutor::mem_eff_scratch_alloc(std::size_t bytes) {
+    if (bytes == 0) return nullptr;
+    // Lazy allocation for eager / non-capture paths where
+    // prepare_mem_eff_scratch_for_capture was not called first. Must
+    // NOT fire during stream capture — that would be an illegal
+    // cudaMalloc inside the capture.
+    if (!mMemEffScratchArena) {
+        prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
+    }
+    constexpr std::size_t kAlign = 128;  // align for 128-bit bf16 loads
+    const std::size_t aligned_offset = (mMemEffScratchOffset + kAlign - 1) & ~(kAlign - 1);
+    if (aligned_offset + bytes > mMemEffScratchCapacity) {
+        std::ostringstream oss;
+        oss << "mem_eff scratch arena exhausted: offset=" << aligned_offset << " + req=" << bytes
+            << " > cap=" << mMemEffScratchCapacity
+            << ". Bump SUROGATE_MEM_EFF_ARENA_MB or prepare_mem_eff_scratch_for_capture size.";
+        throw std::runtime_error(oss.str());
+    }
+    std::byte* p = mMemEffScratchArena + aligned_offset;
+    mMemEffScratchOffset = aligned_offset + bytes;
+    return p;
 }
 
 std::byte* CompiledExecutor::allocate_replay_persist(std::size_t bytes) {
