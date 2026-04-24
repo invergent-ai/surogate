@@ -2261,6 +2261,12 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs,
 void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q) {
     const int count = num_docs + 1;
     mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
+    if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
+        if (env[0] == '1') {
+            std::cerr << "[cu_seqlens] gpu=" << mCuSeqlensGpu << " count=" << mCuSeqlensCount << " -> " << count
+                      << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q << "\n";
+        }
+    }
     // Reallocate GPU buffer if size changed
     if (mCuSeqlensGpu && mCuSeqlensCount != count) {
         CUDA_CHECK(cudaFree(mCuSeqlensGpu));
@@ -2269,17 +2275,96 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
     if (!mCuSeqlensGpu) {
         CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(count) * sizeof(std::int32_t)));
         mCuSeqlensCount = count;
+        if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
+            if (env[0] == '1') {
+                std::cerr << "[cu_seqlens] allocated gpu=" << mCuSeqlensGpu << "\n";
+            }
+        }
     }
     CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
                                cu_seqlens_cpu,
                                static_cast<std::size_t>(count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice,
                                mRunState.MainStream));
-    mDocMaskingNumDocs = num_docs;
-    mDocMaskingMaxSeqlen = max_seqlen;
-    mDocMaskingTotalQ = total_q;
+    // Under full-step CUDA graph capture the flash-varlen kernel bakes
+    // num_docs/max_seqlen/total_q into its kernel-args buffer at capture
+    // time. A later step whose max_seqlen exceeds the captured step's
+    // silently truncates attention at the captured length; likewise a
+    // later step with more docs than captured skips tail docs.
+    //
+    // Fix (Phase 4 path of least resistance):
+    //   max_seqlen → T (sequence_len) — worst-case per-doc bound,
+    //     cu_seqlens bounds the real work.
+    //   num_docs   → if the new value exceeds the captured cap, force
+    //     a graph re-capture (reset_cuda_graphs). Otherwise replay is
+    //     safe as long as trailing cu_seqlens entries point at total_q
+    //     (empty docs).
+    //   total_q    → B*T (the captured buffer is already allocated
+    //     worst-case).
+    // Activated only under force-full-capture; leaves split-attention
+    // path untouched.
+    const bool force_full_capture = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
+    int effective_num_docs = num_docs;
+    int effective_max_seqlen = max_seqlen;
+    int effective_total_q = total_q;
+    if (force_full_capture) {
+        // total_q (= B*T) is stable across steps; use it as the per-doc
+        // upper bound. It's an over-estimate (max per-doc length is T,
+        // not B*T), but correct and conservative — cu_seqlens still
+        // bounds the real work. total_q itself is unchanged.
+        effective_max_seqlen = total_q;
+        effective_total_q = total_q;
+        if (mForwardGraph == nullptr) {
+            // About to capture (or first call). Record the captured cap.
+            mCapturedNumDocs = num_docs;
+            effective_num_docs = num_docs;
+        } else if (num_docs > mCapturedNumDocs) {
+            // Replay would miss tail docs. Invalidate and recapture.
+            if (const char* dbg = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
+                if (dbg[0] == '1') {
+                    std::cerr << "[cu_seqlens] RECAPTURE: num_docs " << mCapturedNumDocs << " -> " << num_docs << "\n";
+                }
+            }
+            reset_cuda_graphs();
+            mCapturedNumDocs = num_docs;
+            effective_num_docs = num_docs;
+        } else {
+            // num_docs <= captured: keep iterating up to the captured
+            // count. Pad cu_seqlens tail with total_q so extra docs are
+            // length-0 and the kernel short-circuits.
+            effective_num_docs = mCapturedNumDocs;
+            const int padded_count = mCapturedNumDocs + 1;
+            if (static_cast<int>(mCuSeqlensCpu.size()) < padded_count) {
+                const int prev = static_cast<int>(mCuSeqlensCpu.size());
+                mCuSeqlensCpu.resize(padded_count, effective_total_q);
+                // Force GPU buffer resize + fresh memcpy of padded data.
+                if (mCuSeqlensCount < padded_count) {
+                    if (mCuSeqlensGpu) {
+                        CUDA_CHECK(cudaFree(mCuSeqlensGpu));
+                        mCuSeqlensGpu = nullptr;
+                    }
+                    CUDA_CHECK(
+                        cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(padded_count) * sizeof(std::int32_t)));
+                    mCuSeqlensCount = padded_count;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
+                                           mCuSeqlensCpu.data(),
+                                           static_cast<std::size_t>(padded_count) * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice,
+                                           mRunState.MainStream));
+                (void)prev;
+            }
+        }
+    }
+    mDocMaskingNumDocs = effective_num_docs;
+    mDocMaskingMaxSeqlen = effective_max_seqlen;
+    mDocMaskingTotalQ = effective_total_q;
     if (mCompiledExecutor) {
-        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu, mCuSeqlensCpu.data(), num_docs, max_seqlen, total_q);
+        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu,
+                                                   mCuSeqlensCpu.data(),
+                                                   effective_num_docs,
+                                                   effective_max_seqlen,
+                                                   effective_total_q);
     }
 }
 

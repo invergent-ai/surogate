@@ -748,3 +748,123 @@ V2+V3+V4 are structurally cleared. Force-capture progresses from
 "immediate crash" to "3-step divergent run." Remaining work is
 numerical rather than structural — still non-trivial but a different
 problem shape.
+
+## Phase 2 attempt 6 — V5 root cause: SDPAAttention per-doc capture
+
+### Diagnostic path
+
+Ran gas=1 force-capture harness (new `/tmp/gas1_harness_n.sh`) to
+separate replay-staleness from single-capture bugs:
+
+| Step | Normal mode | Force-capture | Grad norm normal / capture |
+|------|-------------|---------------|----------------------------|
+| 0 | 3.4275 | 3.4275 | 3.16e32 / 3.16e32 |
+| 1 | 3.5227 | 3.5227 | NaN / NaN |
+| 2 | 3.6633 | 5.8857 | NaN / **1.14e33** |
+
+Step 0 AND step 1 are bit-exact between modes. Step 2 is where capture
+mode diverges with a finite-huge gradient while normal mode has NaN.
+
+### Why step 1 matched (surprise finding)
+
+After step 0's warmup, `trainer._maybe_shrink_stack_after_warmup`
+triggers `dsl_model->invalidate_cuda_graphs()` which calls
+`GraphExecutor::reset_cuda_graphs` and nulls both `mForwardGraph` and
+`mBackwardGraph`. So step 1 *re-captures* with step-1's doc
+boundaries. Step 1 replay immediately after capture = correct.
+
+Step 2 replays step-1's captured graphs with step-2's different doc
+boundaries.
+
+### The real V5 root cause
+
+Gemma4's attention backend selection (via priority-ordered registry):
+
+| Layer | Hq | Hs | window | Backend selected |
+|-------|----|----|--------|------------------|
+| Sliding | 8 | 256 | 512 | `flash_varlen` |
+| Full | 8 | **512** | 0 | **SDPA** (flash-varlen cap is 256) |
+
+`SDPAAttention::forward_packed_sdpa` ([backend_sdpa.cpp:150](../csrc/src/runtime/attention/backend_sdpa.cpp#L150))
+calls `collect_packed_doc_segments` at capture time, then loops
+`for (const PackedDocSegment& doc : docs)` with baked per-doc
+`global_start`/`length` values, emitting a separate cuBLAS kernel
+launch per document. Each captured kernel has step-N's doc offsets
+and lengths baked into its kernel-arg buffer.
+
+On replay at step N+1 with different doc boundaries:
+- Captured kernel reads QKV via `doc.global_start`/`doc.length` from
+  step-N — wrong slice of step-(N+1)'s buffer.
+- `copy_lse_doc_to_dense` writes to `batch_idx`/`row_start` from
+  step-N — LSE ends up at the wrong position for step-(N+1).
+
+Result: attention is computed against completely mis-sliced QKV.
+Silent numerical drift that passes the loss magnitude sanity check but
+corrupts training.
+
+### Why cu_seqlens pinning alone isn't enough
+
+This session shipped `set_doc_masking` capture-safety hardening
+([graph_executor.cpp](../csrc/src/runtime/executor/graph_executor.cpp)):
+- Pin `max_seqlen` = `total_q` (stable worst-case per-doc bound).
+- Track `mCapturedNumDocs`; on a step whose `num_docs` > captured
+  count, call `reset_cuda_graphs()` to force re-capture.
+- Pad `cu_seqlens_cpu` with trailing `total_q` entries when actual
+  count < captured.
+
+This makes the **flash-varlen** layers capture-safe (a single kernel
+with device-pointer cu_seqlens indirection; baked `num_docs`/
+`max_seqlen` are padded with length-0 docs).
+
+It does **not** fix SDPA layers: SDPA's problem is per-doc kernel
+launches at capture time, not kernel args. The loss moved from
+5.8857 → 5.5185 at step 2, confirming some layers were flash-varlen
+(and benefited from the pin) and others are SDPA (still broken).
+
+### Fix options for SDPA under full-step capture
+
+- **(A) Extend flash-varlen to Hs > 256** — moderate kernel work;
+  FlashAttention upstream supports Hs up to 512 in newer versions.
+  Decouples Gemma4 from SDPA entirely.
+- **(B) Refactor SDPA to device-side doc dispatch** — rewrite
+  `forward_packed_sdpa` as a batched kernel with doc metadata
+  read from device (similar to flash-varlen). Significant kernel
+  work.
+- **(C) Re-capture outer graph when doc structure changes** — the
+  outer `train_step_graphed` path already bypasses full-step capture
+  for sample_packing (`has_doc_boundaries` branch at
+  [py_train.cpp:863](../csrc/src/binding/py_train.cpp#L863)). If we
+  want full-step capture on Gemma4 specifically, we'd need to
+  re-capture the outer graph per step whenever doc boundaries change
+  (which is ~every step in practice — defeats the purpose).
+- **(D) Accept that Gemma4 + sample_packing + full-step capture
+  requires flash-varlen extension (option A).** Cheapest durable
+  fix. Other models (Llama/Mistral/Qwen2.5) have Hs ≤ 256 so are
+  unaffected — they'd get the full TPS win today.
+
+### Artifacts from this session
+
+- `scripts/loss_diff_harness.sh` (baseline 3-step harness) — still
+  the primary green gate for normal mode.
+- `/tmp/gas1_harness_n.sh` (ad-hoc, not committed): 3-step gas=1 for
+  V5 diagnosis.
+- `SUROGATE_DEBUG_CU_SEQLENS=1`: per-step cu_seqlens + pointer +
+  effective-values diag.
+- `SUROGATE_DEBUG_ATTN_SELECT=1`: per-selection backend diag (caps at
+  80 lines to avoid log spam).
+
+### Validation
+
+- Normal-mode harness: PASS (3.6317 / 3.8802 / 3.8936).
+- Force-capture gas=1: step 0/1 bit-exact with normal mode, step 2
+  loss 5.5185 (partially fixed from 5.8857 — flash-varlen layers now
+  safe, SDPA layers still baked).
+
+### Recommended next step
+
+Target **option D**: extend flash-varlen support to Hs=512 via
+upstream FlashAttention headers. Until then, Gemma4 stays in the
+split-attention fallback. Validate on a smaller model (Llama-3-1B or
+Mistral-small, both Hs ≤ 128) where flash-varlen covers every layer
+and the current attempt-6 pinning should make force-capture
+correctness-safe end-to-end.
