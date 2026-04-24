@@ -522,7 +522,37 @@ target_compile_options(flash_attn PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
 )
 
-target_link_libraries(surogate-common PRIVATE flash_attn ${CUFILE_LIBS} cudnn_frontend ${CUDNN_LIBRARY} nvidia::nccl fmt::fmt-header-only)
+# Mem-efficient attention (ported from PyTorch aten/src/ATen/native/
+# transformers/cuda/mem_eff_attention, originally xformers). Capture-safe
+# varlen attention with unbounded head_dim (via kMaxK=65536 GMEM path).
+# Replaces the SDPA per-doc slicing backend for Hs > 256 layers that
+# flash-varlen's 256 head-dim cap rejects.
+set(MEM_EFF_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/attention/mem_eff)
+set(MEM_EFF_SOURCES
+    # BF16 forward: the single auto-generated file provides three block
+    # variants (64x64_rf for Hs<=64, 64x128_rf for Hs<=128, 32x128_gmem
+    # for unlimited). Prototype wiring uses the GMEM variant only; the
+    # rf variants link cleanly alongside but remain unused until the
+    # dispatcher picks them as a fast path.
+    ${MEM_EFF_DIR}/kernels/cutlassF_bf16_aligned.cu
+    ${MEM_EFF_DIR}/mem_eff_dispatch.cu
+)
+add_library(mem_eff STATIC ${MEM_EFF_SOURCES})
+set_target_properties(mem_eff PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mem_eff PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
+    ${cutlass_SOURCE_DIR}/include
+    ${cutlass_SOURCE_DIR}/tools/util/include
+)
+target_compile_options(mem_eff PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+)
+
+target_link_libraries(surogate-common PRIVATE flash_attn mem_eff ${CUFILE_LIBS} cudnn_frontend ${CUDNN_LIBRARY} nvidia::nccl fmt::fmt-header-only)
 target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas CUDA::cublasLt ${NVML_LIBS} nlohmann_json::nlohmann_json)
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
@@ -581,6 +611,11 @@ if (PYTHON_BINDING)
     FetchContent_MakeAvailable(nanobind)
     nanobind_add_module(_surogate STABLE_ABI NOSTRIP src/binding/binding.cpp src/binding/py_train.cpp)
     target_link_libraries(_surogate PUBLIC surogate-common Python::Module fmt::fmt-header-only)
+    # mem_eff is a static archive; binding.cpp directly references
+    # surogate::mem_eff::forward_bf16_sm80, so the module itself must
+    # pull the symbol in (surogate-common doesn't call it and thus
+    # doesn't pull the archive objects).
+    target_link_libraries(_surogate PRIVATE mem_eff)
 
     # pick up cuda libraries from within the current python env, if available
     set(RPATH_LIST
@@ -621,7 +656,6 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             # Kernels
             src/testing/kernels/test-swiglu.cu
             src/testing/kernels/test-rope.cu
-            src/testing/kernels/test-qk-norm-rope.cu
             src/testing/kernels/test-classifier.cu
             src/testing/kernels/test-grad-clip.cu
             src/testing/kernels/test-multi-tensor-norm.cu

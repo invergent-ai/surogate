@@ -32,6 +32,7 @@
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "utilities/dtype.h"
 #include "tokenizer/tokenizer.h"
+#include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 
 namespace nb = nanobind;
 
@@ -2705,6 +2706,127 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n"
             "- batch: List of conversations, each a list of message dicts.\n"
             "- strategy: 'default', 'last_round', or 'all'.");
+
+    // ----------------------------------------------------------------------
+    // mem-efficient attention (Phase 4 attempt 1 port, see
+    // design/capture-safe-runtime-plan.md). Exposed as a standalone binding
+    // for the bit-compat test against PyTorch's scaled_dot_product_attention.
+    // Production integration is via the backend registry (coming next).
+    // ----------------------------------------------------------------------
+    m.def(
+        "mem_eff_attention_forward",
+        [](nb::ndarray<nb::device::cuda> q,
+           nb::ndarray<nb::device::cuda> k,
+           nb::ndarray<nb::device::cuda> v,
+           nb::ndarray<nb::device::cuda> out,
+           bool causal,
+           float softmax_scale,
+           int window_size,
+           std::optional<nb::ndarray<std::int32_t, nb::device::cuda>> cu_seqlens_q,
+           std::optional<nb::ndarray<std::int32_t, nb::device::cuda>> cu_seqlens_k,
+           int max_seqlen_q,
+           int max_seqlen_k) {
+            // Dense: q/k/v shape [B, M, H, Hs]. Packed: [total, H, Hs]
+            // plus cu_seqlens. Strides are read from the ndarray so
+            // non-contiguous views work.
+            const int rank = static_cast<int>(q.ndim());
+            if (rank != 3 && rank != 4) {
+                throw std::runtime_error("mem_eff_attention_forward: Q must be rank-3 (packed) or rank-4 (dense)");
+            }
+            const bool is_packed = cu_seqlens_q.has_value();
+
+            surogate::mem_eff::ForwardArgs args;
+            args.q_ptr = q.data();
+            args.k_ptr = k.data();
+            args.v_ptr = v.data();
+            args.out_ptr = out.data();
+            args.causal = causal;
+            args.softmax_scale = softmax_scale;
+            args.window_size = window_size;
+
+            if (rank == 4) {
+                const int B = static_cast<int>(q.shape(0));
+                const int M = static_cast<int>(q.shape(1));
+                const int H = static_cast<int>(q.shape(2));
+                const int Hs = static_cast<int>(q.shape(3));
+                args.num_heads = H;
+                args.head_dim_qk = Hs;
+                args.head_dim_v = static_cast<int>(v.shape(3));
+                args.num_queries = is_packed ? max_seqlen_q : M;
+                args.num_keys = is_packed ? max_seqlen_k : static_cast<int>(k.shape(1));
+                args.num_batches = is_packed ? (cu_seqlens_q->shape(0) - 1) : B;
+                args.q_strideB = static_cast<int64_t>(q.stride(0));
+                args.q_strideM = static_cast<int32_t>(q.stride(1));
+                args.q_strideH = static_cast<int32_t>(q.stride(2));
+                args.k_strideB = static_cast<int64_t>(k.stride(0));
+                args.k_strideM = static_cast<int32_t>(k.stride(1));
+                args.k_strideH = static_cast<int32_t>(k.stride(2));
+                args.v_strideB = static_cast<int64_t>(v.stride(0));
+                args.v_strideM = static_cast<int32_t>(v.stride(1));
+                args.v_strideH = static_cast<int32_t>(v.stride(2));
+                args.o_strideM = static_cast<int32_t>(out.stride(1));
+            } else {
+                // [total, H, Hs] packed. strideB ignored (varlen path).
+                const int H = static_cast<int>(q.shape(1));
+                const int Hs = static_cast<int>(q.shape(2));
+                args.num_heads = H;
+                args.head_dim_qk = Hs;
+                args.head_dim_v = static_cast<int>(v.shape(2));
+                args.num_queries = max_seqlen_q;
+                args.num_keys = max_seqlen_k;
+                args.num_batches = is_packed ? (cu_seqlens_q->shape(0) - 1) : 1;
+                args.q_strideM = static_cast<int32_t>(q.stride(0));
+                args.q_strideH = static_cast<int32_t>(q.stride(1));
+                args.k_strideM = static_cast<int32_t>(k.stride(0));
+                args.k_strideH = static_cast<int32_t>(k.stride(1));
+                args.v_strideM = static_cast<int32_t>(v.stride(0));
+                args.v_strideH = static_cast<int32_t>(v.stride(1));
+                args.o_strideM = static_cast<int32_t>(out.stride(0));
+            }
+
+            if (cu_seqlens_q.has_value()) {
+                args.seqstart_q_ptr = static_cast<const int32_t*>(cu_seqlens_q->data());
+            }
+            if (cu_seqlens_k.has_value()) {
+                args.seqstart_k_ptr = static_cast<const int32_t*>(cu_seqlens_k->data());
+            }
+
+            args.stream = nullptr;
+
+            // GMEM variant needs FP32 output accumulator:
+            // [num_batches, num_queries, num_heads, head_dim_v]
+            const size_t accum_elems =
+                static_cast<size_t>(args.num_batches) * args.num_queries * args.num_heads * args.head_dim_v;
+            float* accum = nullptr;
+            if (cudaMalloc(&accum, accum_elems * sizeof(float)) != cudaSuccess) {
+                throw std::runtime_error("mem_eff_attention_forward: cudaMalloc for accum buffer failed");
+            }
+            args.output_accum_ptr = accum;
+            try {
+                surogate::mem_eff::forward_bf16_sm80(args);
+                cudaStreamSynchronize(nullptr);
+            } catch (...) {
+                cudaFree(accum);
+                throw;
+            }
+            cudaFree(accum);
+        },
+        nb::arg("q"),
+        nb::arg("k"),
+        nb::arg("v"),
+        nb::arg("out"),
+        nb::arg("causal") = true,
+        nb::arg("softmax_scale") = 0.0f,
+        nb::arg("window_size") = 0,
+        nb::arg("cu_seqlens_q") = nb::none(),
+        nb::arg("cu_seqlens_k") = nb::none(),
+        nb::arg("max_seqlen_q") = 0,
+        nb::arg("max_seqlen_k") = 0,
+        "Bit-compat hook: invoke the ported mem-efficient attention "
+        "forward kernel (cutlass, BF16, SM80 ABI, unbounded head_dim) "
+        "on the caller-provided output tensor. For validation against "
+        "PyTorch's scaled_dot_product_attention with "
+        "SDPBackend.EFFICIENT_ATTENTION forced.");
 
     // Disable leak warnings during interpreter shutdown - these are false positives
     // caused by Python's non-deterministic cleanup order, not actual memory leaks.

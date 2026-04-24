@@ -33,6 +33,9 @@ enum class ScalarType : int {
 struct PhiloxCudaState {
     uint64_t seed_ = 0;
     uint64_t offset_ = 0;
+    // PyTorch's CUDA-graph-captured dropout path consults this flag;
+    // surogate never enables dropout so it's always false.
+    bool captured_ = false;
     constexpr PhiloxCudaState() = default;
     constexpr PhiloxCudaState(uint64_t s, uint64_t o)
         : seed_(s),
