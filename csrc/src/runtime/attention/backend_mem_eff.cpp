@@ -278,6 +278,12 @@ public:
                                               p.stream);
         // Gather delta_dense [B, Hq, T] into flat [Hq, total_q] layout
         // with delta_strideH = total_q.
+        // NOTE: kKernelComputesDelta=true on sm80 (kIsHalf + non-sm70),
+        // so the kernel overwrites this buffer with its own delta
+        // computation. The pre-gather is only used on sm70 where
+        // kKernelComputesDelta is false. We keep the gather for
+        // correctness on older arches; on sm80+ the kernel's write
+        // pattern also requires delta_strideH=total_q.
         surogate::mem_eff::delta_gather_runtime_to_flat(delta_ptr,
                                                         delta_dense_ptr,
                                                         p.cu_seqlens,

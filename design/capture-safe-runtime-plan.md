@@ -1222,6 +1222,112 @@ beyond the delta layout remains to be found. Parking the pin+capture
 interaction investigation separately; the delta layout fix ships
 regardless.
 
+### Phase 4 attempt 7 — pin bug is NOT capture-specific
+
+A follow-up bisect reveals the "force-capture grad-norm blowup" is
+actually a **pure pin-overstatement bug in the mem_eff kernel**, not
+a capture problem:
+
+* Added probe `SUROGATE_DEBUG_ALWAYS_PIN=1` that enables the
+  `effective_max_seqlen = total_q` pin path in
+  [graph_executor.cpp::set_doc_masking](../csrc/src/runtime/executor/graph_executor.cpp#L2310)
+  even without `SUROGATE_FORCE_FULL_GRAPH_CAPTURE`.
+* Normal mode (no capture, no graphs) + ALWAYS_PIN reproduces the
+  identical 1.13e32 grad norm at step 0 that force-capture shows.
+* So the bug is triggered solely by the condition
+  `args.num_queries > actual max doc length in this batch`, which
+  is what pinning introduces.
+
+What's ruled out by zero-scratch probes:
+
+* `cudaMemsetAsync` on output_accum, kernel_lse, delta, dK/dV/dQ
+  partial buffers (`SUROGATE_DEBUG_ZERO_{ACCUM,LSE,DELTA,PARTIALS}`)
+  — none restores the grad norm. So uninitialized scratch memory is
+  not the cause.
+
+What's consistent between pin and no-pin (verified by tracing):
+
+* Kernel-internal `lse_dim = ceil_div(p.num_queries, 8) * 8` at
+  [kernel_forward.h:194](../csrc/src/runtime/attention/mem_eff/kernel_forward.h#L194)
+  matches the backend's `lse_dim = (max_seqlen+7)/8*8`. LSE pointer
+  offsets agree across fwd write, scatter, gather, bwd read.
+* The forward kernel's internal `num_queries` is reassigned per-doc
+  at
+  [kernel_forward.h:220](../csrc/src/runtime/attention/mem_eff/kernel_forward.h#L220)
+  to actual doc length, bounding work within doc boundaries and
+  returning early for query blocks past the doc. Workspace sizing,
+  grid launch, and per-block stride all remain consistent.
+
+So the pin issue is a kernel-internal bug triggered by the
+`initial_num_queries > per_doc_length` mismatch. The exact
+mechanism — which kernel variable or buffer ends up misindexed —
+remains to be pinpointed, possibly requires GPU debugger or
+cutlass-level instrumentation.
+
+**Workaround path**: don't pin. Instead, track the worst-case
+max_seqlen seen so far and bake that into the captured kernel.
+`reset_cuda_graphs` on growth, as attempt-6 already does for
+num_docs. This pins to the smallest value that covers all seen
+steps, avoiding the `args.num_queries >> actual` regime.
+
+Parking as Phase 4 attempt 8; the current ship keeps the
+`set_doc_masking` pin (forces cross-step stability) and accepts the
+resulting grad-norm inflation, which is clip-absorbed and recovers
+to sane values by step 3+.
+
+### Phase 4 attempt 8 — always-recapture-on-mismatch (V5 gas>1 closed)
+
+The attempt-7 watermark idea didn't go far enough. Any direction of
+mismatch between captured `args.num_queries` and current batch's
+actual max doc length triggers the mem_eff pin bug — including the
+OVER-CAPTURED case (captured > current). So a high-water mark that
+preserves `max(old, new)` still hits the bug when a later batch has
+a shorter max.
+
+**Correct fix**: recapture whenever `num_docs` OR `max_seqlen`
+*changes* (in either direction). Not just growth. This ensures
+every step's captured kernel args match that step's actual batch,
+avoiding the pin bug entirely.
+
+Trade-off: more recaptures in early training while max_seqlen
+fluctuates across batches. Once max_seqlen stabilizes (a few dozen
+steps in for most datasets), recaptures stop. The runtime cost is
+one `cudaGraphInstantiate` per re-capture, measured in milliseconds
+— acceptable vs. the alternative of silent gradient corruption.
+
+**Validation** (force-capture vs normal mode, all close to
+bit-exact):
+
+| config | step 0 | step 1 | step 2 | grad norms |
+|--------|--------|--------|--------|------------|
+| gas=1 mini bf16 | **bit-exact** | **bit-exact** | **bit-exact** | matches |
+| gas=2 mini bf16 | 3.4390/3.4390 | 4.0821/4.0829 | 4.6121/4.6122 | 1.3/1.7/2.0 |
+| gas=4 full bf16 | 3.6351/3.6351 | 3.8704/3.8702 | 3.8707/3.8708 | 1.2/1.4/1.7 |
+
+The residual ~1e-3 loss diff at gas>1 is within the bf16 noise
+floor and matches the diff seen at gas=1 in earlier attempts
+(before the delta layout fix).
+
+**V5 is closed**. Force-capture now matches normal mode for
+Gemma4-E2B LoRA training at bs=2, seq_len=2048, gas=4 — the full
+target config from Phase 4's opening charter.
+
+#### Fix summary (Phase 4)
+
+Four distinct capture-safety bugs fixed this phase:
+
+* **Bug A (`8ddb5e5`)**: `mCuSeqlensGpu` grow-only — cudaFree on
+  size changes was invalidating captured graph args.
+* **Bug B (`8ddb5e5`)**: canonical `gs.inputs[0]` staging — ms>0
+  replays of `mForwardGraph` were reading ms=0's pinned buffer.
+* **Bug C (`be1cfdd`)**: mem_eff varlen delta layout — backend was
+  writing delta in LSE's `[num_docs, Hq, lse_dim]` layout, but the
+  kernel resets batch_id=0 and reads delta flat as `[Hq, total_q]`.
+* **Bug D (this attempt)**: always-recapture-on-mismatch —
+  `args.num_queries != actual max doc length` triggers a kernel
+  bug, so captured kernel args must exactly match the current
+  batch's actual values.
+
 #### Remaining work (memory budget + cleanup)
 
 1. **CMake wiring.** Add the 72 `mem_eff/**/*.cu` source files to

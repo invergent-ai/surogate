@@ -399,7 +399,8 @@ private:
     int mDocMaskingNumDocs = 0;
     int mDocMaskingMaxSeqlen = 0;
     int mDocMaskingTotalQ = 0;
-    int mCapturedNumDocs = 0;  // high-water num_docs seen during capture (force-full-capture only)
+    int mCapturedNumDocs = 0;    // high-water num_docs seen during capture (force-full-capture only)
+    int mCapturedMaxSeqlen = 0;  // high-water max_seqlen seen during capture (force-full-capture only)
 
     // Layer-to-weight-names map for prefetching
     std::vector<std::vector<std::string>> mLayerWeightNames;

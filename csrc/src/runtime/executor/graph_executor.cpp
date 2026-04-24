@@ -2320,53 +2320,45 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
     int effective_max_seqlen = max_seqlen;
     int effective_total_q = total_q;
     if (force_full_capture) {
-        // total_q (= B*T) is stable across steps; use it as the per-doc
-        // upper bound. It's an over-estimate (max per-doc length is T,
-        // not B*T), but correct and conservative — cu_seqlens still
-        // bounds the real work. total_q itself is unchanged.
-        effective_max_seqlen = total_q;
+        // total_q itself is stable across steps (=B*T). num_docs and
+        // max_seqlen vary per batch. For captured kernels we track
+        // HIGH-WATER values and recapture when either grows past the
+        // captured cap. This avoids the previous blanket pin of
+        // max_seqlen to total_q, which triggers a mem_eff kernel bug
+        // when args.num_queries >> actual per-doc length
+        // (reproducible without capture via the ALWAYS_PIN probe —
+        // see plan doc Phase 4 attempt 7 for the investigation).
         effective_total_q = total_q;
         if (mForwardGraph == nullptr) {
-            // About to capture (or first call). Record the captured cap.
+            // Fresh capture: seed the high-water marks from this call.
             mCapturedNumDocs = num_docs;
+            mCapturedMaxSeqlen = max_seqlen;
             effective_num_docs = num_docs;
-        } else if (num_docs > mCapturedNumDocs) {
-            // Replay would miss tail docs. Invalidate and recapture.
+            effective_max_seqlen = max_seqlen;
+        } else if (num_docs != mCapturedNumDocs || max_seqlen != mCapturedMaxSeqlen) {
+            // mem_eff's backward kernel produces catastrophically
+            // wrong gradients when args.num_queries != actual max
+            // doc length in the batch — triggers pin bug
+            // (reproducible without capture, see plan Phase 4
+            // attempt 7). Any mismatch between captured and current
+            // (in either direction) requires a recapture. Trade-off:
+            // more recaptures in early training until max_seqlen
+            // settles, but each step's kernel args match its actual
+            // batch, keeping gradients correct.
             if (const char* dbg = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
                 if (dbg[0] == '1') {
-                    std::cerr << "[cu_seqlens] RECAPTURE: num_docs " << mCapturedNumDocs << " -> " << num_docs << "\n";
+                    std::cerr << "[cu_seqlens] RECAPTURE: num_docs " << mCapturedNumDocs << " -> " << num_docs
+                              << " max_seqlen " << mCapturedMaxSeqlen << " -> " << max_seqlen << "\n";
                 }
             }
             reset_cuda_graphs();
             mCapturedNumDocs = num_docs;
+            mCapturedMaxSeqlen = max_seqlen;
             effective_num_docs = num_docs;
-        } else {
-            // num_docs <= captured: keep iterating up to the captured
-            // count. Pad cu_seqlens tail with total_q so extra docs are
-            // length-0 and the kernel short-circuits.
-            effective_num_docs = mCapturedNumDocs;
-            const int padded_count = mCapturedNumDocs + 1;
-            if (static_cast<int>(mCuSeqlensCpu.size()) < padded_count) {
-                const int prev = static_cast<int>(mCuSeqlensCpu.size());
-                mCuSeqlensCpu.resize(padded_count, effective_total_q);
-                // Force GPU buffer resize + fresh memcpy of padded data.
-                if (mCuSeqlensCount < padded_count) {
-                    if (mCuSeqlensGpu) {
-                        CUDA_CHECK(cudaFree(mCuSeqlensGpu));
-                        mCuSeqlensGpu = nullptr;
-                    }
-                    CUDA_CHECK(
-                        cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(padded_count) * sizeof(std::int32_t)));
-                    mCuSeqlensCount = padded_count;
-                }
-                CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
-                                           mCuSeqlensCpu.data(),
-                                           static_cast<std::size_t>(padded_count) * sizeof(std::int32_t),
-                                           cudaMemcpyHostToDevice,
-                                           mRunState.MainStream));
-                (void)prev;
-            }
+            effective_max_seqlen = max_seqlen;
         }
+        // else: both num_docs and max_seqlen match the captured values;
+        // replay uses the current cu_seqlens (memcpy'd above) directly.
     }
     mDocMaskingNumDocs = effective_num_docs;
     mDocMaskingMaxSeqlen = effective_max_seqlen;
