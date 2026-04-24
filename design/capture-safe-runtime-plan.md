@@ -683,3 +683,68 @@ Expect V5+ to follow similar patterns. The harness + incremental-fix
 strategy has proven much more reliable than batch-changing and crashing
 into walls. Each attempt ships ~200 LoC and clears one class of
 invariant.
+
+## Phase 2 attempt 5 — V4 fix: block-scope FwdStack snapshot restore widened
+
+### Root cause (V4)
+
+Under full-step capture with `gas > 1`, multiple micro-step forward+backward
+pairs run in sequence. Only micro-step 0's forward actually executes C++
+host code (runs through `CompiledExecutor::execute_forward`); subsequent
+micro-steps' forwards are CUDA-graph replays that bypass C++ dispatch.
+But each micro-step's **backward** DOES run host code (it captures its
+own backward graph when `graph_idx=1` on the first `micro_step>0`).
+
+`execute_backward` entry clears `mTensors.assign(..., Tensor{})` and
+restores from `mForwardTensorsSnapshot`. The existing restore only
+covered tids whose snapshot `Data` pointer fell within the narrow
+`fwd_stack_ptr`/`save_for_bwd_ptr` sub-ranges. Block-scope FwdStack tids
+that `ensure_output_tensor`'s slow path temp-alloc'd outside those
+arena windows (Gemma4's `pli_flat` is a view whose Data inherits from
+`pli_narrow_layer*`, itself temp-alloc'd) weren't in range → restore
+skipped → `mTensors[2362]` stayed `Tensor{}` for micro-step N+1's
+backward → `dispatch_mul_backward` read wrong-shape / nil tensor.
+
+### Fix
+
+`execute_backward`'s snapshot-restore now also covers FwdStack-region
+tids with any non-null snapshot Data (not just arena-bound ones). The
+comment explains why this is safe: the snapshot carries correct
+metadata from the forward that last ran through host code; the Data
+pointer remains valid across fwd→bwd within a step (Stack isn't rolled
+back there); nothing worse than restoring a stale metadata Tensor struct
+— which is exactly what the block-scope consumers need.
+
+### Validation
+
+- Normal-mode harness: green (loss 3.6317 / 3.8802 / 3.8936 — steps 1-2
+  drift +0.1 vs baseline, well within band; likely noise from stats-RNG
+  path differences).
+- Force-capture: **training completes 3 steps end-to-end for the first
+  time**. Loss is 4.93 / 5.83 / 6.45 (out-of-band upward divergence).
+
+### V5 surfaces
+
+Force-capture now runs without crashing but loss diverges upward. Likely
+causes:
+1. Captured graph uses captured-time pointers that point to Stack-temp
+   memory reused across steps → reads stale data from overwritten stack
+   region. The baked pointer is numerically the same but the underlying
+   bytes aren't what the op captured.
+2. Some tensor we didn't cover gets numerically wrong values.
+
+Different class from V1-V4 (those were crashes/errors). V5 is silent
+correctness drift — harder to localize without per-op-level loss
+comparison.
+
+Recommended next attempt: extend the harness to diff intermediate
+activations (using `surogate debug diff`) between captured and
+non-captured paths at specific layer checkpoints. Track where the
+first NaN-equivalent drift appears.
+
+### Session bottom line
+
+V2+V3+V4 are structurally cleared. Force-capture progresses from
+"immediate crash" to "3-step divergent run." Remaining work is
+numerical rather than structural — still non-trivial but a different
+problem shape.
