@@ -961,3 +961,10 @@ dispatcher is decided.
 7. **Gemma4 validation.** Re-run the gas=1 force-capture harness;
    step 2 loss should now match normal mode (both modes using the
    new mem_eff backend for the Hs=512 layers).
+8. **Remove SDPAAttention.** Once mem_eff covers every case SDPA
+   handled today (packed + dense, all head dims), delete
+   `csrc/src/runtime/attention/backend_sdpa.cpp`, its registry
+   entry, and any tests that target SDPA specifically. The priority
+   table collapses to cuDNN(100) / mem_eff(95) / flash_varlen(90).
+   Dead code removal — no migration shim needed since the selection
+   is hidden behind the registry.
