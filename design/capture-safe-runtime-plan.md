@@ -868,3 +868,96 @@ split-attention fallback. Validate on a smaller model (Llama-3-1B or
 Mistral-small, both Hs ≤ 128) where flash-varlen covers every layer
 and the current attempt-6 pinning should make force-capture
 correctness-safe end-to-end.
+
+## Phase 4 attempt 1 — port PyTorch mem-efficient attention (in-flight)
+
+### Motivation
+
+V5 analysis showed SDPAAttention's per-doc Python slicing is
+fundamentally capture-unsafe (offsets baked at capture time). PyTorch's
+`_efficient_attention_forward` (the cutlass kernel under
+`aten/src/ATen/native/transformers/cuda/mem_eff_attention/`) has three
+properties that make it the right replacement:
+
+- **Device-pointer `seqstart_q/k`** — doc dispatch lives inside the
+  kernel via `tl.load(seqstart_q_ptr + batch_id)` at
+  [kernel_forward.h:213](../csrc/src/runtime/attention/mem_eff/kernel_forward.h#L213).
+- **Unbounded head_dim via kMaxK iteration** — `kMaxK=65536` template
+  variant (`cutlassF_bf16_aligned_32x128_gmem_sm80` in upstream's
+  auto-generated kernels) lets the kernel loop over K blocks instead
+  of keeping the whole K dimension in shared memory. Handles Hs=512
+  without a kernel rewrite.
+- **Over-sized launch grid + in-kernel bounds check** — line 233:
+  `if (query_start >= num_queries) return false;`. The outer grid can
+  be pinned to worst-case at capture time; blocks whose
+  `seqstart_q_ptr[batch_id]` places them past a doc's actual length
+  at replay no-op cleanly. Matches attempt-6's cu_seqlens pinning
+  strategy exactly.
+
+### This-session deliverables (foundation commit)
+
+Everything below is committed together as the "ground floor" —
+subsequent sessions start from a state where the kernel source is in
+tree, the PyTorch deps are stubbed out, and the shape of the
+dispatcher is decided.
+
+- **Headers extracted** to
+  [csrc/src/runtime/attention/mem_eff/](../csrc/src/runtime/attention/mem_eff)
+  (72 files, ~20k LOC, 992 KiB). Upstream license is BSD-3-Clause
+  (Meta/xformers lineage) — compatible with Apache-2.0.
+- **Include paths rewritten** from
+  `ATen/native/transformers/cuda/mem_eff_attention/…` →
+  `runtime/attention/mem_eff/…`.
+- **PyTorch compat shim** at
+  [mem_eff/aten_compat.h](../csrc/src/runtime/attention/mem_eff/aten_compat.h):
+  stubs for `at::PhiloxCudaState` (dropout is compiled out via the
+  `kSupportsDropout=false` template parameter), `at::ScalarType`,
+  `at::cuda::philox::unpack`, and a `TORCH_CHECK` macro that throws
+  `std::runtime_error` instead of `c10::Error`.
+- **Dispatcher header**
+  [mem_eff/mem_eff_dispatch.h](../csrc/src/runtime/attention/mem_eff/mem_eff_dispatch.h)
+  declares a `surogate::mem_eff::forward_bf16_sm80(ForwardArgs)` entry
+  point with the minimum surface area to drive the kernel from our
+  runtime.
+- **Dispatcher skeleton**
+  [mem_eff/mem_eff_dispatch.cu](../csrc/src/runtime/attention/mem_eff/mem_eff_dispatch.cu)
+  wires the GMEM variant (`kMaxK=65536`, 32×128 blocks), constructs
+  `AttentionKernel::Params`, computes the launch grid, and launches.
+  Not yet integrated into the CMake build — see "Remaining work".
+- **Bit-exact test skeleton** at
+  [tests/test_mem_eff_attention_pytorch_compat.py](../tests/test_mem_eff_attention_pytorch_compat.py).
+  Generates deterministic inputs, runs the ported kernel alongside
+  PyTorch's `scaled_dot_product_attention` with
+  `SDPBackend.EFFICIENT_ATTENTION` forced. Because both paths dispatch
+  to the same cutlass kernel, `torch.equal` (bit-exact) is the
+  correctness target. Gated on a `hasattr` check for the Python
+  binding — tests skip cleanly until the binding lands.
+
+### Remaining work (follow-up sessions)
+
+1. **CMake wiring.** Add the 72 `mem_eff/**/*.cu` source files to
+   `surogate-common` target (or a new static library). Need to set
+   the cutlass include path and restrict compute capabilities to
+   sm_80..sm_121 (the range the kernel instantiations gate on).
+2. **Python binding.** Expose `mem_eff_attention_forward(q, k, v,
+   causal=, softmax_scale=, window_size=, cu_seqlens_q=,
+   cu_seqlens_k=)` from
+   `csrc/src/binding/binding.cpp`. Argument shapes match the
+   test-skeleton file so the existing tests light up on first build.
+3. **First compile pass.** Resolve template errors (expect 1-2 rounds
+   around `dispatch_policy.hpp` cutlass API changes between xformers
+   cutlass 3.x and our cutlass 4.4.1). Start with GMEM variant only;
+   skip register-file variants until the foundation compiles.
+4. **Run the bit-compat test.** If outputs match bit-exact, the port
+   is correct. Any divergence likely points at an include-path or
+   struct-layout issue in the compat shim.
+5. **Backward.** `kernel_backward.h` has the same structure; repeat
+   the above for `cutlassB_bf16_aligned_k65536.cu`.
+6. **Backend registry integration.** Wrap as
+   `backend_mem_eff_varlen` with priority 95 (between cuDNN=100 and
+   flash-varlen=90). Gate selection on `Hs > 256 && cu_seqlens
+   != nullptr` so it only fires where flash-varlen cedes and SDPA
+   would otherwise run.
+7. **Gemma4 validation.** Re-run the gas=1 force-capture harness;
+   step 2 loss should now match normal mode (both modes using the
+   new mem_eff backend for the Hs=512 layers).
