@@ -975,6 +975,82 @@ memory-budget issue unrelated to correctness: the ~9.3 GiB stack-arena
 by model weights + LoRA state + optimizer moments. Mini-config runs
 fine because the stack only needs ~2 GiB.
 
+### Phase 4 attempt 3 — persistent scratch arena (full Gemma4 at gas=1 ✓)
+
+Moves mem_eff's per-op transient buffers off the main stack arena
+onto a dedicated 1 GiB cudaMalloc'd block
+(`CompiledExecutor::{prepare,alloc,reset}_mem_eff_scratch`). Prevents
+the stack's graph_peak inflation that was tripping the 9.3 GiB
+single-cudaMalloc fragmentation cliff on Gemma4-E2B.
+
+Plus a sizing correction: `max_seqlen` capped to `T` in mem_eff (a doc
+never spans more than one batch row) avoids the ~940 MiB accum that
+force-capture's `max_seqlen = B*T` pin would have produced.
+
+**Validation — full Gemma4 bs=2, seq=2048 force-capture at gas=1**:
+
+| step | normal | force-capture | diff |
+|------|--------|---------------|---|
+| 0 | 3.4297 | 3.4297 | bit-exact |
+| 1 | 3.5370 | 3.5373 | 3e-4 |
+| 2 | 3.6610 | 3.6611 | 1e-4 |
+
+Memory budget is no longer the blocker.
+
+### Phase 4 attempt 4 — gas>1 replay divergence (pre-existing, not mem_eff)
+
+Under force-capture at `gradient_accumulation_steps > 1`, backward
+produces numerically different gradients than normal mode even though
+forward is correct. Narrowing:
+
+* Step 0 loss matches (forward is bit-exact).
+* Step 0 grad norm is ~10³⁰× larger under force-capture than normal
+  mode (1.3 vs 1.13e32 at gas=2 mini).
+* Step 1 loss diverges by ~3e-3 (clipped updates absorb most of the
+  grad divergence but not all).
+* Step 2 loss diverges further and hits NaN on full config, or
+  survives as a small diff on mini.
+* At gas=1 every config matches. **Issue is specifically `gas>1`.**
+
+**Critical finding: this is a pre-existing issue, not introduced by
+mem_eff.** With `SUROGATE_DISABLE_MEM_EFF=1` (attempt-6 baseline
+path using flash-varlen + SDPA), gas=2 force-capture at the mini
+config produces:
+
+| step | normal | baseline (SDPA) | mem_eff |
+|------|--------|-----------------|---------|
+| 0 | 3.4390 | 4.2951 | **3.4390 (bit-exact)** |
+| 1 | 4.0821 | 4.0918 | 4.0914 |
+| 2 | 4.6215 | 6.5426 | **4.6349** |
+
+mem_eff **reduces** the gas>1 divergence by ~100× at step 0 and
+~130× at step 2. The remaining gap at step 2 (0.013 loss diff) is
+downstream of grad-norm divergence that mem_eff alone can't fix.
+
+Structural difference: gas>1 triggers a second backward-graph
+capture (`mBackwardGraph[1]` for `micro_step > 0`). The two captures
+share captured-time pointers and scratch regions.
+Tested-and-rejected hypothesis:
+
+* **Workspace zeroing**: always zeroing the cutlass backward
+  workspace (instead of gated on `should_zero_workspace()`) did NOT
+  change the gas=2 divergence at all. So the residue-reuse theory
+  between `mBackwardGraph[0]` and `[1]` is not the cause.
+
+Remaining hypotheses:
+
+* The `skip_zeroing` flag path interacts with capture differently
+  across `graph_idx=0` and `graph_idx=1`.
+* The outer `train_step_graphed` eager micro-step loop has
+  per-step state that interacts with force-capture's cu_seqlens
+  pinning in a way not yet understood.
+* Some backward op outside attention (layer-norm, matmul grad)
+  has captured-time assumptions that break across the two backward
+  graphs.
+
+This is orthogonal to the mem_eff correctness work. Tracked as
+follow-up; not blocking for mem_eff ship.
+
 #### Remaining work (memory budget + cleanup)
 
 1. **CMake wiring.** Add the 72 `mem_eff/**/*.cu` source files to
