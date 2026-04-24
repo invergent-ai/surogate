@@ -7,20 +7,20 @@
 # Build:
 #   docker build -f Dockerfile.cu130 \
 #     --build-arg PACKAGE_VERSION=0.1.1 \
-#     -t ghcr.io/invergent-ai/surogate-trainer:0.1.1-cu130 .
+#     -t ghcr.io/invergent-ai/surogate:0.1.1-cu130 .
 #
 # Run:
-#   docker run --gpus all ghcr.io/invergent-ai/surogate-trainer:0.1.1-cu130 --help
+#   docker run --gpus all ghcr.io/invergent-ai/surogate:0.1.1-cu130 --help
 #   docker run --gpus all \
 #     -v /path/to/config.yaml:/config.yaml \
 #     -v /path/to/output:/output \
-#     ghcr.io/invergent-ai/surogate-trainer:0.1.1-cu130 sft /config.yaml
+#     ghcr.io/invergent-ai/surogate:0.1.1-cu130 sft /config.yaml
 
 FROM ubuntu:noble-20260210.1
-LABEL org.opencontainers.image.source=https://github.com/invergent-ai/surogate-trainer
+LABEL org.opencontainers.image.source=https://github.com/invergent-ai/surogate
 ARG PACKAGE_VERSION=0.1.1
 ARG CUDA_TAG=cu130
-ARG WHEEL_URL=https://github.com/invergent-ai/surogate-trainer/releases/download/v${PACKAGE_VERSION}/surogate_trainer-${PACKAGE_VERSION}+${CUDA_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
+ARG WHEEL_URL=https://github.com/invergent-ai/surogate/releases/download/v${PACKAGE_VERSION}/surogate-${PACKAGE_VERSION}+${CUDA_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
 ARG DSTACK_RUNNER_VERSION=0.20.18
 
 ENV DEBIAN_FRONTEND=noninteractive

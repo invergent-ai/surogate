@@ -10,7 +10,7 @@ if [ -z "$HOME" ]; then
     [ -z "$HOME" ] && [ "$(id -u)" -eq 0 ] && export HOME="/root"
 fi
 
-REPO="invergent-ai/surogate-trainer"
+REPO="invergent-ai/surogate"
 VENV_DIR=".venv"
 
 # Check for required tools
