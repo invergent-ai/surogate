@@ -14,7 +14,6 @@ from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.metrics import MoEMetrics, StepMetrics
-from surogate.train.metrics_writer import MetricsWriter
 from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
@@ -29,26 +28,6 @@ from surogate.utils.model import estimate_model_parameters
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
-
-
-def _gpu_util_to_dict(info) -> dict:
-    return {
-        "gpu_utilization": info.gpu_utilization,
-        "mem_utilization": info.mem_utilization,
-        "mem_free": info.mem_free,
-        "mem_reserved": info.mem_reserved,
-        "mem_total": info.mem_total,
-        "temperature": info.temperature,
-        "temp_slowdown": info.temp_slowdown,
-        "power": info.power,
-        "power_limit": info.power_limit,
-        "clock": info.clock,
-        "max_clock": info.max_clock,
-        "fan": info.fan,
-        "pcie_rx": info.pcie_rx,
-        "pcie_tx": info.pcie_tx,
-        "throttle_reason": info.throttle_reason,
-    }
 
 
 class SurogateTrainerWrapper:
@@ -276,8 +255,6 @@ class SurogateTrainerWrapper:
             self.warmup_steps = int(self.max_steps * config.warmup_ratio)
             logger.info(f"Derived {self.warmup_steps} warmup steps from warmup_ratio={config.warmup_ratio}")
 
-        self.metrics_writer = MetricsWriter()
-
         # Setup learning rate schedule
         self.lr_schedule = LRSchedule(
             base_lr=config.learning_rate,
@@ -392,11 +369,6 @@ class SurogateTrainerWrapper:
             logger.info(f"Total batch size: {self.total_batch_size} tokens")
             logger.info(f"Steps per epoch: {self.steps_per_epoch}")
             logger.info(f"Max steps: {self.max_steps}")
-            self.metrics_writer.log_config(
-                total_batch_size=self.total_batch_size,
-                steps_per_epoch=self.steps_per_epoch,
-                max_steps=self.max_steps,
-            )
             logger.info(
                 f"LR schedule: {self.config.lr_scheduler_type} (warmup={self.warmup_steps}, cooldown={self.config.cooldown_steps})"
             )
@@ -482,7 +454,6 @@ class SurogateTrainerWrapper:
                 # Generate training plot in output directory
                 generate_training_plot(self.config.log_file, Path(self.config.output_dir) / "training_plot.png")
 
-            self.metrics_writer.close()
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
 
     def run_training_loop_mm(self, train_logger: _surogate.TrainingRunLogger):
@@ -670,23 +641,8 @@ class SurogateTrainerWrapper:
                         metrics.loss,
                         metrics.lr,
                     )
-                self._write_step_metrics(metrics)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
-
-    def _write_step_metrics(self, metrics: StepMetrics) -> None:
-        gpu = [_gpu_util_to_dict(info) for info in self.trainer.get_gpu_info()]
-        self.metrics_writer.track(
-            step=metrics.step,
-            epoch=metrics.epoch,
-            loss=metrics.loss,
-            grad_norm=metrics.grad_norm,
-            lr=metrics.lr,
-            tokens=metrics.tokens,
-            elapsed_ms=metrics.elapsed_ms,
-            phase=metrics.phase,
-            gpu=gpu,
-        )
 
     def run_evaluation_mm(self, max_steps: int) -> tuple[float, int, int]:
         if max_steps == 0:
@@ -987,7 +943,6 @@ class SurogateTrainerWrapper:
                         metrics.loss,
                         metrics.lr,
                     )
-                self._write_step_metrics(metrics)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
