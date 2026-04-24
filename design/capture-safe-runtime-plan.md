@@ -1051,6 +1051,109 @@ Remaining hypotheses:
 This is orthogonal to the mem_eff correctness work. Tracked as
 follow-up; not blocking for mem_eff ship.
 
+### Phase 4 attempt 5 — two capture-correctness bugs in the force-capture path
+
+A deep trace of the gas>1 grad-norm blowup surfaced two pre-existing
+capture-correctness bugs in the doc-masking + force-capture eager
+micro-step loop. Both are fixed; they explain the *silent-corruption*
+failure modes this plan is chasing, even if they don't close the
+remaining grad-norm divergence on their own.
+
+#### Bug A — mCuSeqlensGpu cudaFree mid-training invalidates captured refs
+
+[graph_executor.cpp:set_doc_masking](../csrc/src/runtime/executor/graph_executor.cpp#L2267)
+reallocates `mCuSeqlensGpu` every time `num_docs + 1` changes (typical
+across micro-steps: 4→3→5 documents within a few calls).
+
+Flash-varlen and mem_eff kernel launches bake the `cu_seqlens` device
+pointer into the captured `mForwardGraph` / `mBackwardGraph[]`
+argument buffers at capture time. A subsequent `cudaFree` in
+`set_doc_masking` leaves those graphs pointing at freed memory;
+replays read whatever the CUDA allocator reuses that region for.
+
+**Evidence** (gas=2 mini, `SUROGATE_DEBUG_CU_SEQLENS=1`):
+
+```
+[cu_seqlens] gpu=0x...  count=5 -> 4 num_docs=3       # step 1 ms0: free+realloc
+[cu_seqlens] allocated gpu=0x...                      # fresh pointer
+[cu_seqlens] gpu=0x...  count=4 -> 5 num_docs=4       # step 1 ms1: free+realloc again
+```
+
+By step 2 the old-pointer references in the captured graphs point at
+completely unrelated memory.
+
+**Fix**: make `mCuSeqlensGpu` grow-only, pre-sized to the worst-case
+cap (`total_q + 1`, one document per token). Subsequent shrinks just
+update the tail; the pointer stays stable for the life of the
+executor.
+
+#### Bug B — mForwardGraph replays gs.inputs[0] for every micro-step
+
+Under force-full-capture, `py_train.cpp::train_step_graphed` takes
+the eager micro-step path (doc boundaries present, so the outer
+full-step capture is declined at
+[py_train.cpp:863](../csrc/src/binding/py_train.cpp#L863)). Inside
+that loop, `GraphExecutor::forward` captures `mForwardGraph` at
+ms=0 and replays it for ms>0 within the same step. The captured
+pinned-source H2D memcpy bakes `gs.inputs[0].Data` as its source;
+the replay for ms>0 re-reads `gs.inputs[0]`, not `gs.inputs[j]`.
+
+Under normal mode this doesn't trigger: doc-masking selects the
+split-attention path, `use_graphs=false`, and the memcpy runs
+eagerly per-call with the correct `gs.inputs[j]` source.
+
+**Fix**: under force-capture + doc_masking + gas>1, stage every
+micro-step's inputs/targets/position_ids through `gs.inputs[0]`,
+`gs.targets[0]`, `gs.position_ids[0]` and pass those stable
+buffers into `forward()`/`backward()`. The captured replay then
+reads the correct current-micro-step data from the stable baked
+source pointer.
+
+#### Residual issue — grad-norm blowup at gas>1 force-capture
+
+With both fixes shipped, losses still match normal mode at step 0
+bit-exact, and match closely downstream — but grad norms remain
+30 orders of magnitude larger under force-capture than under normal
+mode (1.31 vs 1.13e32 at gas=2 mini step 0; similar magnitude at
+full gas=4). The huge norms get clipped aggressively, so updates
+stay bounded and loss drift is small (~0.01 by step 2), but
+eventually one clip produces NaN.
+
+Reproduces equally under `SUROGATE_DISABLE_MEM_EFF=1` (attempt-6
+SDPA baseline) — confirming this is orthogonal to the attention
+backend. Also reproduces at gas=1 full config, ruling out
+micro-step interaction as the sole driver.
+
+Ruled out by probes:
+
+* `SUROGATE_DEBUG_EAGER_FWD=1` + `SUROGATE_DEBUG_EAGER_BWD=1`
+  (run forward/backward eagerly instead of via `mForwardGraph` /
+  `mBackwardGraph[]`) — grad norm unchanged. The inner CUDA-graph
+  capture/replay is not the bug.
+* `SUROGATE_DEBUG_BWD_PERSIST_IN_CAPTURE=1` (force the BwdCrossLayer
+  cross-layer persist to run during capture, lifting the `!capturing`
+  gate at
+  [compiled_ops_execute.cpp:2603](../csrc/src/runtime/executor/compiled_ops_execute.cpp#L2603))
+  — grad norm unchanged.
+
+Pending hypotheses for follow-up:
+
+* Stack checkpoint asymmetry between ms=0 (stack top advances
+  naturally after capture) and ms>0 (stack top is restored before
+  replay). ms>0 backward capture then allocates temps starting from
+  the pre-forward checkpoint, baking pointers that overlap the
+  forward region. Harmless for temps, but dangerous for any
+  Stack-owned tensor that fwd writes and bwd reads without going
+  through the SaveForBwd or FwdStack arenas.
+* The `mSplitAttentionGraphs=false` flat-ops path dispatches some
+  backward op (layer-norm grad, LoRA grad) differently than the
+  split-attention path, and the flat version has a capture-time
+  assumption that doesn't hold. Need per-op grad-norm
+  instrumentation to localize.
+
+Both require more targeted bisection than the allocated Phase 4
+budget permits; parking as V6 for a future sweep.
+
 #### Remaining work (memory budget + cleanup)
 
 1. **CMake wiring.** Add the 72 `mem_eff/**/*.cu` source files to

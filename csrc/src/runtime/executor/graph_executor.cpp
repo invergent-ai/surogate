@@ -2273,17 +2273,23 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
                       << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q << "\n";
         }
     }
-    // Reallocate GPU buffer if size changed
-    if (mCuSeqlensGpu && mCuSeqlensCount != count) {
-        CUDA_CHECK(cudaFree(mCuSeqlensGpu));
-        mCuSeqlensGpu = nullptr;
-    }
-    if (!mCuSeqlensGpu) {
-        CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(count) * sizeof(std::int32_t)));
-        mCuSeqlensCount = count;
+    // Grow-only GPU buffer. CUDA graph capture bakes mCuSeqlensGpu into
+    // the attention kernel's args buffer; shrinking via cudaFree would
+    // leave captured graphs pointing at freed memory, causing wrong-data
+    // reads on replay (visible as 1e32 grad norms at gas>1 force-capture).
+    if (!mCuSeqlensGpu || mCuSeqlensCount < count) {
+        if (mCuSeqlensGpu) {
+            CUDA_CHECK(cudaFree(mCuSeqlensGpu));
+            mCuSeqlensGpu = nullptr;
+        }
+        // Allocate to worst-case so subsequent shrinks never re-alloc.
+        // Worst case per-doc = 1 token → num_docs = total_q; count = total_q+1.
+        const int cap_count = std::max(count, total_q + 1);
+        CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(cap_count) * sizeof(std::int32_t)));
+        mCuSeqlensCount = cap_count;
         if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
             if (env[0] == '1') {
-                std::cerr << "[cu_seqlens] allocated gpu=" << mCuSeqlensGpu << "\n";
+                std::cerr << "[cu_seqlens] allocated gpu=" << mCuSeqlensGpu << " cap=" << cap_count << "\n";
             }
         }
     }
