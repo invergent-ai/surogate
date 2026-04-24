@@ -21,6 +21,7 @@ LABEL org.opencontainers.image.source=https://github.com/invergent-ai/surogate-t
 ARG PACKAGE_VERSION=0.1.1
 ARG CUDA_TAG=cu130
 ARG WHEEL_URL=https://github.com/invergent-ai/surogate-trainer/releases/download/v${PACKAGE_VERSION}/surogate_trainer-${PACKAGE_VERSION}+${CUDA_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
+ARG DSTACK_RUNNER_VERSION=0.20.18
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_LIB_ROOT="/root/.venv/lib/python3.12/site-packages/nvidia"
@@ -51,6 +52,10 @@ RUN ~/.local/bin/uv pip install "torch==2.10.0+${CUDA_TAG}" "torchvision==0.25.0
 RUN ~/.local/bin/uv pip install "vllm==0.19.0"
 RUN ~/.local/bin/uv pip install ${WHEEL_URL}
 RUN ~/.local/bin/uv pip install "nvidia-cuda-runtime==13.1.80" "nvidia-cudnn-cu13>=9.10.2.21" "nvidia-nccl-cu13==2.29.3" "nvidia-cufile==1.16.1.26" "nvidia-cuda-nvrtc==13.1.115"
+
+# Add dstack launcher
+RUN curl --connect-timeout 60 --max-time 240 --retry 1 --output /usr/local/bin/dstack-runner https://dstack-runner-downloads.s3.eu-west-1.amazonaws.com/${DSTACK_RUNNER_VERSION}/binaries/dstack-runner-linux-amd64 \
+    && chmod +x /usr/local/bin/dstack-runner
 
 # Default entrypoint
 ENTRYPOINT ["/root/.venv/bin/surogate"]
