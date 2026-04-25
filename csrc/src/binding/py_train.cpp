@@ -849,6 +849,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         // correctly. Cap-and-pad mode is enabled before
         // cudaStreamBeginCapture below; per-launch cu_seqlens recomputes
         // happen right before cudaGraphLaunch.
+        // Mirror dsl::compute_doc_masking: only WITHIN-ROW transitions
+        // count as doc boundaries. Multi-row batches (B>1) without packed
+        // sequences would otherwise look like they have "boundaries" at
+        // every row transition (pos[T] -> 0), which is wrong.
         bool has_doc_boundaries = false;
         std::vector<std::vector<std::int32_t>> per_ms_cu_seqlens(micro_steps);
         std::vector<int> per_ms_total_q(micro_steps, 0);
@@ -858,9 +862,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 auto& cu = per_ms_cu_seqlens[j];
                 cu.clear();
                 cu.push_back(0);
-                int doc_start = 0;
                 for (int b = 0; b < B; ++b) {
                     const int row_base = b * T;
+                    int doc_start = row_base;
                     for (int t = 1; t < T; ++t) {
                         const int idx = row_base + t;
                         if (pos[idx] - pos[idx - 1] != 1) {
@@ -872,7 +876,6 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     }
                     const int last_len = (b + 1) * T - doc_start;
                     if (last_len > 0) cu.push_back(cu.back() + last_len);
-                    doc_start = (b + 1) * T;
                 }
                 per_ms_total_q[j] = static_cast<int>(B * T);
             }
