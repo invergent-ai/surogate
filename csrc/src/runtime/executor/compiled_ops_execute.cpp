@@ -1771,12 +1771,27 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // pointers auto-reset via the bump cursor, but fallback allocations
     // must be explicitly released.
     mBwdCrossLayerBumpOffset = 0;
-    for (std::byte* ptr : mBwdCrossLayerFallbacks) {
-        if (ptr) {
-            (void)cudaFree(ptr);
+    // cudaFree during stream capture invalidates the capture, so defer
+    // the fallback-cleanup to the next non-capturing entry. Fallbacks
+    // only ever get appended in the bwd_cross_layer-arena overflow path
+    // (eager-only — that allocator throws under capture), so it's safe
+    // to skip the free loop entirely here. The vector is cleared
+    // unconditionally so the bump cursor reset stays consistent.
+    {
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(mRunState.MainStream, &cap_status);
+        const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
+        if (!capturing) {
+            for (std::byte* ptr : mBwdCrossLayerFallbacks) {
+                if (ptr) {
+                    (void)cudaFree(ptr);
+                }
+            }
+            mBwdCrossLayerFallbacks.clear();
         }
+        // Under capture: leave any existing fallback pointers in the
+        // vector. They'll be freed on the next non-capturing entry.
     }
-    mBwdCrossLayerFallbacks.clear();
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward

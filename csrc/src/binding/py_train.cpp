@@ -856,11 +856,17 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             }
         }
 
-        // If graphs are disabled or packed sequences need doc masking, use eager execution.
-        // When doc boundaries are present but CUDA graphs are enabled, the GraphExecutor
-        // uses split-attention mode: non-attention ops are captured as per-segment CUDA
-        // graphs, while FlashAttention runs eagerly with per-step cu_seqlens.
-        if (!mOptions.UseCudaGraphs || has_doc_boundaries) {
+        // Phase 5: opt-in path that lets the outer full-step capture run even
+        // under sample_packing. Used to drive the Phase-0 inventory of
+        // capture-unsafe call sites. Production stays on the eager fallback
+        // until that inventory is closed and the captures are reliable.
+        const bool force_outer_capture = std::getenv("SUROGATE_DEBUG_FORCE_OUTER_CAPTURE") != nullptr;
+
+        // If graphs are disabled, or packed sequences need doc masking AND
+        // we're not in force-outer-capture mode, fall back to eager. Outer
+        // graph replay can't handle per-step cu_seqlens updates today; the
+        // force-outer-capture branch is a Phase-0 probe, not yet a fix.
+        if (!mOptions.UseCudaGraphs || (has_doc_boundaries && !force_outer_capture)) {
             const bool do_timing = mOptions.TriggerTimingEvents;
             if (do_timing && rs.TimingForwardStart.empty()) {
                 rs.setup_timing_events(micro_steps);
