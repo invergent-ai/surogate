@@ -843,18 +843,38 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                                    rs.MainStream));
 
         // Detect packed sequences with document boundaries in any micro-step.
-        // When present, fall back to eager execution because CUDA graph replay
-        // cannot handle per-step cu_seqlens updates for Flash Attention varlen.
+        // When present, the captured H2D memcpys for cu_seqlens read from
+        // per-ms slices of mCuSeqlensCpu and the captured kernel grid
+        // bakes in MAX_NUM_DOCS so any topology (within cap) replays
+        // correctly. Cap-and-pad mode is enabled before
+        // cudaStreamBeginCapture below; per-launch cu_seqlens recomputes
+        // happen right before cudaGraphLaunch.
         bool has_doc_boundaries = false;
+        std::vector<std::vector<std::int32_t>> per_ms_cu_seqlens(micro_steps);
+        std::vector<int> per_ms_total_q(micro_steps, 0);
         if (mOptions.DocMasking) {
-            for (int j = 0; j < micro_steps && !has_doc_boundaries; ++j) {
+            for (int j = 0; j < micro_steps; ++j) {
                 const auto* pos = reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data);
-                for (int t = 1; t < B * T; ++t) {
-                    if (pos[t] - pos[t - 1] != 1) {
-                        has_doc_boundaries = true;
-                        break;
+                auto& cu = per_ms_cu_seqlens[j];
+                cu.clear();
+                cu.push_back(0);
+                int doc_start = 0;
+                for (int b = 0; b < B; ++b) {
+                    const int row_base = b * T;
+                    for (int t = 1; t < T; ++t) {
+                        const int idx = row_base + t;
+                        if (pos[idx] - pos[idx - 1] != 1) {
+                            const int doc_len = idx - doc_start;
+                            if (doc_len > 0) cu.push_back(cu.back() + doc_len);
+                            doc_start = idx;
+                            has_doc_boundaries = true;
+                        }
                     }
+                    const int last_len = (b + 1) * T - doc_start;
+                    if (last_len > 0) cu.push_back(cu.back() + last_len);
+                    doc_start = (b + 1) * T;
                 }
+                per_ms_total_q[j] = static_cast<int>(B * T);
             }
         }
 
@@ -992,6 +1012,34 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             // observed high-water mark before capture begins so the
             // captured backward never falls back to cudaMalloc.
             dsl_model->prepare_bwd_cross_layer_for_capture();
+            // Cap-and-pad: when packed sequences are present, lock the
+            // captured kernel grid + scalar args (params.b, seqlen) to
+            // worst case so a single captured graph replays correctly
+            // for any per-step cu_seqlens topology within
+            // SUROGATE_OUTER_CAPTURE_MAX_DOCS (default 64). cu_seqlens
+            // contents are updated per-launch from a stable pinned host
+            // buffer below, before cudaGraphLaunch.
+            int max_num_docs = 64;
+            if (const char* env = std::getenv("SUROGATE_OUTER_CAPTURE_MAX_DOCS")) {
+                char* end = nullptr;
+                const long val = std::strtol(env, &end, 10);
+                if (end != env && val > 0) max_num_docs = static_cast<int>(val);
+            }
+            if (has_doc_boundaries) {
+                dsl_model->enable_doc_masking_pad_to_max(max_num_docs, micro_steps);
+                // Stage warmup-step cu_seqlens for each ms so the captured
+                // forward sees consistent shapes during capture.
+                const int total_q = static_cast<int>(B * T);
+                for (int j = 0; j < micro_steps; ++j) {
+                    auto& cu = per_ms_cu_seqlens[j];
+                    if (cu.size() <= 1) {
+                        // No boundaries this ms — synthesize a single
+                        // doc covering the full B*T span.
+                        cu.assign({0, total_q});
+                    }
+                    dsl_model->stage_cu_seqlens_for_micro_step(j, cu.data(), static_cast<int>(cu.size()), total_q);
+                }
+            }
             // Ensure the main stream is idle before beginning capture (no external dependencies).
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
             auto stack_cp = rs.Stack.checkpoint();
@@ -1073,6 +1121,21 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
 
         if (gs.has_stack_checkpoint) {
             rs.Stack.restore(DeviceMemoryStack::Checkpoint{gs.stack_top, gs.stack_alloc_count});
+        }
+        // Per-launch cu_seqlens update: write each ms's cu_seqlens into
+        // its slice of the pinned host buffer. The captured H2D memcpys
+        // pick up the new contents at the next launch (host pointer is
+        // stable, contents change). Without this, the captured graph
+        // would replay step 0's cu_seqlens for every subsequent step.
+        if (has_doc_boundaries) {
+            const int total_q = static_cast<int>(B * T);
+            for (int j = 0; j < micro_steps; ++j) {
+                auto& cu = per_ms_cu_seqlens[j];
+                if (cu.size() <= 1) {
+                    cu.assign({0, total_q});
+                }
+                dsl_model->stage_cu_seqlens_for_micro_step(j, cu.data(), static_cast<int>(cu.size()), total_q);
+            }
         }
         CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
         CUDA_CHECK(cudaDeviceSynchronize());

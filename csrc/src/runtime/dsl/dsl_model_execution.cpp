@@ -118,9 +118,13 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
             mExecutor->set_doc_masking(doc_info->cu_seqlens.data(),
                                        doc_info->num_docs,
                                        doc_info->max_seqlen,
-                                       doc_info->total_q);
+                                       doc_info->total_q,
+                                       micro_step);
             mDocMaskingActive = true;
         }
+    }
+    if (mOptions.DocMasking && !mDocMaskingActive) {
+        mExecutor->clear_doc_masking();
     }
 
     if (!lora_enabled()) {
@@ -158,9 +162,13 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
             mExecutor->set_doc_masking(doc_info->cu_seqlens.data(),
                                        doc_info->num_docs,
                                        doc_info->max_seqlen,
-                                       doc_info->total_q);
+                                       doc_info->total_q,
+                                       micro_step);
             mDocMaskingActive = true;
         }
+    }
+    if (mOptions.DocMasking && !mDocMaskingActive) {
+        mExecutor->clear_doc_masking();
     }
 
     if (!lora_enabled()) {
@@ -422,6 +430,27 @@ void DslModel::prepare_bwd_cross_layer_for_capture() {
     }
 }
 
+void DslModel::enable_doc_masking_pad_to_max(int max_num_docs, int num_micro_steps) {
+    if (mExecutor) {
+        mExecutor->enable_doc_masking_pad_to_max(max_num_docs, num_micro_steps);
+    }
+}
+
+void DslModel::stage_cu_seqlens_for_micro_step(int micro_step,
+                                               const std::int32_t* cu_seqlens_cpu,
+                                               int count,
+                                               int total_q) {
+    if (mExecutor) {
+        mExecutor->stage_cu_seqlens_for_micro_step(micro_step, cu_seqlens_cpu, count, total_q);
+    }
+}
+
+void DslModel::reissue_cu_seqlens_for_micro_step(int micro_step) {
+    if (mExecutor) {
+        mExecutor->reissue_cu_seqlens_for_micro_step(micro_step);
+    }
+}
+
 std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                                               const std::int32_t* targets,
                                               int B,
@@ -459,6 +488,8 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                                     doc_info->num_docs,
                                     doc_info->max_seqlen,
                                     doc_info->total_q);
+    } else if (mOptions.DocMasking) {
+        graph_exec->clear_doc_masking();
     }
 
     graph_exec->execute_logprobs_forward((long)B,
@@ -512,6 +543,8 @@ void DslModel::step_with_custom_loss(Tensor inputs,
                                     doc_info->num_docs,
                                     doc_info->max_seqlen,
                                     doc_info->total_q);
+    } else if (mOptions.DocMasking) {
+        graph_exec->clear_doc_masking();
     }
 
     auto& rs = *mRunState;
@@ -616,6 +649,8 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs,
                                     doc_info->num_docs,
                                     doc_info->max_seqlen,
                                     doc_info->total_q);
+    } else if (mOptions.DocMasking) {
+        graph_exec->clear_doc_masking();
     }
 
     auto& rs = *mRunState;

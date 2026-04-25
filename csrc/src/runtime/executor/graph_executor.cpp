@@ -2276,7 +2276,62 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs,
 // Document masking (Flash Attention varlen)
 // ============================================================================
 
-void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q) {
+void GraphExecutor::enable_doc_masking_pad_to_max(int max_num_docs, int num_micro_steps) {
+    if (max_num_docs <= 0 || num_micro_steps <= 0) return;
+    mDocMaskingPadMaxDocs = max_num_docs;
+    mDocMaskingPadMicroSteps = num_micro_steps;
+    // mCuSeqlensCpu is laid out as num_micro_steps slices, each of
+    // (max_num_docs+1) int32 entries. Each slice has a stable host
+    // address (no realloc once reserved), so captured H2D memcpys
+    // recording src=mCuSeqlensCpu.data()+slice_offset stay valid across
+    // replays.
+    const std::size_t slice_count = static_cast<std::size_t>(max_num_docs + 1);
+    const std::size_t total_count = static_cast<std::size_t>(num_micro_steps) * slice_count;
+    if (mCuSeqlensCpu.capacity() < total_count) {
+        mCuSeqlensCpu.reserve(total_count);
+    }
+    mCuSeqlensCpu.assign(total_count, 0);
+}
+
+void GraphExecutor::reissue_cu_seqlens_for_micro_step(int micro_step) {
+    if (mDocMaskingPadMaxDocs <= 0 || !mCuSeqlensGpu) return;
+    if (micro_step < 0 || micro_step >= mDocMaskingPadMicroSteps) return;
+    const std::size_t slice_count = static_cast<std::size_t>(mDocMaskingPadMaxDocs + 1);
+    const std::size_t slice_offset = static_cast<std::size_t>(micro_step) * slice_count;
+    if (slice_offset + slice_count > mCuSeqlensCpu.size()) return;
+    CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
+                               mCuSeqlensCpu.data() + slice_offset,
+                               slice_count * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               mRunState.MainStream));
+}
+
+void GraphExecutor::stage_cu_seqlens_for_micro_step(int micro_step,
+                                                    const std::int32_t* cu_seqlens_cpu,
+                                                    int count,
+                                                    int total_q) {
+    if (mDocMaskingPadMaxDocs <= 0) return;
+    if (micro_step < 0 || micro_step >= mDocMaskingPadMicroSteps) return;
+    const std::size_t slice_count = static_cast<std::size_t>(mDocMaskingPadMaxDocs + 1);
+    const std::size_t slice_offset = static_cast<std::size_t>(micro_step) * slice_count;
+    if (slice_offset + slice_count > mCuSeqlensCpu.size()) return;
+    // Copy actual cu_seqlens entries.
+    const int copy_count = std::min(count, mDocMaskingPadMaxDocs + 1);
+    for (int i = 0; i < copy_count; ++i) {
+        mCuSeqlensCpu[slice_offset + i] = cu_seqlens_cpu[i];
+    }
+    // Pad trailing slots with total_q so the kernel's per-doc seqlen
+    // computation yields 0 for empty docs (early-return in the kernel).
+    for (std::size_t i = static_cast<std::size_t>(copy_count); i < slice_count; ++i) {
+        mCuSeqlensCpu[slice_offset + i] = total_q;
+    }
+}
+
+void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu,
+                                    int num_docs,
+                                    int max_seqlen,
+                                    int total_q,
+                                    int micro_step) {
     const int count = num_docs + 1;
     // Reserve mCuSeqlensCpu to worst-case (total_q + 1 entries) up front so
     // its data() pointer stays stable across subsequent calls. Under full-
@@ -2288,29 +2343,47 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
     // returns), the replay reads from freed/relocated memory and the
     // captured graph crashes. Source the memcpy from the stable member
     // buffer instead.
-    if (mCuSeqlensCpu.capacity() < static_cast<std::size_t>(total_q + 1)) {
-        mCuSeqlensCpu.reserve(static_cast<std::size_t>(total_q + 1));
+    const bool pad_to_max = mDocMaskingPadMaxDocs > 0;
+    int memcpy_count = count;
+    int slice_offset = 0;
+    if (pad_to_max) {
+        const int padded_count = mDocMaskingPadMaxDocs + 1;
+        const int active_ms = std::clamp(micro_step, 0, mDocMaskingPadMicroSteps - 1);
+        slice_offset = active_ms * padded_count;
+        memcpy_count = padded_count;
+        // Stage actual cu_seqlens for this micro-step into its slice and
+        // pad trailing entries with total_q (empty doc slots). The kernel's
+        // actual_seqlen_q = cu_seqlens[bidb+1] - cu_seqlens[bidb] is 0
+        // for trailing slots, so the per-block early-return makes them
+        // no-ops. mCuSeqlensCpu is sized at enable time so the slice is
+        // always valid.
+        stage_cu_seqlens_for_micro_step(active_ms, cu_seqlens_cpu, count, total_q);
+    } else {
+        if (mCuSeqlensCpu.capacity() < static_cast<std::size_t>(total_q + 1)) {
+            mCuSeqlensCpu.reserve(static_cast<std::size_t>(total_q + 1));
+        }
+        mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
     }
-    mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
     if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
         if (env[0] == '1') {
-            std::cerr << "[cu_seqlens] gpu=" << mCuSeqlensGpu << " count=" << mCuSeqlensCount << " -> " << count
+            std::cerr << "[cu_seqlens] gpu=" << mCuSeqlensGpu << " count=" << mCuSeqlensCount << " -> " << memcpy_count
                       << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q
-                      << " cpu_data=" << static_cast<void*>(mCuSeqlensCpu.data()) << "\n";
+                      << " ms=" << micro_step << " pad=" << (pad_to_max ? 1 : 0) << " slice_off=" << slice_offset
+                      << " cpu_data=" << static_cast<void*>(mCuSeqlensCpu.data() + slice_offset) << "\n";
         }
     }
     // Grow-only GPU buffer. CUDA graph capture bakes mCuSeqlensGpu into
     // the attention kernel's args buffer; shrinking via cudaFree would
     // leave captured graphs pointing at freed memory, causing wrong-data
     // reads on replay (visible as 1e32 grad norms at gas>1 force-capture).
-    if (!mCuSeqlensGpu || mCuSeqlensCount < count) {
+    if (!mCuSeqlensGpu || mCuSeqlensCount < memcpy_count) {
         if (mCuSeqlensGpu) {
             CUDA_CHECK(cudaFree(mCuSeqlensGpu));
             mCuSeqlensGpu = nullptr;
         }
         // Allocate to worst-case so subsequent shrinks never re-alloc.
         // Worst case per-doc = 1 token → num_docs = total_q; count = total_q+1.
-        const int cap_count = std::max(count, total_q + 1);
+        const int cap_count = std::max(memcpy_count, total_q + 1);
         CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(cap_count) * sizeof(std::int32_t)));
         mCuSeqlensCount = cap_count;
         if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
@@ -2320,8 +2393,8 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
         }
     }
     CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
-                               mCuSeqlensCpu.data(),
-                               static_cast<std::size_t>(count) * sizeof(std::int32_t),
+                               mCuSeqlensCpu.data() + slice_offset,
+                               static_cast<std::size_t>(memcpy_count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice,
                                mRunState.MainStream));
     // Under full-step CUDA graph capture the flash-varlen kernel bakes
@@ -2345,7 +2418,17 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
     int effective_num_docs = num_docs;
     int effective_max_seqlen = max_seqlen;
     int effective_total_q = total_q;
-    if (force_full_capture) {
+    if (pad_to_max) {
+        // Cap-and-pad: lock the kernel-arg dims to worst case. The captured
+        // grid (num_m_block, params.b, params.h) is then independent of
+        // per-step doc topology — empty docs from padding become per-block
+        // no-ops via the kernel's `if (m_block * kBlockM >= actual_seqlen_q)
+        // return` guard. max_seqlen=total_q is the broadest single-doc
+        // bound (a single doc spanning all tokens).
+        effective_num_docs = mDocMaskingPadMaxDocs;
+        effective_max_seqlen = total_q;
+        effective_total_q = total_q;
+    } else if (force_full_capture) {
         // total_q itself is stable across steps (=B*T). num_docs and
         // max_seqlen vary per batch. For captured kernels we track
         // HIGH-WATER values and recapture when either grows past the
