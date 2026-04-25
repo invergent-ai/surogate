@@ -97,14 +97,9 @@ inline bool stream_is_capturing(cudaStream_t stream) {
 
 inline bool is_capture_unsafe_op_type(CompiledOpType type) {
     switch (type) {
-        // Qwen3.5 / Triton JIT kernels
-        case CompiledOpType::ChunkGatedDeltaRule:
-        case CompiledOpType::ChunkGatedDeltaRuleBackward:
-        case CompiledOpType::Qwen3_5Decay:
-        case CompiledOpType::Qwen3_5DecayBackward:
         // MoE routing / grouped GEMM rely on per-step host metadata and dynamic routing.
-        case CompiledOpType::MoESoftmax:
-        case CompiledOpType::MoESigmoid:
+        // (MoESigmoid/MoESoftmax are plain element-wise kernels reused by non-MoE
+        // models like Qwen3.5; they're capture-safe and intentionally excluded.)
         case CompiledOpType::MoETopK:
         case CompiledOpType::MoEPermute:
         case CompiledOpType::MoEGroupedGemm:
@@ -112,8 +107,6 @@ inline bool is_capture_unsafe_op_type(CompiledOpType type) {
         case CompiledOpType::MoEGroupedGemmDown:
         case CompiledOpType::MoEUnpermute:
         case CompiledOpType::MoEExpertBiasAdd:
-        case CompiledOpType::MoESoftmaxBackward:
-        case CompiledOpType::MoESigmoidBackward:
         case CompiledOpType::MoETopKBackward:
         case CompiledOpType::MoEPermuteBackward:
         case CompiledOpType::MoEGroupedGemmBackward:
