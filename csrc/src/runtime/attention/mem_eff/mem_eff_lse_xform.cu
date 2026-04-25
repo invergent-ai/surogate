@@ -3,7 +3,7 @@
 //
 //   Kernel layout (what the cutlass fwd writes, bwd reads):
 //     lse_kernel[num_docs, num_heads, lse_dim]  (fp32, contiguous)
-//     lse_dim = ceil(max_doc_seqlen, 8)
+//     lse_dim = ceil(max_doc_seqlen, 32)
 //
 //   Runtime layout (DSL's [B, Hq, T]):
 //     lse_runtime[B, num_heads, T]  (fp32, contiguous)

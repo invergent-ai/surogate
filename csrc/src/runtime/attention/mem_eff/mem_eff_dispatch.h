@@ -172,7 +172,8 @@ void compute_delta_bf16(const void* out,
 // d_qkv[..., Hkv:Hkv+1, :] / [..., Hkv+1:Hkv+2, :] regions (strideM =
 // HtotQKV * Hs so successive tokens land at the right offset).
 // LSE layout conversion helpers. The cutlass kernel writes / reads LSE
-// in [num_docs, num_heads, lse_dim] layout (lse_dim = ceil8(max_seqlen)).
+// in [num_docs, num_heads, lse_dim] layout (lse_dim = ceil32(max_seqlen),
+// matching AttentionKernel::kAlignLSE).
 // Our runtime exposes LSE as [B, num_heads, T]. Scatter runs after the
 // forward kernel; gather runs before the backward kernel.
 void lse_scatter_kernel_to_runtime(const float* lse_kernel,

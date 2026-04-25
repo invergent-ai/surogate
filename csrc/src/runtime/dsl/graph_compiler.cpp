@@ -5067,8 +5067,18 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
 
         // Pre-resolve inputs
         compiled.inputs.reserve(op.inputs.size());
-        for (const auto& input : op.inputs) {
-            compiled.inputs.push_back(resolve_tensor_ref(input, false, op, *env_ptr));
+        for (std::size_t i = 0; i < op.inputs.size(); ++i) {
+            auto ref = resolve_tensor_ref(op.inputs[i], false, op, *env_ptr);
+            if ((compiled.type == CompiledOpType::RMSNormBackward ||
+                 compiled.type == CompiledOpType::LayerNormBackward) &&
+                i == 3) {
+                ref.dtype = ETensorDType::FP32;
+                if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                    ref.shape = compiled.inputs[1].shape;
+                    ref.shape.pop_back();
+                }
+            }
+            compiled.inputs.push_back(ref);
         }
 
         // Pre-resolve outputs
@@ -5087,6 +5097,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             // overflowing into the next slot when the FP32 kernel writes.
             // Patch the dtype here, where we know the op semantics.
             if (compiled.type == CompiledOpType::FlashAttention && i == 1) {
+                ref.dtype = ETensorDType::FP32;
+            }
+            if ((compiled.type == CompiledOpType::RMSNorm || compiled.type == CompiledOpType::LayerNorm) && i == 1) {
                 ref.dtype = ETensorDType::FP32;
             }
 

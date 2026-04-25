@@ -1357,7 +1357,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     //     declared a view that the pre-bind already materialized); an
     //     empty-shape ref falls through to the canonical-shape cached
     //     path at the tail.
-    if (tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
+    if (ref.slot != TensorSlot::Saved && tid >= 0 && mCurrentGraph && static_cast<std::size_t>(tid) < mTensors.size()) {
         const auto& meta = mCurrentGraph->tensor_meta[static_cast<std::size_t>(tid)];
         const bool is_save_for_bwd = meta.region == dsl::RegionKind::SaveForBwd;
         const bool is_fwd_stack = meta.region == dsl::RegionKind::FwdStack && !ref.shape.empty();
@@ -1370,7 +1370,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     }
 
-    if (!ref.name.empty() && !bypass_named_for_rstd) {
+    if (ref.slot != TensorSlot::Saved && !ref.name.empty() && !bypass_named_for_rstd) {
         auto name_it = mNamedTensors.find(ref.name);
         if (name_it != mNamedTensors.end() && name_it->second.Data) {
             log_tensor(name_it->second, "named");
@@ -1428,7 +1428,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // Check flat tensor vector first for cached/aliased tensors (e.g., view_backward aliases).
     // This is critical because view_backward stores aliases, and subsequent ops
     // (like rmsnorm_backward) must use that aliased tensor, not a fresh temp.
-    if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+    if (ref.slot != TensorSlot::Saved && tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
         log_tensor(mTensors[static_cast<std::size_t>(tid)], "cached");
         return mTensors[static_cast<std::size_t>(tid)];
     }
@@ -1452,20 +1452,39 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             if (mSaved) {
                 auto it = mSaved->find(ref.name);
                 if (it != mSaved->end()) {
+                    auto tensor_matches_ref = [&](const Tensor& t) {
+                        if (!t.Data) {
+                            return false;
+                        }
+                        if (t.DType != ref.dtype) {
+                            return false;
+                        }
+                        if (!ref.shape.empty() && shape_nelem(ref.shape) != static_cast<std::size_t>(t.nelem())) {
+                            return false;
+                        }
+                        return true;
+                    };
                     // If the saved tensor has actual data, use it directly.
                     // Only resolve from live buffers when Data == nullptr (metadata-only mode).
-                    if (it->second.Data != nullptr) {
+                    if (tensor_matches_ref(it->second)) {
                         return it->second;
+                    }
+                    if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() &&
+                        tensor_matches_ref(mTensors[static_cast<std::size_t>(tid)])) {
+                        return mTensors[static_cast<std::size_t>(tid)];
                     }
                     // Metadata-only: resolve from current live tensors first.
                     if (Tensor* live = try_resolve_saved_live(ref.name, it->second)) {
-                        return *live;
+                        if (tensor_matches_ref(*live)) {
+                            return *live;
+                        }
                     }
                     // As a last resort, reuse cached tensor-id only if it points to
                     // persistent (non-stack) memory; stack pointers can become stale
                     // across layer checkpoint restores under recompute/capture.
                     if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data &&
-                        !mRunState.Stack.owns(mTensors[static_cast<std::size_t>(tid)].Data)) {
+                        !mRunState.Stack.owns(mTensors[static_cast<std::size_t>(tid)].Data) &&
+                        tensor_matches_ref(mTensors[static_cast<std::size_t>(tid)])) {
                         return mTensors[static_cast<std::size_t>(tid)];
                     }
                     return it->second;

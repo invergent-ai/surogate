@@ -22,6 +22,8 @@
 namespace dsl {
 namespace {
 
+constexpr int kMemEffLseAlignment = 32;
+
 class MemEffAttention final : public AttentionBackend {
 public:
     const char* name() const override {
@@ -124,7 +126,7 @@ public:
         // sized to the kernel's layout, hand it to the kernel, and
         // scatter into p.lse via cu_seqlens-indexed positions so the
         // rest of the runtime sees values in the layout it expects.
-        const int lse_dim = (max_seqlen + 7) / 8 * 8;
+        const int lse_dim = (max_seqlen + kMemEffLseAlignment - 1) / kMemEffLseAlignment * kMemEffLseAlignment;
         const long lse_kernel_elems = static_cast<long>(num_batches) * Hq * lse_dim;
         float* lse_kernel_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(lse_kernel_elems * sizeof(float)));
 
@@ -227,7 +229,7 @@ public:
         if (p.lse.Data == nullptr) {
             throw std::runtime_error("mem_eff backend: backward requires saved LSE from forward");
         }
-        const int lse_dim = (max_seqlen + 7) / 8 * 8;
+        const int lse_dim = (max_seqlen + kMemEffLseAlignment - 1) / kMemEffLseAlignment * kMemEffLseAlignment;
         const long lse_kernel_elems = static_cast<long>(num_batches) * Hq * lse_dim;
         float* lse_ptr = reinterpret_cast<float*>(exec->mem_eff_scratch_alloc(lse_kernel_elems * sizeof(float)));
         // Zero padding slots before gather: the gather only writes
