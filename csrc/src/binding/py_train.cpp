@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <tuple>
 #include <vector>
 #include <iostream>
 
@@ -1012,6 +1014,54 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                                                     gs.opt_step.template get<int>());
             }
             CUDA_CHECK(cudaStreamEndCapture(rs.MainStream, &graph));
+            // Diagnostic: walk captured graph and report memcpy nodes whose
+            // host source/dest pointers look suspicious (stack-resident, or
+            // outside the pinned-buffer / device-arena ranges we know are
+            // stable). Helps localize V#3 — a captured op that references
+            // a transient host allocation valid only at capture time.
+            if (std::getenv("SUROGATE_DEBUG_DUMP_CAPTURED_GRAPH") != nullptr) {
+                size_t num_nodes = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &num_nodes));
+                std::vector<cudaGraphNode_t> nodes(num_nodes);
+                CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &num_nodes));
+                fprintf(stderr, "[graph-dump] %zu nodes\n", num_nodes);
+                std::map<int, int> kind_counts;
+                std::vector<std::tuple<int, void*, void*, size_t, int>> memcpys;  // idx, src, dst, bytes, kind
+                for (size_t i = 0; i < num_nodes; ++i) {
+                    cudaGraphNodeType t = cudaGraphNodeTypeEmpty;
+                    CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &t));
+                    kind_counts[static_cast<int>(t)]++;
+                    if (t == cudaGraphNodeTypeMemcpy) {
+                        cudaMemcpy3DParms params{};
+                        cudaError_t err = cudaGraphMemcpyNodeGetParams(nodes[i], &params);
+                        if (err == cudaSuccess) {
+                            void* src = params.srcPtr.ptr;
+                            void* dst = params.dstPtr.ptr;
+                            size_t bytes = params.extent.width * std::max<size_t>(params.extent.height, 1) *
+                                           std::max<size_t>(params.extent.depth, 1);
+                            memcpys.emplace_back(static_cast<int>(i), src, dst, bytes, static_cast<int>(params.kind));
+                        }
+                    }
+                }
+                fprintf(stderr, "[graph-dump] node kinds:");
+                for (const auto& [k, c] : kind_counts) {
+                    fprintf(stderr, " %d=%d", k, c);
+                }
+                fprintf(stderr, "\n");
+                fprintf(stderr, "[graph-dump] %zu memcpy nodes:\n", memcpys.size());
+                for (const auto& [idx, src, dst, bytes, kind] : memcpys) {
+                    const char* kname = "?";
+                    if (kind == cudaMemcpyHostToDevice)
+                        kname = "H2D";
+                    else if (kind == cudaMemcpyDeviceToHost)
+                        kname = "D2H";
+                    else if (kind == cudaMemcpyDeviceToDevice)
+                        kname = "D2D";
+                    else if (kind == cudaMemcpyHostToHost)
+                        kname = "H2H";
+                    fprintf(stderr, "  node[%d] %s src=%p dst=%p bytes=%zu\n", idx, kname, src, dst, bytes);
+                }
+            }
             CUDA_CHECK(cudaGraphInstantiate(&gs.graph_exec, graph, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(graph));
             gs.captured = true;
