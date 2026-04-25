@@ -4,7 +4,7 @@
     <img
       alt="Surogate"
       width="40%"
-      src="https://github.com/invergent-ai/surogate-trainer/raw/main/assets/logo-white.svg#gh-dark-mode-only"
+      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-white.svg#gh-dark-mode-only"
     />
   </a>
 
@@ -12,7 +12,7 @@
     <img
       alt="Surogate"
       width="40%"
-      src="https://github.com/invergent-ai/surogate-trainer/raw/main/assets/logo-black.svg#gh-light-mode-only"
+      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-black.svg#gh-light-mode-only"
     />
   </a>
 </p>
@@ -22,15 +22,15 @@
 <div>
 <a href="https://surogate.ai">Home</a> ·
 <a href="https://docs.surogate.ai">Docs</a> ·
-<a href="https://github.com/invergent-ai/surogate-trainer/tree/master/examples">Examples</a> ·
+<a href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
 <a href="https://docs.surogate.ai/reference/benchmarks">Benchmarks</a> ·
 <a href="https://github.com/invergent-ai/surogates">Managed Agents</a>
 </div>
 <br/>
-  
-[![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate-trainer?style=social)](https://github.com/invergent-ai/surogate-trainer)
-[![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate-trainer)](https://github.com/invergent-ai/surogate-trainer/issues)
-[![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate-trainer)](https://github.com/invergent-ai/surogate-trainer/pulls)
+
+[![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate?style=social)](https://github.com/invergent-ai/surogate)
+[![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/issues)
+[![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/pulls)
 [![Twitter Follow](https://img.shields.io/twitter/follow/surogate_ai?style=social)](https://x.com/surogate_ai)
 
 </div>
@@ -40,7 +40,7 @@ Surogate Trainer is built for developers and enterprises that need fast experime
 
 **⚡ The Surogate trainer surpasses all existing training frameworks in performance for single-GPU, multi-GPU and GPU+CPU by a large margin.**
 
-**✨ The native CPU offloading feature achieves superior performance and VRAM usage compared to QLoRA. You can fine-tune models at native bf16 precision, rendering QLoRA obsolete.** 
+**✨ The native CPU offloading feature achieves superior performance and VRAM usage compared to QLoRA. You can fine-tune models at native bf16 precision, rendering QLoRA obsolete.**
 
 ### Highlights
 
@@ -52,7 +52,7 @@ Surogate Trainer is built for developers and enterprises that need fast experime
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
 - [**🔥 Python DSL**](https://docs.surogate.ai/about/dsl) with AOT auto-differentiation for adding new model architectures
 - [**⚖️ Smart CPU Offloading**](https://docs.surogate.ai/guides/offloading) for weights, gradients, activations, quants
-- **📜 Pre-built training recipes**: 
+- **📜 Pre-built training recipes**:
   - [**💎 BF16**](https://docs.surogate.ai/guides/precision-and-recipes#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
   - [**🔥 FP8**](https://docs.surogate.ai/guides/precision-and-recipes#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
   - [**🔥 NVFP4**](https://docs.surogate.ai/guides/precision-and-recipes#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
@@ -95,9 +95,9 @@ Surogate provides 3 docker images for various CUDA versions. Currently only the 
 
 | CUDA   | Image                                        | Recommended NVIDIA Driver | Minimum NVIDIA Driver |
 | ------ | -------------------------------------------- | ------------------------- | --------------------- |
-| 12.8.1 | `ghcr.io/invergent-ai/surogate-trainer:latest-cu128` | `>= 570.124.06`           | `>= 525`              |
-| 12.9.1 | `ghcr.io/invergent-ai/surogate-trainer:latest-cu129` | `>= 575.57.08`            | `>= 525`              |
-| 13.1   | `ghcr.io/invergent-ai/surogate-trainer:latest-cu130` | `>= 590.48.01`            | `>= 580`              |
+| 12.8.1 | `ghcr.io/invergent-ai/surogate:latest-cu128` | `>= 570.124.06`           | `>= 525`              |
+| 12.9.1 | `ghcr.io/invergent-ai/surogate:latest-cu129` | `>= 575.57.08`            | `>= 525`              |
+| 13.1   | `ghcr.io/invergent-ai/surogate:latest-cu130` | `>= 590.48.01`            | `>= 580`              |
 
 ```bash
 docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my/local/output_dir:<OUTPUT_DIR_FROM_CONFIG_YAML> <IMAGE> sft config.yaml
@@ -169,7 +169,7 @@ surogate sft config.yaml
 - `SM103`: B300, GB300
 - `SM120`: RTX PRO 6000/5000/4000/2500/2000 Blackwell,  RTX 5050,  RTX 5060,  RTX 5070,  RTX 5080,  RTX 5090
 - `SM121`: DGX Spark
-  
+
 ---
 
 ## Documentation / Examples

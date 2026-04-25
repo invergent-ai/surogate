@@ -4,6 +4,8 @@
 #include "runtime/attention/attention_backend.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 
@@ -30,6 +32,22 @@ void AttentionBackendRegistry::add(std::unique_ptr<AttentionBackend> backend) {
 AttentionBackend& AttentionBackendRegistry::select(const AttentionParams& p) const {
     for (const auto& b : mBackends) {
         if (b->supports(p)) {
+            if (const char* env = std::getenv("SUROGATE_DEBUG_ATTN_SELECT")) {
+                if (env[0] == '1') {
+                    static int select_count = 0;
+                    if (select_count++ < 80) {
+                        std::fprintf(stderr,
+                                     "[attn-select] backend=%s prio=%d T=%d Hq=%d Hs=%d window=%d varlen=%s\n",
+                                     b->name(),
+                                     b->priority(),
+                                     p.T,
+                                     p.Hq,
+                                     p.Hs,
+                                     p.window_size,
+                                     p.cu_seqlens ? "yes" : "no");
+                    }
+                }
+            }
             return *b;
         }
     }

@@ -856,22 +856,50 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             }
         }
 
-        // If graphs are disabled or packed sequences need doc masking, use eager execution.
-        // When doc boundaries are present but CUDA graphs are enabled, the GraphExecutor
-        // uses split-attention mode: non-attention ops are captured as per-segment CUDA
-        // graphs, while FlashAttention runs eagerly with per-step cu_seqlens.
-        if (!mOptions.UseCudaGraphs || has_doc_boundaries) {
+        // Phase 5: opt-in path that lets the outer full-step capture run even
+        // under sample_packing. Used to drive the Phase-0 inventory of
+        // capture-unsafe call sites. Production stays on the eager fallback
+        // until that inventory is closed and the captures are reliable.
+        const bool force_outer_capture = std::getenv("SUROGATE_DEBUG_FORCE_OUTER_CAPTURE") != nullptr;
+
+        // If graphs are disabled, or packed sequences need doc masking AND
+        // we're not in force-outer-capture mode, fall back to eager. Outer
+        // graph replay can't handle per-step cu_seqlens updates today; the
+        // force-outer-capture branch is a Phase-0 probe, not yet a fix.
+        if (!mOptions.UseCudaGraphs || (has_doc_boundaries && !force_outer_capture)) {
             const bool do_timing = mOptions.TriggerTimingEvents;
             if (do_timing && rs.TimingForwardStart.empty()) {
                 rs.setup_timing_events(micro_steps);
             }
+            // Under force-full-capture + doc_masking, GraphExecutor captures
+            // mForwardGraph at ms=0 and replays it for ms>0 within the same
+            // step. The captured H2D memcpys bake in the source pinned-buffer
+            // address (gs.inputs[0], gs.targets[0], gs.position_ids[0]).
+            // If we pass gs.inputs[j] for j>0, the replay ignores j's buffer
+            // and re-reads [0]'s contents — so ms>0 forwards see ms=0's
+            // tokens. Route every micro-step through the [0] buffer and
+            // stage fresh data there per micro-step so captured replays
+            // read the correct current tokens.
+            const bool force_full_capture = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
+            const bool stage_through_zero = force_full_capture && has_doc_boundaries && micro_steps > 1;
+            const std::size_t pos_bytes_per_plane = stride * sizeof(std::int32_t);
+            const std::size_t pos_total_bytes =
+                (pos_planes > 1 ? static_cast<std::size_t>(pos_planes) : 1) * pos_bytes_per_plane;
             for (int j = 0; j < micro_steps; ++j) {
-                rs.Targets_CPU = gs.targets[j];
+                if (stage_through_zero && j > 0) {
+                    std::memcpy(gs.inputs[0].Data, gs.inputs[j].Data, stride * sizeof(std::int32_t));
+                    std::memcpy(gs.targets[0].Data, gs.targets[j].Data, stride * sizeof(std::int32_t));
+                    std::memcpy(gs.position_ids[0].Data, gs.position_ids[j].Data, pos_total_bytes);
+                }
+                Tensor& in_t = stage_through_zero ? gs.inputs[0] : gs.inputs[j];
+                Tensor& tgt_t = stage_through_zero ? gs.targets[0] : gs.targets[j];
+                Tensor& pos_t = stage_through_zero ? gs.position_ids[0] : gs.position_ids[j];
+                rs.Targets_CPU = tgt_t;
                 if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingForwardStart[j], rs.MainStream));
-                ctx.Model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                ctx.Model->forward(in_t, pos_t, *ctx.Communicator, j);
                 if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingForwardEnd[j], rs.MainStream));
                 if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardStart[j], rs.MainStream));
-                ctx.Model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+                ctx.Model->backward(in_t, tgt_t, *ctx.Communicator, micro_steps, j);
                 if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardEnd[j], rs.MainStream));
             }
             if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingOptimizerStart, rs.MainStream));

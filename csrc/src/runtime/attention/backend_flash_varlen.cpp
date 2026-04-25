@@ -50,16 +50,12 @@ public:
             // plus the synthesized cu_seqlens buffer.
             return false;
         }
-        // Sliding-window attention is routed to the custom backend. The
-        // flash-varlen local path is the source of the remaining packed
-        // Gemma4 boundary drift; packed sliding attention now lowers to
-        // explicit per-document dense calls instead.
-        if (p.window_size > 0) {
-            return false;
-        }
-        // Everything else — dense full-causal (we'll synthesize dense
-        // cu_seqlens) and packed full-causal — is
-        // handled by the flash-varlen kernels.
+        // FlashAttention-varlen natively supports sliding windows via its
+        // window_size_left parameter — the kernel is ~4x faster than the
+        // SDPA math path for sliding layers on Gemma4-sized shapes.
+        // (Previous gate disabled this pending Gemma4 boundary-drift debug;
+        // re-enabled after narrowing the drift to the packed-boundary
+        // bookkeeping that is now handled by synthesize_dense_cu_seqlens.)
         return true;
     }
 

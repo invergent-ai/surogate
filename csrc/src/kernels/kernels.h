@@ -1182,6 +1182,33 @@ void swiglu_backward(Tensor& dinp,
                      int C,
                      cudaStream_t stream);
 
+// Fused GELU-GLU (tanh approximation, matches HF gelu_pytorch_tanh).
+// Takes `gate` and `up` as separate same-shape tensors and produces
+// out = gelu_tanh(gate) * up — drop-in replacement for the
+// gelu+mul pair used in the non-fuse_gate_up MLP path (Gemma4-style).
+void gelu_glu_forward(nv_bfloat16* out, const nv_bfloat16* gate, const nv_bfloat16* up, long n, cudaStream_t stream);
+void gelu_glu_forward(float* out, const float* gate, const float* up, long n, cudaStream_t stream);
+
+// Backward: given dout = dL/dh where h = gelu_tanh(gate) * up,
+//   d_gate = dout * up * gelu_grad(gate),
+//   d_up   = dout * gelu_tanh(gate).
+// Safe to pass d_gate==gate (gradient-in-place layout): the kernel loads
+// gate before writing d_gate.
+void gelu_glu_backward(nv_bfloat16* d_gate,
+                       nv_bfloat16* d_up,
+                       const nv_bfloat16* dout,
+                       const nv_bfloat16* gate,
+                       const nv_bfloat16* up,
+                       long n,
+                       cudaStream_t stream);
+void gelu_glu_backward(float* d_gate,
+                       float* d_up,
+                       const float* dout,
+                       const float* gate,
+                       const float* up,
+                       long n,
+                       cudaStream_t stream);
+
 // GPT-OSS MoE gated activation (interleaved gate/up).
 void gpt_oss_moe_act_forward(nv_bfloat16* out,
                              const nv_bfloat16* inp,

@@ -241,6 +241,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MatmulBias: return "matmul_bias";
         case CompiledOpType::BiasAdd: return "bias_add";
         case CompiledOpType::SwiGLU: return "swiglu";
+        case CompiledOpType::GeluGlu: return "gelu_glu";
         case CompiledOpType::GptOssMoeAct: return "gpt_oss_moe_act";
         case CompiledOpType::Silu: return "silu";
         case CompiledOpType::Gelu: return "gelu";
@@ -276,6 +277,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MatmulBackward: return "matmul_backward";
         case CompiledOpType::BiasAddBackward: return "bias_add_backward";
         case CompiledOpType::SwiGLUBackward: return "swiglu_backward";
+        case CompiledOpType::GeluGluBackward: return "gelu_glu_backward";
         case CompiledOpType::GptOssMoeActBackward: return "gpt_oss_moe_act_backward";
         case CompiledOpType::SiluBackward: return "silu_backward";
         case CompiledOpType::GeluBackward: return "gelu_backward";
@@ -372,6 +374,12 @@ CompiledExecutor::~CompiledExecutor() {
         mReplayPersistArena = nullptr;
         mReplayPersistCapacity = 0;
         mReplayPersistOffset = 0;
+    }
+    if (mMemEffScratchArena) {
+        cudaFree(mMemEffScratchArena);
+        mMemEffScratchArena = nullptr;
+        mMemEffScratchCapacity = 0;
+        mMemEffScratchOffset = 0;
     }
 
     // Free persistent MoE saved tensor buffers. Arena-backed entries are
@@ -480,6 +488,10 @@ CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t
     return result;
 }
 
+void CompiledExecutor::prepare_replay_persist_arena_for_capture() {
+    ensure_replay_persist_arena();
+}
+
 void CompiledExecutor::ensure_replay_persist_arena() {
     // 256 MiB is a conservative upper bound — one layer's worth of
     // stack-backed replay persistence (typically 9 slots × up to 8 MiB for
@@ -492,6 +504,49 @@ void CompiledExecutor::ensure_replay_persist_arena() {
     CUDA_CHECK(cudaMalloc(&raw, kArenaBytes));
     mReplayPersistArena = static_cast<std::byte*>(raw);
     mReplayPersistCapacity = kArenaBytes;
+}
+
+void CompiledExecutor::prepare_mem_eff_scratch_for_capture(std::size_t bytes) {
+    if (bytes == 0) return;
+    if (mMemEffScratchArena && mMemEffScratchCapacity >= bytes) return;
+    if (mMemEffScratchArena) {
+        cudaFree(mMemEffScratchArena);
+        mMemEffScratchArena = nullptr;
+        mMemEffScratchCapacity = 0;
+        mMemEffScratchOffset = 0;
+    }
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, bytes));
+    mMemEffScratchArena = static_cast<std::byte*>(raw);
+    mMemEffScratchCapacity = bytes;
+    mMemEffScratchOffset = 0;
+}
+
+void CompiledExecutor::mem_eff_scratch_reset() {
+    mMemEffScratchOffset = 0;
+}
+
+std::byte* CompiledExecutor::mem_eff_scratch_alloc(std::size_t bytes) {
+    if (bytes == 0) return nullptr;
+    // Lazy allocation for eager / non-capture paths where
+    // prepare_mem_eff_scratch_for_capture was not called first. Must
+    // NOT fire during stream capture — that would be an illegal
+    // cudaMalloc inside the capture.
+    if (!mMemEffScratchArena) {
+        prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
+    }
+    constexpr std::size_t kAlign = 128;  // align for 128-bit bf16 loads
+    const std::size_t aligned_offset = (mMemEffScratchOffset + kAlign - 1) & ~(kAlign - 1);
+    if (aligned_offset + bytes > mMemEffScratchCapacity) {
+        std::ostringstream oss;
+        oss << "mem_eff scratch arena exhausted: offset=" << aligned_offset << " + req=" << bytes
+            << " > cap=" << mMemEffScratchCapacity
+            << ". Bump SUROGATE_MEM_EFF_ARENA_MB or prepare_mem_eff_scratch_for_capture size.";
+        throw std::runtime_error(oss.str());
+    }
+    std::byte* p = mMemEffScratchArena + aligned_offset;
+    mMemEffScratchOffset = aligned_offset + bytes;
+    return p;
 }
 
 std::byte* CompiledExecutor::allocate_replay_persist(std::size_t bytes) {

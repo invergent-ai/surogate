@@ -34,6 +34,12 @@ void cuda_throw_on_error(cudaError_t status, const char* statement, const char* 
                           std::string(statement) + "): " + cudaGetErrorName(status) + ": ";
         msg += cudaGetErrorString(status);
         msg += "\n\nStack trace:\n" + surogate::capture_stacktrace(2);
+        // Capture-safety debug: mirror the full error + stack trace to stderr so it
+        // survives exception-message truncation by upstream handlers. Guarded by
+        // env var to avoid noise in normal runs.
+        if (std::getenv("SUROGATE_DEBUG_CAPTURE_SAFETY")) {
+            std::cerr << "[capture-safety] " << msg << std::endl;
+        }
         // make sure we have a clean cuda error state before launching the exception
         // otherwise, if there are calls to the CUDA API in the exception handler,
         // they will return the old error.

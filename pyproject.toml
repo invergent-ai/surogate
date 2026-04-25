@@ -1,5 +1,5 @@
 [project]
-name = "surogate-trainer"
+name = "surogate"
 dynamic = ["version"]
 description = "Surogate LLMOps Toolkit"
 readme = "README.md"
@@ -12,7 +12,7 @@ authors = [
 maintainers = [
     { name = "Flavius Burca", email = "flavius@invergent.ai" }
 ]
-urls = { "Homepage" = "https://surogate.ai", "Repository" = "https://github.com/invergent-ai/surogate-trainer", "Issues" = "https://github.com/invergent-ai/surogate-trainer/issues" }
+urls = { "Homepage" = "https://surogate.ai", "Repository" = "https://github.com/invergent-ai/surogate", "Issues" = "https://github.com/invergent-ai/surogate/issues" }
 keywords = ["machine learning", "large language model"]
 classifiers = [
     "Environment :: GPU :: NVIDIA CUDA :: 12",

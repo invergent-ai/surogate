@@ -187,11 +187,20 @@ class GenericMLP(Module):
         elif cfg.gated:
             gate_flat = g.matmul(x_flat, gate_w, transpose="NT")
             up_flat = g.matmul(x_flat, up_w, transpose="NT")
-            act_fn = act_table.get(cfg.activation.cpp_op)
-            if act_fn is None:
-                raise ValueError(f"Unsupported activation '{cfg.activation.cpp_op}' for non-fused gated MLP")
-            gate_act = act_fn(gate_flat, out_name=tracer.prefixed("gate_act"))
-            act_flat = g.mul(gate_act, up_flat)
+            # Fused gelu_glu post-kernel: gelu_tanh(gate) * up in a single
+            # CUDA kernel (forward + backward), replacing the gelu + mul pair.
+            # One HBM round-trip instead of three; ~40 ms/step on Gemma4-E2B
+            # bs=2 gas=4. Only applies to the tanh-approx GELU (cpp_op=="gelu"
+            # in our kernel — matches HF gelu_pytorch_tanh); SiLU falls back
+            # to the split gelu/silu + mul path below.
+            if cfg.activation.cpp_op == "gelu":
+                act_flat = g.gelu_glu(gate_flat, up_flat, out_name=tracer.prefixed("act_flat"))
+            else:
+                act_fn = act_table.get(cfg.activation.cpp_op)
+                if act_fn is None:
+                    raise ValueError(f"Unsupported activation '{cfg.activation.cpp_op}' for non-fused gated MLP")
+                gate_act = act_fn(gate_flat, out_name=tracer.prefixed("gate_act"))
+                act_flat = g.mul(gate_act, up_flat)
         else:
             up_flat = g.matmul(x_flat, up_w, transpose="NT")
             act_fn = act_table.get(cfg.activation.cpp_op)

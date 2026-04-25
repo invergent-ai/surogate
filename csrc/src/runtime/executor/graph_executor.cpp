@@ -962,6 +962,33 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                        *mCompiledBackward,
                                        std::move(save_name_arg),
                                        /*fwd_per_layer_sections=*/!recompute_active);
+
+            // Flag PersistentActivation tids whose names appear in
+            // mSaveList (the runtime save list) as cross_layer_global.
+            // Under force-capture, save_tensors runs both during capture
+            // (live mTensors works) and again at step N>0 replay to
+            // refresh mSaved pointers — that refresh finds mTensors[tid]
+            // null for intermediates like `pli_narrow_layer*` that are in
+            // mSaveList but aren't consumed by bwd ops (so
+            // finalize_save_for_bwd's consumed_in_bwd detection misses
+            // them). Flagging routes them through populate_fwd_stack_bindings'
+            // PersistentActivation branch so their Data points into a
+            // stable arena slot instead of a stack temp. Block-scoped
+            // tensors are excluded — they have their own arena-residency
+            // logic in FwdStack/SaveForBwd bindings.
+            for (const auto& name : mSaveList) {
+                int tid = mCompiledForward->find_tensor_id(name);
+                if (tid < 0 || tid >= mCompiledForward->num_tensors) continue;
+                auto& fmeta = mCompiledForward->tensor_meta[static_cast<std::size_t>(tid)];
+                if (fmeta.is_blocks()) continue;
+                if (fmeta.block_layer_idx >= 0) continue;
+                if (fmeta.region != dsl::RegionKind::PersistentActivation) continue;
+                if (fmeta.cross_layer_global) continue;
+                fmeta.cross_layer_global = true;
+                if (tid < mCompiledBackward->num_tensors) {
+                    mCompiledBackward->tensor_meta[static_cast<std::size_t>(tid)].cross_layer_global = true;
+                }
+            }
         }
 
         // Phase-tree arena allocation. Sized from baked offsets. Re-allocated
@@ -1247,7 +1274,12 @@ void GraphExecutor::execute_forward(long B,
     // ops run eagerly while other segments can still use CUDA graphs.
     const bool has_capture_unsafe_ops = graph_has_capture_unsafe_ops(mCompiledForward.get());
     // When doc masking or capture-unsafe ops are present, use split-attention mode.
-    const bool doc_masking_active = (mCuSeqlensGpu != nullptr);
+    const bool doc_masking_active_raw = (mCuSeqlensGpu != nullptr);
+    // Phase-0 discovery knob: bypass the doc-masking gate so we can catalog
+    // capture-unsafe call sites. Intentionally NOT capture-correct yet —
+    // used only for running the runtime under capture to surface violations.
+    const bool force_full_capture = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
+    const bool doc_masking_active = doc_masking_active_raw && !force_full_capture;
     const bool has_tiled_mlp = mCompiledForward && !mCompiledForward->mlp_tile_groups.empty();
     const bool needs_split = doc_masking_active || has_capture_unsafe_ops || has_tiled_mlp;
     const bool use_split_attention = needs_split && mOptions.UseCudaGraphs && !in_capture;
@@ -1270,6 +1302,13 @@ void GraphExecutor::execute_forward(long B,
         // inside save_tensors (which is not allowed during capture).
         mCompiledExecutor->set_dimensions(B, T);
         mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
+        // Preallocate the replay-persist arena (256 MiB cudaMalloc) outside capture.
+        mCompiledExecutor->prepare_replay_persist_arena_for_capture();
+        // Preallocate the mem_eff attention scratch arena (~256 MiB) so
+        // backend_mem_eff's per-op temps don't need temp_alloc from the
+        // stack arena. One attention op at a time, so ~128 MiB per op
+        // peak is enough; 256 MiB gives comfortable margin.
+        mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
 
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
@@ -1344,7 +1383,8 @@ void GraphExecutor::execute_backward(long B,
                              capture_status != cudaStreamCaptureStatusNone);
     const bool has_capture_unsafe_ops =
         graph_has_capture_unsafe_ops(mCompiledForward ? mCompiledForward.get() : mCompiledBackward.get());
-    const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr);
+    const bool force_full_capture_bwd = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
+    const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr) && !force_full_capture_bwd;
     const bool has_capture_unsafe_bwd = has_capture_unsafe_ops;
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
@@ -1364,6 +1404,8 @@ void GraphExecutor::execute_backward(long B,
         prime_fp8_weight_cache({});
         prime_fp8_weight_cache_transposed({});
         prime_fp4_weight_cache({});
+        mCompiledExecutor->prepare_replay_persist_arena_for_capture();
+        mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
     }
 
     auto run_ops = [&]() {
@@ -2225,25 +2267,108 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs,
 void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q) {
     const int count = num_docs + 1;
     mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
-    // Reallocate GPU buffer if size changed
-    if (mCuSeqlensGpu && mCuSeqlensCount != count) {
-        CUDA_CHECK(cudaFree(mCuSeqlensGpu));
-        mCuSeqlensGpu = nullptr;
+    if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
+        if (env[0] == '1') {
+            std::cerr << "[cu_seqlens] gpu=" << mCuSeqlensGpu << " count=" << mCuSeqlensCount << " -> " << count
+                      << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q << "\n";
+        }
     }
-    if (!mCuSeqlensGpu) {
-        CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(count) * sizeof(std::int32_t)));
-        mCuSeqlensCount = count;
+    // Grow-only GPU buffer. CUDA graph capture bakes mCuSeqlensGpu into
+    // the attention kernel's args buffer; shrinking via cudaFree would
+    // leave captured graphs pointing at freed memory, causing wrong-data
+    // reads on replay (visible as 1e32 grad norms at gas>1 force-capture).
+    if (!mCuSeqlensGpu || mCuSeqlensCount < count) {
+        if (mCuSeqlensGpu) {
+            CUDA_CHECK(cudaFree(mCuSeqlensGpu));
+            mCuSeqlensGpu = nullptr;
+        }
+        // Allocate to worst-case so subsequent shrinks never re-alloc.
+        // Worst case per-doc = 1 token → num_docs = total_q; count = total_q+1.
+        const int cap_count = std::max(count, total_q + 1);
+        CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(cap_count) * sizeof(std::int32_t)));
+        mCuSeqlensCount = cap_count;
+        if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
+            if (env[0] == '1') {
+                std::cerr << "[cu_seqlens] allocated gpu=" << mCuSeqlensGpu << " cap=" << cap_count << "\n";
+            }
+        }
     }
     CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
                                cu_seqlens_cpu,
                                static_cast<std::size_t>(count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice,
                                mRunState.MainStream));
-    mDocMaskingNumDocs = num_docs;
-    mDocMaskingMaxSeqlen = max_seqlen;
-    mDocMaskingTotalQ = total_q;
+    // Under full-step CUDA graph capture the flash-varlen kernel bakes
+    // num_docs/max_seqlen/total_q into its kernel-args buffer at capture
+    // time. A later step whose max_seqlen exceeds the captured step's
+    // silently truncates attention at the captured length; likewise a
+    // later step with more docs than captured skips tail docs.
+    //
+    // Fix (Phase 4 path of least resistance):
+    //   max_seqlen → T (sequence_len) — worst-case per-doc bound,
+    //     cu_seqlens bounds the real work.
+    //   num_docs   → if the new value exceeds the captured cap, force
+    //     a graph re-capture (reset_cuda_graphs). Otherwise replay is
+    //     safe as long as trailing cu_seqlens entries point at total_q
+    //     (empty docs).
+    //   total_q    → B*T (the captured buffer is already allocated
+    //     worst-case).
+    // Activated only under force-full-capture; leaves split-attention
+    // path untouched.
+    const bool force_full_capture = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
+    int effective_num_docs = num_docs;
+    int effective_max_seqlen = max_seqlen;
+    int effective_total_q = total_q;
+    if (force_full_capture) {
+        // total_q itself is stable across steps (=B*T). num_docs and
+        // max_seqlen vary per batch. For captured kernels we track
+        // HIGH-WATER values and recapture when either grows past the
+        // captured cap. This avoids the previous blanket pin of
+        // max_seqlen to total_q, which triggers a mem_eff kernel bug
+        // when args.num_queries >> actual per-doc length
+        // (reproducible without capture via the ALWAYS_PIN probe —
+        // see plan doc Phase 4 attempt 7 for the investigation).
+        effective_total_q = total_q;
+        if (mForwardGraph == nullptr) {
+            // Fresh capture: seed the high-water marks from this call.
+            mCapturedNumDocs = num_docs;
+            mCapturedMaxSeqlen = max_seqlen;
+            effective_num_docs = num_docs;
+            effective_max_seqlen = max_seqlen;
+        } else if (num_docs != mCapturedNumDocs || max_seqlen != mCapturedMaxSeqlen) {
+            // mem_eff's backward kernel produces catastrophically
+            // wrong gradients when args.num_queries != actual max
+            // doc length in the batch — triggers pin bug
+            // (reproducible without capture, see plan Phase 4
+            // attempt 7). Any mismatch between captured and current
+            // (in either direction) requires a recapture. Trade-off:
+            // more recaptures in early training until max_seqlen
+            // settles, but each step's kernel args match its actual
+            // batch, keeping gradients correct.
+            if (const char* dbg = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
+                if (dbg[0] == '1') {
+                    std::cerr << "[cu_seqlens] RECAPTURE: num_docs " << mCapturedNumDocs << " -> " << num_docs
+                              << " max_seqlen " << mCapturedMaxSeqlen << " -> " << max_seqlen << "\n";
+                }
+            }
+            reset_cuda_graphs();
+            mCapturedNumDocs = num_docs;
+            mCapturedMaxSeqlen = max_seqlen;
+            effective_num_docs = num_docs;
+            effective_max_seqlen = max_seqlen;
+        }
+        // else: both num_docs and max_seqlen match the captured values;
+        // replay uses the current cu_seqlens (memcpy'd above) directly.
+    }
+    mDocMaskingNumDocs = effective_num_docs;
+    mDocMaskingMaxSeqlen = effective_max_seqlen;
+    mDocMaskingTotalQ = effective_total_q;
     if (mCompiledExecutor) {
-        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu, mCuSeqlensCpu.data(), num_docs, max_seqlen, total_q);
+        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu,
+                                                   mCuSeqlensCpu.data(),
+                                                   effective_num_docs,
+                                                   effective_max_seqlen,
+                                                   effective_total_q);
     }
 }
 

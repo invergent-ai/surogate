@@ -272,6 +272,23 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                 }
             }
 
+            // Tid-based fallback: inputs from model-scope ops (e.g., the
+            // Gemma4 PLI `scale_N` → `narrow_pli_L` chain) are often
+            // compiled with empty ref.name (TensorRef optimizes named-slot
+            // strings away when the slot resolves by tid alone) AND aren't
+            // in saved_named_tensors. They DO live in saved_tensors[tid]
+            // after the swap, as long as prune_stack_tensors didn't evict
+            // them during forward — which the `cross_layer_global` flag
+            // prevents via mSaveMask. Without this branch, the chain above
+            // misses them and throws "tensor not found".
+            if (!resolved.Data && inp.tensor_id >= 0 &&
+                static_cast<std::size_t>(inp.tensor_id) < saved_tensors.size()) {
+                const Tensor& t = saved_tensors[static_cast<std::size_t>(inp.tensor_id)];
+                if (t.Data) {
+                    resolved = t;
+                }
+            }
+
             if (resolved.Data) {
                 store_tensor(inp, resolved);
                 if (!inp.name.empty()) {
@@ -697,6 +714,18 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (sid >= 0) {
                 mSaveMask[static_cast<std::size_t>(sid)] = true;
             }
+        }
+    }
+    // Cross-layer globals (model-scope tensors consumed by multiple layers,
+    // e.g. Gemma4 per_layer_inputs) must NOT be pruned at layer-end — each
+    // subsequent layer's compiler-synthesized narrow op reads them, and the
+    // forward-to-backward snapshot carry-over also depends on them staying
+    // in mTensors. They aren't in the runtime save list, so mark them in
+    // the mask directly. Narrow: only preserves the tensor across layer
+    // boundaries; does not trigger save_tensors or any other persistence.
+    for (int tid = 0; tid < graph.num_tensors; ++tid) {
+        if (graph.tensor_meta[static_cast<std::size_t>(tid)].cross_layer_global) {
+            mSaveMask[static_cast<std::size_t>(tid)] = true;
         }
     }
 
@@ -1742,12 +1771,27 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // pointers auto-reset via the bump cursor, but fallback allocations
     // must be explicitly released.
     mBwdCrossLayerBumpOffset = 0;
-    for (std::byte* ptr : mBwdCrossLayerFallbacks) {
-        if (ptr) {
-            (void)cudaFree(ptr);
+    // cudaFree during stream capture invalidates the capture, so defer
+    // the fallback-cleanup to the next non-capturing entry. Fallbacks
+    // only ever get appended in the bwd_cross_layer-arena overflow path
+    // (eager-only — that allocator throws under capture), so it's safe
+    // to skip the free loop entirely here. The vector is cleared
+    // unconditionally so the bump cursor reset stays consistent.
+    {
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(mRunState.MainStream, &cap_status);
+        const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
+        if (!capturing) {
+            for (std::byte* ptr : mBwdCrossLayerFallbacks) {
+                if (ptr) {
+                    (void)cudaFree(ptr);
+                }
+            }
+            mBwdCrossLayerFallbacks.clear();
         }
+        // Under capture: leave any existing fallback pointers in the
+        // vector. They'll be freed on the next non-capturing entry.
     }
-    mBwdCrossLayerFallbacks.clear();
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward
@@ -1799,7 +1843,48 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             const bool in_fwd = has_fwd && meta.region == dsl::RegionKind::FwdStack && data >= fwd_lo && data < fwd_hi;
             const bool in_save =
                 has_save && meta.region == dsl::RegionKind::SaveForBwd && data >= save_lo && data < save_hi;
-            if (!in_fwd && !in_save) continue;
+            // Cross-layer globals (e.g. Gemma4 per_layer_inputs) aren't in
+            // either arena at runtime — their data is stack-temp-alloc'd at
+            // forward time — but they must still be visible to backward
+            // resolution. The snapshot carries the pointer (which remains
+            // valid under the unified_stack-rebase regime); restore it.
+            const bool is_clg = meta.cross_layer_global && mRunState.Stack.owns(data);
+            // Fall-through: if the snapshot carries a Stack-owned pointer
+            // for a block-scope FwdStack tid whose Data doesn't fall in
+            // the narrow fwd_stack_ptr sub-range (block-scope views like
+            // Gemma4 `pli_flat` temp-alloc into unified_stack from
+            // ensure_output_tensor's slow path), still restore — the
+            // pointer remains valid across fwd→bwd (Stack isn't rolled
+            // back there) and mTensors[tid]'s Sizes would otherwise
+            // survive from the previous bwd's assign-clear as
+            // Tensor{} (nil). Under force-capture this causes a
+            // wrong-shape read when micro-step N+1's backward resumes
+            // without a C++-level forward pass (graph replay doesn't
+            // repopulate mTensors).
+            // Block-scope FwdStack tids whose Data isn't in the narrow
+            // fwd_stack_ptr sub-range (e.g., Gemma4 `pli_flat` views whose
+            // ensure_output_tensor slow path landed them outside the
+            // arena's tight window). Restore from snapshot as long as the
+            // Data is non-null — the pointer remains valid across
+            // fwd→bwd within a step, and without this, mTensors[tid]
+            // stays as Tensor{} after execute_backward's assign-clear,
+            // yielding nil/wrong shape when micro-step N+1's backward
+            // reads them without a preceding C++ forward pass (graph
+            // replay doesn't re-populate mTensors).
+            // Block-scope FwdStack tids whose Data falls outside the
+            // narrow fwd_stack_ptr sub-range can still need restoration.
+            // Examples in Gemma4: compiler-synthesized view/narrow outputs
+            // (`pli_flat`, `pli_narrow_layer*`) whose ensure_output_tensor
+            // slow path landed them in Stack temps outside the arena's
+            // tight window. Without restore, mTensors[tid] stays as
+            // Tensor{} after execute_backward's assign-clear, and
+            // micro-step N+1's backward (which runs C++ but no preceding
+            // C++ forward under full-step capture — graph replay skips
+            // host dispatch) reads wrong-shape zero/stale data. Snapshot
+            // carries the correct metadata from the forward that last
+            // ran through host code.
+            const bool fwd_region = meta.region == dsl::RegionKind::FwdStack && data != nullptr;
+            if (!in_fwd && !in_save && !is_clg && !fwd_region) continue;
             mTensors[i] = mForwardTensorsSnapshot[i];
         }
     }

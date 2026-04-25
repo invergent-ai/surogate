@@ -40,6 +40,39 @@ resolve_block_slot(const std::string& name, int* out_layer_idx, bool* out_is_fla
 
 namespace {
 
+constexpr bool is_block_activation_slot(TensorSlot s) {
+    switch (s) {
+        case TensorSlot::BlockLN1:
+        case TensorSlot::BlockLN1RSTD:
+        case TensorSlot::BlockLN2:
+        case TensorSlot::BlockLN2RSTD:
+        case TensorSlot::BlockQRSTD:
+        case TensorSlot::BlockKRSTD:
+        case TensorSlot::BlockQKV:
+        case TensorSlot::BlockQKVRoPE:
+        case TensorSlot::BlockLSE:
+        case TensorSlot::BlockAtt:
+        case TensorSlot::BlockAttOut:
+        case TensorSlot::BlockResidualAtt:
+        case TensorSlot::BlockMLPUp:
+        case TensorSlot::BlockSwiGLU:
+        case TensorSlot::BlockMLPDown:
+        case TensorSlot::BlockResidualFFN:
+        case TensorSlot::BlockHOut:
+        case TensorSlot::BlockRouterLogits:
+        case TensorSlot::BlockRouterProbs:
+        case TensorSlot::BlockRoutingWeights:
+        case TensorSlot::BlockRoutingIndices:
+        case TensorSlot::BlockPermutedInput:
+        case TensorSlot::BlockScatterIndices:
+        case TensorSlot::BlockExpertGateUp:
+        case TensorSlot::BlockExpertAct:
+        case TensorSlot::BlockExpertDown:
+        case TensorSlot::BlockMoeOut: return true;
+        default: return false;
+    }
+}
+
 constexpr bool is_block_gradient_slot(TensorSlot s) {
     switch (s) {
         case TensorSlot::BlockDLN1:
@@ -61,6 +94,7 @@ constexpr bool is_block_gradient_slot(TensorSlot s) {
 
 Tensor* block_activation_ptr(DslRunState& rs, int layer_idx, TensorSlot slot) {
     if (layer_idx < 0) return nullptr;
+    if (!is_block_activation_slot(slot)) return nullptr;
 
     // mTensors[tid] is the source of truth for block activations. Special
     // cases: managed residual stream and in-place QKVRoPE fallback route
