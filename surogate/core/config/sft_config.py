@@ -516,6 +516,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.auto_lr_reduction = cfg.get("auto_lr_reduction", self.auto_lr_reduction)
         self.early_stop = cfg.get("early_stop", self.early_stop)
         self.epoch_adjustment = cfg.get("epoch_adjustment", self.epoch_adjustment)
+        self.log_gpu_util = cfg.get("log_gpu_util", self.log_gpu_util)
 
         self.wandb_project = cfg.get("wandb_project", self.wandb_project)
         self.wandb_name = cfg.get("wandb_name", self.wandb_name or self.run_name)

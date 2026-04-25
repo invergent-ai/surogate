@@ -11,7 +11,7 @@ from surogate.core.config.sft_config import SFTConfig
 
 
 @contextlib.contextmanager
-def training_logger_context(config: SFTConfig):
+def training_logger_context(config: SFTConfig, extra_config: dict | None = None):
     report_to = config.report_to
     if report_to is None:
         backends: list[str] = []
@@ -28,6 +28,8 @@ def training_logger_context(config: SFTConfig):
     log_options.pop("model_info")
     log_options.pop("model")
     log_options.pop("tokenizer")
+    if extra_config:
+        log_options.update(extra_config)
 
     filtered_options: dict[str, bool | int | float | str] = {}
     for k, v in log_options.items():
@@ -96,6 +98,7 @@ def training_logger_context(config: SFTConfig):
 
             metrics_path = getattr(config, "surogate_metrics_path", None)
             writer = stack.enter_context(MetricsWriter(output_path=metrics_path))
+            writer.log_config(**filtered_options)
             handlers.append(functools.partial(log_line_to_surogate, writer))
 
         if "aim" in backends_set:
@@ -290,6 +293,9 @@ def log_line_to_surogate(writer, entry: dict):
         duration_ms = entry.get("duration_ms", 0)
         if duration_ms:
             metrics["train/tokens_per_second"] = step_tokens / (duration_ms / 1000)
+        phase = entry.get("phase")
+        if phase:
+            metrics["train/phase"] = phase
         writer.track(step, **metrics)
     elif kind == "eval":
         metrics = {
@@ -302,7 +308,24 @@ def log_line_to_surogate(writer, entry: dict):
         if duration_ms:
             metrics["eval/tokens_per_second"] = eval_tokens / (duration_ms / 1000)
         writer.track(step, **metrics)
-    elif kind in {"gpu", "cmd", "gpu-model", "allocator", "dataset", "option", "info", "message", "sol"}:
+    elif kind == "gpu":
+        gpu_id = entry.get("id", 0)
+        metrics = {}
+        for k, v in entry.items():
+            if k in {"log", "step", "time", "throttle", "id"}:
+                continue
+            if not isinstance(v, (int, float)):
+                continue
+            if k == "fan" and v == 0:
+                continue
+            if k == "dram_free":
+                v = v / 1024**2  # MiB
+            elif k in {"pcie_rx", "pcie_tx"}:
+                v = v / 1024**2  # MiB/s
+            metrics[k] = v
+        if metrics:
+            writer.log_gpu(step, gpu_id=gpu_id, **metrics)
+    elif kind in {"cmd", "gpu-model", "allocator", "dataset", "option", "info", "message", "sol"}:
         pass  # skip non-training metrics
     else:
         raise RuntimeError(f"Unknown kind {kind}")

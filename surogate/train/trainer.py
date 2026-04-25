@@ -336,7 +336,12 @@ class SurogateTrainerWrapper:
                 logger.info(f"Copied {filename}")
 
     def train(self):
-        with training_logger_context(self.config) as train_logger:
+        runtime_config = {
+            "total_batch_size": self.total_batch_size,
+            "steps_per_epoch": self.steps_per_epoch,
+            "max_steps": self.max_steps,
+        }
+        with training_logger_context(self.config, extra_config=runtime_config) as train_logger:
             # Log dataset information
             if not self._train_vision and self.eval_loader:
                 train_logger.log_dataset(self.train_loader, self.eval_loader)

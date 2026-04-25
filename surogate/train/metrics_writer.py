@@ -38,6 +38,12 @@ class MetricsWriter:
         self._file.write(json.dumps(entry) + "\n")
         self._file.flush()
 
+    def log_gpu(self, step, gpu_id=0, **metrics):
+        entry = {"type": "gpu", "step": step, "gpu_id": gpu_id, "ts": time.time()}
+        entry.update(metrics)
+        self._file.write(json.dumps(entry) + "\n")
+        self._file.flush()
+
     def close(self):
         if self._file and not self._file.closed:
             self._file.close()
