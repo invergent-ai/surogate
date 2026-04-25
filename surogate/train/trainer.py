@@ -882,7 +882,13 @@ class SurogateTrainerWrapper:
                 # Optional LoRA gradient debug (before optimizer update)
                 self._maybe_log_lora_grad_stats(step)
                 result = self.trainer.update_with_config(opt_config, step + 1)
-            self._maybe_shrink_stack_after_warmup()
+            # Stack shrinking under full-step graphs would free the buffer the
+            # captured graph references, faulting on step 1's replay. The
+            # graph captures absolute device pointers from the warmup-sized
+            # stack, so any post-capture cudaFree+cudaMalloc that moves it
+            # invalidates them.
+            if not use_full_step_graphs:
+                self._maybe_shrink_stack_after_warmup()
 
             # Build structured metrics for this step
             step_time = time.time() - step_start
