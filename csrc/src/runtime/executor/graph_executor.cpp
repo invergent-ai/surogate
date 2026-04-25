@@ -1262,7 +1262,8 @@ void GraphExecutor::execute_forward(long B,
                                     long T,
                                     NCCLCommunicator& comm,
                                     bool full,
-                                    const modules::ForwardHook* hook) {
+                                    const modules::ForwardHook* hook,
+                                    int micro_step) {
     // LoRA is slice-driven via ``CompiledAttrs::lora_slices``; the forward
     // hook parameter is kept for ABI stability with callers that still
     // build hook values, but nothing is invoked from it.
@@ -1283,7 +1284,7 @@ void GraphExecutor::execute_forward(long B,
     // ops run eagerly while other segments can still use CUDA graphs.
     const bool has_capture_unsafe_ops = graph_has_capture_unsafe_ops(mCompiledForward.get());
     // When doc masking or capture-unsafe ops are present, use split-attention mode.
-    const bool doc_masking_active_raw = (mCuSeqlensGpu != nullptr);
+    const bool doc_masking_active_raw = (mDocMaskingNumDocs > 0);
     // Phase-0 discovery knob: bypass the doc-masking gate so we can catalog
     // capture-unsafe call sites. Intentionally NOT capture-correct yet —
     // used only for running the runtime under capture to surface violations.
@@ -1352,6 +1353,7 @@ void GraphExecutor::execute_forward(long B,
 
     auto run_ops = [&]() {
         mCompiledExecutor->set_dimensions(B, T);
+        mCompiledExecutor->set_current_micro_step(micro_step);
         mCompiledExecutor->set_recompute_enabled(recompute_active);
         mCompiledExecutor->set_capturing(capturing);
         mCompiledExecutor->execute_forward(*mCompiledForward, comm, full, hook);
@@ -1393,7 +1395,7 @@ void GraphExecutor::execute_backward(long B,
     const bool has_capture_unsafe_ops =
         graph_has_capture_unsafe_ops(mCompiledForward ? mCompiledForward.get() : mCompiledBackward.get());
     const bool force_full_capture_bwd = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
-    const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr) && !force_full_capture_bwd;
+    const bool doc_masking_active_bwd = (mDocMaskingNumDocs > 0) && !force_full_capture_bwd;
     const bool has_capture_unsafe_bwd = has_capture_unsafe_ops;
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
@@ -1538,7 +1540,7 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, nullptr);
+    execute_forward(B, T, comm, /*full=*/false, nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -1637,7 +1639,7 @@ float GraphExecutor::validate(Tensor inputs,
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, nullptr);
+    execute_forward(B, T, comm, /*full=*/false, nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -1866,7 +1868,7 @@ void GraphExecutor::forward_with_hook(Tensor inputs,
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -1971,7 +1973,7 @@ float GraphExecutor::validate_with_hook(Tensor inputs,
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -2186,6 +2188,7 @@ void GraphExecutor::execute_logprobs_forward(long B,
     mCompiledExecutor->set_save_list(&empty_save_list);
 
     // Run forward with optional LoRA hook (nullptr = no LoRA = reference model).
+    mCompiledExecutor->set_current_micro_step(0);
     mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, hook);
 
     // Copy results back to CPU.
@@ -2275,11 +2278,25 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs,
 
 void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q) {
     const int count = num_docs + 1;
+    // Reserve mCuSeqlensCpu to worst-case (total_q + 1 entries) up front so
+    // its data() pointer stays stable across subsequent calls. Under full-
+    // step CUDA graph capture the H2D memcpy below is recorded into the
+    // captured graph as a memcpy node with the host source pointer baked
+    // in; if mCuSeqlensCpu reallocates between capture and replay (or the
+    // memcpy uses the caller-supplied parameter, which is itself a
+    // transient std::vector::data() that's destroyed when set_doc_masking
+    // returns), the replay reads from freed/relocated memory and the
+    // captured graph crashes. Source the memcpy from the stable member
+    // buffer instead.
+    if (mCuSeqlensCpu.capacity() < static_cast<std::size_t>(total_q + 1)) {
+        mCuSeqlensCpu.reserve(static_cast<std::size_t>(total_q + 1));
+    }
     mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
     if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
         if (env[0] == '1') {
             std::cerr << "[cu_seqlens] gpu=" << mCuSeqlensGpu << " count=" << mCuSeqlensCount << " -> " << count
-                      << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q << "\n";
+                      << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q
+                      << " cpu_data=" << static_cast<void*>(mCuSeqlensCpu.data()) << "\n";
         }
     }
     // Grow-only GPU buffer. CUDA graph capture bakes mCuSeqlensGpu into
@@ -2303,7 +2320,7 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
         }
     }
     CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
-                               cu_seqlens_cpu,
+                               mCuSeqlensCpu.data(),
                                static_cast<std::size_t>(count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice,
                                mRunState.MainStream));
