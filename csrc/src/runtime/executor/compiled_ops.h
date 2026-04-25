@@ -246,6 +246,24 @@ public:
     // that would otherwise lazy-allocate via allocate_replay_persist.
     void prepare_replay_persist_arena_for_capture();
 
+    // Resize the bwd_cross_layer arena to fit the high-water mark observed
+    // during prior eager backward calls (peak bump usage + total fallback
+    // bytes), plus a small slack margin. Frees and re-cudaMallocs the
+    // arena when growth is needed; no-op if the current capacity already
+    // fits. MUST be called outside CUDA stream capture — the cudaMalloc
+    // is illegal under capture. Used to size the arena correctly before
+    // a full-step capture, so `allocate_bwd_cross_layer` doesn't need a
+    // cudaMalloc fallback during the captured backward.
+    void prepare_bwd_cross_layer_for_capture();
+
+    // High-water byte usage observed for the bwd_cross_layer arena since
+    // executor construction. Includes both arena bump usage and bytes
+    // returned by the cudaMalloc fallback. Used by
+    // `prepare_bwd_cross_layer_for_capture` to choose the new arena size.
+    [[nodiscard]] std::size_t bwd_cross_layer_high_water_bytes() const {
+        return mBwdCrossLayerHighWaterBytes;
+    }
+
     // mem_eff attention backend's per-op scratch arena. Holds the
     // transient buffers (forward output_accum + lse_scratch; backward
     // delta + delta_dense + lse_scratch + MQA dQ/dK/dV partials +
@@ -562,6 +580,15 @@ private:
     // arena). Freed at the start of each backward call alongside the bump
     // offset reset.
     std::vector<std::byte*> mBwdCrossLayerFallbacks;
+    // High-water byte usage observed in any backward call: peak bump usage
+    // plus total fallback bytes for the call. Driven by
+    // `allocate_bwd_cross_layer`; consumed by
+    // `prepare_bwd_cross_layer_for_capture` to decide arena growth.
+    std::size_t mBwdCrossLayerHighWaterBytes = 0;
+    // Sum of bytes returned by the cudaMalloc fallback path within the
+    // current backward call. Reset alongside the bump cursor at backward
+    // entry. Folds into the high-water tally below at allocate time.
+    std::size_t mBwdCrossLayerCurrentFallbackBytes = 0;
 
     // Cross-step monotonic bump cursor into the moe_saved arena. Never
     // reset — MoE save buffers are keyed by name and persist for the

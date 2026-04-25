@@ -127,6 +127,12 @@ public:
         return false;
     }
 
+    /// Resize the bwd_cross_layer arena to fit prior eager-measured peak
+    /// usage before an outer capture session begins. Default is a no-op
+    /// for executors without a bwd_cross_layer arena.
+    virtual void prepare_bwd_cross_layer_for_capture() {
+    }
+
     // Optional LoRA state wiring (no-op for implementations that don't support it).
     virtual void set_lora_state(const modules::ModularLoRAConfig*,
                                 modules::ModularLoRAWeightsManager*,
@@ -219,6 +225,12 @@ public:
     void set_internal_graphs_enabled(bool enabled) override;
     bool internal_graphs_enabled() const override;
     bool has_capture_unsafe_ops() const override;
+
+    /// Resize the bwd_cross_layer arena to fit the eager-measured high-water
+    /// mark before an outer-capture session begins. Must be called outside
+    /// any CUDA stream capture. No-op if the arena already fits or if no
+    /// backward has run yet (in which case the caller should warm up first).
+    void prepare_bwd_cross_layer_for_capture() override;
 
     size_t saved_buffers_total_bytes() const override;
     int saved_buffers_count() const override;

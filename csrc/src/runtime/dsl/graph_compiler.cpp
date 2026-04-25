@@ -3123,6 +3123,46 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.save_for_bwd_bytes = total;
 }
 
+std::size_t estimate_bwd_cross_layer_bytes(const CompiledGraph& bwd) {
+    if (bwd.layer_end_indices.empty() || bwd.num_tensors <= 0) {
+        return 0;
+    }
+
+    auto is_stack_resident = [](RegionKind r) {
+        return r == RegionKind::FwdStack || r == RegionKind::BwdStack || r == RegionKind::Recomputed ||
+               r == RegionKind::Unknown;
+    };
+
+    // Collect layer-end op indices in execution order. layer_end_indices[L]
+    // is past-the-end; the op that ends layer L sits at index le-1.
+    std::vector<std::size_t> layer_end_ops;
+    layer_end_ops.reserve(bwd.layer_end_indices.size());
+    for (std::size_t le : bwd.layer_end_indices) {
+        if (le == SIZE_MAX || le == 0) continue;
+        layer_end_ops.push_back(le - 1);
+    }
+    if (layer_end_ops.empty()) return 0;
+    std::sort(layer_end_ops.begin(), layer_end_ops.end());
+
+    std::size_t total = 0;
+    for (int tid = 0; tid < bwd.num_tensors; ++tid) {
+        const auto& meta = bwd.tensor_meta[static_cast<std::size_t>(tid)];
+        if (!is_stack_resident(meta.region)) continue;
+        if (meta.bytes == 0) continue;
+        const std::string_view name = bwd.name_for_tensor_id(tid);
+        if (name.empty()) continue;
+        auto it = bwd.last_use_index.find(std::string(name));
+        if (it == bwd.last_use_index.end()) continue;
+        const std::size_t last_use = it->second;
+        // Persisted at the first layer-end whose op_idx < last_use. If
+        // none of the layer ends fall before last_use, the tid never
+        // crosses a layer boundary and won't be persisted.
+        if (last_use <= layer_end_ops.front()) continue;
+        total += meta.bytes;
+    }
+    return total;
+}
+
 namespace {
 
 void cuda_malloc_or_die(std::byte** out, std::size_t bytes, const char* label) {

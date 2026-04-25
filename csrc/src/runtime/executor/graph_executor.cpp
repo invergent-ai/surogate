@@ -999,13 +999,23 @@ void GraphExecutor::compile_graphs(long B, long T) {
         if (mCompiledForward && mCompiledBackward) {
             {
                 const std::size_t stack_bytes = mRunState.Stack.capacity();
-                // bwd_cross_layer arena. Fixed 64 MiB; the per-step bump
-                // resets at backward start. 0 bytes for dense transformers
-                // (typical), < 16 MiB for small-MoE aux-loss.
-                // `CompiledExecutor::allocate_bwd_cross_layer` falls back to
-                // cudaMalloc when this arena is exhausted (hybrid models
-                // with large per-layer attn_dim variance can overflow).
-                const std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
+                // bwd_cross_layer arena. Default 64 MiB; the per-step bump
+                // resets at backward start. Eager mode falls back to
+                // cudaMalloc on overflow (tracked in mBwdCrossLayerFallbacks
+                // and freed on the next non-capture entry). Capture mode
+                // can't tolerate the fallback, so before capture begins
+                // py_train.cpp calls `prepare_bwd_cross_layer_for_capture`
+                // which grows the arena to the eager-measured high-water
+                // mark — that avoids paying for the worst case upfront on
+                // models where eager actually uses far less.
+                std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
+                if (const char* env = std::getenv("SUROGATE_BWD_CROSS_LAYER_MB")) {
+                    char* end = nullptr;
+                    const unsigned long mb = std::strtoul(env, &end, 10);
+                    if (end != env && mb > 0) {
+                        bwd_cross_layer_bytes = static_cast<std::size_t>(mb) * 1024ULL * 1024ULL;
+                    }
+                }
                 // moe_saved arena sized 256 MiB when NumExperts > 0.
                 // Cross-step monotonic bump; cudaMalloc fallback on exhaustion.
                 const std::size_t moe_saved_bytes = mConfig.NumExperts > 0 ? 256ULL * 1024 * 1024 : 0;
@@ -1224,6 +1234,12 @@ bool GraphExecutor::internal_graphs_enabled() const {
 
 bool GraphExecutor::has_capture_unsafe_ops() const {
     return graph_has_capture_unsafe_ops(mCompiledForward.get());
+}
+
+void GraphExecutor::prepare_bwd_cross_layer_for_capture() {
+    if (mCompiledExecutor) {
+        mCompiledExecutor->prepare_bwd_cross_layer_for_capture();
+    }
 }
 
 size_t GraphExecutor::saved_buffers_total_bytes() const {

@@ -569,21 +569,69 @@ std::byte* CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
     if (!mPhaseArenas || !mPhaseArenas->allocated || !mPhaseArenas->bwd_cross_layer_ptr) {
         throw std::runtime_error("allocate_bwd_cross_layer: bwd_cross_layer arena not allocated");
     }
+    auto update_high_water = [&]() {
+        const std::size_t cur = mBwdCrossLayerBumpOffset + mBwdCrossLayerCurrentFallbackBytes;
+        if (cur > mBwdCrossLayerHighWaterBytes) {
+            mBwdCrossLayerHighWaterBytes = cur;
+        }
+    };
     if (mBwdCrossLayerBumpOffset + nbytes <= mPhaseArenas->bwd_cross_layer_bytes) {
         std::byte* ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
         mBwdCrossLayerBumpOffset += nbytes;
+        update_high_water();
         return ptr;
     }
-    // Arena exhausted — fall back to cudaMalloc. Tracked in
-    // `mBwdCrossLayerFallbacks` and freed at the start of the next backward
-    // call (alongside the bump offset reset in execute_backward).
-    // This triggers on hybrid models whose per-layer attn_dim / intermediate
-    // variance grows the cross-layer persist past the fixed arena budget;
-    // Gemma4-E2B with correct full-attention per-layer dims lands here.
+    // Arena exhausted. Under CUDA stream capture a cudaMalloc fallback
+    // would invalidate the captured graph, so throw with a clear hint —
+    // `prepare_bwd_cross_layer_for_capture` should have grown the arena
+    // to fit the eager-measured high-water mark before capture began.
+    cudaStream_t stream = mRunState.MainStream;
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap_status);
+    const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
+    if (capturing) {
+        std::ostringstream oss;
+        oss << "allocate_bwd_cross_layer: arena exhausted under CUDA graph capture "
+            << "(req=" << nbytes << " bytes, used=" << mBwdCrossLayerBumpOffset
+            << ", cap=" << mPhaseArenas->bwd_cross_layer_bytes
+            << "). Set SUROGATE_BWD_CROSS_LAYER_MB above the eager high-water mark.";
+        throw std::runtime_error(oss.str());
+    }
+    // Eager fallback (non-capture): cudaMalloc grows lazily so the user
+    // doesn't pay for the worst case upfront. Tracked into the high-water
+    // mark so capture preparation can size the arena correctly.
     std::byte* ptr = nullptr;
     CUDA_CHECK(cudaMalloc(&ptr, nbytes));
     mBwdCrossLayerFallbacks.push_back(ptr);
+    mBwdCrossLayerCurrentFallbackBytes += nbytes;
+    update_high_water();
     return reinterpret_cast<std::byte*>(ptr);
+}
+
+void CompiledExecutor::prepare_bwd_cross_layer_for_capture() {
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return;
+    // 32 MiB slack to absorb minor cross-step variance in the persist
+    // pattern. Without slack a small uptick on a later step would
+    // exhaust the arena under capture and throw.
+    constexpr std::size_t kSlackBytes = 32ULL * 1024 * 1024;
+    const std::size_t needed = mBwdCrossLayerHighWaterBytes + kSlackBytes;
+    if (needed <= mPhaseArenas->bwd_cross_layer_bytes) return;
+    // Free fallback ptrs first (would otherwise leak on next backward
+    // entry now that the new arena will absorb their work).
+    for (std::byte* p : mBwdCrossLayerFallbacks) {
+        if (p) (void)cudaFree(p);
+    }
+    mBwdCrossLayerFallbacks.clear();
+    if (mPhaseArenas->bwd_cross_layer_ptr) {
+        CUDA_CHECK(cudaFree(mPhaseArenas->bwd_cross_layer_ptr));
+        mPhaseArenas->bwd_cross_layer_ptr = nullptr;
+    }
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, needed));
+    mPhaseArenas->bwd_cross_layer_ptr = static_cast<std::byte*>(raw);
+    mPhaseArenas->bwd_cross_layer_bytes = needed;
+    mBwdCrossLayerBumpOffset = 0;
+    mBwdCrossLayerCurrentFallbackBytes = 0;
 }
 
 void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache) {

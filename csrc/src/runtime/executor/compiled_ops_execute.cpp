@@ -1771,6 +1771,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // pointers auto-reset via the bump cursor, but fallback allocations
     // must be explicitly released.
     mBwdCrossLayerBumpOffset = 0;
+    mBwdCrossLayerCurrentFallbackBytes = 0;
     // cudaFree during stream capture invalidates the capture, so defer
     // the fallback-cleanup to the next non-capturing entry. Fallbacks
     // only ever get appended in the bwd_cross_layer-arena overflow path
@@ -2611,12 +2612,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // cleanup (used by BwdCrossLayer persist to decide which tids survive).
     auto bwd_layer_end_cleanup = [&](int L, std::size_t idx, bool capturing = false) {
         if (L < 0 || L == last_layer_restored) return;
-        // Capture-unsafe work (BwdCrossLayer persist, handle_layer_end,
-        // debug dump, grad reduce/offload/notify) is skipped during CUDA
-        // stream capture — those APIs invalidate the capture. Stack.restore
-        // + slot clears still run so peak memory stays bounded.
-        if (!capturing) {
-            // BwdCrossLayer arena-backed persist.
+
+        // BwdCrossLayer arena-backed persist runs in BOTH eager and capture
+        // modes. The arena is grown to the eager-measured high-water mark
+        // by `prepare_bwd_cross_layer_for_capture` before capture begins,
+        // so `allocate_bwd_cross_layer` doesn't fall back to cudaMalloc
+        // here and the path is capture-safe. Skipping persist under
+        // capture would drop cross-layer-global gradients (Gemma4
+        // d_scale_8, Qwen3.5 d_blocks[N].lin_conv_w2d) at layer-end
+        // Stack.restore, breaking the next layer's resolution.
+        {
             std::unordered_map<std::uintptr_t, std::size_t> max_bytes_by_ptr;
             struct PendingPersist {
                 int tid;
@@ -2671,7 +2676,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     if (it != persistent_by_ptr.end()) tensor.Data = it->second;
                 }
             }
+        }
 
+        // Eager-only side-stream / host-callback work. handle_layer_end
+        // self-skips when mCapturing; debug dump and grad streaming/reduce/
+        // notify/offload do their own host-side recording that's not
+        // permitted during CUDA stream capture.
+        if (!capturing) {
             handle_layer_end(L);
             if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
 

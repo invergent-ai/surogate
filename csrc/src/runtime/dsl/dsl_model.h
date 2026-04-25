@@ -95,6 +95,7 @@ public:
     void set_internal_graphs_enabled(bool enabled);
     [[nodiscard]] bool internal_graphs_enabled() const;
     [[nodiscard]] bool has_capture_unsafe_ops() const;
+    void prepare_bwd_cross_layer_for_capture();
 
     ITensorContainer& weights() override;
     ITensorContainer& opt_momentum() override;

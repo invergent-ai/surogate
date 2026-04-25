@@ -985,6 +985,11 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
 
         if (!gs.captured) {
             dsl_model->prepare_optimizer_state_for_graph(*ctx.Communicator, config);
+            // The bwd_cross_layer arena is sized lazily during eager
+            // backward (warmup just ran one); grow it now to fit the
+            // observed high-water mark before capture begins so the
+            // captured backward never falls back to cudaMalloc.
+            dsl_model->prepare_bwd_cross_layer_for_capture();
             // Ensure the main stream is idle before beginning capture (no external dependencies).
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
             auto stack_cp = rs.Stack.checkpoint();
