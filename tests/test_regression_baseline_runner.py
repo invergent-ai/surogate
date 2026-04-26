@@ -71,15 +71,20 @@ def test_command_for_case_uses_sft_cli_without_unsupported_flags():
 
 def test_materialize_case_config_applies_runner_overrides(tmp_path, monkeypatch):
     source = tmp_path / "case.yaml"
-    source.write_text("max_steps: 100\neval_steps: 25\ngpus: 1\nep_size: 4\n")
+    source.write_text("model: upstream/model\nmax_steps: 100\neval_steps: 25\ngpus: 1\nep_size: 4\n")
     monkeypatch.setattr(br, "REPO_ROOT", tmp_path)
-    case = br.RegressionCase("m", "fp8", "2gpu_dp", storage="cpu_stream", config="case.yaml")
+    monkeypatch.setenv("MODEL_PATH", "/models/local")
+    case = br.RegressionCase(
+        "m", "fp8", "2gpu_dp", storage="cpu_stream", config="case.yaml", env_model_path="MODEL_PATH"
+    )
 
     materialized = br._materialize_case_config(case, steps=7, directory=tmp_path / "out")
 
     data = br.yaml.safe_load(materialized.read_text())
+    assert data["model"] == "/models/local"
     assert data["max_steps"] == 7
     assert data["eval_steps"] == 0
+    assert data["output_dir"] == str(tmp_path / "out" / "runs" / case.case_id)
     assert data["gpus"] == 2
     assert data["ep_size"] == 1
     assert data["cpu_training"] is True

@@ -192,6 +192,9 @@ def _materialize_case_config(case: RegressionCase, *, steps: int, directory: Pat
     data = yaml.safe_load(src.read_text()) or {}
     data["max_steps"] = steps
     data["eval_steps"] = 0
+    data["output_dir"] = str(directory / "runs" / case.case_id)
+    if case.env_model_path:
+        data["model"] = os.environ[case.env_model_path]
     if case.distribution == "2gpu_dp":
         data["gpus"] = 2
         data["ep_size"] = 1
