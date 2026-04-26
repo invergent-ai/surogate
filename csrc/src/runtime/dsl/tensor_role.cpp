@@ -102,6 +102,10 @@ bool tensor_role_is_rope_name(std::string_view name) {
     return infer_tensor_role_from_name(name).is_rope_freq();
 }
 
+bool tensor_role_is_expert_parallel_name(std::string_view name) {
+    return infer_tensor_role_from_name(name).is_expert_parallel();
+}
+
 void tensor_role_parity_check(std::string_view name, bool legacy_value, bool role_value, const char* context) {
     const char* env = std::getenv("SUROGATE_TENSOR_ROLE_PARITY");
     if (!env || std::string_view(env) == "0") {

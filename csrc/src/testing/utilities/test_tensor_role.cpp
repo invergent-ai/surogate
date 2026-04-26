@@ -16,7 +16,9 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(role.ownership == TensorOwnership::MoE);
         REQUIRE(role.dist.kind == DistributionKind::RouterReplicated);
         REQUIRE(role.is_moe_owned());
+        REQUIRE_FALSE(role.is_expert_parallel());
         REQUIRE(tensor_role_is_moe_name("blocks[2].router_logits"));
+        REQUIRE_FALSE(tensor_role_is_expert_parallel_name("blocks[2].router_logits"));
     }
 
     SECTION("expert tensors are MoE-owned and expert-parallel eligible") {
@@ -26,6 +28,9 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(role.ownership == TensorOwnership::MoE);
         REQUIRE(role.dist.kind == DistributionKind::ExpertParallel);
         REQUIRE(role.is_moe_owned());
+        REQUIRE(role.is_expert_parallel());
+        REQUIRE(tensor_role_is_expert_parallel_name("blocks[4].expert_gate_up"));
+        REQUIRE(tensor_role_is_expert_parallel_name("d_blocks[4].experts_gate_up"));
     }
 
     SECTION("EP side-channel tensors are EP-owned and expert-parallel") {
@@ -34,6 +39,7 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(role.ownership == TensorOwnership::EP);
         REQUIRE(role.dist.kind == DistributionKind::ExpertParallel);
         REQUIRE(role.is_moe_owned());
+        REQUIRE(role.is_expert_parallel());
     }
 
     SECTION("global MoE side-channels remain MoE-owned") {
@@ -42,6 +48,7 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(role.ownership == TensorOwnership::MoE);
         REQUIRE(role.dist.kind == DistributionKind::ExpertParallel);
         REQUIRE(role.is_moe_owned());
+        REQUIRE(role.is_expert_parallel());
     }
 
     SECTION("non-MoE special tensors keep explicit ownership") {
