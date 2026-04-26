@@ -103,6 +103,9 @@ void GraphExecutor::prime_fp8_weight_cache(const std::vector<char>& required) {
             continue;
         }
         const std::string& weight_name = op.inputs.at(1);
+        if (is_mlp_gate_weight(weight_name)) {
+            continue;
+        }
         if (!mWeights.has(weight_name)) {
             continue;
         }
@@ -185,6 +188,9 @@ void GraphExecutor::prime_fp8_weight_cache_transposed(const std::vector<char>& r
             continue;
         }
         const std::string& weight_name = op.inputs.at(2);
+        if (is_mlp_gate_weight(weight_name)) {
+            continue;
+        }
 
         int layer_idx = -1;
         auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
@@ -271,6 +277,33 @@ GraphExecutor::get_fp8_cached_weight_transposed(const std::string& name, Tensor&
     }
 
     return &it->second.weight;
+}
+
+void GraphExecutor::prime_fp8_lm_head_cache(bool transposed) {
+    if (std::getenv("SUROGATE_DISABLE_FP8_LMHEAD") != nullptr) {
+        return;
+    }
+    if (transposed) {
+        if (!mRunState.has_fp8_hybrid_backward()) {
+            return;
+        }
+    } else if (!mRunState.has_fp8_forward()) {
+        return;
+    }
+
+    const char* names[] = {"lm_head", "lm_head_weight"};
+    for (const char* name : names) {
+        if (!mWeights.has(name)) {
+            continue;
+        }
+        Tensor& weight = mWeights.get(name);
+        if (transposed) {
+            (void)get_fp8_cached_weight_transposed(name, weight, mRunState.MainStream);
+        } else {
+            (void)get_fp8_cached_weight(name, weight, mRunState.MainStream);
+        }
+        return;
+    }
 }
 
 // ============================================================================

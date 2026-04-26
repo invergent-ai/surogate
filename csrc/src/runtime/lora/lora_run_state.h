@@ -19,6 +19,7 @@ struct LoRARunState {
     Tensor norm_buffer;
     Tensor recompute_ln;    // (B, T, C) - buffer for recomputed ln1/ln2 activations
     Tensor recompute_rstd;  // (B, T) - buffer for recomputed rstd (unused but required by kernel)
+
     int B = 0;
     int T = 0;
 

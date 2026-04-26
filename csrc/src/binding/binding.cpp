@@ -12,6 +12,7 @@
 #include <nanobind/ndarray.h>
 
 #include <filesystem>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <fmt/format.h>
@@ -2511,6 +2512,11 @@ NB_MODULE(_surogate, m) {
                 // - QLoRA FP4/FP8: dequantizes to BF16, so actual compute is BF16
                 // - Non-QLoRA FP8/FP4 recipes: actual compute in FP8/FP4
                 const bool is_qlora = trainer->is_qlora();
+                ETensorDType lm_head_dtype = config.DType;
+                if (!is_qlora && options.TrainingRecipe && options.TrainingRecipe->is_fp8_hybrid() &&
+                    std::getenv("SUROGATE_DISABLE_FP8_LMHEAD") == nullptr) {
+                    lm_head_dtype = ETensorDType::FP8_E4M3;
+                }
                 auto ops = get_transformer_ops(
                     config.NumLayers * ((long)config.HiddenSize *
                                         (config.IntermediateSize * 3 + config.HiddenSize * 1 + config.qkv_channels())),
@@ -2520,6 +2526,9 @@ NB_MODULE(_surogate, m) {
                     config.NumQueryHeads * config.head_size(),
                     config.NumLayers,
                     trainer->seq_length());
+                if (ops.size() > 1) {
+                    ops[1].first = lm_head_dtype;
+                }
                 logger->log_sol_estimate(ops, trainer->world_size());
             },
             nb::arg("trainer"),

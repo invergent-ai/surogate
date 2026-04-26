@@ -517,12 +517,24 @@ std::optional<modules::MatmulOp> matmul_op_from_weight(std::string_view name, in
     if (field == "qkv_weight") return modules::MatmulOp::QKV;
     if (field == "out_weight") return modules::MatmulOp::AttnOut;
     if (field == "mlp_up_weight") return modules::MatmulOp::MLPUp;
+    if (field == "mlp_gate_weight") return modules::MatmulOp::MLPUp;
     if (field == "mlp_down_weight") return modules::MatmulOp::MLPDown;
     if (field == "up_weight") return modules::MatmulOp::MLPUp;
+    if (field == "gate_weight") return modules::MatmulOp::MLPUp;
     if (field == "down_weight") return modules::MatmulOp::MLPDown;
     if (field == "shared_expert_up") return modules::MatmulOp::MLPUp;
     if (field == "shared_expert_down") return modules::MatmulOp::MLPDown;
     return std::nullopt;
+}
+
+bool is_mlp_gate_weight(std::string_view name) {
+    int layer_idx = -1;
+    std::string field;
+    if (!parse_block_param(name, layer_idx, field)) {
+        return false;
+    }
+    (void)layer_idx;
+    return field == "mlp_gate_weight" || field == "gate_weight";
 }
 
 EMMTranspose parse_transpose(const AttrMap& attrs) {

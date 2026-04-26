@@ -1197,6 +1197,7 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         if (op.inputs.size() > 1) {
             int layer_idx = -1;
             auto matmul_op = matmul_op_from_weight(op.inputs[1], layer_idx);
+            const bool is_gate_projection = is_mlp_gate_weight(op.inputs[1]);
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
             attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
@@ -1209,7 +1210,9 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                         attrs.forward_hook_point = modules::ForwardHookPoint::AfterAttnOutProjection;
                         break;
                     case modules::MatmulOp::MLPUp:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                        if (!is_gate_projection) {
+                            attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                        }
                         break;
                     case modules::MatmulOp::MLPDown:
                         attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPDownProjection;
@@ -1248,7 +1251,8 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 attrs.matmul_op = modules::MatmulOp::QKV;
             } else if (field == "out_weight") {
                 attrs.matmul_op = modules::MatmulOp::AttnOut;
-            } else if (field == "mlp_up_weight" || field == "up_weight") {
+            } else if (field == "mlp_up_weight" || field == "up_weight" || field == "mlp_gate_weight" ||
+                       field == "gate_weight") {
                 attrs.matmul_op = modules::MatmulOp::MLPUp;
             } else if (field == "mlp_down_weight" || field == "down_weight") {
                 attrs.matmul_op = modules::MatmulOp::MLPDown;

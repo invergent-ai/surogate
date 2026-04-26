@@ -36,6 +36,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     const std::string& weight_name = op.inputs[1].name;
+    const bool is_gate_projection = is_mlp_gate_weight(weight_name);
 
     const bool is_shared_weight = (weight_name.find("shared_expert_up") != std::string::npos) ||
                                   (weight_name.find("shared_expert_down") != std::string::npos);
@@ -162,8 +163,12 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                         case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
                         default: break;
                     }
-                    if (ready_flag != DslRunState::FP8Ready_None && mRunState.consume_fp8_buffer_ready(ready_flag)) {
-                        ctx.inp_quant_ready = true;
+                    if (ready_flag != DslRunState::FP8Ready_None) {
+                        if (is_gate_projection && mRunState.is_fp8_buffer_ready(ready_flag)) {
+                            ctx.inp_quant_ready = true;
+                        } else if (mRunState.consume_fp8_buffer_ready(ready_flag)) {
+                            ctx.inp_quant_ready = true;
+                        }
                     }
 
                     if (b.DType == ETensorDType::FP8_E4M3) {
@@ -238,7 +243,11 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         switch (*op.attrs.matmul_op) {
             case modules::MatmulOp::QKV: layer_plan.qkv = plan; break;
             case modules::MatmulOp::AttnOut: layer_plan.out_proj = plan; break;
-            case modules::MatmulOp::MLPUp: layer_plan.mlp_up = plan; break;
+            case modules::MatmulOp::MLPUp:
+                if (!is_gate_projection) {
+                    layer_plan.mlp_up = plan;
+                }
+                break;
             case modules::MatmulOp::MLPDown: layer_plan.mlp_down = plan; break;
             default: break;
         }

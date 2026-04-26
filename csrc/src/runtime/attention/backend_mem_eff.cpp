@@ -67,6 +67,9 @@ public:
         };
         if (p.Hs <= 0) return reject("Hs<=0");
         if (p.dtype != ETensorDType::BF16) return reject("not bf16");
+        if (p.Hs <= 256 && std::getenv("SUROGATE_ENABLE_MEM_EFF_SMALL_HS") == nullptr) {
+            return reject("Hs<=256 handled by flash_varlen");
+        }
         // GQA (Hq != Hkv) is not supported by the underlying kernel
         // without a KV broadcast pre-step; skip for now and let
         // flash-varlen / SDPA handle those cases until we add broadcast.

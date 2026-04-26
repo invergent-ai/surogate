@@ -577,7 +577,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # The output buffer is {B*T/chunks, V} in bf16 which can be >1 GiB with chunks=1.
         if self.lora and self.recompute and self.lmhead_chunks == 1:
             total_tokens = self.per_device_train_batch_size * self.sequence_len
-            for chunks in (8, 4, 2):
+            chunk_order = (2, 4, 8) if self.recipe in ("fp8-hybrid", "fp8_hybrid") else (8, 4, 2)
+            for chunks in chunk_order:
                 if total_tokens % chunks == 0:
                     self.lmhead_chunks = chunks
                     logger.info(f"Auto-setting lmhead_chunks={chunks}")

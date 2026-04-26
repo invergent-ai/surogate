@@ -966,11 +966,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             throw std::runtime_error("train_step_graphed: only supports AdamW, AdamW 8-bit or NorMuon optimizer");
         }
 
-        // CUDA graph capture path. Full capture remains available for
-        // diagnostics. The fwd_bwd debug mode keeps the optimizer update eager
-        // because update has host-side side effects (weight-cache
-        // invalidation/sync, delayed state updates) that are not replayed by
-        // CUDA graph launch.
+        // CUDA graph capture path (both AdamW and NorMuon support graph capture)
         enum class FullStepGraphMode {
             Full,
             ForwardBackward,
@@ -979,9 +975,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         const char* graph_mode_env = std::getenv("SUROGATE_FULLSTEP_GRAPH_MODE");
         FullStepGraphMode graph_mode = FullStepGraphMode::Full;
         if (graph_mode_env) {
-            if (std::strcmp(graph_mode_env, "full") == 0) {
-                graph_mode = FullStepGraphMode::Full;
-            } else if (std::strcmp(graph_mode_env, "fwd_bwd") == 0) {
+            if (std::strcmp(graph_mode_env, "fwd_bwd") == 0) {
                 graph_mode = FullStepGraphMode::ForwardBackward;
             } else if (std::strcmp(graph_mode_env, "fwd") == 0) {
                 graph_mode = FullStepGraphMode::ForwardOnly;
@@ -993,7 +987,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             static bool graph_mode_warned = false;
             if (!graph_mode_warned && ctx.Communicator && ctx.Communicator->rank() == 0) {
                 fprintf(stderr,
-                        "[CUDA graphs] SUROGATE_FULLSTEP_GRAPH_MODE=%s (eager optimizer update)\n",
+                        "[CUDA graphs] SUROGATE_FULLSTEP_GRAPH_MODE=%s (debug mode)\n",
                         graph_mode == FullStepGraphMode::ForwardBackward ? "fwd_bwd" : "fwd");
                 graph_mode_warned = true;
             }
@@ -1241,9 +1235,6 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             }
         }
         CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
-        if (!do_graph_update && do_graph_backward) {
-            dsl_model->update_with_config(*ctx.Communicator, config, opt_step_host);
-        }
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Refresh loss/norm on host after full-step graph launch.

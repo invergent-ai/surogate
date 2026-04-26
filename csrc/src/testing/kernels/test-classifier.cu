@@ -273,6 +273,7 @@ TEST_CASE("chunked cross-entropy fp32 large vocab (V=128K)", "[kernels][classifi
                                   V,
                                   P,
                                   n_chunks,
+                                  /*softcap=*/0.0f,
                                   /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits.data()),
@@ -283,6 +284,7 @@ TEST_CASE("chunked cross-entropy fp32 large vocab (V=128K)", "[kernels][classifi
                                    BT,
                                    V,
                                    P,
+                                   /*softcap=*/0.0f,
                                    /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -344,6 +346,7 @@ TEST_CASE("chunked cross-entropy fp32 very large vocab (V=256K)", "[kernels][cla
                                   V,
                                   P,
                                   n_chunks,
+                                  /*softcap=*/0.0f,
                                   /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits.data()),
@@ -354,6 +357,7 @@ TEST_CASE("chunked cross-entropy fp32 very large vocab (V=256K)", "[kernels][cla
                                    BT,
                                    V,
                                    P,
+                                   /*softcap=*/0.0f,
                                    /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -417,6 +421,7 @@ TEST_CASE("chunked cross-entropy bf16 large vocab", "[kernels][classifier][chunk
                                   V,
                                   P,
                                   n_chunks,
+                                  /*softcap=*/0.0f,
                                   /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits.data()),
@@ -427,6 +432,7 @@ TEST_CASE("chunked cross-entropy bf16 large vocab", "[kernels][classifier][chunk
                                    BT,
                                    V,
                                    P,
+                                   /*softcap=*/0.0f,
                                    /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -490,6 +496,7 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                 BT,
                                 V,
                                 P,
+                                /*softcap=*/0.0f,
                                 /*stream=*/0);
 
     fused_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits_fused.data()),
@@ -500,6 +507,7 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                  BT,
                                  V,
                                  P,
+                                 /*softcap=*/0.0f,
                                  /*stream=*/0);
 
     thrust::device_vector<float> d_logits_chunked = to_device(h_logits);
@@ -520,6 +528,7 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                   V,
                                   P,
                                   n_chunks,
+                                  /*softcap=*/0.0f,
                                   /*stream=*/0);
 
     chunked_cross_entropy_backward(thrust::raw_pointer_cast(d_dlogits_chunked.data()),
@@ -530,6 +539,7 @@ TEST_CASE("chunked cross-entropy matches fused at boundary vocab", "[kernels][cl
                                    BT,
                                    V,
                                    P,
+                                   /*softcap=*/0.0f,
                                    /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 

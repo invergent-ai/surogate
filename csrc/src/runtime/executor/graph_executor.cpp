@@ -1318,6 +1318,7 @@ void GraphExecutor::execute_forward(long B,
     const bool recompute_active = mOptions.recompute_enabled() && mCompiledForward != nullptr;
     mCompiledExecutor->set_recompute_enabled(recompute_active);
     const bool capturing = use_graphs && mForwardGraph == nullptr;
+    const bool enable_fp8_weight_cache = std::getenv("SUROGATE_ENABLE_FP8_WEIGHT_CACHE") != nullptr;
     if (!use_graphs || capturing) {
         mSaved.clear();
         reset_forward_plan();
@@ -1338,6 +1339,7 @@ void GraphExecutor::execute_forward(long B,
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
         prime_fp8_weight_cache({});
+        prime_fp8_lm_head_cache(false);
         prime_fp4_weight_cache({});
     } else if (!use_graphs && !in_capture) {
         // External/full-step CUDA graph capture paths (outside GraphExecutor) can still
@@ -1350,10 +1352,14 @@ void GraphExecutor::execute_forward(long B,
         // Prime FP4 weight caches on first call. This covers split-attention mode
         // (sample_packing + CUDA graphs) where use_graphs is false but we still need
         // cached weights to avoid re-quantizing on every matmul.
+        if (enable_fp8_weight_cache) {
+            prime_fp8_weight_cache({});
+        }
         if (!mWeightCachesPrimed) {
             prime_fp4_weight_cache({});
             mWeightCachesPrimed = true;
         }
+        prime_fp8_lm_head_cache(false);
     } else if (!mWeightCachesPrimed) {
         // Prime FP4 weight caches on first eager execution (e.g., QLoRA where CUDA
         // graphs are disabled). FP4 on-the-fly quantization (two-level block scaling,
@@ -1362,8 +1368,12 @@ void GraphExecutor::execute_forward(long B,
         // cheap (single abs_max + per-element scale), and priming FP8 caches adds
         // ~2x model size in persistent GPU memory (FP8 + FP8 transposed), causing
         // OOM on memory-constrained GPUs with QLoRA.
+        if (enable_fp8_weight_cache) {
+            prime_fp8_weight_cache({});
+        }
         prime_fp4_weight_cache({});
         mWeightCachesPrimed = true;
+        prime_fp8_lm_head_cache(false);
     }
 
     auto run_ops = [&]() {
@@ -1427,13 +1437,22 @@ void GraphExecutor::execute_backward(long B,
     const bool recompute_active = mOptions.recompute_enabled() && mCompiledForward != nullptr;
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
+    const bool enable_fp8_weight_cache = std::getenv("SUROGATE_ENABLE_FP8_WEIGHT_CACHE") != nullptr;
     if (capturing) {
         // Same reason as forward: avoid allocating inside capture when a recipe wants cached weights.
         prime_fp8_weight_cache({});
         prime_fp8_weight_cache_transposed({});
+        prime_fp8_lm_head_cache(false);
+        prime_fp8_lm_head_cache(true);
         prime_fp4_weight_cache({});
         mCompiledExecutor->prepare_replay_persist_arena_for_capture();
         mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
+    } else if (!in_capture) {
+        if (enable_fp8_weight_cache) {
+            prime_fp8_weight_cache_transposed({});
+        }
+        prime_fp8_lm_head_cache(false);
+        prime_fp8_lm_head_cache(true);
     }
 
     auto run_ops = [&]() {

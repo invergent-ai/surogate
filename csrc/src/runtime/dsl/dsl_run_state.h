@@ -144,6 +144,9 @@ public:
         }
         return false;
     }
+    [[nodiscard]] bool is_fp8_buffer_ready(FP8BufferReady flag) const {
+        return (mFP8BufferReadyFlags & flag) != 0;
+    }
     void reset_fp8_buffer_ready() {
         mFP8BufferReadyFlags = FP8Ready_None;
     }
