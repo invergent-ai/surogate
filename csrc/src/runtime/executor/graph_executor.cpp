@@ -8,6 +8,7 @@
 #include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/compiled_ops.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/dsl/tensor_slot_dispatch.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/executor/graph_executor_internal.h"
@@ -718,8 +719,11 @@ void GraphExecutor::init_compiled_execution() {
         };
 
         const auto maybe_rope = [&](std::string_view probe) -> std::optional<Tensor> {
-            if (probe.find("rope_freqs") != std::string_view::npos ||
-                probe.find("freq_cis") != std::string_view::npos) {
+            const bool legacy_value =
+                probe.find("rope_freqs") != std::string_view::npos || probe.find("freq_cis") != std::string_view::npos;
+            const bool role_value = tensor_role_is_rope_name(probe);
+            tensor_role_parity_check(probe, legacy_value, role_value, "GraphExecutor::resolve_param::maybe_rope");
+            if (legacy_value || role_value) {
                 Tensor t = mRunState.rope_freqs(name);
                 if (t.Data) {
                     log_debug_dump_choice("rope", t);
