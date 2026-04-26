@@ -59,6 +59,25 @@ inline int host_batch_row_for_local_rank(int local_rank, int ep_size) {
     return local_rank;
 }
 
+inline int round_up_pow2_int(int value) {
+    if (value <= 1) return 1;
+    int rounded = 1;
+    while (rounded < value && rounded < (1 << 30)) {
+        rounded <<= 1;
+    }
+    return rounded;
+}
+
+long env_long_mb(const char* name, long default_value) {
+    const char* value = std::getenv(name);
+    if (!value) {
+        return default_value;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    return (end != value && parsed >= 0) ? parsed : default_value;
+}
+
 }  // namespace
 
 namespace {
@@ -854,6 +873,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         // sequences would otherwise look like they have "boundaries" at
         // every row transition (pos[T] -> 0), which is wrong.
         bool has_doc_boundaries = false;
+        int current_max_num_docs = 0;
         std::vector<std::vector<std::int32_t>> per_ms_cu_seqlens(micro_steps);
         std::vector<int> per_ms_total_q(micro_steps, 0);
         if (mOptions.DocMasking) {
@@ -878,20 +898,23 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     if (last_len > 0) cu.push_back(cu.back() + last_len);
                 }
                 per_ms_total_q[j] = static_cast<int>(B * T);
+                current_max_num_docs = std::max(current_max_num_docs, std::max(0, static_cast<int>(cu.size()) - 1));
             }
         }
 
-        // Phase 5: opt-in path that lets the outer full-step capture run even
-        // under sample_packing. Used to drive the Phase-0 inventory of
-        // capture-unsafe call sites. Production stays on the eager fallback
-        // until that inventory is closed and the captures are reliable.
+        // Outer full-step capture handles sample_packing via the cap-and-pad
+        // cu_seqlens machinery (commits 05423b6, e4da4f8 + the saved-tensor
+        // policy fix): per-ms cu_seqlens slices in mCuSeqlensCpu, captured
+        // H2D memcpys with stable host source pointers, and a captured
+        // kernel grid baked at worst-case dims (params.b = MAX_NUM_DOCS,
+        // seqlen = total_q). SUROGATE_DEBUG_FORCE_OUTER_CAPTURE is now
+        // redundant for the doc-masking gate but kept as an opt-in escape
+        // hatch for diagnostic runs. The eager fallback below remains the
+        // path used when CUDA graphs are entirely disabled.
         const bool force_outer_capture = std::getenv("SUROGATE_DEBUG_FORCE_OUTER_CAPTURE") != nullptr;
+        (void)force_outer_capture;
 
-        // If graphs are disabled, or packed sequences need doc masking AND
-        // we're not in force-outer-capture mode, fall back to eager. Outer
-        // graph replay can't handle per-step cu_seqlens updates today; the
-        // force-outer-capture branch is a Phase-0 probe, not yet a fix.
-        if (!mOptions.UseCudaGraphs || (has_doc_boundaries && !force_outer_capture)) {
+        if (!mOptions.UseCudaGraphs) {
             const bool do_timing = mOptions.TriggerTimingEvents;
             if (do_timing && rs.TimingForwardStart.empty()) {
                 rs.setup_timing_events(micro_steps);
@@ -988,6 +1011,30 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             dsl_model->zero_grads(rs.MainStream);
             dsl_model->set_rng_state(rng_state);
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+
+            // Full-step graph capture bakes stack addresses into the graph, so
+            // Python cannot safely shrink the DSL stack after step 0. Do the
+            // one-shot shrink here: warmup has measured the real high-water
+            // mark, and capture has not started yet.
+            if (!env_enabled("SUROGATE_DISABLE_STACK_SHRINK")) {
+                const long safety_mb = env_long_mb("SUROGATE_FULLSTEP_STACK_SHRINK_SAFETY_MB", 512);
+                const long min_savings_mb = env_long_mb("SUROGATE_FULLSTEP_STACK_SHRINK_MIN_SAVINGS_MB", 128);
+                auto* dsl_rs = dynamic_cast<dsl::DslRunState*>(&rs);
+                if (dsl_rs) {
+                    const long old_size = static_cast<long>(dsl_rs->Stack.capacity());
+                    const long new_size =
+                        dsl_rs->shrink_stack_to_high_water_mark(safety_mb * 1024 * 1024, min_savings_mb * 1024 * 1024);
+                    if (new_size > 0) {
+                        dsl_model->invalidate_cuda_graphs();
+                        if (ctx.Communicator && ctx.Communicator->rank() == 0) {
+                            fprintf(stderr,
+                                    "[CUDA graphs] DSL stack shrunk before full-step capture: %ld MiB -> %ld MiB\n",
+                                    old_size / (1024 * 1024),
+                                    new_size / (1024 * 1024));
+                        }
+                    }
+                }
+            }
         }
 
         // After warmup compiles the graph, check for capture-unsafe ops
@@ -1008,6 +1055,32 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             return;
         }
 
+        int max_num_docs = 64;
+        if (const char* env = std::getenv("SUROGATE_OUTER_CAPTURE_MAX_DOCS")) {
+            char* end = nullptr;
+            const long val = std::strtol(env, &end, 10);
+            if (end != env && val > 0) max_num_docs = static_cast<int>(val);
+        }
+        if (has_doc_boundaries && current_max_num_docs > max_num_docs) {
+            throw std::runtime_error(
+                fmt::format("outer capture doc cap exceeded: current batch has {} docs, cap is {}. "
+                            "Increase SUROGATE_OUTER_CAPTURE_MAX_DOCS.",
+                            current_max_num_docs,
+                            max_num_docs));
+        }
+        if (gs.captured) {
+            if (has_doc_boundaries && (gs.captured_doc_cap <= 0 || current_max_num_docs > gs.captured_doc_cap)) {
+                gs.reset_capture();
+            } else if (!has_doc_boundaries && gs.captured_doc_cap > 0) {
+                has_doc_boundaries = true;
+                current_max_num_docs = 1;
+                const int total_q = static_cast<int>(B * T);
+                for (auto& cu : per_ms_cu_seqlens) {
+                    cu.assign({0, total_q});
+                }
+            }
+        }
+
         if (!gs.captured) {
             dsl_model->prepare_optimizer_state_for_graph(*ctx.Communicator, config);
             // The bwd_cross_layer arena is sized lazily during eager
@@ -1022,14 +1095,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             // SUROGATE_OUTER_CAPTURE_MAX_DOCS (default 64). cu_seqlens
             // contents are updated per-launch from a stable pinned host
             // buffer below, before cudaGraphLaunch.
-            int max_num_docs = 64;
-            if (const char* env = std::getenv("SUROGATE_OUTER_CAPTURE_MAX_DOCS")) {
-                char* end = nullptr;
-                const long val = std::strtol(env, &end, 10);
-                if (end != env && val > 0) max_num_docs = static_cast<int>(val);
-            }
             if (has_doc_boundaries) {
-                dsl_model->enable_doc_masking_pad_to_max(max_num_docs, micro_steps);
+                const int capture_doc_cap = std::min(max_num_docs, round_up_pow2_int(current_max_num_docs));
+                dsl_model->enable_doc_masking_pad_to_max(capture_doc_cap, micro_steps);
+                gs.captured_doc_cap = capture_doc_cap;
                 // Stage warmup-step cu_seqlens for each ms so the captured
                 // forward sees consistent shapes during capture.
                 const int total_q = static_cast<int>(B * T);

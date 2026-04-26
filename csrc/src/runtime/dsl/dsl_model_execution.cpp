@@ -408,6 +408,9 @@ void DslModel::zero_grads(cudaStream_t stream) {
     if (mGrads) {
         mGrads->zero_all(stream);
     }
+    if (mLoRAGrads) {
+        mLoRAGrads->zero_all(stream);
+    }
 }
 
 void DslModel::set_internal_graphs_enabled(bool enabled) {

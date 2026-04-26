@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -180,6 +181,88 @@ bool should_dump_attention_layer(int layer_idx) {
     return layer_idx == static_cast<int>(requested);
 }
 
+bool should_dump_flash_args() {
+    const char* env = std::getenv("SUROGATE_DEBUG_FLASH_ARGS");
+    return env && *env && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
+}
+
+std::string classify_flash_ptr(const void* raw, const dsl::PhaseArenas* arenas, const DeviceMemoryStack& stack) {
+    if (!raw) {
+        return "null";
+    }
+    const auto* ptr = static_cast<const std::byte*>(raw);
+    std::ostringstream oss;
+    if (stack.owns(ptr)) {
+        const auto* base = stack.base();
+        oss << "Stack";
+        if (base) {
+            oss << "+0x" << std::hex << static_cast<std::uintptr_t>(ptr - base) << std::dec;
+        }
+        oss << " live=" << (stack.is_live(ptr) ? 1 : 0);
+        return oss.str();
+    }
+    if (arenas && arenas->allocated) {
+        auto in_range = [&](const char* name, const std::byte* base, std::size_t bytes) -> bool {
+            if (!base || bytes == 0 || ptr < base || ptr >= base + bytes) {
+                return false;
+            }
+            oss << name << "+0x" << std::hex << static_cast<std::uintptr_t>(ptr - base) << std::dec;
+            return true;
+        };
+        if (in_range("Persistent", arenas->persistent_ptr, arenas->persistent_bytes)) return oss.str();
+        if (in_range("PersistentActivation", arenas->persistent_activation_ptr, arenas->persistent_activation_bytes))
+            return oss.str();
+        if (in_range("ModelScopePersistent", arenas->model_scope_persistent_ptr, arenas->model_scope_persistent_bytes))
+            return oss.str();
+        if (in_range("Accumulator", arenas->accumulator_ptr, arenas->accumulator_bytes)) return oss.str();
+        if (in_range("FwdStack", arenas->fwd_stack_ptr, arenas->fwd_stack_bytes)) return oss.str();
+        if (in_range("BwdStack", arenas->bwd_stack_ptr, arenas->bwd_stack_bytes)) return oss.str();
+        if (arenas->save_for_bwd_ptr && arenas->save_for_bwd_bytes > 0 && ptr >= arenas->save_for_bwd_ptr &&
+            ptr < arenas->save_for_bwd_ptr + arenas->save_for_bwd_bytes) {
+            const std::size_t rel = static_cast<std::size_t>(ptr - arenas->save_for_bwd_ptr);
+            int block = -1;
+            std::size_t block_base = 0;
+            for (std::size_t i = 0; i < arenas->save_for_bwd_block_bases.size(); ++i) {
+                const std::size_t begin = arenas->save_for_bwd_block_bases[i];
+                const std::size_t end = (i + 1 < arenas->save_for_bwd_block_bases.size())
+                                            ? arenas->save_for_bwd_block_bases[i + 1]
+                                            : arenas->save_for_bwd_bytes;
+                if (rel >= begin && rel < end) {
+                    block = static_cast<int>(i);
+                    block_base = begin;
+                    break;
+                }
+            }
+            oss << "SaveForBwd+0x" << std::hex << rel << std::dec;
+            if (block >= 0) {
+                oss << " block=" << block << " block_off=0x" << std::hex << (rel - block_base) << std::dec;
+            }
+            return oss.str();
+        }
+        if (in_range("BwdCrossLayer", arenas->bwd_cross_layer_ptr, arenas->bwd_cross_layer_bytes)) return oss.str();
+        if (in_range("MoeSaved", arenas->moe_saved_ptr, arenas->moe_saved_bytes)) return oss.str();
+    }
+    return "external";
+}
+
+void dump_flash_arg_line(const char* phase,
+                         const char* role,
+                         const TensorRef& ref,
+                         const Tensor& tensor,
+                         const CompiledGraph* graph,
+                         const dsl::PhaseArenas* arenas,
+                         const DeviceMemoryStack& stack) {
+    std::cerr << "[FLASH_ARGS] " << phase << " role=" << role << " data=" << static_cast<const void*>(tensor.Data)
+              << " where=" << classify_flash_ptr(tensor.Data, arenas, stack) << " shape=" << tensor_shape_debug(tensor)
+              << " bytes=" << tensor.bytes();
+    if (graph && ref.tensor_id >= 0) {
+        std::cerr << " " << graph->describe_tensor_id(ref.tensor_id);
+    } else if (!ref.name.empty()) {
+        std::cerr << " name='" << ref.name << "'";
+    }
+    std::cerr << "\n";
+}
+
 }  // namespace
 
 void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
@@ -254,6 +337,30 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
+    if (should_dump_flash_args()) {
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(mRunState.MainStream, &cap_status);
+        std::cerr << "[FLASH_ARGS] phase=fwd"
+                  << " ms=" << mMicroStep << " layer=" << layer_idx << " op=" << op.op_id
+                  << " backend=" << backend.name() << " capture=" << static_cast<int>(cap_status) << " B=" << mB
+                  << " T=" << mT << " num_docs=" << mNumDocs << " max_doc_seqlen=" << mMaxDocSeqlen
+                  << " total_doc_tokens=" << mTotalDocTokens
+                  << " cu_seqlens_gpu=" << static_cast<const void*>(mCuSeqlensGpu);
+        if (mCuSeqlensCpu && mNumDocs >= 0) {
+            const int preview = std::min(mNumDocs + 1, 8);
+            std::cerr << " cu_seqlens_cpu=[";
+            for (int i = 0; i < preview; ++i) {
+                if (i > 0) std::cerr << ",";
+                std::cerr << mCuSeqlensCpu[i];
+            }
+            if (mNumDocs + 1 > preview) std::cerr << ",...";
+            std::cerr << "]";
+        }
+        std::cerr << "\n";
+        dump_flash_arg_line("fwd", "qkv", op.inputs[0], qkv, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+        dump_flash_arg_line("fwd", "out", op.outputs[0], out, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+        dump_flash_arg_line("fwd", "lse", op.outputs[1], lse, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+    }
     if (env_enabled("SUROGATE_DEBUG_ATTENTION_RUNTIME")) {
         std::cerr << "[ATTN] dir=fwd"
                   << " layer=" << layer_idx << " backend=" << backend.name() << " window=" << window_size
@@ -354,6 +461,33 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
+    if (should_dump_flash_args()) {
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(mRunState.MainStream, &cap_status);
+        std::cerr << "[FLASH_ARGS] phase=bwd"
+                  << " ms=" << mMicroStep << " layer=" << layer_idx << " op=" << op.op_id
+                  << " backend=" << backend.name() << " capture=" << static_cast<int>(cap_status) << " B=" << mB
+                  << " T=" << mT << " num_docs=" << mNumDocs << " max_doc_seqlen=" << mMaxDocSeqlen
+                  << " total_doc_tokens=" << mTotalDocTokens
+                  << " cu_seqlens_gpu=" << static_cast<const void*>(mCuSeqlensGpu)
+                  << " deterministic=" << (params.deterministic_bwd ? 1 : 0);
+        if (mCuSeqlensCpu && mNumDocs >= 0) {
+            const int preview = std::min(mNumDocs + 1, 8);
+            std::cerr << " cu_seqlens_cpu=[";
+            for (int i = 0; i < preview; ++i) {
+                if (i > 0) std::cerr << ",";
+                std::cerr << mCuSeqlensCpu[i];
+            }
+            if (mNumDocs + 1 > preview) std::cerr << ",...";
+            std::cerr << "]";
+        }
+        std::cerr << "\n";
+        dump_flash_arg_line("bwd", "d_out", op.inputs[0], d_out, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+        dump_flash_arg_line("bwd", "out", op.inputs[1], out, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+        dump_flash_arg_line("bwd", "lse", op.inputs[2], lse, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+        dump_flash_arg_line("bwd", "qkv", op.inputs[3], qkv, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+        dump_flash_arg_line("bwd", "d_qkv", op.outputs[0], d_qkv, mCurrentGraph, mPhaseArenas, mRunState.Stack);
+    }
     if (env_enabled("SUROGATE_DEBUG_ATTENTION_RUNTIME")) {
         std::cerr << "[ATTN] dir=bwd"
                   << " layer=" << layer_idx << " backend=" << backend.name() << " window=" << window_size

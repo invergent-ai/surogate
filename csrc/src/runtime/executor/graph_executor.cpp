@@ -47,6 +47,10 @@
 namespace dsl {
 namespace {
 
+inline std::size_t align_up_bytes(std::size_t value, std::size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
 /// Copy position IDs to the device-side PositionIDs buffer, replicating a single
 /// plane across all 3 mRoPE planes when the model uses multimodal RoPE but the
 /// caller provides only one plane (e.g. text-only GRPO training).
@@ -1050,16 +1054,23 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 std::size_t wm_slab_bytes = 0;
                 std::size_t base_persistent_bytes = 0;
                 std::size_t extras_slab_bytes = 0;
+                std::size_t wm_slab_offset = 0;
+                std::size_t lora_slab_offset = 0;
+                std::size_t extras_slab_offset = 0;
                 if (mPhaseArenas.persistent_bytes > 0) {
                     base_persistent_bytes = mWeights.rebindable_persistent_bytes(*mCompiledForward);
-                    mPhaseArenas.persistent_bytes = base_persistent_bytes;
+                    std::size_t persistent_cursor = base_persistent_bytes;
                     if (mWeightManager) {
+                        persistent_cursor = align_up_bytes(persistent_cursor, 256);
+                        wm_slab_offset = persistent_cursor;
                         wm_slab_bytes = mWeightManager->total_persistent_bytes();
-                        mPhaseArenas.persistent_bytes += wm_slab_bytes;
+                        persistent_cursor += wm_slab_bytes;
                     }
                     if (mLoRAWeights) {
+                        persistent_cursor = align_up_bytes(persistent_cursor, 256);
+                        lora_slab_offset = persistent_cursor;
                         lora_slab_bytes = mLoRAWeights->total_persistent_bytes();
-                        mPhaseArenas.persistent_bytes += lora_slab_bytes;
+                        persistent_cursor += lora_slab_bytes;
                     }
                     // Non-graph persistent buffers (today: `output` logits
                     // scratch). These have no tid in the compiled graph, so
@@ -1067,7 +1078,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     // the arena here and route via
                     // rebind_non_graph_persistent_to_arena below.
                     extras_slab_bytes = mRunState.non_graph_persistent_extras_bytes();
-                    mPhaseArenas.persistent_bytes += extras_slab_bytes;
+                    if (extras_slab_bytes > 0) {
+                        persistent_cursor = align_up_bytes(persistent_cursor, 256);
+                        extras_slab_offset = persistent_cursor;
+                        persistent_cursor += extras_slab_bytes;
+                    }
+                    mPhaseArenas.persistent_bytes = persistent_cursor;
                 }
                 // Accumulator slab clamps to what DslGradStore can actually
                 // rebind; ZeRO-2 / offloaded / streaming / cpu-training
@@ -1117,11 +1133,11 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // is absent or has nothing device-resident to rebind.
                 mWeights.rebind_to_persistent_arena(*mCompiledForward, mPhaseArenas, mRunState.MainStream);
                 if (mWeightManager && wm_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
-                    std::byte* wm_base = mPhaseArenas.persistent_ptr + base_persistent_bytes;
+                    std::byte* wm_base = mPhaseArenas.persistent_ptr + wm_slab_offset;
                     mWeightManager->rebind_to_persistent_arena(wm_base, wm_slab_bytes, mRunState.MainStream);
                 }
                 if (mLoRAWeights && lora_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
-                    std::byte* lora_base = mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes;
+                    std::byte* lora_base = mPhaseArenas.persistent_ptr + lora_slab_offset;
                     mLoRAWeights->rebind_to_persistent_arena(lora_base, lora_slab_bytes, mRunState.MainStream);
                 }
                 if (mPhaseArenas.persistent_activation_ptr != nullptr) {
@@ -1130,8 +1146,7 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                                                    mRunState.MainStream);
                 }
                 if (extras_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
-                    std::byte* extras_base =
-                        mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes + lora_slab_bytes;
+                    std::byte* extras_base = mPhaseArenas.persistent_ptr + extras_slab_offset;
                     mRunState.rebind_non_graph_persistent_to_arena(extras_base,
                                                                    extras_slab_bytes,
                                                                    mRunState.MainStream);
@@ -1368,7 +1383,9 @@ void GraphExecutor::execute_forward(long B,
                                            rs.Stack,
                                            mForwardCheckpoint);
     // On CUDA graph replay, run_ops isn't executed, so saved tensors are stale.
-    // Refresh them here to reflect the current forward activations.
+    // During fresh capture, run_ops records layer-end D2D saves at the right
+    // point in the graph. Re-running save_tensors() after launch can recopy
+    // from stack slots that have already been restored/reused.
     if (use_graphs && !capturing) {
         mCompiledExecutor->save_tensors(mSaveList);
     }

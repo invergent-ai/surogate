@@ -577,6 +577,10 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
 
 namespace {
 
+std::size_t align_up_bytes(std::size_t value, std::size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
 // Walk every allocated (.Data != nullptr) leaf Tensor/TensorShard in the
 // LoRA weights set. `visit` is invoked once per live leaf in a stable,
 // layer-major order so master and work traversals match offset-for-offset
@@ -637,8 +641,14 @@ void for_each_lora_tensor(TSet& set, F&& visit) {
 std::size_t ModularLoRAWeightsManager::total_persistent_bytes() const {
     if (!enabled()) return 0;
     std::size_t total = 0;
-    for_each_lora_tensor(mMaster, [&](const Tensor& t) { total += t.bytes(); });
-    for_each_lora_tensor(mWork, [&](const Tensor& t) { total += t.bytes(); });
+    for_each_lora_tensor(mMaster, [&](const Tensor& t) {
+        total = align_up_bytes(total, 256);
+        total += t.bytes();
+    });
+    for_each_lora_tensor(mWork, [&](const Tensor& t) {
+        total = align_up_bytes(total, 256);
+        total += t.bytes();
+    });
     return total;
 }
 
@@ -655,6 +665,7 @@ std::size_t ModularLoRAWeightsManager::rebind_to_persistent_arena(std::byte* are
         if (tensor.Data == nullptr) return;
         const std::size_t bytes = tensor.bytes();
         if (bytes == 0) return;
+        cursor = align_up_bytes(cursor, 256);
         if (cursor + bytes > max_bytes) {
             throw std::runtime_error("ModularLoRAWeightsManager::rebind_to_persistent_arena: slab capacity " +
                                      std::to_string(max_bytes) + " exhausted at cursor " + std::to_string(cursor) +

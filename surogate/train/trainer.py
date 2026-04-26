@@ -882,12 +882,12 @@ class SurogateTrainerWrapper:
                 # Optional LoRA gradient debug (before optimizer update)
                 self._maybe_log_lora_grad_stats(step)
                 result = self.trainer.update_with_config(opt_config, step + 1)
-            # Stack shrinking under full-step graphs would free the buffer the
-            # captured graph references, faulting on step 1's replay. The
-            # graph captures absolute device pointers from the warmup-sized
-            # stack, so any post-capture cudaFree+cudaMalloc that moves it
-            # invalidates them.
-            if not use_full_step_graphs:
+            # Full-step CUDA graphs shrink internally after warmup and before
+            # capture, because the captured graph references absolute stack
+            # pointers. When full-step execution runs with CUDA graphs disabled
+            # (for example cpu_training/offload_master), it is still eager and
+            # can use the Python post-step shrink path.
+            if (not use_full_step_graphs) or (use_full_step_graphs and not self.config.use_cuda_graphs):
                 self._maybe_shrink_stack_after_warmup()
 
             # Build structured metrics for this step

@@ -252,6 +252,65 @@ inline void apply_lora_contribution(Tensor& output,
         return;
     }
 
+    Tensor output_slice = output;
+    output_slice.Data = output.Data + (std::size_t)output_offset * get_dtype_size(output.DType);
+    const bool aligned = ((uintptr_t)output_slice.Data % 16) == 0;
+
+    const bool enable_lora_b_small_rank_kernel = (std::getenv("SUROGATE_ENABLE_LORA_B_SMALL_RANK") != nullptr);
+    if (enable_lora_b_small_rank_kernel && prefer_explicit_add && fold_scaling_into_alpha &&
+        lora_accum_b_small_rank_bf16(output,
+                                     lora.B,
+                                     intermediate,
+                                     BT,
+                                     static_cast<int>(total_out_features),
+                                     out_features,
+                                     output_offset,
+                                     rank,
+                                     b_alpha,
+                                     stream)) {
+        return;
+    }
+
+    if (prefer_explicit_add && fold_scaling_into_alpha && rank == 16) {
+        if (output_offset == 0 && out_features == total_out_features) {
+            matmul(output,
+                   lora.B,
+                   intermediate,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   handle,
+                   workspace,
+                   out_features,
+                   BT,
+                   rank,
+                   EMMTranspose::TN,
+                   /*alpha=*/b_alpha,
+                   /*beta=*/1.0f,
+                   stream);
+            return;
+        }
+        if (aligned) {
+            matmul_strided_c(output_slice,
+                             lora.B,
+                             intermediate,
+                             std::nullopt,
+                             nullptr,
+                             nullptr,
+                             handle,
+                             workspace,
+                             out_features,
+                             BT,
+                             rank,
+                             EMMTranspose::TN,
+                             /*alpha=*/b_alpha,
+                             /*beta=*/1.0f,
+                             (int)total_out_features,
+                             stream);
+            return;
+        }
+    }
+
     const bool packed_delta_available =
         (slice_buffer.Data != nullptr && slice_buffer.DType == output.DType && slice_buffer.Rank >= 2 &&
          slice_buffer.Sizes[0] >= BT && slice_buffer.Sizes[1] >= out_features);
@@ -296,9 +355,6 @@ inline void apply_lora_contribution(Tensor& output,
     // Fused projections: prefer direct strided accumulate when aligned, else fall back to packed delta + add.
     // Some BF16 small-rank + large-output shapes (e.g. D=3584) are brittle with strided-C GEMM
     // on certain cuBLAS/cuBLASLt combinations; keep those on the packed-delta path.
-    Tensor output_slice = output;
-    output_slice.Data = output.Data + (std::size_t)output_offset * get_dtype_size(output.DType);
-    bool aligned = ((uintptr_t)output_slice.Data % 16) == 0;
     if (!prefer_explicit_add && aligned && out_features <= 2048) {
         matmul_strided_c(output_slice,
                          lora.B,

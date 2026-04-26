@@ -569,6 +569,24 @@ void matmul_strided_c(nv_bfloat16* c,
                       int ldc,
                       cudaStream_t stream);
 
+void matmul_strided_c(nv_bfloat16* c,
+                      const nv_bfloat16* a,
+                      const nv_bfloat16* b,
+                      const nv_bfloat16* bias,
+                      const float* scale_a,
+                      const float* scale_b,
+                      cublasLtHandle_t handle,
+                      std::byte* workspace,
+                      std::size_t workspace_size,
+                      int M,
+                      int N,
+                      int K,
+                      EMMTranspose mode,
+                      float alpha,
+                      float beta,
+                      int ldc,
+                      cudaStream_t stream);
+
 void matmul(nv_bfloat16* c,
             const __nv_fp8_e4m3* a,
             const __nv_fp8_e4m3* b,
@@ -673,6 +691,23 @@ void matmul_strided_c(Tensor& c,
                       int K,
                       EMMTranspose mode,
                       bool accumulate,
+                      int ldc,
+                      cudaStream_t stream);
+
+void matmul_strided_c(Tensor& c,
+                      const Tensor& a,
+                      const Tensor& b,
+                      std::optional<Tensor> bias,
+                      const float* scale_a,
+                      const float* scale_b,
+                      cublasLtHandle_t handle,
+                      Tensor& workspace,
+                      int M,
+                      int N,
+                      int K,
+                      EMMTranspose mode,
+                      float alpha,
+                      float beta,
                       int ldc,
                       cudaStream_t stream);
 
@@ -4344,6 +4379,23 @@ bool lora_project_small_rank_bf16(Tensor& out,
                                   int BT,
                                   int in_features,
                                   int rank,
+                                  cudaStream_t stream);
+
+/**
+ * @brief Accumulate a small-rank LoRA-B projection directly into BF16 output.
+ *
+ * Computes output[row, output_offset + col] += scaling * dot(intermediate[row, :], B[col, :])
+ * for rank-specialized BF16 tensors. Returns true when the custom kernel handled the shape.
+ */
+bool lora_accum_b_small_rank_bf16(Tensor& output,
+                                  const Tensor& B,
+                                  const Tensor& intermediate,
+                                  int BT,
+                                  int total_out_features,
+                                  int out_features,
+                                  int output_offset,
+                                  int rank,
+                                  float scaling,
                                   cudaStream_t stream);
 
 #endif  //SUROGATE_SRC_KERNELS_KERNELS_H

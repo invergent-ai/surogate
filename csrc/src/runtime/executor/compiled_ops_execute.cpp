@@ -378,9 +378,9 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             if (!parse_block_param(tensor_name, saved_layer, saved_field) || saved_layer != layer_idx) {
                 return false;
             }
-            const std::string base = strip_ssa_suffix(saved_field);
-            return base == "ln1" || base == "ln1_flat" || base == "ln" || base == "ln_flat" || base == "ln1_rstd" ||
-                   base == "ln_rstd";
+            const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(saved_field));
+            return slot == TensorSlot::BlockLN1 || slot == TensorSlot::BlockLN1RSTD || slot == TensorSlot::BlockLN2 ||
+                   slot == TensorSlot::BlockLN2RSTD;
         };
         for (const auto& name : *mSaveList) {
             {
@@ -830,21 +830,20 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (!parse_block_param(name, resolved_layer, field) || resolved_layer != layer_idx) {
                 return false;
             }
-            const std::string base_field = strip_ssa_suffix(field);
-            return base_field == "ln1" || base_field == "ln1_flat" || base_field == "ln" || base_field == "ln_flat" ||
-                   base_field == "ln1_rstd" || base_field == "ln_rstd";
+            const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+            return slot == TensorSlot::BlockLN1 || slot == TensorSlot::BlockLN1RSTD || slot == TensorSlot::BlockLN2 ||
+                   slot == TensorSlot::BlockLN2RSTD;
+        };
+        auto is_lora_hook_activation = [&](const std::string& name) -> bool {
+            if (!mLoRAConfig) {
+                return false;
+            }
+            const TensorSlot slot = resolve_block_slot(name);
+            return slot == TensorSlot::BlockSwiGLU || slot == TensorSlot::BlockAtt;
         };
 
         auto persist_saved_source_now = [&](const std::string& name, const Tensor& src) -> bool {
             if (!src.Data) {
-                return false;
-            }
-            // Skip under forward-stream capture: the cudaMemcpyAsync below
-            // captures src.Data at capture time, but the source lives on the
-            // Stack arena whose contents are regenerated per-step in ways
-            // that can drift the captured pointer. Meta-only save + replay
-            // regen in backward is the capture-safe path.
-            if (fwd_stream_capturing) {
                 return false;
             }
             const size_t bytes = src.bytes();
@@ -853,6 +852,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             auto buf_it = mMoeSavedBuffers.find(name);
             if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+                if (fwd_stream_capturing) {
+                    // Capture can record the D2D copy below, but it cannot
+                    // allocate the persistent destination. The graph executor
+                    // must preallocate these buffers before capture.
+                    return false;
+                }
                 if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
@@ -948,13 +953,17 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             if (!name_belongs_to_layer(name, layer_idx)) {
                 continue;
             }
-            if (mSaved->find(name) != mSaved->end()) {
-                continue;
+            const bool force_lora_hook = is_lora_hook_activation(name);
+            if (auto saved_it = mSaved->find(name); saved_it != mSaved->end()) {
+                if (!force_lora_hook) {
+                    continue;
+                }
+                mSaved->erase(saved_it);
             }
             // Skip tensors that will be recomputed in backward — save metadata only.
             // This avoids allocating persistent cudaMalloc buffers for tensors like
             // mlp_up and swiglu that are stack-backed but fully recomputable.
-            if (will_recompute_tensor(name)) {
+            if (!force_lora_hook && will_recompute_tensor(name)) {
                 auto src_opt = resolve_saved_source(name);
                 if (src_opt.has_value() && src_opt->Data) {
                     Tensor meta = *src_opt;
@@ -1772,6 +1781,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // must be explicitly released.
     mBwdCrossLayerBumpOffset = 0;
     mBwdCrossLayerCurrentFallbackBytes = 0;
+    mBwdCrossLayerCurrentLiveBytes = 0;
+    mBwdCrossLayerFreeBlocks.clear();
+    mBwdCrossLayerAllocBytes.clear();
     // cudaFree during stream capture invalidates the capture, so defer
     // the fallback-cleanup to the next non-capturing entry. Fallbacks
     // only ever get appended in the bwd_cross_layer-arena overflow path
@@ -2396,7 +2408,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             }
         }
         // Arena-backed pointers in the bwd_cross_layer arena are reclaimed
-        // by the per-step bump reset; nothing to free here.
+        // into a per-backward free list so later cross-layer persists can
+        // reuse the memory before the next bump reset.
+        release_bwd_cross_layer(ptr);
         persisted_backward_refcount.erase(ptr);
     };
     auto release_persisted_backward_tid = [&](int tid) {

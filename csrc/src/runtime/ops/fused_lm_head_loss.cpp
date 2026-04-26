@@ -353,7 +353,6 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         const bool need_softcap_bwd = (op.attrs.softcap > 0.0f);
         if (need_softcap_bwd) {
             capped_copy = mRunState.temp_alloc(logits.DType, {nano_batch_size, V}, "fused_lm_head_softcap_capped");
-            mTemps.push_back(capped_copy);
             CUDA_CHECK(cudaMemcpyAsync(capped_copy.Data,
                                        logits.Data,
                                        static_cast<std::size_t>(nano_batch_size) * static_cast<std::size_t>(V) *
@@ -415,6 +414,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                                     static_cast<int>(nano_batch_size),
                                     V,
                                     mRunState.MainStream);
+            mRunState.temp_free(capped_copy);
         }
 
         if (d_weight_ptr) {

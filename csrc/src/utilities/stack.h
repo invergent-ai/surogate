@@ -39,6 +39,9 @@ public:
     [[nodiscard]] std::size_t capacity() const {
         return mCapacity;
     }
+    [[nodiscard]] const std::byte* base() const {
+        return mBackingMemory;
+    }
     int device_id() const;
     bool owns(const std::byte* ptr) const;
     bool is_live(const std::byte* ptr) const;

@@ -231,6 +231,7 @@ private:
         bool has_stack_checkpoint = false;
         std::byte* stack_top = nullptr;
         std::size_t stack_alloc_count = 0;
+        int captured_doc_cap = 0;
         Tensor opt_params;
         Tensor opt_step;
         std::vector<Tensor> inputs;
@@ -250,6 +251,7 @@ private:
             has_stack_checkpoint = false;
             stack_top = nullptr;
             stack_alloc_count = 0;
+            captured_doc_cap = 0;
         }
     };
     struct sThreadContext {

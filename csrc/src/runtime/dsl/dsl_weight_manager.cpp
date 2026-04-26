@@ -47,6 +47,15 @@ bool is_embedding_name(std::string_view name) {
     return clean == "embedding" || clean == "embeddings" || clean == "embed_tokens" || clean == "pli_embedding";
 }
 
+bool is_primary_embedding_name(std::string_view name) {
+    const std::string_view clean = trim_optional(name);
+    return clean == "embedding" || clean == "embeddings" || clean == "embed_tokens";
+}
+
+bool is_pli_embedding_name(std::string_view name) {
+    return trim_optional(name) == "pli_embedding";
+}
+
 bool is_lm_head_name(std::string_view name) {
     const std::string_view clean = trim_optional(name);
     return clean == "lm_head" || clean == "lm_head_weight";
@@ -296,7 +305,14 @@ void DslWeightManager::allocate_weights(const Module& module,
             // CPU-RAM centric: only embedding/lm_head may share a GPU work buffer.
             // final_norm is gathered alongside them in forward/backward, so sharing it
             // would let the later gather clobber the earlier weight before use.
-            if (is_embedding_name(name) || is_lm_head_name(name)) {
+            if (is_pli_embedding_name(name)) {
+                // Gemma4 PLI embedding is several GiB because its embedding dim
+                // is num_layers * hidden_size_per_layer_input. In cpu_training,
+                // keep it CPU-resident and let the embedding kernel read the
+                // mapped pinned master rows directly instead of materializing a
+                // full GPU copy for a sparse lookup.
+                entry.work = Tensor{};
+            } else if (is_primary_embedding_name(name) || is_lm_head_name(name)) {
                 entry.work = Tensor{};  // Will be set to the shared buffer below
             } else {
                 entry.work =
@@ -329,7 +345,7 @@ void DslWeightManager::allocate_weights(const Module& module,
             const auto& name = kv.first;
             auto& entry = kv.second;
             if (entry.is_block || entry.work.Data) continue;
-            if (!is_embedding_name(name) && !is_lm_head_name(name)) continue;
+            if (!is_primary_embedding_name(name) && !is_lm_head_name(name)) continue;
             std::size_t bytes = 1;
             std::vector<long> shape(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
             for (auto d : shape)
@@ -351,7 +367,7 @@ void DslWeightManager::allocate_weights(const Module& module,
                 const auto& name = kv.first;
                 auto& entry = kv.second;
                 if (entry.is_block || entry.work.Data) continue;
-                if (!is_embedding_name(name) && !is_lm_head_name(name)) continue;
+                if (!is_primary_embedding_name(name) && !is_lm_head_name(name)) continue;
                 entry.work = Tensor::from_pointer(
                     shared_buf.Data,
                     shared_buf.Device,
@@ -412,6 +428,15 @@ void DslWeightManager::allocate_prefetch_buffers() {
         }
         return name;
     };
+    auto prefetch_key = [](const std::string& base, const std::vector<long>& shape) -> std::string {
+        std::string key = base;
+        key.push_back('|');
+        for (long dim : shape) {
+            key += std::to_string(dim);
+            key.push_back(',');
+        }
+        return key;
+    };
 
     // Allocate double buffers for prefetching.
     // Only one layer occupies each prefetch slot at a time, so we allocate one set
@@ -431,19 +456,20 @@ void DslWeightManager::allocate_prefetch_buffers() {
                 if (it == mWeights.end()) continue;
 
                 std::string bname = base_name(name);
-                auto bit = base_buffers.find(bname);
+                const auto& entry = it->second;
+                std::vector<long> shape = entry.global_shape;
+                if (shape.empty()) {
+                    shape.assign(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
+                }
+                const std::string pkey = prefetch_key(bname, shape);
+                auto bit = base_buffers.find(pkey);
 
                 if (bit == base_buffers.end()) {
                     // First time seeing this base param — allocate GPU buffer
-                    const auto& entry = it->second;
-                    std::vector<long> shape = entry.global_shape;
-                    if (shape.empty()) {
-                        shape.assign(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
-                    }
                     std::string buf_name = "prefetch_" + std::to_string(i) + "_" + bname;
                     Tensor buf =
                         mAllocator->allocate(mConfig.work_dtype, buf_name.c_str(), EAllocationType::ON_DEVICE, shape);
-                    base_buffers.emplace(bname, buf);
+                    base_buffers.emplace(pkey, buf);
                     mPrefetchBuffers[i].emplace(name, buf);
                 } else {
                     // Reuse existing buffer — alias same GPU memory
@@ -571,10 +597,16 @@ void DslWeightManager::sync_work_from_master(cudaStream_t stream) {
         if ((mStreamWeights || mConfig.offload_master) && entry.is_block) {
             continue;  // Block weights are gathered on demand
         }
-        if (mConfig.cpu_training && !entry.is_block) {
-            continue;  // Non-block weights are gathered on demand in cpu_training
+        if (mConfig.cpu_training && !entry.is_block &&
+            (kv.first == mEmbeddingName || kv.first == mLmHeadName || kv.first == mFinalNormName)) {
+            continue;  // Shared/special non-block weights are gathered on demand in cpu_training.
         }
-        convert_to_work(entry.master, entry.work, stream);
+        try {
+            convert_to_work(entry.master, entry.work, stream);
+        } catch (const std::exception& e) {
+            throw std::runtime_error("DslWeightManager::sync_work_from_master failed for '" + kv.first +
+                                     "': " + e.what());
+        }
     }
 }
 
@@ -903,6 +935,10 @@ void DslWeightManager::iterate_tensors(const std::function<void(std::string, con
 
 namespace {
 
+std::size_t align_up_bytes(std::size_t value, std::size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
 // True when `t` is a device-resident Tensor backed by a `cudaMalloc`
 // allocation (as opposed to pinned CPU / zero-copy / uninitialized).
 // `Device >= 0` is the signal the allocator sets for on-device buffers;
@@ -919,6 +955,7 @@ std::size_t DslWeightManager::total_persistent_bytes() const {
     auto count_if_eligible = [&](const Tensor& t) {
         if (!is_device_resident(t)) return;
         if (!seen.insert(t.Data).second) return;
+        total = align_up_bytes(total, 256);
         total += t.bytes();
     };
     for (const auto& kv : mWeights) {
@@ -964,6 +1001,7 @@ DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t 
         }
         const std::size_t bytes = t.bytes();
         if (bytes == 0) return false;
+        cursor = align_up_bytes(cursor, 256);
         if (cursor + bytes > max_bytes) {
             throw std::runtime_error("DslWeightManager::rebind_to_persistent_arena: slab capacity " +
                                      std::to_string(max_bytes) + " exhausted at cursor " + std::to_string(cursor) +

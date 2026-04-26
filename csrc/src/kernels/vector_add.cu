@@ -46,6 +46,27 @@ __global__ void vector_add_sr_kernel(T* dest, const T* left, const T* right, flo
     }
 }
 
+template <typename T>
+__global__ void vector_add_same_sr_kernel(T* dest, const T* src, float scale, long nelem, unsigned seed) {
+    using vec_t = GenericVector<T, 16 / sizeof(T)>;
+    long idx = (blockIdx.x * blockDim.x + threadIdx.x) * vec_t::size;
+    if (idx + vec_t::size <= nelem) {
+        vec_t a = vec_t::load_cs(src + idx);
+        vec_t c = vec_t::zeros();
+        for (int j = 0; j < vec_t::size; ++j) {
+            float sum = scale * ((float)a[j] + (float)a[j]);
+            stochastic_rounding(sum, &c[j], seed + idx + j);
+        }
+        c.store(dest + idx);
+    } else if (idx < nelem) {
+        for (long j = idx; j < nelem; ++j) {
+            float value = (float)src[j];
+            float sum = scale * (value + value);
+            stochastic_rounding(sum, &dest[j], seed + j);
+        }
+    }
+}
+
 /**
  * @brief CUDA kernel for reducing multiple shards into a single destination with stochastic rounding.
  *
@@ -161,8 +182,13 @@ void vector_add_sr_imp(T* dest,
     if (grid_size > 2147483647L) {
         throw std::runtime_error("vector_add_sr_imp: grid_size too large");
     }
-    vector_add_sr_kernel<T>
-        <<<(unsigned int)grid_size, (unsigned int)block_size, 0, stream>>>(dest, left, right, scale, nelem, seed);
+    if (left == right) {
+        vector_add_same_sr_kernel<T>
+            <<<(unsigned int)grid_size, (unsigned int)block_size, 0, stream>>>(dest, left, scale, nelem, seed);
+    } else {
+        vector_add_sr_kernel<T>
+            <<<(unsigned int)grid_size, (unsigned int)block_size, 0, stream>>>(dest, left, right, scale, nelem, seed);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

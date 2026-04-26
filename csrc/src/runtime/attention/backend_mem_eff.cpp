@@ -12,6 +12,7 @@
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 #include "runtime/dsl/dsl_run_state.h"
 #include "runtime/executor/compiled_ops.h"
+#include "kernels/kernels.h"
 #include "utilities/tensor.h"
 
 #include <cuda_bf16.h>
@@ -23,6 +24,17 @@ namespace dsl {
 namespace {
 
 constexpr int kMemEffLseAlignment = 32;
+
+void synthesize_dense_cu_seqlens_if_needed(AttentionParams& p, DslRunState& rs) {
+    if (p.cu_seqlens != nullptr) return;
+    p.num_docs = p.B;
+    p.max_doc_seqlen = p.T;
+    p.total_doc_tokens = p.B * p.T;
+    Tensor dense = rs.temp_alloc(ETensorDType::INT32, {static_cast<long>(p.num_docs + 1)}, "mem_eff_dense_cu_seqlens");
+    fill_dense_cu_seqlens(dense.get<int32_t>(), p.num_docs, p.max_doc_seqlen, p.stream);
+    p.cu_seqlens = dense.get<int32_t>();
+    p.cu_seqlens_cpu = nullptr;
+}
 
 class MemEffAttention final : public AttentionBackend {
 public:
@@ -62,10 +74,6 @@ public:
         // True GQA with Hkv>1 && Hkv<Hq needs a head-group stride the
         // kernel doesn't expose; reject those cases for now.
         if (p.Hkv != p.Hq && p.Hkv != 1) return reject("GQA with Hkv>1 not supported");
-        // Only claim the cu_seqlens case initially — this is where SDPA
-        // is the worst fit (per-doc slicing). Dense non-varlen stays on
-        // cuDNN / flash-varlen which are already capture-safe.
-        if (p.cu_seqlens == nullptr) return reject("no cu_seqlens");
         if (p.run_state == nullptr || p.temps == nullptr) return reject("no run_state/temps");
         return true;
     }
@@ -78,6 +86,7 @@ public:
         if (!exec) {
             throw std::runtime_error("mem_eff forward: no active executor");
         }
+        synthesize_dense_cu_seqlens_if_needed(p, rs);
         exec->mem_eff_scratch_reset();
 
         // Compute layout from AttentionParams shape fields.
@@ -193,6 +202,7 @@ public:
         if (!exec) {
             throw std::runtime_error("mem_eff backward: no active executor");
         }
+        synthesize_dense_cu_seqlens_if_needed(p, rs);
         exec->mem_eff_scratch_reset();
 
         const int T = p.T;

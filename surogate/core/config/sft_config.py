@@ -351,7 +351,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora: bool | None = True
     lora_rank: int | None = 16
     lora_alpha: int | None = 32
-    lora_dropout: float | None = 0.05
+    lora_dropout: float | None = 0
     lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False

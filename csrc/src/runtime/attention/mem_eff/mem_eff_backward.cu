@@ -17,12 +17,12 @@ using AttentionBackwardKernelGmem = PyTorchMemEffAttention::AttentionBackwardKer
                                                                                     true,                 // kIsAligned_
                                                                                     false,   // kApplyDropout_
                                                                                     false,   // kPreload_
-                                                                                    64,      // kBlockSizeI
+                                                                                    128,     // kBlockSizeI
                                                                                     64,      // kBlockSizeJ
                                                                                     65536>;  // kMaxK
 
 // Auto-generated (kernels/cutlassB_bf16_aligned_k65536.cu), global scope.
-__global__ void fmha_cutlassB_bf16_aligned_64x64_k65536_sm80(typename AttentionBackwardKernelGmem::Params p);
+__global__ void fmha_cutlassB_bf16_aligned_128x64_k65536_sm80(typename AttentionBackwardKernelGmem::Params p);
 
 namespace surogate {
 namespace mem_eff {
@@ -109,7 +109,7 @@ void backward_bf16_sm80(const BackwardArgs& args) {
 
     const size_t smem_bytes = sizeof(typename AttentionBackwardKernelGmem::SharedStorage);
     if (smem_bytes > 0xc000) {
-        cudaError_t err = cudaFuncSetAttribute(fmha_cutlassB_bf16_aligned_64x64_k65536_sm80,
+        cudaError_t err = cudaFuncSetAttribute(fmha_cutlassB_bf16_aligned_128x64_k65536_sm80,
                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                static_cast<int>(smem_bytes));
         if (err == cudaErrorInvalidValue) {
@@ -120,7 +120,8 @@ void backward_bf16_sm80(const BackwardArgs& args) {
         }
     }
 
-    fmha_cutlassB_bf16_aligned_64x64_k65536_sm80<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, args.stream>>>(p);
+    fmha_cutlassB_bf16_aligned_128x64_k65536_sm80<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, args.stream>>>(
+        p);
 }
 
 }  // namespace mem_eff
