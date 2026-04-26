@@ -125,6 +125,17 @@ bool tensor_role_is_shared_expert_name(std::string_view name) {
     return role.is_moe_owned() && contains(name, "shared_expert");
 }
 
+bool tensor_role_is_expert_weight_name(std::string_view name) {
+    const TensorRole role = infer_tensor_role_from_name(name);
+    return role.is_expert_parallel() &&
+           (contains(name, "experts") || contains(name, "expert_gate_up") || contains(name, "expert_down"));
+}
+
+bool tensor_role_is_expert_bias_name(std::string_view name) {
+    const TensorRole role = infer_tensor_role_from_name(name);
+    return role.is_expert_parallel() && contains(name, "experts_") && contains(name, "_bias");
+}
+
 void tensor_role_parity_check(std::string_view name, bool legacy_value, bool role_value, const char* context) {
     const char* env = std::getenv("SUROGATE_TENSOR_ROLE_PARITY");
     if (!env || std::string_view(env) == "0") {
