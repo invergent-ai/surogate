@@ -19,6 +19,7 @@
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
 #include "runtime/dsl/dsl_weight_loader.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/qlora/adapter_merger.h"
 #include "runtime/qlora/fp4_block_quantized_tensor.h"
 #include "utilities/allocator.h"
@@ -47,8 +48,11 @@ size_t spec_num_elements(const WeightLoadSpec& spec) {
 bool is_expert_weight(const WeightLoadSpec& spec) {
     if (spec.shape.size() < 3) return false;
     const auto& n = spec.name;
-    return n.find("experts") != std::string::npos || n.find("expert_gate_up") != std::string::npos ||
-           n.find("expert_down") != std::string::npos;
+    const bool legacy_value = n.find("experts") != std::string::npos || n.find("expert_gate_up") != std::string::npos ||
+                              n.find("expert_down") != std::string::npos;
+    const bool role_value = dsl::tensor_role_is_expert_weight_name(n);
+    dsl::tensor_role_parity_check(n, legacy_value, role_value, "qlora_pipeline::expert_weight");
+    return legacy_value || role_value;
 }
 
 const SafeTensorEntry* try_find_entry(const SafeTensorsReader& reader, std::string_view name) {
