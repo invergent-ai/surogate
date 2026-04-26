@@ -1,0 +1,19 @@
+{
+  "artifacts": {},
+  "case": {
+    "config": null,
+    "distribution": "single_gpu",
+    "env_model_path": "NEMOTRON_H_MODEL_PATH",
+    "model": "nemotron_h",
+    "op_kind": "dense",
+    "recipe": "fp8",
+    "storage": "gpu",
+    "supported": true
+  },
+  "command": [],
+  "duration_s": 0.0,
+  "metrics": {},
+  "reason": "missing NEMOTRON_H_MODEL_PATH",
+  "started_at": 0.0,
+  "status": "skipped"
+}

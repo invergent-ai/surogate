@@ -119,6 +119,7 @@ FIRST_MONTH_MATRIX: tuple[RegressionCase, ...] = (
         env_model_path="GEMMA4_MODEL_PATH",
     ),
     RegressionCase("nemotron_h", "bf16", "single_gpu", env_model_path="NEMOTRON_H_MODEL_PATH"),
+    RegressionCase("nemotron_h", "fp8", "single_gpu", env_model_path="NEMOTRON_H_MODEL_PATH"),
     RegressionCase(
         "qwen3_5",
         "bf16",
