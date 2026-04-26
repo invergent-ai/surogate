@@ -4516,6 +4516,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
             }
         }
 
+        meta.role = infer_tensor_role_from_name(name, meta.block_layer_idx);
         graph.tensor_meta[static_cast<std::size_t>(id)] = meta;
     }
 

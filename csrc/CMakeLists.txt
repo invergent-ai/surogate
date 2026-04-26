@@ -301,6 +301,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/op_shape_signatures.cpp
     src/runtime/dsl/tensor_slot_registry.cpp
     src/runtime/dsl/tensor_slot_dispatch.cpp
+    src/runtime/dsl/tensor_role.cpp
 
     src/runtime/ops/embedding.cpp
     src/runtime/ops/zeros.cpp

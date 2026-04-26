@@ -23,6 +23,7 @@
 
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
 
@@ -403,6 +404,7 @@ struct TensorMeta {
 
     // Classification (populated by classify_tensors() after build_tensor_metadata).
     TensorKind kind = TensorKind::Unknown;
+    TensorRole role{};
     int base_param_tid = -1;     ///< ParamGrad -> tid of the parameter
     int base_producer_tid = -1;  ///< ActivationGrad -> tid of the forward activation
     int base_grad_tid = -1;      ///< AccumTemp -> tid of the non-accum parent gradient
