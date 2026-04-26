@@ -799,11 +799,10 @@ class SurogateTrainerWrapper:
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
                 if early_stopping is not None and early_stopping.check_eval(val_loss, step):
                     break
-                # Reload training batch after evaluation (eval leaves its last batch in the buffers)
-                if use_full_step_graphs:
-                    chunk = self.config.gpus * self.config.per_device_train_batch_size
-                    self.train_loader.load_batch(in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk])
-                else:
+                # Reload training batch after evaluation for the eager path.
+                # Full-step training loads every micro-batch below, so doing it
+                # here would silently consume and skip one train batch per eval.
+                if not use_full_step_graphs:
                     self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic checkpointing (before training step)

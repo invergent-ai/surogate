@@ -1056,17 +1056,33 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         }
 
         int max_num_docs = 64;
+        bool max_num_docs_from_env = false;
         if (const char* env = std::getenv("SUROGATE_OUTER_CAPTURE_MAX_DOCS")) {
             char* end = nullptr;
             const long val = std::strtol(env, &end, 10);
-            if (end != env && val > 0) max_num_docs = static_cast<int>(val);
+            if (end != env && val > 0) {
+                max_num_docs = static_cast<int>(val);
+                max_num_docs_from_env = true;
+            }
         }
         if (has_doc_boundaries && current_max_num_docs > max_num_docs) {
-            throw std::runtime_error(
-                fmt::format("outer capture doc cap exceeded: current batch has {} docs, cap is {}. "
-                            "Increase SUROGATE_OUTER_CAPTURE_MAX_DOCS.",
-                            current_max_num_docs,
-                            max_num_docs));
+            if (max_num_docs_from_env) {
+                throw std::runtime_error(
+                    fmt::format("outer capture doc cap exceeded: current batch has {} docs, cap is {}. "
+                                "Increase SUROGATE_OUTER_CAPTURE_MAX_DOCS.",
+                                current_max_num_docs,
+                                max_num_docs));
+            }
+            const int old_max_num_docs = max_num_docs;
+            max_num_docs = round_up_pow2_int(current_max_num_docs);
+            static bool warned_auto_doc_cap = false;
+            if (!warned_auto_doc_cap && ctx.Communicator && ctx.Communicator->rank() == 0) {
+                std::fprintf(stderr,
+                             "[CUDA graphs] outer capture doc cap auto-raised: %d -> %d docs\n",
+                             old_max_num_docs,
+                             max_num_docs);
+                warned_auto_doc_cap = true;
+            }
         }
         if (gs.captured) {
             if (has_doc_boundaries && (gs.captured_doc_cap <= 0 || current_max_num_docs > gs.captured_doc_cap)) {
@@ -1092,9 +1108,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             // captured kernel grid + scalar args (params.b, seqlen) to
             // worst case so a single captured graph replays correctly
             // for any per-step cu_seqlens topology within
-            // SUROGATE_OUTER_CAPTURE_MAX_DOCS (default 64). cu_seqlens
-            // contents are updated per-launch from a stable pinned host
-            // buffer below, before cudaGraphLaunch.
+            // SUROGATE_OUTER_CAPTURE_MAX_DOCS, or the observed topology when
+            // the env cap is unset. cu_seqlens contents are updated per-launch
+            // from a stable pinned host buffer below, before cudaGraphLaunch.
             if (has_doc_boundaries) {
                 const int capture_doc_cap = std::min(max_num_docs, round_up_pow2_int(current_max_num_docs));
                 dsl_model->enable_doc_masking_pad_to_max(capture_doc_cap, micro_steps);
