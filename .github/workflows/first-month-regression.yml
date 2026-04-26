@@ -1,0 +1,67 @@
+name: First Month Regression
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: Run the self-hosted GPU regression lane
+        required: false
+        type: boolean
+        default: false
+      steps:
+        description: Training steps for GPU regression cases
+        required: false
+        type: number
+        default: 50
+  schedule:
+    - cron: "17 7 * * *"
+
+jobs:
+  no-gpu-smoke:
+    name: No-GPU Regression Smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Run no-GPU regression smoke
+        run: make regression-smoke
+
+  gpu-regression:
+    name: Self-Hosted GPU Regression
+    runs-on: self-hosted
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_gpu)
+    env:
+      GEMMA4_MODEL_PATH: ${{ secrets.GEMMA4_MODEL_PATH }}
+      NEMOTRON_H_MODEL_PATH: ${{ secrets.NEMOTRON_H_MODEL_PATH }}
+      QWEN3_MODEL_PATH: ${{ secrets.QWEN3_MODEL_PATH }}
+      QWEN3_5_MODEL_PATH: ${{ secrets.QWEN3_5_MODEL_PATH }}
+      QWEN3_5_MOE_MODEL_PATH: ${{ secrets.QWEN3_5_MOE_MODEL_PATH }}
+      SUROGATE_FP8_MOE_WGRAD: "1"
+      STEPS: ${{ inputs.steps || 50 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build development extension
+        run: make wheel-dev
+
+      - name: Run first-month GPU regression matrix
+        run: make regression-gpu
+
+      - name: Upload current regression artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: first-month-regression-current
+          path: regression_baselines/current/
+          if-no-files-found: ignore

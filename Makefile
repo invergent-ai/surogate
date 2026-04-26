@@ -12,7 +12,7 @@ CUDA_HOME ?= $(or $(CUDA_PATH),$(shell dirname $$(dirname $$(which nvcc 2>/dev/n
 export CCACHE_CUDA_PATHS := $(CUDA_HOME)
 endif
 
-.PHONY: all build export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all help info format format-check format-cpp format-py lint-py
+.PHONY: all build export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
 
 # Default target
 all: build
@@ -144,6 +144,19 @@ test-all: build-tests
 # Default test target (backward compatible, runs unit tests)
 test: test-unit
 
+# First-month refactor regression harness. These targets intentionally avoid
+# tests/test_distributed.py; distributed GPU coverage is driven by the baseline
+# runner matrix instead.
+regression-smoke:
+	uv run pytest -q tests/test_regression_baseline_runner.py tests/test_moe_monitor.py --no-gpu
+	uv run python -m surogate.regression.baseline_runner --out /tmp/surogate-regression-current --compare --report
+
+regression-update-baseline:
+	uv run python -m surogate.regression.baseline_runner --out /tmp/surogate-regression-current --baseline regression_baselines/locked --update-baseline --report
+
+regression-gpu:
+	uv run python -m surogate.regression.baseline_runner --out regression_baselines/current --baseline regression_baselines/locked --run --steps $${STEPS:-50} --compare --report
+
 # Clean build artifacts (keep build directory structure)
 clean:
 	@if [ -d "$(BUILD_DIR)" ] && [ -f "$(BUILD_DIR)/CMakeCache.txt" ]; then \
@@ -200,6 +213,8 @@ help:
 	@echo "  test-unit        - Build and run unit tests (kernels, modules, components)"
 	@echo "  test-integration - Build and run integration tests (training, distributed)"
 	@echo "  test-all         - Build and run all tests (unit + integration)"
+	@echo "  regression-smoke - Run no-GPU first-month regression harness checks"
+	@echo "  regression-gpu   - Run GPU first-month regression matrix (STEPS=N optional)"
 	@echo ""
 	@echo "Cleanup Targets:"
 	@echo "  clean            - Clean build artifacts"
