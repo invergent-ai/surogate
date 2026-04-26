@@ -14,6 +14,7 @@
 
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/executor/op_registry.h"
+#include "runtime/dsl/tensor_role.h"
 
 namespace dsl {
 
@@ -146,6 +147,16 @@ bool is_non_diff_dtype(ETensorDType dtype) {
     }
 }
 
+bool legacy_is_rope_name(const std::string& name) {
+    return name.find("rope_freqs") != std::string::npos;
+}
+
+bool legacy_is_moe_side_channel_name(const std::string& name) {
+    return name.find("scatter_indices") != std::string::npos || name.find("routing_indices") != std::string::npos ||
+           name.find("gather_indices") != std::string::npos || name.find("expert_offsets") != std::string::npos ||
+           name.find("ep_recv_scatter") != std::string::npos;
+}
+
 bool is_non_differentiable(const Graph& forward, const std::string& name) {
     // Check graph inputs
     auto it_input = forward.inputs.find(name);
@@ -160,7 +171,10 @@ bool is_non_differentiable(const Graph& forward, const std::string& name) {
         if (it_param->second.dtype && is_non_diff_dtype(*it_param->second.dtype)) {
             return true;
         }
-        if (name.find("rope_freqs") != std::string::npos) {
+        const bool legacy_is_rope = legacy_is_rope_name(name);
+        const bool role_is_rope = tensor_role_is_rope_name(name);
+        tensor_role_parity_check(name, legacy_is_rope, role_is_rope, "autodiff::is_non_differentiable::rope");
+        if (legacy_is_rope || role_is_rope) {
             return true;
         }
     }
@@ -172,9 +186,13 @@ bool is_non_differentiable(const Graph& forward, const std::string& name) {
         }
     }
     // Also handle MoE index tensors by name pattern (in case intermediates map is incomplete)
-    if (name.find("scatter_indices") != std::string::npos || name.find("routing_indices") != std::string::npos ||
-        name.find("gather_indices") != std::string::npos || name.find("expert_offsets") != std::string::npos ||
-        name.find("ep_recv_scatter") != std::string::npos) {
+    const bool legacy_is_moe_side_channel = legacy_is_moe_side_channel_name(name);
+    const bool role_is_moe_side_channel = tensor_role_is_moe_side_channel_name(name);
+    tensor_role_parity_check(name,
+                             legacy_is_moe_side_channel,
+                             role_is_moe_side_channel,
+                             "autodiff::is_non_differentiable::moe_side_channel");
+    if (legacy_is_moe_side_channel || role_is_moe_side_channel) {
         return true;
     }
     return false;

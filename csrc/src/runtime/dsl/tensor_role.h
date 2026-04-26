@@ -113,6 +113,9 @@ bool tensor_role_is_rope_name(std::string_view name);
 /// Legacy-compatible expert-parallel predicate derived from TensorRole.
 bool tensor_role_is_expert_parallel_name(std::string_view name);
 
+/// Legacy-compatible MoE routing/index side-channel predicate derived from TensorRole.
+bool tensor_role_is_moe_side_channel_name(std::string_view name);
+
 /// When SUROGATE_TENSOR_ROLE_PARITY is set, log or abort on mismatches between
 /// legacy and role-derived decisions. Set it to "abort" for fatal assertions.
 void tensor_role_parity_check(std::string_view name, bool legacy_value, bool role_value, const char* context);
