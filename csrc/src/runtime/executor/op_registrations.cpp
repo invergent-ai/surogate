@@ -286,6 +286,16 @@ REGISTER_OP("moe_unpermute_backward", MoEUnpermuteBackward, nullptr, ::dsl::bwd_
 REGISTER_OP("moe_expert_bias_add", MoEExpertBiasAdd, ::dsl::fwd_moe_expert_bias_add, nullptr);
 REGISTER_OP("moe_expert_bias_add_backward", MoEExpertBiasAddBackward, nullptr, ::dsl::bwd_moe_expert_bias_add);
 
+REGISTER_OP_METADATA("moe_softmax", MoE, RouterReplicated, 0);
+REGISTER_OP_METADATA("moe_sigmoid", MoE, RouterReplicated, 0);
+REGISTER_OP_METADATA("moe_topk", MoE, RouterReplicated, 0);
+REGISTER_OP_METADATA("moe_permute", MoE, ExpertParallel, 0);
+REGISTER_OP_METADATA("moe_grouped_gemm", MoE, ExpertParallel, 0);
+REGISTER_OP_METADATA("moe_grouped_gemm_gate_up", MoE, ExpertParallel, 0);
+REGISTER_OP_METADATA("moe_grouped_gemm_down", MoE, ExpertParallel, 0);
+REGISTER_OP_METADATA("moe_unpermute", MoE, ExpertParallel, 0);
+REGISTER_OP_METADATA("moe_expert_bias_add", MoE, ExpertParallel, 0);
+
 // Expert parallelism forward + backward
 REGISTER_OP("ep_dispatch", EpDispatch, ::dsl::fwd_ep_dispatch, nullptr);
 REGISTER_OP("ep_dispatch_backward", EpDispatchBackward, nullptr, ::dsl::bwd_ep_dispatch);

@@ -14,12 +14,14 @@
 #define SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H
 
 #include <functional>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
+#include "runtime/dsl/tensor_role.h"
 
 namespace dsl {
 
@@ -52,6 +54,21 @@ using AutodiffFn = std::function<std::vector<Operation>(const BackwardRuleContex
 // scan, Flash-Attention backward workspace, etc.).
 using StackBoundFn = long (*)(const CompiledOp& op, const BufferPlan& plan);
 
+enum class OpSemanticKind : std::uint8_t {
+    Unknown = 0,
+    Dense,
+    MoE,
+    Collective,
+    Attention,
+    Normalization,
+    Elementwise,
+    View,
+    Loss,
+    Sequence,
+};
+
+const char* op_semantic_kind_name(OpSemanticKind kind);
+
 struct OpDescriptor {
     std::string name;                               // e.g. "embedding", "softmax"
     CompiledOpType type = CompiledOpType::Unknown;  // may be Unknown for name-only rules
@@ -59,6 +76,9 @@ struct OpDescriptor {
     OpExecFn backward_fn = nullptr;                 // backward-graph dispatch
     AutodiffFn autodiff_fn;                         // backward-graph generator (autodiff rule)
     StackBoundFn stack_bound_fn = nullptr;          // op-internal stack bytes (optional)
+    OpSemanticKind semantic_kind = OpSemanticKind::Unknown;
+    DistributionKind distribution_kind = DistributionKind::Replicated;
+    std::uint32_t descriptor_flags = 0;
 };
 
 class OpRegistry {
@@ -136,5 +156,18 @@ private:
     static const int SUROGATE_OP_REG_CONCAT(_surogate_stack_bound_reg_, __COUNTER__) = \
         ::dsl::OpRegistry::instance().register_op(                                     \
             ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, nullptr, nullptr, {}, stack_fn})
+
+// Attach descriptor metadata without changing dispatch/autodiff behavior.
+#define REGISTER_OP_METADATA(name_str, semantic_kind_enum, distribution_kind_enum, flags_)                             \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_op_meta_reg_, __COUNTER__) =                                     \
+        ::dsl::OpRegistry::instance().register_op(::dsl::OpDescriptor{name_str,                                        \
+                                                                      ::dsl::CompiledOpType::Unknown,                  \
+                                                                      nullptr,                                         \
+                                                                      nullptr,                                         \
+                                                                      {},                                              \
+                                                                      nullptr,                                         \
+                                                                      ::dsl::OpSemanticKind::semantic_kind_enum,       \
+                                                                      ::dsl::DistributionKind::distribution_kind_enum, \
+                                                                      flags_})
 
 #endif  // SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H
