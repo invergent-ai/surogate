@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -30,6 +31,7 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
@@ -48,6 +50,36 @@
 #include "utilities/dtype.h"
 
 namespace dsl {
+
+namespace {
+
+bool legacy_is_rope_name(const std::string& name) {
+    return name.find("freq_cis") != std::string::npos || name.find("rope_freqs") != std::string::npos;
+}
+
+std::optional<bool> rope_role_from_ref(const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) return std::nullopt;
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        return role->is_rope_freq();
+    }
+    if (!ref.name.empty()) {
+        if (const TensorRole* role = graph->role_for_name(ref.name)) {
+            return role->is_rope_freq();
+        }
+    }
+    return std::nullopt;
+}
+
+bool is_rope_freq_ref(const CompiledGraph* graph, const TensorRef& ref, const char* context) {
+    const bool legacy_value = !ref.name.empty() && legacy_is_rope_name(ref.name);
+    const bool role_value = rope_role_from_ref(graph, ref).value_or(tensor_role_is_rope_name(ref.name));
+    if (!ref.name.empty()) {
+        tensor_role_parity_check(ref.name, legacy_value, role_value, context);
+    }
+    return legacy_value || role_value;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // replay_layer_forward — torch-style gradient checkpointing
@@ -203,8 +235,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                     if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
                         resolved = *bp;
                     }
-                } else if (inp.name.find("freq_cis") != std::string::npos ||
-                           inp.name.find("rope_freqs") != std::string::npos) {
+                } else if (is_rope_freq_ref(mCurrentGraph, inp, "compiled_ops_execute::resolve_input")) {
                     // Rope frequencies come through unqualified global names;
                     // inp.slot would be FreqCis and line 217 already handled
                     // compile-classified refs. This fallback covers names the
@@ -2251,7 +2282,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Build the set of gradients that require accumulation (not the first micro-step).
     // Also bind parameter gradient tensors so they're used instead of temporaries.
     for (const auto& param_name : mGrads.param_names()) {
-        if (param_name.find("rope_freqs") != std::string::npos) {
+        const bool legacy_is_rope = legacy_is_rope_name(param_name);
+        const bool role_is_rope = tensor_role_is_rope_name(param_name);
+        tensor_role_parity_check(param_name, legacy_is_rope, role_is_rope, "compiled_ops_execute::bind_param_grads");
+        if (legacy_is_rope || role_is_rope) {
             continue;
         }
         bool accumulate = false;

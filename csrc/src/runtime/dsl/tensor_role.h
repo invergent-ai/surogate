@@ -86,6 +86,10 @@ struct TensorRole {
         return ownership == TensorOwnership::MoE || ownership == TensorOwnership::EP ||
                dist.kind == DistributionKind::ExpertParallel || dist.kind == DistributionKind::RouterReplicated;
     }
+
+    [[nodiscard]] bool is_rope_freq() const {
+        return ownership == TensorOwnership::RopeFreqs;
+    }
 };
 
 const char* tensor_ownership_name(TensorOwnership ownership);
@@ -98,6 +102,9 @@ TensorRole infer_tensor_role_from_name(std::string_view name, int block_layer = 
 
 /// Legacy-compatible MoE ownership predicate derived from TensorRole.
 bool tensor_role_is_moe_name(std::string_view name);
+
+/// Legacy-compatible RoPE/frequency ownership predicate derived from TensorRole.
+bool tensor_role_is_rope_name(std::string_view name);
 
 /// When SUROGATE_TENSOR_ROLE_PARITY is set, log or abort on mismatches between
 /// legacy and role-derived decisions. Set it to "abort" for fatal assertions.

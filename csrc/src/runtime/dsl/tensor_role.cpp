@@ -98,6 +98,10 @@ bool tensor_role_is_moe_name(std::string_view name) {
     return infer_tensor_role_from_name(name).is_moe_owned();
 }
 
+bool tensor_role_is_rope_name(std::string_view name) {
+    return infer_tensor_role_from_name(name).is_rope_freq();
+}
+
 void tensor_role_parity_check(std::string_view name, bool legacy_value, bool role_value, const char* context) {
     const char* env = std::getenv("SUROGATE_TENSOR_ROLE_PARITY");
     if (!env || std::string_view(env) == "0") {

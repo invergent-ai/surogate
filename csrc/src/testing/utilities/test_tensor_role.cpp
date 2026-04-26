@@ -50,11 +50,16 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         TensorRole activation = infer_tensor_role_from_name("blocks[0].attn_out", 0);
 
         REQUIRE(rope.ownership == TensorOwnership::RopeFreqs);
+        REQUIRE(rope.is_rope_freq());
         REQUIRE_FALSE(rope.is_moe_owned());
+        REQUIRE(tensor_role_is_rope_name("blocks[1].rope_freqs"));
+        REQUIRE(tensor_role_is_rope_name("freq_cis"));
         REQUIRE(embedding.ownership == TensorOwnership::Embedding);
         REQUIRE_FALSE(embedding.is_moe_owned());
+        REQUIRE_FALSE(embedding.is_rope_freq());
         REQUIRE(activation.ownership == TensorOwnership::Stack);
         REQUIRE_FALSE(activation.is_moe_owned());
+        REQUIRE_FALSE(tensor_role_is_rope_name("blocks[0].attn_out"));
     }
 }
 

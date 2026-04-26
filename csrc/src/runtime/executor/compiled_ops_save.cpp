@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -123,6 +124,25 @@ std::optional<bool> moe_role_from_tensor_id(const CompiledGraph* graph, int tid)
         return role->is_moe_owned();
     }
     return std::nullopt;
+}
+
+bool legacy_is_rope_name(const std::string& name) {
+    return name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos;
+}
+
+std::optional<bool> rope_role_from_name(const CompiledGraph* graph, const std::string& name) {
+    if (!graph) return std::nullopt;
+    if (const TensorRole* role = graph->role_for_name(name)) {
+        return role->is_rope_freq();
+    }
+    return std::nullopt;
+}
+
+bool is_rope_freq_name(const CompiledGraph* graph, const std::string& name, const char* context) {
+    const bool legacy_value = legacy_is_rope_name(name);
+    const bool role_value = rope_role_from_name(graph, name).value_or(tensor_role_is_rope_name(name));
+    tensor_role_parity_check(name, legacy_value, role_value, context);
+    return legacy_value || role_value;
 }
 
 }  // namespace
@@ -370,7 +390,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             return mRunState.rope_freqs(name);
         }
         // Qualified rope references (blocks[N].rope_freqs, …) still need the name.
-        if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+        if (is_rope_freq_name(mCurrentGraph, name, "compiled_ops_save::resolve_source")) {
             return mRunState.rope_freqs(name);
         }
 
@@ -868,7 +888,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             continue;
         }
         // Qualified rope references (blocks[N].rope_freqs, …) still need the name.
-        if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+        if (is_rope_freq_name(mCurrentGraph, name, "compiled_ops_save::save_tensors")) {
             save_tensor_with_policy(name, mRunState.rope_freqs(name), prefer_live, force_persist_name);
             continue;
         }
@@ -968,7 +988,7 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
     if (glob_slot == TensorSlot::FreqCis) {
         return map_view(mRunState.rope_freqs(name));
     }
-    if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+    if (is_rope_freq_name(mCurrentGraph, name, "compiled_ops_save::resolve_tensor")) {
         return map_view(mRunState.rope_freqs(name));
     }
 
