@@ -110,6 +110,34 @@ def test_select_cases_rejects_unknown_filters():
         raise AssertionError("expected SystemExit")
 
 
+def test_case_listing_exposes_case_ids():
+    case = br.FIRST_MONTH_MATRIX[0]
+
+    rows = br.case_listing((case,))
+
+    assert rows == [
+        {
+            "case_id": case.case_id,
+            "model": case.model,
+            "recipe": case.recipe,
+            "distribution": case.distribution,
+            "storage": case.storage,
+            "op_kind": case.op_kind,
+            "supported": case.supported,
+            "env_model_path": case.env_model_path,
+            "config": case.config,
+        }
+    ]
+
+
+def test_main_list_cases_prints_json(capsys):
+    rc = br.main(["--list-cases", "--case", br.FIRST_MONTH_MATRIX[0].case_id])
+
+    assert rc == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["case_id"] for row in rows] == [br.FIRST_MONTH_MATRIX[0].case_id]
+
+
 def test_compare_artifacts_respects_recipe_tolerance():
     case = br.RegressionCase("m", "fp8", "single_gpu")
     base = {

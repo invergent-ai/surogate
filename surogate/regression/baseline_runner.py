@@ -486,6 +486,23 @@ def select_cases(case_filters: list[str] | None = None) -> tuple[RegressionCase,
     return tuple(selected)
 
 
+def case_listing(cases: tuple[RegressionCase, ...] = FIRST_MONTH_MATRIX) -> list[dict[str, Any]]:
+    return [
+        {
+            "case_id": case.case_id,
+            "model": case.model,
+            "recipe": case.recipe,
+            "distribution": case.distribution,
+            "storage": case.storage,
+            "op_kind": case.op_kind,
+            "supported": case.supported,
+            "env_model_path": case.env_model_path or "",
+            "config": case.config or "",
+        }
+        for case in cases
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=BASELINE_DIR / "current")
@@ -498,7 +515,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--update-baseline", action="store_true")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--report", action="store_true")
+    parser.add_argument("--list-cases", action="store_true", help="Print the first-month matrix and exit")
     args = parser.parse_args(argv)
+
+    if args.list_cases:
+        print(json.dumps(case_listing(select_cases(args.case_filters)), indent=2, sort_keys=True))
+        return 0
 
     results = [
         run_case(case, run=args.run, steps=args.steps, artifact_dir=args.out)
