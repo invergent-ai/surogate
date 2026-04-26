@@ -29,6 +29,24 @@
 
 namespace dsl {
 
+namespace {
+
+TensorRoleKind role_kind_from_tensor_kind(TensorKind kind) {
+    switch (kind) {
+        case TensorKind::ForwardParam: return TensorRoleKind::Param;
+        case TensorKind::ForwardActivation: return TensorRoleKind::Activation;
+        case TensorKind::ParamGrad: return TensorRoleKind::ParamGrad;
+        case TensorKind::ActivationGrad:
+        case TensorKind::AccumTemp: return TensorRoleKind::ActivationGrad;
+        case TensorKind::LossInput: return TensorRoleKind::LossInput;
+        case TensorKind::Scratch: return TensorRoleKind::Scratch;
+        case TensorKind::Unknown: return TensorRoleKind::Unknown;
+    }
+    return TensorRoleKind::Unknown;
+}
+
+}  // namespace
+
 /// Strip trailing SSA-style numeric suffix (e.g., "qkv_rope_7" -> "qkv_rope")
 /// The DSL IR generates unique tensor names with suffixes like _0, _7, _10, etc.
 /// This function removes these suffixes for field name matching.
@@ -4517,6 +4535,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
         }
 
         meta.role = infer_tensor_role_from_name(name, meta.block_layer_idx);
+        meta.role.block_slot = static_cast<int>(resolve_block_slot(name));
         graph.tensor_meta[static_cast<std::size_t>(id)] = meta;
     }
 
@@ -4730,6 +4749,7 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
         if (graph.tensor_meta[i].kind == TensorKind::Unknown) {
             graph.tensor_meta[i].kind = TensorKind::Scratch;
         }
+        graph.tensor_meta[i].role.kind = role_kind_from_tensor_kind(graph.tensor_meta[i].kind);
     }
 
     // Optional: dump classification on demand for debugging and for comparing

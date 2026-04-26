@@ -621,6 +621,13 @@ struct CompiledGraph {
         return &tensor_meta[static_cast<std::size_t>(tid)];
     }
 
+    const TensorRole* role_for_tensor_id(int tid) const {
+        if (const TensorMeta* meta = meta_for_tensor_id(tid)) {
+            return &meta->role;
+        }
+        return nullptr;
+    }
+
     /// Reverse lookup table `(layer_idx, slot) -> tid`, populated by
     /// compute_layout. Row layout:
     /// `slot_tid_by_layer[layer_idx][static_cast<std::size_t>(slot)]`.
@@ -642,6 +649,11 @@ struct CompiledGraph {
     const TensorMeta* meta_for_name(const std::string& name) const {
         int tid = find_tensor_id(name);
         return tid >= 0 ? meta_for_tensor_id(tid) : nullptr;
+    }
+
+    const TensorRole* role_for_name(const std::string& name) const {
+        int tid = find_tensor_id(name);
+        return tid >= 0 ? role_for_tensor_id(tid) : nullptr;
     }
 
     /// Debuggability (P4.7): format "tid=5 name='blocks[3].ln1' region=FwdStack

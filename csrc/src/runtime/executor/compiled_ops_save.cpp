@@ -117,6 +117,14 @@ bool is_moe_tensor_name(const std::string& n) {
     return legacy || role_tail;
 }
 
+std::optional<bool> moe_role_from_tensor_id(const CompiledGraph* graph, int tid) {
+    if (!graph) return std::nullopt;
+    if (const TensorRole* role = graph->role_for_tensor_id(tid)) {
+        return role->is_moe_owned();
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 // Historical note: `strip_autodiff_accum_suffix` and
@@ -177,7 +185,8 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
              name.find("scatter_indices") != std::string::npos || name.find("routing_weights") != std::string::npos ||
              name.find("routing_indices") != std::string::npos || name.find("router_") != std::string::npos ||
              name.find("permuted") != std::string::npos || name.find("expert_") != std::string::npos);
-        const bool role_is_moe_tensor = tensor_role_is_moe_name(name);
+        const bool role_is_moe_tensor =
+            moe_role_from_tensor_id(mCurrentGraph, tid).value_or(tensor_role_is_moe_name(name));
         tensor_role_parity_check(name,
                                  legacy_is_moe_tensor,
                                  role_is_moe_tensor,
