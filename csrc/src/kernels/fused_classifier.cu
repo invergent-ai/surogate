@@ -82,6 +82,10 @@ struct SoftmaxParams {
     float Offset;  ///< Maximum logit value for numerical stability
 };
 
+__device__ __forceinline__ float maybe_softcap_value(float v, float softcap) {
+    return softcap > 0.0f ? softcap * tanhf(v / softcap) : v;
+}
+
 /**
  * @brief Computes softmax parameters (max and sum) for one row using block-wide reduction.
  *
@@ -98,7 +102,8 @@ struct SoftmaxParams {
  * @return SoftmaxParams containing Scale (1/sum) and Offset (max).
  */
 template <class floatX>
-__device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P) {
+__device__ SoftmaxParams
+prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P, float softcap = 0.0f) {
     using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
@@ -115,7 +120,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
             if (i * x128::size + k >= V) {
                 break;  // bounds checking against real V (rather than padded P)
             }
-            float v = (float)x[i * x128::size + k];
+            float v = maybe_softcap_value((float)x[i * x128::size + k], softcap);
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
             thread_sumval *= expf((old_maxval - thread_maxval));
@@ -128,7 +133,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
     for (; i >= 0; i -= blockDim.x) {
         x128 packed_x = x128::load(x + i * x128::size);  // load and keep in cache until fused_classifier loop
         for (int k = 0; k < x128::size; ++k) {
-            float v = (float)packed_x[k];
+            float v = maybe_softcap_value((float)packed_x[k], softcap);
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
             thread_sumval *= expf((old_maxval - thread_maxval));
@@ -508,7 +513,8 @@ __global__ void cross_entropy_forward_kernel(const floatX* logits,
                                              int* correct_count,
                                              int BT,
                                              int V,
-                                             int P) {
+                                             int P,
+                                             float softcap) {
     int idx = static_cast<int>(blockIdx.x);
     if (idx >= BT) {
         return;
@@ -527,7 +533,7 @@ __global__ void cross_entropy_forward_kernel(const floatX* logits,
         atomicAdd(valid_token_count, 1);
     }
 
-    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
+    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P, softcap);
     float lse = sp.Offset + logf(1.0f / sp.Scale);
 
     // Optional accuracy computation (argmax)
@@ -589,7 +595,7 @@ __global__ void cross_entropy_forward_kernel(const floatX* logits,
     }
 
     if (threadIdx.x == 0) {
-        float logit_val = (float)logits[idx * P + ix];
+        float logit_val = maybe_softcap_value((float)logits[idx * P + ix], softcap);
         // Accumulate loss (not overwrite) to support gradient accumulation
         losses[idx] += lse - logit_val;
         if (logsumexp) {
@@ -606,7 +612,8 @@ __global__ void cross_entropy_backward_kernel(floatX* dlogits,
                                               const int* targets,
                                               int BT,
                                               int V,
-                                              int P) {
+                                              int P,
+                                              float softcap) {
     // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
     // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
     int idx = static_cast<int>(blockIdx.x);
@@ -631,11 +638,18 @@ __global__ void cross_entropy_backward_kernel(floatX* dlogits,
 
     float dloss_val = dloss ? dloss[idx] : 1.0f;
     const floatX* logits_vec = logits + static_cast<int64_t>(idx) * P;
+    const float inv_softcap = softcap > 0.0f ? 1.0f / softcap : 0.0f;
 
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
-        float prob = expf((float)logits_vec[i] - lse);
+        float raw = (float)logits_vec[i];
+        float capped = maybe_softcap_value(raw, softcap);
+        float prob = expf(capped - lse);
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss_val;
+        if (softcap > 0.0f) {
+            float y = capped * inv_softcap;
+            dlogit *= 1.0f - y * y;
+        }
         dlogits[idx * P + i] = (floatX)dlogit;
     }
 }
@@ -650,7 +664,8 @@ __global__ void chunked_cross_entropy_forward_kernel(const floatX* logits,
                                                      int V,
                                                      int P,
                                                      int n_chunks,
-                                                     int chunk_size) {
+                                                     int chunk_size,
+                                                     float softcap) {
     int row_idx = static_cast<int>(blockIdx.x);
     int chunk_idx = static_cast<int>(blockIdx.y);
     int start = chunk_idx * chunk_size;
@@ -662,7 +677,7 @@ __global__ void chunked_cross_entropy_forward_kernel(const floatX* logits,
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
     for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
-        float v = (float)logits[row_idx * P + i];
+        float v = maybe_softcap_value((float)logits[row_idx * P + i], softcap);
         float old_max = thread_maxval;
         thread_maxval = fmaxf(thread_maxval, v);
         thread_sumval *= expf(old_max - thread_maxval);
@@ -681,7 +696,7 @@ __global__ void chunked_cross_entropy_forward_kernel(const floatX* logits,
                 if (valid_token_count) {
                     atomicAdd(valid_token_count, 1);
                 }
-                float logit_val = (float)logits[row_idx * P + ix];
+                float logit_val = maybe_softcap_value((float)logits[row_idx * P + ix], softcap);
                 // Accumulate loss (not overwrite) to support gradient accumulation
                 losses[row_idx] -= logit_val;
             }
@@ -735,7 +750,8 @@ __global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits,
                                                       int BT,
                                                       int V,
                                                       int P,
-                                                      int chunk_size) {
+                                                      int chunk_size,
+                                                      float softcap) {
     // HuggingFace-style normalization: dloss is already scaled by 1/accumulated_valid_tokens
     // at the caller level (GraphExecutor/CompiledExecutor). No per-batch token scaling here.
     int row_idx = static_cast<int>(blockIdx.x);
@@ -757,11 +773,18 @@ __global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits,
     float lse = logsumexp ? logsumexp[row_idx] : 0.0f;
     float dloss_val = dloss ? dloss[row_idx] : 1.0f;
     const floatX* logits_vec = logits + static_cast<int64_t>(row_idx) * P;
+    const float inv_softcap = softcap > 0.0f ? 1.0f / softcap : 0.0f;
 
     for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
-        float prob = expf((float)logits_vec[i] - lse);
+        float raw = (float)logits_vec[i];
+        float capped = maybe_softcap_value(raw, softcap);
+        float prob = expf(capped - lse);
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss_val;
+        if (softcap > 0.0f) {
+            float y = capped * inv_softcap;
+            dlogit *= 1.0f - y * y;
+        }
         dlogits[row_idx * P + i] = (floatX)dlogit;
     }
 }
@@ -843,6 +866,7 @@ void fused_cross_entropy_forward(float* logits,
                                  int BT,
                                  int V,
                                  int P,
+                                 float softcap,
                                  cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
@@ -854,7 +878,8 @@ void fused_cross_entropy_forward(float* logits,
                                                                        correct_count,
                                                                        BT,
                                                                        V,
-                                                                       P);
+                                                                       P,
+                                                                       softcap);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -867,6 +892,7 @@ void fused_cross_entropy_forward(nv_bfloat16* logits,
                                  int BT,
                                  int V,
                                  int P,
+                                 float softcap,
                                  cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
@@ -878,7 +904,8 @@ void fused_cross_entropy_forward(nv_bfloat16* logits,
                                                                        correct_count,
                                                                        BT,
                                                                        V,
-                                                                       P);
+                                                                       P,
+                                                                       softcap);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -890,6 +917,7 @@ void fused_cross_entropy_backward(float* dlogits,
                                   int BT,
                                   int V,
                                   int P,
+                                  float softcap,
                                   cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
@@ -900,7 +928,8 @@ void fused_cross_entropy_backward(float* dlogits,
                                                                         targets,
                                                                         BT,
                                                                         V,
-                                                                        P);
+                                                                        P,
+                                                                        softcap);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -912,6 +941,7 @@ void fused_cross_entropy_backward(nv_bfloat16* dlogits,
                                   int BT,
                                   int V,
                                   int P,
+                                  float softcap,
                                   cudaStream_t stream) {
     const int block_size = 256;
     const int grid_size = BT;
@@ -922,7 +952,8 @@ void fused_cross_entropy_backward(nv_bfloat16* dlogits,
                                                                         targets,
                                                                         BT,
                                                                         V,
-                                                                        P);
+                                                                        P,
+                                                                        softcap);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -937,6 +968,7 @@ void chunked_cross_entropy_forward(float* logits,
                                    int V,
                                    int P,
                                    int n_chunks,
+                                   float softcap,
                                    cudaStream_t stream) {
     const int block_size = 256;
     dim3 grid(BT, n_chunks);
@@ -949,7 +981,8 @@ void chunked_cross_entropy_forward(float* logits,
                                                                           V,
                                                                           P,
                                                                           n_chunks,
-                                                                          CROSS_ENTROPY_MAX_FUSED_SIZE);
+                                                                          CROSS_ENTROPY_MAX_FUSED_SIZE,
+                                                                          softcap);
     CUDA_CHECK(cudaGetLastError());
 
     logsumexp_reduce_kernel<<<BT, block_size, 0, stream>>>(logsumexp, chunk_logsumexp, BT, n_chunks);
@@ -977,6 +1010,7 @@ void chunked_cross_entropy_forward(nv_bfloat16* logits,
                                    int V,
                                    int P,
                                    int n_chunks,
+                                   float softcap,
                                    cudaStream_t stream) {
     const int block_size = 256;
     dim3 grid(BT, n_chunks);
@@ -989,7 +1023,8 @@ void chunked_cross_entropy_forward(nv_bfloat16* logits,
                                                                           V,
                                                                           P,
                                                                           n_chunks,
-                                                                          CROSS_ENTROPY_MAX_FUSED_SIZE);
+                                                                          CROSS_ENTROPY_MAX_FUSED_SIZE,
+                                                                          softcap);
     CUDA_CHECK(cudaGetLastError());
 
     logsumexp_reduce_kernel<<<BT, block_size, 0, stream>>>(logsumexp, chunk_logsumexp, BT, n_chunks);
@@ -1014,6 +1049,7 @@ void chunked_cross_entropy_backward(float* dlogits,
                                     int BT,
                                     int V,
                                     int P,
+                                    float softcap,
                                     cudaStream_t stream) {
     const int block_size = 256;
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
@@ -1026,7 +1062,8 @@ void chunked_cross_entropy_backward(float* dlogits,
                                                                            BT,
                                                                            V,
                                                                            P,
-                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE,
+                                                                           softcap);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1038,6 +1075,7 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
                                     int BT,
                                     int V,
                                     int P,
+                                    float softcap,
                                     cudaStream_t stream) {
     const int block_size = 256;
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
@@ -1050,7 +1088,8 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
                                                                            BT,
                                                                            V,
                                                                            P,
-                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE);
+                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE,
+                                                                           softcap);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -55,14 +55,9 @@ namespace {
 
 inline bool is_capture_unsafe_op_type(CompiledOpType type) {
     switch (type) {
-        // Qwen3.5 / Triton JIT kernels
-        case CompiledOpType::ChunkGatedDeltaRule:
-        case CompiledOpType::ChunkGatedDeltaRuleBackward:
-        case CompiledOpType::Qwen3_5Decay:
-        case CompiledOpType::Qwen3_5DecayBackward:
         // MoE routing / grouped GEMM rely on per-step host metadata and dynamic routing.
-        case CompiledOpType::MoESoftmax:
-        case CompiledOpType::MoESigmoid:
+        // (MoESigmoid/MoESoftmax are plain element-wise kernels reused by non-MoE
+        // models like Qwen3.5; they're capture-safe and intentionally excluded.)
         case CompiledOpType::MoETopK:
         case CompiledOpType::MoEPermute:
         case CompiledOpType::MoEGroupedGemm:
@@ -70,8 +65,6 @@ inline bool is_capture_unsafe_op_type(CompiledOpType type) {
         case CompiledOpType::MoEGroupedGemmDown:
         case CompiledOpType::MoEUnpermute:
         case CompiledOpType::MoEExpertBiasAdd:
-        case CompiledOpType::MoESoftmaxBackward:
-        case CompiledOpType::MoESigmoidBackward:
         case CompiledOpType::MoETopKBackward:
         case CompiledOpType::MoEPermuteBackward:
         case CompiledOpType::MoEGroupedGemmBackward:
@@ -1204,6 +1197,7 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         if (op.inputs.size() > 1) {
             int layer_idx = -1;
             auto matmul_op = matmul_op_from_weight(op.inputs[1], layer_idx);
+            const bool is_gate_projection = is_mlp_gate_weight(op.inputs[1]);
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
             attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
@@ -1216,7 +1210,9 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                         attrs.forward_hook_point = modules::ForwardHookPoint::AfterAttnOutProjection;
                         break;
                     case modules::MatmulOp::MLPUp:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                        if (!is_gate_projection) {
+                            attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                        }
                         break;
                     case modules::MatmulOp::MLPDown:
                         attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPDownProjection;
@@ -1255,7 +1251,8 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 attrs.matmul_op = modules::MatmulOp::QKV;
             } else if (field == "out_weight") {
                 attrs.matmul_op = modules::MatmulOp::AttnOut;
-            } else if (field == "mlp_up_weight" || field == "up_weight") {
+            } else if (field == "mlp_up_weight" || field == "up_weight" || field == "mlp_gate_weight" ||
+                       field == "gate_weight") {
                 attrs.matmul_op = modules::MatmulOp::MLPUp;
             } else if (field == "mlp_down_weight" || field == "down_weight") {
                 attrs.matmul_op = modules::MatmulOp::MLPDown;
@@ -3128,6 +3125,46 @@ void compute_arena_sizes(PhaseArenas& arenas,
         total += std::max(fwd_bytes, bwd_bytes);
     }
     arenas.save_for_bwd_bytes = total;
+}
+
+std::size_t estimate_bwd_cross_layer_bytes(const CompiledGraph& bwd) {
+    if (bwd.layer_end_indices.empty() || bwd.num_tensors <= 0) {
+        return 0;
+    }
+
+    auto is_stack_resident = [](RegionKind r) {
+        return r == RegionKind::FwdStack || r == RegionKind::BwdStack || r == RegionKind::Recomputed ||
+               r == RegionKind::Unknown;
+    };
+
+    // Collect layer-end op indices in execution order. layer_end_indices[L]
+    // is past-the-end; the op that ends layer L sits at index le-1.
+    std::vector<std::size_t> layer_end_ops;
+    layer_end_ops.reserve(bwd.layer_end_indices.size());
+    for (std::size_t le : bwd.layer_end_indices) {
+        if (le == SIZE_MAX || le == 0) continue;
+        layer_end_ops.push_back(le - 1);
+    }
+    if (layer_end_ops.empty()) return 0;
+    std::sort(layer_end_ops.begin(), layer_end_ops.end());
+
+    std::size_t total = 0;
+    for (int tid = 0; tid < bwd.num_tensors; ++tid) {
+        const auto& meta = bwd.tensor_meta[static_cast<std::size_t>(tid)];
+        if (!is_stack_resident(meta.region)) continue;
+        if (meta.bytes == 0) continue;
+        const std::string_view name = bwd.name_for_tensor_id(tid);
+        if (name.empty()) continue;
+        auto it = bwd.last_use_index.find(std::string(name));
+        if (it == bwd.last_use_index.end()) continue;
+        const std::size_t last_use = it->second;
+        // Persisted at the first layer-end whose op_idx < last_use. If
+        // none of the layer ends fall before last_use, the tid never
+        // crosses a layer boundary and won't be persisted.
+        if (last_use <= layer_end_ops.front()) continue;
+        total += meta.bytes;
+    }
+    return total;
 }
 
 namespace {

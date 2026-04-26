@@ -95,6 +95,23 @@ public:
     void set_internal_graphs_enabled(bool enabled);
     [[nodiscard]] bool internal_graphs_enabled() const;
     [[nodiscard]] bool has_capture_unsafe_ops() const;
+    void prepare_bwd_cross_layer_for_capture();
+
+    /// Enable cap-and-pad for outer-capture safety. See
+    /// `IGraphExecutor::enable_doc_masking_pad_to_max`.
+    void enable_doc_masking_pad_to_max(int max_num_docs, int num_micro_steps);
+
+    /// Stage cu_seqlens for a specific micro-step before cudaGraphLaunch.
+    /// Called by the trainer to update each ms's slice in the pinned host
+    /// buffer; the captured H2D memcpy reads from a stable per-ms address.
+    void stage_cu_seqlens_for_micro_step(int micro_step, const std::int32_t* cu_seqlens_cpu, int count, int total_q);
+
+    /// Re-issue cu_seqlens H2D memcpy for the given micro-step. Called
+    /// from DslModel::backward in cap-and-pad mode so each ms's backward
+    /// kernels see its own cu_seqlens (the captured graph contains all
+    /// forwards before any backward, and the GPU buffer is shared, so
+    /// without re-issue every backward sees the LAST forward's data).
+    void reissue_cu_seqlens_for_micro_step(int micro_step);
 
     ITensorContainer& weights() override;
     ITensorContainer& opt_momentum() override;

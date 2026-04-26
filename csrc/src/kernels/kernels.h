@@ -569,6 +569,24 @@ void matmul_strided_c(nv_bfloat16* c,
                       int ldc,
                       cudaStream_t stream);
 
+void matmul_strided_c(nv_bfloat16* c,
+                      const nv_bfloat16* a,
+                      const nv_bfloat16* b,
+                      const nv_bfloat16* bias,
+                      const float* scale_a,
+                      const float* scale_b,
+                      cublasLtHandle_t handle,
+                      std::byte* workspace,
+                      std::size_t workspace_size,
+                      int M,
+                      int N,
+                      int K,
+                      EMMTranspose mode,
+                      float alpha,
+                      float beta,
+                      int ldc,
+                      cudaStream_t stream);
+
 void matmul(nv_bfloat16* c,
             const __nv_fp8_e4m3* a,
             const __nv_fp8_e4m3* b,
@@ -673,6 +691,23 @@ void matmul_strided_c(Tensor& c,
                       int K,
                       EMMTranspose mode,
                       bool accumulate,
+                      int ldc,
+                      cudaStream_t stream);
+
+void matmul_strided_c(Tensor& c,
+                      const Tensor& a,
+                      const Tensor& b,
+                      std::optional<Tensor> bias,
+                      const float* scale_a,
+                      const float* scale_b,
+                      cublasLtHandle_t handle,
+                      Tensor& workspace,
+                      int M,
+                      int N,
+                      int K,
+                      EMMTranspose mode,
+                      float alpha,
+                      float beta,
                       int ldc,
                       cudaStream_t stream);
 
@@ -1455,6 +1490,7 @@ void fused_cross_entropy_forward(float* logits,
                                  int BT,
                                  int V,
                                  int P,
+                                 float softcap,
                                  cudaStream_t stream);
 void fused_cross_entropy_forward(nv_bfloat16* logits,
                                  float* losses,
@@ -1465,6 +1501,7 @@ void fused_cross_entropy_forward(nv_bfloat16* logits,
                                  int BT,
                                  int V,
                                  int P,
+                                 float softcap,
                                  cudaStream_t stream);
 void fused_cross_entropy_backward(float* dlogits,
                                   const float* logits,
@@ -1474,6 +1511,7 @@ void fused_cross_entropy_backward(float* dlogits,
                                   int BT,
                                   int V,
                                   int P,
+                                  float softcap,
                                   cudaStream_t stream);
 void fused_cross_entropy_backward(nv_bfloat16* dlogits,
                                   const nv_bfloat16* logits,
@@ -1483,6 +1521,7 @@ void fused_cross_entropy_backward(nv_bfloat16* dlogits,
                                   int BT,
                                   int V,
                                   int P,
+                                  float softcap,
                                   cudaStream_t stream);
 void chunked_cross_entropy_forward(float* logits,
                                    float* losses,
@@ -1495,6 +1534,7 @@ void chunked_cross_entropy_forward(float* logits,
                                    int V,
                                    int P,
                                    int n_chunks,
+                                   float softcap,
                                    cudaStream_t stream);
 void chunked_cross_entropy_forward(nv_bfloat16* logits,
                                    float* losses,
@@ -1507,6 +1547,7 @@ void chunked_cross_entropy_forward(nv_bfloat16* logits,
                                    int V,
                                    int P,
                                    int n_chunks,
+                                   float softcap,
                                    cudaStream_t stream);
 void chunked_cross_entropy_backward(float* dlogits,
                                     const float* logits,
@@ -1516,6 +1557,7 @@ void chunked_cross_entropy_backward(float* dlogits,
                                     int BT,
                                     int V,
                                     int P,
+                                    float softcap,
                                     cudaStream_t stream);
 void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
                                     const nv_bfloat16* logits,
@@ -1525,6 +1567,7 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
                                     int BT,
                                     int V,
                                     int P,
+                                    float softcap,
                                     cudaStream_t stream);
 void fused_cross_entropy_forward(Tensor& logits,
                                  Tensor& losses,
@@ -1535,6 +1578,7 @@ void fused_cross_entropy_forward(Tensor& logits,
                                  int BT,
                                  int V,
                                  int P,
+                                 float softcap,
                                  cudaStream_t stream);
 void fused_cross_entropy_backward(Tensor& dlogits,
                                   const Tensor& logits,
@@ -1544,6 +1588,7 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                   int BT,
                                   int V,
                                   int P,
+                                  float softcap,
                                   cudaStream_t stream);
 void chunked_cross_entropy_forward(Tensor& logits,
                                    Tensor& losses,
@@ -1556,6 +1601,7 @@ void chunked_cross_entropy_forward(Tensor& logits,
                                    int V,
                                    int P,
                                    int n_chunks,
+                                   float softcap,
                                    cudaStream_t stream);
 void chunked_cross_entropy_backward(Tensor& dlogits,
                                     const Tensor& logits,
@@ -1565,6 +1611,7 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                     int BT,
                                     int V,
                                     int P,
+                                    float softcap,
                                     cudaStream_t stream);
 
 /// Extract per-token log-probabilities: logprobs[t] = logit[target[t]] - logsumexp(logits[t]).
@@ -4329,21 +4376,20 @@ void repeat_interleave_heads_backward(Tensor& d_inp, const Tensor& d_out, int re
 void lora_dropout_scale(Tensor& intermediate, float dropout_prob, unsigned int seed, cudaStream_t stream);
 
 /**
- * @brief Compute LoRA rank-projection for BF16 tensors using a custom small-rank kernel.
+ * @brief Accumulate a small-rank LoRA-B projection directly into BF16 output.
  *
- * Computes out = input @ A^T where:
- * - input: [BT, in_features] BF16
- * - A:     [rank, in_features] BF16
- * - out:   [BT, rank] BF16
- *
- * Returns true when the custom kernel handled the given rank, false otherwise.
+ * Computes output[row, output_offset + col] += scaling * dot(intermediate[row, :], B[col, :])
+ * for rank-specialized BF16 tensors. Returns true when the custom kernel handled the shape.
  */
-bool lora_project_small_rank_bf16(Tensor& out,
-                                  const Tensor& A,
-                                  const Tensor& input,
+bool lora_accum_b_small_rank_bf16(Tensor& output,
+                                  const Tensor& B,
+                                  const Tensor& intermediate,
                                   int BT,
-                                  int in_features,
+                                  int total_out_features,
+                                  int out_features,
+                                  int output_offset,
                                   int rank,
+                                  float scaling,
                                   cudaStream_t stream);
 
 #endif  //SUROGATE_SRC_KERNELS_KERNELS_H

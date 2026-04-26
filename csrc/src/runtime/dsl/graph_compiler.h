@@ -926,6 +926,18 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          std::size_t bwd_cross_layer_bytes = 0,
                          std::size_t moe_saved_bytes = 0);
 
+/// Static upper bound on bytes the BwdCrossLayer arena needs across one
+/// backward call. Mirrors the runtime persist logic in
+/// `compiled_ops_execute.cpp::bwd_layer_end_cleanup`: at each layer-end,
+/// every named tid that's stack-resident (FwdStack/BwdStack/Recomputed/
+/// Unknown region) AND has last_use beyond that layer-end op gets copied
+/// into the arena; this function sums those bytes once per tid (the
+/// runtime guarantees each tid is persisted at most once per backward
+/// call). Over-counts when slot-aliased tids share a runtime pointer
+/// (runtime dedups, compile time can't), so callers should treat the
+/// result as an upper bound and add a small slack margin.
+std::size_t estimate_bwd_cross_layer_bytes(const CompiledGraph& bwd);
+
 /// cudaMalloc all arenas at their computed sizes. arenas.allocated is set to
 /// true on success. Safe to call only after compute_arena_sizes().
 void allocate_phase_arenas(PhaseArenas& arenas);

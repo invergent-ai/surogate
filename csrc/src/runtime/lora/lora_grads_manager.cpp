@@ -257,51 +257,55 @@ void ModularLoRAGradsManager::allocate_gradients() {
     }
 }
 
+void ModularLoRAGradsManager::zero_all(cudaStream_t stream) {
+    if (!mConfig.lora_config.enabled()) return;
+
+    for (auto& block : mFullGrads.blocks) {
+        auto zero_layer = [stream](auto& opt_layer) {
+            if (!opt_layer.has_value()) return;
+            if (opt_layer->A.Data) fill_zero(opt_layer->A, stream);
+            if (opt_layer->B.Data) fill_zero(opt_layer->B, stream);
+        };
+        zero_layer(block.attention.q);
+        zero_layer(block.attention.k);
+        zero_layer(block.attention.v);
+        zero_layer(block.attention.o);
+        zero_layer(block.mlp.gate);
+        zero_layer(block.mlp.gate_up);
+        zero_layer(block.mlp.up);
+        zero_layer(block.mlp.down);
+
+        if (block.moe.use_grouped) {
+            zero_layer(block.moe.grouped.gate);
+            zero_layer(block.moe.grouped.gate_up);
+            zero_layer(block.moe.grouped.up);
+            zero_layer(block.moe.grouped.down);
+        } else {
+            // MoE expert LoRA gradients
+            for (auto& expert : block.moe.experts) {
+                zero_layer(expert.gate);
+                zero_layer(expert.gate_up);
+                zero_layer(expert.up);
+                zero_layer(expert.down);
+            }
+        }
+
+        if (block.moe.shared.has_value()) {
+            zero_layer(block.moe.shared->up);
+            zero_layer(block.moe.shared->down);
+        }
+
+        // Router LoRA gradients
+        zero_layer(block.router);
+    }
+}
+
 void ModularLoRAGradsManager::start_micro_step(cudaStream_t stream, int micro_step, int total_steps) {
     mIsFirstMicroStep = (micro_step == 0);
     mIsLastMicroStep = (micro_step == total_steps - 1);
 
-    if (!mConfig.lora_config.enabled()) return;
-
     if (mIsFirstMicroStep) {
-        for (auto& block : mFullGrads.blocks) {
-            auto zero_layer = [stream](auto& opt_layer) {
-                if (!opt_layer.has_value()) return;
-                if (opt_layer->A.Data) fill_zero(opt_layer->A, stream);
-                if (opt_layer->B.Data) fill_zero(opt_layer->B, stream);
-            };
-            zero_layer(block.attention.q);
-            zero_layer(block.attention.k);
-            zero_layer(block.attention.v);
-            zero_layer(block.attention.o);
-            zero_layer(block.mlp.gate);
-            zero_layer(block.mlp.gate_up);
-            zero_layer(block.mlp.up);
-            zero_layer(block.mlp.down);
-
-            if (block.moe.use_grouped) {
-                zero_layer(block.moe.grouped.gate);
-                zero_layer(block.moe.grouped.gate_up);
-                zero_layer(block.moe.grouped.up);
-                zero_layer(block.moe.grouped.down);
-            } else {
-                // MoE expert LoRA gradients
-                for (auto& expert : block.moe.experts) {
-                    zero_layer(expert.gate);
-                    zero_layer(expert.gate_up);
-                    zero_layer(expert.up);
-                    zero_layer(expert.down);
-                }
-            }
-
-            if (block.moe.shared.has_value()) {
-                zero_layer(block.moe.shared->up);
-                zero_layer(block.moe.shared->down);
-            }
-
-            // Router LoRA gradients
-            zero_layer(block.router);
-        }
+        zero_all(stream);
     }
 }
 

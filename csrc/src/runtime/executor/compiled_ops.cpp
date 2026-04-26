@@ -533,7 +533,15 @@ std::byte* CompiledExecutor::mem_eff_scratch_alloc(std::size_t bytes) {
     // NOT fire during stream capture — that would be an illegal
     // cudaMalloc inside the capture.
     if (!mMemEffScratchArena) {
-        prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
+        std::size_t default_bytes = 1024ull * 1024 * 1024;
+        if (const char* env = std::getenv("SUROGATE_MEM_EFF_ARENA_MB")) {
+            char* end = nullptr;
+            const unsigned long mb = std::strtoul(env, &end, 10);
+            if (end != env && mb > 0) {
+                default_bytes = static_cast<std::size_t>(mb) * 1024ull * 1024ull;
+            }
+        }
+        prepare_mem_eff_scratch_for_capture(default_bytes);
     }
     constexpr std::size_t kAlign = 128;  // align for 128-bit bf16 loads
     const std::size_t aligned_offset = (mMemEffScratchOffset + kAlign - 1) & ~(kAlign - 1);
@@ -569,21 +577,133 @@ std::byte* CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
     if (!mPhaseArenas || !mPhaseArenas->allocated || !mPhaseArenas->bwd_cross_layer_ptr) {
         throw std::runtime_error("allocate_bwd_cross_layer: bwd_cross_layer arena not allocated");
     }
+    constexpr std::size_t kAlign = 256;
+    nbytes = (nbytes + kAlign - 1) & ~(kAlign - 1);
+    auto note_live_alloc = [&](std::byte* ptr) {
+        mBwdCrossLayerAllocBytes[ptr] = nbytes;
+        mBwdCrossLayerCurrentLiveBytes += nbytes;
+        if (mBwdCrossLayerCurrentLiveBytes > mBwdCrossLayerHighWaterBytes) {
+            mBwdCrossLayerHighWaterBytes = mBwdCrossLayerCurrentLiveBytes;
+        }
+    };
+    for (auto it = mBwdCrossLayerFreeBlocks.begin(); it != mBwdCrossLayerFreeBlocks.end(); ++it) {
+        if (it->bytes < nbytes) continue;
+        std::byte* ptr = it->ptr;
+        const std::size_t remaining = it->bytes - nbytes;
+        if (remaining >= kAlign) {
+            it->ptr += nbytes;
+            it->bytes = remaining;
+        } else {
+            mBwdCrossLayerFreeBlocks.erase(it);
+        }
+        note_live_alloc(ptr);
+        return ptr;
+    }
     if (mBwdCrossLayerBumpOffset + nbytes <= mPhaseArenas->bwd_cross_layer_bytes) {
         std::byte* ptr = mPhaseArenas->bwd_cross_layer_ptr + mBwdCrossLayerBumpOffset;
         mBwdCrossLayerBumpOffset += nbytes;
+        note_live_alloc(ptr);
         return ptr;
     }
-    // Arena exhausted — fall back to cudaMalloc. Tracked in
-    // `mBwdCrossLayerFallbacks` and freed at the start of the next backward
-    // call (alongside the bump offset reset in execute_backward).
-    // This triggers on hybrid models whose per-layer attn_dim / intermediate
-    // variance grows the cross-layer persist past the fixed arena budget;
-    // Gemma4-E2B with correct full-attention per-layer dims lands here.
+    // Arena exhausted. Under CUDA stream capture a cudaMalloc fallback
+    // would invalidate the captured graph, so throw with a clear hint —
+    // `prepare_bwd_cross_layer_for_capture` should have grown the arena
+    // to fit the eager-measured high-water mark before capture began.
+    cudaStream_t stream = mRunState.MainStream;
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap_status);
+    const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
+    if (capturing) {
+        std::ostringstream oss;
+        oss << "allocate_bwd_cross_layer: arena exhausted under CUDA graph capture "
+            << "(req=" << nbytes << " bytes, used=" << mBwdCrossLayerBumpOffset
+            << ", cap=" << mPhaseArenas->bwd_cross_layer_bytes
+            << "). Set SUROGATE_BWD_CROSS_LAYER_MB above the eager high-water mark.";
+        throw std::runtime_error(oss.str());
+    }
+    // Eager fallback (non-capture): cudaMalloc grows lazily so the user
+    // doesn't pay for the worst case upfront. Tracked into the high-water
+    // mark so capture preparation can size the arena correctly.
     std::byte* ptr = nullptr;
     CUDA_CHECK(cudaMalloc(&ptr, nbytes));
     mBwdCrossLayerFallbacks.push_back(ptr);
+    mBwdCrossLayerCurrentFallbackBytes += nbytes;
+    note_live_alloc(ptr);
     return reinterpret_cast<std::byte*>(ptr);
+}
+
+void CompiledExecutor::release_bwd_cross_layer(std::byte* ptr) {
+    if (!ptr) return;
+    auto size_it = mBwdCrossLayerAllocBytes.find(ptr);
+    if (size_it == mBwdCrossLayerAllocBytes.end()) return;
+    const std::size_t nbytes = size_it->second;
+    mBwdCrossLayerAllocBytes.erase(size_it);
+    if (mBwdCrossLayerCurrentLiveBytes >= nbytes) {
+        mBwdCrossLayerCurrentLiveBytes -= nbytes;
+    } else {
+        mBwdCrossLayerCurrentLiveBytes = 0;
+    }
+
+    const auto* arena_begin = mPhaseArenas ? mPhaseArenas->bwd_cross_layer_ptr : nullptr;
+    const auto* arena_end = arena_begin ? arena_begin + mPhaseArenas->bwd_cross_layer_bytes : nullptr;
+    if (arena_begin && ptr >= arena_begin && ptr < arena_end) {
+        mBwdCrossLayerFreeBlocks.push_back({ptr, nbytes});
+        std::sort(mBwdCrossLayerFreeBlocks.begin(),
+                  mBwdCrossLayerFreeBlocks.end(),
+                  [](const BwdCrossLayerFreeBlock& a, const BwdCrossLayerFreeBlock& b) { return a.ptr < b.ptr; });
+        std::vector<BwdCrossLayerFreeBlock> merged;
+        merged.reserve(mBwdCrossLayerFreeBlocks.size());
+        for (const auto& block : mBwdCrossLayerFreeBlocks) {
+            if (!block.ptr || block.bytes == 0) continue;
+            if (!merged.empty() && merged.back().ptr + merged.back().bytes == block.ptr) {
+                merged.back().bytes += block.bytes;
+            } else {
+                merged.push_back(block);
+            }
+        }
+        mBwdCrossLayerFreeBlocks.swap(merged);
+        return;
+    }
+
+    auto fb_it = std::find(mBwdCrossLayerFallbacks.begin(), mBwdCrossLayerFallbacks.end(), ptr);
+    if (fb_it != mBwdCrossLayerFallbacks.end()) {
+        (void)cudaFree(ptr);
+        mBwdCrossLayerFallbacks.erase(fb_it);
+        if (mBwdCrossLayerCurrentFallbackBytes >= nbytes) {
+            mBwdCrossLayerCurrentFallbackBytes -= nbytes;
+        } else {
+            mBwdCrossLayerCurrentFallbackBytes = 0;
+        }
+    }
+}
+
+void CompiledExecutor::prepare_bwd_cross_layer_for_capture() {
+    if (!mPhaseArenas || !mPhaseArenas->allocated) return;
+    // Slack absorbs cross-step variance and free-list fragmentation in the persist
+    // pattern. Without slack a small uptick on a later step would
+    // exhaust the arena under capture and throw.
+    constexpr std::size_t kSlackBytes = 128ULL * 1024 * 1024;
+    const std::size_t needed = mBwdCrossLayerHighWaterBytes + kSlackBytes;
+    if (needed <= mPhaseArenas->bwd_cross_layer_bytes) return;
+    // Free fallback ptrs first (would otherwise leak on next backward
+    // entry now that the new arena will absorb their work).
+    for (std::byte* p : mBwdCrossLayerFallbacks) {
+        if (p) (void)cudaFree(p);
+    }
+    mBwdCrossLayerFallbacks.clear();
+    if (mPhaseArenas->bwd_cross_layer_ptr) {
+        CUDA_CHECK(cudaFree(mPhaseArenas->bwd_cross_layer_ptr));
+        mPhaseArenas->bwd_cross_layer_ptr = nullptr;
+    }
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&raw, needed));
+    mPhaseArenas->bwd_cross_layer_ptr = static_cast<std::byte*>(raw);
+    mPhaseArenas->bwd_cross_layer_bytes = needed;
+    mBwdCrossLayerBumpOffset = 0;
+    mBwdCrossLayerCurrentFallbackBytes = 0;
+    mBwdCrossLayerCurrentLiveBytes = 0;
+    mBwdCrossLayerFreeBlocks.clear();
+    mBwdCrossLayerAllocBytes.clear();
 }
 
 void CompiledExecutor::set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache) {

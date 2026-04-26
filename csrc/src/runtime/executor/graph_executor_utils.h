@@ -94,6 +94,7 @@ inline Tensor flatten_bt(const Tensor& t, long B, long T) {
 
 // Matmul utilities
 std::optional<::modules::MatmulOp> matmul_op_from_weight(std::string_view name, int& layer_idx);
+bool is_mlp_gate_weight(std::string_view name);
 EMMTranspose parse_transpose(const AttrMap& attrs);
 EMMTranspose swap_transpose(EMMTranspose mode);
 void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, int& N, int& K);

@@ -351,7 +351,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora: bool | None = True
     lora_rank: int | None = 16
     lora_alpha: int | None = 32
-    lora_dropout: float | None = 0.05
+    lora_dropout: float | None = 0
     lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False
@@ -516,6 +516,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.auto_lr_reduction = cfg.get("auto_lr_reduction", self.auto_lr_reduction)
         self.early_stop = cfg.get("early_stop", self.early_stop)
         self.epoch_adjustment = cfg.get("epoch_adjustment", self.epoch_adjustment)
+        self.log_gpu_util = cfg.get("log_gpu_util", self.log_gpu_util)
 
         self.wandb_project = cfg.get("wandb_project", self.wandb_project)
         self.wandb_name = cfg.get("wandb_name", self.wandb_name or self.run_name)
@@ -576,7 +577,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # The output buffer is {B*T/chunks, V} in bf16 which can be >1 GiB with chunks=1.
         if self.lora and self.recompute and self.lmhead_chunks == 1:
             total_tokens = self.per_device_train_batch_size * self.sequence_len
-            for chunks in (8, 4, 2):
+            chunk_order = (2, 4, 8) if self.recipe in ("fp8-hybrid", "fp8_hybrid") else (8, 4, 2)
+            for chunks in chunk_order:
                 if total_tokens % chunks == 0:
                     self.lmhead_chunks = chunks
                     logger.info(f"Auto-setting lmhead_chunks={chunks}")

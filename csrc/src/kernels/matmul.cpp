@@ -7,10 +7,14 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <fmt/core.h>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include "kernels.h"
 #include "utilities/utils.h"
@@ -19,6 +23,525 @@
 namespace {
 std::mutex g_fallback_cublas_mutex;
 std::unordered_map<int, cublasHandle_t> g_fallback_cublas_handles;
+
+struct MatmulTraceKey {
+    int m;
+    int n;
+    int k;
+    int mode;
+    int lda;
+    int ldb;
+    int ldc;
+    int a_type;
+    int b_type;
+    int c_type;
+    int has_bias;
+    int alpha_milli;
+    int beta_milli;
+    int algo_id;
+    int tile_id;
+    int stages_id;
+    int splitk;
+
+    bool operator==(const MatmulTraceKey& other) const {
+        return m == other.m && n == other.n && k == other.k && mode == other.mode && lda == other.lda &&
+               ldb == other.ldb && ldc == other.ldc && a_type == other.a_type && b_type == other.b_type &&
+               c_type == other.c_type && has_bias == other.has_bias && alpha_milli == other.alpha_milli &&
+               beta_milli == other.beta_milli && algo_id == other.algo_id && tile_id == other.tile_id &&
+               stages_id == other.stages_id && splitk == other.splitk;
+    }
+};
+
+struct MatmulTraceKeyHash {
+    std::size_t operator()(const MatmulTraceKey& key) const {
+        std::size_t h = 1469598103934665603ull;
+        auto mix = [&](int v) {
+            h ^= static_cast<std::size_t>(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        mix(key.m);
+        mix(key.n);
+        mix(key.k);
+        mix(key.mode);
+        mix(key.lda);
+        mix(key.ldb);
+        mix(key.ldc);
+        mix(key.a_type);
+        mix(key.b_type);
+        mix(key.c_type);
+        mix(key.has_bias);
+        mix(key.alpha_milli);
+        mix(key.beta_milli);
+        mix(key.algo_id);
+        mix(key.tile_id);
+        mix(key.stages_id);
+        mix(key.splitk);
+        return h;
+    }
+};
+
+std::mutex g_matmul_trace_mutex;
+std::unordered_map<MatmulTraceKey, std::size_t, MatmulTraceKeyHash> g_matmul_trace_counts;
+std::once_flag g_matmul_trace_atexit_once;
+
+struct MatmulAutotuneKey {
+    int device;
+    int m;
+    int n;
+    int k;
+    int mode;
+    int lda;
+    int ldb;
+    int ldc;
+    int a_type;
+    int b_type;
+    int c_type;
+    int bias_type;
+    int has_bias;
+    int has_scale_a;
+    int has_scale_b;
+    int alpha_milli;
+    int beta_milli;
+    int compute_type;
+    int workspace_mb;
+
+    bool operator==(const MatmulAutotuneKey& other) const {
+        return device == other.device && m == other.m && n == other.n && k == other.k && mode == other.mode &&
+               lda == other.lda && ldb == other.ldb && ldc == other.ldc && a_type == other.a_type &&
+               b_type == other.b_type && c_type == other.c_type && bias_type == other.bias_type &&
+               has_bias == other.has_bias && has_scale_a == other.has_scale_a && has_scale_b == other.has_scale_b &&
+               alpha_milli == other.alpha_milli && beta_milli == other.beta_milli &&
+               compute_type == other.compute_type && workspace_mb == other.workspace_mb;
+    }
+};
+
+struct MatmulAutotuneKeyHash {
+    std::size_t operator()(const MatmulAutotuneKey& key) const {
+        std::size_t h = 1469598103934665603ull;
+        auto mix = [&](int v) {
+            h ^= static_cast<std::size_t>(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        mix(key.device);
+        mix(key.m);
+        mix(key.n);
+        mix(key.k);
+        mix(key.mode);
+        mix(key.lda);
+        mix(key.ldb);
+        mix(key.ldc);
+        mix(key.a_type);
+        mix(key.b_type);
+        mix(key.c_type);
+        mix(key.bias_type);
+        mix(key.has_bias);
+        mix(key.has_scale_a);
+        mix(key.has_scale_b);
+        mix(key.alpha_milli);
+        mix(key.beta_milli);
+        mix(key.compute_type);
+        mix(key.workspace_mb);
+        return h;
+    }
+};
+
+struct MatmulAutotuneEntry {
+    cublasLtMatmulAlgo_t algo;
+    float elapsed_ms = 0.0f;
+    int candidate_index = -1;
+};
+
+std::mutex g_matmul_autotune_mutex;
+std::unordered_map<MatmulAutotuneKey, MatmulAutotuneEntry, MatmulAutotuneKeyHash> g_matmul_autotune_cache;
+
+static bool matmul_trace_enabled() {
+    static const bool enabled = (std::getenv("SUROGATE_DEBUG_MATMUL_SHAPES") != nullptr);
+    return enabled;
+}
+
+static int round_milli(float value) {
+    return static_cast<int>(value * 1000.0f + (value >= 0.0f ? 0.5f : -0.5f));
+}
+
+static bool matmul_autotune_enabled() {
+    static const bool enabled = (std::getenv("SUROGATE_DISABLE_MATMUL_AUTOTUNE") == nullptr);
+    return enabled;
+}
+
+static bool matmul_autotune_debug_enabled() {
+    static const bool enabled = (std::getenv("SUROGATE_DEBUG_MATMUL_AUTOTUNE") != nullptr);
+    return enabled;
+}
+
+static int matmul_autotune_repetitions() {
+    static const int reps = []() {
+        if (const char* env = std::getenv("SUROGATE_MATMUL_AUTOTUNE_REPS")) {
+            char* end = nullptr;
+            const long val = std::strtol(env, &end, 10);
+            if (end != env && val > 0) return static_cast<int>(std::min<long>(val, 16));
+        }
+        return 3;
+    }();
+    return reps;
+}
+
+static int matmul_autotune_max_candidates() {
+    static const int candidates = []() {
+        if (const char* env = std::getenv("SUROGATE_MATMUL_AUTOTUNE_MAX_CANDIDATES")) {
+            char* end = nullptr;
+            const long val = std::strtol(env, &end, 10);
+            if (end != env && val > 0) return static_cast<int>(std::min<long>(val, 32));
+        }
+        return 8;
+    }();
+    return candidates;
+}
+
+static std::size_t matmul_autotune_max_temp_bytes() {
+    static const std::size_t bytes = []() {
+        if (const char* env = std::getenv("SUROGATE_MATMUL_AUTOTUNE_MAX_TEMP_MB")) {
+            char* end = nullptr;
+            const long val = std::strtol(env, &end, 10);
+            if (end != env && val > 0) return static_cast<std::size_t>(val) * 1024ull * 1024ull;
+        }
+        return static_cast<std::size_t>(512) * 1024ull * 1024ull;
+    }();
+    return bytes;
+}
+
+static bool stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    return (cudaStreamIsCapturing(stream, &cap) == cudaSuccess) && (cap != cudaStreamCaptureStatusNone);
+}
+
+static int get_algo_attr_int(const cublasLtMatmulAlgo_t& algo, cublasLtMatmulAlgoConfigAttributes_t attr) {
+    int value = -1;
+    std::size_t written = 0;
+    cublasStatus_t status = cublasLtMatmulAlgoConfigGetAttribute(&algo, attr, &value, sizeof(value), &written);
+    if (status != CUBLAS_STATUS_SUCCESS || written == 0) {
+        return -1;
+    }
+    return value;
+}
+
+static void dump_matmul_trace() {
+    std::vector<std::pair<MatmulTraceKey, std::size_t>> entries;
+    {
+        std::lock_guard<std::mutex> lock(g_matmul_trace_mutex);
+        entries.reserve(g_matmul_trace_counts.size());
+        for (const auto& item : g_matmul_trace_counts) {
+            entries.push_back(item);
+        }
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::fprintf(stderr, "[MATMUL-SHAPES] unique=%zu\n", entries.size());
+    const std::size_t limit = std::min<std::size_t>(entries.size(), 128);
+    for (std::size_t i = 0; i < limit; ++i) {
+        const auto& key = entries[i].first;
+        std::fprintf(stderr,
+                     "[MATMUL-SHAPES] count=%zu m=%d n=%d k=%d mode=%d lda=%d ldb=%d ldc=%d "
+                     "types=%d/%d/%d bias=%d alpha_milli=%d beta_milli=%d algo=%d tile=%d stages=%d splitk=%d\n",
+                     entries[i].second,
+                     key.m,
+                     key.n,
+                     key.k,
+                     key.mode,
+                     key.lda,
+                     key.ldb,
+                     key.ldc,
+                     key.a_type,
+                     key.b_type,
+                     key.c_type,
+                     key.has_bias,
+                     key.alpha_milli,
+                     key.beta_milli,
+                     key.algo_id,
+                     key.tile_id,
+                     key.stages_id,
+                     key.splitk);
+    }
+}
+
+static void record_matmul_trace(int m,
+                                int n,
+                                int k,
+                                EMMTranspose mode,
+                                int lda,
+                                int ldb,
+                                int ldc,
+                                int a_type,
+                                int b_type,
+                                int c_type,
+                                bool has_bias,
+                                float alpha,
+                                float beta,
+                                const cublasLtMatmulAlgo_t& algo) {
+    if (!matmul_trace_enabled()) {
+        return;
+    }
+    std::call_once(g_matmul_trace_atexit_once, []() { std::atexit(dump_matmul_trace); });
+
+    MatmulTraceKey key{
+        m,
+        n,
+        k,
+        static_cast<int>(mode),
+        lda,
+        ldb,
+        ldc,
+        a_type,
+        b_type,
+        c_type,
+        has_bias ? 1 : 0,
+        round_milli(alpha),
+        round_milli(beta),
+        get_algo_attr_int(algo, CUBLASLT_ALGO_CONFIG_ID),
+        get_algo_attr_int(algo, CUBLASLT_ALGO_CONFIG_TILE_ID),
+        get_algo_attr_int(algo, CUBLASLT_ALGO_CONFIG_STAGES_ID),
+        get_algo_attr_int(algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM),
+    };
+
+    std::lock_guard<std::mutex> lock(g_matmul_trace_mutex);
+    ++g_matmul_trace_counts[key];
+}
+
+static bool matmul_heuristic_debug_enabled() {
+    static const bool enabled = (std::getenv("SUROGATE_DEBUG_MATMUL_HEURISTICS") != nullptr);
+    return enabled;
+}
+
+static void maybe_dump_matmul_heuristics(int m,
+                                         int n,
+                                         int k,
+                                         EMMTranspose mode,
+                                         int lda,
+                                         int ldb,
+                                         int ldc,
+                                         int a_type,
+                                         int b_type,
+                                         int c_type,
+                                         bool has_bias,
+                                         const cublasLtMatmulHeuristicResult_t* heuristics,
+                                         int returned_results) {
+    if (!matmul_heuristic_debug_enabled()) {
+        return;
+    }
+    static std::mutex log_mutex;
+    static int log_count = 0;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    if (log_count >= 64) {
+        return;
+    }
+    ++log_count;
+    std::fprintf(stderr,
+                 "[MATMUL-HEUR] shape m=%d n=%d k=%d mode=%d lda=%d ldb=%d ldc=%d types=%d/%d/%d bias=%d "
+                 "returned=%d\n",
+                 m,
+                 n,
+                 k,
+                 static_cast<int>(mode),
+                 lda,
+                 ldb,
+                 ldc,
+                 a_type,
+                 b_type,
+                 c_type,
+                 has_bias ? 1 : 0,
+                 returned_results);
+    for (int i = 0; i < returned_results; ++i) {
+        const auto& result = heuristics[i];
+        std::fprintf(stderr,
+                     "[MATMUL-HEUR]   idx=%d state=%d workspace=%zu waves=%.3f algo=%d tile=%d stages=%d splitk=%d\n",
+                     i,
+                     static_cast<int>(result.state),
+                     static_cast<std::size_t>(result.workspaceSize),
+                     static_cast<double>(result.wavesCount),
+                     get_algo_attr_int(result.algo, CUBLASLT_ALGO_CONFIG_ID),
+                     get_algo_attr_int(result.algo, CUBLASLT_ALGO_CONFIG_TILE_ID),
+                     get_algo_attr_int(result.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID),
+                     get_algo_attr_int(result.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM));
+    }
+}
+
+template <class FloatC, class FloatA, class FloatB>
+static bool try_get_cached_matmul_algo(const MatmulAutotuneKey& key, cublasLtMatmulAlgo_t& algo_out) {
+    if (!matmul_autotune_enabled()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_matmul_autotune_mutex);
+    auto it = g_matmul_autotune_cache.find(key);
+    if (it == g_matmul_autotune_cache.end()) {
+        return false;
+    }
+    algo_out = it->second.algo;
+    return true;
+}
+
+template <class FloatC, class FloatA, class FloatB>
+static bool tune_matmul_algo(const MatmulAutotuneKey& key,
+                             cublasLtHandle_t handle,
+                             cublasLtMatmulDesc_t operationDesc,
+                             cublasLtMatrixLayout_t ALayout,
+                             cublasLtMatrixLayout_t BLayout,
+                             cublasLtMatrixLayout_t CLayout,
+                             cublasLtMatrixLayout_t DLayout,
+                             const float* alpha,
+                             const FloatA* a,
+                             const FloatB* b,
+                             const float* beta,
+                             std::byte* workspace,
+                             std::size_t workspace_size,
+                             int ldc,
+                             int n,
+                             cudaStream_t stream,
+                             const cublasLtMatmulHeuristicResult_t* heuristics,
+                             int returned_results,
+                             cublasLtMatmulAlgo_t& algo_out) {
+    if (!matmul_autotune_enabled()) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_matmul_autotune_mutex);
+        auto it = g_matmul_autotune_cache.find(key);
+        if (it != g_matmul_autotune_cache.end()) {
+            algo_out = it->second.algo;
+            return true;
+        }
+    }
+
+    if (stream_is_capturing(stream) || returned_results <= 1) {
+        return false;
+    }
+
+    const std::size_t temp_elems = static_cast<std::size_t>(ldc) * static_cast<std::size_t>(n);
+    const std::size_t temp_bytes = temp_elems * sizeof(FloatC);
+    if (temp_bytes == 0 || temp_bytes > matmul_autotune_max_temp_bytes()) {
+        return false;
+    }
+
+    FloatC* temp_d = nullptr;
+    cudaError_t alloc_status = cudaMalloc(&temp_d, temp_bytes);
+    if (alloc_status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    const int max_candidates = std::min(returned_results, matmul_autotune_max_candidates());
+    const int reps = matmul_autotune_repetitions();
+    float best_ms = INFINITY;
+    int best_idx = -1;
+    cublasLtMatmulAlgo_t best_algo{};
+
+    for (int i = 0; i < max_candidates; ++i) {
+        const auto& candidate = heuristics[i];
+        if (candidate.state != CUBLAS_STATUS_SUCCESS || candidate.workspaceSize > workspace_size) {
+            continue;
+        }
+
+        cublasStatus_t status = cublasLtMatmul(handle,
+                                               operationDesc,
+                                               alpha,
+                                               a,
+                                               ALayout,
+                                               b,
+                                               BLayout,
+                                               beta,
+                                               temp_d,
+                                               CLayout,
+                                               temp_d,
+                                               DLayout,
+                                               &candidate.algo,
+                                               workspace,
+                                               workspace_size,
+                                               stream);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            continue;
+        }
+
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        for (int r = 0; r < reps; ++r) {
+            status = cublasLtMatmul(handle,
+                                    operationDesc,
+                                    alpha,
+                                    a,
+                                    ALayout,
+                                    b,
+                                    BLayout,
+                                    beta,
+                                    temp_d,
+                                    CLayout,
+                                    temp_d,
+                                    DLayout,
+                                    &candidate.algo,
+                                    workspace,
+                                    workspace_size,
+                                    stream);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                break;
+            }
+        }
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            continue;
+        }
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        elapsed_ms /= static_cast<float>(reps);
+        if (elapsed_ms < best_ms) {
+            best_ms = elapsed_ms;
+            best_idx = i;
+            best_algo = candidate.algo;
+        }
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(temp_d));
+
+    if (best_idx < 0) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_matmul_autotune_mutex);
+        auto [it, inserted] = g_matmul_autotune_cache.emplace(key, MatmulAutotuneEntry{best_algo, best_ms, best_idx});
+        if (!inserted) {
+            algo_out = it->second.algo;
+            return true;
+        }
+    }
+
+    if (matmul_autotune_debug_enabled()) {
+        std::fprintf(stderr,
+                     "[MATMUL-AUTOTUNE] m=%d n=%d k=%d mode=%d types=%d/%d/%d beta_milli=%d best_idx=%d "
+                     "elapsed_ms=%.4f algo=%d tile=%d stages=%d splitk=%d candidates=%d\n",
+                     key.m,
+                     key.n,
+                     key.k,
+                     key.mode,
+                     key.a_type,
+                     key.b_type,
+                     key.c_type,
+                     key.beta_milli,
+                     best_idx,
+                     best_ms,
+                     get_algo_attr_int(best_algo, CUBLASLT_ALGO_CONFIG_ID),
+                     get_algo_attr_int(best_algo, CUBLASLT_ALGO_CONFIG_TILE_ID),
+                     get_algo_attr_int(best_algo, CUBLASLT_ALGO_CONFIG_STAGES_ID),
+                     get_algo_attr_int(best_algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM),
+                     max_candidates);
+    }
+
+    algo_out = best_algo;
+    return true;
+}
 }  // namespace
 
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
@@ -161,8 +684,6 @@ void matmul_cublaslt(FloatC* d,
 
     int returnedResults = 0;
     cublasLtMatmulPreference_t preference;
-    cublasLtMatmulHeuristicResult_t heuristic;
-
     bool transA = mode == EMMTranspose::TN || mode == EMMTranspose::TT;
     bool transB = mode == EMMTranspose::NT || mode == EMMTranspose::TT;
 
@@ -246,7 +767,7 @@ void matmul_cublaslt(FloatC* d,
 
     // find a suitable algorithm (cached internally so shouldn't take much CPU time in practice)
     // Request multiple algorithms to allow fallback if primary fails
-    constexpr int kMaxAlgos = 8;
+    constexpr int kMaxAlgos = 32;
     cublasLtMatmulHeuristicResult_t heuristics[kMaxAlgos];
     cublasLtMatmulAlgoGetHeuristic(handle,
                                    operationDesc,
@@ -258,6 +779,19 @@ void matmul_cublaslt(FloatC* d,
                                    kMaxAlgos,
                                    heuristics,
                                    &returnedResults);
+    maybe_dump_matmul_heuristics(m,
+                                 n,
+                                 k,
+                                 mode,
+                                 lda,
+                                 ldb,
+                                 ldc,
+                                 static_cast<int>(to_cuda_lib_type_enum<FloatA>),
+                                 static_cast<int>(to_cuda_lib_type_enum<FloatB>),
+                                 static_cast<int>(to_cuda_lib_type_enum<FloatC>),
+                                 has_bias,
+                                 heuristics,
+                                 returnedResults);
     if (returnedResults == 0) {
         throw std::runtime_error(
             fmt::format("No cuBLASLt algorithm: m: {}, n: {}, k: {}, bias: {}", n, m, k, has_bias));
@@ -273,7 +807,93 @@ void matmul_cublaslt(FloatC* d,
     cublasStatus_t gemm_status = CUBLAS_STATUS_NOT_SUPPORTED;
     bool fallback_tried = false;
     int algos_tried = 0;
+
+    int device_id_for_key = -1;
+    CUDA_CHECK(cudaGetDevice(&device_id_for_key));
+    const MatmulAutotuneKey autotune_key{
+        device_id_for_key,
+        m,
+        n,
+        k,
+        static_cast<int>(mode),
+        lda,
+        ldb,
+        ldc,
+        static_cast<int>(to_cuda_lib_type_enum<FloatA>),
+        static_cast<int>(to_cuda_lib_type_enum<FloatB>),
+        static_cast<int>(to_cuda_lib_type_enum<FloatC>),
+        static_cast<int>(to_cuda_lib_type_enum<FloatBias>),
+        has_bias ? 1 : 0,
+        scale_a ? 1 : 0,
+        scale_b ? 1 : 0,
+        round_milli(alpha_val),
+        round_milli(beta_val),
+        static_cast<int>(compute_type),
+        static_cast<int>(workspace_size / (1024ull * 1024ull)),
+    };
+
+    cublasLtMatmulAlgo_t tuned_algo{};
+    if (tune_matmul_algo<FloatC, FloatA, FloatB>(autotune_key,
+                                                 handle,
+                                                 operationDesc,
+                                                 ALayout,
+                                                 BLayout,
+                                                 CLayout,
+                                                 DLayout,
+                                                 alpha,
+                                                 a,
+                                                 b,
+                                                 beta,
+                                                 workspace,
+                                                 workspace_size,
+                                                 ldc,
+                                                 n,
+                                                 stream,
+                                                 heuristics,
+                                                 returnedResults,
+                                                 tuned_algo)) {
+        matmul_status = cublasLtMatmul(handle,
+                                       operationDesc,
+                                       alpha,
+                                       a,
+                                       ALayout,
+                                       b,
+                                       BLayout,
+                                       beta,
+                                       d,
+                                       CLayout,
+                                       d,
+                                       DLayout,
+                                       &tuned_algo,
+                                       workspace,
+                                       workspace_size,
+                                       stream);
+        ++algos_tried;
+        if (matmul_status == CUBLAS_STATUS_SUCCESS) {
+            record_matmul_trace(m,
+                                n,
+                                k,
+                                mode,
+                                lda,
+                                ldb,
+                                ldc,
+                                static_cast<int>(to_cuda_lib_type_enum<FloatA>),
+                                static_cast<int>(to_cuda_lib_type_enum<FloatB>),
+                                static_cast<int>(to_cuda_lib_type_enum<FloatC>),
+                                has_bias,
+                                alpha_val,
+                                beta_val,
+                                tuned_algo);
+        } else {
+            std::lock_guard<std::mutex> lock(g_matmul_autotune_mutex);
+            g_matmul_autotune_cache.erase(autotune_key);
+        }
+    }
+
     for (int i = 0; i < returnedResults; ++i) {
+        if (matmul_status == CUBLAS_STATUS_SUCCESS) {
+            break;
+        }
         if (heuristics[i].state != CUBLAS_STATUS_SUCCESS) {
             continue;
         }
@@ -295,6 +915,20 @@ void matmul_cublaslt(FloatC* d,
                                        stream);
         ++algos_tried;
         if (matmul_status == CUBLAS_STATUS_SUCCESS) {
+            record_matmul_trace(m,
+                                n,
+                                k,
+                                mode,
+                                lda,
+                                ldb,
+                                ldc,
+                                static_cast<int>(to_cuda_lib_type_enum<FloatA>),
+                                static_cast<int>(to_cuda_lib_type_enum<FloatB>),
+                                static_cast<int>(to_cuda_lib_type_enum<FloatC>),
+                                has_bias,
+                                alpha_val,
+                                beta_val,
+                                heuristics[i].algo);
             break;
         }
     }
@@ -581,6 +1215,42 @@ void matmul_strided_c(nv_bfloat16* c,
                       cudaStream_t stream) {
     float alpha = 1.0f;
     float beta = accumulate ? 1.0f : 0.0f;
+    matmul_strided_c(c,
+                     a,
+                     b,
+                     bias,
+                     scale_a,
+                     scale_b,
+                     handle,
+                     workspace,
+                     workspace_size,
+                     M,
+                     N,
+                     K,
+                     mode,
+                     alpha,
+                     beta,
+                     ldc,
+                     stream);
+}
+
+void matmul_strided_c(nv_bfloat16* c,
+                      const nv_bfloat16* a,
+                      const nv_bfloat16* b,
+                      const nv_bfloat16* bias,
+                      const float* scale_a,
+                      const float* scale_b,
+                      cublasLtHandle_t handle,
+                      std::byte* workspace,
+                      std::size_t workspace_size,
+                      int M,
+                      int N,
+                      int K,
+                      EMMTranspose mode,
+                      float alpha,
+                      float beta,
+                      int ldc,
+                      cudaStream_t stream) {
     matmul_cublaslt(c,
                     a,
                     b,

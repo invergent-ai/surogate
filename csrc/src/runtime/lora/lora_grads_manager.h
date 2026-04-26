@@ -65,6 +65,11 @@ public:
     void start_micro_step(cudaStream_t stream, int micro_step, int total_steps);
 
     /**
+     * @brief Clear all full LoRA gradient buffers.
+     */
+    void zero_all(cudaStream_t stream);
+
+    /**
      * @brief End a micro-step
      */
     void end_micro_step(cudaStream_t stream, NCCLCommunicator& comm);

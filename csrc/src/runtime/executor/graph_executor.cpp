@@ -47,6 +47,10 @@
 namespace dsl {
 namespace {
 
+inline std::size_t align_up_bytes(std::size_t value, std::size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
 /// Copy position IDs to the device-side PositionIDs buffer, replicating a single
 /// plane across all 3 mRoPE planes when the model uses multimodal RoPE but the
 /// caller provides only one plane (e.g. text-only GRPO training).
@@ -97,14 +101,9 @@ inline bool stream_is_capturing(cudaStream_t stream) {
 
 inline bool is_capture_unsafe_op_type(CompiledOpType type) {
     switch (type) {
-        // Qwen3.5 / Triton JIT kernels
-        case CompiledOpType::ChunkGatedDeltaRule:
-        case CompiledOpType::ChunkGatedDeltaRuleBackward:
-        case CompiledOpType::Qwen3_5Decay:
-        case CompiledOpType::Qwen3_5DecayBackward:
         // MoE routing / grouped GEMM rely on per-step host metadata and dynamic routing.
-        case CompiledOpType::MoESoftmax:
-        case CompiledOpType::MoESigmoid:
+        // (MoESigmoid/MoESoftmax are plain element-wise kernels reused by non-MoE
+        // models like Qwen3.5; they're capture-safe and intentionally excluded.)
         case CompiledOpType::MoETopK:
         case CompiledOpType::MoEPermute:
         case CompiledOpType::MoEGroupedGemm:
@@ -112,8 +111,6 @@ inline bool is_capture_unsafe_op_type(CompiledOpType type) {
         case CompiledOpType::MoEGroupedGemmDown:
         case CompiledOpType::MoEUnpermute:
         case CompiledOpType::MoEExpertBiasAdd:
-        case CompiledOpType::MoESoftmaxBackward:
-        case CompiledOpType::MoESigmoidBackward:
         case CompiledOpType::MoETopKBackward:
         case CompiledOpType::MoEPermuteBackward:
         case CompiledOpType::MoEGroupedGemmBackward:
@@ -1006,13 +1003,23 @@ void GraphExecutor::compile_graphs(long B, long T) {
         if (mCompiledForward && mCompiledBackward) {
             {
                 const std::size_t stack_bytes = mRunState.Stack.capacity();
-                // bwd_cross_layer arena. Fixed 64 MiB; the per-step bump
-                // resets at backward start. 0 bytes for dense transformers
-                // (typical), < 16 MiB for small-MoE aux-loss.
-                // `CompiledExecutor::allocate_bwd_cross_layer` falls back to
-                // cudaMalloc when this arena is exhausted (hybrid models
-                // with large per-layer attn_dim variance can overflow).
-                const std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
+                // bwd_cross_layer arena. Default 64 MiB; the per-step bump
+                // resets at backward start. Eager mode falls back to
+                // cudaMalloc on overflow (tracked in mBwdCrossLayerFallbacks
+                // and freed on the next non-capture entry). Capture mode
+                // can't tolerate the fallback, so before capture begins
+                // py_train.cpp calls `prepare_bwd_cross_layer_for_capture`
+                // which grows the arena to the eager-measured high-water
+                // mark — that avoids paying for the worst case upfront on
+                // models where eager actually uses far less.
+                std::size_t bwd_cross_layer_bytes = 64ULL * 1024 * 1024;
+                if (const char* env = std::getenv("SUROGATE_BWD_CROSS_LAYER_MB")) {
+                    char* end = nullptr;
+                    const unsigned long mb = std::strtoul(env, &end, 10);
+                    if (end != env && mb > 0) {
+                        bwd_cross_layer_bytes = static_cast<std::size_t>(mb) * 1024ULL * 1024ULL;
+                    }
+                }
                 // moe_saved arena sized 256 MiB when NumExperts > 0.
                 // Cross-step monotonic bump; cudaMalloc fallback on exhaustion.
                 const std::size_t moe_saved_bytes = mConfig.NumExperts > 0 ? 256ULL * 1024 * 1024 : 0;
@@ -1047,16 +1054,23 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 std::size_t wm_slab_bytes = 0;
                 std::size_t base_persistent_bytes = 0;
                 std::size_t extras_slab_bytes = 0;
+                std::size_t wm_slab_offset = 0;
+                std::size_t lora_slab_offset = 0;
+                std::size_t extras_slab_offset = 0;
                 if (mPhaseArenas.persistent_bytes > 0) {
                     base_persistent_bytes = mWeights.rebindable_persistent_bytes(*mCompiledForward);
-                    mPhaseArenas.persistent_bytes = base_persistent_bytes;
+                    std::size_t persistent_cursor = base_persistent_bytes;
                     if (mWeightManager) {
+                        persistent_cursor = align_up_bytes(persistent_cursor, 256);
+                        wm_slab_offset = persistent_cursor;
                         wm_slab_bytes = mWeightManager->total_persistent_bytes();
-                        mPhaseArenas.persistent_bytes += wm_slab_bytes;
+                        persistent_cursor += wm_slab_bytes;
                     }
                     if (mLoRAWeights) {
+                        persistent_cursor = align_up_bytes(persistent_cursor, 256);
+                        lora_slab_offset = persistent_cursor;
                         lora_slab_bytes = mLoRAWeights->total_persistent_bytes();
-                        mPhaseArenas.persistent_bytes += lora_slab_bytes;
+                        persistent_cursor += lora_slab_bytes;
                     }
                     // Non-graph persistent buffers (today: `output` logits
                     // scratch). These have no tid in the compiled graph, so
@@ -1064,7 +1078,12 @@ void GraphExecutor::compile_graphs(long B, long T) {
                     // the arena here and route via
                     // rebind_non_graph_persistent_to_arena below.
                     extras_slab_bytes = mRunState.non_graph_persistent_extras_bytes();
-                    mPhaseArenas.persistent_bytes += extras_slab_bytes;
+                    if (extras_slab_bytes > 0) {
+                        persistent_cursor = align_up_bytes(persistent_cursor, 256);
+                        extras_slab_offset = persistent_cursor;
+                        persistent_cursor += extras_slab_bytes;
+                    }
+                    mPhaseArenas.persistent_bytes = persistent_cursor;
                 }
                 // Accumulator slab clamps to what DslGradStore can actually
                 // rebind; ZeRO-2 / offloaded / streaming / cpu-training
@@ -1114,11 +1133,11 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 // is absent or has nothing device-resident to rebind.
                 mWeights.rebind_to_persistent_arena(*mCompiledForward, mPhaseArenas, mRunState.MainStream);
                 if (mWeightManager && wm_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
-                    std::byte* wm_base = mPhaseArenas.persistent_ptr + base_persistent_bytes;
+                    std::byte* wm_base = mPhaseArenas.persistent_ptr + wm_slab_offset;
                     mWeightManager->rebind_to_persistent_arena(wm_base, wm_slab_bytes, mRunState.MainStream);
                 }
                 if (mLoRAWeights && lora_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
-                    std::byte* lora_base = mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes;
+                    std::byte* lora_base = mPhaseArenas.persistent_ptr + lora_slab_offset;
                     mLoRAWeights->rebind_to_persistent_arena(lora_base, lora_slab_bytes, mRunState.MainStream);
                 }
                 if (mPhaseArenas.persistent_activation_ptr != nullptr) {
@@ -1127,8 +1146,7 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                                                    mRunState.MainStream);
                 }
                 if (extras_slab_bytes > 0 && mPhaseArenas.persistent_ptr != nullptr) {
-                    std::byte* extras_base =
-                        mPhaseArenas.persistent_ptr + base_persistent_bytes + wm_slab_bytes + lora_slab_bytes;
+                    std::byte* extras_base = mPhaseArenas.persistent_ptr + extras_slab_offset;
                     mRunState.rebind_non_graph_persistent_to_arena(extras_base,
                                                                    extras_slab_bytes,
                                                                    mRunState.MainStream);
@@ -1233,6 +1251,12 @@ bool GraphExecutor::has_capture_unsafe_ops() const {
     return graph_has_capture_unsafe_ops(mCompiledForward.get());
 }
 
+void GraphExecutor::prepare_bwd_cross_layer_for_capture() {
+    if (mCompiledExecutor) {
+        mCompiledExecutor->prepare_bwd_cross_layer_for_capture();
+    }
+}
+
 size_t GraphExecutor::saved_buffers_total_bytes() const {
     return mCompiledExecutor ? mCompiledExecutor->saved_buffers_total_bytes() : 0;
 }
@@ -1253,7 +1277,8 @@ void GraphExecutor::execute_forward(long B,
                                     long T,
                                     NCCLCommunicator& comm,
                                     bool full,
-                                    const modules::ForwardHook* hook) {
+                                    const modules::ForwardHook* hook,
+                                    int micro_step) {
     // LoRA is slice-driven via ``CompiledAttrs::lora_slices``; the forward
     // hook parameter is kept for ABI stability with callers that still
     // build hook values, but nothing is invoked from it.
@@ -1274,7 +1299,7 @@ void GraphExecutor::execute_forward(long B,
     // ops run eagerly while other segments can still use CUDA graphs.
     const bool has_capture_unsafe_ops = graph_has_capture_unsafe_ops(mCompiledForward.get());
     // When doc masking or capture-unsafe ops are present, use split-attention mode.
-    const bool doc_masking_active_raw = (mCuSeqlensGpu != nullptr);
+    const bool doc_masking_active_raw = (mDocMaskingNumDocs > 0);
     // Phase-0 discovery knob: bypass the doc-masking gate so we can catalog
     // capture-unsafe call sites. Intentionally NOT capture-correct yet —
     // used only for running the runtime under capture to surface violations.
@@ -1293,6 +1318,7 @@ void GraphExecutor::execute_forward(long B,
     const bool recompute_active = mOptions.recompute_enabled() && mCompiledForward != nullptr;
     mCompiledExecutor->set_recompute_enabled(recompute_active);
     const bool capturing = use_graphs && mForwardGraph == nullptr;
+    const bool enable_fp8_weight_cache = std::getenv("SUROGATE_ENABLE_FP8_WEIGHT_CACHE") != nullptr;
     if (!use_graphs || capturing) {
         mSaved.clear();
         reset_forward_plan();
@@ -1313,6 +1339,7 @@ void GraphExecutor::execute_forward(long B,
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
         prime_fp8_weight_cache({});
+        prime_fp8_lm_head_cache(false);
         prime_fp4_weight_cache({});
     } else if (!use_graphs && !in_capture) {
         // External/full-step CUDA graph capture paths (outside GraphExecutor) can still
@@ -1325,10 +1352,14 @@ void GraphExecutor::execute_forward(long B,
         // Prime FP4 weight caches on first call. This covers split-attention mode
         // (sample_packing + CUDA graphs) where use_graphs is false but we still need
         // cached weights to avoid re-quantizing on every matmul.
+        if (enable_fp8_weight_cache) {
+            prime_fp8_weight_cache({});
+        }
         if (!mWeightCachesPrimed) {
             prime_fp4_weight_cache({});
             mWeightCachesPrimed = true;
         }
+        prime_fp8_lm_head_cache(false);
     } else if (!mWeightCachesPrimed) {
         // Prime FP4 weight caches on first eager execution (e.g., QLoRA where CUDA
         // graphs are disabled). FP4 on-the-fly quantization (two-level block scaling,
@@ -1337,12 +1368,17 @@ void GraphExecutor::execute_forward(long B,
         // cheap (single abs_max + per-element scale), and priming FP8 caches adds
         // ~2x model size in persistent GPU memory (FP8 + FP8 transposed), causing
         // OOM on memory-constrained GPUs with QLoRA.
+        if (enable_fp8_weight_cache) {
+            prime_fp8_weight_cache({});
+        }
         prime_fp4_weight_cache({});
         mWeightCachesPrimed = true;
+        prime_fp8_lm_head_cache(false);
     }
 
     auto run_ops = [&]() {
         mCompiledExecutor->set_dimensions(B, T);
+        mCompiledExecutor->set_current_micro_step(micro_step);
         mCompiledExecutor->set_recompute_enabled(recompute_active);
         mCompiledExecutor->set_capturing(capturing);
         mCompiledExecutor->execute_forward(*mCompiledForward, comm, full, hook);
@@ -1357,7 +1393,9 @@ void GraphExecutor::execute_forward(long B,
                                            rs.Stack,
                                            mForwardCheckpoint);
     // On CUDA graph replay, run_ops isn't executed, so saved tensors are stale.
-    // Refresh them here to reflect the current forward activations.
+    // During fresh capture, run_ops records layer-end D2D saves at the right
+    // point in the graph. Re-running save_tensors() after launch can recopy
+    // from stack slots that have already been restored/reused.
     if (use_graphs && !capturing) {
         mCompiledExecutor->save_tensors(mSaveList);
     }
@@ -1384,7 +1422,7 @@ void GraphExecutor::execute_backward(long B,
     const bool has_capture_unsafe_ops =
         graph_has_capture_unsafe_ops(mCompiledForward ? mCompiledForward.get() : mCompiledBackward.get());
     const bool force_full_capture_bwd = std::getenv("SUROGATE_FORCE_FULL_GRAPH_CAPTURE") != nullptr;
-    const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr) && !force_full_capture_bwd;
+    const bool doc_masking_active_bwd = (mDocMaskingNumDocs > 0) && !force_full_capture_bwd;
     const bool has_capture_unsafe_bwd = has_capture_unsafe_ops;
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
@@ -1399,13 +1437,22 @@ void GraphExecutor::execute_backward(long B,
     const bool recompute_active = mOptions.recompute_enabled() && mCompiledForward != nullptr;
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
+    const bool enable_fp8_weight_cache = std::getenv("SUROGATE_ENABLE_FP8_WEIGHT_CACHE") != nullptr;
     if (capturing) {
         // Same reason as forward: avoid allocating inside capture when a recipe wants cached weights.
         prime_fp8_weight_cache({});
         prime_fp8_weight_cache_transposed({});
+        prime_fp8_lm_head_cache(false);
+        prime_fp8_lm_head_cache(true);
         prime_fp4_weight_cache({});
         mCompiledExecutor->prepare_replay_persist_arena_for_capture();
         mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
+    } else if (!in_capture) {
+        if (enable_fp8_weight_cache) {
+            prime_fp8_weight_cache_transposed({});
+        }
+        prime_fp8_lm_head_cache(false);
+        prime_fp8_lm_head_cache(true);
     }
 
     auto run_ops = [&]() {
@@ -1529,7 +1576,7 @@ void GraphExecutor::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, nullptr);
+    execute_forward(B, T, comm, /*full=*/false, nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -1628,7 +1675,7 @@ float GraphExecutor::validate(Tensor inputs,
         record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, nullptr);
+    execute_forward(B, T, comm, /*full=*/false, nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -1857,7 +1904,7 @@ void GraphExecutor::forward_with_hook(Tensor inputs,
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -1962,7 +2009,7 @@ float GraphExecutor::validate_with_hook(Tensor inputs,
         rs.configure_forward_graphs(/*hooked=*/true);
     }
 
-    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr);
+    execute_forward(B, T, comm, /*full=*/false, hook ? &hook : nullptr, micro_step);
 
     sync_event_if_not_capturing(rs.TransferDone, rs.MainStream);
     record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
@@ -2177,6 +2224,7 @@ void GraphExecutor::execute_logprobs_forward(long B,
     mCompiledExecutor->set_save_list(&empty_save_list);
 
     // Run forward with optional LoRA hook (nullptr = no LoRA = reference model).
+    mCompiledExecutor->set_current_micro_step(0);
     mCompiledExecutor->execute_forward(*mCompiledForward, comm, /*full=*/false, hook);
 
     // Copy results back to CPU.
@@ -2264,27 +2312,114 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs,
 // Document masking (Flash Attention varlen)
 // ============================================================================
 
-void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q) {
+void GraphExecutor::enable_doc_masking_pad_to_max(int max_num_docs, int num_micro_steps) {
+    if (max_num_docs <= 0 || num_micro_steps <= 0) return;
+    mDocMaskingPadMaxDocs = max_num_docs;
+    mDocMaskingPadMicroSteps = num_micro_steps;
+    // mCuSeqlensCpu is laid out as num_micro_steps slices, each of
+    // (max_num_docs+1) int32 entries. Each slice has a stable host
+    // address (no realloc once reserved), so captured H2D memcpys
+    // recording src=mCuSeqlensCpu.data()+slice_offset stay valid across
+    // replays.
+    const std::size_t slice_count = static_cast<std::size_t>(max_num_docs + 1);
+    const std::size_t total_count = static_cast<std::size_t>(num_micro_steps) * slice_count;
+    if (mCuSeqlensCpu.capacity() < total_count) {
+        mCuSeqlensCpu.reserve(total_count);
+    }
+    mCuSeqlensCpu.assign(total_count, 0);
+}
+
+void GraphExecutor::reissue_cu_seqlens_for_micro_step(int micro_step) {
+    if (mDocMaskingPadMaxDocs <= 0 || !mCuSeqlensGpu) return;
+    if (micro_step < 0 || micro_step >= mDocMaskingPadMicroSteps) return;
+    const std::size_t slice_count = static_cast<std::size_t>(mDocMaskingPadMaxDocs + 1);
+    const std::size_t slice_offset = static_cast<std::size_t>(micro_step) * slice_count;
+    if (slice_offset + slice_count > mCuSeqlensCpu.size()) return;
+    CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
+                               mCuSeqlensCpu.data() + slice_offset,
+                               slice_count * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               mRunState.MainStream));
+}
+
+void GraphExecutor::stage_cu_seqlens_for_micro_step(int micro_step,
+                                                    const std::int32_t* cu_seqlens_cpu,
+                                                    int count,
+                                                    int total_q) {
+    if (mDocMaskingPadMaxDocs <= 0) return;
+    if (micro_step < 0 || micro_step >= mDocMaskingPadMicroSteps) return;
+    const std::size_t slice_count = static_cast<std::size_t>(mDocMaskingPadMaxDocs + 1);
+    const std::size_t slice_offset = static_cast<std::size_t>(micro_step) * slice_count;
+    if (slice_offset + slice_count > mCuSeqlensCpu.size()) return;
+    // Copy actual cu_seqlens entries.
+    const int copy_count = std::min(count, mDocMaskingPadMaxDocs + 1);
+    for (int i = 0; i < copy_count; ++i) {
+        mCuSeqlensCpu[slice_offset + i] = cu_seqlens_cpu[i];
+    }
+    // Pad trailing slots with total_q so the kernel's per-doc seqlen
+    // computation yields 0 for empty docs (early-return in the kernel).
+    for (std::size_t i = static_cast<std::size_t>(copy_count); i < slice_count; ++i) {
+        mCuSeqlensCpu[slice_offset + i] = total_q;
+    }
+}
+
+void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu,
+                                    int num_docs,
+                                    int max_seqlen,
+                                    int total_q,
+                                    int micro_step) {
     const int count = num_docs + 1;
-    mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
+    // Reserve mCuSeqlensCpu to worst-case (total_q + 1 entries) up front so
+    // its data() pointer stays stable across subsequent calls. Under full-
+    // step CUDA graph capture the H2D memcpy below is recorded into the
+    // captured graph as a memcpy node with the host source pointer baked
+    // in; if mCuSeqlensCpu reallocates between capture and replay (or the
+    // memcpy uses the caller-supplied parameter, which is itself a
+    // transient std::vector::data() that's destroyed when set_doc_masking
+    // returns), the replay reads from freed/relocated memory and the
+    // captured graph crashes. Source the memcpy from the stable member
+    // buffer instead.
+    const bool pad_to_max = mDocMaskingPadMaxDocs > 0;
+    int memcpy_count = count;
+    int slice_offset = 0;
+    if (pad_to_max) {
+        const int padded_count = mDocMaskingPadMaxDocs + 1;
+        const int active_ms = std::clamp(micro_step, 0, mDocMaskingPadMicroSteps - 1);
+        slice_offset = active_ms * padded_count;
+        memcpy_count = padded_count;
+        // Stage actual cu_seqlens for this micro-step into its slice and
+        // pad trailing entries with total_q (empty doc slots). The kernel's
+        // actual_seqlen_q = cu_seqlens[bidb+1] - cu_seqlens[bidb] is 0
+        // for trailing slots, so the per-block early-return makes them
+        // no-ops. mCuSeqlensCpu is sized at enable time so the slice is
+        // always valid.
+        stage_cu_seqlens_for_micro_step(active_ms, cu_seqlens_cpu, count, total_q);
+    } else {
+        if (mCuSeqlensCpu.capacity() < static_cast<std::size_t>(total_q + 1)) {
+            mCuSeqlensCpu.reserve(static_cast<std::size_t>(total_q + 1));
+        }
+        mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
+    }
     if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
         if (env[0] == '1') {
-            std::cerr << "[cu_seqlens] gpu=" << mCuSeqlensGpu << " count=" << mCuSeqlensCount << " -> " << count
-                      << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q << "\n";
+            std::cerr << "[cu_seqlens] gpu=" << mCuSeqlensGpu << " count=" << mCuSeqlensCount << " -> " << memcpy_count
+                      << " num_docs=" << num_docs << " max_seqlen=" << max_seqlen << " total_q=" << total_q
+                      << " ms=" << micro_step << " pad=" << (pad_to_max ? 1 : 0) << " slice_off=" << slice_offset
+                      << " cpu_data=" << static_cast<void*>(mCuSeqlensCpu.data() + slice_offset) << "\n";
         }
     }
     // Grow-only GPU buffer. CUDA graph capture bakes mCuSeqlensGpu into
     // the attention kernel's args buffer; shrinking via cudaFree would
     // leave captured graphs pointing at freed memory, causing wrong-data
     // reads on replay (visible as 1e32 grad norms at gas>1 force-capture).
-    if (!mCuSeqlensGpu || mCuSeqlensCount < count) {
+    if (!mCuSeqlensGpu || mCuSeqlensCount < memcpy_count) {
         if (mCuSeqlensGpu) {
             CUDA_CHECK(cudaFree(mCuSeqlensGpu));
             mCuSeqlensGpu = nullptr;
         }
         // Allocate to worst-case so subsequent shrinks never re-alloc.
         // Worst case per-doc = 1 token → num_docs = total_q; count = total_q+1.
-        const int cap_count = std::max(count, total_q + 1);
+        const int cap_count = std::max(memcpy_count, total_q + 1);
         CUDA_CHECK(cudaMalloc(&mCuSeqlensGpu, static_cast<std::size_t>(cap_count) * sizeof(std::int32_t)));
         mCuSeqlensCount = cap_count;
         if (const char* env = std::getenv("SUROGATE_DEBUG_CU_SEQLENS")) {
@@ -2294,8 +2429,8 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
         }
     }
     CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensGpu,
-                               cu_seqlens_cpu,
-                               static_cast<std::size_t>(count) * sizeof(std::int32_t),
+                               mCuSeqlensCpu.data() + slice_offset,
+                               static_cast<std::size_t>(memcpy_count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice,
                                mRunState.MainStream));
     // Under full-step CUDA graph capture the flash-varlen kernel bakes
@@ -2319,7 +2454,17 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
     int effective_num_docs = num_docs;
     int effective_max_seqlen = max_seqlen;
     int effective_total_q = total_q;
-    if (force_full_capture) {
+    if (pad_to_max) {
+        // Cap-and-pad: lock the kernel-arg dims to worst case. The captured
+        // grid (num_m_block, params.b, params.h) is then independent of
+        // per-step doc topology — empty docs from padding become per-block
+        // no-ops via the kernel's `if (m_block * kBlockM >= actual_seqlen_q)
+        // return` guard. max_seqlen=total_q is the broadest single-doc
+        // bound (a single doc spanning all tokens).
+        effective_num_docs = mDocMaskingPadMaxDocs;
+        effective_max_seqlen = total_q;
+        effective_total_q = total_q;
+    } else if (force_full_capture) {
         // total_q itself is stable across steps (=B*T). num_docs and
         // max_seqlen vary per batch. For captured kernels we track
         // HIGH-WATER values and recapture when either grows past the

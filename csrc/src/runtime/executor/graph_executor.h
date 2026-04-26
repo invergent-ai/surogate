@@ -127,6 +127,12 @@ public:
         return false;
     }
 
+    /// Resize the bwd_cross_layer arena to fit prior eager-measured peak
+    /// usage before an outer capture session begins. Default is a no-op
+    /// for executors without a bwd_cross_layer arena.
+    virtual void prepare_bwd_cross_layer_for_capture() {
+    }
+
     // Optional LoRA state wiring (no-op for implementations that don't support it).
     virtual void set_lora_state(const modules::ModularLoRAConfig*,
                                 modules::ModularLoRAWeightsManager*,
@@ -154,10 +160,42 @@ public:
     }
 
     /// Document masking for packed sequences (Flash Attention varlen).
-    virtual void
-    set_doc_masking(const std::int32_t* /*cu_seqlens_cpu*/, int /*num_docs*/, int /*max_seqlen*/, int /*total_q*/) {
+    virtual void set_doc_masking(const std::int32_t* /*cu_seqlens_cpu*/,
+                                 int /*num_docs*/,
+                                 int /*max_seqlen*/,
+                                 int /*total_q*/,
+                                 int /*micro_step*/ = 0) {
     }
     virtual void clear_doc_masking() {
+    }
+
+    /// Cap-and-pad: enable padding mode for outer-capture safety. Once on,
+    /// set_doc_masking pads cu_seqlens to (max_num_docs+1) entries with
+    /// trailing total_q (empty doc slots) and forces effective_num_docs =
+    /// max_num_docs / max_seqlen = total_q so the captured kernel grid
+    /// and scalar args bake in worst-case dims. Per-ms cu_seqlens are kept
+    /// in distinct slices of mCuSeqlensCpu so each captured H2D memcpy
+    /// reads from a stable per-ms host address.
+    virtual void enable_doc_masking_pad_to_max(int /*max_num_docs*/, int /*num_micro_steps*/) {
+    }
+
+    /// Update a specific micro-step's cu_seqlens slice in the pinned host
+    /// buffer between cudaGraphLaunches. Pads to the (max_num_docs+1)
+    /// layout established by enable_doc_masking_pad_to_max.
+    virtual void stage_cu_seqlens_for_micro_step(int /*micro_step*/,
+                                                 const std::int32_t* /*cu_seqlens_cpu*/,
+                                                 int /*count*/,
+                                                 int /*total_q*/) {
+    }
+
+    /// Re-issue the cu_seqlens H2D memcpy for a specific micro-step. The
+    /// captured graph contains forward+backward sequences for all mss in
+    /// order; backward kernels for ms j run AFTER forward kernels for all
+    /// ms 0..micro_steps-1, so the GPU cu_seqlens buffer last holds the
+    /// final forward's data. Calling this before each ms's backward
+    /// re-loads its cu_seqlens into the GPU buffer so its kernels see the
+    /// correct topology.
+    virtual void reissue_cu_seqlens_for_micro_step(int /*micro_step*/) {
     }
 };
 
@@ -219,6 +257,12 @@ public:
     void set_internal_graphs_enabled(bool enabled) override;
     bool internal_graphs_enabled() const override;
     bool has_capture_unsafe_ops() const override;
+
+    /// Resize the bwd_cross_layer arena to fit the eager-measured high-water
+    /// mark before an outer-capture session begins. Must be called outside
+    /// any CUDA stream capture. No-op if the arena already fits or if no
+    /// backward has run yet (in which case the caller should warm up first).
+    void prepare_bwd_cross_layer_for_capture() override;
 
     size_t saved_buffers_total_bytes() const override;
     int saved_buffers_count() const override;
@@ -307,9 +351,21 @@ public:
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.
-    /// Copies to GPU and propagates to CompiledExecutor.
-    void set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q);
-    void clear_doc_masking();
+    /// Copies to GPU and propagates to CompiledExecutor. The micro_step
+    /// parameter selects a per-ms slice of mCuSeqlensCpu when pad-to-max
+    /// mode is enabled; defaults to 0 for non-capture paths.
+    void set_doc_masking(const std::int32_t* cu_seqlens_cpu,
+                         int num_docs,
+                         int max_seqlen,
+                         int total_q,
+                         int micro_step = 0) override;
+    void clear_doc_masking() override;
+    void enable_doc_masking_pad_to_max(int max_num_docs, int num_micro_steps) override;
+    void stage_cu_seqlens_for_micro_step(int micro_step,
+                                         const std::int32_t* cu_seqlens_cpu,
+                                         int count,
+                                         int total_q) override;
+    void reissue_cu_seqlens_for_micro_step(int micro_step) override;
     void set_inv_temperature_context(const float* inv_temperature_gpu);
 
     /// Destroy every CUDA-graph capture this executor owns (whole-graph,
@@ -377,6 +433,7 @@ private:
     const Tensor* get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
     void prime_fp8_weight_cache_transposed(const std::vector<char>& required);
     const Tensor* get_fp8_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
+    void prime_fp8_lm_head_cache(bool transposed);
 
     // FP4 weight cache helpers (for NVFP4 recipe on Blackwell+)
     void prime_fp4_weight_cache(const std::vector<char>& required);
@@ -401,6 +458,16 @@ private:
     int mDocMaskingTotalQ = 0;
     int mCapturedNumDocs = 0;    // high-water num_docs seen during capture (force-full-capture only)
     int mCapturedMaxSeqlen = 0;  // high-water max_seqlen seen during capture (force-full-capture only)
+    // Cap-and-pad mode for outer-capture safety. When mDocMaskingPadMaxDocs
+    // > 0, set_doc_masking pads cu_seqlens to (mDocMaskingPadMaxDocs+1)
+    // entries with trailing total_q (empty doc slots) and forces
+    // effective_num_docs / max_seqlen to fixed worst-case values so the
+    // captured kernel grid bakes in stable dims. mCuSeqlensCpu is sized to
+    // mDocMaskingPadMicroSteps * (mDocMaskingPadMaxDocs+1) so each ms has
+    // its own slice with a stable host source pointer for captured H2D
+    // memcpys.
+    int mDocMaskingPadMaxDocs = 0;
+    int mDocMaskingPadMicroSteps = 1;
 
     // Layer-to-weight-names map for prefetching
     std::vector<std::vector<std::string>> mLayerWeightNames;
@@ -462,7 +529,12 @@ private:
     /// SUROGATE_DEBUG_ACT_OFFSETS=1. Runs once per (B,T) recompile.
     void dump_simplified_activation_offsets();
 
-    void execute_forward(long B, long T, NCCLCommunicator& comm, bool full, const modules::ForwardHook* hook);
+    void execute_forward(long B,
+                         long T,
+                         NCCLCommunicator& comm,
+                         bool full,
+                         const modules::ForwardHook* hook,
+                         int micro_step);
     void execute_backward(long B,
                           long T,
                           NCCLCommunicator& comm,

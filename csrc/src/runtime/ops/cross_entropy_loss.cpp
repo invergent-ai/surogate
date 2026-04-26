@@ -62,6 +62,7 @@ void CompiledExecutor::dispatch_cross_entropy_loss(const CompiledOp& op) {
                                       V,
                                       P,
                                       n_chunks,
+                                      /*softcap=*/0.0f,
                                       mRunState.MainStream);
     } else {
         fused_cross_entropy_forward(logits,
@@ -73,6 +74,7 @@ void CompiledExecutor::dispatch_cross_entropy_loss(const CompiledOp& op) {
                                     BT,
                                     V,
                                     P,
+                                    /*softcap=*/0.0f,
                                     mRunState.MainStream);
     }
 }
@@ -107,9 +109,27 @@ void CompiledExecutor::dispatch_cross_entropy_loss_backward(const CompiledOp& op
     }
 
     if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
-        chunked_cross_entropy_backward(d_logits, logits, logsumexp, d_loss, targets, BT, V, P, mRunState.MainStream);
+        chunked_cross_entropy_backward(d_logits,
+                                       logits,
+                                       logsumexp,
+                                       d_loss,
+                                       targets,
+                                       BT,
+                                       V,
+                                       P,
+                                       0.0f,
+                                       mRunState.MainStream);
     } else {
-        fused_cross_entropy_backward(d_logits, logits, logsumexp, d_loss, targets, BT, V, P, mRunState.MainStream);
+        fused_cross_entropy_backward(d_logits,
+                                     logits,
+                                     logsumexp,
+                                     d_loss,
+                                     targets,
+                                     BT,
+                                     V,
+                                     P,
+                                     0.0f,
+                                     mRunState.MainStream);
     }
 }
 

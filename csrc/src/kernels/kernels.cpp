@@ -934,6 +934,7 @@ void fused_cross_entropy_forward(Tensor& logits,
                                  int BT,
                                  int V,
                                  int P,
+                                 float softcap,
                                  cudaStream_t stream) {
     float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     int* count_ptr = valid_token_count ? valid_token_count->get<int>() : nullptr;
@@ -948,6 +949,7 @@ void fused_cross_entropy_forward(Tensor& logits,
                                     BT,
                                     V,
                                     P,
+                                    softcap,
                                     stream);
     } else if (logits.DType == ETensorDType::BF16) {
         fused_cross_entropy_forward(logits.get<nv_bfloat16>(),
@@ -959,6 +961,7 @@ void fused_cross_entropy_forward(Tensor& logits,
                                     BT,
                                     V,
                                     P,
+                                    softcap,
                                     stream);
     } else {
         throw std::runtime_error("fused_cross_entropy_forward: unsupported dtype");
@@ -973,6 +976,7 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                   int BT,
                                   int V,
                                   int P,
+                                  float softcap,
                                   cudaStream_t stream) {
     const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     const float* dloss_ptr = dloss.get<float>();
@@ -985,6 +989,7 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                      BT,
                                      V,
                                      P,
+                                     softcap,
                                      stream);
     } else if (dlogits.DType == ETensorDType::BF16) {
         fused_cross_entropy_backward(dlogits.get<nv_bfloat16>(),
@@ -995,6 +1000,7 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                      BT,
                                      V,
                                      P,
+                                     softcap,
                                      stream);
     } else {
         throw std::runtime_error("fused_cross_entropy_backward: unsupported dtype");
@@ -1012,6 +1018,7 @@ void chunked_cross_entropy_forward(Tensor& logits,
                                    int V,
                                    int P,
                                    int n_chunks,
+                                   float softcap,
                                    cudaStream_t stream) {
     float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     if (!lse_ptr) {
@@ -1031,6 +1038,7 @@ void chunked_cross_entropy_forward(Tensor& logits,
                                       V,
                                       P,
                                       n_chunks,
+                                      softcap,
                                       stream);
     } else if (logits.DType == ETensorDType::BF16) {
         chunked_cross_entropy_forward(logits.get<nv_bfloat16>(),
@@ -1044,6 +1052,7 @@ void chunked_cross_entropy_forward(Tensor& logits,
                                       V,
                                       P,
                                       n_chunks,
+                                      softcap,
                                       stream);
     } else {
         throw std::runtime_error("chunked_cross_entropy_forward: unsupported dtype");
@@ -1058,6 +1067,7 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                     int BT,
                                     int V,
                                     int P,
+                                    float softcap,
                                     cudaStream_t stream) {
     const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     if (!lse_ptr) {
@@ -1073,6 +1083,7 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                        BT,
                                        V,
                                        P,
+                                       softcap,
                                        stream);
     } else if (dlogits.DType == ETensorDType::BF16) {
         chunked_cross_entropy_backward(dlogits.get<nv_bfloat16>(),
@@ -1083,6 +1094,7 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                        BT,
                                        V,
                                        P,
+                                       softcap,
                                        stream);
     } else {
         throw std::runtime_error("chunked_cross_entropy_backward: unsupported dtype");
@@ -2116,12 +2128,36 @@ void matmul_strided_c(Tensor& c,
                       bool accumulate,
                       int ldc,
                       cudaStream_t stream) {
+    const float alpha = 1.0f;
+    const float beta = accumulate ? 1.0f : 0.0f;
+    matmul_strided_c(c, a, b, bias, scale_a, scale_b, handle, workspace, M, N, K, mode, alpha, beta, ldc, stream);
+}
+
+void matmul_strided_c(Tensor& c,
+                      const Tensor& a,
+                      const Tensor& b,
+                      std::optional<Tensor> bias,
+                      const float* scale_a,
+                      const float* scale_b,
+                      cublasLtHandle_t handle,
+                      Tensor& workspace,
+                      int M,
+                      int N,
+                      int K,
+                      EMMTranspose mode,
+                      float alpha,
+                      float beta,
+                      int ldc,
+                      cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
     if (ldc <= 0) {
         throw std::logic_error("matmul_strided_c: invalid ldc");
     }
     if (c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
+        if (alpha != 1.0f || (beta != 0.0f && beta != 1.0f)) {
+            throw std::logic_error("matmul_strided_c: FP32 alpha/beta overload only supports alpha=1 and beta=0/1");
+        }
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
         matmul_strided_c(c.get<float>(),
                          a.get<float>(),
@@ -2136,7 +2172,7 @@ void matmul_strided_c(Tensor& c,
                          N,
                          K,
                          mode,
-                         accumulate,
+                         beta != 0.0f,
                          ldc,
                          stream);
     } else if (c.DType == ETensorDType::BF16 && a.DType == ETensorDType::BF16 && b.DType == ETensorDType::BF16) {
@@ -2154,7 +2190,8 @@ void matmul_strided_c(Tensor& c,
                          N,
                          K,
                          mode,
-                         accumulate,
+                         alpha,
+                         beta,
                          ldc,
                          stream);
     } else {

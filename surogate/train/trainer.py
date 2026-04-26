@@ -336,7 +336,12 @@ class SurogateTrainerWrapper:
                 logger.info(f"Copied {filename}")
 
     def train(self):
-        with training_logger_context(self.config) as train_logger:
+        runtime_config = {
+            "total_batch_size": self.total_batch_size,
+            "steps_per_epoch": self.steps_per_epoch,
+            "max_steps": self.max_steps,
+        }
+        with training_logger_context(self.config, extra_config=runtime_config) as train_logger:
             # Log dataset information
             if not self._train_vision and self.eval_loader:
                 train_logger.log_dataset(self.train_loader, self.eval_loader)
@@ -794,11 +799,10 @@ class SurogateTrainerWrapper:
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
                 if early_stopping is not None and early_stopping.check_eval(val_loss, step):
                     break
-                # Reload training batch after evaluation (eval leaves its last batch in the buffers)
-                if use_full_step_graphs:
-                    chunk = self.config.gpus * self.config.per_device_train_batch_size
-                    self.train_loader.load_batch(in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk])
-                else:
+                # Reload training batch after evaluation for the eager path.
+                # Full-step training loads every micro-batch below, so doing it
+                # here would silently consume and skip one train batch per eval.
+                if not use_full_step_graphs:
                     self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
 
             # Periodic checkpointing (before training step)
@@ -877,7 +881,13 @@ class SurogateTrainerWrapper:
                 # Optional LoRA gradient debug (before optimizer update)
                 self._maybe_log_lora_grad_stats(step)
                 result = self.trainer.update_with_config(opt_config, step + 1)
-            self._maybe_shrink_stack_after_warmup()
+            # Full-step CUDA graphs shrink internally after warmup and before
+            # capture, because the captured graph references absolute stack
+            # pointers. When full-step execution runs with CUDA graphs disabled
+            # (for example cpu_training/offload_master), it is still eager and
+            # can use the Python post-step shrink path.
+            if (not use_full_step_graphs) or (use_full_step_graphs and not self.config.use_cuda_graphs):
+                self._maybe_shrink_stack_after_warmup()
 
             # Build structured metrics for this step
             step_time = time.time() - step_start

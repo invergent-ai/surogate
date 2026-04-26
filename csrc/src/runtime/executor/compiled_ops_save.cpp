@@ -228,6 +228,20 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
     // When forward replay is active, ALL block tensors will be regenerated
     // by replay_layer_forward during backward — no persistent buffers needed.
     const bool forward_replay_active = recompute_enabled && static_cast<bool>(mRecomputeFn);
+    auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+        std::string h(haystack);
+        std::string n(needle);
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return h.find(n) != std::string::npos;
+    };
+    const bool is_qwen3_5_model =
+        contains_ci(mConfig.ModelTypeName, "qwen3_5") || contains_ci(mConfig.ModelTypeName, "qwen3.5") ||
+        contains_ci(mConfig.ArchitectureName, "qwen3_5") || contains_ci(mConfig.ArchitectureName, "qwen3.5");
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
         if (!recompute_enabled || !mSlotRegistry) {
@@ -238,6 +252,13 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             int layer_idx = -1;
             std::string field;
             if (parse_block_param(tensor_name, layer_idx, field)) {
+                if (is_qwen3_5_model) {
+                    const TensorSlot slot = builtin_slot_from_name(strip_ssa_suffix(field));
+                    if (slot == TensorSlot::BlockLN1 || slot == TensorSlot::BlockLN1RSTD ||
+                        slot == TensorSlot::BlockLN2 || slot == TensorSlot::BlockLN2RSTD) {
+                        return false;
+                    }
+                }
                 return true;
             }
         }
@@ -639,14 +660,15 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             const std::string base_field = strip_ssa_suffix(field);
             // When forward replay is active, ALL block tensors will be regenerated
             if (forward_replay_active) {
-                // Qwen3.5 replay drifts at LN1 if we drop the exact original normalized
-                // activation into metadata-only mode. Keep those tensors persistent so
-                // replay consumes the saved forward values instead of recomputing them.
-                // Dispatch via slot enum so any alias (`ln1_flat`, `ln`, `ln_flat`,
-                // `ln1_rstd`, `ln_rstd`) maps to the same decision in one place.
+                // Qwen3.5 replay drifts at RMSNorm boundaries if we drop the exact
+                // normalized activations into metadata-only mode. Keep those tensors
+                // persistent so replay consumes the saved forward values instead of
+                // recomputing them. Dispatch via slot enum so aliases map to the same
+                // decision in one place.
                 if (is_qwen3_5_model) {
                     const TensorSlot slot = builtin_slot_from_name(base_field);
-                    if (slot == TensorSlot::BlockLN1 || slot == TensorSlot::BlockLN1RSTD) {
+                    if (slot == TensorSlot::BlockLN1 || slot == TensorSlot::BlockLN1RSTD ||
+                        slot == TensorSlot::BlockLN2 || slot == TensorSlot::BlockLN2RSTD) {
                         return false;
                     }
                 }
@@ -774,8 +796,8 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (saved_it != mSaved->end()) {
             // Layer-end replay bookkeeping pre-seeds metadata-only entries for block tensors.
             // If this tensor should not remain metadata-only, refresh it now with live data.
-            const bool needs_refresh =
-                (saved_it->second.Data == nullptr) && (force_persist || force_persist_name || !prefer_live);
+            const bool needs_refresh = force_persist || force_lora_hook ||
+                                       ((saved_it->second.Data == nullptr) && (force_persist_name || !prefer_live));
             if (!needs_refresh) {
                 continue;
             }
@@ -1428,7 +1450,11 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // Check flat tensor vector first for cached/aliased tensors (e.g., view_backward aliases).
     // This is critical because view_backward stores aliases, and subsequent ops
     // (like rmsnorm_backward) must use that aliased tensor, not a fresh temp.
-    if (ref.slot != TensorSlot::Saved && tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
+    const bool parameter_may_move = mWeightManager &&
+                                    (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled()) &&
+                                    (ref.slot == TensorSlot::Parameter || mWeightManager->has(ref.name));
+    if (ref.slot != TensorSlot::Saved && !parameter_may_move && tid >= 0 &&
+        mTensors[static_cast<std::size_t>(tid)].Data) {
         log_tensor(mTensors[static_cast<std::size_t>(tid)], "cached");
         return mTensors[static_cast<std::size_t>(tid)];
     }

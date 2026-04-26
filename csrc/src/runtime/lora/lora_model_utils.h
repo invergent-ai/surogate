@@ -100,14 +100,6 @@ inline void apply_lora_contribution(Tensor& output,
                                                       is_training,
                                                       stream);
 
-    bool used_small_rank_kernel = false;
-    const bool enable_small_rank_kernel = (std::getenv("SUROGATE_ENABLE_LORA_SMALL_RANK") != nullptr);
-    if (enable_small_rank_kernel && prefer_explicit_add && intermediate.DType == ETensorDType::BF16 &&
-        input_mat.DType == ETensorDType::BF16 && lora.A.DType == ETensorDType::BF16) {
-        used_small_rank_kernel =
-            lora_project_small_rank_bf16(intermediate, lora.A, input_mat, BT, in_features, rank, stream);
-    }
-
     if (std::getenv("SUROGATE_DEBUG_LORA_GEMM")) {
         static int printed = 0;
         if (printed < 32) {
@@ -115,7 +107,7 @@ inline void apply_lora_contribution(Tensor& output,
             std::fprintf(stderr,
                          "[LORA-GEMM] out_ptr=%p out_dtype=%d A_ptr=%p A_dtype=%d B_ptr=%p B_dtype=%d inp_ptr=%p "
                          "inp_dtype=%d inter_ptr=%p inter_dtype=%d slice_ptr=%p rank=%d BT=%d in=%d out=%d out_off=%d "
-                         "total_out=%ld prefer=%d small_rank=%d transA_path=%d fp32_path=%d A_shape=[%ld,%ld] "
+                         "total_out=%ld prefer=%d transA_path=%d fp32_path=%d A_shape=[%ld,%ld] "
                          "A_rank=%d inp_shape=[%ld,%ld,%ld] inp_rank=%d inter_shape=[%ld,%ld] inter_rank=%d\n",
                          (void*)output.Data,
                          (int)output.DType,
@@ -135,7 +127,6 @@ inline void apply_lora_contribution(Tensor& output,
                          output_offset,
                          total_out_features,
                          (int)prefer_explicit_add,
-                         (int)used_small_rank_kernel,
                          (int)use_transposed_a_path,
                          (int)use_fp32_intermediate,
                          lora.A.Sizes[0],
@@ -151,9 +142,7 @@ inline void apply_lora_contribution(Tensor& output,
         }
     }
 
-    if (used_small_rank_kernel) {
-        // Done.
-    } else if (use_transposed_a_path) {
+    if (use_transposed_a_path) {
         // Equivalent computation with pre-transposed A to avoid problematic TN/BF16 kernels.
         Tensor a_t = slice_buffer;
         a_t.DType = ETensorDType::BF16;
@@ -252,6 +241,65 @@ inline void apply_lora_contribution(Tensor& output,
         return;
     }
 
+    Tensor output_slice = output;
+    output_slice.Data = output.Data + (std::size_t)output_offset * get_dtype_size(output.DType);
+    const bool aligned = ((uintptr_t)output_slice.Data % 16) == 0;
+
+    const bool enable_lora_b_small_rank_kernel = (std::getenv("SUROGATE_ENABLE_LORA_B_SMALL_RANK") != nullptr);
+    if (enable_lora_b_small_rank_kernel && prefer_explicit_add && fold_scaling_into_alpha &&
+        lora_accum_b_small_rank_bf16(output,
+                                     lora.B,
+                                     intermediate,
+                                     BT,
+                                     static_cast<int>(total_out_features),
+                                     out_features,
+                                     output_offset,
+                                     rank,
+                                     b_alpha,
+                                     stream)) {
+        return;
+    }
+
+    if (prefer_explicit_add && fold_scaling_into_alpha && rank == 16) {
+        if (output_offset == 0 && out_features == total_out_features) {
+            matmul(output,
+                   lora.B,
+                   intermediate,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   handle,
+                   workspace,
+                   out_features,
+                   BT,
+                   rank,
+                   EMMTranspose::TN,
+                   /*alpha=*/b_alpha,
+                   /*beta=*/1.0f,
+                   stream);
+            return;
+        }
+        if (aligned) {
+            matmul_strided_c(output_slice,
+                             lora.B,
+                             intermediate,
+                             std::nullopt,
+                             nullptr,
+                             nullptr,
+                             handle,
+                             workspace,
+                             out_features,
+                             BT,
+                             rank,
+                             EMMTranspose::TN,
+                             /*alpha=*/b_alpha,
+                             /*beta=*/1.0f,
+                             (int)total_out_features,
+                             stream);
+            return;
+        }
+    }
+
     const bool packed_delta_available =
         (slice_buffer.Data != nullptr && slice_buffer.DType == output.DType && slice_buffer.Rank >= 2 &&
          slice_buffer.Sizes[0] >= BT && slice_buffer.Sizes[1] >= out_features);
@@ -296,9 +344,6 @@ inline void apply_lora_contribution(Tensor& output,
     // Fused projections: prefer direct strided accumulate when aligned, else fall back to packed delta + add.
     // Some BF16 small-rank + large-output shapes (e.g. D=3584) are brittle with strided-C GEMM
     // on certain cuBLAS/cuBLASLt combinations; keep those on the packed-delta path.
-    Tensor output_slice = output;
-    output_slice.Data = output.Data + (std::size_t)output_offset * get_dtype_size(output.DType);
-    bool aligned = ((uintptr_t)output_slice.Data % 16) == 0;
     if (!prefer_explicit_add && aligned && out_features <= 2048) {
         matmul_strided_c(output_slice,
                          lora.B,
@@ -857,24 +902,14 @@ inline void backward_lora_layer(Tensor& dA,
                                                   dropout_seed,
                                                   is_training,
                                                   stream);
-
-    // Prefer the dedicated small-rank kernel for BF16 LoRA recompute. This avoids
-    // cuBLAS/cuBLASLt shape gaps seen on some rank-16 large-K paths.
-    bool used_small_rank_kernel = false;
-    const bool enable_small_rank_kernel = (std::getenv("SUROGATE_ENABLE_LORA_SMALL_RANK") != nullptr);
-    if (enable_small_rank_kernel && A.DType == ETensorDType::BF16 && x_mat.DType == ETensorDType::BF16 &&
-        intermediate.DType == ETensorDType::BF16 && rank > 0 && rank <= 64) {
-        used_small_rank_kernel = lora_project_small_rank_bf16(intermediate, A, x_mat, BT, in_features, rank, stream);
-    }
-
     if (std::getenv("SUROGATE_DEBUG_LORA_GEMM")) {
         static int printed_bwd = 0;
         if (printed_bwd < 32) {
             ++printed_bwd;
             std::fprintf(stderr,
-                         "[LORA-BWD] small_rank=%d use_transposed_a_path=%d rank=%d BT=%d in=%d out=%d A_dtype=%d "
+                         "[LORA-BWD] cached=%d use_transposed_a_path=%d rank=%d BT=%d in=%d out=%d A_dtype=%d "
                          "x_dtype=%d inter_dtype=%d\n",
-                         (int)used_small_rank_kernel,
+                         0,
                          (int)use_transposed_a_path,
                          rank,
                          BT,
@@ -886,9 +921,7 @@ inline void backward_lora_layer(Tensor& dA,
         }
     }
 
-    if (used_small_rank_kernel) {
-        // Done.
-    } else if (use_transposed_a_path) {
+    if (use_transposed_a_path) {
         const long required = static_cast<long>(in_features) * static_cast<long>(rank);
         if (slice_buffer.nelem() < required) {
             throw std::logic_error("backward_lora_layer: slice_buffer too small for transposed-A path");
@@ -938,7 +971,7 @@ inline void backward_lora_layer(Tensor& dA,
                       intermediate,
                       intermediate,
                       0.5f * scaling,
-                      intermediate.nelem(),
+                      static_cast<long>(BT) * static_cast<long>(rank),
                       /*seed=*/0,
                       stream);
     }
@@ -1491,7 +1524,6 @@ inline void backward_lora_mlp_up_gate_fused(
     const long full_features = dL_dy.Sizes[dL_dy.Rank - 1];
     const std::size_t elem_size = get_dtype_size(dL_dy.DType);
     const int ldb_stride = (int)full_features;  // leading dim override for strided dL_dy reads
-
     // Zero-copy dL_dy views (just pointer arithmetic, no memory copy)
     auto make_dL_dy_view = [&](int offset) -> Tensor {
         Tensor view = dL_dy;

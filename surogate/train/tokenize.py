@@ -373,10 +373,10 @@ def write_padded(
             tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
             mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
 
-        # Position IDs: 0..actual_len-1, then 0 for padding
+        # Keep padding monotonic so packed-boundary detection does not
+        # treat every padded token as a length-1 document.
         actual_len = min(doc["tokens"].size if hasattr(doc["tokens"], "size") else len(doc["tokens"]), seq_len)
-        pos_ids = np.zeros(seq_len, dtype=np.int32)
-        pos_ids[:actual_len] = np.arange(actual_len, dtype=np.int32)
+        pos_ids = np.arange(seq_len, dtype=np.int32)
 
         writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
 
@@ -852,8 +852,9 @@ class TokenizeDatasets(SurogateCommand):
                         tokens = np.pad(tokens, (0, p), constant_values=pad_token_id)
                         mask = np.pad(mask, (0, p), constant_values=0)
 
-                    pos_ids = np.zeros(seq_len, dtype=np.int32)
-                    pos_ids[:actual_len] = np.arange(actual_len, dtype=np.int32)
+                    # Keep padding monotonic so document-boundary detection
+                    # does not create one-token documents for every pad slot.
+                    pos_ids = np.arange(seq_len, dtype=np.int32)
                     writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
 
                 total_tokens += writer.n_tokens
