@@ -15,6 +15,7 @@
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/training/runtime_options.h"
 #include "utilities/comm.h"
@@ -28,11 +29,17 @@ namespace dsl {
 namespace {
 
 bool is_rope_param(const std::string& name) {
-    return name.find("rope_freqs") != std::string::npos;
+    const bool legacy_value = name.find("rope_freqs") != std::string::npos;
+    const bool role_value = tensor_role_is_rope_name(name);
+    tensor_role_parity_check(name, legacy_value, role_value, "DslWeightManager::is_rope_param");
+    return legacy_value;
 }
 
 bool is_router_param(const std::string& name) {
-    return name.find("router") != std::string::npos;
+    const bool legacy_value = name.find("router") != std::string::npos;
+    const bool role_value = infer_tensor_role_from_name(name).dist.kind == DistributionKind::RouterReplicated;
+    tensor_role_parity_check(name, legacy_value, role_value, "DslWeightManager::is_router_param");
+    return legacy_value;
 }
 
 std::string_view trim_optional(std::string_view name) {
