@@ -424,6 +424,7 @@ private:
     // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCacheT;  ///< Backward dinp (transposed layout)
+    std::unordered_map<std::string, MoEFP8WeightCacheEntry> mMoEFP8WeightCache;
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;   ///< Forward pass (normal layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;  ///< Backward dgrad (transposed layout)
 

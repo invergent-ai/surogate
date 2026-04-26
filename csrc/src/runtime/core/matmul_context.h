@@ -270,6 +270,13 @@ struct MoeMatmulContext {
     Tensor* dout_quant = nullptr;    ///< E5M2 quantized gradient buffer (backward)
     int delayed_quantizer_idx = -1;  ///< Quantizer index for delayed scaling (-1 = JIT)
 
+    // Optional executor-owned FP8 expert weight cache. The recipe writes these
+    // during forward and reuses them during backward dgrad/wgrad when valid.
+    Tensor* cached_moe_weights_e4m3 = nullptr;
+    Tensor* cached_moe_weight_amax = nullptr;
+    Tensor* cached_moe_weight_scales = nullptr;
+    bool* cached_moe_weights_initialized = nullptr;
+
     // =========================================================================
     // Dimensions
     // =========================================================================
@@ -286,8 +293,9 @@ struct MoeMatmulContext {
 
     IRunState* run_state = nullptr;  ///< Run state for temp buffer allocation
     cudnnHandle_t cudnn_handle = nullptr;
-    void* cublas_handle = nullptr;   ///< cublasLtHandle_t for FP8×FP8 matmul
-    std::byte* workspace = nullptr;  ///< cuDNN/cuBLAS workspace
+    void* cublas_handle = nullptr;    ///< cublasHandle_t for BF16 grouped GEMM fallback
+    void* cublaslt_handle = nullptr;  ///< cublasLtHandle_t for FP8×FP8 grouped GEMM
+    std::byte* workspace = nullptr;   ///< cuDNN/cuBLAS workspace
     std::size_t workspace_size = 0;
     cudaStream_t stream = nullptr;
 

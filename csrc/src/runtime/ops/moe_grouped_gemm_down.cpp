@@ -219,9 +219,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         ctx.total_tokens = static_cast<int>(total_tokens);
         ctx.run_state = &mRunState;
         ctx.cudnn_handle = mRunState.CudnnHandle;
+        ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.cublaslt_handle = mRunState.CublasLtHandle;
         ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
         ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
         ctx.stream = mRunState.MainStream;
+        attach_moe_fp8_cache(ctx, op.inputs[1].name);
         mRecipe->forward_moe_matmul(ctx);
     } else if (inp.DType == ETensorDType::BF16) {
         moe_grouped_gemm_down(out.get<nv_bfloat16>(),
@@ -682,8 +685,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     if (qlora_provider && qlora_provider->supports_selective_moe()) {
         const int* refresh_offsets = host_offsets_ptr;
         if (refresh_offsets) {
-            (void)
+            const bool refreshed =
                 refresh_moe_experts_if_needed(layer_idx, refresh_offsets, num_experts, mWeights, mRunState.MainStream);
+            if (refreshed) {
+                invalidate_moe_fp8_cache(op.inputs[2].name);
+            }
         }
     }
 
@@ -973,6 +979,21 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                             }
                         }
                         if (grad_output.DType == ETensorDType::BF16) {
+                            if (try_moe_fp8_weight_grad(d_weight_view,
+                                                        grad_output,
+                                                        in,
+                                                        expert_offsets_ptr,
+                                                        num_experts,
+                                                        M,
+                                                        N,
+                                                        lora_host_offsets_ptr,
+                                                        lora_active_ptr,
+                                                        lora_weight_is_compact,
+                                                        lora_num_active,
+                                                        beta,
+                                                        "moe_grouped_gemm_down_lora")) {
+                                return;
+                            }
                             if (d_weight_view.DType != ETensorDType::BF16) {
                                 throw std::runtime_error(
                                     "MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "

@@ -190,8 +190,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     // Refresh MoE expert weights for this layer using the current routing offsets.
     auto* qlora_provider = mWeights.qlora_provider();
     if (host_offsets_ptr && layer_idx_any >= 0 && qlora_provider && qlora_provider->supports_selective_moe()) {
-        (void)
+        const bool refreshed =
             refresh_moe_experts_if_needed(layer_idx_any, host_offsets_ptr, num_experts, mWeights, mRunState.MainStream);
+        if (refreshed) {
+            invalidate_moe_fp8_cache(op.inputs[1].name);
+        }
     }
 
     MoeCompactInfo compact = host_offsets_ptr ? build_moe_compact_info_from_host(host_offsets_ptr,
@@ -236,6 +239,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         ctx.run_state = &mRunState;
         ctx.cudnn_handle = mRunState.CudnnHandle;
         ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.cublaslt_handle = mRunState.CublasLtHandle;
         ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
         ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
         ctx.stream = mRunState.MainStream;
@@ -244,6 +248,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         ctx.num_active = num_active;
         ctx.weight_is_compact = weight_is_compact;
         ctx.allow_fp8 = op.attrs.allow_quant;
+        attach_moe_fp8_cache(ctx, op.inputs[1].name);
 
         // Allocate FP8 buffers if using FP8 hybrid recipe
         Tensor inp_quant_buf, inp_stats_buf;
@@ -699,11 +704,14 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     if (qlora_provider && qlora_provider->supports_selective_moe()) {
         const int* refresh_offsets = host_offsets_ptr;
         if (refresh_offsets) {
-            (void)refresh_moe_experts_if_needed(layer_idx_any,
-                                                refresh_offsets,
-                                                num_experts,
-                                                mWeights,
-                                                mRunState.MainStream);
+            const bool refreshed = refresh_moe_experts_if_needed(layer_idx_any,
+                                                                 refresh_offsets,
+                                                                 num_experts,
+                                                                 mWeights,
+                                                                 mRunState.MainStream);
+            if (refreshed) {
+                invalidate_moe_fp8_cache(op.inputs[2].name);
+            }
         }
     }
 
@@ -731,6 +739,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         ctx.layer_idx = layer_idx_any;
         ctx.run_state = &mRunState;
         ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.cublaslt_handle = mRunState.CublasLtHandle;
         ctx.stream = mRunState.MainStream;
         ctx.host_offsets = host_offsets_ptr;
         ctx.active_experts = active_ptr;
@@ -738,9 +747,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         ctx.weight_is_compact = weight_is_compact;
         ctx.skip_weight_grad = false;
         ctx.allow_fp8 = op.attrs.allow_quant;
+        attach_moe_fp8_cache(ctx, op.inputs[2].name);
 
         // Allocate FP8 buffers if using FP8 hybrid recipe
-        Tensor dout_quant_buf, dout_stats_buf;
+        Tensor dout_quant_buf, dout_stats_buf, inp_quant_buf, inp_stats_buf;
         if (mRecipe->is_fp8_hybrid() && ctx.allow_fp8) {
             const long num_elements = total_tokens * out_features;
             dout_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
@@ -752,6 +762,15 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             ctx.dout_quant = &dout_quant_buf;
             mTemps.push_back(dout_quant_buf);
             mTemps.push_back(dout_stats_buf);
+
+            inp_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E4M3,
+                                                 {total_tokens, static_cast<long>(in_features)},
+                                                 "moe_grouped_gemm_bwd_inp_quant_buf");
+            inp_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_grouped_gemm_bwd_inp_stats_buf");
+            inp_quant_buf.Stats = inp_stats_buf.get<float>();
+            ctx.inp_quant = &inp_quant_buf;
+            mTemps.push_back(inp_quant_buf);
+            mTemps.push_back(inp_stats_buf);
         }
 
         mRecipe->backward_moe_matmul(ctx);
@@ -960,6 +979,21 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                             lora_num_active = fallback_count;
                         }
                         if (grad_output.DType == ETensorDType::BF16) {
+                            if (try_moe_fp8_weight_grad(d_weight_view,
+                                                        grad_output,
+                                                        in,
+                                                        expert_offsets_data,
+                                                        num_experts,
+                                                        M,
+                                                        N,
+                                                        host_offsets_ptr,
+                                                        lora_active_ptr,
+                                                        lora_weight_is_compact,
+                                                        lora_num_active,
+                                                        beta,
+                                                        "moe_grouped_gemm_lora")) {
+                                return;
+                            }
                             if (d_weight_view.DType != ETensorDType::BF16) {
                                 throw std::runtime_error(
                                     "MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "

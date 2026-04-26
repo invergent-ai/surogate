@@ -658,6 +658,7 @@ void GraphExecutor::init_compiled_execution() {
     });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
     mCompiledExecutor->set_fp8_cache_transposed(&mFP8WeightCacheT);
+    mCompiledExecutor->set_moe_fp8_cache(&mMoEFP8WeightCache);
     mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
     mCompiledExecutor->set_saved_tensors(&mSaved);
     mCompiledExecutor->set_save_list(&mSaveList);

@@ -1826,3 +1826,38 @@ void matmul(nv_bfloat16* c,
                     alpha,
                     beta);
 }
+
+void matmul(nv_bfloat16* c,
+            const __nv_fp8_e5m2* a,
+            const __nv_fp8_e4m3* b,
+            const nv_bfloat16* bias,
+            const float* scale_a,
+            const float* scale_b,
+            cublasLtHandle_t handle,
+            std::byte* workspace,
+            std::size_t workspace_size,
+            int M,
+            int N,
+            int K,
+            EMMTranspose mode,
+            bool accumulate,
+            cudaStream_t stream) {
+    float alpha = 1.0f;
+    float beta = accumulate ? 1.0f : 0.0f;
+    matmul_cublaslt(c,
+                    a,
+                    b,
+                    bias,
+                    workspace,
+                    workspace_size,
+                    M,
+                    N,
+                    K,
+                    stream,
+                    handle,
+                    scale_a,
+                    scale_b,
+                    mode,
+                    alpha,
+                    beta);
+}

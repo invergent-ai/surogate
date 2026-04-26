@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdlib>
+#include <stdexcept>
 #include <cub/cub.cuh>
 #include <cublas_v2.h>
 #include <cfloat>
@@ -2539,6 +2540,66 @@ void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight,
                                       active_expert_indices,
                                       weight_is_compact,
                                       num_active_experts);
+}
+
+void moe_grouped_gemm_weight_grad_fp8(nv_bfloat16* d_weight,
+                                      const __nv_fp8_e5m2* grad_output,
+                                      const __nv_fp8_e4m3* input,
+                                      const float* grad_output_scale,
+                                      const float* input_scale,
+                                      const int* expert_offsets,
+                                      int num_experts,
+                                      int M,
+                                      int N,
+                                      cublasLtHandle_t cublas_handle,
+                                      cudaStream_t stream,
+                                      const int* host_offsets,
+                                      float alpha,
+                                      float beta,
+                                      const int* active_expert_indices,
+                                      bool weight_is_compact,
+                                      int num_active_experts) {
+    if (!host_offsets) {
+        throw std::runtime_error("moe_grouped_gemm_weight_grad_fp8 requires host_offsets for month-one guarded path");
+    }
+    if (alpha != 1.0f) {
+        throw std::runtime_error("moe_grouped_gemm_weight_grad_fp8 currently supports alpha=1 only");
+    }
+
+    const int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
+    for (int e = 0; e < n_active; ++e) {
+        const int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        if (global_idx < 0 || global_idx >= num_experts) {
+            throw std::runtime_error("moe_grouped_gemm_weight_grad_fp8: active expert index out of range");
+        }
+        const int tokens_e = host_offsets[global_idx + 1] - host_offsets[global_idx];
+        if (tokens_e <= 0) {
+            continue;
+        }
+
+        const int weight_idx = weight_is_compact ? e : global_idx;
+        nv_bfloat16* d_weight_e = d_weight + static_cast<long>(weight_idx) * M * N;
+        const __nv_fp8_e5m2* grad_e = grad_output + static_cast<long>(host_offsets[global_idx]) * M;
+        const __nv_fp8_e4m3* input_e = input + static_cast<long>(host_offsets[global_idx]) * N;
+
+        // Existing BF16 path computes row-major dW(M,N) with column-major
+        // cuBLAS as C(M,N) = grad_output(M,tokens) @ input(tokens,N).
+        matmul(d_weight_e,
+               grad_e,
+               input_e,
+               static_cast<nv_bfloat16*>(nullptr),
+               grad_output_scale,
+               input_scale,
+               cublas_handle,
+               nullptr,
+               0,
+               M,
+               N,
+               tokens_e,
+               EMMTranspose::NT,
+               beta != 0.0f,
+               stream);
+    }
 }
 
 template <typename T>

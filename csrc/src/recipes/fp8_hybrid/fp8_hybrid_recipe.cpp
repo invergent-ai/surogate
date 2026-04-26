@@ -6,6 +6,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
 
 #include "runtime/core/fp8_scaling_config.h"  // QuantizerIndex
 #include "runtime/core/fp8_scaling_state.h"   // FP8ScalingState (must be before runtime/training/model.h)
@@ -13,6 +16,49 @@
 #include "runtime/training/model.h"
 
 namespace recipes {
+namespace {
+
+bool fp8_moe_wgrad_enabled() {
+    const char* env = std::getenv("SUROGATE_FP8_MOE_WGRAD");
+    return env && std::string_view(env) != "0";
+}
+
+bool has_moe_fp8_weight_cache(const modules::MoeMatmulContext& ctx) {
+    return ctx.cached_moe_weights_e4m3 && ctx.cached_moe_weights_e4m3->Data && ctx.cached_moe_weight_amax &&
+           ctx.cached_moe_weight_amax->Data && ctx.cached_moe_weight_scales && ctx.cached_moe_weight_scales->Data &&
+           ctx.cached_moe_weights_initialized;
+}
+
+cublasLtHandle_t moe_cublaslt_handle(const modules::MoeMatmulContext& ctx) {
+    return reinterpret_cast<cublasLtHandle_t>(ctx.cublaslt_handle ? ctx.cublaslt_handle : ctx.cublas_handle);
+}
+
+void ensure_moe_fp8_weight_cache(modules::MoeMatmulContext& ctx, IRunState& rs) {
+    if (!has_moe_fp8_weight_cache(ctx) || *ctx.cached_moe_weights_initialized) {
+        return;
+    }
+    Tensor& weights_e4m3 = *ctx.cached_moe_weights_e4m3;
+    Tensor& weight_amax = *ctx.cached_moe_weight_amax;
+    Tensor& weight_scales = *ctx.cached_moe_weight_scales;
+    for (int e = 0; e < ctx.num_experts; ++e) {
+        const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
+        __nv_fp8_e4m3* weight_fp8_e = weights_e4m3.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
+        float* abs_max_e = weight_amax.get<float>() + e;
+        float* scale_e = weight_scales.get<float>() + e;
+
+        abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+        quantize_with_abs_max(weight_fp8_e,
+                              scale_e,
+                              weight_e,
+                              abs_max_e,
+                              static_cast<long>(ctx.N) * ctx.K,
+                              rs.DeviceProp,
+                              ctx.stream);
+    }
+    *ctx.cached_moe_weights_initialized = true;
+}
+
+}  // namespace
 
 void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     // FP8 forward matmul with delayed scaling support
@@ -652,25 +698,36 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
                                   ctx.stream);
         }
 
-        // Step 2: Quantize expert weights to FP8 E4M3 (per-expert quantization)
-        Tensor weights_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_fp8");
-        Tensor weight_amax = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_amax");
-        Tensor weight_scales = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_scales");
+        // Step 2: Quantize expert weights to FP8 E4M3 (per-expert quantization).
+        ensure_moe_fp8_weight_cache(ctx, rs);
+        Tensor weights_fp8{};
+        Tensor weight_amax{};
+        Tensor weight_scales{};
+        bool using_cache = false;
+        if (has_moe_fp8_weight_cache(ctx) && *ctx.cached_moe_weights_initialized) {
+            weights_fp8 = *ctx.cached_moe_weights_e4m3;
+            weight_scales = *ctx.cached_moe_weight_scales;
+            using_cache = true;
+        } else {
+            weights_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_fp8");
+            weight_amax = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_amax");
+            weight_scales = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_scales");
 
-        for (int e = 0; e < ctx.num_experts; ++e) {
-            const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
-            __nv_fp8_e4m3* weight_fp8_e = weights_fp8.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
-            float* abs_max_e = weight_amax.get<float>() + e;
-            float* scale_e = weight_scales.get<float>() + e;
+            for (int e = 0; e < ctx.num_experts; ++e) {
+                const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
+                __nv_fp8_e4m3* weight_fp8_e = weights_fp8.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
+                float* abs_max_e = weight_amax.get<float>() + e;
+                float* scale_e = weight_scales.get<float>() + e;
 
-            abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
-            quantize_with_abs_max(weight_fp8_e,
-                                  scale_e,
-                                  weight_e,
-                                  abs_max_e,
-                                  static_cast<long>(ctx.N) * ctx.K,
-                                  rs.DeviceProp,
-                                  ctx.stream);
+                abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+                quantize_with_abs_max(weight_fp8_e,
+                                      scale_e,
+                                      weight_e,
+                                      abs_max_e,
+                                      static_cast<long>(ctx.N) * ctx.K,
+                                      rs.DeviceProp,
+                                      ctx.stream);
+            }
         }
 
         // Step 3: FP8×FP8 MoE grouped GEMM
@@ -683,7 +740,7 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
                          ctx.num_experts,
                          ctx.N,
                          ctx.K,
-                         reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle),
+                         moe_cublaslt_handle(ctx),
                          ctx.stream,
                          ctx.host_offsets,
                          1.0f,
@@ -693,9 +750,11 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
                          ctx.weight_is_compact,
                          ctx.num_active);
 
-        rs.temp_free(weight_scales);
-        rs.temp_free(weight_amax);
-        rs.temp_free(weights_fp8);
+        if (!using_cache) {
+            rs.temp_free(weight_scales);
+            rs.temp_free(weight_amax);
+            rs.temp_free(weights_fp8);
+        }
         return;  // Success - FP8 path completed
     }
 
@@ -757,25 +816,36 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
                               rs.DeviceProp,
                               ctx.stream);
 
-        // Step 2: Quantize expert weights to E4M3
-        Tensor weights_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_e4m3");
-        Tensor weight_amax = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_amax");
-        Tensor weight_scales = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_scales");
+        // Step 2: Quantize expert weights to E4M3, preferring the forward-filled cache.
+        ensure_moe_fp8_weight_cache(ctx, rs);
+        Tensor weights_e4m3{};
+        Tensor weight_amax{};
+        Tensor weight_scales{};
+        bool using_cache = false;
+        if (has_moe_fp8_weight_cache(ctx) && *ctx.cached_moe_weights_initialized) {
+            weights_e4m3 = *ctx.cached_moe_weights_e4m3;
+            weight_scales = *ctx.cached_moe_weight_scales;
+            using_cache = true;
+        } else {
+            weights_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_e4m3");
+            weight_amax = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_amax");
+            weight_scales = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts}, "weight_scales");
 
-        for (int e = 0; e < ctx.num_experts; ++e) {
-            const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
-            __nv_fp8_e4m3* weight_fp8_e = weights_e4m3.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
-            float* abs_max_e = weight_amax.get<float>() + e;
-            float* scale_e = weight_scales.get<float>() + e;
+            for (int e = 0; e < ctx.num_experts; ++e) {
+                const nv_bfloat16* weight_e = ctx.weights + e * ctx.N * ctx.K;
+                __nv_fp8_e4m3* weight_fp8_e = weights_e4m3.get<__nv_fp8_e4m3>() + e * ctx.N * ctx.K;
+                float* abs_max_e = weight_amax.get<float>() + e;
+                float* scale_e = weight_scales.get<float>() + e;
 
-            abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
-            quantize_with_abs_max(weight_fp8_e,
-                                  scale_e,
-                                  weight_e,
-                                  abs_max_e,
-                                  static_cast<long>(ctx.N) * ctx.K,
-                                  rs.DeviceProp,
-                                  ctx.stream);
+                abs_max(abs_max_e, weight_e, static_cast<long>(ctx.N) * ctx.K, rs.DeviceProp, ctx.stream);
+                quantize_with_abs_max(weight_fp8_e,
+                                      scale_e,
+                                      weight_e,
+                                      abs_max_e,
+                                      static_cast<long>(ctx.N) * ctx.K,
+                                      rs.DeviceProp,
+                                      ctx.stream);
+            }
         }
 
         // Step 3: FP8 backward GEMM (E4M3 weights × E5M2 gradients → BF16 dinp)
@@ -788,16 +858,80 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
                                      ctx.num_experts,
                                      ctx.K,
                                      ctx.N,
-                                     reinterpret_cast<cublasLtHandle_t>(ctx.cublas_handle),
+                                     moe_cublaslt_handle(ctx),
                                      ctx.stream,
                                      ctx.host_offsets,
                                      ctx.active_experts,
                                      ctx.weight_is_compact,
                                      ctx.num_active);
 
-        rs.temp_free(weight_scales);
-        rs.temp_free(weight_amax);
-        rs.temp_free(weights_e4m3);
+        if (ctx.dweight && ctx.inp_quant && ctx.inp_quant->Data && fp8_moe_wgrad_enabled()) {
+            try {
+                Tensor inp_bf16{};
+                inp_bf16.Data = reinterpret_cast<std::byte*>(const_cast<nv_bfloat16*>(ctx.inp));
+                inp_bf16.DType = ETensorDType::BF16;
+                inp_bf16.Rank = 2;
+                inp_bf16.Sizes[0] = ctx.total_tokens;
+                inp_bf16.Sizes[1] = ctx.K;
+                if (!ctx.inp_quant->abs_max() || !ctx.inp_quant->scale()) {
+                    throw std::runtime_error("FP8 MoE wgrad input quant buffer missing abs_max/scale");
+                }
+                abs_max(ctx.inp_quant->abs_max(),
+                        inp_bf16,
+                        static_cast<long>(ctx.total_tokens) * ctx.K,
+                        rs.DeviceProp,
+                        ctx.stream);
+                quantize_with_abs_max(*ctx.inp_quant,
+                                      ctx.inp_quant->scale(),
+                                      inp_bf16,
+                                      ctx.inp_quant->abs_max(),
+                                      static_cast<long>(ctx.total_tokens) * ctx.K,
+                                      rs.DeviceProp,
+                                      ctx.stream);
+                moe_grouped_gemm_weight_grad_fp8(ctx.dweight,
+                                                 dout_e5m2.get<__nv_fp8_e5m2>(),
+                                                 ctx.inp_quant->get<__nv_fp8_e4m3>(),
+                                                 dout_e5m2.scale(),
+                                                 ctx.inp_quant->scale(),
+                                                 ctx.expert_offsets,
+                                                 ctx.num_experts,
+                                                 ctx.N,
+                                                 ctx.K,
+                                                 moe_cublaslt_handle(ctx),
+                                                 ctx.stream,
+                                                 ctx.host_offsets,
+                                                 1.0f,
+                                                 0.0f,
+                                                 ctx.active_experts,
+                                                 ctx.weight_is_compact,
+                                                 ctx.num_active);
+            } catch (const std::exception& e) {
+                if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
+                    std::fprintf(stderr, "[FP8 MoE wgrad] fallback: %s\n", e.what());
+                }
+                moe_grouped_gemm_weight_grad(ctx.dweight,
+                                             ctx.dout,
+                                             ctx.inp,
+                                             ctx.expert_offsets,
+                                             ctx.num_experts,
+                                             ctx.N,
+                                             ctx.K,
+                                             reinterpret_cast<cublasHandle_t>(ctx.cublas_handle),
+                                             ctx.stream,
+                                             ctx.host_offsets,
+                                             1.0f,
+                                             0.0f,
+                                             ctx.active_experts,
+                                             ctx.weight_is_compact,
+                                             ctx.num_active);
+            }
+        }
+
+        if (!using_cache) {
+            rs.temp_free(weight_scales);
+            rs.temp_free(weight_amax);
+            rs.temp_free(weights_e4m3);
+        }
         return;  // Success - FP8 backward completed
     }
 

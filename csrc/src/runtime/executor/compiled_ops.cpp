@@ -19,6 +19,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -714,6 +715,10 @@ void CompiledExecutor::set_fp8_cache_transposed(std::unordered_map<std::string, 
     mFP8CacheT = cache_t;
 }
 
+void CompiledExecutor::set_moe_fp8_cache(std::unordered_map<std::string, MoEFP8WeightCacheEntry>* cache) {
+    mMoEFP8Cache = cache;
+}
+
 void CompiledExecutor::set_fp4_cache(std::unordered_map<std::string, FP4WeightCacheEntry>* cache,
                                      std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t) {
     mFP4Cache = cache;
@@ -729,6 +734,137 @@ void CompiledExecutor::set_save_list(const std::vector<std::string>* save_list) 
     mSaveSet.clear();
     if (save_list) {
         mSaveSet.insert(save_list->begin(), save_list->end());
+    }
+}
+
+void CompiledExecutor::attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, const std::string& weight_name) {
+    const char* env = std::getenv("SUROGATE_FP8_MOE_WGRAD");
+    if (!env || std::string_view(env) == "0" || !mMoEFP8Cache || weight_name.empty() || ctx.num_experts <= 0 ||
+        ctx.N <= 0 || ctx.K <= 0) {
+        return;
+    }
+    auto it = mMoEFP8Cache->find(weight_name);
+    if (it == mMoEFP8Cache->end()) {
+        MoEFP8WeightCacheEntry entry{};
+        entry.weights_e4m3 = mRunState.Allocator->allocate(ETensorDType::FP8_E4M3,
+                                                           ("fp8_moe_cache_" + weight_name).c_str(),
+                                                           EAllocationType::ON_DEVICE,
+                                                           {ctx.num_experts, ctx.N, ctx.K});
+        entry.weight_amax = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                          ("fp8_moe_cache_" + weight_name + "_amax").c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          {ctx.num_experts});
+        entry.weight_scales = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                            ("fp8_moe_cache_" + weight_name + "_scales").c_str(),
+                                                            EAllocationType::ON_DEVICE,
+                                                            {ctx.num_experts});
+        auto [insert_it, _] = mMoEFP8Cache->emplace(weight_name, std::move(entry));
+        it = insert_it;
+    }
+    ctx.cached_moe_weights_e4m3 = &it->second.weights_e4m3;
+    ctx.cached_moe_weight_amax = &it->second.weight_amax;
+    ctx.cached_moe_weight_scales = &it->second.weight_scales;
+    ctx.cached_moe_weights_initialized = &it->second.initialized;
+}
+
+void CompiledExecutor::invalidate_moe_fp8_cache(const std::string& weight_name) {
+    if (!mMoEFP8Cache || weight_name.empty()) {
+        return;
+    }
+    auto it = mMoEFP8Cache->find(weight_name);
+    if (it != mMoEFP8Cache->end()) {
+        it->second.initialized = false;
+    }
+}
+
+bool CompiledExecutor::try_moe_fp8_weight_grad(Tensor& d_weight,
+                                               const Tensor& grad_output,
+                                               const Tensor& input,
+                                               const int* expert_offsets,
+                                               int num_experts,
+                                               int M,
+                                               int N,
+                                               const int* host_offsets,
+                                               const int* active_experts,
+                                               bool weight_is_compact,
+                                               int num_active,
+                                               float beta,
+                                               const char* debug_tag) {
+    const char* env = std::getenv("SUROGATE_FP8_MOE_WGRAD");
+    if (!env || std::string_view(env) == "0") {
+        return false;
+    }
+    if (grad_output.DType != ETensorDType::BF16 || input.DType != ETensorDType::BF16 ||
+        d_weight.DType != ETensorDType::BF16 || !expert_offsets || !host_offsets || !mRunState.CublasLtHandle ||
+        num_experts <= 0 || M <= 0 || N <= 0 || grad_output.Rank < 2 || input.Rank < 2 ||
+        grad_output.Sizes[0] != input.Sizes[0] || grad_output.Sizes[1] != M || input.Sizes[1] != N ||
+        (beta != 0.0f && beta != 1.0f)) {
+        return false;
+    }
+
+    const long total_tokens = grad_output.Sizes[0];
+    try {
+        Tensor grad_e5m2 =
+            mRunState.temp_alloc(ETensorDType::FP8_E5M2, {total_tokens, static_cast<long>(M)}, "moe_wgrad_dout_e5m2");
+        Tensor grad_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_wgrad_dout_stats");
+        grad_e5m2.Stats = grad_stats.get<float>();
+        Tensor input_e4m3 =
+            mRunState.temp_alloc(ETensorDType::FP8_E4M3, {total_tokens, static_cast<long>(N)}, "moe_wgrad_input_e4m3");
+        Tensor input_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_wgrad_input_stats");
+        input_e4m3.Stats = input_stats.get<float>();
+        mTemps.push_back(grad_e5m2);
+        mTemps.push_back(grad_stats);
+        mTemps.push_back(input_e4m3);
+        mTemps.push_back(input_stats);
+
+        abs_max(grad_e5m2.abs_max(),
+                grad_output.get<nv_bfloat16>(),
+                total_tokens * static_cast<long>(M),
+                mRunState.DeviceProp,
+                mRunState.MainStream);
+        quantize_with_abs_max(grad_e5m2,
+                              grad_e5m2.scale(),
+                              grad_output,
+                              grad_e5m2.abs_max(),
+                              total_tokens * static_cast<long>(M),
+                              mRunState.DeviceProp,
+                              mRunState.MainStream);
+        abs_max(input_e4m3.abs_max(),
+                input.get<nv_bfloat16>(),
+                total_tokens * static_cast<long>(N),
+                mRunState.DeviceProp,
+                mRunState.MainStream);
+        quantize_with_abs_max(input_e4m3,
+                              input_e4m3.scale(),
+                              input,
+                              input_e4m3.abs_max(),
+                              total_tokens * static_cast<long>(N),
+                              mRunState.DeviceProp,
+                              mRunState.MainStream);
+
+        moe_grouped_gemm_weight_grad_fp8(d_weight.get<nv_bfloat16>(),
+                                         grad_e5m2.get<__nv_fp8_e5m2>(),
+                                         input_e4m3.get<__nv_fp8_e4m3>(),
+                                         grad_e5m2.scale(),
+                                         input_e4m3.scale(),
+                                         expert_offsets,
+                                         num_experts,
+                                         M,
+                                         N,
+                                         mRunState.CublasLtHandle,
+                                         mRunState.MainStream,
+                                         host_offsets,
+                                         1.0f,
+                                         beta,
+                                         active_experts,
+                                         weight_is_compact,
+                                         num_active);
+        return true;
+    } catch (const std::exception& e) {
+        if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
+            std::fprintf(stderr, "[FP8 MoE wgrad] fallback in %s: %s\n", debug_tag ? debug_tag : "unknown", e.what());
+        }
+        return false;
     }
 }
 
