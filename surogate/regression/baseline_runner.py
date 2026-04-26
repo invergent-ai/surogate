@@ -467,10 +467,32 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def select_cases(case_filters: list[str] | None = None) -> tuple[RegressionCase, ...]:
+    if not case_filters:
+        return FIRST_MONTH_MATRIX
+    selected: list[RegressionCase] = []
+    requested = set(case_filters)
+    matched: set[str] = set()
+    for case in FIRST_MONTH_MATRIX:
+        if case.case_id in requested or case.model in requested:
+            selected.append(case)
+            if case.case_id in requested:
+                matched.add(case.case_id)
+            if case.model in requested:
+                matched.add(case.model)
+    missing = requested - matched
+    if missing:
+        raise SystemExit(f"unknown regression case filter(s): {', '.join(sorted(missing))}")
+    return tuple(selected)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=BASELINE_DIR / "current")
     parser.add_argument("--baseline", type=Path, default=BASELINE_DIR / "locked")
+    parser.add_argument(
+        "--case", action="append", dest="case_filters", help="Run one case_id or all rows for one model"
+    )
     parser.add_argument("--run", action="store_true", help="Launch configured GPU workloads")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--update-baseline", action="store_true")
@@ -478,7 +500,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", action="store_true")
     args = parser.parse_args(argv)
 
-    results = [run_case(case, run=args.run, steps=args.steps, artifact_dir=args.out) for case in FIRST_MONTH_MATRIX]
+    results = [
+        run_case(case, run=args.run, steps=args.steps, artifact_dir=args.out)
+        for case in select_cases(args.case_filters)
+    ]
     write_results(results, args.out)
     loaded = load_results(args.out)
 

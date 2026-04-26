@@ -90,6 +90,26 @@ def test_materialize_case_config_applies_runner_overrides(tmp_path, monkeypatch)
     assert data["cpu_training"] is True
 
 
+def test_select_cases_accepts_case_id_and_model_filters():
+    case = br.FIRST_MONTH_MATRIX[0]
+
+    by_id = br.select_cases([case.case_id])
+    by_model = br.select_cases([case.model])
+
+    assert by_id == (case,)
+    assert all(row.model == case.model for row in by_model)
+    assert len(by_model) > 1
+
+
+def test_select_cases_rejects_unknown_filters():
+    try:
+        br.select_cases(["missing-model"])
+    except SystemExit as exc:
+        assert "missing-model" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+
+
 def test_compare_artifacts_respects_recipe_tolerance():
     case = br.RegressionCase("m", "fp8", "single_gpu")
     base = {
