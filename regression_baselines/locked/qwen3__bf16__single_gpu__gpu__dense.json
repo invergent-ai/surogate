@@ -1,0 +1,19 @@
+{
+  "artifacts": {},
+  "case": {
+    "config": "examples/sft/qwen3/qwen3-lora-bf16-1step.yaml",
+    "distribution": "single_gpu",
+    "env_model_path": "QWEN3_MODEL_PATH",
+    "model": "qwen3",
+    "op_kind": "dense",
+    "recipe": "bf16",
+    "storage": "gpu",
+    "supported": true
+  },
+  "command": [],
+  "duration_s": 0.0,
+  "metrics": {},
+  "reason": "missing QWEN3_MODEL_PATH",
+  "started_at": 0.0,
+  "status": "skipped"
+}

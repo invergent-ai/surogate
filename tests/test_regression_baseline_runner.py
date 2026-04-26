@@ -49,6 +49,17 @@ def test_load_results_ignores_report_artifacts(tmp_path):
     assert set(loaded) == {case.case_id}
 
 
+def test_write_results_can_normalize_volatile_baseline_fields(tmp_path):
+    case = br.FIRST_MONTH_MATRIX[0]
+    result = br.RegressionResult(case=br.asdict(case), status="skipped", started_at=123.0, duration_s=4.5)
+
+    br.write_results([result], tmp_path, stable=True)
+
+    data = json.loads((tmp_path / f"{case.case_id}.json").read_text())
+    assert data["started_at"] == 0.0
+    assert data["duration_s"] == 0.0
+
+
 def test_compare_artifacts_respects_recipe_tolerance():
     case = br.RegressionCase("m", "fp8", "single_gpu")
     base = {

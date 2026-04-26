@@ -242,11 +242,19 @@ def run_case(case: RegressionCase, *, run: bool, steps: int, artifact_dir: Path 
     return result
 
 
-def write_results(results: list[RegressionResult], directory: Path) -> None:
+def _stable_result_dict(result: RegressionResult) -> dict[str, Any]:
+    data = asdict(result)
+    data["started_at"] = 0.0
+    data["duration_s"] = 0.0
+    return data
+
+
+def write_results(results: list[RegressionResult], directory: Path, *, stable: bool = False) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for result in results:
         case = RegressionCase(**result.case)
-        _case_path(case, directory).write_text(json.dumps(asdict(result), indent=2, sort_keys=True) + "\n")
+        data = _stable_result_dict(result) if stable else asdict(result)
+        _case_path(case, directory).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def load_results(directory: Path) -> dict[str, dict[str, Any]]:
@@ -451,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
     loaded = load_results(args.out)
 
     if args.update_baseline:
-        write_results(results, args.baseline)
+        write_results(results, args.baseline, stable=True)
 
     if args.report:
         report = coverage_report(loaded)
