@@ -115,6 +115,16 @@ bool tensor_role_is_moe_side_channel_name(std::string_view name) {
            contains(name, "expert_offsets") || contains(name, "ep_recv_scatter");
 }
 
+bool tensor_role_is_router_name(std::string_view name) {
+    const TensorRole role = infer_tensor_role_from_name(name);
+    return role.dist.kind == DistributionKind::RouterReplicated;
+}
+
+bool tensor_role_is_shared_expert_name(std::string_view name) {
+    const TensorRole role = infer_tensor_role_from_name(name);
+    return role.is_moe_owned() && contains(name, "shared_expert");
+}
+
 void tensor_role_parity_check(std::string_view name, bool legacy_value, bool role_value, const char* context) {
     const char* env = std::getenv("SUROGATE_TENSOR_ROLE_PARITY");
     if (!env || std::string_view(env) == "0") {

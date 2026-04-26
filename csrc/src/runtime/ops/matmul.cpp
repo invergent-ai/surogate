@@ -16,6 +16,7 @@
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -28,6 +29,25 @@
 
 namespace dsl {
 
+namespace {
+
+bool is_shared_expert_weight_name(const std::string& weight_name) {
+    const bool legacy_value = (weight_name.find("shared_expert_up") != std::string::npos) ||
+                              (weight_name.find("shared_expert_down") != std::string::npos);
+    const bool role_value = tensor_role_is_shared_expert_name(weight_name);
+    tensor_role_parity_check(weight_name, legacy_value, role_value, "matmul::shared_expert_weight");
+    return legacy_value || role_value;
+}
+
+bool is_router_weight_name(const std::string& weight_name) {
+    const bool legacy_value = weight_name.find("router_weight") != std::string::npos;
+    const bool role_value = tensor_role_is_router_name(weight_name);
+    tensor_role_parity_check(weight_name, legacy_value, role_value, "matmul::router_weight");
+    return legacy_value || role_value;
+}
+
+}  // namespace
+
 // flatten_bt now lives in runtime/executor/graph_executor_utils.h so it
 // can be reused by LoRA slice dispatch (lora_slice_dispatch.h).
 
@@ -38,8 +58,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     const std::string& weight_name = op.inputs[1].name;
     const bool is_gate_projection = is_mlp_gate_weight(weight_name);
 
-    const bool is_shared_weight = (weight_name.find("shared_expert_up") != std::string::npos) ||
-                                  (weight_name.find("shared_expert_down") != std::string::npos);
+    const bool is_shared_weight = is_shared_expert_weight_name(weight_name);
 
     std::optional<Tensor> bias;
     if (op.type == CompiledOpType::MatmulBias && op.inputs.size() > 2) {
@@ -51,7 +70,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
     // Router matmul: match HF by computing logits in FP32 using FP32 inputs/weights.
     // Skip the string search for dense (non-MoE) models — they have no router.
-    const bool is_router = (mConfig.NumExperts > 0) && (weight_name.find("router_weight") != std::string::npos);
+    const bool is_router = (mConfig.NumExperts > 0) && is_router_weight_name(weight_name);
     if (is_router &&
         (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
         auto shape_vec = [](const Tensor& t) {
