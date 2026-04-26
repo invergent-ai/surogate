@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_DIR = REPO_ROOT / "regression_baselines"
@@ -183,13 +185,30 @@ def _missing_reason(case: RegressionCase) -> str | None:
     return None
 
 
-def _command_for_case(case: RegressionCase, steps: int) -> list[str]:
+def _materialize_case_config(case: RegressionCase, *, steps: int, directory: Path) -> Path | None:
     if not case.config:
-        return []
-    cmd = ["surogate", "sft", str(REPO_ROOT / case.config)]
+        return None
+    src = REPO_ROOT / case.config
+    data = yaml.safe_load(src.read_text()) or {}
+    data["max_steps"] = steps
+    data["eval_steps"] = 0
     if case.distribution == "2gpu_dp":
-        cmd = ["python", "-m", "surogate.train.distributed", str(REPO_ROOT / case.config)]
-    return cmd + ["--max-steps", str(steps)]
+        data["gpus"] = 2
+        data["ep_size"] = 1
+    if case.storage == "cpu_stream":
+        data["cpu_training"] = True
+
+    out = directory / "configs" / f"{case.case_id}.yaml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(yaml.safe_dump(data, sort_keys=False) + "\n")
+    return out
+
+
+def _command_for_case(case: RegressionCase, config_path: Path | None = None) -> list[str]:
+    path = config_path or ((REPO_ROOT / case.config) if case.config else None)
+    if not path:
+        return []
+    return ["surogate", "sft", str(path)]
 
 
 def _artifact_path(case: RegressionCase, directory: Path) -> Path:
@@ -209,7 +228,8 @@ def run_case(case: RegressionCase, *, run: bool, steps: int, artifact_dir: Path 
         result.reason = missing
         return result
 
-    cmd = _command_for_case(case, steps)
+    cmd_config = _materialize_case_config(case, steps=steps, directory=artifact_dir) if run and artifact_dir else None
+    cmd = _command_for_case(case, cmd_config)
     result.command = cmd
     if not run:
         result.reason = "not executed; pass --run to launch GPU workload"

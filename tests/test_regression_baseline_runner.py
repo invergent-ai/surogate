@@ -60,6 +60,31 @@ def test_write_results_can_normalize_volatile_baseline_fields(tmp_path):
     assert data["duration_s"] == 0.0
 
 
+def test_command_for_case_uses_sft_cli_without_unsupported_flags():
+    case = br.RegressionCase("m", "bf16", "single_gpu", config="dummy.yaml")
+
+    cmd = br._command_for_case(case)
+
+    assert cmd[:2] == ["surogate", "sft"]
+    assert "--max-steps" not in cmd
+
+
+def test_materialize_case_config_applies_runner_overrides(tmp_path, monkeypatch):
+    source = tmp_path / "case.yaml"
+    source.write_text("max_steps: 100\neval_steps: 25\ngpus: 1\nep_size: 4\n")
+    monkeypatch.setattr(br, "REPO_ROOT", tmp_path)
+    case = br.RegressionCase("m", "fp8", "2gpu_dp", storage="cpu_stream", config="case.yaml")
+
+    materialized = br._materialize_case_config(case, steps=7, directory=tmp_path / "out")
+
+    data = br.yaml.safe_load(materialized.read_text())
+    assert data["max_steps"] == 7
+    assert data["eval_steps"] == 0
+    assert data["gpus"] == 2
+    assert data["ep_size"] == 1
+    assert data["cpu_training"] is True
+
+
 def test_compare_artifacts_respects_recipe_tolerance():
     case = br.RegressionCase("m", "fp8", "single_gpu")
     base = {
@@ -140,7 +165,8 @@ def test_run_case_loads_external_artifact(tmp_path, monkeypatch):
         f"{json.dumps(json.dumps(artifact_payload))})"
     )
     monkeypatch.setattr(br, "_missing_reason", lambda _: None)
-    monkeypatch.setattr(br, "_command_for_case", lambda _, steps: [sys.executable, "-c", script])
+    monkeypatch.setattr(br, "_materialize_case_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(br, "_command_for_case", lambda _, config_path=None: [sys.executable, "-c", script])
 
     result = br.run_case(case, run=True, steps=1, artifact_dir=tmp_path)
 
