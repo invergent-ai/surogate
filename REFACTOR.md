@@ -133,6 +133,7 @@
 - [x] `BufferPlan` now resolves schema activation shape tokens against the current layer dimensions and reports resolved/unresolved activation-shape counters.
 - [x] `BufferPlan` now computes dtype-aware byte estimates for resolved schema activation shapes, enabling numeric allocation parity checks.
 - [x] Regression block-schema summaries now include slot kind, shape coverage, save-for-backward, and grouped-slot counts for allocator migration tracking.
+- [x] Acceptance model graph tests now require every emitted block-schema slot to declare a name, kind, and non-empty shape.
 
 Local validation status:
 

@@ -356,3 +356,11 @@ def test_acceptance_model_graphs_emit_complete_block_schema_metadata():
         assert len(records) == config["n_layers"]
         assert [record["layer"] for record in records] == list(range(config["n_layers"]))
         assert [record["schema"]["attrs"]["block_family"] for record in records] == expected_families
+        for record in records:
+            slots = record["schema"]["slots"]
+            assert slots
+            for slot in slots:
+                assert slot["name"]
+                assert slot["kind"] in {"activation", "param", "scratch", "param_grad", "activation_grad"}
+                assert isinstance(slot.get("shape"), list)
+                assert slot["shape"]
