@@ -135,6 +135,7 @@ public:
 
     /// Async D2H copy layer gradients to CPU (call at layer_end in backward).
     void offload_layer_grads(int layer_idx, cudaStream_t compute_stream, cudaStream_t copy_stream);
+    void accumulate_layer_to_sharded(int layer_idx, cudaStream_t stream);
 
     /// Per-layer NCCL all-reduce (multi-GPU). Call at layer_end BEFORE offload.
     void reduce_layer_grads(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
@@ -190,7 +191,7 @@ private:
     void destroy_layer_events() noexcept;
     void allocate_sharded_grads();
     void accumulate_to_sharded(int layer_idx, cudaStream_t stream);
-    int dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, cudaStream_t stream);
+    int dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, cudaStream_t stream, void* payload = nullptr);
 
     std::shared_ptr<TensorAllocator> mAllocator;
     std::unordered_map<std::string, Tensor> mGrads;         ///< Full gradients (always on device for NCCL)

@@ -1225,7 +1225,14 @@ DslModel::DslModel(const PretrainedConfig& config,
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterReduceScatter)) {
-            mHookRegistry.on_after_reduce_scatter(target, "schema_after_reduce_scatter");
+            mHookRegistry.on_after_reduce_scatter(target, "schema_after_reduce_scatter", [](HookContext& context) {
+                auto* payload = static_cast<GradientOffloadHookPayload*>(context.payload);
+                if (!payload || !payload->reduce_scattered || payload->sharded_accumulated || !payload->grads) {
+                    return;
+                }
+                payload->grads->accumulate_layer_to_sharded(context.layer_idx, payload->compute_stream);
+                payload->sharded_accumulated = true;
+            });
         }
     }
     validate_ir();

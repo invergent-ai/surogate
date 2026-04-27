@@ -87,6 +87,8 @@ struct GradientOffloadHookPayload {
     cudaEvent_t sync_event = nullptr;
     bool capturing = false;
     bool offloaded = false;
+    bool reduce_scattered = false;
+    bool sharded_accumulated = false;
 };
 
 struct CommunicationHookPayload {

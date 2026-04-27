@@ -552,17 +552,24 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         comm.execute_transaction(ev);
     }
 
-    // ZeRO-2 with offloading: accumulate reduced shards into host storage
-    if (mConfig.shard_gradients && !mShardedGrads.empty()) {
-        accumulate_to_sharded(layer_idx, stream);
-    }
+    GradientOffloadHookPayload reduce_payload;
+    reduce_payload.grads = this;
+    reduce_payload.compute_stream = stream;
+    reduce_payload.copy_stream = stream;
+    reduce_payload.reduce_scattered = mConfig.shard_gradients;
     dispatch_schema_layer_hooks(mConfig.shard_gradients ? HookEventKind::AfterReduceScatter
                                                         : HookEventKind::AfterAllReduce,
                                 layer_idx,
-                                stream);
+                                stream,
+                                &reduce_payload);
+
+    // ZeRO-2 with offloading: accumulate reduced shards into host storage.
+    if (mConfig.shard_gradients && !reduce_payload.sharded_accumulated && !mShardedGrads.empty()) {
+        accumulate_to_sharded(layer_idx, stream);
+    }
 }
 
-int DslGradStore::dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, cudaStream_t stream) {
+int DslGradStore::dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, cudaStream_t stream, void* payload) {
     if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || layer_idx < 0 ||
         layer_idx >= static_cast<int>(mHookSchemaIdsByLayer.size())) {
         return 0;
@@ -581,12 +588,20 @@ int DslGradStore::dispatch_schema_layer_hooks(HookEventKind event, int layer_idx
         context.target = registration.target;
         context.event = event;
         context.stream = stream;
+        context.payload = payload;
         if (registration.callback) {
             registration.callback(context);
         }
         ++dispatched;
     }
     return dispatched;
+}
+
+void DslGradStore::accumulate_layer_to_sharded(int layer_idx, cudaStream_t stream) {
+    if (!mConfig.shard_gradients || mShardedGrads.empty()) {
+        return;
+    }
+    accumulate_to_sharded(layer_idx, stream);
 }
 
 void DslGradStore::allocate_sharded_grads() {
