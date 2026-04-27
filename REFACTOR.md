@@ -83,6 +83,7 @@
 - [x] Shared recipe capability predicates now include MoE/grouped FP8, FP4, and FP8-backward capability checks with legacy fallback logging.
 - [x] MoE grouped recipe paths now receive `MoECapabilities` from compiled descriptors and consult grouped FP8/FP4 predicates before specialized paths.
 - [x] Missing-dispatch diagnostics now print `MoECapabilities` alongside generic capability, epilogue, storage, comm, and distribution facets.
+- [x] North-star coverage rows now report required MoE/grouped capabilities separately from generic op capabilities.
 
 Local validation status:
 

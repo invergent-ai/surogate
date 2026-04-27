@@ -54,6 +54,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     report = br.coverage_report(results)
 
     assert report["rows"][0]["required_capabilities"] == ["GroupedMatmul", "MoERouted", "FP8Eligible"]
+    assert report["rows"][0]["required_moe_capabilities"] == ["GroupedGemmEligible", "FP8GroupedEligible"]
     assert report["rows"][0]["fusion_candidate_starts"] == 3
 
 

@@ -470,6 +470,20 @@ def required_capabilities_for_case(case: dict[str, Any]) -> list[str]:
     return caps
 
 
+def required_moe_capabilities_for_case(case: dict[str, Any]) -> list[str]:
+    recipe = case["recipe"]
+    op_kind = case["op_kind"]
+    if op_kind != "moe_grouped" or recipe not in {"fp8", "fp4"}:
+        return []
+
+    caps = ["GroupedGemmEligible"]
+    if recipe == "fp8":
+        caps.append("FP8GroupedEligible")
+    elif recipe == "fp4":
+        caps.append("FP4GroupedEligible")
+    return caps
+
+
 def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     eligible = 0
@@ -494,6 +508,7 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "status": result["status"],
                 "reason": result.get("reason", ""),
                 "required_capabilities": required_capabilities_for_case(case),
+                "required_moe_capabilities": required_moe_capabilities_for_case(case),
                 "fusion_candidate_starts": descriptor_summary.get("fusion_candidate_starts"),
             }
         )
