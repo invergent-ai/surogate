@@ -241,6 +241,19 @@ def test_compare_artifacts_checks_convergence_perf_memory_and_nccl():
     assert any("nccl.all_reduce.bytes" in f for f in failures)
 
 
+def test_compare_artifacts_checks_descriptor_summary_counts():
+    case = br.RegressionCase("m", "fp8", "single_gpu")
+    base_metrics = {"descriptor_summary": {"fusion_candidate_starts": 2, "forward_fp8_eligible_ops": 8}}
+    cur_metrics = {"descriptor_summary": {"fusion_candidate_starts": 3}}
+    base = {case.case_id: {"case": br.asdict(case), "status": "passed", "metrics": base_metrics}}
+    cur = {case.case_id: {"case": br.asdict(case), "status": "passed", "metrics": cur_metrics}}
+
+    failures = br.compare_results(cur, base)
+
+    assert f"{case.case_id}: descriptor_summary.fusion_candidate_starts 3 != 2" in failures
+    assert f"{case.case_id}: missing descriptor_summary.forward_fp8_eligible_ops" in failures
+
+
 def test_run_case_loads_external_artifact(tmp_path, monkeypatch):
     case = br.RegressionCase("m", "bf16", "single_gpu", config="dummy.yaml")
     artifact_payload = {

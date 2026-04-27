@@ -385,6 +385,19 @@ def _compare_nccl(failures: list[str], case_id: str, cur: dict[str, Any], base: 
                 failures.append(f"{case_id}: nccl.{op_name}.bytes rel delta {rel:.3%} > {NCCL_BYTES_REL_TOL:.3%}")
 
 
+def _compare_descriptor_summary(failures: list[str], case_id: str, cur: dict[str, Any], base: dict[str, Any]) -> None:
+    base_summary = base.get("descriptor_summary", {})
+    cur_summary = cur.get("descriptor_summary", {})
+    for key, base_value in base_summary.items():
+        if not isinstance(base_value, int):
+            continue
+        cur_value = cur_summary.get(key)
+        if cur_value is None:
+            failures.append(f"{case_id}: missing descriptor_summary.{key}")
+        elif cur_value != base_value:
+            failures.append(f"{case_id}: descriptor_summary.{key} {cur_value} != {base_value}")
+
+
 def _compare_artifacts(case_id: str, cur: dict[str, Any], base: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     case = cur.get("case", {})
@@ -420,6 +433,7 @@ def _compare_artifacts(case_id: str, cur: dict[str, Any], base: dict[str, Any]) 
     )
     _compare_perf_and_memory(failures, case_id, cur_metrics, base_metrics)
     _compare_nccl(failures, case_id, cur_metrics, base_metrics)
+    _compare_descriptor_summary(failures, case_id, cur_metrics, base_metrics)
     return failures
 
 
