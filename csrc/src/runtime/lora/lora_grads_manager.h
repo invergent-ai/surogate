@@ -95,6 +95,7 @@ public:
      */
     void notify_block(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
     void set_schema_hook_registry(const dsl::HookRegistry* registry, std::vector<std::string> schema_ids_by_layer);
+    void reduce_layer_gradients(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
 
     [[nodiscard]] bool is_first_micro_step() const {
         return mIsFirstMicroStep;
@@ -121,7 +122,7 @@ private:
 
     void allocate_gradients();
     void reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm);
-    int dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream);
+    int dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream, void* payload = nullptr);
 };
 
 }  // namespace modules

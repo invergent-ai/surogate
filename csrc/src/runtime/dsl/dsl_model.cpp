@@ -1210,6 +1210,14 @@ DslModel::DslModel(const PretrainedConfig& config,
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllReduce)) {
             mHookRegistry.on_after_all_reduce(target, "schema_after_all_reduce", [](HookContext& context) {
                 auto* payload = static_cast<GradientOffloadHookPayload*>(context.payload);
+                if (payload && payload->lora_gradients && payload->lora_grads && payload->comm &&
+                    !payload->lora_reduced) {
+                    payload->lora_grads->reduce_layer_gradients(context.layer_idx,
+                                                                payload->compute_stream,
+                                                                *payload->comm);
+                    payload->lora_reduced = true;
+                    return;
+                }
                 if (!payload || payload->offloaded || payload->capturing || !payload->grads ||
                     !payload->grads->is_streaming_grads()) {
                     return;

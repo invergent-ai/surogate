@@ -225,6 +225,7 @@ Real-model acceptance queue:
 - [x] EP token all-to-all now dispatches typed `after_all_to_all` / `after_communication` payloads at the actual token-A2A completion point inside `EPStrategy`, instead of from the outer op trampoline after all EP post-processing.
 - [x] ZeRO-2 reduced-shard accumulation now routes through the typed `after_reduce_scatter` hook payload under opt-in dispatch, with the existing imperative accumulation retained as fallback.
 - [x] Regression/runtime artifacts now expose `after_communication` hook target counts and EP hook readiness requires both generic communication and all-to-all hook coverage.
+- [x] LoRA gradient reduction now uses the typed `after_all_reduce` hook payload per layer; under opt-in schema dispatch, callbacks can own LoRA all-reduce/DP-only expert reduction, with the previous reduction path retained as fallback.
 
 ---
 
@@ -801,7 +802,7 @@ hook_registry.on_after_reduce_scatter(          // ⭐ NEW
 );
 ```
 
-**Cleanup status:** LoRA dense/shared/router/separate-expert/grouped-expert iteration now routes through structural `LoRATargetId` helpers in optimizer setup, norm pointers, gradient zeroing, gradient reduction, and paired optimizer updates. Dense projection LoRA after-produce, CPU current-layer prefetch, streamed-weight release, EP token all-to-all observation, ZeRO-2 reduced-shard accumulation, and streaming grad offload now have typed hook payloads behind opt-in dispatch; remaining Phase 5 migration is to keep moving distribution/offload side effects from inert boundaries into registered callbacks.
+**Cleanup status:** LoRA dense/shared/router/separate-expert/grouped-expert iteration now routes through structural `LoRATargetId` helpers in optimizer setup, norm pointers, gradient zeroing, gradient reduction, and paired optimizer updates. Dense projection LoRA after-produce, CPU current-layer prefetch, streamed-weight release, EP token all-to-all observation, ZeRO-2 reduced-shard accumulation, LoRA gradient reduction, and streaming grad offload now have typed hook payloads behind opt-in dispatch; remaining Phase 5 migration is to keep moving distribution/offload side effects from inert boundaries into registered callbacks.
 
 **Less critical than Phases 1–4 because the immediate FP8/FP4 + MoE goal doesn't require it.** Finishes the extensibility story.
 

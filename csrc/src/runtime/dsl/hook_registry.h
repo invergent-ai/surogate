@@ -22,6 +22,10 @@
 class NCCLCommunicator;
 struct Tensor;
 
+namespace modules {
+class ModularLoRAGradsManager;
+}  // namespace modules
+
 namespace dsl {
 
 class DslGradStore;
@@ -81,6 +85,7 @@ struct AfterConsumeHookPayload {
 
 struct GradientOffloadHookPayload {
     DslGradStore* grads = nullptr;
+    modules::ModularLoRAGradsManager* lora_grads = nullptr;
     NCCLCommunicator* comm = nullptr;
     cudaStream_t compute_stream = nullptr;
     cudaStream_t copy_stream = nullptr;
@@ -89,6 +94,8 @@ struct GradientOffloadHookPayload {
     bool offloaded = false;
     bool reduce_scattered = false;
     bool sharded_accumulated = false;
+    bool lora_gradients = false;
+    bool lora_reduced = false;
 };
 
 struct CommunicationHookPayload {

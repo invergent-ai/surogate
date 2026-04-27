@@ -320,8 +320,26 @@ void ModularLoRAGradsManager::set_schema_hook_registry(const dsl::HookRegistry* 
 
 void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm) {
     if (comm.world_size() == 1) return;
-    const bool ep_active = comm.ep_enabled();
 
+    for (int layer = 0; layer < static_cast<int>(mFullGrads.blocks.size()); ++layer) {
+        dsl::GradientOffloadHookPayload payload;
+        payload.lora_grads = this;
+        payload.comm = &comm;
+        payload.compute_stream = stream;
+        payload.copy_stream = stream;
+        payload.lora_gradients = true;
+        dispatch_schema_layer_hooks(layer, stream, &payload);
+        if (!payload.lora_reduced) {
+            reduce_layer_gradients(layer, stream, comm);
+        }
+    }
+}
+
+void ModularLoRAGradsManager::reduce_layer_gradients(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm) {
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(mFullGrads.blocks.size())) {
+        return;
+    }
+    const bool ep_active = comm.ep_enabled();
     auto all_reduce_layer = [&](LoRATargetId id, auto& layer) {
         // Expert adapters are EP-sharded; reducing them over the full world would mix experts.
         const bool reduce_dp_only = ep_active && lora_target_is_expert(id);
@@ -332,16 +350,10 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
             reduce_dp_only ? comm.all_reduce_avg_dp(layer.B, stream) : comm.all_reduce_avg(layer.B, stream);
         }
     };
-
-    for (auto& block : mFullGrads.blocks) {
-        for_each_lora_layer_weight(block, all_reduce_layer);
-    }
-    for (int layer = 0; layer < static_cast<int>(mHookSchemaIdsByLayer.size()); ++layer) {
-        dispatch_schema_layer_hooks(layer, stream);
-    }
+    for_each_lora_layer_weight(mFullGrads.blocks[static_cast<std::size_t>(layer_idx)], all_reduce_layer);
 }
 
-int ModularLoRAGradsManager::dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream) {
+int ModularLoRAGradsManager::dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream, void* payload) {
     if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || layer_idx < 0 ||
         layer_idx >= static_cast<int>(mHookSchemaIdsByLayer.size())) {
         return 0;
@@ -360,6 +372,7 @@ int ModularLoRAGradsManager::dispatch_schema_layer_hooks(int layer_idx, cudaStre
         context.target = registration.target;
         context.event = registration.event;
         context.stream = stream;
+        context.payload = payload;
         if (registration.callback) {
             registration.callback(context);
         }
