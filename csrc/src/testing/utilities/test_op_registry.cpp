@@ -75,6 +75,8 @@ TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {
 TEST_CASE("ep ops carry communication profile metadata", "[op_registry]") {
     const OpDescriptor* dispatch = OpRegistry::instance().find_by_name("ep_dispatch");
     REQUIRE(dispatch != nullptr);
+    REQUIRE(dispatch == OpRegistry::instance().find(CompiledOpType::EpDispatch));
+    REQUIRE(dispatch->forward_fn != nullptr);
     REQUIRE(dispatch->semantic_kind == OpSemanticKind::Collective);
     REQUIRE(dispatch->comm_profile.kind == CommunicationKind::AllToAllIn);
     REQUIRE(dispatch->comm_profile.can_overlap_with_compute);
@@ -83,6 +85,8 @@ TEST_CASE("ep ops carry communication profile metadata", "[op_registry]") {
 
     const OpDescriptor* combine = OpRegistry::instance().find_by_name("ep_combine");
     REQUIRE(combine != nullptr);
+    REQUIRE(combine == OpRegistry::instance().find(CompiledOpType::EpCombine));
+    REQUIRE(combine->forward_fn != nullptr);
     REQUIRE(combine->comm_profile.kind == CommunicationKind::AllToAllOut);
 }
 
