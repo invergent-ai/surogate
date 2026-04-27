@@ -34,6 +34,7 @@ const char* tensor_ownership_name(TensorOwnership ownership) {
         case TensorOwnership::EP: return "EP";
         case TensorOwnership::RopeFreqs: return "RopeFreqs";
         case TensorOwnership::Embedding: return "Embedding";
+        case TensorOwnership::LMHead: return "LMHead";
     }
     return "Unknown";
 }
@@ -77,6 +78,10 @@ TensorRole infer_tensor_role_from_name(std::string_view raw_name, int block_laye
     }
     if (name == "embedding" || name == "embeddings" || name == "embed_tokens" || contains(name, "embed")) {
         role.ownership = TensorOwnership::Embedding;
+        return role;
+    }
+    if (name == "lm_head" || name == "lm_head_weight" || contains(name, "lm_head")) {
+        role.ownership = TensorOwnership::LMHead;
         return role;
     }
 
@@ -132,6 +137,10 @@ bool tensor_role_is_router_name(std::string_view name) {
 
 bool tensor_role_is_embedding_name(std::string_view name) {
     return infer_tensor_role_from_name(name).ownership == TensorOwnership::Embedding;
+}
+
+bool tensor_role_is_lm_head_name(std::string_view name) {
+    return infer_tensor_role_from_name(name).ownership == TensorOwnership::LMHead;
 }
 
 bool tensor_role_is_shared_expert_name(std::string_view name) {

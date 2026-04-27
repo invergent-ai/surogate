@@ -240,6 +240,7 @@ Real-model acceptance queue:
 - [x] `save_moe_layer_tensors` now reuses the compiled save-path MoE TensorRole/slot helper instead of maintaining a second substring allowlist.
 - [x] Compiled executor embedding-output fallback now has TensorRole parity around the remaining legacy `embed` substring route to the encoded activation slot.
 - [x] TensorRole now exposes an embedding predicate, and NorMuon embedding classification uses it with the legacy `embed` substring retained only as fallback.
+- [x] TensorRole now exposes LM-head ownership/predicate, and NorMuon `lm_head` classification uses it with the legacy substring retained only as fallback.
 - [x] Runtime hook readiness reporting now reuses the hook-registry `after_produce` slot predicate instead of maintaining a shadow string list in `dsl_debug.cpp`.
 - [x] Runtime hook readiness reporting now reuses the hook-registry event predicate for all schema hook target counts, eliminating duplicated stream/comm/reduction slot logic in `dsl_debug.cpp`.
 

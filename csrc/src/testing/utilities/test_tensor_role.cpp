@@ -89,6 +89,7 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
     SECTION("non-MoE special tensors keep explicit ownership") {
         TensorRole rope = infer_tensor_role_from_name("blocks[1].rope_freqs", 1);
         TensorRole embedding = infer_tensor_role_from_name("embed_tokens");
+        TensorRole lm_head = infer_tensor_role_from_name("lm_head");
         TensorRole activation = infer_tensor_role_from_name("blocks[0].attn_out", 0);
 
         REQUIRE(rope.ownership == TensorOwnership::RopeFreqs);
@@ -102,6 +103,10 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(tensor_role_is_embedding_name("embed_tokens"));
         REQUIRE(tensor_role_is_embedding_name("embed_1"));
         REQUIRE_FALSE(tensor_role_is_embedding_name("blocks[0].attn_out"));
+        REQUIRE(lm_head.ownership == TensorOwnership::LMHead);
+        REQUIRE(tensor_role_is_lm_head_name("lm_head"));
+        REQUIRE(tensor_role_is_lm_head_name("model.lm_head.weight"));
+        REQUIRE_FALSE(tensor_role_is_lm_head_name("blocks[0].attn_out"));
         REQUIRE(activation.ownership == TensorOwnership::Stack);
         REQUIRE_FALSE(activation.is_moe_owned());
         REQUIRE_FALSE(tensor_role_is_rope_name("blocks[0].attn_out"));

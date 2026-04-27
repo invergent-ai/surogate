@@ -51,7 +51,10 @@ bool is_normuon_param(const std::string& name, const Tensor& param) {
     const bool role_embedding = dsl::tensor_role_is_embedding_name(lower);
     dsl::tensor_role_parity_check(lower, legacy_embedding, role_embedding, "normuon::embedding_param");
     if (legacy_embedding || role_embedding) return false;
-    if (lower.find("lm_head") != std::string::npos) return false;
+    const bool legacy_lm_head = lower.find("lm_head") != std::string::npos;
+    const bool role_lm_head = dsl::tensor_role_is_lm_head_name(lower);
+    dsl::tensor_role_parity_check(lower, legacy_lm_head, role_lm_head, "normuon::lm_head_param");
+    if (legacy_lm_head || role_lm_head) return false;
 
     // MoE router gates use AdamW (special case from study implementation).
     const bool legacy_router = lower.find("router") != std::string::npos;

@@ -34,6 +34,7 @@ enum class TensorOwnership : std::uint8_t {
     EP,
     RopeFreqs,
     Embedding,
+    LMHead,
 };
 
 enum class QuantState : std::uint8_t {
@@ -122,6 +123,9 @@ bool tensor_role_is_router_name(std::string_view name);
 
 /// Legacy-compatible embedding tensor predicate derived from TensorRole.
 bool tensor_role_is_embedding_name(std::string_view name);
+
+/// Legacy-compatible LM-head tensor predicate derived from TensorRole.
+bool tensor_role_is_lm_head_name(std::string_view name);
 
 /// Legacy-compatible shared-expert tensor predicate derived from TensorRole.
 bool tensor_role_is_shared_expert_name(std::string_view name);
