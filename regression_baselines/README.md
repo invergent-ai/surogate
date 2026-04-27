@@ -1,6 +1,6 @@
 # Regression Baselines
 
-This directory is the tracked home for first-month refactor regression artifacts.
+This directory is the tracked home for refactor regression artifacts.
 
 Use:
 

@@ -40,6 +40,13 @@ std::string schema_slot_from_weight_name(std::string_view weight_name) {
     return std::string(slot);
 }
 
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    const std::string_view text(value);
+    return text == "1" || text == "true" || text == "TRUE" || text == "on" || text == "ON";
+}
+
 void set_forward_hook_schema_slot(CompiledAttrs& attrs, modules::ForwardHookPoint point, std::string_view schema_slot) {
     attrs.forward_hook_point = point;
     attrs.forward_hook_schema_slot = std::string(schema_slot);
@@ -1562,6 +1569,19 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         if (type == CompiledOpType::MoEPermuteBackward) {
             if (auto it = mTensorIdMap.find("moe_gather_indices"); it != mTensorIdMap.end()) {
                 attrs.moe_gather_tensor_id = it->second;
+            }
+        }
+    }
+
+    if (env_flag_enabled("SUROGATE_HOOK_SCHEMA_PARITY")) {
+        if (attrs.forward_hook_point.has_value() && attrs.forward_hook_schema_slot.empty()) {
+            throw std::runtime_error("graph_compiler: op '" + op.name +
+                                     "' has legacy forward hook point without schema slot parity");
+        }
+        for (const LoRASlice& slice : attrs.lora_slices) {
+            if (slice.schema_slot.empty()) {
+                throw std::runtime_error("graph_compiler: op '" + op.name +
+                                         "' has LoRA slice without schema slot parity");
             }
         }
     }
