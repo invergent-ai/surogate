@@ -322,8 +322,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             << ", block_schema_frame_activation_bytes=" << initial_plan.schema_frame_activation_bytes
             << ", block_schema_max_layer_activation_shape_bytes="
             << initial_plan.schema_max_layer_activation_shape_bytes
-            << ", block_schema_legacy_max_activation_shape_bytes="
-            << initial_plan.schema_legacy_max_activation_shape_bytes
+            << ", block_schema_baseline_max_activation_shape_bytes="
+            << initial_plan.schema_baseline_max_activation_shape_bytes
             << ", block_schema_activation_shape_savings_bytes=" << initial_plan.schema_activation_shape_savings_bytes
             << ", block_schema_resolved_param_shape_slots=" << initial_plan.schema_resolved_param_shape_slots
             << ", block_schema_unresolved_param_shape_slots=" << initial_plan.schema_unresolved_param_shape_slots

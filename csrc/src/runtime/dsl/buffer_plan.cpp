@@ -688,10 +688,10 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             std::max(p.schema_max_layer_activation_shape_bytes, layer.resolved_activation_shape_bytes);
     }
     if (p.schema_record_count == p.NumLayers && p.NumLayers > 0 && p.schema_max_layer_activation_shape_bytes > 0) {
-        p.schema_legacy_max_activation_shape_bytes =
+        p.schema_baseline_max_activation_shape_bytes =
             p.schema_max_layer_activation_shape_bytes * static_cast<long>(p.NumLayers);
         p.schema_activation_shape_savings_bytes =
-            std::max(0L, p.schema_legacy_max_activation_shape_bytes - p.schema_resolved_activation_shape_bytes);
+            std::max(0L, p.schema_baseline_max_activation_shape_bytes - p.schema_resolved_activation_shape_bytes);
     }
     p.schema_expert_parallel_param_shape_savings_bytes =
         std::max(0L, p.schema_expert_parallel_param_shape_bytes - p.schema_expert_parallel_param_shape_local_bytes);

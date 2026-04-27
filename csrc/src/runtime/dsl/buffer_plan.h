@@ -253,7 +253,7 @@ struct BufferPlan {
     long schema_save_for_backward_activation_bytes = 0;
     long schema_frame_activation_bytes = 0;
     long schema_max_layer_activation_shape_bytes = 0;
-    long schema_legacy_max_activation_shape_bytes = 0;
+    long schema_baseline_max_activation_shape_bytes = 0;
     long schema_activation_shape_savings_bytes = 0;
     int schema_resolved_param_shape_slots = 0;
     int schema_unresolved_param_shape_slots = 0;

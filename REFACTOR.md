@@ -46,6 +46,7 @@
 - [x] NorMuon standalone-gate exclusion now routes through a TensorRole predicate, and MoE saved-buffer compatibility lookups no longer carry `legacy_key` local names.
 - [x] Grouped MoE forward/backward EP weight-pointer routing now uses TensorRole expert projection predicates (`expert_gate_up`, `expert_up`, `expert_down`) instead of local substring checks.
 - [x] Dead TensorRole parity helper and `SUROGATE_TENSOR_ROLE_PARITY` runtime hook removed after call-site migration; remaining classifier diagnostics now describe the old `d_<base>` heuristic explicitly.
+- [x] Schema allocation comparison metrics renamed from `legacy` to `baseline` in runtime debug output, binding output, C++ tests, and tracked regression run artifacts.
 
 ### Phase 2 — Op registry descriptor extension — COMPLETE
 

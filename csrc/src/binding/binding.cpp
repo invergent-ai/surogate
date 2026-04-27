@@ -2081,7 +2081,7 @@ NB_MODULE(_surogate, m) {
                 d["schema_save_for_backward_activation_bytes"] = s.schema_save_for_backward_activation_bytes;
                 d["schema_frame_activation_bytes"] = s.schema_frame_activation_bytes;
                 d["schema_max_layer_activation_shape_bytes"] = s.schema_max_layer_activation_shape_bytes;
-                d["schema_legacy_max_activation_shape_bytes"] = s.schema_legacy_max_activation_shape_bytes;
+                d["schema_baseline_max_activation_shape_bytes"] = s.schema_baseline_max_activation_shape_bytes;
                 d["schema_activation_shape_savings_bytes"] = s.schema_activation_shape_savings_bytes;
                 d["schema_resolved_param_shape_slots"] = s.schema_resolved_param_shape_slots;
                 d["schema_unresolved_param_shape_slots"] = s.schema_unresolved_param_shape_slots;

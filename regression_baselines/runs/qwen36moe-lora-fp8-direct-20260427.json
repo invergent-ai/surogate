@@ -97,7 +97,7 @@
     "schema_frame_activation_bytes": 0,
     "schema_frame_activation_slots": 40,
     "schema_layer_lifetime_slots": 200,
-    "schema_legacy_max_activation_shape_bytes": 0,
+    "schema_baseline_max_activation_shape_bytes": 0,
     "schema_linear_mixer_layers": 0,
     "schema_mamba_layers": 0,
     "schema_max_layer_activation_shape_bytes": 0,

@@ -296,7 +296,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_save_for_backward_activation_bytes == 0);
     REQUIRE(plan.schema_frame_activation_bytes == 96);
     REQUIRE(plan.schema_max_layer_activation_shape_bytes == 96);
-    REQUIRE(plan.schema_legacy_max_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_baseline_max_activation_shape_bytes == 96);
     REQUIRE(plan.schema_activation_shape_savings_bytes == 0);
     REQUIRE(plan.schema_resolved_param_shape_slots == 2);
     REQUIRE(plan.schema_unresolved_param_shape_slots == 0);
@@ -489,7 +489,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
                                                      &savings_records);
     REQUIRE(savings_plan.schema_resolved_activation_shape_bytes == 144);
     REQUIRE(savings_plan.schema_max_layer_activation_shape_bytes == 96);
-    REQUIRE(savings_plan.schema_legacy_max_activation_shape_bytes == 192);
+    REQUIRE(savings_plan.schema_baseline_max_activation_shape_bytes == 192);
     REQUIRE(savings_plan.schema_activation_shape_savings_bytes == 48);
 
     REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);

@@ -333,7 +333,7 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     s.schema_save_for_backward_activation_bytes = u64(p.schema_save_for_backward_activation_bytes);
     s.schema_frame_activation_bytes = u64(p.schema_frame_activation_bytes);
     s.schema_max_layer_activation_shape_bytes = u64(p.schema_max_layer_activation_shape_bytes);
-    s.schema_legacy_max_activation_shape_bytes = u64(p.schema_legacy_max_activation_shape_bytes);
+    s.schema_baseline_max_activation_shape_bytes = u64(p.schema_baseline_max_activation_shape_bytes);
     s.schema_activation_shape_savings_bytes = u64(p.schema_activation_shape_savings_bytes);
     s.schema_resolved_param_shape_slots = u64(p.schema_resolved_param_shape_slots);
     s.schema_unresolved_param_shape_slots = u64(p.schema_unresolved_param_shape_slots);
