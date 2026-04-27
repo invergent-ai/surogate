@@ -153,6 +153,7 @@ Local validation status:
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py tests/test_regression_baseline_runner.py tests/test_regression_artifact_writer.py --no-gpu` with 49 tests.
 - [x] GPU acceptance rows exercised locally for the real-model queue below; runner uses Hugging Face model IDs from configs by default, with `*_MODEL_PATH` only as optional local/offline overrides.
 - [x] Real-model GPU acceptance default shortened to 5 steps for practical iteration; longer convergence runs remain opt-in via `--steps`/`STEPS`.
+- [x] Direct real-model run passed for [`qwen3-lora-fp8.yaml`](examples/sft/qwen3/qwen3-lora-fp8.yaml) on 2026-04-27 with `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` and `buffer_plan_summary` artifact capture; loss moved `2.0824 -> 1.4151`, artifact saved to `regression_baselines/runs/qwen3-lora-fp8-direct-20260427.json`, log `output/log-isometric-laser-20260427-060630.json`.
 - [x] Direct real-model run passed for [`qwen35-text-lora-fp8.yaml`](examples/sft/qwen35/qwen35-text-lora-fp8.yaml) on 2026-04-27 with 5 steps; loss moved `1.7376 -> 1.1236`, adapter saved under `output_q35`, log `output_q35/log-obliged-franklin-20260427-055716.json`.
 
 Real-model acceptance queue:
