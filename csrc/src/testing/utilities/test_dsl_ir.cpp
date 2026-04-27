@@ -230,6 +230,12 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     cfg.NumLayers = 1;
     dsl::DslRuntimeConfig runtime_config;
     runtime_config.num_experts = 4;
+    runtime_config.linear_conv_kernel_dim = 4;
+    runtime_config.linear_key_head_dim = 32;
+    runtime_config.linear_value_head_dim = 16;
+    runtime_config.linear_num_key_heads = 4;
+    runtime_config.linear_num_value_heads = 8;
+    runtime_config.d_per_layer_input = 12;
     RuntimeOptions options;
     options.EPSize = 2;
     dsl::TensorSlotRegistry registry;
@@ -329,9 +335,37 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     kv_slot.shape_dims = {"KVDim", "C"};
     kv_slot.shape_rank = 2;
     alias_records[0].slots.push_back(kv_slot);
-    alias_records[0].slot_count = 2;
-    alias_records[0].param_slots = 2;
-    alias_records[0].activation_slots = 0;
+    dsl::BlockSchemaSlotSummary conv_slot;
+    conv_slot.name = "lin_in_proj_qkv_weight";
+    conv_slot.kind = "param";
+    conv_slot.distribution_kind = "replicated";
+    conv_slot.shape_dims = {"ConvDim", "C"};
+    conv_slot.shape_rank = 2;
+    alias_records[0].slots.push_back(conv_slot);
+    dsl::BlockSchemaSlotSummary value_slot;
+    value_slot.name = "lin_out_weight";
+    value_slot.kind = "param";
+    value_slot.distribution_kind = "replicated";
+    value_slot.shape_dims = {"C", "ValueDim"};
+    value_slot.shape_rank = 2;
+    alias_records[0].slots.push_back(value_slot);
+    dsl::BlockSchemaSlotSummary conv_state_slot;
+    conv_state_slot.name = "lin_conv_state";
+    conv_state_slot.kind = "activation";
+    conv_state_slot.distribution_kind = "replicated";
+    conv_state_slot.shape_dims = {"B", "ConvDim", "ConvK"};
+    conv_state_slot.shape_rank = 3;
+    alias_records[0].slots.push_back(conv_state_slot);
+    dsl::BlockSchemaSlotSummary pli_slot;
+    pli_slot.name = "per_layer_input";
+    pli_slot.kind = "activation";
+    pli_slot.distribution_kind = "replicated";
+    pli_slot.shape_dims = {"B", "T", "PLI_D"};
+    pli_slot.shape_rank = 3;
+    alias_records[0].slots.push_back(pli_slot);
+    alias_records[0].slot_count = 6;
+    alias_records[0].param_slots = 4;
+    alias_records[0].activation_slots = 2;
     const auto alias_plan = dsl::BufferPlan::build(cfg,
                                                    runtime_config,
                                                    options,
@@ -344,6 +378,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
                                                    &alias_records);
     REQUIRE(alias_plan.schema_layers[0].slots[0].resolved_shape == std::vector<long>{16, 8});
     REQUIRE(alias_plan.schema_layers[0].slots[1].resolved_shape == std::vector<long>{4, 8});
+    REQUIRE(alias_plan.schema_layers[0].slots[2].resolved_shape == std::vector<long>{384, 8});
+    REQUIRE(alias_plan.schema_layers[0].slots[3].resolved_shape == std::vector<long>{8, 128});
+    REQUIRE(alias_plan.schema_layers[0].slots[4].resolved_shape == std::vector<long>{2, 384, 4});
+    REQUIRE(alias_plan.schema_layers[0].slots[5].resolved_shape == std::vector<long>{2, 3, 12});
     REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);
     REQUIRE(plan.schema_layer(1) == nullptr);
     REQUIRE(plan.schema_layer_has_slot(0, "experts_gate_up"));

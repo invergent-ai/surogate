@@ -158,6 +158,20 @@ namespace {
         out = plan.Hq;
     } else if (token == "Hkv") {
         out = plan.Hkv;
+    } else if (token == "Hk") {
+        out = plan.LinearKeyHeads;
+    } else if (token == "Hv") {
+        out = plan.LinearValueHeads;
+    } else if (token == "Vd") {
+        out = plan.LinearValueDim;
+    } else if (token == "ValueDim") {
+        out = plan.LinearValueHeads * plan.LinearValueDim;
+    } else if (token == "ConvK") {
+        out = plan.LinearConvK;
+    } else if (token == "ConvDim") {
+        out = 2 * plan.LinearKeyHeads * plan.LinearKeyDim + plan.LinearValueHeads * plan.LinearValueDim;
+    } else if (token == "PLI_D") {
+        out = plan.PerLayerInputDim;
     } else {
         return false;
     }
@@ -423,6 +437,12 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.NumExperts = runtime_config.num_experts;
     p.TopK = (runtime_config.num_experts_per_tok > 0) ? runtime_config.num_experts_per_tok : 1;
     p.EPSize = std::max(options.EPSize, 1);
+    p.LinearConvK = runtime_config.linear_conv_kernel_dim;
+    p.LinearKeyHeads = runtime_config.linear_num_key_heads;
+    p.LinearValueHeads = runtime_config.linear_num_value_heads;
+    p.LinearKeyDim = runtime_config.linear_key_head_dim;
+    p.LinearValueDim = runtime_config.linear_value_head_dim;
+    p.PerLayerInputDim = runtime_config.d_per_layer_input;
     p.MoeM = (runtime_config.moe_intermediate_size > 0) ? runtime_config.moe_intermediate_size : cfg.IntermediateSize;
     p.MoeMUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * p.MoeM;
     p.use_qk_norm = runtime_config.use_qk_norm;

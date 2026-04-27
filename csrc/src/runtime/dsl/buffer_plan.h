@@ -250,6 +250,12 @@ struct BufferPlan {
     long NumExperts = 0;
     long TopK = 0;
     int EPSize = 1;
+    long LinearConvK = 0;
+    long LinearKeyHeads = 0;
+    long LinearValueHeads = 0;
+    long LinearKeyDim = 0;
+    long LinearValueDim = 0;
+    long PerLayerInputDim = 0;
 
     int NumLayers = 0;
 

@@ -137,6 +137,7 @@
 - [x] `BufferPlan` now computes global and EP-local dtype-aware byte estimates for resolved schema parameter slots, including expert-parallel weights.
 - [x] Regression block-schema summaries now distinguish expert-parallel parameter slots from activation/storage slots.
 - [x] `BufferPlan` schema shape resolution now covers Qwen3.5 `QProjDim` and `KVDim` aliases with C++ parity coverage.
+- [x] C++ runtime config now carries Qwen3.5 linear-attention and Gemma per-layer-input dimensions so `BufferPlan` can resolve `ConvDim`, `ValueDim`, `ConvK`, `Hk`, `Hv`, `Vd`, and `PLI_D` schema aliases.
 
 Local validation status:
 
