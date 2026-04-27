@@ -151,6 +151,9 @@ public:
     //! Descriptor/capability counts across forward + backward graphs.
     dsl::DebugDescriptorSummary get_debug_descriptor_summary();
 
+    //! BufferPlan schema/allocation diagnostics.
+    dsl::DebugBufferPlanSummary get_debug_buffer_plan_summary();
+
     //! Phase tree + flattened instruction stream for one graph.
     dsl::DebugPhaseTree get_debug_phase_tree(bool is_backward);
 

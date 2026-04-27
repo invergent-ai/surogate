@@ -646,6 +646,13 @@ class SurogateTrainerWrapper:
             except Exception as exc:
                 descriptor_summary = {"descriptor_summary_error": 1}
                 logger.warning(f"Failed to collect regression descriptor summary: {exc}")
+        buffer_plan_summary: dict[str, int] = {}
+        if hasattr(self.trainer, "get_debug_buffer_plan_summary"):
+            try:
+                buffer_plan_summary = dict(self.trainer.get_debug_buffer_plan_summary())
+            except Exception as exc:
+                buffer_plan_summary = {"buffer_plan_summary_error": 1}
+                logger.warning(f"Failed to collect regression buffer-plan summary: {exc}")
 
         path = Path(self._regression_artifact_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -659,6 +666,7 @@ class SurogateTrainerWrapper:
             "nccl": {},
             "descriptor_summary": descriptor_summary,
             "block_schema_summary": self._block_schema_summary,
+            "buffer_plan_summary": buffer_plan_summary,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 

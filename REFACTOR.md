@@ -140,6 +140,7 @@
 - [x] C++ runtime config now carries Qwen3.5 linear-attention and Gemma per-layer-input dimensions so `BufferPlan` can resolve `ConvDim`, `ValueDim`, `ConvK`, `Hk`, `Hv`, `Vd`, and `PLI_D` schema aliases.
 - [x] `BufferPlan` now separates dynamic MoE `dispatched_tokens` schema shapes from other unresolved shape aliases in diagnostics.
 - [x] `BufferPlan` now reports schema-derived per-layer activation bytes, legacy max-layer activation-byte estimates, and potential schema allocation savings for Phase 4b allocator parity.
+- [x] Regression artifacts now include structured `buffer_plan_summary` metrics for Phase 4b schema allocation parity and baseline drift checks.
 
 Local validation status:
 

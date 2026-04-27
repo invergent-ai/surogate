@@ -124,6 +124,10 @@ def test_artifact_schema_accepts_descriptor_summary():
                 "block_schema_expected_layers": 2,
                 "block_schema_missing_layers": 0,
             },
+            "buffer_plan_summary": {
+                "schema_record_count": 2,
+                "schema_activation_shape_savings_bytes": 1024,
+            },
         }
     )
 
@@ -135,6 +139,10 @@ def test_artifact_schema_accepts_descriptor_summary():
         "block_schema_records": 2,
         "block_schema_expected_layers": 2,
         "block_schema_missing_layers": 0,
+    }
+    assert artifacts.buffer_plan_summary == {
+        "schema_record_count": 2,
+        "schema_activation_shape_savings_bytes": 1024,
     }
 
 
@@ -364,6 +372,24 @@ def test_compare_artifacts_checks_block_schema_summary_counts():
 
     assert f"{case.case_id}: block_schema_summary.block_schema_records 1 != 2" in failures
     assert f"{case.case_id}: missing block_schema_summary.block_schema_missing_layers" in failures
+
+
+def test_compare_artifacts_checks_buffer_plan_summary_counts():
+    case = br.RegressionCase("m", "bf16", "single_gpu")
+    base_metrics = {
+        "buffer_plan_summary": {
+            "schema_record_count": 2,
+            "schema_activation_shape_savings_bytes": 1024,
+        }
+    }
+    cur_metrics = {"buffer_plan_summary": {"schema_record_count": 1}}
+    base = {case.case_id: {"case": br.asdict(case), "status": "passed", "metrics": base_metrics}}
+    cur = {case.case_id: {"case": br.asdict(case), "status": "passed", "metrics": cur_metrics}}
+
+    failures = br.compare_results(cur, base)
+
+    assert f"{case.case_id}: buffer_plan_summary.schema_record_count 1 != 2" in failures
+    assert f"{case.case_id}: missing buffer_plan_summary.schema_activation_shape_savings_bytes" in failures
 
 
 def test_run_case_loads_external_artifact(tmp_path, monkeypatch):

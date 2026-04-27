@@ -2038,6 +2038,38 @@ NB_MODULE(_surogate, m) {
             "Descriptor/capability counts for forward + backward compiled graphs.\n"
             "Returns count-only sub-dicts suitable for regression artifacts.")
         .def(
+            "get_debug_buffer_plan_summary",
+            [](MultiGPUPyTrainer* trainer) {
+                auto s = trainer->get_debug_buffer_plan_summary();
+                nb::dict d;
+                d["schema_record_count"] = s.schema_record_count;
+                d["schema_routing_layers"] = s.schema_routing_layers;
+                d["schema_ep_layers"] = s.schema_ep_layers;
+                d["schema_dense_layers"] = s.schema_dense_layers;
+                d["schema_moe_layers"] = s.schema_moe_layers;
+                d["schema_mamba_layers"] = s.schema_mamba_layers;
+                d["schema_linear_mixer_layers"] = s.schema_linear_mixer_layers;
+                d["schema_slot_count"] = s.schema_slot_count;
+                d["schema_param_slots"] = s.schema_param_slots;
+                d["schema_activation_slots"] = s.schema_activation_slots;
+                d["schema_registry_registered_activation_slots"] = s.schema_registry_registered_activation_slots;
+                d["schema_registry_missing_activation_slots"] = s.schema_registry_missing_activation_slots;
+                d["schema_resolved_activation_shape_slots"] = s.schema_resolved_activation_shape_slots;
+                d["schema_unresolved_activation_shape_slots"] = s.schema_unresolved_activation_shape_slots;
+                d["schema_dynamic_activation_shape_slots"] = s.schema_dynamic_activation_shape_slots;
+                d["schema_resolved_activation_shape_bytes"] = s.schema_resolved_activation_shape_bytes;
+                d["schema_max_layer_activation_shape_bytes"] = s.schema_max_layer_activation_shape_bytes;
+                d["schema_legacy_max_activation_shape_bytes"] = s.schema_legacy_max_activation_shape_bytes;
+                d["schema_activation_shape_savings_bytes"] = s.schema_activation_shape_savings_bytes;
+                d["schema_resolved_param_shape_slots"] = s.schema_resolved_param_shape_slots;
+                d["schema_unresolved_param_shape_slots"] = s.schema_unresolved_param_shape_slots;
+                d["schema_expert_parallel_param_slots"] = s.schema_expert_parallel_param_slots;
+                d["schema_resolved_param_shape_bytes"] = s.schema_resolved_param_shape_bytes;
+                d["schema_resolved_param_shape_local_bytes"] = s.schema_resolved_param_shape_local_bytes;
+                return d;
+            },
+            "BufferPlan schema/allocation diagnostics suitable for regression artifacts.")
+        .def(
             "get_debug_phase_tree",
             [](MultiGPUPyTrainer* trainer, bool is_backward) {
                 auto t = trainer->get_debug_phase_tree(is_backward);

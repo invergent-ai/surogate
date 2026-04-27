@@ -181,6 +181,35 @@ struct DebugDescriptorSummary {
     DebugGraphDescriptorSummary backward;
 };
 
+//! BufferPlan summary for schema-driven allocation migration. Count and byte
+//! fields mirror BufferPlan's Phase 4b dual-path diagnostics.
+struct DebugBufferPlanSummary {
+    std::uint64_t schema_record_count = 0;
+    std::uint64_t schema_routing_layers = 0;
+    std::uint64_t schema_ep_layers = 0;
+    std::uint64_t schema_dense_layers = 0;
+    std::uint64_t schema_moe_layers = 0;
+    std::uint64_t schema_mamba_layers = 0;
+    std::uint64_t schema_linear_mixer_layers = 0;
+    std::uint64_t schema_slot_count = 0;
+    std::uint64_t schema_param_slots = 0;
+    std::uint64_t schema_activation_slots = 0;
+    std::uint64_t schema_registry_registered_activation_slots = 0;
+    std::uint64_t schema_registry_missing_activation_slots = 0;
+    std::uint64_t schema_resolved_activation_shape_slots = 0;
+    std::uint64_t schema_unresolved_activation_shape_slots = 0;
+    std::uint64_t schema_dynamic_activation_shape_slots = 0;
+    std::uint64_t schema_resolved_activation_shape_bytes = 0;
+    std::uint64_t schema_max_layer_activation_shape_bytes = 0;
+    std::uint64_t schema_legacy_max_activation_shape_bytes = 0;
+    std::uint64_t schema_activation_shape_savings_bytes = 0;
+    std::uint64_t schema_resolved_param_shape_slots = 0;
+    std::uint64_t schema_unresolved_param_shape_slots = 0;
+    std::uint64_t schema_expert_parallel_param_slots = 0;
+    std::uint64_t schema_resolved_param_shape_bytes = 0;
+    std::uint64_t schema_resolved_param_shape_local_bytes = 0;
+};
+
 //! One pair of overlapping `(region, block_layer_idx, offset, bytes)` ranges
 //! in the same CompiledGraph. Under correct compilation, the only overlaps
 //! are intentional aliases validated at compile time. Unexpected overlaps
@@ -231,6 +260,9 @@ DebugArenaSummary collect_arena_summary(const DslModel& model);
 
 //! Aggregate descriptor/capability counts across both compiled graphs.
 DebugDescriptorSummary collect_descriptor_summary(const DslModel& model);
+
+//! BufferPlan schema/allocation diagnostics for regression artifacts.
+DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model);
 
 //! Collect the phase tree + instruction stream for one graph.
 //! `DebugPhaseTree::present == false` if the graph has no phase tree

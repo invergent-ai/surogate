@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
 
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/executor/graph_executor.h"
 
@@ -253,6 +255,43 @@ DebugDescriptorSummary collect_descriptor_summary(const DslModel& model) {
     }
     fill_graph_descriptor_summary(s.forward, exec->compiled_forward(), DebugGraphKind::Forward);
     fill_graph_descriptor_summary(s.backward, exec->compiled_backward(), DebugGraphKind::Backward);
+    return s;
+}
+
+DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
+    DebugBufferPlanSummary s{};
+    const auto* rs = dynamic_cast<const DslRunState*>(&model.get_run_state());
+    if (!rs) {
+        return s;
+    }
+    const BufferPlan& p = rs->buffer_plan();
+    auto u64 = [](auto value) -> std::uint64_t {
+        return value > 0 ? static_cast<std::uint64_t>(value) : 0;
+    };
+    s.schema_record_count = u64(p.schema_record_count);
+    s.schema_routing_layers = u64(p.schema_routing_layers);
+    s.schema_ep_layers = u64(p.schema_ep_layers);
+    s.schema_dense_layers = u64(p.schema_dense_layers);
+    s.schema_moe_layers = u64(p.schema_moe_layers);
+    s.schema_mamba_layers = u64(p.schema_mamba_layers);
+    s.schema_linear_mixer_layers = u64(p.schema_linear_mixer_layers);
+    s.schema_slot_count = u64(p.schema_slot_count);
+    s.schema_param_slots = u64(p.schema_param_slots);
+    s.schema_activation_slots = u64(p.schema_activation_slots);
+    s.schema_registry_registered_activation_slots = u64(p.schema_registry_registered_activation_slots);
+    s.schema_registry_missing_activation_slots = u64(p.schema_registry_missing_activation_slots);
+    s.schema_resolved_activation_shape_slots = u64(p.schema_resolved_activation_shape_slots);
+    s.schema_unresolved_activation_shape_slots = u64(p.schema_unresolved_activation_shape_slots);
+    s.schema_dynamic_activation_shape_slots = u64(p.schema_dynamic_activation_shape_slots);
+    s.schema_resolved_activation_shape_bytes = u64(p.schema_resolved_activation_shape_bytes);
+    s.schema_max_layer_activation_shape_bytes = u64(p.schema_max_layer_activation_shape_bytes);
+    s.schema_legacy_max_activation_shape_bytes = u64(p.schema_legacy_max_activation_shape_bytes);
+    s.schema_activation_shape_savings_bytes = u64(p.schema_activation_shape_savings_bytes);
+    s.schema_resolved_param_shape_slots = u64(p.schema_resolved_param_shape_slots);
+    s.schema_unresolved_param_shape_slots = u64(p.schema_unresolved_param_shape_slots);
+    s.schema_expert_parallel_param_slots = u64(p.schema_expert_parallel_param_slots);
+    s.schema_resolved_param_shape_bytes = u64(p.schema_resolved_param_shape_bytes);
+    s.schema_resolved_param_shape_local_bytes = u64(p.schema_resolved_param_shape_local_bytes);
     return s;
 }
 

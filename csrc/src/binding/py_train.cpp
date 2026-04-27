@@ -1707,6 +1707,20 @@ dsl::DebugDescriptorSummary MultiGPUPyTrainer::get_debug_descriptor_summary() {
     return result;
 }
 
+dsl::DebugBufferPlanSummary MultiGPUPyTrainer::get_debug_buffer_plan_summary() {
+    dsl::DebugBufferPlanSummary result{};
+    run_work(
+        [&result](sThreadContext& ctx) {
+            auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!m) {
+                return;
+            }
+            result = dsl::collect_buffer_plan_summary(*m);
+        },
+        /*gpu_id=*/0);
+    return result;
+}
+
 dsl::DebugPhaseTree MultiGPUPyTrainer::get_debug_phase_tree(bool is_backward) {
     dsl::DebugPhaseTree result;
     const long b = B;
