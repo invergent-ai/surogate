@@ -216,6 +216,7 @@ Real-model acceptance queue:
 - [x] LoRA gradient reduction now receives the same schema hook metadata and dispatches opt-in `after_all_reduce` layer hook boundaries after the existing LoRA all-reduce path, so LoRA-only runs are covered by Phase 5 reduction hooks.
 - [x] LoRA tensor iteration now routes through structural `LoRATargetId` helpers for dense, shared, router, separate-expert, and grouped-expert adapters; optimizer/norm pointer setup, optimizer state initialization, and paired optimizer updates no longer hand-walk expert/router fields.
 - [x] LoRA gradient zeroing and reduction now use the same structural target iterator; EP-active expert adapters still reduce over the DP group only, while dense/shared/router adapters keep the existing full-world reduction route.
+- [x] Legacy LoRA optimizer-state zeroing now uses the structural target iterator as well; PEFT-compatible export naming remains explicit.
 
 ---
 

@@ -29,41 +29,25 @@ ModularLoRAOptimizerState::ModularLoRAOptimizerState(const Config& config,
 
     allocate_state();
 
-    auto zero_layer = [stream](auto& opt_layer) {
-        if (!opt_layer.has_value()) return;
-        if (opt_layer->A.Data) {
-            if (opt_layer->A.Device < 0) {
-                std::memset(opt_layer->A.Data, 0, opt_layer->A.bytes());
+    auto zero_tensor = [stream](auto& tensor) {
+        if (tensor.Data) {
+            if (tensor.Device < 0) {
+                std::memset(tensor.Data, 0, tensor.bytes());
             } else {
-                fill_zero(opt_layer->A, stream);
-            }
-        }
-        if (opt_layer->B.Data) {
-            if (opt_layer->B.Device < 0) {
-                std::memset(opt_layer->B.Data, 0, opt_layer->B.bytes());
-            } else {
-                fill_zero(opt_layer->B, stream);
+                fill_zero(tensor, stream);
             }
         }
     };
+    auto zero_layer = [&](auto, auto& layer) {
+        zero_tensor(layer.A);
+        zero_tensor(layer.B);
+    };
 
     for (auto& block : mMomentum.blocks) {
-        zero_layer(block.attention.q);
-        zero_layer(block.attention.k);
-        zero_layer(block.attention.v);
-        zero_layer(block.attention.o);
-        zero_layer(block.mlp.gate);
-        zero_layer(block.mlp.up);
-        zero_layer(block.mlp.down);
+        for_each_lora_layer_weight(block, zero_layer);
     }
     for (auto& block : mVariance.blocks) {
-        zero_layer(block.attention.q);
-        zero_layer(block.attention.k);
-        zero_layer(block.attention.v);
-        zero_layer(block.attention.o);
-        zero_layer(block.mlp.gate);
-        zero_layer(block.mlp.up);
-        zero_layer(block.mlp.down);
+        for_each_lora_layer_weight(block, zero_layer);
     }
 
     // Staging buffers are always device-resident.
