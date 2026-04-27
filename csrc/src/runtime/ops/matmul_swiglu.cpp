@@ -63,13 +63,7 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
 
             // Check if the upstream rmsnorm dispatch has already pre-quantized
             // the LN2 output into the FP8 buffer.
-            DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
-            switch (*op.attrs.matmul_op) {
-                case modules::MatmulOp::QKV: ready_flag = DslRunState::FP8Ready_LN1; break;
-                case modules::MatmulOp::MLPUp: ready_flag = DslRunState::FP8Ready_LN2; break;
-                case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
-                default: break;
-            }
+            DslRunState::FP8BufferReady ready_flag = fp8_ready_flag_for_matmul_op(*op.attrs.matmul_op);
             if (ready_flag != DslRunState::FP8Ready_None && mRunState.consume_fp8_buffer_ready(ready_flag)) {
                 ctx.inp_quant_ready = true;
             }

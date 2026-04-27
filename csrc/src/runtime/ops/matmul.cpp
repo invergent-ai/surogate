@@ -178,13 +178,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
                     // Check if the upstream activation dispatch has already pre-quantized
                     // the input into the FP8 buffer (co-located quantization).
-                    DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
-                    switch (*op.attrs.matmul_op) {
-                        case modules::MatmulOp::QKV: ready_flag = DslRunState::FP8Ready_LN1; break;
-                        case modules::MatmulOp::MLPUp: ready_flag = DslRunState::FP8Ready_LN2; break;
-                        case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
-                        default: break;
-                    }
+                    DslRunState::FP8BufferReady ready_flag = fp8_ready_flag_for_matmul_op(*op.attrs.matmul_op);
                     if (ready_flag != DslRunState::FP8Ready_None) {
                         if (is_gate_projection && mRunState.is_fp8_buffer_ready(ready_flag)) {
                             ctx.inp_quant_ready = true;

@@ -5,6 +5,7 @@
 
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/tensor_role.h"
+#include "runtime/executor/graph_executor_helpers.h"
 
 using namespace dsl;
 
@@ -80,6 +81,15 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE_FALSE(activation.is_moe_owned());
         REQUIRE_FALSE(tensor_role_is_rope_name("blocks[0].attn_out"));
     }
+}
+
+TEST_CASE("FP8 ready flag mapping covers dense matmul quant producers", "[tensor_role]") {
+    REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::QKV) == DslRunState::FP8Ready_LN1);
+    REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::MLPUp) == DslRunState::FP8Ready_LN2);
+    REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::AttnOut) == DslRunState::FP8Ready_Att);
+    REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::MLPDown) == DslRunState::FP8Ready_SwiGLU);
+    REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::Embedding) == DslRunState::FP8Ready_None);
+    REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::LMHead) == DslRunState::FP8Ready_None);
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {
