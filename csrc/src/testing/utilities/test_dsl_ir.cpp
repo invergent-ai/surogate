@@ -42,7 +42,18 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
         "operations": [
           {"id": "node_1", "name": "embedding", "kernel_type": "embedding", "inputs": ["token_ids", "embedding"], "outputs": ["x0"]},
           {"id": "node_2", "name": "view", "kernel_type": "view", "inputs": ["x0"], "outputs": ["x0_flat"], "attrs": {"shape": ["(B * T)", "d_model"]}}
-        ]
+        ],
+        "metadata": {
+          "block_schemas": [
+            {
+              "layer": 0,
+              "block_type": "Qwen3Block",
+              "schema": {
+                "attrs": {"block_family": "qwen3_dense"}
+              }
+            }
+          ]
+        }
       }
     }
   ]
@@ -80,4 +91,26 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(dim_expr);
     dsl::Dim dim = dsl::Dim::computed(*dim_expr);
     REQUIRE(dsl::resolve_dim(dim, env) == 6);
+
+    auto meta_it = module.forward->metadata.find("block_schemas");
+    REQUIRE(meta_it != module.forward->metadata.end());
+    const auto* records_ptr = std::get_if<dsl::AttrValue::ListPtr>(&meta_it->second.value);
+    REQUIRE(records_ptr);
+    REQUIRE(*records_ptr);
+    REQUIRE((**records_ptr).size() == 1);
+
+    const auto* record_ptr = std::get_if<dsl::AttrValue::MapPtr>(&(**records_ptr)[0].value);
+    REQUIRE(record_ptr);
+    REQUIRE(*record_ptr);
+    const auto& record = **record_ptr;
+    REQUIRE(std::get<std::int64_t>(record.at("layer").value) == 0);
+    REQUIRE(std::get<std::string>(record.at("block_type").value) == "Qwen3Block");
+
+    const auto* schema_ptr = std::get_if<dsl::AttrValue::MapPtr>(&record.at("schema").value);
+    REQUIRE(schema_ptr);
+    REQUIRE(*schema_ptr);
+    const auto* attrs_ptr = std::get_if<dsl::AttrValue::MapPtr>(&(**schema_ptr).at("attrs").value);
+    REQUIRE(attrs_ptr);
+    REQUIRE(*attrs_ptr);
+    REQUIRE(std::get<std::string>((**attrs_ptr).at("block_family").value) == "qwen3_dense");
 }

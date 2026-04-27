@@ -211,6 +211,9 @@ Graph parse_graph(const nlohmann::json& graph_json) {
             graph.operations.push_back(parse_operation(op_json));
         }
     }
+    if (graph_json.contains("metadata") && graph_json["metadata"].is_object()) {
+        graph.metadata = parse_attr_map(graph_json["metadata"]);
+    }
     return graph;
 }
 
