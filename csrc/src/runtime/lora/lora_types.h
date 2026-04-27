@@ -5,6 +5,9 @@
 #ifndef SUROGATE_SRC_MODULES_LORA_LORA_TYPES_H
 #define SUROGATE_SRC_MODULES_LORA_LORA_TYPES_H
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -266,6 +269,118 @@ inline LoRAGroupedLayerWeights<TTensor>* get_grouped_weight_by_target(LoRABlockW
         case LoRATargetId::ExpertDown: return g.down.has_value() ? &*g.down : nullptr;
         default: return nullptr;
     }
+}
+
+template <typename TTensor>
+inline LoRALayerWeights<TTensor>* get_expert_weight_by_target(LoRAExpertWeights<TTensor>& expert, LoRATargetId id) {
+    switch (id) {
+        case LoRATargetId::ExpertGate: return expert.gate.has_value() ? &*expert.gate : nullptr;
+        case LoRATargetId::ExpertUp: return expert.up.has_value() ? &*expert.up : nullptr;
+        case LoRATargetId::ExpertGateUp: return expert.gate_up.has_value() ? &*expert.gate_up : nullptr;
+        case LoRATargetId::ExpertDown: return expert.down.has_value() ? &*expert.down : nullptr;
+        default: return nullptr;
+    }
+}
+
+inline constexpr std::array<LoRATargetId, 8> kBaseLoRALayerTargets = {
+    LoRATargetId::Q,
+    LoRATargetId::K,
+    LoRATargetId::V,
+    LoRATargetId::O,
+    LoRATargetId::Gate,
+    LoRATargetId::GateUp,
+    LoRATargetId::Up,
+    LoRATargetId::Down,
+};
+
+inline constexpr std::array<LoRATargetId, 4> kExpertLoRALayerTargets = {
+    LoRATargetId::ExpertGate,
+    LoRATargetId::ExpertGateUp,
+    LoRATargetId::ExpertUp,
+    LoRATargetId::ExpertDown,
+};
+
+inline constexpr std::array<LoRATargetId, 2> kSharedLoRALayerTargets = {
+    LoRATargetId::SharedUp,
+    LoRATargetId::SharedDown,
+};
+
+template <typename TTensor, typename Fn>
+inline void for_each_lora_layer_weight(LoRABlockWeights<TTensor>& block, Fn&& fn) {
+    for (LoRATargetId id : kBaseLoRALayerTargets) {
+        if (auto* layer = get_layer_weight_by_target(block, id)) {
+            fn(id, *layer);
+        }
+    }
+
+    if (block.moe.use_grouped) {
+        for (LoRATargetId id : kExpertLoRALayerTargets) {
+            if (auto* layer = get_grouped_weight_by_target(block, id)) {
+                fn(id, *layer);
+            }
+        }
+    } else {
+        for (auto& expert : block.moe.experts) {
+            for (LoRATargetId id : kExpertLoRALayerTargets) {
+                if (auto* layer = get_expert_weight_by_target(expert, id)) {
+                    fn(id, *layer);
+                }
+            }
+        }
+    }
+
+    for (LoRATargetId id : kSharedLoRALayerTargets) {
+        if (auto* layer = get_layer_weight_by_target(block, id)) {
+            fn(id, *layer);
+        }
+    }
+
+    if (auto* layer = get_layer_weight_by_target(block, LoRATargetId::Router)) {
+        fn(LoRATargetId::Router, *layer);
+    }
+}
+
+template <typename TWeightTensor, typename TGradTensor, typename Fn>
+inline void for_each_lora_layer_weight_pair(LoRABlockWeights<TWeightTensor>& weights,
+                                            LoRABlockWeights<TGradTensor>& grads,
+                                            Fn&& fn) {
+    auto visit_pair = [&](LoRATargetId id) {
+        auto* w = get_layer_weight_by_target(weights, id);
+        auto* g = get_layer_weight_by_target(grads, id);
+        if (w && g) {
+            fn(id, *w, *g);
+        }
+    };
+
+    for (LoRATargetId id : kBaseLoRALayerTargets) {
+        visit_pair(id);
+    }
+
+    if (weights.moe.use_grouped) {
+        for (LoRATargetId id : kExpertLoRALayerTargets) {
+            auto* w = get_grouped_weight_by_target(weights, id);
+            auto* g = get_grouped_weight_by_target(grads, id);
+            if (w && g) {
+                fn(id, *w, *g);
+            }
+        }
+    } else {
+        const std::size_t n = std::min(weights.moe.experts.size(), grads.moe.experts.size());
+        for (std::size_t e = 0; e < n; ++e) {
+            for (LoRATargetId id : kExpertLoRALayerTargets) {
+                auto* w = get_expert_weight_by_target(weights.moe.experts[e], id);
+                auto* g = get_expert_weight_by_target(grads.moe.experts[e], id);
+                if (w && g) {
+                    fn(id, *w, *g);
+                }
+            }
+        }
+    }
+
+    for (LoRATargetId id : kSharedLoRALayerTargets) {
+        visit_pair(id);
+    }
+    visit_pair(LoRATargetId::Router);
 }
 
 /// Stable integer key for a LoRA target, used to seed per-projection

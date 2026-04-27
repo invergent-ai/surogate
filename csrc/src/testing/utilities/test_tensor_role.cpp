@@ -4,13 +4,31 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <vector>
 
 #include "runtime/core/matmul_context.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/graph_executor_helpers.h"
+#include "runtime/lora/lora_types.h"
 
 using namespace dsl;
+
+namespace {
+
+struct FakeLoRATensor {
+    void* Data = nullptr;
+};
+
+modules::LoRALayerWeights<FakeLoRATensor> fake_lora_layer() {
+    return {FakeLoRATensor{reinterpret_cast<void*>(0x1)}, FakeLoRATensor{reinterpret_cast<void*>(0x2)}};
+}
+
+modules::LoRAGroupedLayerWeights<FakeLoRATensor> fake_grouped_lora_layer() {
+    return {FakeLoRATensor{reinterpret_cast<void*>(0x3)}, FakeLoRATensor{reinterpret_cast<void*>(0x4)}};
+}
+
+}  // namespace
 
 TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively", "[tensor_role]") {
     SECTION("router tensors are MoE-owned and router-replicated") {
@@ -126,6 +144,43 @@ TEST_CASE("MatmulContext carries optional input TensorRole metadata", "[tensor_r
     REQUIRE(moe_ctx.has_token_role);
     REQUIRE(moe_ctx.token_role.is_moe_owned());
     REQUIRE(moe_ctx.token_role.block_layer == 0);
+}
+
+TEST_CASE("LoRA target iteration follows structural block order", "[tensor_role][lora]") {
+    modules::LoRABlockWeights<FakeLoRATensor> block;
+    block.attention.q = fake_lora_layer();
+    block.mlp.down = fake_lora_layer();
+    block.moe.experts.resize(1);
+    block.moe.experts[0].gate = fake_lora_layer();
+    block.moe.experts[0].up = fake_lora_layer();
+    block.moe.shared = modules::LoRAMLPWeights<FakeLoRATensor>{};
+    block.moe.shared->down = fake_lora_layer();
+    block.router = fake_lora_layer();
+
+    std::vector<modules::LoRATargetId> ids;
+    modules::for_each_lora_layer_weight(block, [&](modules::LoRATargetId id, auto&) { ids.push_back(id); });
+
+    REQUIRE(ids == std::vector<modules::LoRATargetId>{
+                       modules::LoRATargetId::Q,
+                       modules::LoRATargetId::Down,
+                       modules::LoRATargetId::ExpertGate,
+                       modules::LoRATargetId::ExpertUp,
+                       modules::LoRATargetId::SharedDown,
+                       modules::LoRATargetId::Router,
+                   });
+
+    block.moe.use_grouped = true;
+    block.moe.grouped.gate_up = fake_grouped_lora_layer();
+    ids.clear();
+    modules::for_each_lora_layer_weight(block, [&](modules::LoRATargetId id, auto&) { ids.push_back(id); });
+
+    REQUIRE(ids == std::vector<modules::LoRATargetId>{
+                       modules::LoRATargetId::Q,
+                       modules::LoRATargetId::Down,
+                       modules::LoRATargetId::ExpertGateUp,
+                       modules::LoRATargetId::SharedDown,
+                       modules::LoRATargetId::Router,
+                   });
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {

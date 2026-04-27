@@ -310,51 +310,16 @@ void DslModel::populate_lora_norm_pointers(NCCLCommunicator& comm, cudaStream_t 
         h_dtype_flags.push_back(t.DType == ETensorDType::BF16 ? 1 : 0);
     };
 
-    auto collect_layer = [&](const auto& layer) {
-        if (!layer.has_value()) return;
-        collect_tensor(layer->A);
-        collect_tensor(layer->B);
-    };
-
-    auto collect_grouped_layer = [&](const auto& layer) {
-        if (!layer.has_value()) return;
-        collect_tensor(layer->A);
-        collect_tensor(layer->B);
+    auto collect_layer = [&](auto, auto& layer) {
+        collect_tensor(layer.A);
+        collect_tensor(layer.B);
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         bool unused_acc = false;
         auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
 
-        collect_layer(g.attention.q);
-        collect_layer(g.attention.k);
-        collect_layer(g.attention.v);
-        collect_layer(g.attention.o);
-        collect_layer(g.mlp.gate);
-        collect_layer(g.mlp.gate_up);
-        collect_layer(g.mlp.up);
-        collect_layer(g.mlp.down);
-
-        if (g.moe.use_grouped) {
-            collect_grouped_layer(g.moe.grouped.gate);
-            collect_grouped_layer(g.moe.grouped.gate_up);
-            collect_grouped_layer(g.moe.grouped.up);
-            collect_grouped_layer(g.moe.grouped.down);
-        } else {
-            for (auto& expert : g.moe.experts) {
-                collect_layer(expert.gate);
-                collect_layer(expert.gate_up);
-                collect_layer(expert.up);
-                collect_layer(expert.down);
-            }
-        }
-
-        if (g.moe.shared.has_value()) {
-            collect_layer(g.moe.shared->up);
-            collect_layer(g.moe.shared->down);
-        }
-
-        collect_layer(g.router);
+        modules::for_each_lora_layer_weight(g, collect_layer);
     }
 
     lrs.norm_num_tensors = static_cast<int>(h_data_ptrs.size());
@@ -652,48 +617,14 @@ void DslModel::update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t st
     h_grad_ptrs.reserve(state.num_tensors);
     bool unused_acc = false;
 
-    auto collect_grad = [&](std::optional<modules::LoRALayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
-    };
-    auto collect_grouped_grad = [&](std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
+    auto collect_layer = [&](auto, auto& layer) {
+        if (layer.A.Data) h_grad_ptrs.push_back(layer.A.Data);
+        if (layer.B.Data) h_grad_ptrs.push_back(layer.B.Data);
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
-        collect_grad(lora_g.attention.q);
-        collect_grad(lora_g.attention.k);
-        collect_grad(lora_g.attention.v);
-        collect_grad(lora_g.attention.o);
-        collect_grad(lora_g.mlp.gate);
-        collect_grad(lora_g.mlp.gate_up);
-        collect_grad(lora_g.mlp.up);
-        collect_grad(lora_g.mlp.down);
-
-        if (lora_g.moe.use_grouped) {
-            collect_grouped_grad(lora_g.moe.grouped.gate);
-            collect_grouped_grad(lora_g.moe.grouped.gate_up);
-            collect_grouped_grad(lora_g.moe.grouped.up);
-            collect_grouped_grad(lora_g.moe.grouped.down);
-        } else {
-            for (auto& expert : lora_g.moe.experts) {
-                collect_grad(expert.gate);
-                collect_grad(expert.gate_up);
-                collect_grad(expert.up);
-                collect_grad(expert.down);
-            }
-        }
-
-        if (lora_g.moe.shared.has_value()) {
-            collect_grad(lora_g.moe.shared->up);
-            collect_grad(lora_g.moe.shared->down);
-        }
-
-        collect_grad(lora_g.router);
+        modules::for_each_lora_layer_weight(lora_g, collect_layer);
     }
 
     if (h_grad_ptrs.size() != static_cast<std::size_t>(state.num_tensors)) {
@@ -887,48 +818,14 @@ void DslModel::update_lora_adamw_grad_pointers(NCCLCommunicator& comm, cudaStrea
     h_grad_ptrs.reserve(state.num_tensors);
     bool unused_acc = false;
 
-    auto collect_grad = [&](std::optional<modules::LoRALayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
-    };
-    auto collect_grouped_grad = [&](std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
+    auto collect_layer = [&](auto, auto& layer) {
+        if (layer.A.Data) h_grad_ptrs.push_back(layer.A.Data);
+        if (layer.B.Data) h_grad_ptrs.push_back(layer.B.Data);
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
-        collect_grad(lora_g.attention.q);
-        collect_grad(lora_g.attention.k);
-        collect_grad(lora_g.attention.v);
-        collect_grad(lora_g.attention.o);
-        collect_grad(lora_g.mlp.gate);
-        collect_grad(lora_g.mlp.gate_up);
-        collect_grad(lora_g.mlp.up);
-        collect_grad(lora_g.mlp.down);
-
-        if (lora_g.moe.use_grouped) {
-            collect_grouped_grad(lora_g.moe.grouped.gate);
-            collect_grouped_grad(lora_g.moe.grouped.gate_up);
-            collect_grouped_grad(lora_g.moe.grouped.up);
-            collect_grouped_grad(lora_g.moe.grouped.down);
-        } else {
-            for (auto& expert : lora_g.moe.experts) {
-                collect_grad(expert.gate);
-                collect_grad(expert.gate_up);
-                collect_grad(expert.up);
-                collect_grad(expert.down);
-            }
-        }
-
-        if (lora_g.moe.shared.has_value()) {
-            collect_grad(lora_g.moe.shared->up);
-            collect_grad(lora_g.moe.shared->down);
-        }
-
-        collect_grad(lora_g.router);
+        modules::for_each_lora_layer_weight(lora_g, collect_layer);
     }
 
     if (h_grad_ptrs.size() != static_cast<std::size_t>(state.num_tensors)) {
