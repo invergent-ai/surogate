@@ -26,6 +26,8 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
             "moe_fp4_grouped_eligible_ops": 2,
             "lora_slices": 3,
             "lora_schema_slot_slices": 3,
+            "forward_hook_points": 4,
+            "forward_hook_schema_slot_points": 4,
             "name": "forward",
         },
         "backward": {
@@ -58,6 +60,8 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
     assert flattened["lora_slices"] == 5
     assert flattened["lora_schema_slot_slices"] == 5
     assert flattened["grouped_lora_schema_slot_slices"] == 1
+    assert flattened["forward_hook_points"] == 4
+    assert flattened["forward_hook_schema_slot_points"] == 4
 
 
 def test_flatten_arena_summary_keeps_top_level_graph_and_region_counts():

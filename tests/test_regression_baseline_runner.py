@@ -68,6 +68,8 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "lora_slices": 2,
                     "lora_schema_slot_slices": 2,
                     "grouped_lora_schema_slot_slices": 2,
+                    "forward_hook_points": 2,
+                    "forward_hook_schema_slot_points": 2,
                 },
                 "block_schema_summary": {
                     "block_schema_records": 2,
@@ -113,6 +115,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["hook_target_counts"]["hook_after_all_to_all_targets"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_after_all_reduce_targets"] == 1
     assert report["rows"][0]["hook_target_counts"]["lora_schema_slot_slices"] == 2
+    assert report["rows"][0]["hook_target_counts"]["forward_hook_schema_slot_points"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_registry_registrations"] == 8
     assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
     assert report["rows"][0]["buffer_plan_summary"]["schema_expert_parallel_param_shape_savings_bytes"] == 1024

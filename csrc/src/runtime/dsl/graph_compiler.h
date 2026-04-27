@@ -241,6 +241,7 @@ struct CompiledAttrs {
     // values are consumed for this purpose; they are not invoked as
     // callbacks anymore (LoRA dispatch is slice-driven).
     std::optional<modules::ForwardHookPoint> forward_hook_point;
+    std::string forward_hook_schema_slot;  ///< Phase 5 structural equivalent of forward_hook_point; diagnostics only.
 
     // MoE-specific
     int top_k = 0;

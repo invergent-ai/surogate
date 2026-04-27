@@ -2032,6 +2032,8 @@ NB_MODULE(_surogate, m) {
                     d["lora_slices"] = g.lora_slices;
                     d["lora_schema_slot_slices"] = g.lora_schema_slot_slices;
                     d["grouped_lora_schema_slot_slices"] = g.grouped_lora_schema_slot_slices;
+                    d["forward_hook_points"] = g.forward_hook_points;
+                    d["forward_hook_schema_slot_points"] = g.forward_hook_schema_slot_points;
                     return d;
                 };
                 nb::dict r;

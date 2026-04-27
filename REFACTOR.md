@@ -202,6 +202,7 @@ Real-model acceptance queue:
 - [x] North-star coverage rows now report Phase 5 hook readiness, missing hook-count diagnostics, and hook target counts alongside descriptor/schema/storage/EP readiness.
 - [x] Schema hook target collection now covers `after_produce` activation slots used by LoRA post-projection hooks (`qkv`, `att_out`, `mlp_up`, `mlp_down`, router/expert outputs), and `DslModel` seeds inert registrations for them.
 - [x] Schema hook target collection now covers `after_all_reduce` replicated/router-replicated parameter slots, so DP hook readiness is tracked alongside EP all-to-all and sharded reduce-scatter readiness.
+- [x] Legacy `ForwardHookPoint` attrs now carry diagnostic schema-slot equivalents (`qkv`, `att_out`, `mlp_up`, `mlp_down`), and descriptor/coverage reports track parity before the enum path is removed.
 
 ---
 

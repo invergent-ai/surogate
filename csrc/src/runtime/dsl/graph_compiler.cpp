@@ -40,6 +40,11 @@ std::string schema_slot_from_weight_name(std::string_view weight_name) {
     return std::string(slot);
 }
 
+void set_forward_hook_schema_slot(CompiledAttrs& attrs, modules::ForwardHookPoint point, std::string_view schema_slot) {
+    attrs.forward_hook_point = point;
+    attrs.forward_hook_schema_slot = std::string(schema_slot);
+}
+
 TensorRoleKind role_kind_from_tensor_kind(TensorKind kind) {
     switch (kind) {
         case TensorKind::ForwardParam: return TensorRoleKind::Param;
@@ -1232,18 +1237,24 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             if (matmul_op.has_value()) {
                 switch (*matmul_op) {
                     case modules::MatmulOp::QKV:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterQKVProjection;
+                        set_forward_hook_schema_slot(attrs, modules::ForwardHookPoint::AfterQKVProjection, "qkv");
                         break;
                     case modules::MatmulOp::AttnOut:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterAttnOutProjection;
+                        set_forward_hook_schema_slot(attrs,
+                                                     modules::ForwardHookPoint::AfterAttnOutProjection,
+                                                     "att_out");
                         break;
                     case modules::MatmulOp::MLPUp:
                         if (!is_gate_projection) {
-                            attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                            set_forward_hook_schema_slot(attrs,
+                                                         modules::ForwardHookPoint::AfterMLPUpProjection,
+                                                         "mlp_up");
                         }
                         break;
                     case modules::MatmulOp::MLPDown:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPDownProjection;
+                        set_forward_hook_schema_slot(attrs,
+                                                     modules::ForwardHookPoint::AfterMLPDownProjection,
+                                                     "mlp_down");
                         break;
                     default: break;
                 }
@@ -1260,7 +1271,7 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             attrs.layer_idx = layer_idx;
             attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
             if (matmul_op.has_value() && *matmul_op == modules::MatmulOp::MLPUp) {
-                attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                set_forward_hook_schema_slot(attrs, modules::ForwardHookPoint::AfterMLPUpProjection, "mlp_up");
             }
         }
     }

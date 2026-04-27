@@ -649,6 +649,8 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
         "lora_slices": descriptor_summary.get("lora_slices"),
         "lora_schema_slot_slices": descriptor_summary.get("lora_schema_slot_slices"),
         "grouped_lora_schema_slot_slices": descriptor_summary.get("grouped_lora_schema_slot_slices"),
+        "forward_hook_points": descriptor_summary.get("forward_hook_points"),
+        "forward_hook_schema_slot_points": descriptor_summary.get("forward_hook_schema_slot_points"),
     }
 
 
@@ -696,6 +698,8 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
     if int(counts.get("lora_slices") or 0) > 0:
         required.append("hook_after_produce_targets")
         required.append("lora_schema_slot_slices")
+    if int(counts.get("forward_hook_points") or 0) > 0:
+        required.append("forward_hook_schema_slot_points")
     if not required:
         return "not_applicable", []
     if not metrics:
@@ -705,6 +709,9 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
         value = int(counts.get(key) or 0)
         if key == "lora_schema_slot_slices":
             if value < int(counts.get("lora_slices") or 0):
+                missing.append(key)
+        elif key == "forward_hook_schema_slot_points":
+            if value < int(counts.get("forward_hook_points") or 0):
                 missing.append(key)
         elif value <= 0:
             missing.append(key)

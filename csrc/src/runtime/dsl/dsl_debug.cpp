@@ -197,6 +197,12 @@ void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const Compi
     out.fp8_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP8Ready));
     out.fp4_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP4Ready));
     for (const CompiledOp& op : graph->ops) {
+        if (op.attrs.forward_hook_point.has_value()) {
+            out.forward_hook_points += 1;
+            if (!op.attrs.forward_hook_schema_slot.empty()) {
+                out.forward_hook_schema_slot_points += 1;
+            }
+        }
         for (const LoRASlice& slice : op.attrs.lora_slices) {
             out.lora_slices += 1;
             if (!slice.schema_slot.empty()) {
