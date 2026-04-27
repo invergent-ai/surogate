@@ -155,7 +155,7 @@ def _gemma4_dense_schema(block_family: str, *, shared_kv: bool = False) -> Block
             SlotDecl("mlp_up_weight", kind="param", shape=("M", "C"), residency="auto"),
             SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
             SlotDecl("layer_scalar", kind="param", shape=(1,), dtype="bf16"),
-            SlotDecl("res_att", shape=("B", "T", "C"), save_for_backward=True),
+            SlotDecl("res_att", shape=("B", "T", "C")),
             SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
         ),
         attrs={"block_family": block_family, "shared_kv": shared_kv},
@@ -196,7 +196,7 @@ def _gemma4_moe_schema(block_family: str) -> BlockSchema:
             SlotDecl(
                 "permuted_input", shape=("dispatched_tokens", "C"), distribution=DistributionDecl.expert_parallel()
             ),
-            SlotDecl("res_att", shape=("B", "T", "C"), save_for_backward=True),
+            SlotDecl("res_att", shape=("B", "T", "C")),
         ),
         routing=RoutingSchema(kind="topk_softmax", topk="num_experts_per_tok", norm_topk_prob=True),
         ep_topology=EPTopology(ep_size_param="ep_size"),

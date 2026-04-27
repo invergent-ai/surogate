@@ -20,7 +20,7 @@ class Qwen3Block(nn.Block):
             SlotDecl("out_weight", kind="param", shape=("C", "AttnDim")),
             SlotDecl("mlp_up_weight", kind="param", shape=("2M", "C"), residency="auto"),
             SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
-            SlotDecl("res_att", shape=("B", "T", "C"), save_for_backward=True),
+            SlotDecl("res_att", shape=("B", "T", "C")),
             SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
         ),
         attrs={"block_family": "qwen3_dense"},

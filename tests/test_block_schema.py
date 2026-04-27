@@ -110,6 +110,17 @@ def _compiled_activation_slot_names(module_payload):
     return names
 
 
+def _compiled_save_for_backward_slot_names(module_payload):
+    layout = module_payload["activation_layout"]
+    names = set()
+    for slot in layout.get("slots") or []:
+        if not slot.get("save_for_backward"):
+            continue
+        names.add(slot["name"])
+        names.update(slot.get("aliases") or [])
+    return names
+
+
 def test_block_schema_distribution_factories():
     replicated = DistributionDecl.replicated()
     sharded = DistributionDecl.sharded_dim(dim=0, mode="zero2", num_shards="dp_size")
@@ -401,3 +412,27 @@ def test_acceptance_model_schema_activation_slots_exist_in_compiled_layout():
                     missing.append(f"layer{record['layer']}.{slot['name']}")
 
         assert missing == [], f"{model_name} schema references non-emitted activation slots: {missing}"
+
+
+def test_acceptance_model_schema_save_slots_match_compiled_layout():
+    from surogate.dsl.models.gemma4 import Gemma4CausalModel  # noqa: F401
+    from surogate.dsl.models.gpt_oss import GptOssModel  # noqa: F401
+    from surogate.dsl.models.qwen3 import Qwen3Model  # noqa: F401
+    from surogate.dsl.models.qwen3_5 import Qwen3_5CausalModel  # noqa: F401
+    from surogate.dsl.models.qwen3_5_moe import Qwen3_5MoECausalModel  # noqa: F401
+
+    for model_name, config, _expected_families in _acceptance_schema_cases():
+        payload = json.loads(compile_model(model_name, config, raise_on_error=True))
+        module = payload["modules"][0]
+        layout_save_names = _compiled_save_for_backward_slot_names(module)
+        mismatched = []
+
+        records = module["forward"]["metadata"]["block_schemas"]
+        for record in records:
+            for slot in record["schema"]["slots"]:
+                if not slot.get("save_for_backward"):
+                    continue
+                if slot["name"] not in layout_save_names:
+                    mismatched.append(f"layer{record['layer']}.{slot['name']}")
+
+        assert mismatched == [], f"{model_name} schema save slots are not saved in compiled layout: {mismatched}"

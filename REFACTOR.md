@@ -144,6 +144,7 @@
 - [x] Qwen3.5, Qwen3.5-MoE, and Gemma4 schemas now exclude non-emitted block inputs/state slots so `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` enforces real slot-registry parity across the acceptance queue.
 - [x] `BufferPlan` now preserves schema slot lifetime metadata and splits resolved activation bytes into save-for-backward versus frame-local allocation candidates for the Phase 4b dual path.
 - [x] Regression artifacts now capture flattened arena summaries so schema save/frame byte plans can be compared against compiled graph arena allocation drift.
+- [x] Acceptance model schema tests now enforce save-for-backward parity with compiled activation layouts; dense `res_att` schema declarations were aligned to the emitted non-save layout.
 
 Local validation status:
 
