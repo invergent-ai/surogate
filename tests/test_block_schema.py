@@ -1,9 +1,11 @@
+import json
+
 from surogate.dsl.block_schema import BlockSchema, DistributionDecl
 from surogate.dsl.blocks.gpt_oss import GptOssBlock
 from surogate.dsl.blocks.nemotron_h import NemotronHMamba2Block, NemotronHMoEBlock
 from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
 from surogate.dsl.py_lowering import lower_block_spec
-from surogate.dsl.py_compiler import _module_ir_to_dict, compile_block_spec
+from surogate.dsl.py_compiler import _module_ir_to_dict, compile_block_spec, compile_model
 
 
 def test_block_schema_distribution_factories():
@@ -112,3 +114,38 @@ def test_legacy_lowerer_preserves_block_schema_metadata():
 
     assert ir.block_schema["attrs"]["block_family"] == "nemotron_mamba2"
     assert ir.block_schema["slots"][0]["name"] == "ssm_state"
+
+
+def test_model_compile_emits_per_layer_block_schema_metadata():
+    from surogate.dsl.models.qwen3_moe import Qwen3MoEModel  # noqa: F401
+
+    payload = json.loads(
+        compile_model(
+            "Qwen3MoEModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "eps": 1e-6,
+                "use_qkv_bias": False,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "shared_expert_intermediate": 256,
+            },
+            raise_on_error=True,
+        )
+    )
+
+    forward = payload["modules"][0]["forward"]
+    records = forward["metadata"]["block_schemas"]
+
+    assert [record["layer"] for record in records] == [0, 1]
+    assert records[0]["blocks_param"] == "blocks"
+    assert records[0]["block_type"] == "Qwen3MoEBlock"
+    assert records[0]["schema"]["routing"]["kind"] == "topk_softmax"
+    assert records[0]["schema"]["ep_topology"]["ep_size_param"] == "ep_size"
