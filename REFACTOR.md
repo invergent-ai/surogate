@@ -115,6 +115,7 @@
 - [x] Optional `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` parity guard checks schema record coverage against `NumLayers` without changing default execution.
 - [x] `BufferPlan` now carries schema-derived record/routing/EP counters as diagnostics-only parity inputs.
 - [x] `BufferPlan` schema diagnostics now include slot, param, activation, expert-parallel, and streaming-hint counters.
+- [x] Model-level schema coverage tests now assert complete per-layer metadata for Qwen3, GPT-OSS, and Gemma4 compiled graphs.
 
 Local validation status:
 

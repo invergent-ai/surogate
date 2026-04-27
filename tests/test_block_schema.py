@@ -256,3 +256,69 @@ def test_model_compile_emits_per_layer_block_schema_metadata():
     assert records[0]["block_type"] == "Qwen3MoEBlock"
     assert records[0]["schema"]["routing"]["kind"] == "topk_softmax"
     assert records[0]["schema"]["ep_topology"]["ep_size_param"] == "ep_size"
+
+
+def test_acceptance_model_graphs_emit_complete_block_schema_metadata():
+    from surogate.dsl.models.gemma4 import Gemma4CausalModel  # noqa: F401
+    from surogate.dsl.models.gpt_oss import GptOssModel  # noqa: F401
+    from surogate.dsl.models.qwen3 import Qwen3Model  # noqa: F401
+
+    cases = [
+        (
+            "Qwen3Model",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+            },
+            ["qwen3_dense", "qwen3_dense"],
+        ),
+        (
+            "GptOssModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+            },
+            ["gpt_oss_moe", "gpt_oss_moe"],
+        ),
+        (
+            "Gemma4CausalModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "sliding_window": 512,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "global_head_dim": 64,
+                "global_num_kv_heads": 2,
+                "d_per_layer_input": 0,
+            },
+            ["gemma4_sliding", "gemma4_full"],
+        ),
+    ]
+
+    for model_name, config, expected_families in cases:
+        payload = json.loads(compile_model(model_name, config, raise_on_error=True))
+        records = payload["modules"][0]["forward"]["metadata"]["block_schemas"]
+
+        assert len(records) == config["n_layers"]
+        assert [record["layer"] for record in records] == list(range(config["n_layers"]))
+        assert [record["schema"]["attrs"]["block_family"] for record in records] == expected_families
