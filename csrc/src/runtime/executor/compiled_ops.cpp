@@ -515,6 +515,29 @@ int CompiledExecutor::dispatch_schema_layer_hooks(HookEventKind event, int layer
     return dispatched;
 }
 
+int CompiledExecutor::schema_hook_layer_idx(const CompiledOp& op) const {
+    if (op.attrs.layer_idx >= 0) {
+        return op.attrs.layer_idx;
+    }
+    if (op.layer_start >= 0) {
+        return op.layer_start;
+    }
+    if (op.layer_end >= 0) {
+        return op.layer_end;
+    }
+    for (const TensorRef& ref : op.outputs) {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+    }
+    for (const TensorRef& ref : op.inputs) {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+    }
+    return -1;
+}
+
 void CompiledExecutor::set_recompute_fn(std::function<void(int, long, long, bool)> fn) {
     mRecomputeFn = std::move(fn);
 }
