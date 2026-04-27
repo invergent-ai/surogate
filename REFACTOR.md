@@ -642,7 +642,7 @@ The `RoutingSchema` and `EPTopology` declarations make per-architecture MoE diff
 
 #### 4b. BufferPlan migration (weeks 3–4)
 
-**Status: STARTED.** The C++ runtime now collects per-layer schema records and exposes an opt-in coverage parity guard; allocator decisions still use the legacy enum-driven `BufferPlan`.
+**Status: STARTED.** The C++ runtime now collects per-layer schema records, validates coverage and slot-registry parity behind `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1`, preserves per-slot residency/distribution/routing/shape metadata, and computes schema-side activation/parameter byte diagnostics including EP-local expert weights. Allocator decisions still use the legacy enum-driven `BufferPlan`.
 
 Parallel `BufferPlan` path consumes schemas. Old enum-driven path stays. Both run, allocation parity-checked.
 
