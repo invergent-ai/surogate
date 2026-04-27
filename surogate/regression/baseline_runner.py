@@ -120,7 +120,7 @@ FIRST_MONTH_MATRIX: tuple[RegressionCase, ...] = (
         "gemma4",
         "fp8",
         "single_gpu",
-        config="examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml",
+        config="examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml",
         env_model_path="GEMMA4_MODEL_PATH",
     ),
     RegressionCase("nemotron_h", "bf16", "single_gpu", env_model_path="NEMOTRON_H_MODEL_PATH"),
@@ -148,6 +148,14 @@ FIRST_MONTH_MATRIX: tuple[RegressionCase, ...] = (
         env_model_path="QWEN3_5_MOE_MODEL_PATH",
     ),
     RegressionCase(
+        "gpt_oss",
+        "fp8",
+        "single_gpu",
+        op_kind="moe_grouped",
+        config="examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml",
+        env_model_path="GPT_OSS_MODEL_PATH",
+    ),
+    RegressionCase(
         "qwen3",
         "bf16",
         "2gpu_dp",
@@ -161,6 +169,14 @@ FIRST_MONTH_MATRIX: tuple[RegressionCase, ...] = (
         op_kind="moe_grouped",
         config="examples/sft/qwen35moe/qwen35moe-lora-fp8.yaml",
         env_model_path="QWEN3_5_MOE_MODEL_PATH",
+    ),
+    RegressionCase(
+        "qwen3_6_moe",
+        "fp8",
+        "2gpu_dp_ep",
+        op_kind="moe_grouped",
+        config="examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml",
+        env_model_path="QWEN3_6_MOE_MODEL_PATH",
     ),
     RegressionCase(
         "qwen3",
