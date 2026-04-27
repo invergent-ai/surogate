@@ -165,6 +165,34 @@ def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
     ]
 
 
+def test_coverage_report_requires_reduce_scatter_hooks_for_sharded_distribution():
+    case = br.RegressionCase("m", "fp8", "2gpu_dp_zero2", op_kind="dense")
+    results = {
+        case.case_id: {
+            "case": br.asdict(case),
+            "status": "failed",
+            "metrics": {
+                "block_schema_summary": {
+                    "hook_after_all_reduce_targets": 1,
+                    "hook_after_reduce_scatter_targets": 0,
+                },
+                "buffer_plan_summary": {
+                    "hook_registry_after_all_reduce_registrations": 1,
+                    "hook_registry_after_reduce_scatter_registrations": 0,
+                },
+            },
+        }
+    }
+
+    report = br.coverage_report(results)
+
+    assert report["rows"][0]["hook_readiness_status"] == "missing"
+    assert report["rows"][0]["missing_hook_counts"] == [
+        "hook_after_reduce_scatter_targets",
+        "hook_registry_after_reduce_scatter_registrations",
+    ]
+
+
 def test_coverage_report_requires_full_hook_structural_targets():
     case = br.RegressionCase("m", "fp8", "single_gpu")
     results = {

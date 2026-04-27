@@ -724,6 +724,10 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
     if "ep" in str(case.get("distribution") or ""):
         add_required("hook_after_all_to_all_targets")
         add_required("hook_registry_after_all_to_all_registrations")
+    distribution = str(case.get("distribution") or "")
+    if "zero" in distribution or "shard" in distribution:
+        add_required("hook_after_reduce_scatter_targets")
+        add_required("hook_registry_after_reduce_scatter_registrations")
     if int(counts.get("lora_slices") or 0) > 0:
         add_required("hook_after_produce_targets")
         add_required("hook_registry_after_produce_registrations")
