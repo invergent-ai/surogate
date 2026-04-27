@@ -642,6 +642,7 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
         "runtime_hook_after_all_to_all_targets": buffer_plan_summary.get("hook_after_all_to_all_targets"),
         "runtime_hook_after_all_reduce_targets": buffer_plan_summary.get("hook_after_all_reduce_targets"),
         "runtime_hook_after_reduce_scatter_targets": buffer_plan_summary.get("hook_after_reduce_scatter_targets"),
+        "schema_hook_dispatch_enabled": buffer_plan_summary.get("schema_hook_dispatch_enabled"),
         "hook_registry_registrations": buffer_plan_summary.get("hook_registry_registrations"),
         "hook_registry_distribution_aware_registrations": buffer_plan_summary.get(
             "hook_registry_distribution_aware_registrations"

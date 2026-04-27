@@ -2097,6 +2097,7 @@ NB_MODULE(_surogate, m) {
                 d["hook_after_all_to_all_targets"] = s.hook_after_all_to_all_targets;
                 d["hook_after_all_reduce_targets"] = s.hook_after_all_reduce_targets;
                 d["hook_after_reduce_scatter_targets"] = s.hook_after_reduce_scatter_targets;
+                d["schema_hook_dispatch_enabled"] = s.schema_hook_dispatch_enabled;
                 d["hook_registry_registrations"] = s.hook_registry_registrations;
                 d["hook_registry_distribution_aware_registrations"] = s.hook_registry_distribution_aware_registrations;
                 d["hook_registry_after_produce_registrations"] = s.hook_registry_after_produce_registrations;

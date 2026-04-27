@@ -4,10 +4,12 @@
 #include "runtime/dsl/dsl_debug.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -31,6 +33,13 @@ namespace {
 // ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
+
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    const std::string_view text(value);
+    return text == "1" || text == "true" || text == "TRUE" || text == "on" || text == "ON";
+}
 
 const CompiledGraph* compiled_graph_for(const DslModel& model, bool is_backward) {
     const GraphExecutor* exec = model.graph_executor();
@@ -333,6 +342,7 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     s.schema_expert_parallel_param_shape_bytes = u64(p.schema_expert_parallel_param_shape_bytes);
     s.schema_expert_parallel_param_shape_local_bytes = u64(p.schema_expert_parallel_param_shape_local_bytes);
     s.schema_expert_parallel_param_shape_savings_bytes = u64(p.schema_expert_parallel_param_shape_savings_bytes);
+    s.schema_hook_dispatch_enabled = env_flag_enabled("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH") ? 1 : 0;
     for (const BlockSchemaLayerSummary& layer : p.schema_layers) {
         for (const BlockSchemaSlotSummary& slot : layer.slots) {
             const bool is_param = slot.kind == "param";

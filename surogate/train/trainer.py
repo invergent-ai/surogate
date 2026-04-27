@@ -152,6 +152,7 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "hook_after_all_to_all_targets": 0,
         "hook_after_all_reduce_targets": 0,
         "hook_after_reduce_scatter_targets": 0,
+        "schema_hook_dispatch_enabled": 0,
     }
     for module in root.get("modules", []):
         forward = module.get("forward") or {}
