@@ -104,3 +104,20 @@ TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][gr
     REQUIRE(graph.role_for_tensor_id(2) == nullptr);
     REQUIRE(graph.role_for_name("missing") == nullptr);
 }
+
+TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]") {
+    CompiledGraph graph;
+    graph.ops.resize(3);
+    graph.ops[0].comm_profile.kind = CommunicationKind::NoComm;
+    graph.ops[1].comm_profile.kind = CommunicationKind::AllToAllIn;
+    graph.ops[1].grouped_semantics.routes_tokens = true;
+    graph.ops[2].comm_profile.kind = CommunicationKind::ExpertParallelRouted;
+    graph.ops[2].grouped_semantics.is_grouped = true;
+    graph.ops[2].grouped_semantics.expert_dim = 0;
+
+    REQUIRE(graph.count_ops_with_comm(CommunicationKind::NoComm) == 1);
+    REQUIRE(graph.count_ops_with_comm(CommunicationKind::AllToAllIn) == 1);
+    REQUIRE(graph.count_ops_with_comm(CommunicationKind::ExpertParallelRouted) == 1);
+    REQUIRE(graph.count_ops_with_comm(CommunicationKind::AllReduceAfter) == 0);
+    REQUIRE(graph.count_grouped_ops() == 1);
+}

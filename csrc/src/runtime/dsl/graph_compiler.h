@@ -665,6 +665,26 @@ struct CompiledGraph {
         return tid >= 0 ? role_for_tensor_id(tid) : nullptr;
     }
 
+    std::size_t count_ops_with_comm(CommunicationKind kind) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.comm_profile.kind == kind) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_grouped_ops() const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.grouped_semantics.is_grouped) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     /// Debuggability (P4.7): format "tid=5 name='blocks[3].ln1' region=FwdStack
     /// block=3 offset=0x1000 bytes=32768". Intended for error messages and
     /// exception rewrites. Returns "<tid=N unknown>" when tid is invalid.
