@@ -71,6 +71,21 @@ DslRunState::FP8BufferReady fp8_ready_flag_for_matmul_op(::modules::MatmulOp op)
     }
 }
 
+const char* fp8_ready_flag_name(DslRunState::FP8BufferReady flag) {
+    switch (flag) {
+        case DslRunState::FP8Ready_None: return "None";
+        case DslRunState::FP8Ready_LN1: return "LN1";
+        case DslRunState::FP8Ready_LN2: return "LN2";
+        case DslRunState::FP8Ready_Att: return "AttnOut";
+        case DslRunState::FP8Ready_SwiGLU: return "SwiGLU";
+    }
+    return "Unknown";
+}
+
+QuantState quant_state_for_fp8_ready_flag(DslRunState::FP8BufferReady flag) {
+    return flag == DslRunState::FP8Ready_None ? QuantState::None : QuantState::FP8Ready;
+}
+
 void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cudaStream_t stream) {
     if (out.DType != bias.DType) {
         throw std::runtime_error("DSL graph executor: bias_add dtype mismatch");

@@ -25,6 +25,8 @@ Tensor* fp8_forward_buffer(DslRunState& rs, ::modules::MatmulOp op);
 Tensor* fp8_grad_buffer(DslRunState& rs, ::modules::MatmulOp op);
 int fp8_quantizer_index(const DslRunState& rs, ::modules::MatmulOp op, int layer_idx);
 DslRunState::FP8BufferReady fp8_ready_flag_for_matmul_op(::modules::MatmulOp op);
+const char* fp8_ready_flag_name(DslRunState::FP8BufferReady flag);
+QuantState quant_state_for_fp8_ready_flag(DslRunState::FP8BufferReady flag);
 
 // Bias addition
 void add_bias_tensor(Tensor& out, const Tensor& bias, int B, int T, int OC, cudaStream_t stream);

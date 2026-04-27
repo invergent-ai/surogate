@@ -72,6 +72,7 @@
 - [x] Fusion registry exposes a non-mutating candidate-count helper for future coverage/reporting hooks.
 - [x] `CompiledGraph` summary helpers now expose inert fusion-candidate start counts.
 - [x] Dense FP8 co-located quant ready-flag mapping centralized as a first Phase 3d bridge toward generic quant-state routing.
+- [x] FP8 ready flags now expose diagnostic names and map into the `QuantState::FP8Ready` vocabulary without changing execution.
 - [x] Mamba `out_proj` forward/backward matmul delegates now declare dense FP8/FP4 capability and CPU-stream storage compatibility.
 
 Local validation status:

@@ -3,6 +3,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string>
+
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/graph_executor_helpers.h"
@@ -90,6 +92,10 @@ TEST_CASE("FP8 ready flag mapping covers dense matmul quant producers", "[tensor
     REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::MLPDown) == DslRunState::FP8Ready_SwiGLU);
     REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::Embedding) == DslRunState::FP8Ready_None);
     REQUIRE(fp8_ready_flag_for_matmul_op(modules::MatmulOp::LMHead) == DslRunState::FP8Ready_None);
+    REQUIRE(std::string(fp8_ready_flag_name(DslRunState::FP8Ready_LN1)) == "LN1");
+    REQUIRE(std::string(fp8_ready_flag_name(DslRunState::FP8Ready_Att)) == "AttnOut");
+    REQUIRE(quant_state_for_fp8_ready_flag(DslRunState::FP8Ready_None) == QuantState::None);
+    REQUIRE(quant_state_for_fp8_ready_flag(DslRunState::FP8Ready_SwiGLU) == QuantState::FP8Ready);
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {
