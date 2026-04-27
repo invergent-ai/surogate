@@ -214,7 +214,7 @@ Real-model acceptance queue:
 - [x] `DslGradStore` now receives schema hook metadata and dispatches opt-in `after_all_reduce` / `after_reduce_scatter` layer hook boundaries after existing gradient reduction scheduling, preserving default reduction behavior.
 - [x] North-star hook readiness now requires reduce-scatter targets and seeded registrations for sharded/ZeRO-style distribution rows.
 - [x] LoRA gradient reduction now receives the same schema hook metadata and dispatches opt-in `after_all_reduce` layer hook boundaries after the existing LoRA all-reduce path, so LoRA-only runs are covered by Phase 5 reduction hooks.
-- [x] LoRA tensor iteration now routes through structural `LoRATargetId` helpers for dense, shared, router, separate-expert, and grouped-expert adapters; optimizer/norm pointer setup no longer hand-walks expert/router fields.
+- [x] LoRA tensor iteration now routes through structural `LoRATargetId` helpers for dense, shared, router, separate-expert, and grouped-expert adapters; optimizer/norm pointer setup and paired optimizer updates no longer hand-walk expert/router fields.
 
 ---
 

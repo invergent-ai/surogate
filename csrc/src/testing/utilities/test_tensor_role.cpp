@@ -181,6 +181,25 @@ TEST_CASE("LoRA target iteration follows structural block order", "[tensor_role]
                        modules::LoRATargetId::SharedDown,
                        modules::LoRATargetId::Router,
                    });
+
+    modules::LoRABlockWeights<FakeLoRATensor> grads;
+    grads.attention.q = fake_lora_layer();
+    grads.mlp.down = fake_lora_layer();
+    grads.moe.use_grouped = true;
+    grads.moe.grouped.gate_up = fake_grouped_lora_layer();
+    grads.router = fake_lora_layer();
+
+    ids.clear();
+    modules::for_each_lora_layer_weight_pair(block, grads, [&](modules::LoRATargetId id, auto&, auto&) {
+        ids.push_back(id);
+    });
+
+    REQUIRE(ids == std::vector<modules::LoRATargetId>{
+                       modules::LoRATargetId::Q,
+                       modules::LoRATargetId::Down,
+                       modules::LoRATargetId::ExpertGateUp,
+                       modules::LoRATargetId::Router,
+                   });
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {
