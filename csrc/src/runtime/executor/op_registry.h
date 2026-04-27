@@ -13,7 +13,6 @@
 #ifndef SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H
 #define SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H
 
-#include <cstdint>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -22,7 +21,7 @@
 
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
-#include "runtime/dsl/tensor_role.h"
+#include "runtime/executor/op_descriptor_types.h"
 
 namespace dsl {
 
@@ -54,46 +53,6 @@ using AutodiffFn = std::function<std::vector<Operation>(const BackwardRuleContex
 // internal temps to distort sizing (ChunkGatedDeltaRuleBackward, Mamba
 // scan, Flash-Attention backward workspace, etc.).
 using StackBoundFn = long (*)(const CompiledOp& op, const BufferPlan& plan);
-
-enum class OpSemanticKind : std::uint8_t {
-    Unknown = 0,
-    Dense,
-    MoE,
-    Collective,
-    Attention,
-    Normalization,
-    Elementwise,
-    View,
-    Loss,
-    Sequence,
-};
-
-enum class CommunicationKind : std::uint8_t {
-    NoComm = 0,
-    AllReduceAfter,
-    ReduceScatterAfter,
-    AllToAllIn,
-    AllToAllOut,
-    ExpertParallelRouted,
-    WeightStreamFromCpu,
-    WeightTransferP2P,
-};
-
-struct CommunicationProfile {
-    CommunicationKind kind = CommunicationKind::NoComm;
-    bool can_overlap_with_compute = false;
-    int reduction_priority = 0;
-};
-
-struct GroupedSemantics {
-    bool is_grouped = false;
-    bool routes_tokens = false;
-    int expert_dim = -1;
-    bool ep_aware = false;
-};
-
-const char* op_semantic_kind_name(OpSemanticKind kind);
-const char* communication_kind_name(CommunicationKind kind);
 
 struct OpDescriptor {
     std::string name;                               // e.g. "embedding", "softmax"

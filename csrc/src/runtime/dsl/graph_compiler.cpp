@@ -5081,6 +5081,11 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
         // when it tries to call it.
         if (const OpDescriptor* desc = OpRegistry::instance().find(compiled.type)) {
             compiled.fn = is_backward ? desc->backward_fn : desc->forward_fn;
+            compiled.semantic_kind = desc->semantic_kind;
+            compiled.distribution_kind = desc->distribution_kind;
+            compiled.comm_profile = desc->comm_profile;
+            compiled.grouped_semantics = desc->grouped_semantics;
+            compiled.descriptor_flags = desc->descriptor_flags;
         }
 
         // Validate operation shapes at compile time.

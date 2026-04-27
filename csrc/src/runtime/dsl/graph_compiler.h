@@ -24,6 +24,7 @@
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
 #include "runtime/dsl/tensor_role.h"
+#include "runtime/executor/op_descriptor_types.h"
 #include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
 
@@ -330,6 +331,14 @@ struct CompiledOp {
 
     // Pre-resolved attributes
     CompiledAttrs attrs;
+
+    // Descriptor facets copied from OpRegistry at compile time. These are
+    // metadata only for now; execution continues through `fn`.
+    OpSemanticKind semantic_kind = OpSemanticKind::Unknown;
+    DistributionKind distribution_kind = DistributionKind::Replicated;
+    CommunicationProfile comm_profile{};
+    GroupedSemantics grouped_semantics{};
+    std::uint32_t descriptor_flags = 0;
 
     // Layer boundary info (for prefetch optimization)
     int layer_start = -1;  // If >= 0, this op starts a new layer
