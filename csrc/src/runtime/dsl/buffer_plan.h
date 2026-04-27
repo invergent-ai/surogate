@@ -63,6 +63,16 @@ struct BlockSchemaPlanRecord {
     int cpu_pinned_stream_slots = 0;
     int cpu_pageable_slots = 0;
     int nvme_offload_slots = 0;
+    std::string routing_kind;
+    int routing_topk = -1;
+    std::string routing_topk_param;
+    bool routing_norm_topk_prob = false;
+    std::string routing_norm_topk_prob_param;
+    bool routing_scoring_bias = false;
+    int routing_shared_experts = 0;
+    std::string routing_shared_experts_param;
+    std::string ep_size_param;
+    bool ep_weight_transfer_eligible = false;
     bool has_routing = false;
     bool has_ep_topology = false;
 };
@@ -90,6 +100,16 @@ struct BlockSchemaLayerSummary {
     int cpu_pinned_stream_slots = 0;
     int cpu_pageable_slots = 0;
     int nvme_offload_slots = 0;
+    std::string routing_kind;
+    int routing_topk = -1;
+    std::string routing_topk_param;
+    bool routing_norm_topk_prob = false;
+    std::string routing_norm_topk_prob_param;
+    bool routing_scoring_bias = false;
+    int routing_shared_experts = 0;
+    std::string routing_shared_experts_param;
+    std::string ep_size_param;
+    bool ep_weight_transfer_eligible = false;
     bool has_routing = false;
     bool has_ep_topology = false;
 };
@@ -165,6 +185,9 @@ struct BufferPlan {
     int schema_cpu_pinned_stream_slots = 0;
     int schema_cpu_pageable_slots = 0;
     int schema_nvme_offload_slots = 0;
+    int schema_scoring_bias_routing_layers = 0;
+    int schema_shared_expert_routing_layers = 0;
+    int schema_weight_transfer_layers = 0;
     std::vector<BlockSchemaLayerSummary> schema_layers;
 
     // ---------------- Dimensions ----------------

@@ -53,8 +53,14 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
               "blocks_param": "blocks",
               "block_name": "Qwen3Block",
               "schema": {
-                "routing": {"kind": "none"},
-                "ep_topology": {"ep_size_param": "ep_size"},
+                "routing": {
+                  "kind": "topk_softmax",
+                  "topk": 2,
+                  "norm_topk_prob": true,
+                  "scoring_bias": false,
+                  "shared_experts": 0
+                },
+                "ep_topology": {"ep_size_param": "ep_size", "weight_transfer_eligible": false},
                 "slots": [
                   {
                     "name": "qkv_weight",
@@ -163,6 +169,16 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].cpu_pinned_stream_slots == 1);
     REQUIRE(schema_records[0].cpu_pageable_slots == 0);
     REQUIRE(schema_records[0].nvme_offload_slots == 0);
+    REQUIRE(schema_records[0].routing_kind == "topk_softmax");
+    REQUIRE(schema_records[0].routing_topk == 2);
+    REQUIRE(schema_records[0].routing_topk_param.empty());
+    REQUIRE(schema_records[0].routing_norm_topk_prob);
+    REQUIRE(schema_records[0].routing_norm_topk_prob_param.empty());
+    REQUIRE_FALSE(schema_records[0].routing_scoring_bias);
+    REQUIRE(schema_records[0].routing_shared_experts == 0);
+    REQUIRE(schema_records[0].routing_shared_experts_param.empty());
+    REQUIRE(schema_records[0].ep_size_param == "ep_size");
+    REQUIRE_FALSE(schema_records[0].ep_weight_transfer_eligible);
     REQUIRE(schema_records[0].has_routing);
     REQUIRE(schema_records[0].has_ep_topology);
 
@@ -227,6 +243,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_cpu_pinned_stream_slots == 1);
     REQUIRE(plan.schema_cpu_pageable_slots == 0);
     REQUIRE(plan.schema_nvme_offload_slots == 0);
+    REQUIRE(plan.schema_scoring_bias_routing_layers == 0);
+    REQUIRE(plan.schema_shared_expert_routing_layers == 0);
+    REQUIRE(plan.schema_weight_transfer_layers == 0);
     REQUIRE(plan.schema_layers.size() == 1);
     REQUIRE(plan.schema_layers[0].layer == 0);
     REQUIRE(plan.schema_layers[0].has_schema);
@@ -245,6 +264,13 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].cpu_pinned_stream_slots == 1);
     REQUIRE(plan.schema_layers[0].cpu_pageable_slots == 0);
     REQUIRE(plan.schema_layers[0].nvme_offload_slots == 0);
+    REQUIRE(plan.schema_layers[0].routing_kind == "topk_softmax");
+    REQUIRE(plan.schema_layers[0].routing_topk == 2);
+    REQUIRE(plan.schema_layers[0].routing_norm_topk_prob);
+    REQUIRE_FALSE(plan.schema_layers[0].routing_scoring_bias);
+    REQUIRE(plan.schema_layers[0].routing_shared_experts == 0);
+    REQUIRE(plan.schema_layers[0].ep_size_param == "ep_size");
+    REQUIRE_FALSE(plan.schema_layers[0].ep_weight_transfer_eligible);
     REQUIRE(plan.schema_layers[0].has_routing);
     REQUIRE(plan.schema_layers[0].has_ep_topology);
 }

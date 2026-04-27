@@ -56,6 +56,15 @@ namespace {
     return -1;
 }
 
+[[nodiscard]] bool attr_bool(const AttrMap& map, const std::string& key) {
+    const auto* value = find_attr(map, key);
+    if (!value) return false;
+    if (const auto* v = std::get_if<bool>(&value->value)) {
+        return *v;
+    }
+    return false;
+}
+
 [[nodiscard]] std::string lower_copy(std::string_view value) {
     std::string out;
     out.reserve(value.size());
@@ -108,9 +117,26 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
         const AttrMap* schema = schema_value ? attr_map(*schema_value) : nullptr;
         if (schema) {
             const AttrValue* routing_value = find_attr(*schema, "routing");
-            out.has_routing = routing_value && attr_map(*routing_value) != nullptr;
+            if (const AttrMap* routing = routing_value ? attr_map(*routing_value) : nullptr) {
+                out.routing_kind = attr_string(*routing, "kind");
+                out.routing_topk = attr_int(*routing, "topk");
+                out.routing_topk_param = attr_string(*routing, "topk");
+                out.routing_norm_topk_prob = attr_bool(*routing, "norm_topk_prob");
+                out.routing_norm_topk_prob_param = attr_string(*routing, "norm_topk_prob");
+                out.routing_scoring_bias = attr_bool(*routing, "scoring_bias");
+                out.routing_shared_experts = attr_int(*routing, "shared_experts");
+                if (out.routing_shared_experts < 0) {
+                    out.routing_shared_experts = 0;
+                }
+                out.routing_shared_experts_param = attr_string(*routing, "shared_experts");
+                out.has_routing = !out.routing_kind.empty() && out.routing_kind != "none";
+            }
             const AttrValue* ep_value = find_attr(*schema, "ep_topology");
-            out.has_ep_topology = ep_value && attr_map(*ep_value) != nullptr;
+            if (const AttrMap* ep = ep_value ? attr_map(*ep_value) : nullptr) {
+                out.ep_size_param = attr_string(*ep, "ep_size_param");
+                out.ep_weight_transfer_eligible = attr_bool(*ep, "weight_transfer_eligible");
+                out.has_ep_topology = true;
+            }
 
             const AttrValue* attrs_value = find_attr(*schema, "attrs");
             if (const AttrMap* attrs = attrs_value ? attr_map(*attrs_value) : nullptr) {
@@ -323,6 +349,15 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             p.schema_cpu_pinned_stream_slots += record.cpu_pinned_stream_slots;
             p.schema_cpu_pageable_slots += record.cpu_pageable_slots;
             p.schema_nvme_offload_slots += record.nvme_offload_slots;
+            if (record.routing_scoring_bias) {
+                ++p.schema_scoring_bias_routing_layers;
+            }
+            if (record.routing_shared_experts > 0 || !record.routing_shared_experts_param.empty()) {
+                ++p.schema_shared_expert_routing_layers;
+            }
+            if (record.ep_weight_transfer_eligible) {
+                ++p.schema_weight_transfer_layers;
+            }
             if (record.layer >= 0 && record.layer < p.NumLayers) {
                 auto& layer = p.schema_layers[static_cast<std::size_t>(record.layer)];
                 layer.has_schema = true;
@@ -341,6 +376,16 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 layer.cpu_pinned_stream_slots = record.cpu_pinned_stream_slots;
                 layer.cpu_pageable_slots = record.cpu_pageable_slots;
                 layer.nvme_offload_slots = record.nvme_offload_slots;
+                layer.routing_kind = record.routing_kind;
+                layer.routing_topk = record.routing_topk;
+                layer.routing_topk_param = record.routing_topk_param;
+                layer.routing_norm_topk_prob = record.routing_norm_topk_prob;
+                layer.routing_norm_topk_prob_param = record.routing_norm_topk_prob_param;
+                layer.routing_scoring_bias = record.routing_scoring_bias;
+                layer.routing_shared_experts = record.routing_shared_experts;
+                layer.routing_shared_experts_param = record.routing_shared_experts_param;
+                layer.ep_size_param = record.ep_size_param;
+                layer.ep_weight_transfer_eligible = record.ep_weight_transfer_eligible;
                 layer.has_routing = record.has_routing;
                 layer.has_ep_topology = record.has_ep_topology;
             }
