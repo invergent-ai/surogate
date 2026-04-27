@@ -359,6 +359,7 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
                              slot.residency == "nvme_offload");
             if (streamable_param) {
                 s.hook_before_consume_targets += 1;
+                s.hook_after_consume_targets += 1;
             }
             if (!is_param && slot.distribution_kind == "expert_parallel") {
                 s.hook_after_all_to_all_targets += 1;
@@ -386,6 +387,7 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     };
     s.hook_registry_after_produce_registrations = count_registry_event(HookEventKind::AfterProduce);
     s.hook_registry_before_consume_registrations = count_registry_event(HookEventKind::BeforeConsume);
+    s.hook_registry_after_consume_registrations = count_registry_event(HookEventKind::AfterConsume);
     s.hook_registry_after_communication_registrations = count_registry_event(HookEventKind::AfterCommunication);
     s.hook_registry_after_all_reduce_registrations = count_registry_event(HookEventKind::AfterAllReduce);
     s.hook_registry_after_all_to_all_registrations = count_registry_event(HookEventKind::AfterAllToAll);

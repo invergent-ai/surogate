@@ -602,6 +602,12 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(prefetch_targets[0].schema_id == "qwen3_dense");
     REQUIRE(prefetch_targets[0].slot_name == "experts_gate_up");
 
+    REQUIRE(dsl::hook_event_name(dsl::HookEventKind::AfterConsume) == std::string("after_consume"));
+    const auto release_targets = dsl::collect_schema_hook_targets(schema_records, dsl::HookEventKind::AfterConsume);
+    REQUIRE(release_targets.size() == 1);
+    REQUIRE(release_targets[0].schema_id == "qwen3_dense");
+    REQUIRE(release_targets[0].slot_name == "experts_gate_up");
+
     const auto comm_targets = dsl::collect_schema_hook_targets(schema_records, dsl::HookEventKind::AfterAllToAll);
     REQUIRE(comm_targets.size() == 1);
     REQUIRE(comm_targets[0].schema_id == "qwen3_dense");
@@ -671,6 +677,11 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     gradient_offload_payload.offloaded = true;
     hook_ctx.payload = &gradient_offload_payload;
     REQUIRE(static_cast<dsl::GradientOffloadHookPayload*>(hook_ctx.payload)->offloaded);
+
+    dsl::AfterConsumeHookPayload after_consume_payload;
+    after_consume_payload.current_layer_released = true;
+    hook_ctx.payload = &after_consume_payload;
+    REQUIRE(static_cast<dsl::AfterConsumeHookPayload*>(hook_ctx.payload)->current_layer_released);
 
     REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
 }

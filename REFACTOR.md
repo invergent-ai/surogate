@@ -220,6 +220,7 @@ Real-model acceptance queue:
 - [x] Regression/runtime artifacts now record whether schema hook dispatch was enabled for the run, so opt-in hook-boundary validation is visible alongside hook target and registration counts.
 - [x] `before_consume` schema hooks now carry a typed prefetch payload and can own the current-layer `DslWeightManager::gather_block` / `wait_for_gather` path under `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=1`; the legacy imperative path remains the default and fallback.
 - [x] Streaming gradient offload now has a typed `after_all_reduce` hook payload; under opt-in schema dispatch, hooks can own per-layer all-reduce plus D2H offload, with the legacy imperative path retained as the default and fallback.
+- [x] Streamed-weight release now has a typed `after_consume` hook payload; under opt-in schema dispatch, hooks can own per-layer `DslWeightManager::release_block`, and CPU-stream readiness requires both prefetch and release hook coverage.
 
 ---
 
@@ -796,7 +797,7 @@ hook_registry.on_after_reduce_scatter(          // ⭐ NEW
 );
 ```
 
-**Cleanup status:** LoRA dense/shared/router/separate-expert/grouped-expert iteration now routes through structural `LoRATargetId` helpers in optimizer setup, norm pointers, gradient zeroing, gradient reduction, and paired optimizer updates. The remaining Phase 5 migration is to move CPU/offload side effects behind registered hook callbacks rather than using hooks only as opt-in execution boundaries.
+**Cleanup status:** LoRA dense/shared/router/separate-expert/grouped-expert iteration now routes through structural `LoRATargetId` helpers in optimizer setup, norm pointers, gradient zeroing, gradient reduction, and paired optimizer updates. CPU/offload side effects for current-layer prefetch, streamed-weight release, and streaming grad offload now have typed hook payloads behind opt-in dispatch; remaining Phase 5 migration is to keep moving distribution/offload side effects from inert boundaries into registered callbacks.
 
 **Less critical than Phases 1–4 because the immediate FP8/FP4 + MoE goal doesn't require it.** Finishes the extensibility story.
 
@@ -1027,7 +1028,7 @@ Extend `MoeMatmulContext` with `dweight` field if not present (verify against cu
 - **Not making recipes architecture-agnostic at the kernel level.** Capabilities are the right abstraction; full kernel-level genericness is wrong.
 - **Not chasing PyTorch universality or HF compat breadth.** Specialized fast-path remains the strategic position.
 - **Not addressing Gemma4 perf as part of refactor.** Separate track (§9.1).
-- **Not doing Phase 5 hook registry until Phase 3 ships,** no matter how tempting.
+- ~~**Not doing Phase 5 hook registry until Phase 3 ships,** no matter how tempting.~~ **SUPERSEDED:** Phase 5 started early as opt-in, dual-path scaffolding after the Phase 4 schema work made the hook targets available.
 - **Not introducing new closed enums during refactor.** Reviewers enforce.
 - **Not implementing tensor parallelism or pipeline parallelism.** DP + EP + ZeRO-2 are the supported distributed configs. TP/PP would be a separate project; capability fields reserve room.
 - **Not implementing ZeRO-3 (parameter sharding).** Out of scope for refactor; capability fields reserve room.

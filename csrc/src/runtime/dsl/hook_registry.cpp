@@ -89,6 +89,7 @@ const char* hook_event_name(HookEventKind event) {
     switch (event) {
         case HookEventKind::AfterProduce: return "after_produce";
         case HookEventKind::BeforeConsume: return "before_consume";
+        case HookEventKind::AfterConsume: return "after_consume";
         case HookEventKind::AfterCommunication: return "after_communication";
         case HookEventKind::AfterAllReduce: return "after_all_reduce";
         case HookEventKind::AfterAllToAll: return "after_all_to_all";
@@ -111,6 +112,10 @@ void HookRegistry::on_after_produce(HookTarget target, std::string name, HookCal
 
 void HookRegistry::on_before_consume(HookTarget target, std::string name, HookCallback callback, int priority) {
     add(*this, HookEventKind::BeforeConsume, std::move(target), std::move(name), std::move(callback), priority);
+}
+
+void HookRegistry::on_after_consume(HookTarget target, std::string name, HookCallback callback, int priority) {
+    add(*this, HookEventKind::AfterConsume, std::move(target), std::move(name), std::move(callback), priority);
 }
 
 void HookRegistry::on_after_communication(HookTarget target, std::string name, HookCallback callback, int priority) {
@@ -174,6 +179,7 @@ std::vector<HookTarget> collect_schema_hook_targets(const std::vector<BlockSchem
             switch (event) {
                 case HookEventKind::AfterProduce: include = is_lora_after_produce_slot(slot); break;
                 case HookEventKind::BeforeConsume: include = is_streamable_param_slot(slot); break;
+                case HookEventKind::AfterConsume: include = is_streamable_param_slot(slot); break;
                 case HookEventKind::AfterCommunication:
                 case HookEventKind::AfterAllToAll: include = is_expert_parallel_activation(slot); break;
                 case HookEventKind::AfterAllReduce: include = is_replicated_param_slot(slot); break;

@@ -634,11 +634,13 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
     return {
         "hook_after_produce_targets": block_schema_summary.get("hook_after_produce_targets"),
         "hook_before_consume_targets": block_schema_summary.get("hook_before_consume_targets"),
+        "hook_after_consume_targets": block_schema_summary.get("hook_after_consume_targets"),
         "hook_after_all_to_all_targets": block_schema_summary.get("hook_after_all_to_all_targets"),
         "hook_after_all_reduce_targets": block_schema_summary.get("hook_after_all_reduce_targets"),
         "hook_after_reduce_scatter_targets": block_schema_summary.get("hook_after_reduce_scatter_targets"),
         "runtime_hook_after_produce_targets": buffer_plan_summary.get("hook_after_produce_targets"),
         "runtime_hook_before_consume_targets": buffer_plan_summary.get("hook_before_consume_targets"),
+        "runtime_hook_after_consume_targets": buffer_plan_summary.get("hook_after_consume_targets"),
         "runtime_hook_after_all_to_all_targets": buffer_plan_summary.get("hook_after_all_to_all_targets"),
         "runtime_hook_after_all_reduce_targets": buffer_plan_summary.get("hook_after_all_reduce_targets"),
         "runtime_hook_after_reduce_scatter_targets": buffer_plan_summary.get("hook_after_reduce_scatter_targets"),
@@ -652,6 +654,9 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
         ),
         "hook_registry_before_consume_registrations": buffer_plan_summary.get(
             "hook_registry_before_consume_registrations"
+        ),
+        "hook_registry_after_consume_registrations": buffer_plan_summary.get(
+            "hook_registry_after_consume_registrations"
         ),
         "hook_registry_after_communication_registrations": buffer_plan_summary.get(
             "hook_registry_after_communication_registrations"
@@ -719,6 +724,8 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
     if case.get("storage") == "cpu_stream":
         add_required("hook_before_consume_targets")
         add_required("hook_registry_before_consume_registrations")
+        add_required("hook_after_consume_targets")
+        add_required("hook_registry_after_consume_registrations")
     if "dp" in str(case.get("distribution") or ""):
         add_required("hook_after_all_reduce_targets")
         add_required("hook_registry_after_all_reduce_registrations")

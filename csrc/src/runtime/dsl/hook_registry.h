@@ -30,6 +30,7 @@ enum class HookEventKind {
     Unknown,
     AfterProduce,
     BeforeConsume,
+    AfterConsume,
     AfterCommunication,
     AfterAllReduce,
     AfterAllToAll,
@@ -64,6 +65,13 @@ struct BeforeConsumeHookPayload {
     bool current_layer_handled = false;
 };
 
+struct AfterConsumeHookPayload {
+    DslWeightManager* weight_manager = nullptr;
+    cudaStream_t release_stream = nullptr;
+    bool capturing = false;
+    bool current_layer_released = false;
+};
+
 struct GradientOffloadHookPayload {
     DslGradStore* grads = nullptr;
     NCCLCommunicator* comm = nullptr;
@@ -91,6 +99,7 @@ public:
 
     void on_after_produce(HookTarget target, std::string name, HookCallback callback = {}, int priority = 0);
     void on_before_consume(HookTarget target, std::string name, HookCallback callback = {}, int priority = 0);
+    void on_after_consume(HookTarget target, std::string name, HookCallback callback = {}, int priority = 0);
     void on_after_communication(HookTarget target, std::string name, HookCallback callback = {}, int priority = 0);
     void on_after_all_reduce(HookTarget target, std::string name, HookCallback callback = {}, int priority = 0);
     void on_after_all_to_all(HookTarget target, std::string name, HookCallback callback = {}, int priority = 0);

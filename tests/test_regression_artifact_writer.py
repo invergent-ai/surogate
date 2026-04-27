@@ -172,5 +172,6 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
     assert summary["block_schema_cpu_stream_slots"] == 1
     assert summary["hook_after_produce_targets"] == 1
     assert summary["hook_before_consume_targets"] == 1
+    assert summary["hook_after_consume_targets"] == 1
     assert summary["hook_after_all_to_all_targets"] == 1
     assert summary["hook_after_reduce_scatter_targets"] == 1

@@ -2094,6 +2094,7 @@ NB_MODULE(_surogate, m) {
                     s.schema_expert_parallel_param_shape_savings_bytes;
                 d["hook_after_produce_targets"] = s.hook_after_produce_targets;
                 d["hook_before_consume_targets"] = s.hook_before_consume_targets;
+                d["hook_after_consume_targets"] = s.hook_after_consume_targets;
                 d["hook_after_all_to_all_targets"] = s.hook_after_all_to_all_targets;
                 d["hook_after_all_reduce_targets"] = s.hook_after_all_reduce_targets;
                 d["hook_after_reduce_scatter_targets"] = s.hook_after_reduce_scatter_targets;
@@ -2102,6 +2103,7 @@ NB_MODULE(_surogate, m) {
                 d["hook_registry_distribution_aware_registrations"] = s.hook_registry_distribution_aware_registrations;
                 d["hook_registry_after_produce_registrations"] = s.hook_registry_after_produce_registrations;
                 d["hook_registry_before_consume_registrations"] = s.hook_registry_before_consume_registrations;
+                d["hook_registry_after_consume_registrations"] = s.hook_registry_after_consume_registrations;
                 d["hook_registry_after_communication_registrations"] =
                     s.hook_registry_after_communication_registrations;
                 d["hook_registry_after_all_reduce_registrations"] = s.hook_registry_after_all_reduce_registrations;

@@ -1168,6 +1168,18 @@ DslModel::DslModel(const PretrainedConfig& config,
             });
         }
         for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterConsume)) {
+            mHookRegistry.on_after_consume(target, "schema_release", [](HookContext& context) {
+                auto* payload = static_cast<AfterConsumeHookPayload*>(context.payload);
+                if (!payload || payload->current_layer_released || payload->capturing || !payload->weight_manager ||
+                    !payload->weight_manager->needs_block_gather()) {
+                    return;
+                }
+                payload->weight_manager->release_block(context.layer_idx, payload->release_stream);
+                payload->current_layer_released = true;
+            });
+        }
+        for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllToAll)) {
             mHookRegistry.on_after_all_to_all(target, "schema_after_all_to_all");
         }

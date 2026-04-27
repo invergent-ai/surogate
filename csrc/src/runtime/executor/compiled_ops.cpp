@@ -1059,8 +1059,15 @@ void CompiledExecutor::handle_layer_start(int layer_idx) {
 }
 
 void CompiledExecutor::handle_layer_end(int layer_idx) {
+    AfterConsumeHookPayload after_consume_payload;
+    after_consume_payload.weight_manager = mWeightManager;
+    after_consume_payload.release_stream = mRunState.MainStream;
+    after_consume_payload.capturing = mCapturing;
+    dispatch_schema_layer_hooks(HookEventKind::AfterConsume, layer_idx, &after_consume_payload);
+
     // Release previous layer's weights
-    if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
+    if (!after_consume_payload.current_layer_released && mWeightManager && mWeightManager->needs_block_gather() &&
+        !mCapturing) {
         mWeightManager->release_block(layer_idx, mRunState.MainStream);
     }
 

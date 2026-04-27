@@ -233,6 +233,7 @@ struct DebugBufferPlanSummary {
     std::uint64_t schema_expert_parallel_param_shape_savings_bytes = 0;
     std::uint64_t hook_after_produce_targets = 0;
     std::uint64_t hook_before_consume_targets = 0;
+    std::uint64_t hook_after_consume_targets = 0;
     std::uint64_t hook_after_all_to_all_targets = 0;
     std::uint64_t hook_after_all_reduce_targets = 0;
     std::uint64_t hook_after_reduce_scatter_targets = 0;
@@ -241,6 +242,7 @@ struct DebugBufferPlanSummary {
     std::uint64_t hook_registry_distribution_aware_registrations = 0;
     std::uint64_t hook_registry_after_produce_registrations = 0;
     std::uint64_t hook_registry_before_consume_registrations = 0;
+    std::uint64_t hook_registry_after_consume_registrations = 0;
     std::uint64_t hook_registry_after_communication_registrations = 0;
     std::uint64_t hook_registry_after_all_reduce_registrations = 0;
     std::uint64_t hook_registry_after_all_to_all_registrations = 0;
