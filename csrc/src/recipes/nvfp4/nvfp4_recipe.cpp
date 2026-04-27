@@ -11,18 +11,12 @@
 #include <cuda_fp8.h>
 
 #include "runtime/core/matmul_context.h"
+#include "recipes/capability_predicates.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 #include "runtime/training/model.h"
 
 namespace recipes {
-namespace {
-
-bool descriptor_allows_fp4(dsl::OpCapabilities caps) {
-    return caps.flags == dsl::OpCapabilityNone || caps.has(dsl::OpCapabilityFp4Eligible);
-}
-
-}  // namespace
 
 void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     // Validate input

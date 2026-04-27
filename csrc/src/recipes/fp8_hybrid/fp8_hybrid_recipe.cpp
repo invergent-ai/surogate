@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <string_view>
 
+#include "recipes/capability_predicates.h"
 #include "runtime/core/fp8_scaling_config.h"  // QuantizerIndex
 #include "runtime/core/fp8_scaling_state.h"   // FP8ScalingState (must be before runtime/training/model.h)
 #include "kernels/kernels.h"
@@ -21,10 +22,6 @@ namespace {
 bool fp8_moe_wgrad_enabled() {
     const char* env = std::getenv("SUROGATE_FP8_MOE_WGRAD");
     return env && std::string_view(env) != "0";
-}
-
-bool descriptor_allows_fp8(dsl::OpCapabilities caps) {
-    return caps.flags == dsl::OpCapabilityNone || caps.has(dsl::OpCapabilityFp8Eligible);
 }
 
 bool has_moe_fp8_weight_cache(const modules::MoeMatmulContext& ctx) {

@@ -57,6 +57,7 @@
 
 - [x] Descriptor capability metadata plumbed into dense and MoE matmul recipe contexts; FP8 recipe now consults `FP8Eligible` with legacy fallback for unannotated ops.
 - [x] Dense NVFP4 matmul recipe now consults `FP4Eligible` with legacy fallback; MoE FP4 fallback behavior remains unchanged.
+- [x] Shared recipe capability predicate helpers added so FP8/FP4 eligibility uses one descriptor fallback rule.
 
 Local validation status:
 
