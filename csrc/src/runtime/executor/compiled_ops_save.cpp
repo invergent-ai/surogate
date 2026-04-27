@@ -94,7 +94,7 @@ std::optional<bool> is_mapped_slot(const TensorSlotRegistry* registry, const std
     return std::nullopt;
 }
 
-bool is_moe_tensor_name(const std::string& n) {
+bool legacy_is_moe_tensor_name(const std::string& n) {
     bool legacy_slot = false;
     switch (resolve_block_slot(n)) {
         case TensorSlot::BlockRouterLogits:
@@ -112,10 +112,7 @@ bool is_moe_tensor_name(const std::string& n) {
     // Global MoE side-channels (not modelled as per-block slots).
     const std::string probe = strip_ssa_suffix(n);
     const bool legacy_tail = probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
-    const bool legacy = legacy_slot || legacy_tail;
-    const bool role_tail = tensor_role_is_moe_name(n);
-    tensor_role_parity_check(n, legacy, role_tail, "compiled_ops_save::is_moe_tensor_name");
-    return legacy || role_tail;
+    return legacy_slot || legacy_tail;
 }
 
 std::optional<bool> moe_role_from_tensor_id(const CompiledGraph* graph, int tid) {
@@ -124,6 +121,20 @@ std::optional<bool> moe_role_from_tensor_id(const CompiledGraph* graph, int tid)
         return role->is_moe_owned();
     }
     return std::nullopt;
+}
+
+bool is_moe_tensor_name(const std::string& n, const char* context = "compiled_ops_save::is_moe_tensor_name") {
+    const bool legacy_value = legacy_is_moe_tensor_name(n);
+    const bool role_value = tensor_role_is_moe_name(n);
+    tensor_role_parity_check(n, legacy_value, role_value, context);
+    return legacy_value || role_value;
+}
+
+bool classify_moe_tensor(const CompiledGraph* graph, int tid, const std::string& name, const char* context) {
+    const bool legacy_value = legacy_is_moe_tensor_name(name);
+    const bool role_value = moe_role_from_tensor_id(graph, tid).value_or(tensor_role_is_moe_name(name));
+    tensor_role_parity_check(name, legacy_value, role_value, context);
+    return legacy_value || role_value;
 }
 
 bool legacy_is_rope_name(const std::string& name) {
@@ -199,19 +210,9 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
             continue;
         }
 
-        // Check if this is an MoE-related tensor that needs persistent storage
-        const bool legacy_is_moe_tensor =
-            (name.find("moe_") != std::string::npos || name.find("ep_") != std::string::npos ||
-             name.find("scatter_indices") != std::string::npos || name.find("routing_weights") != std::string::npos ||
-             name.find("routing_indices") != std::string::npos || name.find("router_") != std::string::npos ||
-             name.find("permuted") != std::string::npos || name.find("expert_") != std::string::npos);
-        const bool role_is_moe_tensor =
-            moe_role_from_tensor_id(mCurrentGraph, tid).value_or(tensor_role_is_moe_name(name));
-        tensor_role_parity_check(name,
-                                 legacy_is_moe_tensor,
-                                 role_is_moe_tensor,
-                                 "CompiledExecutor::save_moe_layer_tensors");
-        const bool is_moe_tensor = legacy_is_moe_tensor || role_is_moe_tensor;
+        // Check if this is an MoE-related tensor that needs persistent storage.
+        const bool is_moe_tensor =
+            classify_moe_tensor(mCurrentGraph, tid, name, "CompiledExecutor::save_moe_layer_tensors");
 
         if (!is_moe_tensor) continue;
         if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
