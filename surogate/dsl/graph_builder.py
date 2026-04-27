@@ -1152,9 +1152,10 @@ class GraphBuilder:
         x: str | GraphRef,
         weights: str | GraphRef,
         offsets: str | GraphRef,
+        out_name: str | None = None,
     ) -> GraphRef:
         """MoE grouped GEMM."""
-        out = self._fresh_name("moe_gemm")
+        out = out_name or self._fresh_name("moe_gemm")
         self._add_node(
             GraphNode(
                 op="moe_grouped_gemm",

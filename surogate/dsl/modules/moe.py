@@ -1121,6 +1121,7 @@ class NemotronMoEExperts(Module):
             gemm_input,
             tracer.prefixed("experts_up"),
             gemm_scatter,
+            out_name=tracer.prefixed("expert_up"),
         )
 
         # Activation (relu2 by default)

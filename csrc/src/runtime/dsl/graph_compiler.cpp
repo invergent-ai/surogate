@@ -42,6 +42,15 @@ std::string schema_slot_from_weight_name(std::string_view weight_name) {
     return std::string(slot);
 }
 
+std::string schema_slot_from_block_tensor_name(std::string_view tensor_name) {
+    int layer_idx = -1;
+    std::string field;
+    if (!parse_block_param(tensor_name, layer_idx, field)) {
+        return {};
+    }
+    return strip_ssa_suffix(field);
+}
+
 std::string hook_schema_id_from_record(const BlockSchemaPlanRecord& record) {
     if (!record.block_family.empty()) return record.block_family;
     if (!record.block_name.empty()) return record.block_name;
@@ -1395,6 +1404,30 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 attrs.gate_up_interleaved = *v;
             } else if (auto v_int = attr_int(*interleaved_attr)) {
                 attrs.gate_up_interleaved = (*v_int != 0);
+            }
+        }
+    }
+
+    if (type == CompiledOpType::MoEGroupedGemm || type == CompiledOpType::MoEGroupedGemmGateUp ||
+        type == CompiledOpType::MoEGroupedGemmDown || type == CompiledOpType::MoEGroupedGemmBackward ||
+        type == CompiledOpType::MoEGroupedGemmGateUpBackward || type == CompiledOpType::MoEGroupedGemmDownBackward) {
+        const std::size_t weight_idx =
+            (type == CompiledOpType::MoEGroupedGemm || type == CompiledOpType::MoEGroupedGemmGateUp ||
+             type == CompiledOpType::MoEGroupedGemmDown)
+                ? 1
+                : 2;
+        if (op.inputs.size() > weight_idx) {
+            int layer_idx = -1;
+            std::string field;
+            if (parse_block_param(op.inputs[weight_idx], layer_idx, field)) {
+                attrs.layer_idx = layer_idx;
+                attrs.allow_quant = allow_quant_layer(mOptions, mConfig, layer_idx);
+            }
+        }
+        if (type == CompiledOpType::MoEGroupedGemm || type == CompiledOpType::MoEGroupedGemmGateUp ||
+            type == CompiledOpType::MoEGroupedGemmDown) {
+            if (!op.outputs.empty()) {
+                attrs.forward_hook_schema_slot = schema_slot_from_block_tensor_name(op.outputs[0]);
             }
         }
     }

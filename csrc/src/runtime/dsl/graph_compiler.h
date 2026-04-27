@@ -52,7 +52,7 @@ std::string strip_ssa_suffix(const std::string& field);
 struct LoRASlice {
     modules::LoRATargetId id = modules::LoRATargetId::Unknown;
     std::string name;         ///< Raw target name; only read when id == Unknown or on error.
-    std::string schema_slot;  ///< Structural BlockSchema param slot inferred from the weight name; diagnostics only.
+    std::string schema_slot;  ///< Structural BlockSchema param slot inferred from the weight name.
     int offset = 0;           ///< Element offset on the output dim (0 for unfused).
     int size = 0;             ///< Output slice size in elements (0 = full output dim).
     bool grouped = false;     ///< True for MoE batched-expert LoRA (uses grouped GEMM path).
@@ -242,7 +242,7 @@ struct CompiledAttrs {
     // values are consumed for this purpose; they are not invoked as
     // callbacks anymore (LoRA dispatch is slice-driven).
     std::optional<modules::ForwardHookPoint> forward_hook_point;
-    std::string forward_hook_schema_slot;  ///< Phase 5 structural equivalent of forward_hook_point; diagnostics only.
+    std::string forward_hook_schema_slot;  ///< Structural activation slot used by schema hook dispatch.
 
     // MoE-specific
     int top_k = 0;

@@ -36,21 +36,6 @@ void attach_token_role(modules::MoeMatmulContext& ctx, const CompiledGraph* grap
     }
 }
 
-const char* grouped_lora_after_produce_slot(const CompiledOp& op, modules::LoRATargetId target_id) {
-    for (const LoRASlice& slice : op.attrs.lora_slices) {
-        if (slice.grouped && slice.id == target_id) {
-            switch (target_id) {
-                case modules::LoRATargetId::ExpertUp: return "expert_up";
-                case modules::LoRATargetId::ExpertGate:
-                case modules::LoRATargetId::ExpertGateUp: return "expert_gate_up";
-                case modules::LoRATargetId::ExpertDown: return "expert_down";
-                default: break;
-            }
-        }
-    }
-    return "";
-}
-
 }  // namespace
 
 void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
@@ -505,8 +490,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     };
 
     AfterProduceHookPayload after_produce_payload;
-    const char* after_produce_slot = grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertUp);
-    if (after_produce_slot[0] != '\0') {
+    const std::string_view after_produce_slot =
+        grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertUp, "expert_up");
+    if (!after_produce_slot.empty()) {
         after_produce_payload.apply_lora_action = apply_grouped_moe_up_lora;
         dispatch_schema_hook(HookEventKind::AfterProduce,
                              layer_idx_any,

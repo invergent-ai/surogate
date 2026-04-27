@@ -23,6 +23,33 @@ namespace {
 // Forward declaration for local helper
 Tensor* try_get_tensor(ExecState& st, const std::string& name, std::unordered_map<std::string, Tensor>& saved);
 
+bool has_grouped_lora_target(const CompiledOp& op, modules::LoRATargetId target_id) {
+    for (const LoRASlice& slice : op.attrs.lora_slices) {
+        if (slice.grouped && slice.id == target_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string_view structural_output_slot(const CompiledOp& op) {
+    if (op.outputs.empty()) {
+        return {};
+    }
+    std::string_view name = op.outputs[0].name;
+    if (starts_with(name, "saved.")) {
+        name.remove_prefix(6);
+    }
+    if (!(starts_with(name, "blocks[") || starts_with(name, "blocks.") || starts_with(name, "layer"))) {
+        return {};
+    }
+    const std::size_t dot = name.rfind('.');
+    if (dot == std::string_view::npos || dot + 1 >= name.size()) {
+        return {};
+    }
+    return name.substr(dot + 1);
+}
+
 }  // namespace
 
 // String utilities
@@ -571,6 +598,20 @@ void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, in
     M = static_cast<int>(a_rows);
     N = static_cast<int>(b_cols);
     K = static_cast<int>(a_cols);
+}
+
+std::string_view
+grouped_lora_after_produce_slot(const CompiledOp& op, modules::LoRATargetId target_id, std::string_view legacy_slot) {
+    if (!has_grouped_lora_target(op, target_id)) {
+        return {};
+    }
+    if (!op.attrs.forward_hook_schema_slot.empty()) {
+        return op.attrs.forward_hook_schema_slot;
+    }
+    if (std::string_view slot = structural_output_slot(op); !slot.empty()) {
+        return slot;
+    }
+    return legacy_slot;
 }
 
 // Graph utilities

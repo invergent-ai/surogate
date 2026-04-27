@@ -11,8 +11,10 @@
 #include <nlohmann/json.hpp>
 
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/hook_registry.h"
 #include "runtime/dsl/ir.h"
+#include "runtime/executor/graph_executor_utils.h"
 
 TEST_CASE("DSL IR loader parses module and resolves shapes") {
     const char* kJson = R"JSON(
@@ -747,4 +749,27 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(comm_payload.after_all_to_all_observed);
 
     REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
+}
+
+TEST_CASE("Grouped MoE LoRA hook slots prefer structural activation slots") {
+    dsl::CompiledOp op;
+    op.outputs.emplace_back();
+    op.outputs[0].name = "blocks[3].expert_gate_up";
+    dsl::LoRASlice gate_up_slice;
+    gate_up_slice.id = modules::LoRATargetId::ExpertGateUp;
+    gate_up_slice.schema_slot = "experts_gate_up";
+    gate_up_slice.grouped = true;
+    op.attrs.lora_slices.push_back(gate_up_slice);
+
+    op.attrs.forward_hook_schema_slot = "expert_gate_up";
+    REQUIRE(dsl::grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertGateUp, "legacy") ==
+            "expert_gate_up");
+
+    op.attrs.forward_hook_schema_slot.clear();
+    REQUIRE(dsl::grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertGateUp, "legacy") ==
+            "expert_gate_up");
+
+    op.outputs[0].name = "moe_gemm_0";
+    REQUIRE(dsl::grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertGateUp, "legacy") == "legacy");
+    REQUIRE(dsl::grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertDown, "expert_down").empty());
 }

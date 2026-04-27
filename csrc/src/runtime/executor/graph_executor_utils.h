@@ -16,6 +16,7 @@
 
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
+#include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
@@ -31,6 +32,7 @@ bool ends_with(std::string_view value, std::string_view suffix);
 bool env_enabled(const char* name);
 
 struct CompiledGraph;  // fwd
+struct CompiledOp;     // fwd
 
 // Classifier-backed resolution. Returns the parameter name ONLY when the
 // tensor has TensorKind::ParamGrad. For ActivationGrad / AccumTemp /
@@ -83,6 +85,10 @@ bool is_mlp_gate_weight(std::string_view name);
 EMMTranspose parse_transpose(const AttrMap& attrs);
 EMMTranspose swap_transpose(EMMTranspose mode);
 void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, int& N, int& K);
+
+// LoRA hook slot resolution
+std::string_view
+grouped_lora_after_produce_slot(const CompiledOp& op, modules::LoRATargetId target_id, std::string_view legacy_slot);
 
 // Graph utilities
 bool is_required_op(const Operation& op, const std::unordered_set<std::string>& needed);

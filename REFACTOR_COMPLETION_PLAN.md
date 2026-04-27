@@ -23,12 +23,18 @@ Acceptance:
 
 ## Track 2 - Promote Hook Dispatch From Opt-In To Runtime Path
 
-- [ ] Move CPU-stream prefetch from imperative gather/wait paths into registered `before_consume` schema hooks.
-- [ ] Move streaming grad offload after all-reduce into registered `after_all_reduce` hooks.
-- [ ] Move EP all-to-all observation and follow-up actions into registered `after_all_to_all` hooks.
-- [ ] Move LoRA after-produce actions for dense, router, shared expert, and grouped expert projections into registered schema hooks.
-- [ ] Keep the current imperative paths as fallback until hook parity is green under CI.
+- [x] Move CPU-stream prefetch from imperative gather/wait paths into registered `before_consume` schema hooks.
+- [x] Move streaming grad offload after all-reduce into registered `after_all_reduce` hooks.
+- [x] Move EP all-to-all observation and follow-up actions into registered `after_all_to_all` hooks.
+- [x] Move LoRA after-produce actions for dense, router, shared expert, and grouped expert projections into registered schema hooks.
+- [x] Keep the current imperative paths as fallback until hook parity is green under CI.
 - [ ] Flip default dispatch after parity, then remove fallback-only code that no longer has a caller.
+
+Completed subphase:
+
+- Grouped MoE LoRA after-produce dispatch now uses the compiled structural activation slot and schema id for `expert_gate_up`, `expert_up`, and `expert_down`; legacy slot names remain only as fallback for graphs without structural metadata.
+- MoE grouped GEMM compile attrs now carry `layer_idx`, `hook_schema_id`, `allow_quant`, and forward activation schema slot metadata, matching the dense/router/shared expert hook path.
+- Nemotron-style separate expert-up grouped GEMM now emits the structural `expert_up` activation name so schema hooks can target it.
 
 Acceptance:
 
