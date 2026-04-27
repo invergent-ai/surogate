@@ -140,8 +140,12 @@ namespace {
         out = plan.C;
     } else if (token == "QKV") {
         out = plan.layer_qkv(layer.layer);
-    } else if (token == "AttnDim" || token == "QProjDim") {
+    } else if (token == "AttnDim") {
         out = plan.layer_attn_dim(layer.layer);
+    } else if (token == "QProjDim") {
+        out = 2 * plan.layer_attn_dim(layer.layer);
+    } else if (token == "KVDim") {
+        out = plan.Hkv * (plan.Hq > 0 ? plan.layer_attn_dim(layer.layer) / plan.Hq : 0);
     } else if (token == "M") {
         out = layer_m;
     } else if (token == "2M" || token == "MUp") {

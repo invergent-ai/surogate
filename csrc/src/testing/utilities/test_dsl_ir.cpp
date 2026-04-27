@@ -312,6 +312,38 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].slots[2].resolved_shape == std::vector<long>{2, 3, 8});
     REQUIRE(plan.schema_layers[0].slots[2].resolved_numel == 48);
     REQUIRE(plan.schema_layers[0].slots[2].resolved_bytes == 96);
+
+    auto alias_records = schema_records;
+    alias_records[0].slots.clear();
+    dsl::BlockSchemaSlotSummary q_proj_slot;
+    q_proj_slot.name = "full_q_proj_weight";
+    q_proj_slot.kind = "param";
+    q_proj_slot.distribution_kind = "replicated";
+    q_proj_slot.shape_dims = {"QProjDim", "C"};
+    q_proj_slot.shape_rank = 2;
+    alias_records[0].slots.push_back(q_proj_slot);
+    dsl::BlockSchemaSlotSummary kv_slot;
+    kv_slot.name = "full_k_proj_weight";
+    kv_slot.kind = "param";
+    kv_slot.distribution_kind = "replicated";
+    kv_slot.shape_dims = {"KVDim", "C"};
+    kv_slot.shape_rank = 2;
+    alias_records[0].slots.push_back(kv_slot);
+    alias_records[0].slot_count = 2;
+    alias_records[0].param_slots = 2;
+    alias_records[0].activation_slots = 0;
+    const auto alias_plan = dsl::BufferPlan::build(cfg,
+                                                   runtime_config,
+                                                   options,
+                                                   registry,
+                                                   /*lora_only_mode=*/false,
+                                                   /*B=*/2,
+                                                   /*T=*/3,
+                                                   ETensorDType::BF16,
+                                                   ETensorDType::BF16,
+                                                   &alias_records);
+    REQUIRE(alias_plan.schema_layers[0].slots[0].resolved_shape == std::vector<long>{16, 8});
+    REQUIRE(alias_plan.schema_layers[0].slots[1].resolved_shape == std::vector<long>{4, 8});
     REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);
     REQUIRE(plan.schema_layer(1) == nullptr);
     REQUIRE(plan.schema_layer_has_slot(0, "experts_gate_up"));

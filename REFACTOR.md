@@ -136,6 +136,7 @@
 - [x] Acceptance model graph tests now require every emitted block-schema slot to declare a name, kind, and non-empty shape.
 - [x] `BufferPlan` now computes global and EP-local dtype-aware byte estimates for resolved schema parameter slots, including expert-parallel weights.
 - [x] Regression block-schema summaries now distinguish expert-parallel parameter slots from activation/storage slots.
+- [x] `BufferPlan` schema shape resolution now covers Qwen3.5 `QProjDim` and `KVDim` aliases with C++ parity coverage.
 
 Local validation status:
 
