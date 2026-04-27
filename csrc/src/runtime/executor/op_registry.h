@@ -63,6 +63,9 @@ struct OpDescriptor {
     StackBoundFn stack_bound_fn = nullptr;          // op-internal stack bytes (optional)
     OpSemanticKind semantic_kind = OpSemanticKind::Unknown;
     DistributionKind distribution_kind = DistributionKind::Replicated;
+    OpCapabilities default_caps{};
+    EpilogueSupport epilogue_support{};
+    StorageCompatibility storage_compat{};
     CommunicationProfile comm_profile{};
     GroupedSemantics grouped_semantics{};
     std::uint32_t descriptor_flags = 0;
@@ -116,6 +119,18 @@ inline OpDescriptor make_metadata_descriptor(std::string name,
     desc.comm_profile = comm_profile;
     desc.grouped_semantics = grouped_semantics;
     desc.descriptor_flags = descriptor_flags;
+    return desc;
+}
+
+inline OpDescriptor make_capability_descriptor(std::string name,
+                                               OpCapabilities default_caps,
+                                               EpilogueSupport epilogue_support,
+                                               StorageCompatibility storage_compat) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.default_caps = default_caps;
+    desc.epilogue_support = epilogue_support;
+    desc.storage_compat = storage_compat;
     return desc;
 }
 
@@ -232,5 +247,14 @@ private:
                                     -1,                                                    \
                                     false,                                                 \
                                     flags_)
+
+// Attach capability metadata without changing dispatch/autodiff behavior.
+#define REGISTER_OP_CAPABILITIES(name_str, caps_flags_, epilogue_flags_, storage_flags_) \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_op_caps_reg_, __COUNTER__) =       \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_capability_descriptor(     \
+            name_str,                                                                    \
+            ::dsl::OpCapabilities{static_cast<std::uint32_t>(caps_flags_)},              \
+            ::dsl::EpilogueSupport{static_cast<std::uint32_t>(epilogue_flags_)},         \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(storage_flags_)}))
 
 #endif  // SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H

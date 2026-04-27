@@ -61,6 +61,9 @@ int OpRegistry::register_op(OpDescriptor desc) {
         if (desc.distribution_kind != DistributionKind::Replicated) {
             existing.distribution_kind = desc.distribution_kind;
         }
+        existing.default_caps.flags |= desc.default_caps.flags;
+        existing.epilogue_support.flags |= desc.epilogue_support.flags;
+        existing.storage_compat.flags |= desc.storage_compat.flags;
         if (desc.comm_profile.kind != CommunicationKind::NoComm || desc.comm_profile.can_overlap_with_compute ||
             desc.comm_profile.reduction_priority != 0) {
             existing.comm_profile = desc.comm_profile;

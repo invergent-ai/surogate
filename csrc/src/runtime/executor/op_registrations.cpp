@@ -325,6 +325,19 @@ REGISTER_OP_METADATA("cross_entropy_loss_backward", Loss, Replicated, 0);
 REGISTER_OP_METADATA("fused_lm_head_loss", Loss, Replicated, 0);
 REGISTER_OP_METADATA("fused_lm_head_loss_backward", Loss, Replicated, 0);
 
+REGISTER_OP_CAPABILITIES("matmul",
+                         ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible |
+                             ::dsl::OpCapabilityFp4Eligible | ::dsl::OpCapabilityLoRACompatible |
+                             ::dsl::OpCapabilityWeightCacheEligible,
+                         ::dsl::EpilogueSupportNone,
+                         ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
+REGISTER_OP_CAPABILITIES("matmul_bias",
+                         ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible |
+                             ::dsl::OpCapabilityFp4Eligible | ::dsl::OpCapabilityLoRACompatible |
+                             ::dsl::OpCapabilityWeightCacheEligible,
+                         ::dsl::EpilogueSupportBias,
+                         ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
+
 // MoE forward + backward
 REGISTER_OP("moe_softmax", MoESoftmax, ::dsl::fwd_moe_softmax, nullptr);
 REGISTER_OP("moe_softmax_backward", MoESoftmaxBackward, nullptr, ::dsl::bwd_moe_softmax);
@@ -397,6 +410,25 @@ REGISTER_OP_DESCRIPTOR_METADATA("moe_expert_bias_add",
                                 0,
                                 true,
                                 0);
+
+REGISTER_OP_CAPABILITIES("moe_grouped_gemm",
+                         ::dsl::OpCapabilityGroupedMatmul | ::dsl::OpCapabilityMoeRouted |
+                             ::dsl::OpCapabilityFp8Eligible | ::dsl::OpCapabilityLoRACompatible |
+                             ::dsl::OpCapabilityWeightCacheEligible,
+                         ::dsl::EpilogueSupportNone,
+                         ::dsl::StorageCompatibilityGpuResident);
+REGISTER_OP_CAPABILITIES("moe_grouped_gemm_gate_up",
+                         ::dsl::OpCapabilityGroupedMatmul | ::dsl::OpCapabilityMoeRouted |
+                             ::dsl::OpCapabilityFp8Eligible | ::dsl::OpCapabilityLoRACompatible |
+                             ::dsl::OpCapabilityWeightCacheEligible,
+                         ::dsl::EpilogueSupportActivation,
+                         ::dsl::StorageCompatibilityGpuResident);
+REGISTER_OP_CAPABILITIES("moe_grouped_gemm_down",
+                         ::dsl::OpCapabilityGroupedMatmul | ::dsl::OpCapabilityMoeRouted |
+                             ::dsl::OpCapabilityFp8Eligible | ::dsl::OpCapabilityLoRACompatible |
+                             ::dsl::OpCapabilityWeightCacheEligible,
+                         ::dsl::EpilogueSupportNone,
+                         ::dsl::StorageCompatibilityGpuResident);
 
 // Expert parallelism forward + backward
 REGISTER_OP("ep_dispatch", EpDispatch, ::dsl::fwd_ep_dispatch, nullptr);

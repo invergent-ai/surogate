@@ -336,6 +336,9 @@ struct CompiledOp {
     // metadata only for now; execution continues through `fn`.
     OpSemanticKind semantic_kind = OpSemanticKind::Unknown;
     DistributionKind distribution_kind = DistributionKind::Replicated;
+    OpCapabilities default_caps{};
+    EpilogueSupport epilogue_support{};
+    StorageCompatibility storage_compat{};
     CommunicationProfile comm_profile{};
     GroupedSemantics grouped_semantics{};
     std::uint32_t descriptor_flags = 0;
@@ -679,6 +682,36 @@ struct CompiledGraph {
         std::size_t count = 0;
         for (const auto& op : ops) {
             if (op.grouped_semantics.is_grouped) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_capability(std::uint32_t flag) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.default_caps.has(flag)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_epilogue(std::uint32_t flag) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.epilogue_support.has(flag)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_supporting_storage(StorageTier tier) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.storage_compat.supports(tier)) {
                 ++count;
             }
         }

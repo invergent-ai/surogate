@@ -20,6 +20,9 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     OpDescriptor meta;
     meta.name = "__test_descriptor_metadata";
     meta.distribution_kind = DistributionKind::ExpertParallel;
+    meta.default_caps.flags = OpCapabilityGroupedMatmul | OpCapabilityFp8Eligible;
+    meta.epilogue_support.flags = EpilogueSupportActivation;
+    meta.storage_compat.flags = StorageCompatibilityGpuResident | StorageCompatibilityCpuPinnedStream;
     meta.comm_profile.kind = CommunicationKind::ExpertParallelRouted;
     meta.grouped_semantics.is_grouped = true;
     meta.grouped_semantics.expert_dim = 0;
@@ -30,6 +33,13 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     REQUIRE(desc != nullptr);
     REQUIRE(desc->semantic_kind == OpSemanticKind::Dense);
     REQUIRE(desc->distribution_kind == DistributionKind::ExpertParallel);
+    REQUIRE(desc->default_caps.has(OpCapabilityGroupedMatmul));
+    REQUIRE(desc->default_caps.has(OpCapabilityFp8Eligible));
+    REQUIRE_FALSE(desc->default_caps.has(OpCapabilityFp4Eligible));
+    REQUIRE(desc->epilogue_support.has(EpilogueSupportActivation));
+    REQUIRE(desc->storage_compat.supports(StorageTier::GpuResident));
+    REQUIRE(desc->storage_compat.supports(StorageTier::CpuPinnedStream));
+    REQUIRE_FALSE(desc->storage_compat.supports(StorageTier::NvmeOffload));
     REQUIRE(desc->comm_profile.kind == CommunicationKind::ExpertParallelRouted);
     REQUIRE(desc->grouped_semantics.is_grouped);
     REQUIRE(desc->grouped_semantics.expert_dim == 0);
@@ -48,6 +58,12 @@ TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {
     REQUIRE_FALSE(desc->grouped_semantics.routes_tokens);
     REQUIRE(desc->grouped_semantics.expert_dim == 0);
     REQUIRE(desc->grouped_semantics.ep_aware);
+    REQUIRE(desc->default_caps.has(OpCapabilityGroupedMatmul));
+    REQUIRE(desc->default_caps.has(OpCapabilityMoeRouted));
+    REQUIRE(desc->default_caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(desc->default_caps.has(OpCapabilityWeightCacheEligible));
+    REQUIRE(desc->storage_compat.supports(StorageTier::GpuResident));
+    REQUIRE_FALSE(desc->storage_compat.supports(StorageTier::CpuPinnedStream));
 }
 
 TEST_CASE("ep ops carry communication profile metadata", "[op_registry]") {
@@ -87,6 +103,15 @@ TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     REQUIRE(matmul != nullptr);
     REQUIRE(matmul->semantic_kind == OpSemanticKind::Dense);
     REQUIRE(matmul->comm_profile.kind == CommunicationKind::NoComm);
+    REQUIRE(matmul->default_caps.has(OpCapabilityDenseMatmul));
+    REQUIRE(matmul->default_caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(matmul->default_caps.has(OpCapabilityFp4Eligible));
+    REQUIRE(matmul->default_caps.has(OpCapabilityLoRACompatible));
+    REQUIRE(matmul->storage_compat.supports(StorageTier::CpuPinnedStream));
+
+    const OpDescriptor* matmul_bias = OpRegistry::instance().find_by_name("matmul_bias");
+    REQUIRE(matmul_bias != nullptr);
+    REQUIRE(matmul_bias->epilogue_support.has(EpilogueSupportBias));
 
     const OpDescriptor* rmsnorm = OpRegistry::instance().find_by_name("rmsnorm");
     REQUIRE(rmsnorm != nullptr);

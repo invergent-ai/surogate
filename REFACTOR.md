@@ -46,8 +46,9 @@
 - [x] Mamba/SSM and Qwen3.5 gated-delta op families annotated as no-comm sequence/dense/view descriptors.
 - [x] Core transformer ops annotated with semantic descriptor metadata.
 - [x] Descriptor type definitions split into a lightweight header and copied onto `CompiledOp` during graph compilation.
+- [x] Descriptor surface extended with inert `OpCapabilities`, `EpilogueSupport`, and `StorageCompatibility` fields, with dense matmul and MoE grouped matmul annotations.
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, and distribution descriptor facets.
-- [x] `CompiledGraph` summary helpers added for descriptor communication counts and grouped-op counts.
+- [x] `CompiledGraph` summary helpers added for descriptor communication, grouped-op, capability, epilogue, and storage-compat counts.
 
 Local validation status:
 

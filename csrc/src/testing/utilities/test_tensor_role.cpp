@@ -111,13 +111,22 @@ TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]
     graph.ops[0].comm_profile.kind = CommunicationKind::NoComm;
     graph.ops[1].comm_profile.kind = CommunicationKind::AllToAllIn;
     graph.ops[1].grouped_semantics.routes_tokens = true;
+    graph.ops[1].storage_compat.flags |= StorageCompatibilityCpuPinnedStream;
     graph.ops[2].comm_profile.kind = CommunicationKind::ExpertParallelRouted;
     graph.ops[2].grouped_semantics.is_grouped = true;
     graph.ops[2].grouped_semantics.expert_dim = 0;
+    graph.ops[2].default_caps.flags = OpCapabilityGroupedMatmul | OpCapabilityFp8Eligible;
+    graph.ops[2].epilogue_support.flags = EpilogueSupportActivation;
 
     REQUIRE(graph.count_ops_with_comm(CommunicationKind::NoComm) == 1);
     REQUIRE(graph.count_ops_with_comm(CommunicationKind::AllToAllIn) == 1);
     REQUIRE(graph.count_ops_with_comm(CommunicationKind::ExpertParallelRouted) == 1);
     REQUIRE(graph.count_ops_with_comm(CommunicationKind::AllReduceAfter) == 0);
     REQUIRE(graph.count_grouped_ops() == 1);
+    REQUIRE(graph.count_ops_with_capability(OpCapabilityGroupedMatmul) == 1);
+    REQUIRE(graph.count_ops_with_capability(OpCapabilityFp8Eligible) == 1);
+    REQUIRE(graph.count_ops_with_capability(OpCapabilityFp4Eligible) == 0);
+    REQUIRE(graph.count_ops_with_epilogue(EpilogueSupportActivation) == 1);
+    REQUIRE(graph.count_ops_supporting_storage(StorageTier::GpuResident) == 3);
+    REQUIRE(graph.count_ops_supporting_storage(StorageTier::CpuPinnedStream) == 1);
 }

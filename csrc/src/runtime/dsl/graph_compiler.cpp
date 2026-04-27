@@ -5083,6 +5083,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             compiled.fn = is_backward ? desc->backward_fn : desc->forward_fn;
             compiled.semantic_kind = desc->semantic_kind;
             compiled.distribution_kind = desc->distribution_kind;
+            compiled.default_caps = desc->default_caps;
+            compiled.epilogue_support = desc->epilogue_support;
+            compiled.storage_compat = desc->storage_compat;
             compiled.comm_profile = desc->comm_profile;
             compiled.grouped_semantics = desc->grouped_semantics;
             compiled.descriptor_flags = desc->descriptor_flags;
