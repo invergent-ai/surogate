@@ -1123,6 +1123,14 @@ DslModel::DslModel(const PretrainedConfig& config,
     mRuntimeConfig = build_runtime_config(*mModule, *mConfig);
     mModelConfig = build_model_config(*mModule, *mConfig, mRuntimeConfig);
 
+    if (const char* assert_schema = std::getenv("SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT");
+        assert_schema && std::string_view(assert_schema) == "1" && !mBlockSchemaPlanRecords.empty() &&
+        mBlockSchemaPlanRecords.size() != static_cast<std::size_t>(mModelConfig.NumLayers)) {
+        throw std::runtime_error(fmt::format("DSL model: block schema plan record count {} != NumLayers {}",
+                                             mBlockSchemaPlanRecords.size(),
+                                             mModelConfig.NumLayers));
+    }
+
     // Expert Parallelism: set EPSize and compute NumLocalExperts
     mModelConfig.EPSize = mOptions.EPSize;
     if (mModelConfig.NumExperts > 0) {
