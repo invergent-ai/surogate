@@ -102,12 +102,12 @@
 Local validation status:
 
 - [x] `make wheel-dev` passed.
-- [x] `make test-integration` passed.
+- [x] `make test-integration` passed after the unit-gate cleanup.
 - [x] Focused C++ gates passed: `[op_registry]`, `[fusion_rule]`, `[tensor_role]`, `[moe]`; latest `[op_registry],[tensor_role]` pass was 292 assertions across 11 cases.
 - [x] Primitive DSL compiled-op golden gate passed after preserving standalone backward graph outputs across last-use pruning and final stack cleanup.
 - [x] `make test-unit` passed; FP32 flash-attention standalone/module goldens are explicitly skipped where no registered production attention backend supports that dtype.
 - [x] `make regression-smoke` passed.
-- [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py --no-gpu`; latest descriptor artifact/baseline gate passed with 20 tests.
+- [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py tests/test_regression_baseline_runner.py tests/test_regression_artifact_writer.py --no-gpu` with 49 tests.
 - [ ] GPU/model-path acceptance rows are not exercised locally yet because the required `*_MODEL_PATH` env vars are missing; runner reports explicit skips.
 
 ---
