@@ -153,6 +153,7 @@ private:
 
 [[nodiscard]] std::string schema_id_for_hook_target(const BlockSchemaPlanRecord& record);
 [[nodiscard]] std::string schema_id_for_hook_target(const BlockSchemaLayerSummary& layer);
+[[nodiscard]] bool schema_slot_is_lora_after_produce_target(const BlockSchemaSlotSummary& slot);
 
 /// Collect structural hook targets from schema metadata for a future migration.
 /// The result is diagnostics/scaffolding only; it does not alter execution.

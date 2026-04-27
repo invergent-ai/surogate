@@ -233,6 +233,7 @@ Real-model acceptance queue:
 - [x] Generic grouped MoE up-projection LoRA now dispatches the structural `expert_up` `after_produce` hook, and hook target collection includes `expert_up` activation slots for Nemotron-style MoE blocks.
 - [x] Router matmuls now carry the structural `router_logits` `after_produce` hook slot, allowing router LoRA to use the typed after-produce payload instead of only the inline fallback.
 - [x] Expert-weight TensorRole parity now recognizes generic `expert_up` names in addition to fused `expert_gate_up` and `expert_down`, keeping Nemotron-style MoE expert slicing aligned across QLoRA and runtime helpers.
+- [x] Runtime hook readiness reporting now reuses the hook-registry `after_produce` slot predicate instead of maintaining a shadow string list in `dsl_debug.cpp`.
 
 ---
 

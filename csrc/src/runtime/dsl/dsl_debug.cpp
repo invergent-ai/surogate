@@ -16,6 +16,7 @@
 #include "runtime/dsl/dsl_model.h"
 #include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/dsl/hook_registry.h"
 #include "runtime/executor/graph_executor.h"
 
 namespace dsl {
@@ -346,11 +347,7 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     for (const BlockSchemaLayerSummary& layer : p.schema_layers) {
         for (const BlockSchemaSlotSummary& slot : layer.slots) {
             const bool is_param = slot.kind == "param";
-            const bool lora_after_produce =
-                !is_param && (slot.name == "qkv" || slot.name == "att_out" || slot.name == "mlp_up" ||
-                              slot.name == "mlp_down" || slot.name == "router_logits" ||
-                              slot.name == "expert_gate_up" || slot.name == "expert_up" || slot.name == "expert_down");
-            if (lora_after_produce) {
+            if (schema_slot_is_lora_after_produce_target(slot)) {
                 s.hook_after_produce_targets += 1;
             }
             const bool streamable_param =

@@ -41,13 +41,6 @@ namespace {
                                    slot.distribution_kind == "router_replicated");
 }
 
-[[nodiscard]] bool is_lora_after_produce_slot(const BlockSchemaSlotSummary& slot) {
-    if (is_param_slot(slot)) return false;
-    return slot.name == "qkv" || slot.name == "att_out" || slot.name == "mlp_up" || slot.name == "mlp_down" ||
-           slot.name == "router_logits" || slot.name == "expert_gate_up" || slot.name == "expert_up" ||
-           slot.name == "expert_down";
-}
-
 [[nodiscard]] bool registration_less(const HookRegistration& a, const HookRegistration& b) {
     if (a.event != b.event) return static_cast<int>(a.event) < static_cast<int>(b.event);
     if (a.target.schema_id != b.target.schema_id) return a.target.schema_id < b.target.schema_id;
@@ -169,6 +162,13 @@ std::string schema_id_for_hook_target(const BlockSchemaLayerSummary& layer) {
     return layer.block_family;
 }
 
+bool schema_slot_is_lora_after_produce_target(const BlockSchemaSlotSummary& slot) {
+    if (is_param_slot(slot)) return false;
+    return slot.name == "qkv" || slot.name == "att_out" || slot.name == "mlp_up" || slot.name == "mlp_down" ||
+           slot.name == "router_logits" || slot.name == "expert_gate_up" || slot.name == "expert_up" ||
+           slot.name == "expert_down";
+}
+
 std::vector<HookTarget> collect_schema_hook_targets(const std::vector<BlockSchemaPlanRecord>& records,
                                                     HookEventKind event) {
     std::vector<HookTarget> targets;
@@ -178,7 +178,7 @@ std::vector<HookTarget> collect_schema_hook_targets(const std::vector<BlockSchem
         for (const BlockSchemaSlotSummary& slot : record.slots) {
             bool include = false;
             switch (event) {
-                case HookEventKind::AfterProduce: include = is_lora_after_produce_slot(slot); break;
+                case HookEventKind::AfterProduce: include = schema_slot_is_lora_after_produce_target(slot); break;
                 case HookEventKind::BeforeConsume: include = is_streamable_param_slot(slot); break;
                 case HookEventKind::AfterConsume: include = is_streamable_param_slot(slot); break;
                 case HookEventKind::AfterCommunication:
