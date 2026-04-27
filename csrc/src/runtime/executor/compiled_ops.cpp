@@ -992,7 +992,9 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op, const modules::
     if (!op.fn) {
         std::ostringstream oss;
         oss << "dispatch_forward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
-            << ")";
+            << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
+            << ", comm=" << communication_kind_name(op.comm_profile.kind)
+            << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
         throw std::runtime_error(oss.str());
     }
     op.fn(*this, op, static_cast<const void*>(hook));
@@ -1002,7 +1004,9 @@ void CompiledExecutor::dispatch_backward_op(const CompiledOp& op, const modules:
     if (!op.fn) {
         std::ostringstream oss;
         oss << "dispatch_backward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
-            << ")";
+            << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
+            << ", comm=" << communication_kind_name(op.comm_profile.kind)
+            << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
         throw std::runtime_error(oss.str());
     }
     op.fn(*this, op, static_cast<const void*>(hook));

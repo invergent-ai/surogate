@@ -1648,8 +1648,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             // Phase 2a: dispatch via the function pointer baked into
             // op.fn at graph compile time. One indirect call, no switch.
             if (!op.fn) {
-                throw std::runtime_error(std::string("CompiledExecutor: no dispatch fn for forward op type ") +
-                                         op_type_to_string(op.type));
+                std::ostringstream oss;
+                oss << "CompiledExecutor: no dispatch fn for forward op type " << op_type_to_string(op.type)
+                    << " (semantic=" << op_semantic_kind_name(op.semantic_kind)
+                    << ", comm=" << communication_kind_name(op.comm_profile.kind)
+                    << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
+                throw std::runtime_error(oss.str());
             }
             check_op_io_aliasing(op, idx, "fwd");
             op.fn(*this, op, static_cast<const void*>(hook));
@@ -3004,7 +3008,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (!op.fn) {
                 std::ostringstream oss;
                 oss << "CompiledExecutor: no dispatch fn for backward op at idx " << idx
-                    << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
+                    << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
+                    << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
+                    << ", comm=" << communication_kind_name(op.comm_profile.kind)
+                    << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
                 throw std::runtime_error(oss.str());
             }
             check_op_io_aliasing(op, idx, "bwd");
