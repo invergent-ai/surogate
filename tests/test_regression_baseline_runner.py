@@ -49,7 +49,7 @@ def test_coverage_report_counts_supported_quant_rows(tmp_path):
 
 
 def test_coverage_report_marks_moe_grouped_capabilities():
-    case = br.RegressionCase("m", "fp8", "single_gpu", op_kind="moe_grouped")
+    case = br.RegressionCase("m", "fp8", "2gpu_dp_ep", storage="cpu_stream", op_kind="moe_grouped")
     results = {
         case.case_id: {
             "case": br.asdict(case),
@@ -69,6 +69,12 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "block_schema_expected_layers": 2,
                     "block_schema_missing_layers": 0,
                     "block_schema_moe_layers": 2,
+                    "block_schema_ep_layers": 2,
+                    "block_schema_auto_resident_slots": 4,
+                },
+                "buffer_plan_summary": {
+                    "schema_record_count": 2,
+                    "schema_expert_parallel_param_shape_savings_bytes": 1024,
                 },
             },
         }
@@ -87,7 +93,33 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["missing_descriptor_counts"] == []
     assert report["rows"][0]["fusion_candidate_starts"] == 3
     assert report["rows"][0]["block_schema_status"] == "present"
+    assert report["rows"][0]["storage_declaration_status"] == "present"
+    assert report["rows"][0]["ep_topology_status"] == "present"
     assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
+    assert report["rows"][0]["buffer_plan_summary"]["schema_expert_parallel_param_shape_savings_bytes"] == 1024
+
+
+def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
+    case = br.RegressionCase("m", "fp8", "2gpu_dp_ep", storage="cpu_stream", op_kind="moe_grouped")
+    results = {
+        case.case_id: {
+            "case": br.asdict(case),
+            "status": "failed",
+            "metrics": {
+                "block_schema_summary": {
+                    "block_schema_records": 1,
+                    "block_schema_expected_layers": 1,
+                    "block_schema_missing_layers": 0,
+                }
+            },
+        }
+    }
+
+    report = br.coverage_report(results)
+
+    assert report["rows"][0]["block_schema_status"] == "present"
+    assert report["rows"][0]["storage_declaration_status"] == "missing"
+    assert report["rows"][0]["ep_topology_status"] == "missing"
 
 
 def test_coverage_report_marks_descriptor_requirements_present():

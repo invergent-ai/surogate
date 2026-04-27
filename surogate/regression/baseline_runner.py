@@ -664,6 +664,25 @@ def block_schema_status(block_schema_summary: dict[str, Any]) -> str:
     return "missing"
 
 
+def storage_declaration_status(case: dict[str, Any], block_schema_summary: dict[str, Any]) -> str:
+    if case.get("storage") != "cpu_stream":
+        return "not_applicable"
+    if not block_schema_summary:
+        return "unknown"
+    streamable = int(block_schema_summary.get("block_schema_auto_resident_slots") or 0) + int(
+        block_schema_summary.get("block_schema_cpu_stream_slots") or 0
+    )
+    return "present" if streamable > 0 else "missing"
+
+
+def ep_topology_status(case: dict[str, Any], block_schema_summary: dict[str, Any]) -> str:
+    if "ep" not in str(case.get("distribution") or ""):
+        return "not_applicable"
+    if not block_schema_summary:
+        return "unknown"
+    return "present" if int(block_schema_summary.get("block_schema_ep_layers") or 0) > 0 else "missing"
+
+
 def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     eligible = 0
@@ -697,7 +716,10 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "missing_descriptor_counts": missing_descriptor_counts,
                 "fusion_candidate_starts": descriptor_summary.get("fusion_candidate_starts"),
                 "block_schema_status": block_schema_status(block_schema_summary),
+                "storage_declaration_status": storage_declaration_status(case, block_schema_summary),
+                "ep_topology_status": ep_topology_status(case, block_schema_summary),
                 "block_schema_summary": block_schema_summary,
+                "buffer_plan_summary": metrics.get("buffer_plan_summary") or {},
             }
         )
     return {
