@@ -65,6 +65,7 @@
 - [x] Opt-in recipe capability fallback logging added under `SUROGATE_RECIPE_CAPABILITY_LOG`.
 - [x] Dense backward and fused `matmul_swiglu` recipe paths now carry descriptor FP8/FP4 capability metadata into recipe contexts.
 - [x] Recipe capability predicates now distinguish legacy unannotated allow-path diagnostics from explicit descriptor capability denials.
+- [x] Inert `FusionRuleRegistry` scaffold added for Phase 3c pattern, priority, capability, and communication-aware fusion declarations.
 
 Local validation status:
 

@@ -302,6 +302,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/tensor_slot_registry.cpp
     src/runtime/dsl/tensor_slot_dispatch.cpp
     src/runtime/dsl/tensor_role.cpp
+    src/runtime/dsl/fusion_rule_registry.cpp
 
     src/runtime/ops/embedding.cpp
     src/runtime/ops/zeros.cpp
@@ -699,6 +700,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/utilities/test_dsl_ir.cpp
             src/testing/utilities/test_dsl_goldens.cpp
             src/testing/utilities/test_dsl_module_goldens.cpp
+            src/testing/utilities/test_fusion_rule_registry.cpp
             src/testing/utilities/test_op_registry.cpp
             src/testing/utilities/test_tensor_role.cpp
         )
