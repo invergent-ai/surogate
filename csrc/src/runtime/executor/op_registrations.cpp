@@ -401,6 +401,19 @@ REGISTER_OP("mamba_gated_rmsnorm_backward", MambaGatedRMSNormBackward, nullptr, 
 REGISTER_OP("mamba_out_proj", MambaOutProj, ::dsl::fwd_mamba_out_proj, nullptr);
 REGISTER_OP("mamba_out_proj_backward", MambaOutProjBackward, nullptr, ::dsl::bwd_mamba_out_proj);
 
+REGISTER_OP_METADATA("mamba_split_proj", Dense, Replicated, 0);
+REGISTER_OP_METADATA("mamba_split_proj_backward", Dense, Replicated, 0);
+REGISTER_OP_METADATA("mamba_conv1d", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("mamba_conv1d_backward", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("mamba_split_conv_out", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("mamba_split_conv_out_backward", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("mamba_ssm_scan", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("mamba_ssm_scan_backward", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("mamba_gated_rmsnorm", Normalization, Replicated, 0);
+REGISTER_OP_METADATA("mamba_gated_rmsnorm_backward", Normalization, Replicated, 0);
+REGISTER_OP_METADATA("mamba_out_proj", Dense, Replicated, 0);
+REGISTER_OP_METADATA("mamba_out_proj_backward", Dense, Replicated, 0);
+
 // Qwen3.5 gated delta rule forward + backward
 REGISTER_OP("chunk_gated_delta_rule", ChunkGatedDeltaRule, ::dsl::fwd_chunk_gated_delta_rule, nullptr);
 REGISTER_OP("chunk_gated_delta_rule_backward", ChunkGatedDeltaRuleBackward, nullptr, ::dsl::bwd_chunk_gated_delta_rule);
@@ -411,3 +424,10 @@ REGISTER_OP("repeat_interleave_heads_backward",
             RepeatInterleaveHeadsBackward,
             nullptr,
             ::dsl::bwd_repeat_interleave_heads);
+
+REGISTER_OP_METADATA("chunk_gated_delta_rule", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("chunk_gated_delta_rule_backward", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("qwen3_5_decay", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("qwen3_5_decay_backward", Sequence, Replicated, 0);
+REGISTER_OP_METADATA("repeat_interleave_heads", View, Replicated, 0);
+REGISTER_OP_METADATA("repeat_interleave_heads_backward", View, Replicated, 0);

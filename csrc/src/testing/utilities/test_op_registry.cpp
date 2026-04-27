@@ -64,5 +64,23 @@ TEST_CASE("ep ops carry communication profile metadata", "[op_registry]") {
     REQUIRE(combine->comm_profile.kind == CommunicationKind::AllToAllOut);
 }
 
+TEST_CASE("mamba and gated-delta ops carry no-comm descriptor metadata", "[op_registry]") {
+    const OpDescriptor* mamba_scan = OpRegistry::instance().find_by_name("mamba_ssm_scan");
+    REQUIRE(mamba_scan != nullptr);
+    REQUIRE(mamba_scan->semantic_kind == OpSemanticKind::Sequence);
+    REQUIRE(mamba_scan->distribution_kind == DistributionKind::Replicated);
+    REQUIRE(mamba_scan->comm_profile.kind == CommunicationKind::NoComm);
+
+    const OpDescriptor* mamba_out = OpRegistry::instance().find_by_name("mamba_out_proj");
+    REQUIRE(mamba_out != nullptr);
+    REQUIRE(mamba_out->semantic_kind == OpSemanticKind::Dense);
+    REQUIRE(mamba_out->comm_profile.kind == CommunicationKind::NoComm);
+
+    const OpDescriptor* gated_delta = OpRegistry::instance().find_by_name("chunk_gated_delta_rule");
+    REQUIRE(gated_delta != nullptr);
+    REQUIRE(gated_delta->semantic_kind == OpSemanticKind::Sequence);
+    REQUIRE(gated_delta->comm_profile.kind == CommunicationKind::NoComm);
+}
+
 }  // namespace
 }  // namespace dsl
