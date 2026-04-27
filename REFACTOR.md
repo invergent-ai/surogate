@@ -74,6 +74,7 @@
 - [x] Dense FP8 co-located quant ready-flag mapping centralized as a first Phase 3d bridge toward generic quant-state routing.
 - [x] FP8 ready flags now expose diagnostic names and map into the `QuantState::FP8Ready` vocabulary without changing execution.
 - [x] Mamba `out_proj` forward/backward matmul delegates now declare dense FP8/FP4 capability and CPU-stream storage compatibility.
+- [x] Regression artifact schema and north-star coverage rows now reserve descriptor-summary/fusion-candidate counts for descriptor-driven reporting.
 
 Local validation status:
 

@@ -75,6 +75,7 @@ class RegressionArtifacts:
     step_time_ms: dict[str, float] = field(default_factory=dict)
     cuda_peak_memory_bytes: int | None = None
     nccl: dict[str, dict[str, int]] = field(default_factory=dict)
+    descriptor_summary: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, path: Path) -> "RegressionArtifacts":
@@ -91,6 +92,7 @@ class RegressionArtifacts:
             "step_time_ms": data.get("step_time_ms", {}),
             "cuda_peak_memory_bytes": data.get("cuda_peak_memory_bytes"),
             "nccl": data.get("nccl", {}),
+            "descriptor_summary": data.get("descriptor_summary", {}),
         }
         return cls(**known)
 
@@ -461,6 +463,8 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     for result in results.values():
         case = result["case"]
         recipe = case["recipe"]
+        metrics = result.get("metrics") or {}
+        descriptor_summary = metrics.get("descriptor_summary") or {}
         is_quant = recipe in {"fp8", "fp4"}
         if is_quant and case.get("supported", True):
             eligible += 1
@@ -476,6 +480,7 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "status": result["status"],
                 "reason": result.get("reason", ""),
                 "required_capabilities": required_capabilities_for_case(case),
+                "fusion_candidate_starts": descriptor_summary.get("fusion_candidate_starts"),
             }
         )
     return {

@@ -42,11 +42,36 @@ def test_coverage_report_counts_supported_quant_rows(tmp_path):
 
 def test_coverage_report_marks_moe_grouped_capabilities():
     case = br.RegressionCase("m", "fp8", "single_gpu", op_kind="moe_grouped")
-    results = {case.case_id: {"case": br.asdict(case), "status": "skipped", "reason": "missing weights"}}
+    results = {
+        case.case_id: {
+            "case": br.asdict(case),
+            "status": "skipped",
+            "reason": "missing weights",
+            "metrics": {"descriptor_summary": {"fusion_candidate_starts": 3}},
+        }
+    }
 
     report = br.coverage_report(results)
 
     assert report["rows"][0]["required_capabilities"] == ["GroupedMatmul", "MoERouted", "FP8Eligible"]
+    assert report["rows"][0]["fusion_candidate_starts"] == 3
+
+
+def test_artifact_schema_accepts_descriptor_summary():
+    artifacts = br.RegressionArtifacts.from_dict(
+        {
+            "activation_snapshots": {"layer0": {"max_abs": 1.0}},
+            "descriptor_summary": {
+                "compiled_ops": 12,
+                "fusion_candidate_starts": 2,
+            },
+        }
+    )
+
+    assert artifacts.descriptor_summary == {
+        "compiled_ops": 12,
+        "fusion_candidate_starts": 2,
+    }
 
 
 def test_load_results_ignores_report_artifacts(tmp_path):
