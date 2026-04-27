@@ -197,7 +197,7 @@ Real-model acceptance queue:
 - [x] C++ DSL IR coverage now validates deterministic hook lookup, priority ordering, dispatch callbacks, invalid target diagnostics, and schema-derived prefetch/communication/reduce-scatter hook targets.
 - [x] Regression block-schema summaries now expose Phase 5 hook-target coverage counts for before-consume prefetch, after-all-to-all communication, and after-reduce-scatter gradient/offload migration points.
 - [x] Runtime `BufferPlan` debug summaries now expose the same Phase 5 hook-target coverage counts from resolved schema layer summaries, keeping artifact-level and runtime-level diagnostics aligned.
-- [x] `DslModel` now owns an inert schema hook registry seeded from block-schema records for stream prefetch, all-to-all, and reduce-scatter targets; debug summaries report total and distribution-aware registrations without dispatching them in execution.
+- [x] `DslModel` now owns a schema hook registry seeded from block-schema records for stream prefetch, all-to-all, and reduce-scatter targets; debug summaries report total and distribution-aware registrations, and execution dispatch remains opt-in.
 - [x] Compiled LoRA slices now carry diagnostic schema-slot names inferred from their structural weight inputs, and descriptor summaries report LoRA slice/schema-slot coverage including grouped MoE slices.
 - [x] North-star coverage rows now report Phase 5 hook readiness, missing hook-count diagnostics, and hook target counts alongside descriptor/schema/storage/EP readiness.
 - [x] Schema hook target collection now covers `after_produce` activation slots used by LoRA post-projection hooks (`qkv`, `att_out`, `mlp_up`, `mlp_down`, router/expert outputs), and `DslModel` seeds inert registrations for them.
@@ -292,10 +292,10 @@ Phase 1: TensorRole + Distribution scaffolding                COMPLETE
 Phase 2: Op registry descriptor extension scaffold            COMPLETE
 Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
 Phase 4: Block schemas + storage residency + EP topology      COMPLETE
-Phase 5: Hook registry + distribution-aware + CPU offload     STARTED (inert registry scaffold)
+Phase 5: Hook registry + distribution-aware + CPU offload     STARTED (opt-in dispatch boundaries)
 ```
 
-Completion here means the phase work tracked in §0 has landed. The full roadmap below remains the target architecture; Phase 5 execution beyond the current inert scaffold is ongoing.
+Completion here means the phase work tracked in §0 has landed. The full roadmap below remains the target architecture; Phase 5 migration beyond the current opt-in dispatch boundaries is ongoing.
 
 **Critical path to "FP8/FP4 + MoE + multi-GPU generalized":** Phases 0–3 ≈ 29 weeks ≈ **6.7 months solo**, ~4 months with two engineers.
 
