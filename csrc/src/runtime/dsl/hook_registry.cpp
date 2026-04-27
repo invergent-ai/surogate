@@ -44,7 +44,8 @@ namespace {
 [[nodiscard]] bool is_lora_after_produce_slot(const BlockSchemaSlotSummary& slot) {
     if (is_param_slot(slot)) return false;
     return slot.name == "qkv" || slot.name == "att_out" || slot.name == "mlp_up" || slot.name == "mlp_down" ||
-           slot.name == "router_logits" || slot.name == "expert_gate_up" || slot.name == "expert_down";
+           slot.name == "router_logits" || slot.name == "expert_gate_up" || slot.name == "expert_up" ||
+           slot.name == "expert_down";
 }
 
 [[nodiscard]] bool registration_less(const HookRegistration& a, const HookRegistration& b) {

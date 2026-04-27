@@ -35,6 +35,21 @@ void attach_token_role(modules::MoeMatmulContext& ctx, const CompiledGraph* grap
     }
 }
 
+const char* grouped_lora_after_produce_slot(const CompiledOp& op, modules::LoRATargetId target_id) {
+    for (const LoRASlice& slice : op.attrs.lora_slices) {
+        if (slice.grouped && slice.id == target_id) {
+            switch (target_id) {
+                case modules::LoRATargetId::ExpertUp: return "expert_up";
+                case modules::LoRATargetId::ExpertGate:
+                case modules::LoRATargetId::ExpertGateUp: return "expert_gate_up";
+                case modules::LoRATargetId::ExpertDown: return "expert_down";
+                default: break;
+            }
+        }
+    }
+    return "";
+}
+
 }  // namespace
 
 void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
@@ -322,9 +337,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                          llep_weight_ptrs);
     }
 
-    // Apply grouped MoE LoRA (up projection) when enabled.
-    if (mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
-        layer_idx_any >= 0) {
+    auto apply_grouped_moe_up_lora = [&]() {
+        // Apply grouped MoE LoRA (up projection) when enabled.
+        if (!(mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
+              layer_idx_any >= 0)) {
+            return;
+        }
         auto& lora_block = mLoRAWeights->get_block(layer_idx_any, mRunState.MainStream);
         if (lora_block.moe.use_grouped) {
             // When LLEP is active, use merged LoRA tensors
@@ -483,6 +501,20 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                 }
             }  // if (up_ptr && up_ptr->has_value())
         }  // if (use_grouped)
+    };
+
+    AfterProduceHookPayload after_produce_payload;
+    const char* after_produce_slot = grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertUp);
+    if (after_produce_slot[0] != '\0') {
+        after_produce_payload.apply_lora_action = apply_grouped_moe_up_lora;
+        dispatch_schema_hook(HookEventKind::AfterProduce,
+                             layer_idx_any,
+                             op.attrs.hook_schema_id,
+                             after_produce_slot,
+                             &after_produce_payload);
+    }
+    if (!after_produce_payload.lora_applied) {
+        apply_grouped_moe_up_lora();
     }
 
     store_tensor(op.outputs[0], out);
