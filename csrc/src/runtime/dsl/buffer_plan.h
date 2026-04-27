@@ -17,6 +17,7 @@
 #define SUROGATE_SRC_DSL_BUFFER_PLAN_H
 
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -236,6 +237,11 @@ struct BufferPlan {
     }
     [[nodiscard]] bool has_moe() const {
         return NumExperts > 0;
+    }
+    [[nodiscard]] const BlockSchemaLayerSummary* schema_layer(int i) const;
+    [[nodiscard]] const BlockSchemaSlotSummary* schema_slot(int i, std::string_view name) const;
+    [[nodiscard]] bool schema_layer_has_slot(int i, std::string_view name) const {
+        return schema_slot(i, name) != nullptr;
     }
 
     [[nodiscard]] long layer_qkv(int i) const {

@@ -278,6 +278,14 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].nvme_offload_slots == 0);
     REQUIRE(plan.schema_layers[0].slots.size() == 3);
     REQUIRE(plan.schema_layers[0].slots[1].name == "experts_gate_up");
+    REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);
+    REQUIRE(plan.schema_layer(1) == nullptr);
+    REQUIRE(plan.schema_layer_has_slot(0, "experts_gate_up"));
+    REQUIRE_FALSE(plan.schema_layer_has_slot(0, "missing_slot"));
+    const auto* gate_up_slot = plan.schema_slot(0, "experts_gate_up");
+    REQUIRE(gate_up_slot);
+    REQUIRE(gate_up_slot->grouped);
+    REQUIRE(gate_up_slot->streaming_prefetch_distance == 1);
     REQUIRE(plan.schema_layers[0].routing_kind == "topk_softmax");
     REQUIRE(plan.schema_layers[0].routing_topk == 2);
     REQUIRE(plan.schema_layers[0].routing_norm_topk_prob);

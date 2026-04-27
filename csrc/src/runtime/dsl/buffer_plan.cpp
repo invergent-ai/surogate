@@ -428,6 +428,27 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     return p;
 }
 
+const BlockSchemaLayerSummary* BufferPlan::schema_layer(int i) const {
+    if (i < 0 || i >= static_cast<int>(schema_layers.size())) {
+        return nullptr;
+    }
+    const auto& layer = schema_layers[static_cast<std::size_t>(i)];
+    return layer.has_schema ? &layer : nullptr;
+}
+
+const BlockSchemaSlotSummary* BufferPlan::schema_slot(int i, std::string_view name) const {
+    const BlockSchemaLayerSummary* layer = schema_layer(i);
+    if (!layer) {
+        return nullptr;
+    }
+    for (const auto& slot : layer->slots) {
+        if (slot.name == name) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
 // ============================================================================
 // Stack sizing
 // ============================================================================
