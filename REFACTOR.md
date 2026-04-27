@@ -38,6 +38,7 @@
 - [x] DSL stores, matmul MoE predicates, QLoRA expert filters, NorMuon router filters, and MoE expert-bias skip paths wired into role parity.
 - [x] Autodiff MoE side-channel classification centralized through TensorRole helpers.
 - [x] Param-store RoPE/router filtering and grad-store expert-parallel reduction routing now consume TensorRole-derived classifications with legacy string fallback retained.
+- [x] Weight-manager RoPE/router filtering now matches the param-store TensorRole-first classification path with legacy string fallback retained.
 
 ### Phase 2 — Op registry descriptor extension — COMPLETE
 
