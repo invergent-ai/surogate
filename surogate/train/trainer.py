@@ -76,6 +76,76 @@ def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
     return flattened
 
 
+def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
+    if not ir_json:
+        return {}
+    try:
+        root = json.loads(ir_json)
+    except Exception:
+        return {"block_schema_summary_error": 1}
+
+    summary = {
+        "block_schema_records": 0,
+        "block_schema_expected_layers": 0,
+        "block_schema_missing_layers": 0,
+        "block_schema_dense_layers": 0,
+        "block_schema_moe_layers": 0,
+        "block_schema_mamba_layers": 0,
+        "block_schema_linear_mixer_layers": 0,
+        "block_schema_routing_layers": 0,
+        "block_schema_ep_layers": 0,
+        "block_schema_expert_parallel_slots": 0,
+        "block_schema_auto_resident_slots": 0,
+        "block_schema_cpu_stream_slots": 0,
+    }
+    for module in root.get("modules", []):
+        forward = module.get("forward") or {}
+        records = ((forward.get("metadata") or {}).get("block_schemas")) or []
+        if not isinstance(records, list):
+            continue
+        config = module.get("config") or {}
+        n_layers = int(config.get("n_layers") or 0)
+        if n_layers > 0:
+            summary["block_schema_expected_layers"] += n_layers
+            layers = {int(record.get("layer")) for record in records if isinstance(record, dict) and "layer" in record}
+            summary["block_schema_missing_layers"] += max(n_layers - len(layers), 0)
+
+        summary["block_schema_records"] += len(records)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            schema = record.get("schema") or {}
+            attrs = schema.get("attrs") or {}
+            family = str(attrs.get("block_family") or "").lower()
+            if "moe" in family:
+                summary["block_schema_moe_layers"] += 1
+            elif "mamba" in family:
+                summary["block_schema_mamba_layers"] += 1
+            elif "linear" in family:
+                summary["block_schema_linear_mixer_layers"] += 1
+            elif family:
+                summary["block_schema_dense_layers"] += 1
+
+            routing = schema.get("routing")
+            if isinstance(routing, dict) and routing.get("kind") not in (None, "", "none"):
+                summary["block_schema_routing_layers"] += 1
+            if isinstance(schema.get("ep_topology"), dict):
+                summary["block_schema_ep_layers"] += 1
+
+            for slot in schema.get("slots") or []:
+                if not isinstance(slot, dict):
+                    continue
+                distribution = slot.get("distribution") or {}
+                if distribution.get("kind") == "expert_parallel":
+                    summary["block_schema_expert_parallel_slots"] += 1
+                residency = slot.get("residency")
+                if residency == "auto":
+                    summary["block_schema_auto_resident_slots"] += 1
+                elif residency == "cpu_pinned_stream":
+                    summary["block_schema_cpu_stream_slots"] += 1
+    return summary
+
+
 class SurogateTrainerWrapper:
     def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config
@@ -85,6 +155,7 @@ class SurogateTrainerWrapper:
         self._regression_curve: list[dict[str, float]] = []
         self._regression_step_times_ms: list[float] = []
         self._regression_cuda_peak_memory_bytes: int | None = None
+        self._block_schema_summary: dict[str, int] = {}
 
         # Multimodal on-the-fly training intentionally runs in eager mode.
         # Ensure runtime CUDA graph capture is disabled before constructing
@@ -105,6 +176,7 @@ class SurogateTrainerWrapper:
             dsl_extra["ep_size"] = config.ep_size
         ir_json = build_dsl_ir_for_model(config.model_dir, extra_config=dsl_extra or None)
         config.runtime_config.dsl_ir_json = ir_json
+        self._block_schema_summary = _summarize_block_schemas(ir_json)
 
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
@@ -561,6 +633,7 @@ class SurogateTrainerWrapper:
             "cuda_peak_memory_bytes": self._regression_cuda_peak_memory_bytes,
             "nccl": {},
             "descriptor_summary": descriptor_summary,
+            "block_schema_summary": self._block_schema_summary,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 

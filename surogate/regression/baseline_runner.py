@@ -77,6 +77,7 @@ class RegressionArtifacts:
     cuda_peak_memory_bytes: int | None = None
     nccl: dict[str, dict[str, int]] = field(default_factory=dict)
     descriptor_summary: dict[str, int] = field(default_factory=dict)
+    block_schema_summary: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, path: Path) -> "RegressionArtifacts":
@@ -94,6 +95,7 @@ class RegressionArtifacts:
             "cuda_peak_memory_bytes": data.get("cuda_peak_memory_bytes"),
             "nccl": data.get("nccl", {}),
             "descriptor_summary": data.get("descriptor_summary", {}),
+            "block_schema_summary": data.get("block_schema_summary", {}),
         }
         return cls(**known)
 
@@ -425,6 +427,19 @@ def _compare_descriptor_summary(failures: list[str], case_id: str, cur: dict[str
             failures.append(f"{case_id}: descriptor_summary.{key} {cur_value} != {base_value}")
 
 
+def _compare_block_schema_summary(failures: list[str], case_id: str, cur: dict[str, Any], base: dict[str, Any]) -> None:
+    base_summary = base.get("block_schema_summary", {})
+    cur_summary = cur.get("block_schema_summary", {})
+    for key, base_value in base_summary.items():
+        if not isinstance(base_value, int):
+            continue
+        cur_value = cur_summary.get(key)
+        if cur_value is None:
+            failures.append(f"{case_id}: missing block_schema_summary.{key}")
+        elif cur_value != base_value:
+            failures.append(f"{case_id}: block_schema_summary.{key} {cur_value} != {base_value}")
+
+
 def _compare_artifacts(case_id: str, cur: dict[str, Any], base: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     case = cur.get("case", {})
@@ -461,6 +476,7 @@ def _compare_artifacts(case_id: str, cur: dict[str, Any], base: dict[str, Any]) 
     _compare_perf_and_memory(failures, case_id, cur_metrics, base_metrics)
     _compare_nccl(failures, case_id, cur_metrics, base_metrics)
     _compare_descriptor_summary(failures, case_id, cur_metrics, base_metrics)
+    _compare_block_schema_summary(failures, case_id, cur_metrics, base_metrics)
     return failures
 
 
@@ -568,6 +584,19 @@ def descriptor_requirement_status(case: dict[str, Any], descriptor_summary: dict
     return ("present" if not missing else "missing"), missing
 
 
+def block_schema_status(block_schema_summary: dict[str, Any]) -> str:
+    if not block_schema_summary:
+        return "unknown"
+    expected = int(block_schema_summary.get("block_schema_expected_layers") or 0)
+    records = int(block_schema_summary.get("block_schema_records") or 0)
+    missing = int(block_schema_summary.get("block_schema_missing_layers") or 0)
+    if expected <= 0:
+        return "not_applicable"
+    if records >= expected and missing == 0:
+        return "present"
+    return "missing"
+
+
 def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     eligible = 0
@@ -577,6 +606,7 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         recipe = case["recipe"]
         metrics = result.get("metrics") or {}
         descriptor_summary = metrics.get("descriptor_summary") or {}
+        block_schema_summary = metrics.get("block_schema_summary") or {}
         descriptor_status, missing_descriptor_counts = descriptor_requirement_status(case, descriptor_summary)
         is_quant = recipe in {"fp8", "fp4"}
         if is_quant and case.get("supported", True):
@@ -599,6 +629,8 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "descriptor_requirement_status": descriptor_status,
                 "missing_descriptor_counts": missing_descriptor_counts,
                 "fusion_candidate_starts": descriptor_summary.get("fusion_candidate_starts"),
+                "block_schema_status": block_schema_status(block_schema_summary),
+                "block_schema_summary": block_schema_summary,
             }
         )
     return {

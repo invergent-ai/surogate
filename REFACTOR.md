@@ -122,6 +122,7 @@
 - [x] `BufferPlan` now parses schema slot residency into GPU/auto/CPU-stream/NVMe diagnostics for Phase 4 storage planning.
 - [x] `BufferPlan` now parses schema slot distribution into replicated/sharded-dim/router-replicated/expert-parallel diagnostics.
 - [x] `BufferPlan` now preserves MoE routing kind/top-k/shared-expert/scoring-bias and EP weight-transfer metadata for Phase 4b planning.
+- [x] Regression artifacts and north-star rows now include block-schema coverage/status summaries so Phase 4 metadata regressions are visible outside C++ debug output.
 
 Local validation status:
 

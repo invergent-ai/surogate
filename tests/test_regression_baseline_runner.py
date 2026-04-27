@@ -63,7 +63,13 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "fusion_candidate_starts": 3,
                     "forward_matmul_fp8_forward_eligible_ops": 4,
                     "backward_matmul_fp8_backward_eligible_ops": 4,
-                }
+                },
+                "block_schema_summary": {
+                    "block_schema_records": 2,
+                    "block_schema_expected_layers": 2,
+                    "block_schema_missing_layers": 0,
+                    "block_schema_moe_layers": 2,
+                },
             },
         }
     }
@@ -80,6 +86,8 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["descriptor_requirement_status"] == "present"
     assert report["rows"][0]["missing_descriptor_counts"] == []
     assert report["rows"][0]["fusion_candidate_starts"] == 3
+    assert report["rows"][0]["block_schema_status"] == "present"
+    assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
 
 
 def test_coverage_report_marks_descriptor_requirements_present():
@@ -111,12 +119,22 @@ def test_artifact_schema_accepts_descriptor_summary():
                 "compiled_ops": 12,
                 "fusion_candidate_starts": 2,
             },
+            "block_schema_summary": {
+                "block_schema_records": 2,
+                "block_schema_expected_layers": 2,
+                "block_schema_missing_layers": 0,
+            },
         }
     )
 
     assert artifacts.descriptor_summary == {
         "compiled_ops": 12,
         "fusion_candidate_starts": 2,
+    }
+    assert artifacts.block_schema_summary == {
+        "block_schema_records": 2,
+        "block_schema_expected_layers": 2,
+        "block_schema_missing_layers": 0,
     }
 
 
@@ -333,6 +351,19 @@ def test_compare_artifacts_checks_descriptor_summary_counts():
 
     assert f"{case.case_id}: descriptor_summary.fusion_candidate_starts 3 != 2" in failures
     assert f"{case.case_id}: missing descriptor_summary.forward_fp8_eligible_ops" in failures
+
+
+def test_compare_artifacts_checks_block_schema_summary_counts():
+    case = br.RegressionCase("m", "bf16", "single_gpu")
+    base_metrics = {"block_schema_summary": {"block_schema_records": 2, "block_schema_missing_layers": 0}}
+    cur_metrics = {"block_schema_summary": {"block_schema_records": 1}}
+    base = {case.case_id: {"case": br.asdict(case), "status": "passed", "metrics": base_metrics}}
+    cur = {case.case_id: {"case": br.asdict(case), "status": "passed", "metrics": cur_metrics}}
+
+    failures = br.compare_results(cur, base)
+
+    assert f"{case.case_id}: block_schema_summary.block_schema_records 1 != 2" in failures
+    assert f"{case.case_id}: missing block_schema_summary.block_schema_missing_layers" in failures
 
 
 def test_run_case_loads_external_artifact(tmp_path, monkeypatch):

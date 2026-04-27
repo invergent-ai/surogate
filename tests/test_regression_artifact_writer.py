@@ -1,4 +1,4 @@
-from surogate.train.trainer import _flatten_descriptor_summary, _percentile_summary
+from surogate.train.trainer import _flatten_descriptor_summary, _percentile_summary, _summarize_block_schemas
 
 
 def test_percentile_summary_is_stable_for_small_samples():
@@ -45,3 +45,45 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
     assert flattened["matmul_fp4_backward_eligible_ops"] == 2
     assert flattened["moe_fp8_grouped_eligible_ops"] == 4
     assert flattened["moe_fp4_grouped_eligible_ops"] == 6
+
+
+def test_summarize_block_schemas_counts_layer_storage_and_distribution():
+    ir_json = """
+{
+  "modules": [
+    {
+      "config": {"n_layers": 2},
+      "forward": {
+        "metadata": {
+          "block_schemas": [
+            {
+              "layer": 0,
+              "schema": {
+                "routing": {"kind": "topk_softmax"},
+                "ep_topology": {"ep_size_param": "ep_size"},
+                "attrs": {"block_family": "qwen3_moe"},
+                "slots": [
+                  {"residency": "auto", "distribution": {"kind": "expert_parallel"}},
+                  {"residency": "cpu_pinned_stream", "distribution": {"kind": "replicated"}}
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+"""
+
+    summary = _summarize_block_schemas(ir_json)
+
+    assert summary["block_schema_records"] == 1
+    assert summary["block_schema_expected_layers"] == 2
+    assert summary["block_schema_missing_layers"] == 1
+    assert summary["block_schema_moe_layers"] == 1
+    assert summary["block_schema_routing_layers"] == 1
+    assert summary["block_schema_ep_layers"] == 1
+    assert summary["block_schema_expert_parallel_slots"] == 1
+    assert summary["block_schema_auto_resident_slots"] == 1
+    assert summary["block_schema_cpu_stream_slots"] == 1
