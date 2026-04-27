@@ -50,6 +50,12 @@ def _percentile_summary(values: list[float]) -> dict[str, float]:
 def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
     flattened: dict[str, int] = {}
     fusion_candidate_starts = 0
+    totals = {
+        "matmul_fp8_forward_eligible_ops": 0,
+        "matmul_fp8_backward_eligible_ops": 0,
+        "matmul_fp4_forward_eligible_ops": 0,
+        "matmul_fp4_backward_eligible_ops": 0,
+    }
     for graph_name in ("forward", "backward"):
         graph = summary.get(graph_name)
         if not isinstance(graph, dict):
@@ -59,7 +65,10 @@ def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
                 flattened[f"{graph_name}_{key}"] = int(value)
                 if key == "fusion_candidate_starts":
                     fusion_candidate_starts += int(value)
+                if key in totals:
+                    totals[key] += int(value)
     flattened["fusion_candidate_starts"] = fusion_candidate_starts
+    flattened.update(totals)
     return flattened
 
 
