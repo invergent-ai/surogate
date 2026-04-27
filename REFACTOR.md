@@ -794,7 +794,7 @@ hook_registry.on_after_reduce_scatter(          // ⭐ NEW
 );
 ```
 
-**Cleanup target:** [`dsl_model_lora.cpp:344-357`](csrc/src/runtime/dsl/dsl_model_lora.cpp#L344-L357) `expert.{gate, gate_up, up, down}` and `router` struct fields become per-schema slot registrations. Sharded LoRA grad path in `lora_grads_manager.cpp` becomes hook-driven (currently ~150 lines of duplicated sharding logic).
+**Cleanup status:** LoRA dense/shared/router/separate-expert/grouped-expert iteration now routes through structural `LoRATargetId` helpers in optimizer setup, norm pointers, gradient zeroing, gradient reduction, and paired optimizer updates. The remaining Phase 5 migration is to move CPU/offload side effects behind registered hook callbacks rather than using hooks only as opt-in execution boundaries.
 
 **Less critical than Phases 1–4 because the immediate FP8/FP4 + MoE goal doesn't require it.** Finishes the extensibility story.
 
