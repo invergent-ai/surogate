@@ -590,8 +590,8 @@ TEST_CASE("dsl module goldens: swiglu_mlp", "[dsl][modules][goldens]") {
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Copy golden inputs to device
         Tensor& x_tensor = params.get("x");
@@ -902,8 +902,8 @@ TEST_CASE("dsl module goldens: gqa_attention", "[dsl][modules][goldens]") {
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("x"), gc.inputs.at("x"));
@@ -1171,8 +1171,8 @@ TEST_CASE("dsl module goldens: embedding_module", "[dsl][modules][goldens]") {
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Copy inputs
         copy_tensor_to_device(params.get("embedding_weight"), gc.inputs.at("embedding_weight"));
@@ -1316,8 +1316,8 @@ TEST_CASE("dsl module goldens: rmsnorm_module", "[dsl][modules][goldens]") {
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Copy inputs
         copy_tensor_to_device(params.get("residual"), gc.inputs.at("residual"));
@@ -1906,8 +1906,8 @@ TEST_CASE("dsl block goldens: llama_block", "[dsl][goldens][modules][blocks]") {
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("x"), gc.inputs.at("x"));
@@ -2477,8 +2477,8 @@ TEST_CASE("dsl block goldens: qwen3_block", "[dsl][goldens][modules][blocks]") {
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("x"), gc.inputs.at("x"));
@@ -3123,8 +3123,8 @@ TEST_CASE("dsl model goldens: qwen3_model", "[dsl][goldens][modules][models]") {
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Copy golden inputs to device
         copy_tensor_to_device(params.get("embedding"), gc.inputs.at("embedding"));
@@ -3559,8 +3559,8 @@ TEST_CASE("dsl model goldens: qwen3_model recompute comparison", "[dsl][goldens]
                                    static_cast<int>(T),
                                    allocator,
                                    false,
-                                   kStackBytes,
-                                   true);
+                                   false,
+                                   kStackBytes);
 
         // Reset loss/accuracy buffers since cross-entropy forward accumulates into them.
         fill_zero(run_state.Losses, run_state.MainStream);

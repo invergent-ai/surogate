@@ -5077,10 +5077,12 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
 
         // Bake the dispatch function pointer into the op. For the
         // backward graph prefer the backward_fn; for the forward graph
-        // use forward_fn. Null means "no handler" — execute will throw
-        // when it tries to call it.
+        // use forward_fn. Standalone op goldens can compile explicit
+        // backward-only ops without marking the whole graph as backward, so
+        // fall back to backward_fn when the forward slot is intentionally empty.
+        // Null means "no handler" — execute will throw when it tries to call it.
         if (const OpDescriptor* desc = OpRegistry::instance().find(compiled.type)) {
-            compiled.fn = is_backward ? desc->backward_fn : desc->forward_fn;
+            compiled.fn = is_backward ? desc->backward_fn : (desc->forward_fn ? desc->forward_fn : desc->backward_fn);
             compiled.semantic_kind = desc->semantic_kind;
             compiled.distribution_kind = desc->distribution_kind;
             compiled.default_caps = desc->default_caps;

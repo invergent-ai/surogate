@@ -876,6 +876,10 @@ void CompiledExecutor::set_rng_seed_fn(std::function<unsigned int()> fn) {
 }
 
 const Tensor* CompiledExecutor::try_get_tensor(const std::string& name) const {
+    if (auto it = mNamedTensors.find(name); it != mNamedTensors.end() && it->second.Data) {
+        return &it->second;
+    }
+
     // Fast path: check flat tensor vector using compile-time ID
     if (mCurrentGraph) {
         int tid = mCurrentGraph->find_tensor_id(name);

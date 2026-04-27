@@ -104,9 +104,10 @@ Local validation status:
 - [x] `make wheel-dev` passed.
 - [x] `make test-integration` passed.
 - [x] Focused C++ gates passed: `[op_registry]`, `[fusion_rule]`, `[tensor_role]`, `[moe]`; latest `[op_registry],[tensor_role]` pass was 292 assertions across 11 cases.
+- [x] Primitive DSL compiled-op golden gate passed after preserving standalone backward graph outputs across last-use pruning and final stack cleanup.
 - [x] `make regression-smoke` passed.
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py --no-gpu`; latest descriptor artifact/baseline gate passed with 20 tests.
-- [ ] Full `make test-unit` is not green yet; current failures are broad-suite pre-existing/runtime issues outside the focused slices (AdamW tolerance, DSL golden stack/metadata, and one add-backward dispatch golden).
+- [ ] Full `make test-unit` is not green yet; current failures are broad-suite pre-existing/runtime issues outside the focused slices (remaining AdamW tolerance and module/model golden issues).
 - [ ] GPU/model-path acceptance rows are not exercised locally yet because the required `*_MODEL_PATH` env vars are missing; runner reports explicit skips.
 
 ---

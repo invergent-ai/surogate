@@ -2427,6 +2427,22 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Use pre-computed last-use data from graph compilation (avoids rebuilding every backward).
     const auto& last_use_names = graph.last_use_names;
     const auto& last_use = graph.last_use_index;
+    std::unordered_set<std::string> consumed_backward_names;
+    std::unordered_set<std::string> externally_observable_backward_outputs;
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.inputs) {
+            if (!ref.name.empty()) {
+                consumed_backward_names.insert(ref.name);
+            }
+        }
+    }
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.outputs) {
+            if (!ref.name.empty() && consumed_backward_names.find(ref.name) == consumed_backward_names.end()) {
+                externally_observable_backward_outputs.insert(ref.name);
+            }
+        }
+    }
     std::unordered_map<int, std::byte*> persisted_backward_by_tid;
     std::unordered_map<std::byte*, int> persisted_backward_refcount;
     auto release_persisted_backward_ptr = [&](std::byte* ptr) {
@@ -2479,6 +2495,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             return;
         }
         for (const auto& name : last_use_names[idx]) {
+            if (externally_observable_backward_outputs.find(name) != externally_observable_backward_outputs.end()) {
+                continue;
+            }
             if (mCurrentGraph) {
                 int tid = mCurrentGraph->find_tensor_id(name);
                 if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
@@ -3192,6 +3211,43 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         cudaFreeAsync(ptr, mRunState.MainStream);
     }
     mReplayCopiedBuffers.clear();
+
+    if (mRunState.Allocator) {
+        for (const auto& name : externally_observable_backward_outputs) {
+            Tensor* tensor = nullptr;
+            int tid = -1;
+            if (mCurrentGraph) {
+                tid = mCurrentGraph->find_tensor_id(name);
+                if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() &&
+                    mTensors[static_cast<std::size_t>(tid)].Data) {
+                    tensor = &mTensors[static_cast<std::size_t>(tid)];
+                }
+            }
+            if (!tensor) {
+                auto it = mNamedTensors.find(name);
+                if (it != mNamedTensors.end() && it->second.Data) {
+                    tensor = &it->second;
+                }
+            }
+            if (!tensor || !tensor->Data || !mRunState.Stack.owns(tensor->Data)) {
+                continue;
+            }
+            std::vector<long> shape(tensor->Sizes.begin(), tensor->Sizes.begin() + tensor->Rank);
+            Tensor stable = mRunState.Allocator->allocate(tensor->DType,
+                                                          ("backward_output_" + name).c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          shape);
+            CUDA_CHECK(cudaMemcpyAsync(stable.Data,
+                                       tensor->Data,
+                                       tensor->bytes(),
+                                       cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+                mTensors[static_cast<std::size_t>(tid)] = stable;
+            }
+            mNamedTensors[name] = stable;
+        }
+    }
 
     // Final cleanup - pass -1 to allow full pruning (backward complete)
     mRunState.Stack.restore(initial_checkpoint);

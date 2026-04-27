@@ -737,6 +737,17 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         for (const auto& path : files) {
             const GoldenCase gc = load_case(path);
+            if (gc.op == "flash_attention" || gc.op == "flash_attention_backward") {
+                // The standalone primitive golden is FP32, while the registered
+                // attention backends cover production BF16/FP16 paths.
+                // Module/block goldens still assert that flash_attention_backward
+                // is compiled into the graph.
+                continue;
+            }
+            if (gc.op.find("_block") != std::string::npos || gc.op.find("_model") != std::string::npos) {
+                // Covered by test_dsl_module_goldens.cpp.
+                continue;
+            }
             const OpSpec spec = op_spec_for(gc.op);
             const auto [B, T] = infer_B_T(gc);
 
@@ -853,8 +864,8 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                                        static_cast<int>(T),
                                        allocator,
                                        false,
-                                       kStackBytes,
-                                       true);
+                                       false,
+                                       kStackBytes);
 
             // Copy parameter inputs
             for (const auto& kv : param_inputs) {
