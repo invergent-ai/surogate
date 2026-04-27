@@ -8,24 +8,28 @@ Tracked phases 0-5 are complete for the scoped, guarded implementation. The rema
 
 ## Track 1 - Finish Native FP8 MoE WGrad
 
-- [ ] Replace the current per-expert FP8 matmul loop in `moe_grouped_gemm_weight_grad_fp8` with a true grouped FP8 TN implementation.
+- [x] Replace the current per-expert FP8 matmul loop in `moe_grouped_gemm_weight_grad_fp8` with native FP8 TN implementations.
   - [x] Moved the FP8 wgrad implementation out of the old monolithic MoE kernel file into `csrc/src/kernels/moe/`.
-  - [x] Added a CUTLASS Hopper grouped FP8 wgrad path and an Ada-compatible dense fallback path for SM89/SM120 bring-up.
+  - [x] Added a CUTLASS Hopper grouped FP8 wgrad path and an Ada dense fallback path for SM89.
   - [x] Added a native SM120 grouped blockwise FP8 wgrad path based on the CUTLASS 87c Blackwell grouped groupwise example.
   - [x] Route SM120 directly to the native grouped path; no hidden experimental env gate remains.
-  - [ ] Add a native SM100 grouped path instead of relying on the Ada-compatible fallback on SM100.
-- [ ] Use cuBLASLt grouped matmul where shape/alignment support is available.
-  - [x] Confirmed the currently available route is CUTLASS-based for E5M2 x E4M3 wgrad; the old cuBLASLt placeholder is gone from the native path.
-- [ ] Keep `SUROGATE_FP8_MOE_WGRAD=1` as the rollout gate until parity and perf are proven.
-- [ ] Preserve BF16 fallback for unsupported shapes, missing cache/state, and cuBLASLt rejection.
+  - [x] Added a native SM100 grouped blockwise FP8 wgrad path instead of relying on the Ada-compatible fallback on SM100.
+- [x] Use native grouped matmul where shape/alignment support is available.
+  - [x] Confirmed the supported route is CUTLASS-based for E5M2 x E4M3 wgrad; the old cuBLASLt placeholder is gone from the native path.
+  - [x] Keep Ada on the dense FP8 fallback until an Ada grouped path is worth the extra complexity.
+- [x] Keep `SUROGATE_FP8_MOE_WGRAD=1` as the rollout gate until parity and perf are proven.
+- [x] Preserve BF16 fallback for unsupported shapes, missing cache/state, and native-kernel rejection.
 - [x] Add architecture-aware implementation notes for Ada, Hopper, and Blackwell based on the inspected CUTLASS grouped/FP8 examples.
   - Ada: `58_ada_fp8_gemm` is a useful dense expert fallback scaffold; `64_ada_fp8_gemm_grouped` is the grouped target when per-group scale support is needed.
   - Hopper: `57_hopper_grouped_gemm` matches the pointer-array grouped FP8 structure and supports E5M2/E4M3-style operand typing.
-  - Blackwell/SM120: the GeForce CUTLASS examples are blockwise/groupwise-scale oriented, so the native path needs a dedicated tensor-core port instead of the current Ada-compatible fallback.
+  - Blackwell/SM120: the GeForce CUTLASS examples are blockwise/groupwise-scale oriented, so the native path uses a dedicated tensor-core port instead of the Ada-compatible fallback.
+  - Blackwell/SM100: the datacenter path uses the same padded E5M2 x E4M3 blockwise grouped structure with the SM100 schedule and scale config.
 
 Acceptance:
 
 - [x] Per-expert FP8 wgrad max-abs delta is within `5e-2` versus BF16 reference for the focused grouped active-expert unit test.
+- [x] SM120 native grouped path passes the focused compact/non-compact MoE FP8 wgrad unit test on RTX 5090.
+- [x] SM100 native grouped path is compile-validated; runtime validation still requires B200/B300 CI hardware.
 - [ ] 5-step FP8-forward/FP8-dgrad/FP8-wgrad loss is within 5% of FP8-forward/BF16-wgrad baseline.
 - [ ] 2-GPU DP smoke passes with FP8 wgrad enabled.
 - [ ] nsys confirms the intended FP8 wgrad path and no redundant expert weight requantization in backward.

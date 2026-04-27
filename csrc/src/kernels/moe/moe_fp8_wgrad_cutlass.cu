@@ -603,16 +603,22 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm90(nv_bfloat16* d_weight,
 
 #endif
 
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || \
+    defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 
-// Native SM120/SM121 (RTX 50 series, DGX Spark) FP8 grouped GEMM for weight
-// gradients. The GeForce Blackwell tensor cores require blockwise FP8 scaling
-// (the dense-FP8 builder explicitly rejects PtrArray/grouped kernels), so we
-// use the SM120 blockwise grouped collective with constant 1.0 SF tensors and
-// fold the per-tensor scales into `alpha`. The tile/scale K granularity is 128;
-// we pad each group's K up to a multiple of 128 with zeros so partial tiles
-// produce exactly the unscaled grad^T @ input result.
-void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weight,
+// Native Blackwell FP8 grouped GEMM for weight gradients. Blackwell grouped FP8
+// tensor cores require blockwise scale operands, so we use constant 1.0 SF
+// tensors and fold the per-tensor scales into `alpha`. The tile/scale K
+// granularity is 128; each group's K is padded up to 128 with zeros so partial
+// tiles produce exactly the unscaled grad^T @ input result.
+template <typename ArchTag,
+          typename MmaTileShapeMNK,
+          typename ClusterShapeMNK,
+          typename ScaleConfig,
+          typename EpilogueSchedule,
+          typename KernelSchedule>
+void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_name,
+                                                            nv_bfloat16* d_weight,
                                                             const __nv_fp8_e5m2* grad_output,
                                                             const __nv_fp8_e4m3* input,
                                                             int num_experts,
@@ -626,7 +632,8 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
                                                             bool weight_is_compact,
                                                             int num_active_experts) {
     if (beta != 0.0f) {
-        throw std::runtime_error("moe_grouped_gemm_weight_grad_fp8 SM120 path currently requires beta=0");
+        throw std::runtime_error(std::string("moe_grouped_gemm_weight_grad_fp8 ") + arch_name +
+                                 " path currently requires beta=0");
     }
 
     using namespace cute;
@@ -643,22 +650,6 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
     using ElementCompute = float;
     using ElementSF = ElementAccumulator;
 
-    // TileShape N is matched to ScaleGranularityN (ScaleNsPerTile == 1) so the
-    // kernel reads only the SF entries that we allocate per group, even when
-    // problem N is smaller than a "natural" 128-wide N-tile. ScaleGranularityN
-    // is 32 so realistic MoE shapes whose N/intermediate dims are multiples of
-    // 32 (but not always 128) are accepted by the can_implement check
-    // `N % ScaleGranularityN == 0`. Per-tensor scaling is folded into alpha
-    // and the SF tensors are 1.0 everywhere, so the block size has no numerical
-    // effect.
-    using MmaTileShape_MNK = Shape<_128, _32, _128>;
-    using ClusterShape_MNK = Shape<_1, _1, _1>;
-
-    constexpr int ScaleGranularityM = 1;
-    constexpr int ScaleGranularityN = 32;
-    constexpr int ScaleGranularityK = 128;
-    using ScaleConfig =
-        cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK>;
     using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
@@ -667,24 +658,24 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
     constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
     constexpr int AlignmentD = AlignmentC;
 
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm120,
-        cutlass::arch::OpClassTensorOp,
-        MmaTileShape_MNK,
-        ClusterShape_MNK,
-        cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAccumulator,
-        ElementCompute,
-        ElementC,
-        LayoutC*,
-        AlignmentC,
-        ElementD,
-        LayoutD*,
-        AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag,
+                                                                  cutlass::arch::OpClassTensorOp,
+                                                                  MmaTileShapeMNK,
+                                                                  ClusterShapeMNK,
+                                                                  cutlass::epilogue::collective::EpilogueTileAuto,
+                                                                  ElementAccumulator,
+                                                                  ElementCompute,
+                                                                  ElementC,
+                                                                  LayoutC*,
+                                                                  AlignmentC,
+                                                                  ElementD,
+                                                                  LayoutD*,
+                                                                  AlignmentD,
+                                                                  EpilogueSchedule>::CollectiveOp;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-        cutlass::arch::Sm120,
+        ArchTag,
         cutlass::arch::OpClassTensorOp,
         ElementA,
         cute::tuple<LayoutA*, LayoutSFA*>,
@@ -693,11 +684,11 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
         cute::tuple<LayoutB*, LayoutSFB*>,
         AlignmentB,
         ElementAccumulator,
-        MmaTileShape_MNK,
-        ClusterShape_MNK,
+        MmaTileShapeMNK,
+        ClusterShapeMNK,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
+        KernelSchedule>::CollectiveOp;
 
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, void>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -706,7 +697,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
     using StrideC = typename Gemm::GemmKernel::InternalStrideC;
     using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
-    constexpr int kKBlock = ScaleGranularityK;
+    constexpr int kKBlock = 128;
     auto round_up = [](int v, int a) {
         return ((v + a - 1) / a) * a;
     };
@@ -768,7 +759,8 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
             continue;
         }
         if ((K_act % 16) != 0) {
-            throw std::runtime_error("moe_grouped_gemm_weight_grad_fp8 SM120 path requires token counts aligned to 16");
+            throw std::runtime_error(std::string("moe_grouped_gemm_weight_grad_fp8 ") + arch_name +
+                                     " path requires token counts aligned to 16");
         }
         const int K_pad = round_up(K_act, kKBlock);
         const int weight_idx = weight_is_compact ? e : global_idx;
@@ -1002,7 +994,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
         hw_info};
 
     Gemm gemm;
-    check_cutlass_status(Gemm::can_implement(arguments), "moe_grouped_gemm_weight_grad_fp8 SM120 can_implement");
+    check_cutlass_status(Gemm::can_implement(arguments), "moe_grouped_gemm_weight_grad_fp8 SM1xx can_implement");
 
     const size_t workspace_size = Gemm::get_workspace_size(arguments);
     if (workspace_size > 0) {
@@ -1010,12 +1002,13 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
     }
 
     check_cutlass_status(gemm.initialize(arguments, d_workspace, stream),
-                         "moe_grouped_gemm_weight_grad_fp8 SM120 initialize");
-    check_cutlass_status(gemm.run(stream), "moe_grouped_gemm_weight_grad_fp8 SM120 run");
+                         "moe_grouped_gemm_weight_grad_fp8 SM1xx initialize");
+    check_cutlass_status(gemm.run(stream), "moe_grouped_gemm_weight_grad_fp8 SM1xx run");
 
     if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
         std::fprintf(stderr,
-                     "[FP8 MoE wgrad] SM120 grouped path: groups=%d M=%d N=%d K_pad_max=%d alpha=%g\n",
+                     "[FP8 MoE wgrad] %s grouped path: groups=%d M=%d N=%d K_pad_max=%d alpha=%g\n",
+                     arch_name,
                      gemm_count,
                      M,
                      N,
@@ -1049,7 +1042,93 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weigh
     }
 }
 
-#endif  // SM120 / SM121 supported
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+
+void moe_grouped_gemm_weight_grad_fp8_cutlass_sm100_grouped(nv_bfloat16* d_weight,
+                                                            const __nv_fp8_e5m2* grad_output,
+                                                            const __nv_fp8_e4m3* input,
+                                                            int num_experts,
+                                                            int M,
+                                                            int N,
+                                                            cudaStream_t stream,
+                                                            const int* host_offsets,
+                                                            float alpha,
+                                                            float beta,
+                                                            const int* active_expert_indices,
+                                                            bool weight_is_compact,
+                                                            int num_active_experts) {
+    using namespace cute;
+    using MmaTileShapeMNK = Shape<_128, _32, _128>;
+    using ClusterShapeMNK = Shape<_1, _1, _1>;
+    using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<1, 32, 128>;
+    moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped<
+        cutlass::arch::Sm100,
+        MmaTileShapeMNK,
+        ClusterShapeMNK,
+        ScaleConfig,
+        cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm,
+        cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100>("SM100",
+                                                                          d_weight,
+                                                                          grad_output,
+                                                                          input,
+                                                                          num_experts,
+                                                                          M,
+                                                                          N,
+                                                                          stream,
+                                                                          host_offsets,
+                                                                          alpha,
+                                                                          beta,
+                                                                          active_expert_indices,
+                                                                          weight_is_compact,
+                                                                          num_active_experts);
+}
+
+#endif
+
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+
+void moe_grouped_gemm_weight_grad_fp8_cutlass_sm120_grouped(nv_bfloat16* d_weight,
+                                                            const __nv_fp8_e5m2* grad_output,
+                                                            const __nv_fp8_e4m3* input,
+                                                            int num_experts,
+                                                            int M,
+                                                            int N,
+                                                            cudaStream_t stream,
+                                                            const int* host_offsets,
+                                                            float alpha,
+                                                            float beta,
+                                                            const int* active_expert_indices,
+                                                            bool weight_is_compact,
+                                                            int num_active_experts) {
+    using namespace cute;
+    using MmaTileShapeMNK = Shape<_128, _32, _128>;
+    using ClusterShapeMNK = Shape<_1, _1, _1>;
+    using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<1, 32, 128>;
+    moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped<cutlass::arch::Sm120,
+                                                           MmaTileShapeMNK,
+                                                           ClusterShapeMNK,
+                                                           ScaleConfig,
+                                                           cutlass::epilogue::collective::EpilogueScheduleAuto,
+                                                           cutlass::gemm::KernelScheduleSm120Blockwise>(
+        "SM120",
+        d_weight,
+        grad_output,
+        input,
+        num_experts,
+        M,
+        N,
+        stream,
+        host_offsets,
+        alpha,
+        beta,
+        active_expert_indices,
+        weight_is_compact,
+        num_active_experts);
+}
+
+#endif
+
+#endif  // SM100 / SM120 / SM121 supported
 
 }  // namespace
 
@@ -1110,10 +1189,23 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass(nv_bfloat16* d_weight,
         throw std::runtime_error("moe_grouped_gemm_weight_grad_fp8 SM120 CUTLASS support was not compiled");
 #endif
     } else if (props.major == 10) {
-#if defined(CUTLASS_ARCH_MMA_F16_SM89_SUPPORTED)
-        // Datacenter Blackwell (B200/B300): no native SM100 grouped FP8 path
-        // implemented yet — fall back to the Ada FP8 tensor-op kernel which
-        // also runs on SM100 hardware.
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+        // Datacenter Blackwell (B200/B300): native SM100 grouped FP8
+        // blockwise tensor-core path.
+        moe_grouped_gemm_weight_grad_fp8_cutlass_sm100_grouped(d_weight,
+                                                               grad_output,
+                                                               input,
+                                                               num_experts,
+                                                               M,
+                                                               N,
+                                                               stream,
+                                                               host_offsets,
+                                                               alpha,
+                                                               beta,
+                                                               active_expert_indices,
+                                                               weight_is_compact,
+                                                               num_active_experts);
+#elif defined(CUTLASS_ARCH_MMA_F16_SM89_SUPPORTED)
         moe_grouped_gemm_weight_grad_fp8_cutlass_sm89_dense(d_weight,
                                                             grad_output,
                                                             input,
