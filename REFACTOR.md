@@ -51,6 +51,7 @@
 - [x] Consolidated `REGISTER_COMPILED_OP` surface added and proven on dense matmul registrations.
 - [x] MoE grouped forward GEMM registrations migrated to the consolidated descriptor surface.
 - [x] EP dispatch/combine all-to-all registrations migrated to the consolidated descriptor surface.
+- [x] Mamba/SSM and Qwen3.5 gated-delta no-comm families migrated to the consolidated descriptor surface.
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, distribution, capability, epilogue, and storage descriptor facets.
 - [x] `CompiledGraph` summary helpers added for descriptor communication, grouped-op, capability, epilogue, and storage-compat counts.
 

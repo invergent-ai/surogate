@@ -519,46 +519,71 @@ REGISTER_COMPILED_OP("ep_combine_backward",
                      0);
 
 // Mamba/SSM forward + backward
-REGISTER_OP("mamba_split_proj", MambaSplitProj, ::dsl::fwd_mamba_split_proj, nullptr);
-REGISTER_OP("mamba_split_proj_backward", MambaSplitProjBackward, nullptr, ::dsl::bwd_mamba_split_proj);
-REGISTER_OP("mamba_conv1d", MambaConv1d, ::dsl::fwd_mamba_conv1d, nullptr);
-REGISTER_OP("mamba_conv1d_backward", MambaConv1dBackward, nullptr, ::dsl::bwd_mamba_conv1d);
-REGISTER_OP("mamba_split_conv_out", MambaSplitConvOut, ::dsl::fwd_mamba_split_conv_out, nullptr);
-REGISTER_OP("mamba_split_conv_out_backward", MambaSplitConvOutBackward, nullptr, ::dsl::bwd_mamba_split_conv_out);
-REGISTER_OP("mamba_ssm_scan", MambaSsmScan, ::dsl::fwd_mamba_ssm_scan, nullptr);
-REGISTER_OP("mamba_ssm_scan_backward", MambaSsmScanBackward, nullptr, ::dsl::bwd_mamba_ssm_scan);
-REGISTER_OP("mamba_gated_rmsnorm", MambaGatedRMSNorm, ::dsl::fwd_mamba_gated_rmsnorm, nullptr);
-REGISTER_OP("mamba_gated_rmsnorm_backward", MambaGatedRMSNormBackward, nullptr, ::dsl::bwd_mamba_gated_rmsnorm);
-REGISTER_OP("mamba_out_proj", MambaOutProj, ::dsl::fwd_mamba_out_proj, nullptr);
-REGISTER_OP("mamba_out_proj_backward", MambaOutProjBackward, nullptr, ::dsl::bwd_mamba_out_proj);
-
-REGISTER_OP_METADATA("mamba_split_proj", Dense, Replicated, 0);
-REGISTER_OP_METADATA("mamba_split_proj_backward", Dense, Replicated, 0);
-REGISTER_OP_METADATA("mamba_conv1d", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("mamba_conv1d_backward", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("mamba_split_conv_out", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("mamba_split_conv_out_backward", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("mamba_ssm_scan", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("mamba_ssm_scan_backward", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("mamba_gated_rmsnorm", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("mamba_gated_rmsnorm_backward", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("mamba_out_proj", Dense, Replicated, 0);
-REGISTER_OP_METADATA("mamba_out_proj_backward", Dense, Replicated, 0);
+REGISTER_COMPILED_OP_NO_COMM("mamba_split_proj", MambaSplitProj, ::dsl::fwd_mamba_split_proj, nullptr, Dense);
+REGISTER_COMPILED_OP_NO_COMM("mamba_split_proj_backward",
+                             MambaSplitProjBackward,
+                             nullptr,
+                             ::dsl::bwd_mamba_split_proj,
+                             Dense);
+REGISTER_COMPILED_OP_NO_COMM("mamba_conv1d", MambaConv1d, ::dsl::fwd_mamba_conv1d, nullptr, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("mamba_conv1d_backward", MambaConv1dBackward, nullptr, ::dsl::bwd_mamba_conv1d, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("mamba_split_conv_out",
+                             MambaSplitConvOut,
+                             ::dsl::fwd_mamba_split_conv_out,
+                             nullptr,
+                             Sequence);
+REGISTER_COMPILED_OP_NO_COMM("mamba_split_conv_out_backward",
+                             MambaSplitConvOutBackward,
+                             nullptr,
+                             ::dsl::bwd_mamba_split_conv_out,
+                             Sequence);
+REGISTER_COMPILED_OP_NO_COMM("mamba_ssm_scan", MambaSsmScan, ::dsl::fwd_mamba_ssm_scan, nullptr, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("mamba_ssm_scan_backward",
+                             MambaSsmScanBackward,
+                             nullptr,
+                             ::dsl::bwd_mamba_ssm_scan,
+                             Sequence);
+REGISTER_COMPILED_OP_NO_COMM("mamba_gated_rmsnorm",
+                             MambaGatedRMSNorm,
+                             ::dsl::fwd_mamba_gated_rmsnorm,
+                             nullptr,
+                             Normalization);
+REGISTER_COMPILED_OP_NO_COMM("mamba_gated_rmsnorm_backward",
+                             MambaGatedRMSNormBackward,
+                             nullptr,
+                             ::dsl::bwd_mamba_gated_rmsnorm,
+                             Normalization);
+REGISTER_COMPILED_OP_NO_COMM("mamba_out_proj", MambaOutProj, ::dsl::fwd_mamba_out_proj, nullptr, Dense);
+REGISTER_COMPILED_OP_NO_COMM("mamba_out_proj_backward",
+                             MambaOutProjBackward,
+                             nullptr,
+                             ::dsl::bwd_mamba_out_proj,
+                             Dense);
 
 // Qwen3.5 gated delta rule forward + backward
-REGISTER_OP("chunk_gated_delta_rule", ChunkGatedDeltaRule, ::dsl::fwd_chunk_gated_delta_rule, nullptr);
-REGISTER_OP("chunk_gated_delta_rule_backward", ChunkGatedDeltaRuleBackward, nullptr, ::dsl::bwd_chunk_gated_delta_rule);
-REGISTER_OP("qwen3_5_decay", Qwen3_5Decay, ::dsl::fwd_qwen3_5_decay, nullptr);
-REGISTER_OP("qwen3_5_decay_backward", Qwen3_5DecayBackward, nullptr, ::dsl::bwd_qwen3_5_decay);
-REGISTER_OP("repeat_interleave_heads", RepeatInterleaveHeads, ::dsl::fwd_repeat_interleave_heads, nullptr);
-REGISTER_OP("repeat_interleave_heads_backward",
-            RepeatInterleaveHeadsBackward,
-            nullptr,
-            ::dsl::bwd_repeat_interleave_heads);
-
-REGISTER_OP_METADATA("chunk_gated_delta_rule", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("chunk_gated_delta_rule_backward", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("qwen3_5_decay", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("qwen3_5_decay_backward", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("repeat_interleave_heads", View, Replicated, 0);
-REGISTER_OP_METADATA("repeat_interleave_heads_backward", View, Replicated, 0);
+REGISTER_COMPILED_OP_NO_COMM("chunk_gated_delta_rule",
+                             ChunkGatedDeltaRule,
+                             ::dsl::fwd_chunk_gated_delta_rule,
+                             nullptr,
+                             Sequence);
+REGISTER_COMPILED_OP_NO_COMM("chunk_gated_delta_rule_backward",
+                             ChunkGatedDeltaRuleBackward,
+                             nullptr,
+                             ::dsl::bwd_chunk_gated_delta_rule,
+                             Sequence);
+REGISTER_COMPILED_OP_NO_COMM("qwen3_5_decay", Qwen3_5Decay, ::dsl::fwd_qwen3_5_decay, nullptr, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("qwen3_5_decay_backward",
+                             Qwen3_5DecayBackward,
+                             nullptr,
+                             ::dsl::bwd_qwen3_5_decay,
+                             Sequence);
+REGISTER_COMPILED_OP_NO_COMM("repeat_interleave_heads",
+                             RepeatInterleaveHeads,
+                             ::dsl::fwd_repeat_interleave_heads,
+                             nullptr,
+                             View);
+REGISTER_COMPILED_OP_NO_COMM("repeat_interleave_heads_backward",
+                             RepeatInterleaveHeadsBackward,
+                             nullptr,
+                             ::dsl::bwd_repeat_interleave_heads,
+                             View);

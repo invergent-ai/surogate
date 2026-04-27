@@ -96,6 +96,8 @@ TEST_CASE("ep ops carry communication profile metadata", "[op_registry]") {
 TEST_CASE("mamba and gated-delta ops carry no-comm descriptor metadata", "[op_registry]") {
     const OpDescriptor* mamba_scan = OpRegistry::instance().find_by_name("mamba_ssm_scan");
     REQUIRE(mamba_scan != nullptr);
+    REQUIRE(mamba_scan == OpRegistry::instance().find(CompiledOpType::MambaSsmScan));
+    REQUIRE(mamba_scan->forward_fn != nullptr);
     REQUIRE(mamba_scan->semantic_kind == OpSemanticKind::Sequence);
     REQUIRE(mamba_scan->distribution_kind == DistributionKind::Replicated);
     REQUIRE(mamba_scan->comm_profile.kind == CommunicationKind::NoComm);
@@ -107,6 +109,8 @@ TEST_CASE("mamba and gated-delta ops carry no-comm descriptor metadata", "[op_re
 
     const OpDescriptor* gated_delta = OpRegistry::instance().find_by_name("chunk_gated_delta_rule");
     REQUIRE(gated_delta != nullptr);
+    REQUIRE(gated_delta == OpRegistry::instance().find(CompiledOpType::ChunkGatedDeltaRule));
+    REQUIRE(gated_delta->forward_fn != nullptr);
     REQUIRE(gated_delta->semantic_kind == OpSemanticKind::Sequence);
     REQUIRE(gated_delta->comm_profile.kind == CommunicationKind::NoComm);
 }
