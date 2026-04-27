@@ -161,5 +161,38 @@ TEST_CASE("fusion contexts can be built from compiled op descriptors", "[fusion_
     REQUIRE_FALSE(matmul_bias->pattern_matches(truncated));
 }
 
+TEST_CASE("fusion registry finds matching rules at compiled op positions", "[fusion_rule]") {
+    CompiledOp matmul;
+    matmul.type = CompiledOpType::Matmul;
+    matmul.semantic_kind = OpSemanticKind::Dense;
+    matmul.comm_profile = CommunicationProfile{CommunicationKind::NoComm, false, 0};
+    matmul.default_caps = OpCapabilities{OpCapabilityDenseMatmul};
+
+    CompiledOp bias_add;
+    bias_add.type = CompiledOpType::BiasAdd;
+    bias_add.semantic_kind = OpSemanticKind::Elementwise;
+    bias_add.comm_profile = CommunicationProfile{CommunicationKind::NoComm, false, 0};
+
+    CompiledOp collective_bias = bias_add;
+    collective_bias.comm_profile.kind = CommunicationKind::AllReduceAfter;
+
+    std::vector<CompiledOp> eligible = {matmul, bias_add};
+    std::vector<const FusionRule*> matches = FusionRuleRegistry::instance().matching_rules_at(eligible, 0);
+    auto matmul_bias = std::find_if(matches.begin(), matches.end(), [](const FusionRule* rule) {
+        return rule->name == "matmul_bias";
+    });
+    REQUIRE(matmul_bias != matches.end());
+
+    std::vector<CompiledOp> blocked = {matmul, collective_bias};
+    std::vector<const FusionRule*> blocked_matches = FusionRuleRegistry::instance().matching_rules_at(blocked, 0);
+    auto blocked_matmul_bias = std::find_if(blocked_matches.begin(), blocked_matches.end(), [](const FusionRule* rule) {
+        return rule->name == "matmul_bias";
+    });
+    REQUIRE(blocked_matmul_bias == blocked_matches.end());
+
+    REQUIRE(FusionRuleRegistry::instance().matching_rules_at(eligible, 1).empty());
+    REQUIRE(FusionRuleRegistry::instance().matching_rules_at(eligible, eligible.size()).empty());
+}
+
 }  // namespace
 }  // namespace dsl

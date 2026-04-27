@@ -67,6 +67,7 @@ public:
     const FusionRule* find_by_name(std::string_view name) const;
     std::vector<const FusionRule*> all_rules() const;
     std::vector<const FusionRule*> rules_for_first_op(std::string_view op_name) const;
+    std::vector<const FusionRule*> matching_rules_at(const std::vector<CompiledOp>& ops, std::size_t start) const;
 
 private:
     FusionRuleRegistry() = default;

@@ -68,6 +68,7 @@
 - [x] Inert `FusionRuleRegistry` scaffold added for Phase 3c pattern, priority, capability, and communication-aware fusion declarations.
 - [x] Initial inert fusion rule declarations added for existing dense, norm, loss, Mamba, and MoE fusion families.
 - [x] Fusion registry can now build descriptor-backed `FusionContext` views from compiled ops and evaluate pattern plus eligibility matches.
+- [x] Fusion registry exposes a non-mutating compiled-op-position query for future graph-rewrite integration.
 
 Local validation status:
 

@@ -122,4 +122,20 @@ std::vector<const FusionRule*> FusionRuleRegistry::rules_for_first_op(std::strin
     return out;
 }
 
+std::vector<const FusionRule*> FusionRuleRegistry::matching_rules_at(const std::vector<CompiledOp>& ops,
+                                                                     std::size_t start) const {
+    std::vector<const FusionRule*> out;
+    if (start >= ops.size()) {
+        return out;
+    }
+    const char* first_name = op_type_to_string(ops[start].type);
+    for (const FusionRule* rule : rules_for_first_op(first_name)) {
+        FusionContext ctx = make_fusion_context(ops, start, rule->pattern.size());
+        if (rule->matches(ctx)) {
+            out.push_back(rule);
+        }
+    }
+    return out;
+}
+
 }  // namespace dsl
