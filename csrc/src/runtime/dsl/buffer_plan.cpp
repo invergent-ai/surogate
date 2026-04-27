@@ -150,13 +150,24 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                 for (const AttrValue& raw_slot : *slots) {
                     const AttrMap* slot = attr_map(raw_slot);
                     if (!slot) continue;
+                    BlockSchemaSlotSummary slot_summary;
+                    slot_summary.name = attr_string(*slot, "name");
                     const std::string kind = attr_string(*slot, "kind");
+                    slot_summary.kind = kind;
+                    slot_summary.grouped = attr_bool(*slot, "grouped");
+                    slot_summary.save_for_backward = attr_bool(*slot, "save_for_backward");
+                    if (const AttrValue* shape_value = find_attr(*slot, "shape")) {
+                        if (const AttrList* shape = attr_list(*shape_value)) {
+                            slot_summary.shape_rank = static_cast<int>(shape->size());
+                        }
+                    }
                     if (kind == "param") {
                         ++out.param_slots;
                     } else {
                         ++out.activation_slots;
                     }
                     const std::string residency = attr_string(*slot, "residency");
+                    slot_summary.residency = residency.empty() ? "gpu" : residency;
                     if (residency == "auto") {
                         ++out.auto_resident_slots;
                     } else if (residency == "cpu_pinned_stream") {
@@ -171,6 +182,7 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                     if (const AttrValue* dist_value = find_attr(*slot, "distribution")) {
                         if (const AttrMap* dist = attr_map(*dist_value)) {
                             const std::string dist_kind = attr_string(*dist, "kind");
+                            slot_summary.distribution_kind = dist_kind.empty() ? "replicated" : dist_kind;
                             if (dist_kind == "expert_parallel") {
                                 ++out.expert_parallel_slots;
                             } else if (dist_kind == "sharded_dim") {
@@ -181,16 +193,20 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                                 ++out.replicated_slots;
                             }
                         } else {
+                            slot_summary.distribution_kind = "replicated";
                             ++out.replicated_slots;
                         }
                     } else {
+                        slot_summary.distribution_kind = "replicated";
                         ++out.replicated_slots;
                     }
                     if (const AttrValue* streaming_value = find_attr(*slot, "streaming_hint")) {
-                        if (attr_map(*streaming_value)) {
+                        if (const AttrMap* streaming = attr_map(*streaming_value)) {
+                            slot_summary.streaming_prefetch_distance = attr_int(*streaming, "prefetch_distance");
                             ++out.streaming_slots;
                         }
                     }
+                    out.slots.push_back(std::move(slot_summary));
                 }
             }
         }
@@ -376,6 +392,7 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 layer.cpu_pinned_stream_slots = record.cpu_pinned_stream_slots;
                 layer.cpu_pageable_slots = record.cpu_pageable_slots;
                 layer.nvme_offload_slots = record.nvme_offload_slots;
+                layer.slots = record.slots;
                 layer.routing_kind = record.routing_kind;
                 layer.routing_topk = record.routing_topk;
                 layer.routing_topk_param = record.routing_topk_param;

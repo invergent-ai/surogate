@@ -42,6 +42,17 @@ enum class BlockSchemaFamilyKind {
     LinearMixer,
 };
 
+struct BlockSchemaSlotSummary {
+    std::string name;
+    std::string kind;
+    std::string residency;
+    std::string distribution_kind;
+    int shape_rank = 0;
+    bool grouped = false;
+    bool save_for_backward = false;
+    int streaming_prefetch_distance = -1;
+};
+
 struct BlockSchemaPlanRecord {
     int layer = -1;
     int block_index = -1;
@@ -63,6 +74,7 @@ struct BlockSchemaPlanRecord {
     int cpu_pinned_stream_slots = 0;
     int cpu_pageable_slots = 0;
     int nvme_offload_slots = 0;
+    std::vector<BlockSchemaSlotSummary> slots;
     std::string routing_kind;
     int routing_topk = -1;
     std::string routing_topk_param;
@@ -100,6 +112,7 @@ struct BlockSchemaLayerSummary {
     int cpu_pinned_stream_slots = 0;
     int cpu_pageable_slots = 0;
     int nvme_offload_slots = 0;
+    std::vector<BlockSchemaSlotSummary> slots;
     std::string routing_kind;
     int routing_topk = -1;
     std::string routing_topk_param;

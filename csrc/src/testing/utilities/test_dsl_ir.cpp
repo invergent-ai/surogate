@@ -72,6 +72,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
                     "name": "experts_gate_up",
                     "kind": "param",
                     "residency": "auto",
+                    "shape": ["E", "2M", "C"],
+                    "grouped": true,
+                    "save_for_backward": false,
                     "distribution": {"kind": "expert_parallel"},
                     "streaming_hint": {"prefetch_distance": 1}
                   },
@@ -169,6 +172,15 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].cpu_pinned_stream_slots == 1);
     REQUIRE(schema_records[0].cpu_pageable_slots == 0);
     REQUIRE(schema_records[0].nvme_offload_slots == 0);
+    REQUIRE(schema_records[0].slots.size() == 3);
+    REQUIRE(schema_records[0].slots[1].name == "experts_gate_up");
+    REQUIRE(schema_records[0].slots[1].kind == "param");
+    REQUIRE(schema_records[0].slots[1].residency == "auto");
+    REQUIRE(schema_records[0].slots[1].distribution_kind == "expert_parallel");
+    REQUIRE(schema_records[0].slots[1].shape_rank == 3);
+    REQUIRE(schema_records[0].slots[1].grouped);
+    REQUIRE_FALSE(schema_records[0].slots[1].save_for_backward);
+    REQUIRE(schema_records[0].slots[1].streaming_prefetch_distance == 1);
     REQUIRE(schema_records[0].routing_kind == "topk_softmax");
     REQUIRE(schema_records[0].routing_topk == 2);
     REQUIRE(schema_records[0].routing_topk_param.empty());
@@ -264,6 +276,8 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].cpu_pinned_stream_slots == 1);
     REQUIRE(plan.schema_layers[0].cpu_pageable_slots == 0);
     REQUIRE(plan.schema_layers[0].nvme_offload_slots == 0);
+    REQUIRE(plan.schema_layers[0].slots.size() == 3);
+    REQUIRE(plan.schema_layers[0].slots[1].name == "experts_gate_up");
     REQUIRE(plan.schema_layers[0].routing_kind == "topk_softmax");
     REQUIRE(plan.schema_layers[0].routing_topk == 2);
     REQUIRE(plan.schema_layers[0].routing_norm_topk_prob);
