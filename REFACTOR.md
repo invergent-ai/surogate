@@ -147,6 +147,7 @@
 - [x] Acceptance model schema tests now enforce save-for-backward parity with compiled activation layouts; dense `res_att` schema declarations were aligned to the emitted non-save layout.
 - [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` now also rejects schema save-for-backward slots that are not marked saved in the compiled activation layout.
 - [x] Phase 4c block-family migration started with complete Nemotron-H hybrid schema coverage across Mamba, attention, MLP, and MoE layers.
+- [x] LLaMA dense blocks now declare Phase 4 schema metadata with compile-time slot/save parity coverage.
 
 Local validation status:
 
