@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -101,6 +102,25 @@ TEST_CASE("fusion rule registry updates duplicate rule names", "[fusion_rule]") 
     REQUIRE(found->pattern[1] == "c");
     REQUIRE(found->priority == 7);
     REQUIRE_FALSE(found->comm_aware);
+}
+
+TEST_CASE("built-in fusion rule declarations are registered inertly", "[fusion_rule]") {
+    const FusionRule* matmul_bias = FusionRuleRegistry::instance().find_by_name("matmul_bias");
+    REQUIRE(matmul_bias != nullptr);
+    REQUIRE(matmul_bias->pattern == std::vector<std::string>{"matmul", "bias_add"});
+    REQUIRE(matmul_bias->priority == 100);
+    REQUIRE(matmul_bias->comm_aware);
+
+    const FusionRule* moe_permute_quantize = FusionRuleRegistry::instance().find_by_name("moe_permute_quantize");
+    REQUIRE(moe_permute_quantize != nullptr);
+    REQUIRE(moe_permute_quantize->pattern == std::vector<std::string>{"moe_permute", "moe_grouped_gemm"});
+    REQUIRE(moe_permute_quantize->priority == 65);
+
+    std::vector<const FusionRule*> matmul_rules = FusionRuleRegistry::instance().rules_for_first_op("matmul");
+    auto found = std::find_if(matmul_rules.begin(), matmul_rules.end(), [](const FusionRule* rule) {
+        return rule->name == "matmul_bias";
+    });
+    REQUIRE(found != matmul_rules.end());
 }
 
 }  // namespace

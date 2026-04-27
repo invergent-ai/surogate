@@ -303,6 +303,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/tensor_slot_dispatch.cpp
     src/runtime/dsl/tensor_role.cpp
     src/runtime/dsl/fusion_rule_registry.cpp
+    src/runtime/dsl/fusion_rule_registrations.cpp
 
     src/runtime/ops/embedding.cpp
     src/runtime/ops/zeros.cpp
