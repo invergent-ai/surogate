@@ -24,6 +24,7 @@
 - [x] Regression runner materializes per-run configs and injects local model paths from env vars.
 - [x] Regression case filtering and `--list-cases` command added for CI/on-demand selection.
 - [x] CI workflow and Make targets added for no-GPU regression smoke and self-hosted GPU regression lane.
+- [x] North-star coverage rows now include descriptor capability requirements for dense and MoE grouped quantized cases.
 
 ### Phase 1 — TensorRole and Distribution scaffolding
 

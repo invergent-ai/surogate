@@ -36,7 +36,17 @@ def test_coverage_report_counts_supported_quant_rows(tmp_path):
     assert report["eligible"] == 1
     assert report["passed"] == 1
     assert report["coverage"] == 1.0
+    assert report["rows"][0]["required_capabilities"] == ["DenseMatmul", "FP8Eligible"]
     assert json.dumps(report)
+
+
+def test_coverage_report_marks_moe_grouped_capabilities():
+    case = br.RegressionCase("m", "fp8", "single_gpu", op_kind="moe_grouped")
+    results = {case.case_id: {"case": br.asdict(case), "status": "skipped", "reason": "missing weights"}}
+
+    report = br.coverage_report(results)
+
+    assert report["rows"][0]["required_capabilities"] == ["GroupedMatmul", "MoERouted", "FP8Eligible"]
 
 
 def test_load_results_ignores_report_artifacts(tmp_path):

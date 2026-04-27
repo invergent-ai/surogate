@@ -435,6 +435,25 @@ def compare_results(current: dict[str, dict[str, Any]], baseline: dict[str, dict
     return failures
 
 
+def required_capabilities_for_case(case: dict[str, Any]) -> list[str]:
+    recipe = case["recipe"]
+    op_kind = case["op_kind"]
+    if recipe not in {"fp8", "fp4"}:
+        return []
+
+    caps: list[str] = []
+    if op_kind == "dense":
+        caps.append("DenseMatmul")
+    elif op_kind == "moe_grouped":
+        caps.extend(["GroupedMatmul", "MoERouted"])
+
+    if recipe == "fp8":
+        caps.append("FP8Eligible")
+    elif recipe == "fp4":
+        caps.append("FP4Eligible")
+    return caps
+
+
 def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     eligible = 0
@@ -456,6 +475,7 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "storage": case["storage"],
                 "status": result["status"],
                 "reason": result.get("reason", ""),
+                "required_capabilities": required_capabilities_for_case(case),
             }
         )
     return {
