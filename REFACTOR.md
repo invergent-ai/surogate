@@ -99,7 +99,7 @@
 - [x] MoE grouped matmul recipe contexts now carry optional routed-token `TensorRole` metadata from compiled tensor records, preparing MoE capability-plus-role predicates without changing execution.
 - [x] Shared recipe predicate helpers now include a scaffolded MoE FP8 grouped check over `MoECapabilities` plus routed-token `TensorRole`.
 
-### Phase 4 — Block schemas + storage residency + EP topology — STARTED (4a complete, 4b started)
+### Phase 4 — Block schemas + storage residency + EP topology — STARTED (4a/4b complete, 4c started)
 
 - [x] Python DSL `BlockSchema` declaration surface added for slot residency, distribution, streaming hints, routing schema, and EP topology metadata.
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
@@ -146,6 +146,7 @@
 - [x] Regression artifacts now capture flattened arena summaries so schema save/frame byte plans can be compared against compiled graph arena allocation drift.
 - [x] Acceptance model schema tests now enforce save-for-backward parity with compiled activation layouts; dense `res_att` schema declarations were aligned to the emitted non-save layout.
 - [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` now also rejects schema save-for-backward slots that are not marked saved in the compiled activation layout.
+- [x] Phase 4c block-family migration started with complete Nemotron-H hybrid schema coverage across Mamba, attention, MLP, and MoE layers.
 
 Local validation status:
 
@@ -248,7 +249,7 @@ Phase 0: Test infrastructure first-month slice                COMPLETE
 Phase 1: TensorRole + Distribution scaffolding                COMPLETE
 Phase 2: Op registry descriptor extension scaffold            COMPLETE
 Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
-Phase 4: Block schemas + storage residency + EP topology      STARTED
+Phase 4: Block schemas + storage residency + EP topology      STARTED (4a/4b complete)
 Phase 5: Hook registry + distribution-aware + CPU offload     NOT STARTED
 ```
 
@@ -654,7 +655,7 @@ The `RoutingSchema` and `EPTopology` declarations make per-architecture MoE diff
 
 #### 4b. BufferPlan migration (weeks 3–4)
 
-**Status: STARTED.** The C++ runtime now collects per-layer schema records, validates coverage and slot-registry parity behind `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1`, preserves per-slot residency/distribution/routing/shape metadata, and computes schema-side activation/parameter byte diagnostics including EP-local expert weights. Allocator decisions still use the legacy enum-driven `BufferPlan`.
+**Status: COMPLETE.** The C++ runtime now collects per-layer schema records, validates coverage, slot-registry parity, and save-for-backward parity behind `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1`, preserves per-slot residency/distribution/routing/lifetime/shape metadata, computes schema-side activation/parameter byte diagnostics including EP-local expert weights, and emits buffer-plan plus arena summaries into regression artifacts. Allocator decisions still use the legacy enum-driven `BufferPlan`; Phase 4c starts the block-family migration without removing fallback paths.
 
 Parallel `BufferPlan` path consumes schemas. Old enum-driven path stays. Both run, allocation parity-checked.
 

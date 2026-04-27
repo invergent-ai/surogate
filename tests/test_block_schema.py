@@ -328,7 +328,8 @@ def test_legacy_lowerer_preserves_block_schema_metadata():
     ir = lower_block_spec(spec)
 
     assert ir.block_schema["attrs"]["block_family"] == "nemotron_mamba2"
-    assert ir.block_schema["slots"][0]["name"] == "ssm_state"
+    assert [slot["name"] for slot in ir.block_schema["slots"][:2]] == ["projected", "gate"]
+    assert any(slot["name"] == "ssm_state" for slot in ir.block_schema["slots"])
 
 
 def test_model_compile_emits_per_layer_block_schema_metadata():
@@ -436,3 +437,53 @@ def test_acceptance_model_schema_save_slots_match_compiled_layout():
                     mismatched.append(f"layer{record['layer']}.{slot['name']}")
 
         assert mismatched == [], f"{model_name} schema save slots are not saved in compiled layout: {mismatched}"
+
+
+def test_nemotron_h_hybrid_model_emits_schema_for_each_block_family():
+    from surogate.dsl.models.nemotron_h import NemotronHModel  # noqa: F401
+
+    config = {
+        "vocab_size": 32000,
+        "d_model": 256,
+        "n_layers": 4,
+        "num_query_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 64,
+        "d_ff": 512,
+        "mamba_num_heads": 8,
+        "mamba_head_dim": 32,
+        "ssm_state_size": 16,
+        "n_groups": 4,
+        "conv_kernel": 4,
+        "chunk_size": 64,
+        "max_seq": 2048,
+        "hybrid_pattern": "M*-E",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256,
+    }
+
+    payload = json.loads(compile_model("NemotronHModel", config, raise_on_error=True))
+    module = payload["modules"][0]
+    records = module["forward"]["metadata"]["block_schemas"]
+    layout_names = _compiled_activation_slot_names(module)
+    layout_save_names = _compiled_save_for_backward_slot_names(module)
+
+    assert [record["layer"] for record in records] == [0, 1, 2, 3]
+    assert [record["schema"]["attrs"]["block_family"] for record in records] == [
+        "nemotron_mamba2",
+        "nemotron_attention",
+        "nemotron_mlp",
+        "nemotron_moe",
+    ]
+    missing = []
+    save_mismatches = []
+    for record in records:
+        for slot in record["schema"]["slots"]:
+            if slot["kind"] != "param" and slot["name"] not in layout_names:
+                missing.append(f"layer{record['layer']}.{slot['name']}")
+            if slot.get("save_for_backward") and slot["name"] not in layout_save_names:
+                save_mismatches.append(f"layer{record['layer']}.{slot['name']}")
+
+    assert missing == []
+    assert save_mismatches == []

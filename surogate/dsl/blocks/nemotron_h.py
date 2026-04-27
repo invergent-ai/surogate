@@ -147,8 +147,14 @@ class NemotronHMamba2Block(nn.Block):
     _name_remap_ = NEMOTRON_MAMBA_BLOCK_REMAP
     schema = BlockSchema(
         slots=(
-            SlotDecl("ssm_state", shape=("B", "T", "H", "D", "N"), save_for_backward=True),
-            SlotDecl("conv_out", shape=("B", "T", "D_conv"), save_for_backward=True),
+            SlotDecl("projected", shape=("B", "T", "P"), save_for_backward=True),
+            SlotDecl("gate", shape=("B", "T", "I"), save_for_backward=True),
+            SlotDecl("conv_out", shape=("B", "D_conv", "T"), save_for_backward=True),
+            SlotDecl("hidden_states", shape=("B", "I", "T"), save_for_backward=True),
+            SlotDecl("ssm_out", shape=("B", "T", "I"), save_for_backward=True),
+            SlotDecl("ssm_state", shape=("B", "H", "D", "N"), save_for_backward=True),
+            SlotDecl("gated_out", shape=("B", "T", "I"), save_for_backward=True),
+            SlotDecl("out", shape=("B", "T", "C")),
             SlotDecl(
                 "in_proj_weight",
                 kind="param",
@@ -238,6 +244,20 @@ class NemotronHAttentionBlock(nn.Block):
     """Attention block for Nemotron-H hybrid architecture."""
 
     _name_remap_ = NEMOTRON_ATTN_BLOCK_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl("qkv_weight", kind="param", shape=("QKV", "C")),
+            SlotDecl("out_weight", kind="param", shape=("C", "AttnDim")),
+            SlotDecl("res_att", shape=("B", "T", "C")),
+            SlotDecl("ln1", shape=("B", "T", "C"), save_for_backward=True),
+            SlotDecl("ln1_rstd", shape=("B", "T"), dtype="fp32", save_for_backward=True),
+            SlotDecl("qkv", shape=("B", "T", "QKV"), save_for_backward=True),
+            SlotDecl("att", shape=("B", "T", "AttnDim"), save_for_backward=True),
+            SlotDecl("lse", shape=("B", "Hq", "T"), dtype="fp32", save_for_backward=True),
+            SlotDecl("att_out", shape=("B", "T", "C")),
+        ),
+        attrs={"block_family": "nemotron_attention"},
+    )
 
     def __init__(
         self,
@@ -290,6 +310,16 @@ class NemotronHMLPBlock(nn.Block):
     """MLP block for Nemotron-H hybrid architecture."""
 
     _name_remap_ = NEMOTRON_MLP_BLOCK_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl("up_weight", kind="param", shape=("M", "C"), residency="auto"),
+            SlotDecl("down_weight", kind="param", shape=("C", "M"), residency="auto"),
+            SlotDecl("mlp_up", shape=("B", "T", "M"), save_for_backward=True),
+            SlotDecl("swiglu", shape=("B", "T", "M"), save_for_backward=True),
+            SlotDecl("mlp_down", shape=("B", "T", "C")),
+        ),
+        attrs={"block_family": "nemotron_mlp"},
+    )
 
     def __init__(
         self,
