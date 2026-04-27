@@ -254,8 +254,6 @@ class Qwen3_5LinearBlock(nn.Block):
             SlotDecl("lin_out_weight", kind="param", shape=("C", "ValueDim")),
             SlotDecl("mlp_up_weight", kind="param", shape=("2M", "C"), residency="auto"),
             SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
-            SlotDecl("lin_conv_state", shape=("B", "ConvDim", "ConvK"), save_for_backward=True),
-            SlotDecl("lin_delta_state", shape=("B", "Hv", "Vd"), save_for_backward=True),
             SlotDecl("res_att", shape=("B", "T", "C"), save_for_backward=True),
         ),
         attrs={"block_family": "qwen3_5_linear"},

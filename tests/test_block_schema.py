@@ -104,9 +104,8 @@ def test_qwen3_5_moe_blocks_declare_schema():
     assert attn.schema.attrs["block_family"] == "qwen3_5_moe_attention"
     assert linear.schema.attrs["block_family"] == "qwen3_5_moe_linear"
     assert attn.schema.routing.shared_experts == "shared_expert_intermediate"
-    assert linear.schema.get_slot("lin_conv_state").save_for_backward is True
-    assert attn.schema.get_slot("experts_gate_up").distribution.kind == "expert_parallel"
     assert linear.schema.get_slot("permuted_input").distribution.kind == "expert_parallel"
+    assert attn.schema.get_slot("experts_gate_up").distribution.kind == "expert_parallel"
 
 
 def test_gemma4_blocks_declare_dense_and_moe_schema():
@@ -177,7 +176,7 @@ def test_qwen3_and_qwen3_5_dense_blocks_declare_schema():
     assert qwen35_attn.schema.attrs["block_family"] == "qwen3_5_attention"
     assert qwen35_attn.schema.get_slot("full_q_proj_weight").kind == "param"
     assert qwen35_linear.schema.attrs["block_family"] == "qwen3_5_linear"
-    assert qwen35_linear.schema.get_slot("lin_conv_state").save_for_backward is True
+    assert qwen35_linear.schema.get_slot("lin_conv_weight").shape == ("ConvDim", 1, "ConvK")
 
 
 def test_block_schema_lowers_to_block_ir_dict():
