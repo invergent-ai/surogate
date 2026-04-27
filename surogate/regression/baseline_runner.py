@@ -36,6 +36,7 @@ CONVERGENCE_REL_TOL = 0.05
 STEP_TIME_REGRESSION_TOL = 0.05
 CUDA_MEMORY_REGRESSION_TOL = 0.10
 NCCL_BYTES_REL_TOL = 0.01
+DEFAULT_RUN_TIMEOUT_S = int(os.environ.get("SUROGATE_REGRESSION_TIMEOUT_S", "1800"))
 
 
 @dataclass(frozen=True)
@@ -258,7 +259,22 @@ def _load_case_artifacts(path: Path) -> dict[str, Any]:
     return asdict(artifacts)
 
 
-def run_case(case: RegressionCase, *, run: bool, steps: int, artifact_dir: Path | None = None) -> RegressionResult:
+def _subprocess_text_tail(value: str | bytes | None, limit: int = 4000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return value[-limit:]
+
+
+def run_case(
+    case: RegressionCase,
+    *,
+    run: bool,
+    steps: int,
+    artifact_dir: Path | None = None,
+    timeout_s: int | float | None = DEFAULT_RUN_TIMEOUT_S,
+) -> RegressionResult:
     started = time.time()
     result = RegressionResult(case=asdict(case), status="skipped", started_at=started)
     missing = _missing_reason(case)
@@ -284,11 +300,30 @@ def run_case(case: RegressionCase, *, run: bool, steps: int, artifact_dir: Path 
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         env["SUROGATE_REGRESSION_ARTIFACT"] = str(artifact_path)
 
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True, check=False, env=env)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+            timeout=timeout_s if timeout_s and timeout_s > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result.duration_s = time.time() - started
+        result.status = "failed"
+        result.reason = f"command timed out after {timeout_s:g}s"
+        result.artifacts = {
+            "stdout_tail": _subprocess_text_tail(exc.stdout),
+            "stderr_tail": _subprocess_text_tail(exc.stderr),
+            "returncode": "timeout",
+        }
+        return result
     result.duration_s = time.time() - started
     result.artifacts = {
-        "stdout_tail": proc.stdout[-4000:],
-        "stderr_tail": proc.stderr[-4000:],
+        "stdout_tail": _subprocess_text_tail(proc.stdout),
+        "stderr_tail": _subprocess_text_tail(proc.stderr),
         "returncode": proc.returncode,
     }
     if artifact_path and artifact_path.exists():
@@ -719,6 +754,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--run", action="store_true", help="Launch configured GPU workloads")
     parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument(
+        "--timeout-s",
+        type=int,
+        default=DEFAULT_RUN_TIMEOUT_S,
+        help="Per-case wall-clock timeout for launched workloads; 0 disables the timeout",
+    )
     parser.add_argument("--update-baseline", action="store_true")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--report", action="store_true")
@@ -730,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     results = [
-        run_case(case, run=args.run, steps=args.steps, artifact_dir=args.out)
+        run_case(case, run=args.run, steps=args.steps, artifact_dir=args.out, timeout_s=args.timeout_s)
         for case in select_cases(args.case_filters)
     ]
     write_results(results, args.out)

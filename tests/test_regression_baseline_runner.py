@@ -271,11 +271,11 @@ def test_supported_first_month_cases_have_configs():
     assert missing == []
 
 
-def test_main_defaults_to_five_steps(tmp_path, monkeypatch):
+def test_main_defaults_to_five_steps_and_timeout(tmp_path, monkeypatch):
     captured = []
 
-    def fake_run_case(case, *, run, steps, artifact_dir):
-        captured.append((case.case_id, run, steps, artifact_dir))
+    def fake_run_case(case, *, run, steps, artifact_dir, timeout_s):
+        captured.append((case.case_id, run, steps, artifact_dir, timeout_s))
         return br.RegressionResult(case=br.asdict(case), status="skipped")
 
     monkeypatch.setattr(br, "run_case", fake_run_case)
@@ -283,7 +283,22 @@ def test_main_defaults_to_five_steps(tmp_path, monkeypatch):
     rc = br.main(["--case", br.FIRST_MONTH_MATRIX[0].case_id, "--out", str(tmp_path)])
 
     assert rc == 0
-    assert captured == [(br.FIRST_MONTH_MATRIX[0].case_id, False, 5, tmp_path)]
+    assert captured == [(br.FIRST_MONTH_MATRIX[0].case_id, False, 5, tmp_path, br.DEFAULT_RUN_TIMEOUT_S)]
+
+
+def test_main_accepts_timeout_override(tmp_path, monkeypatch):
+    captured = []
+
+    def fake_run_case(case, *, run, steps, artifact_dir, timeout_s):
+        captured.append(timeout_s)
+        return br.RegressionResult(case=br.asdict(case), status="skipped")
+
+    monkeypatch.setattr(br, "run_case", fake_run_case)
+
+    rc = br.main(["--case", br.FIRST_MONTH_MATRIX[0].case_id, "--out", str(tmp_path), "--timeout-s", "7"])
+
+    assert rc == 0
+    assert captured == [7]
 
 
 def test_compare_artifacts_respects_recipe_tolerance():
@@ -431,3 +446,18 @@ def test_run_case_loads_external_artifact(tmp_path, monkeypatch):
     assert result.status == "passed"
     assert result.metrics["activation_snapshots"] == artifact_payload["activation_snapshots"]
     assert result.metrics["convergence_curve"] == artifact_payload["convergence_curve"]
+
+
+def test_run_case_reports_timeout(tmp_path, monkeypatch):
+    case = br.RegressionCase("m", "bf16", "single_gpu", config="dummy.yaml")
+    script = "import time; print('started', flush=True); time.sleep(5)"
+    monkeypatch.setattr(br, "_missing_reason", lambda _: None)
+    monkeypatch.setattr(br, "_materialize_case_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(br, "_command_for_case", lambda _, config_path=None: [sys.executable, "-c", script])
+
+    result = br.run_case(case, run=True, steps=1, artifact_dir=tmp_path, timeout_s=0.1)
+
+    assert result.status == "failed"
+    assert result.reason == "command timed out after 0.1s"
+    assert result.artifacts["returncode"] == "timeout"
+    assert "started" in result.artifacts["stdout_tail"]

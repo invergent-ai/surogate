@@ -23,6 +23,7 @@
 - [x] Regression runner records explicit skip reasons for missing model paths.
 - [x] Regression runner materializes per-run configs and injects local model paths from env vars.
 - [x] Regression case filtering and `--list-cases` command added for CI/on-demand selection.
+- [x] Regression runner now applies a per-case wall-clock timeout (`--timeout-s`, default `SUROGATE_REGRESSION_TIMEOUT_S` or 1800s) so GPU-side hangs fail with explicit artifacts instead of blocking CI indefinitely.
 - [x] CI workflow and Make targets added for no-GPU regression smoke and self-hosted GPU regression lane.
 - [x] North-star coverage rows now include descriptor capability requirements for dense and MoE grouped quantized cases.
 
@@ -171,6 +172,7 @@ Local validation status:
 - [ ] Direct 2-GPU EP prequant MoE run for [`qwen36moe-lora-fp8.yaml`](examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml) remains acceptance-pending after follow-up stability review. The 2026-04-27 run with `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` completed with 40/40 MoE schema records, zero missing schema activation slots, save-for-backward schema parity clean, 80 forward grouped MoE ops and 40 forward all-to-all in/out ops present, and loss moved `7.2512 -> 6.3263`; however repeated 5-step samples showed volatile pre-clipping raw grad norms (`35.43 -> 16.17`, `41.82 -> 34.65`, and one `23.39 -> 61.19`), so this row is not locked green until the norm behavior is explained.
 - [x] Direct real-model run passed for [`gemma4-e2b-lora-fp8.yaml`](examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml) on 2026-04-27 with `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1`; 35/35 schema records present, zero missing schema activation slots, save-for-backward schema parity clean, arena summary captured, schema allocation savings estimate `687865856` bytes, 246 dense FP8 forward/backward matmul descriptors present, loss moved `3.6721 -> 2.4903`, artifact saved to `regression_baselines/runs/gemma4-e2b-lora-fp8-direct-20260427.json`, log `output/log-coffee-fermentation-20260427-065738.json`.
 - [ ] Qwen3 MoE NVFP4 4-GPU EP probe for [`qwen3moe-nvfp4.yaml`](examples/sft/qwen3moe/qwen3moe-nvfp4.yaml) is red. The initial misaligned-address crashes in `fused_residual_rmsnorm` forward/backward were narrowed to unaligned EP MoE views entering vectorized RMSNorm kernels and patched with aligned temp fallbacks; the run then reached step 2 with losses/norms `2.5868/0.1609`, `3.0908/0.2204`, `2.6929/0.1787`, but step 3 entered a GPU-side spin with all four GPUs at 99-100% SM utilization and no log advancement. The process was killed; the driver stayed wedged at 100% utilization with no owning process and `nvidia-smi --gpu-reset -i 0,1,2,3` failed due insufficient permissions. Do not mark Qwen3 MoE acceptance complete until this hang is isolated.
+- [x] Regression harness guardrail added after the Qwen3 MoE step-3 hang: launched cases now have an outer timeout and report `returncode: "timeout"` with stdout/stderr tails for postmortem triage.
 
 Real-model acceptance queue:
 
