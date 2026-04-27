@@ -7,15 +7,15 @@
 
 ---
 
-## 0. First-month implementation progress
+## 0. First-month implementation progress — COMPLETE
 
-### Pre-Phase 0 — FP8 MoE backward closure
+### Pre-Phase 0 — FP8 MoE backward closure — COMPLETE
 
 - [x] FP8 MoE weight-gradient closure scaffold landed behind `SUROGATE_FP8_MOE_WGRAD=1`, with BF16 fallback retained for unsupported paths.
 - [x] Executor-side FP8 MoE expert weight cache support landed for backward dgrad reuse, preserving frozen-weight cacheability.
 - [x] CUTLASS examples README inspected for relevant FP8/grouped GEMM paths; future candidates identified (`57_hopper_grouped_gemm`, `69_hopper_mixed_dtype_grouped_gemm`, `75_blackwell_grouped_gemm`, `81_blackwell_gemm_blockwise`, `54_hopper_fp8_warp_specialized_gemm`, `58_ada_fp8_gemm`).
 
-### Phase 0 — Regression baseline infrastructure
+### Phase 0 — Regression baseline infrastructure — FIRST-MONTH SLICE COMPLETE
 
 - [x] First-month regression harness added with tracked JSON baselines under `regression_baselines/locked`.
 - [x] Baseline compare/update/report commands added, including north-star coverage JSON.
@@ -26,7 +26,7 @@
 - [x] CI workflow and Make targets added for no-GPU regression smoke and self-hosted GPU regression lane.
 - [x] North-star coverage rows now include descriptor capability requirements for dense and MoE grouped quantized cases.
 
-### Phase 1 — TensorRole and Distribution scaffolding
+### Phase 1 — TensorRole and Distribution scaffolding — FIRST-MONTH SLICE COMPLETE
 
 - [x] `TensorRole`, `Distribution`, `StorageTier`, `QuantState`, and conservative name-to-role inference introduced.
 - [x] TensorRole metadata attached to compiled graph tensor records and role lookup helpers added.
@@ -37,7 +37,7 @@
 - [x] DSL stores, matmul MoE predicates, QLoRA expert filters, NorMuon router filters, and MoE expert-bias skip paths wired into role parity.
 - [x] Autodiff MoE side-channel classification centralized through TensorRole helpers.
 
-### Phase 2 — Op registry descriptor extension
+### Phase 2 — Op registry descriptor extension — FIRST-MONTH SLICE COMPLETE
 
 - [x] Existing op dispatch/autodiff registry preserved; descriptor metadata extension started instead of rebuilding the registry.
 - [x] MoE op registry descriptors annotated with first-month semantic/distribution metadata.
@@ -57,7 +57,7 @@
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, distribution, capability, epilogue, and storage descriptor facets.
 - [x] `CompiledGraph` summary helpers added for descriptor communication, grouped-op, capability, epilogue, and storage-compat counts.
 
-### Phase 3 — Capabilities and recipe predicates
+### Phase 3 — Capabilities and recipe predicates — FIRST-MONTH SLICE COMPLETE
 
 - [x] Descriptor capability metadata plumbed into dense and MoE matmul recipe contexts; FP8 recipe now consults `FP8Eligible` with legacy fallback for unannotated ops.
 - [x] Dense NVFP4 matmul recipe now consults `FP4Eligible` with legacy fallback; MoE FP4 fallback behavior remains unchanged.
@@ -190,13 +190,17 @@ Each conflated concept becomes its own open registry. Adding an architecture or 
 ## 4. Phase plan
 
 ```
-Phase 0: Test infrastructure (incl. multi-GPU + MoE lanes)    (7 weeks, blocking)
-Phase 1: TensorRole + Distribution foundation                 (6 weeks)
-Phase 2: Op registry extension (compile + capability + comm)  (7 weeks)
-Phase 3: Capabilities + fusion + epilogues + MoE/grouped     (9 weeks) ← FP8/FP4 + MoE ARRIVES
-Phase 4: Block schemas + storage residency + EP topology      (12 weeks)
-Phase 5: Hook registry + distribution-aware + CPU offload     (5 weeks)
+Pre-Phase 0: FP8 MoE backward tactical closure               COMPLETE
+Phase 0: Test infrastructure first-month slice                COMPLETE
+Phase 1: TensorRole + Distribution scaffolding                COMPLETE
+Phase 2: Op registry descriptor extension scaffold            COMPLETE
+Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
+Phase 4: Block schemas + storage residency + EP topology      NOT STARTED
+Phase 5: Hook registry + distribution-aware + CPU offload     NOT STARTED
 ```
+
+Completion here means the scoped first-month implementation tracked in §0 is done.
+The full multi-month roadmap below remains the target architecture; Phase 4 and Phase 5 have not started.
 
 **Critical path to "FP8/FP4 + MoE + multi-GPU generalized":** Phases 0–3 ≈ 29 weeks ≈ **6.7 months solo**, ~4 months with two engineers.
 
