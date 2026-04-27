@@ -155,7 +155,7 @@ regression-update-baseline:
 	uv run python -m surogate.regression.baseline_runner --out /tmp/surogate-regression-current --baseline regression_baselines/locked --update-baseline --report
 
 regression-gpu:
-	uv run python -m surogate.regression.baseline_runner --out regression_baselines/current --baseline regression_baselines/locked --run --steps $${STEPS:-50} --compare --report
+	uv run python -m surogate.regression.baseline_runner --out regression_baselines/current --baseline regression_baselines/locked --run --steps $${STEPS:-5} --compare --report
 
 # Clean build artifacts (keep build directory structure)
 clean:

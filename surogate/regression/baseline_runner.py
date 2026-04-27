@@ -642,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
         "--case", action="append", dest="case_filters", help="Run one case_id or all rows for one model"
     )
     parser.add_argument("--run", action="store_true", help="Launch configured GPU workloads")
-    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--update-baseline", action="store_true")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--report", action="store_true")

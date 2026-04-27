@@ -109,6 +109,7 @@ Local validation status:
 - [x] `make regression-smoke` passed.
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py tests/test_regression_baseline_runner.py tests/test_regression_artifact_writer.py --no-gpu` with 49 tests.
 - [x] GPU acceptance rows exercised locally for the real-model queue below; runner uses Hugging Face model IDs from configs by default, with `*_MODEL_PATH` only as optional local/offline overrides.
+- [x] Real-model GPU acceptance default shortened to 5 steps for practical iteration; longer convergence runs remain opt-in via `--steps`/`STEPS`.
 
 Real-model acceptance queue:
 

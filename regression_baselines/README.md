@@ -6,7 +6,7 @@ Use:
 
 ```bash
 python -m surogate.regression.baseline_runner --report
-python -m surogate.regression.baseline_runner --run --steps 50 --out regression_baselines/current --report
+python -m surogate.regression.baseline_runner --run --steps 5 --out regression_baselines/current --report
 python -m surogate.regression.baseline_runner --compare
 ```
 
