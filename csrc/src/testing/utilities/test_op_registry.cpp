@@ -175,6 +175,25 @@ TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     REQUIRE(matmul_bias != nullptr);
     REQUIRE(matmul_bias->epilogue_support.has(EpilogueSupportBias));
 
+    const OpDescriptor* matmul_backward = OpRegistry::instance().find_by_name("matmul_backward");
+    REQUIRE(matmul_backward != nullptr);
+    REQUIRE(matmul_backward == OpRegistry::instance().find(CompiledOpType::MatmulBackward));
+    REQUIRE(matmul_backward->backward_fn != nullptr);
+    REQUIRE(matmul_backward->default_caps.has(OpCapabilityDenseMatmul));
+    REQUIRE(matmul_backward->default_caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(matmul_backward->default_caps.has(OpCapabilityFp4Eligible));
+    REQUIRE(matmul_backward->storage_compat.supports(StorageTier::CpuPinnedStream));
+
+    const OpDescriptor* matmul_swiglu = OpRegistry::instance().find_by_name("matmul_swiglu");
+    REQUIRE(matmul_swiglu != nullptr);
+    REQUIRE(matmul_swiglu == OpRegistry::instance().find(CompiledOpType::MatmulSwiGLU));
+    REQUIRE(matmul_swiglu->forward_fn != nullptr);
+    REQUIRE(matmul_swiglu->default_caps.has(OpCapabilityDenseMatmul));
+    REQUIRE(matmul_swiglu->default_caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(matmul_swiglu->default_caps.has(OpCapabilityFp4Eligible));
+    REQUIRE(matmul_swiglu->epilogue_support.has(EpilogueSupportActivation));
+    REQUIRE(matmul_swiglu->storage_compat.supports(StorageTier::CpuPinnedStream));
+
     const OpDescriptor* rmsnorm = OpRegistry::instance().find_by_name("rmsnorm");
     REQUIRE(rmsnorm != nullptr);
     REQUIRE(rmsnorm->semantic_kind == OpSemanticKind::Normalization);

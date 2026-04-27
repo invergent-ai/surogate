@@ -275,6 +275,32 @@ private:
                          ::dsl::StorageCompatibilityGpuResident,                                 \
                          0)
 
+#define REGISTER_COMPILED_OP_NO_COMM_CAPS(name_str,           \
+                                          op_type_enum,       \
+                                          fwd_fn,             \
+                                          bwd_fn,             \
+                                          semantic_kind_enum, \
+                                          caps_flags_,        \
+                                          epilogue_flags_,    \
+                                          storage_flags_)     \
+    REGISTER_COMPILED_OP(name_str,                            \
+                         op_type_enum,                        \
+                         fwd_fn,                              \
+                         bwd_fn,                              \
+                         semantic_kind_enum,                  \
+                         Replicated,                          \
+                         NoComm,                              \
+                         false,                               \
+                         0,                                   \
+                         false,                               \
+                         false,                               \
+                         -1,                                  \
+                         false,                               \
+                         caps_flags_,                         \
+                         epilogue_flags_,                     \
+                         storage_flags_,                      \
+                         0)
+
 // Register an autodiff rule only — for names that don't have a
 // CompiledOpType counterpart (e.g. "softmax", "attention", "identity"
 // generics) or whose dispatch is handled elsewhere. Type defaults to
