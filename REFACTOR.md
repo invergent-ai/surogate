@@ -94,6 +94,7 @@
 - [x] North-star coverage rows now expose both aggregate and per-graph dense matmul descriptor counts for report consumers.
 - [x] Regression artifact flattening now also totals MoE grouped descriptor counts, and coverage diagnostics consume those aggregate MoE keys.
 - [x] Dense matmul recipe contexts now carry optional input `TensorRole` metadata from compiled tensor records, preparing capability-plus-role recipe predicates without changing execution.
+- [x] Shared recipe predicate helpers now include a scaffolded dense FP8 co-located-forward check over `MatmulCapabilities` plus input `TensorRole`.
 
 Local validation status:
 

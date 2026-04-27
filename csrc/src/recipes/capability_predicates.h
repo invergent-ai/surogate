@@ -129,6 +129,35 @@ inline bool descriptor_allows_matmul_fp8_forward(dsl::MatmulCapabilities caps, c
                                                "FP8ForwardEligible");
 }
 
+inline bool descriptor_allows_matmul_fp8_colocated_forward(dsl::MatmulCapabilities caps,
+                                                           const dsl::TensorRole* input_role,
+                                                           const char* context) {
+    if (!descriptor_allows_matmul_fp8_forward(caps, context)) {
+        return false;
+    }
+    if (caps.colocate_input == dsl::QuantColocation::None) {
+        return true;
+    }
+    if (!input_role) {
+        if (recipe_capability_fallback_log_enabled()) {
+            std::fprintf(stderr,
+                         "[recipe capability] %s disabled: matmul descriptor requires %s but input role is missing\n",
+                         context,
+                         dsl::quant_colocation_name(caps.colocate_input));
+        }
+        return false;
+    }
+    const bool ready = input_role->quant_state == dsl::QuantState::FP8Ready;
+    if (!ready && recipe_capability_fallback_log_enabled()) {
+        std::fprintf(stderr,
+                     "[recipe capability] %s disabled: matmul descriptor requires %s but input quant_state=%s\n",
+                     context,
+                     dsl::quant_colocation_name(caps.colocate_input),
+                     dsl::quant_state_name(input_role->quant_state));
+    }
+    return ready;
+}
+
 inline bool descriptor_allows_matmul_fp8_backward(dsl::MatmulCapabilities caps, const char* context) {
     return descriptor_allows_matmul_capability(caps,
                                                dsl::MatmulCapabilityFp8BackwardEligible,

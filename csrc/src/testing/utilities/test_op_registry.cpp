@@ -302,6 +302,16 @@ TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[o
     REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp8_backward(matmul_forward_only, "test"));
     REQUIRE(recipes::descriptor_allows_matmul_fp4_forward(matmul_forward_only, "test"));
     REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp4_backward(matmul_forward_only, "test"));
+
+    TensorRole fp8_ready_input{};
+    fp8_ready_input.quant_state = QuantState::FP8Ready;
+    TensorRole bf16_input{};
+    bf16_input.quant_state = QuantState::None;
+    MatmulCapabilities colocated_forward{MatmulCapabilityFp8ForwardEligible};
+    colocated_forward.colocate_input = QuantColocation::PrecedingNorm;
+    REQUIRE(recipes::descriptor_allows_matmul_fp8_colocated_forward(colocated_forward, &fp8_ready_input, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp8_colocated_forward(colocated_forward, &bf16_input, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp8_colocated_forward(colocated_forward, nullptr, "test"));
 }
 
 }  // namespace
