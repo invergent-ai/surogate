@@ -11,7 +11,9 @@ Tracked phases 0-5 are complete for the scoped, guarded implementation. The rema
 - [ ] Replace the current per-expert FP8 matmul loop in `moe_grouped_gemm_weight_grad_fp8` with a true grouped FP8 TN implementation.
   - [x] Moved the FP8 wgrad implementation out of the old monolithic MoE kernel file into `csrc/src/kernels/moe/`.
   - [x] Added a CUTLASS Hopper grouped FP8 wgrad path and an Ada-compatible dense fallback path for SM89/SM120 bring-up.
-  - [ ] Finish the native Blackwell grouped/blockwise-scale path instead of relying on the Ada-compatible fallback on SM120.
+  - [x] Added a native SM120 grouped blockwise FP8 wgrad path based on the CUTLASS 87c Blackwell grouped groupwise example.
+  - [x] Route SM120 directly to the native grouped path; no hidden experimental env gate remains.
+  - [ ] Add a native SM100 grouped path instead of relying on the Ada-compatible fallback on SM100.
 - [ ] Use cuBLASLt grouped matmul where shape/alignment support is available.
   - [x] Confirmed the currently available route is CUTLASS-based for E5M2 x E4M3 wgrad; the old cuBLASLt placeholder is gone from the native path.
 - [ ] Keep `SUROGATE_FP8_MOE_WGRAD=1` as the rollout gate until parity and perf are proven.
