@@ -59,6 +59,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                 "descriptor_summary": {
                     "matmul_fp8_forward_eligible_ops": 8,
                     "matmul_fp8_backward_eligible_ops": 8,
+                    "moe_fp8_grouped_eligible_ops": 2,
                     "fusion_candidate_starts": 3,
                     "forward_matmul_fp8_forward_eligible_ops": 4,
                     "backward_matmul_fp8_backward_eligible_ops": 4,
@@ -76,8 +77,8 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["matmul_capability_counts"]["matmul_fp8_backward_eligible_ops"] == 8
     assert report["rows"][0]["matmul_capability_counts"]["forward_matmul_fp8_forward_eligible_ops"] == 4
     assert report["rows"][0]["matmul_capability_counts"]["backward_matmul_fp8_backward_eligible_ops"] == 4
-    assert report["rows"][0]["descriptor_requirement_status"] == "missing"
-    assert report["rows"][0]["missing_descriptor_counts"] == ["forward_moe_fp8_grouped_eligible_ops"]
+    assert report["rows"][0]["descriptor_requirement_status"] == "present"
+    assert report["rows"][0]["missing_descriptor_counts"] == []
     assert report["rows"][0]["fusion_candidate_starts"] == 3
 
 

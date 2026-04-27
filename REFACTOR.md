@@ -92,6 +92,7 @@
 - [x] Regression artifact flattening now totals dense matmul FP8/FP4 forward/backward descriptor counts for baseline drift detection.
 - [x] North-star coverage rows now include diagnostic descriptor-requirement status and missing descriptor-count keys for supported dense and MoE quantized cases.
 - [x] North-star coverage rows now expose both aggregate and per-graph dense matmul descriptor counts for report consumers.
+- [x] Regression artifact flattening now also totals MoE grouped descriptor counts, and coverage diagnostics consume those aggregate MoE keys.
 
 Local validation status:
 

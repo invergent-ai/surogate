@@ -17,6 +17,8 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
             "fusion_candidate_starts": 2,
             "matmul_fp8_forward_eligible_ops": 4,
             "matmul_fp4_forward_eligible_ops": 3,
+            "moe_fp8_grouped_eligible_ops": 1,
+            "moe_fp4_grouped_eligible_ops": 2,
             "name": "forward",
         },
         "backward": {
@@ -24,6 +26,8 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
             "fusion_candidate_starts": 3,
             "matmul_fp8_backward_eligible_ops": 5,
             "matmul_fp4_backward_eligible_ops": 2,
+            "moe_fp8_grouped_eligible_ops": 3,
+            "moe_fp4_grouped_eligible_ops": 4,
             "name": "backward",
         },
     }
@@ -39,3 +43,5 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
     assert flattened["matmul_fp8_backward_eligible_ops"] == 5
     assert flattened["matmul_fp4_forward_eligible_ops"] == 3
     assert flattened["matmul_fp4_backward_eligible_ops"] == 2
+    assert flattened["moe_fp8_grouped_eligible_ops"] == 4
+    assert flattened["moe_fp4_grouped_eligible_ops"] == 6

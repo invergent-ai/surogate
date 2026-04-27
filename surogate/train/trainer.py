@@ -55,6 +55,10 @@ def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
         "matmul_fp8_backward_eligible_ops": 0,
         "matmul_fp4_forward_eligible_ops": 0,
         "matmul_fp4_backward_eligible_ops": 0,
+        "moe_fp8_grouped_eligible_ops": 0,
+        "moe_fp4_grouped_eligible_ops": 0,
+        "moe_fp8_backward_implemented_ops": 0,
+        "moe_nvfp4_no_fallback_ops": 0,
     }
     for graph_name in ("forward", "backward"):
         graph = summary.get(graph_name)

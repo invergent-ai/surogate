@@ -525,8 +525,8 @@ def descriptor_count_requirements_for_case(case: dict[str, Any]) -> list[str]:
 
     if op_kind == "moe_grouped":
         if recipe == "fp8":
-            return ["forward_moe_fp8_grouped_eligible_ops"]
-        return ["forward_moe_fp4_grouped_eligible_ops"]
+            return ["moe_fp8_grouped_eligible_ops"]
+        return ["moe_fp4_grouped_eligible_ops"]
 
     return []
 
