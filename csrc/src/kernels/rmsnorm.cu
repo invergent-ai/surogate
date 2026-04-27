@@ -62,7 +62,7 @@ __device__ void rmsnorm_forward_kernel(floatX* __restrict__ out,
 
     // load weights into shared memory
     // do this before we allow any threads to exit!
-    extern __shared__ char* params[];
+    extern __shared__ __align__(16) unsigned char params[];
     __shared__ float block_abs_max;
     // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
     // let's keep everything as x128
@@ -164,7 +164,7 @@ __device__ void fused_residual_rmsnorm_forward_kernel(floatX* residual,
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
-    extern __shared__ char* params[];
+    extern __shared__ __align__(16) unsigned char params[];
     __shared__ float block_abs_max;
     // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
     // let's keep everything as x128
@@ -311,7 +311,7 @@ __device__ void rmsnorm_forward_quant_kernel(__nv_fp8_e4m3* __restrict__ out,
     }
 
     // Load weights into shared memory
-    extern __shared__ char* params[];
+    extern __shared__ __align__(16) unsigned char params[];
     x128* s_weight = reinterpret_cast<x128*>(params);
     x128* s_in = reinterpret_cast<x128*>(params) + ((1 + threadIdx.y) * C / x128::size);
 

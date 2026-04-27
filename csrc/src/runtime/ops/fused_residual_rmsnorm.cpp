@@ -59,6 +59,10 @@ bool tensors_overlap(const Tensor& a, const Tensor& b) {
     return (a_start < b_end) && (b_start < a_end);
 }
 
+bool is_aligned_16(const Tensor& tensor) {
+    return tensor.Data == nullptr || (reinterpret_cast<std::uintptr_t>(tensor.Data) % 16) == 0;
+}
+
 }  // namespace
 
 void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
@@ -182,6 +186,52 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     }
 
     if (!handled_replay_exact) {
+        auto aligned_input = [&](Tensor& src, const char* name) {
+            if (is_aligned_16(src)) {
+                return src;
+            }
+            Tensor aligned = mRunState.temp_alloc(src.DType,
+                                                  std::vector<long>(src.Sizes.begin(), src.Sizes.begin() + src.Rank),
+                                                  name);
+            CUDA_CHECK(
+                cudaMemcpyAsync(aligned.Data, src.Data, src.bytes(), cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            mTemps.push_back(aligned);
+            return aligned;
+        };
+        auto aligned_output = [&](Tensor& dst, const char* name, bool& needs_copy_back) {
+            needs_copy_back = false;
+            if (is_aligned_16(dst)) {
+                return dst;
+            }
+            Tensor aligned = mRunState.temp_alloc(dst.DType,
+                                                  std::vector<long>(dst.Sizes.begin(), dst.Sizes.begin() + dst.Rank),
+                                                  name);
+            mTemps.push_back(aligned);
+            needs_copy_back = true;
+            return aligned;
+        };
+        bool copy_residual_out_back = false;
+        bool copy_y_back = false;
+        Tensor kernel_residual_out =
+            aligned_output(residual_out, "fused_residual_rmsnorm_residual_aligned", copy_residual_out_back);
+        Tensor kernel_y = aligned_output(y, "fused_residual_rmsnorm_y_aligned", copy_y_back);
+        Tensor kernel_residual_in = aligned_input(residual_in, "fused_residual_rmsnorm_residual_in_aligned");
+        Tensor kernel_input = aligned_input(input, "fused_residual_rmsnorm_input_aligned");
+        Tensor kernel_weight = aligned_input(weight, "fused_residual_rmsnorm_weight_aligned");
+        auto copy_outputs_back = [&]() {
+            if (copy_residual_out_back) {
+                CUDA_CHECK(cudaMemcpyAsync(residual_out.Data,
+                                           kernel_residual_out.Data,
+                                           residual_out.bytes(),
+                                           cudaMemcpyDeviceToDevice,
+                                           mRunState.MainStream));
+            }
+            if (copy_y_back) {
+                CUDA_CHECK(
+                    cudaMemcpyAsync(y.Data, kernel_y.Data, y.bytes(), cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+        };
+
         // During replay, the LN1/hybrid fused_residual_rmsnorm cannot correctly reconstruct
         // the residual from its components (res_att[K-1] + mlp_down[K-1]) because those live
         // in shared buffers that contain the last layer's values. Instead, use the correct
@@ -198,32 +248,35 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
                                          "fused_residual_rmsnorm_zero_input");
                 mTemps.push_back(zero_input);
                 fill_zero(zero_input, mRunState.MainStream);
-                fused_residual_rmsnorm_forward(residual_out,
-                                               y,
+                Tensor kernel_stored_res = aligned_input(stored_res_ffn, "fused_residual_rmsnorm_stored_res_aligned");
+                fused_residual_rmsnorm_forward(kernel_residual_out,
+                                               kernel_y,
                                                rstd,
-                                               stored_res_ffn,
+                                               kernel_stored_res,
                                                zero_input,
-                                               weight,
+                                               kernel_weight,
                                                nullptr,
                                                op.attrs.eps,
                                                static_cast<int>(mB * mT),
                                                mConfig.HiddenSize,
                                                mRunState.MainStream);
+                copy_outputs_back();
                 return;
             }
         }
 
-        fused_residual_rmsnorm_forward(residual_out,
-                                       y,
+        fused_residual_rmsnorm_forward(kernel_residual_out,
+                                       kernel_y,
                                        rstd,
-                                       residual_in,
-                                       input,
-                                       weight,
+                                       kernel_residual_in,
+                                       kernel_input,
+                                       kernel_weight,
                                        nullptr,
                                        op.attrs.eps,
                                        static_cast<int>(mB * mT),
                                        mConfig.HiddenSize,
                                        mRunState.MainStream);
+        copy_outputs_back();
     }
 
     // Pre-quantize normalized output into FP8 buffer for the downstream matmul.
@@ -462,18 +515,70 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     const bool mixed_weight_grad = (!skip_weight_grad && d_weight_ptr && d_weight_ptr->DType == ETensorDType::FP32 &&
                                     d_input.DType == ETensorDType::BF16);
 
+    auto aligned_bwd_input = [&](Tensor& src, const char* name) {
+        if (is_aligned_16(src)) {
+            return src;
+        }
+        Tensor aligned =
+            mRunState.temp_alloc(src.DType, std::vector<long>(src.Sizes.begin(), src.Sizes.begin() + src.Rank), name);
+        CUDA_CHECK(
+            cudaMemcpyAsync(aligned.Data, src.Data, src.bytes(), cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        mTemps.push_back(aligned);
+        return aligned;
+    };
+    auto aligned_bwd_output = [&](Tensor& dst, const char* name, bool& needs_copy_back) {
+        needs_copy_back = false;
+        if (is_aligned_16(dst)) {
+            return dst;
+        }
+        Tensor aligned =
+            mRunState.temp_alloc(dst.DType, std::vector<long>(dst.Sizes.begin(), dst.Sizes.begin() + dst.Rank), name);
+        mTemps.push_back(aligned);
+        needs_copy_back = true;
+        return aligned;
+    };
+
+    bool copy_d_input_back = false;
+    bool copy_d_weight_back = false;
+    Tensor kernel_d_input =
+        aligned_bwd_output(d_input, "fused_residual_rmsnorm_backward_d_input_aligned", copy_d_input_back);
+    Tensor kernel_d_weight =
+        aligned_bwd_output(*d_weight_ptr, "fused_residual_rmsnorm_backward_d_weight_aligned", copy_d_weight_back);
+    Tensor kernel_d_residual =
+        aligned_bwd_input(*d_residual_input, "fused_residual_rmsnorm_backward_d_residual_aligned");
+    Tensor kernel_d_y = aligned_bwd_input(d_y, "fused_residual_rmsnorm_backward_d_y_aligned");
+    Tensor kernel_residual_out =
+        aligned_bwd_input(residual_out, "fused_residual_rmsnorm_backward_residual_out_aligned");
+    Tensor kernel_weight = aligned_bwd_input(weight, "fused_residual_rmsnorm_backward_weight_aligned");
+    auto copy_bwd_outputs_back = [&]() {
+        if (copy_d_input_back) {
+            CUDA_CHECK(cudaMemcpyAsync(d_input.Data,
+                                       kernel_d_input.Data,
+                                       d_input.bytes(),
+                                       cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+        }
+        if (copy_d_weight_back) {
+            CUDA_CHECK(cudaMemcpyAsync(d_weight_ptr->Data,
+                                       kernel_d_weight.Data,
+                                       d_weight_ptr->bytes(),
+                                       cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+        }
+    };
+
     if (mixed_weight_grad) {
         // Compute d_input in BF16 and weight grad separately in FP32.
         Tensor tmp_dw =
             mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(C)}, "fused_residual_rmsnorm_tmp_dw");
         mTemps.push_back(tmp_dw);
-        rmsnorm_backward(d_input,
+        rmsnorm_backward(kernel_d_input,
                          tmp_dw,
                          mRunState.scratch().rmsnorm_scratch,
-                         *d_residual_input,
-                         d_y,
-                         residual_out,
-                         weight,
+                         kernel_d_residual,
+                         kernel_d_y,
+                         kernel_residual_out,
+                         kernel_weight,
                          *rstd_ptr,
                          abs_max_ptr,
                          static_cast<int>(mB),
@@ -482,22 +587,22 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                          mRunState.DeviceProp,
                          mRunState.MainStream,
                          /*skip_weight_grad=*/true);
-        rmsnorm_backward_dweight_fp32(*d_weight_ptr,
-                                      d_y,
-                                      residual_out,
+        rmsnorm_backward_dweight_fp32(kernel_d_weight,
+                                      kernel_d_y,
+                                      kernel_residual_out,
                                       *rstd_ptr,
                                       static_cast<int>(mB),
                                       static_cast<int>(mT),
                                       C,
                                       mRunState.MainStream);
     } else {
-        rmsnorm_backward(d_input,
-                         *d_weight_ptr,
+        rmsnorm_backward(kernel_d_input,
+                         kernel_d_weight,
                          mRunState.scratch().rmsnorm_scratch,
-                         *d_residual_input,
-                         d_y,
-                         residual_out,
-                         weight,
+                         kernel_d_residual,
+                         kernel_d_y,
+                         kernel_residual_out,
+                         kernel_weight,
                          *rstd_ptr,
                          abs_max_ptr,
                          static_cast<int>(mB),
@@ -507,6 +612,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                          mRunState.MainStream,
                          skip_weight_grad);
     }
+    copy_bwd_outputs_back();
 
     // Register d_input in mTensors for both graph outputs. Both outputs carry the same
     // gradient (add backward is identity for both inputs). Using store_tensor ensures

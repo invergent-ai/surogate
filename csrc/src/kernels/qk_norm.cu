@@ -84,7 +84,7 @@ __global__ void qkv_head_rmsnorm_forward_kernel(floatX* qkv,
     assert(blockDim.x == WARP_SIZE);
 
     // shared layout: [weight][per-warp input cache]
-    extern __shared__ char smem_raw[];
+    extern __shared__ __align__(16) unsigned char smem_raw[];
     x128* s_weight = reinterpret_cast<x128*>(smem_raw);
     x128* s_in = reinterpret_cast<x128*>(smem_raw) + ((1 + threadIdx.y) * head_size / x128::size);
 

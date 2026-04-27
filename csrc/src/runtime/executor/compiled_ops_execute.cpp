@@ -1449,7 +1449,18 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             const auto& op = graph.ops[i];
                             if (!op.fn) continue;
                             check_op_io_aliasing(op, i, "fwd");
-                            op.fn(*this, op, static_cast<const void*>(hook));
+                            if (op_trace) {
+                                std::cerr << "[OP " << i << "] " << op_type_to_string(op.type) << " id=" << op.op_id
+                                          << std::endl;
+                            }
+                            try {
+                                op.fn(*this, op, static_cast<const void*>(hook));
+                            } catch (const std::exception& e) {
+                                std::ostringstream oss;
+                                oss << "execute_forward stream op=" << i << " type=" << op_type_to_string(op.type)
+                                    << " id=" << op.op_id << ": " << e.what();
+                                throw std::runtime_error(oss.str());
+                            }
                         }
                     }
                     break;
