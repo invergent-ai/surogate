@@ -274,6 +274,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_resolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_unresolved_activation_shape_slots == 0);
     REQUIRE(plan.schema_resolved_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_max_layer_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_legacy_max_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_activation_shape_savings_bytes == 0);
     REQUIRE(plan.schema_resolved_param_shape_slots == 2);
     REQUIRE(plan.schema_unresolved_param_shape_slots == 0);
     REQUIRE(plan.schema_expert_parallel_param_slots == 1);
@@ -392,6 +395,38 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(alias_plan.schema_layers[0].slots[6].shape_dynamic);
     REQUIRE(alias_plan.schema_dynamic_activation_shape_slots == 1);
     REQUIRE(alias_plan.schema_unresolved_activation_shape_slots == 1);
+
+    auto savings_records = schema_records;
+    savings_records.push_back(schema_records[0]);
+    savings_records[1].layer = 1;
+    savings_records[1].slots.clear();
+    dsl::BlockSchemaSlotSummary small_activation;
+    small_activation.name = "small_state";
+    small_activation.kind = "activation";
+    small_activation.distribution_kind = "replicated";
+    small_activation.shape_dims = {"B", "T", "4"};
+    small_activation.shape_rank = 3;
+    savings_records[1].slots.push_back(small_activation);
+    savings_records[1].slot_count = 1;
+    savings_records[1].param_slots = 0;
+    savings_records[1].activation_slots = 1;
+    PretrainedConfig two_layer_cfg = cfg;
+    two_layer_cfg.NumLayers = 2;
+    const auto savings_plan = dsl::BufferPlan::build(two_layer_cfg,
+                                                     runtime_config,
+                                                     options,
+                                                     registry,
+                                                     /*lora_only_mode=*/false,
+                                                     /*B=*/2,
+                                                     /*T=*/3,
+                                                     ETensorDType::BF16,
+                                                     ETensorDType::BF16,
+                                                     &savings_records);
+    REQUIRE(savings_plan.schema_resolved_activation_shape_bytes == 144);
+    REQUIRE(savings_plan.schema_max_layer_activation_shape_bytes == 96);
+    REQUIRE(savings_plan.schema_legacy_max_activation_shape_bytes == 192);
+    REQUIRE(savings_plan.schema_activation_shape_savings_bytes == 48);
+
     REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);
     REQUIRE(plan.schema_layer(1) == nullptr);
     REQUIRE(plan.schema_layer_has_slot(0, "experts_gate_up"));

@@ -139,6 +139,7 @@
 - [x] `BufferPlan` schema shape resolution now covers Qwen3.5 `QProjDim` and `KVDim` aliases with C++ parity coverage.
 - [x] C++ runtime config now carries Qwen3.5 linear-attention and Gemma per-layer-input dimensions so `BufferPlan` can resolve `ConvDim`, `ValueDim`, `ConvK`, `Hk`, `Hv`, `Vd`, and `PLI_D` schema aliases.
 - [x] `BufferPlan` now separates dynamic MoE `dispatched_tokens` schema shapes from other unresolved shape aliases in diagnostics.
+- [x] `BufferPlan` now reports schema-derived per-layer activation bytes, legacy max-layer activation-byte estimates, and potential schema allocation savings for Phase 4b allocator parity.
 
 Local validation status:
 
@@ -151,6 +152,7 @@ Local validation status:
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py tests/test_regression_baseline_runner.py tests/test_regression_artifact_writer.py --no-gpu` with 49 tests.
 - [x] GPU acceptance rows exercised locally for the real-model queue below; runner uses Hugging Face model IDs from configs by default, with `*_MODEL_PATH` only as optional local/offline overrides.
 - [x] Real-model GPU acceptance default shortened to 5 steps for practical iteration; longer convergence runs remain opt-in via `--steps`/`STEPS`.
+- [x] Direct real-model run passed for [`qwen35-text-lora-fp8.yaml`](examples/sft/qwen35/qwen35-text-lora-fp8.yaml) on 2026-04-27 with 5 steps; loss moved `1.7376 -> 1.1236`, adapter saved under `output_q35`, log `output_q35/log-obliged-franklin-20260427-055716.json`.
 
 Real-model acceptance queue:
 

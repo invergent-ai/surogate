@@ -224,6 +224,9 @@ struct BufferPlan {
     int schema_unresolved_activation_shape_slots = 0;
     int schema_dynamic_activation_shape_slots = 0;
     long schema_resolved_activation_shape_bytes = 0;
+    long schema_max_layer_activation_shape_bytes = 0;
+    long schema_legacy_max_activation_shape_bytes = 0;
+    long schema_activation_shape_savings_bytes = 0;
     int schema_resolved_param_shape_slots = 0;
     int schema_unresolved_param_shape_slots = 0;
     int schema_expert_parallel_param_slots = 0;

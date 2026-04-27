@@ -610,6 +610,19 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             }
         }
     }
+    for (const auto& layer : p.schema_layers) {
+        if (!layer.has_schema) {
+            continue;
+        }
+        p.schema_max_layer_activation_shape_bytes =
+            std::max(p.schema_max_layer_activation_shape_bytes, layer.resolved_activation_shape_bytes);
+    }
+    if (p.schema_record_count == p.NumLayers && p.NumLayers > 0 && p.schema_max_layer_activation_shape_bytes > 0) {
+        p.schema_legacy_max_activation_shape_bytes =
+            p.schema_max_layer_activation_shape_bytes * static_cast<long>(p.NumLayers);
+        p.schema_activation_shape_savings_bytes =
+            std::max(0L, p.schema_legacy_max_activation_shape_bytes - p.schema_resolved_activation_shape_bytes);
+    }
 
     // ---------------- FFN temps on stack ----------------
     // Only safe when both mlp_up and swiglu are recomputable — otherwise the
