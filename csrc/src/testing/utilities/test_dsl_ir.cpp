@@ -4,6 +4,7 @@
 // Unit tests for DSL IR JSON loader + shape resolution.
 
 #include <string>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -178,6 +179,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].slots[1].residency == "auto");
     REQUIRE(schema_records[0].slots[1].distribution_kind == "expert_parallel");
     REQUIRE(schema_records[0].slots[1].shape_rank == 3);
+    REQUIRE(schema_records[0].slots[1].shape_dims == std::vector<std::string>{"E", "2M", "C"});
     REQUIRE(schema_records[0].slots[1].grouped);
     REQUIRE_FALSE(schema_records[0].slots[1].save_for_backward);
     REQUIRE(schema_records[0].slots[1].streaming_prefetch_distance == 1);
@@ -280,6 +282,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].nvme_offload_slots == 0);
     REQUIRE(plan.schema_layers[0].slots.size() == 3);
     REQUIRE(plan.schema_layers[0].slots[1].name == "experts_gate_up");
+    REQUIRE(plan.schema_layers[0].slots[1].shape_dims == std::vector<std::string>{"E", "2M", "C"});
     REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);
     REQUIRE(plan.schema_layer(1) == nullptr);
     REQUIRE(plan.schema_layer_has_slot(0, "experts_gate_up"));

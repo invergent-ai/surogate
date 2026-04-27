@@ -49,6 +49,7 @@ struct BlockSchemaSlotSummary {
     std::string residency;
     std::string distribution_kind;
     int shape_rank = 0;
+    std::vector<std::string> shape_dims;
     bool grouped = false;
     bool save_for_backward = false;
     int streaming_prefetch_distance = -1;

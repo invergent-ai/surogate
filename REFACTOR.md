@@ -129,6 +129,7 @@
 - [x] `BufferPlan` now exposes a schema-vs-legacy-slot-registry parity helper for missing activation slot diagnostics.
 - [x] `BufferPlan` now computes schema-vs-slot-registry activation allocation parity counters during plan construction and reports them in debug memory output.
 - [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` now also fails early when schema activation slots are absent from the compiled slot registry.
+- [x] `BufferPlan` now preserves schema slot shape dimension tokens, preparing shape-aware allocation parity beyond rank-only diagnostics.
 
 Local validation status:
 

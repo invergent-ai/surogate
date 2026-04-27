@@ -65,6 +65,22 @@ namespace {
     return false;
 }
 
+[[nodiscard]] std::string attr_scalar_to_string(const AttrValue& value) {
+    if (const auto* text = std::get_if<std::string>(&value.value)) {
+        return *text;
+    }
+    if (const auto* integer = std::get_if<std::int64_t>(&value.value)) {
+        return std::to_string(*integer);
+    }
+    if (const auto* number = std::get_if<double>(&value.value)) {
+        return std::to_string(*number);
+    }
+    if (const auto* flag = std::get_if<bool>(&value.value)) {
+        return *flag ? "true" : "false";
+    }
+    return {};
+}
+
 [[nodiscard]] std::string lower_copy(std::string_view value) {
     std::string out;
     out.reserve(value.size());
@@ -159,6 +175,10 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                     if (const AttrValue* shape_value = find_attr(*slot, "shape")) {
                         if (const AttrList* shape = attr_list(*shape_value)) {
                             slot_summary.shape_rank = static_cast<int>(shape->size());
+                            slot_summary.shape_dims.reserve(shape->size());
+                            for (const AttrValue& dim : *shape) {
+                                slot_summary.shape_dims.push_back(attr_scalar_to_string(dim));
+                            }
                         }
                     }
                     if (kind == "param") {
