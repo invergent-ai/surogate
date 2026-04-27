@@ -37,6 +37,7 @@ def test_coverage_report_counts_supported_quant_rows(tmp_path):
     assert report["passed"] == 1
     assert report["coverage"] == 1.0
     assert report["rows"][0]["required_capabilities"] == ["DenseMatmul", "FP8Eligible"]
+    assert report["rows"][0]["required_matmul_capabilities"] == ["FP8ForwardEligible", "FP8BackwardEligible"]
     assert json.dumps(report)
 
 
@@ -47,7 +48,13 @@ def test_coverage_report_marks_moe_grouped_capabilities():
             "case": br.asdict(case),
             "status": "skipped",
             "reason": "missing weights",
-            "metrics": {"descriptor_summary": {"fusion_candidate_starts": 3}},
+            "metrics": {
+                "descriptor_summary": {
+                    "fusion_candidate_starts": 3,
+                    "forward_matmul_fp8_forward_eligible_ops": 4,
+                    "backward_matmul_fp8_backward_eligible_ops": 4,
+                }
+            },
         }
     }
 
@@ -55,6 +62,9 @@ def test_coverage_report_marks_moe_grouped_capabilities():
 
     assert report["rows"][0]["required_capabilities"] == ["GroupedMatmul", "MoERouted", "FP8Eligible"]
     assert report["rows"][0]["required_moe_capabilities"] == ["GroupedGemmEligible", "FP8GroupedEligible"]
+    assert report["rows"][0]["required_matmul_capabilities"] == []
+    assert report["rows"][0]["matmul_capability_counts"]["forward_matmul_fp8_forward_eligible_ops"] == 4
+    assert report["rows"][0]["matmul_capability_counts"]["backward_matmul_fp8_backward_eligible_ops"] == 4
     assert report["rows"][0]["fusion_candidate_starts"] == 3
 
 

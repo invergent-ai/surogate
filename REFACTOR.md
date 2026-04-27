@@ -87,6 +87,7 @@
 - [x] Dedicated inert `MatmulCapabilities` descriptor surface added for dense matmul FP8/FP4 forward/backward eligibility, weight-cache eligibility, epilogue support, and quant-colocation hints.
 - [x] Dense FP8/FP4 recipe predicates now consult `MatmulCapabilities` in addition to legacy generic op capability flags, preserving legacy fallback for unannotated ops.
 - [x] Compiled-graph descriptor summaries now report dense matmul FP8/FP4 forward/backward eligibility counts through the Python trainer debug surface.
+- [x] North-star coverage rows now report required dense `MatmulCapabilities` and actual dense matmul descriptor-summary counts separately from generic op capabilities.
 
 Local validation status:
 

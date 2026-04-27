@@ -484,6 +484,27 @@ def required_moe_capabilities_for_case(case: dict[str, Any]) -> list[str]:
     return caps
 
 
+def required_matmul_capabilities_for_case(case: dict[str, Any]) -> list[str]:
+    recipe = case["recipe"]
+    op_kind = case["op_kind"]
+    if op_kind != "dense" or recipe not in {"fp8", "fp4"}:
+        return []
+
+    if recipe == "fp8":
+        return ["FP8ForwardEligible", "FP8BackwardEligible"]
+    return ["FP4ForwardEligible", "FP4BackwardEligible"]
+
+
+def matmul_capability_counts(descriptor_summary: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "forward_matmul_fp8_forward_eligible_ops",
+        "backward_matmul_fp8_backward_eligible_ops",
+        "forward_matmul_fp4_forward_eligible_ops",
+        "backward_matmul_fp4_backward_eligible_ops",
+    )
+    return {key: descriptor_summary.get(key) for key in keys}
+
+
 def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     eligible = 0
@@ -509,6 +530,8 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "reason": result.get("reason", ""),
                 "required_capabilities": required_capabilities_for_case(case),
                 "required_moe_capabilities": required_moe_capabilities_for_case(case),
+                "required_matmul_capabilities": required_matmul_capabilities_for_case(case),
+                "matmul_capability_counts": matmul_capability_counts(descriptor_summary),
                 "fusion_candidate_starts": descriptor_summary.get("fusion_candidate_starts"),
             }
         )
