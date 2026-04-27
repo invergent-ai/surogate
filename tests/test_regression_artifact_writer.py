@@ -63,8 +63,20 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
                 "ep_topology": {"ep_size_param": "ep_size"},
                 "attrs": {"block_family": "qwen3_moe"},
                 "slots": [
-                  {"residency": "auto", "distribution": {"kind": "expert_parallel"}},
-                  {"residency": "cpu_pinned_stream", "distribution": {"kind": "replicated"}}
+                  {
+                    "kind": "param",
+                    "shape": ["E", "2M", "C"],
+                    "residency": "auto",
+                    "distribution": {"kind": "expert_parallel"},
+                    "grouped": true
+                  },
+                  {
+                    "kind": "activation",
+                    "shape": ["B", "T", "C"],
+                    "residency": "cpu_pinned_stream",
+                    "distribution": {"kind": "replicated"},
+                    "save_for_backward": true
+                  }
                 ]
               }
             }
@@ -84,6 +96,13 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
     assert summary["block_schema_moe_layers"] == 1
     assert summary["block_schema_routing_layers"] == 1
     assert summary["block_schema_ep_layers"] == 1
+    assert summary["block_schema_slots"] == 2
+    assert summary["block_schema_param_slots"] == 1
+    assert summary["block_schema_activation_slots"] == 1
+    assert summary["block_schema_shape_slots"] == 2
+    assert summary["block_schema_activation_shape_slots"] == 1
+    assert summary["block_schema_save_for_backward_slots"] == 1
+    assert summary["block_schema_grouped_slots"] == 1
     assert summary["block_schema_expert_parallel_slots"] == 1
     assert summary["block_schema_auto_resident_slots"] == 1
     assert summary["block_schema_cpu_stream_slots"] == 1

@@ -132,6 +132,7 @@
 - [x] `BufferPlan` now preserves schema slot shape dimension tokens, preparing shape-aware allocation parity beyond rank-only diagnostics.
 - [x] `BufferPlan` now resolves schema activation shape tokens against the current layer dimensions and reports resolved/unresolved activation-shape counters.
 - [x] `BufferPlan` now computes dtype-aware byte estimates for resolved schema activation shapes, enabling numeric allocation parity checks.
+- [x] Regression block-schema summaries now include slot kind, shape coverage, save-for-backward, and grouped-slot counts for allocator migration tracking.
 
 Local validation status:
 

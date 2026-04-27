@@ -94,6 +94,13 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "block_schema_linear_mixer_layers": 0,
         "block_schema_routing_layers": 0,
         "block_schema_ep_layers": 0,
+        "block_schema_slots": 0,
+        "block_schema_param_slots": 0,
+        "block_schema_activation_slots": 0,
+        "block_schema_shape_slots": 0,
+        "block_schema_activation_shape_slots": 0,
+        "block_schema_save_for_backward_slots": 0,
+        "block_schema_grouped_slots": 0,
         "block_schema_expert_parallel_slots": 0,
         "block_schema_auto_resident_slots": 0,
         "block_schema_cpu_stream_slots": 0,
@@ -135,6 +142,21 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
             for slot in schema.get("slots") or []:
                 if not isinstance(slot, dict):
                     continue
+                summary["block_schema_slots"] += 1
+                kind = slot.get("kind") or "activation"
+                if kind == "param":
+                    summary["block_schema_param_slots"] += 1
+                else:
+                    summary["block_schema_activation_slots"] += 1
+                shape = slot.get("shape") or []
+                if isinstance(shape, list) and shape:
+                    summary["block_schema_shape_slots"] += 1
+                    if kind != "param":
+                        summary["block_schema_activation_shape_slots"] += 1
+                if slot.get("save_for_backward"):
+                    summary["block_schema_save_for_backward_slots"] += 1
+                if slot.get("grouped"):
+                    summary["block_schema_grouped_slots"] += 1
                 distribution = slot.get("distribution") or {}
                 if distribution.get("kind") == "expert_parallel":
                     summary["block_schema_expert_parallel_slots"] += 1
