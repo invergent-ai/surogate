@@ -198,29 +198,34 @@ BWD_WRAP(bwd_repeat_interleave_heads, dispatch_repeat_interleave_heads_backward)
 //   Ones     fwd → dispatch_ones,  bwd → dispatch_zeros_backward (no-op)
 //   Add      fwd → dispatch_add,   bwd → dispatch_add (gradient accumulation)
 
-REGISTER_OP("embedding", Embedding, ::dsl::fwd_embedding, nullptr);
-REGISTER_OP("embedding_backward", EmbeddingBackward, nullptr, ::dsl::bwd_embedding);
-REGISTER_OP("zeros", Zeros, ::dsl::fwd_zeros, ::dsl::fwd_zeros);
-REGISTER_OP("zeros_backward", ZerosBackward, nullptr, ::dsl::bwd_zeros);
-REGISTER_OP("ones", Ones, ::dsl::fwd_ones, ::dsl::bwd_zeros);
-REGISTER_OP("fused_residual_rmsnorm", FusedResidualRMSNorm, ::dsl::fwd_fused_residual_rmsnorm, nullptr);
-REGISTER_OP("fused_residual_rmsnorm_backward",
-            FusedResidualRMSNormBackward,
-            nullptr,
-            ::dsl::bwd_fused_residual_rmsnorm);
-REGISTER_OP("rmsnorm", RMSNorm, ::dsl::fwd_rmsnorm, nullptr);
-REGISTER_OP("rmsnorm_backward", RMSNormBackward, nullptr, ::dsl::bwd_rmsnorm);
-REGISTER_OP("layernorm", LayerNorm, ::dsl::fwd_layernorm, nullptr);
-REGISTER_OP("layernorm_backward", LayerNormBackward, nullptr, ::dsl::bwd_layernorm);
-REGISTER_OP("view", View, ::dsl::fwd_view, ::dsl::bwd_view);
-REGISTER_OP("view_backward", ViewBackward, nullptr, ::dsl::bwd_view);
-REGISTER_OP("transpose", Transpose, ::dsl::fwd_transpose, ::dsl::fwd_transpose);
-REGISTER_OP("split", Split, ::dsl::fwd_split, ::dsl::fwd_split);
-REGISTER_OP("narrow", Narrow, ::dsl::fwd_narrow, ::dsl::fwd_narrow);
-REGISTER_OP("narrow_backward", NarrowBackward, nullptr, ::dsl::bwd_narrow);
-REGISTER_OP("concat", Concat, ::dsl::fwd_concat, ::dsl::fwd_concat);
-REGISTER_OP("add", Add, ::dsl::fwd_add, ::dsl::fwd_add);
-REGISTER_OP("add_backward", AddBackward, nullptr, ::dsl::bwd_add);
+REGISTER_COMPILED_OP_NO_COMM("embedding", Embedding, ::dsl::fwd_embedding, nullptr, Dense);
+REGISTER_COMPILED_OP_NO_COMM("embedding_backward", EmbeddingBackward, nullptr, ::dsl::bwd_embedding, Dense);
+REGISTER_COMPILED_OP_NO_COMM("zeros", Zeros, ::dsl::fwd_zeros, ::dsl::fwd_zeros, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("zeros_backward", ZerosBackward, nullptr, ::dsl::bwd_zeros, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("ones", Ones, ::dsl::fwd_ones, ::dsl::bwd_zeros, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("fused_residual_rmsnorm",
+                             FusedResidualRMSNorm,
+                             ::dsl::fwd_fused_residual_rmsnorm,
+                             nullptr,
+                             Normalization);
+REGISTER_COMPILED_OP_NO_COMM("fused_residual_rmsnorm_backward",
+                             FusedResidualRMSNormBackward,
+                             nullptr,
+                             ::dsl::bwd_fused_residual_rmsnorm,
+                             Normalization);
+REGISTER_COMPILED_OP_NO_COMM("rmsnorm", RMSNorm, ::dsl::fwd_rmsnorm, nullptr, Normalization);
+REGISTER_COMPILED_OP_NO_COMM("rmsnorm_backward", RMSNormBackward, nullptr, ::dsl::bwd_rmsnorm, Normalization);
+REGISTER_COMPILED_OP_NO_COMM("layernorm", LayerNorm, ::dsl::fwd_layernorm, nullptr, Normalization);
+REGISTER_COMPILED_OP_NO_COMM("layernorm_backward", LayerNormBackward, nullptr, ::dsl::bwd_layernorm, Normalization);
+REGISTER_COMPILED_OP_NO_COMM("view", View, ::dsl::fwd_view, ::dsl::bwd_view, View);
+REGISTER_COMPILED_OP_NO_COMM("view_backward", ViewBackward, nullptr, ::dsl::bwd_view, View);
+REGISTER_COMPILED_OP_NO_COMM("transpose", Transpose, ::dsl::fwd_transpose, ::dsl::fwd_transpose, View);
+REGISTER_COMPILED_OP_NO_COMM("split", Split, ::dsl::fwd_split, ::dsl::fwd_split, View);
+REGISTER_COMPILED_OP_NO_COMM("narrow", Narrow, ::dsl::fwd_narrow, ::dsl::fwd_narrow, View);
+REGISTER_COMPILED_OP_NO_COMM("narrow_backward", NarrowBackward, nullptr, ::dsl::bwd_narrow, View);
+REGISTER_COMPILED_OP_NO_COMM("concat", Concat, ::dsl::fwd_concat, ::dsl::fwd_concat, View);
+REGISTER_COMPILED_OP_NO_COMM("add", Add, ::dsl::fwd_add, ::dsl::fwd_add, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("add_backward", AddBackward, nullptr, ::dsl::bwd_add, Elementwise);
 REGISTER_COMPILED_OP("matmul",
                      Matmul,
                      ::dsl::fwd_matmul,
@@ -257,105 +262,69 @@ REGISTER_COMPILED_OP("matmul_bias",
                      ::dsl::EpilogueSupportBias,
                      ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
                      0);
-REGISTER_OP("matmul_backward", MatmulBackward, nullptr, ::dsl::bwd_matmul);
-REGISTER_OP("bias_add", BiasAdd, ::dsl::fwd_bias_add, nullptr);
-REGISTER_OP("bias_add_backward", BiasAddBackward, nullptr, ::dsl::bwd_bias_add);
-REGISTER_OP("swiglu", SwiGLU, ::dsl::fwd_swiglu, nullptr);
-REGISTER_OP("swiglu_backward", SwiGLUBackward, nullptr, ::dsl::bwd_swiglu);
-REGISTER_OP("gelu_glu", GeluGlu, ::dsl::fwd_gelu_glu, nullptr);
-REGISTER_OP("gelu_glu_backward", GeluGluBackward, nullptr, ::dsl::bwd_gelu_glu);
-REGISTER_OP("gpt_oss_moe_act", GptOssMoeAct, ::dsl::fwd_gpt_oss_moe_act, nullptr);
-REGISTER_OP("gpt_oss_moe_act_backward", GptOssMoeActBackward, nullptr, ::dsl::bwd_gpt_oss_moe_act);
-REGISTER_OP("silu", Silu, ::dsl::fwd_silu, nullptr);
-REGISTER_OP("silu_backward", SiluBackward, nullptr, ::dsl::bwd_silu);
-REGISTER_OP("gelu", Gelu, ::dsl::fwd_gelu, nullptr);
-REGISTER_OP("gelu_backward", GeluBackward, nullptr, ::dsl::bwd_gelu);
-REGISTER_OP("relu2", Relu2, ::dsl::fwd_relu2, nullptr);
-REGISTER_OP("relu2_backward", Relu2Backward, nullptr, ::dsl::bwd_relu2);
-REGISTER_OP("mul", Mul, ::dsl::fwd_mul, nullptr);
-REGISTER_OP("mul_backward", MulBackward, nullptr, ::dsl::bwd_mul);
-REGISTER_OP("scale", Scale, ::dsl::fwd_scale, nullptr);
-REGISTER_OP("scale_backward", ScaleBackward, nullptr, ::dsl::bwd_scale);
-REGISTER_OP("mask_scatter", MaskScatter, ::dsl::fwd_mask_scatter, nullptr);
-REGISTER_OP("mask_scatter_backward", MaskScatterBackward, nullptr, ::dsl::bwd_mask_scatter);
-REGISTER_OP("deepstack_inject", DeepstackInject, ::dsl::fwd_deepstack_inject, nullptr);
-REGISTER_OP("deepstack_inject_backward", DeepstackInjectBackward, nullptr, ::dsl::bwd_deepstack_inject);
-REGISTER_OP("matmul_swiglu", MatmulSwiGLU, ::dsl::fwd_matmul_swiglu, nullptr);
-REGISTER_OP("matmul_swiglu_backward", MatmulSwiGLUBackward, nullptr, ::dsl::bwd_matmul_swiglu);
-REGISTER_OP("qkv_qk_norm", QKVQKNorm, ::dsl::fwd_qkv_qk_norm, nullptr);
-REGISTER_OP("qkv_qk_norm_backward", QKVQKNormBackward, nullptr, ::dsl::bwd_qkv_qk_norm);
-REGISTER_OP("qkv_qk_norm_rope", QKVQKNormRoPE, ::dsl::fwd_qkv_qk_norm_rope, nullptr);
-REGISTER_OP("qkv_qk_norm_rope_backward", QKVQKNormRoPEBackward, nullptr, ::dsl::bwd_qkv_qk_norm_rope);
-REGISTER_OP("mrope", MRoPE, ::dsl::fwd_mrope, nullptr);
-REGISTER_OP("mrope_backward", MRoPEBackward, nullptr, ::dsl::bwd_mrope);
-REGISTER_OP("rope", RoPE, ::dsl::fwd_rope, nullptr);
-REGISTER_OP("rope_backward", RoPEBackward, nullptr, ::dsl::bwd_rope);
-REGISTER_OP("flash_attention", FlashAttention, ::dsl::fwd_flash_attention, nullptr);
-REGISTER_OP("flash_attention_backward", FlashAttentionBackward, nullptr, ::dsl::bwd_flash_attention);
-REGISTER_OP("cross_entropy_loss", CrossEntropyLoss, ::dsl::fwd_cross_entropy_loss, nullptr);
-REGISTER_OP("cross_entropy_loss_backward", CrossEntropyLossBackward, nullptr, ::dsl::bwd_cross_entropy_loss);
-REGISTER_OP("fused_lm_head_loss", FusedLMHeadLoss, ::dsl::fwd_fused_lm_head_loss, nullptr);
-REGISTER_OP("fused_lm_head_loss_backward", FusedLMHeadLossBackward, nullptr, ::dsl::bwd_fused_lm_head_loss);
-
-REGISTER_OP_METADATA("embedding", Dense, Replicated, 0);
-REGISTER_OP_METADATA("embedding_backward", Dense, Replicated, 0);
-REGISTER_OP_METADATA("zeros", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("zeros_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("ones", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("fused_residual_rmsnorm", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("fused_residual_rmsnorm_backward", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("rmsnorm", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("rmsnorm_backward", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("layernorm", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("layernorm_backward", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("view", View, Replicated, 0);
-REGISTER_OP_METADATA("view_backward", View, Replicated, 0);
-REGISTER_OP_METADATA("transpose", View, Replicated, 0);
-REGISTER_OP_METADATA("split", View, Replicated, 0);
-REGISTER_OP_METADATA("narrow", View, Replicated, 0);
-REGISTER_OP_METADATA("narrow_backward", View, Replicated, 0);
-REGISTER_OP_METADATA("concat", View, Replicated, 0);
-REGISTER_OP_METADATA("add", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("add_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("matmul_backward", Dense, Replicated, 0);
-REGISTER_OP_METADATA("bias_add", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("bias_add_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("swiglu", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("swiglu_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("gelu_glu", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("gelu_glu_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("gpt_oss_moe_act", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("gpt_oss_moe_act_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("silu", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("silu_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("gelu", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("gelu_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("relu2", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("relu2_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("mul", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("mul_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("scale", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("scale_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("mask_scatter", View, Replicated, 0);
-REGISTER_OP_METADATA("mask_scatter_backward", View, Replicated, 0);
-REGISTER_OP_METADATA("deepstack_inject", View, Replicated, 0);
-REGISTER_OP_METADATA("deepstack_inject_backward", View, Replicated, 0);
-REGISTER_OP_METADATA("matmul_swiglu", Dense, Replicated, 0);
-REGISTER_OP_METADATA("matmul_swiglu_backward", Dense, Replicated, 0);
-REGISTER_OP_METADATA("qkv_qk_norm", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("qkv_qk_norm_backward", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("qkv_qk_norm_rope", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("qkv_qk_norm_rope_backward", Normalization, Replicated, 0);
-REGISTER_OP_METADATA("mrope", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("mrope_backward", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("rope", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("rope_backward", Sequence, Replicated, 0);
-REGISTER_OP_METADATA("flash_attention", Attention, Replicated, 0);
-REGISTER_OP_METADATA("flash_attention_backward", Attention, Replicated, 0);
-REGISTER_OP_METADATA("cross_entropy_loss", Loss, Replicated, 0);
-REGISTER_OP_METADATA("cross_entropy_loss_backward", Loss, Replicated, 0);
-REGISTER_OP_METADATA("fused_lm_head_loss", Loss, Replicated, 0);
-REGISTER_OP_METADATA("fused_lm_head_loss_backward", Loss, Replicated, 0);
+REGISTER_COMPILED_OP_NO_COMM("matmul_backward", MatmulBackward, nullptr, ::dsl::bwd_matmul, Dense);
+REGISTER_COMPILED_OP_NO_COMM("bias_add", BiasAdd, ::dsl::fwd_bias_add, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("bias_add_backward", BiasAddBackward, nullptr, ::dsl::bwd_bias_add, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("swiglu", SwiGLU, ::dsl::fwd_swiglu, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("swiglu_backward", SwiGLUBackward, nullptr, ::dsl::bwd_swiglu, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("gelu_glu", GeluGlu, ::dsl::fwd_gelu_glu, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("gelu_glu_backward", GeluGluBackward, nullptr, ::dsl::bwd_gelu_glu, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("gpt_oss_moe_act", GptOssMoeAct, ::dsl::fwd_gpt_oss_moe_act, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("gpt_oss_moe_act_backward",
+                             GptOssMoeActBackward,
+                             nullptr,
+                             ::dsl::bwd_gpt_oss_moe_act,
+                             Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("silu", Silu, ::dsl::fwd_silu, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("silu_backward", SiluBackward, nullptr, ::dsl::bwd_silu, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("gelu", Gelu, ::dsl::fwd_gelu, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("gelu_backward", GeluBackward, nullptr, ::dsl::bwd_gelu, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("relu2", Relu2, ::dsl::fwd_relu2, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("relu2_backward", Relu2Backward, nullptr, ::dsl::bwd_relu2, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("mul", Mul, ::dsl::fwd_mul, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("mul_backward", MulBackward, nullptr, ::dsl::bwd_mul, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("scale", Scale, ::dsl::fwd_scale, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("scale_backward", ScaleBackward, nullptr, ::dsl::bwd_scale, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("mask_scatter", MaskScatter, ::dsl::fwd_mask_scatter, nullptr, View);
+REGISTER_COMPILED_OP_NO_COMM("mask_scatter_backward", MaskScatterBackward, nullptr, ::dsl::bwd_mask_scatter, View);
+REGISTER_COMPILED_OP_NO_COMM("deepstack_inject", DeepstackInject, ::dsl::fwd_deepstack_inject, nullptr, View);
+REGISTER_COMPILED_OP_NO_COMM("deepstack_inject_backward",
+                             DeepstackInjectBackward,
+                             nullptr,
+                             ::dsl::bwd_deepstack_inject,
+                             View);
+REGISTER_COMPILED_OP_NO_COMM("matmul_swiglu", MatmulSwiGLU, ::dsl::fwd_matmul_swiglu, nullptr, Dense);
+REGISTER_COMPILED_OP_NO_COMM("matmul_swiglu_backward", MatmulSwiGLUBackward, nullptr, ::dsl::bwd_matmul_swiglu, Dense);
+REGISTER_COMPILED_OP_NO_COMM("qkv_qk_norm", QKVQKNorm, ::dsl::fwd_qkv_qk_norm, nullptr, Normalization);
+REGISTER_COMPILED_OP_NO_COMM("qkv_qk_norm_backward", QKVQKNormBackward, nullptr, ::dsl::bwd_qkv_qk_norm, Normalization);
+REGISTER_COMPILED_OP_NO_COMM("qkv_qk_norm_rope", QKVQKNormRoPE, ::dsl::fwd_qkv_qk_norm_rope, nullptr, Normalization);
+REGISTER_COMPILED_OP_NO_COMM("qkv_qk_norm_rope_backward",
+                             QKVQKNormRoPEBackward,
+                             nullptr,
+                             ::dsl::bwd_qkv_qk_norm_rope,
+                             Normalization);
+REGISTER_COMPILED_OP_NO_COMM("mrope", MRoPE, ::dsl::fwd_mrope, nullptr, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("mrope_backward", MRoPEBackward, nullptr, ::dsl::bwd_mrope, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("rope", RoPE, ::dsl::fwd_rope, nullptr, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("rope_backward", RoPEBackward, nullptr, ::dsl::bwd_rope, Sequence);
+REGISTER_COMPILED_OP_NO_COMM("flash_attention", FlashAttention, ::dsl::fwd_flash_attention, nullptr, Attention);
+REGISTER_COMPILED_OP_NO_COMM("flash_attention_backward",
+                             FlashAttentionBackward,
+                             nullptr,
+                             ::dsl::bwd_flash_attention,
+                             Attention);
+REGISTER_COMPILED_OP_NO_COMM("cross_entropy_loss", CrossEntropyLoss, ::dsl::fwd_cross_entropy_loss, nullptr, Loss);
+REGISTER_COMPILED_OP_NO_COMM("cross_entropy_loss_backward",
+                             CrossEntropyLossBackward,
+                             nullptr,
+                             ::dsl::bwd_cross_entropy_loss,
+                             Loss);
+REGISTER_COMPILED_OP_NO_COMM("fused_lm_head_loss", FusedLMHeadLoss, ::dsl::fwd_fused_lm_head_loss, nullptr, Loss);
+REGISTER_COMPILED_OP_NO_COMM("fused_lm_head_loss_backward",
+                             FusedLMHeadLossBackward,
+                             nullptr,
+                             ::dsl::bwd_fused_lm_head_loss,
+                             Loss);
 
 // MoE forward + backward
 REGISTER_OP("moe_softmax", MoESoftmax, ::dsl::fwd_moe_softmax, nullptr);
