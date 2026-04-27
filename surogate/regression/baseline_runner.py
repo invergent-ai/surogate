@@ -646,6 +646,24 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
         "hook_registry_distribution_aware_registrations": buffer_plan_summary.get(
             "hook_registry_distribution_aware_registrations"
         ),
+        "hook_registry_after_produce_registrations": buffer_plan_summary.get(
+            "hook_registry_after_produce_registrations"
+        ),
+        "hook_registry_before_consume_registrations": buffer_plan_summary.get(
+            "hook_registry_before_consume_registrations"
+        ),
+        "hook_registry_after_communication_registrations": buffer_plan_summary.get(
+            "hook_registry_after_communication_registrations"
+        ),
+        "hook_registry_after_all_reduce_registrations": buffer_plan_summary.get(
+            "hook_registry_after_all_reduce_registrations"
+        ),
+        "hook_registry_after_all_to_all_registrations": buffer_plan_summary.get(
+            "hook_registry_after_all_to_all_registrations"
+        ),
+        "hook_registry_after_reduce_scatter_registrations": buffer_plan_summary.get(
+            "hook_registry_after_reduce_scatter_registrations"
+        ),
         "lora_slices": descriptor_summary.get("lora_slices"),
         "lora_schema_slot_slices": descriptor_summary.get("lora_schema_slot_slices"),
         "grouped_lora_schema_slot_slices": descriptor_summary.get("grouped_lora_schema_slot_slices"),

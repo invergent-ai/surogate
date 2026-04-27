@@ -359,6 +359,18 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
         std::count_if(hook_registry.registrations().begin(),
                       hook_registry.registrations().end(),
                       [](const HookRegistration& registration) { return registration.distribution_aware; }));
+    auto count_registry_event = [&](HookEventKind event) -> std::uint64_t {
+        return static_cast<std::uint64_t>(
+            std::count_if(hook_registry.registrations().begin(),
+                          hook_registry.registrations().end(),
+                          [event](const HookRegistration& registration) { return registration.event == event; }));
+    };
+    s.hook_registry_after_produce_registrations = count_registry_event(HookEventKind::AfterProduce);
+    s.hook_registry_before_consume_registrations = count_registry_event(HookEventKind::BeforeConsume);
+    s.hook_registry_after_communication_registrations = count_registry_event(HookEventKind::AfterCommunication);
+    s.hook_registry_after_all_reduce_registrations = count_registry_event(HookEventKind::AfterAllReduce);
+    s.hook_registry_after_all_to_all_registrations = count_registry_event(HookEventKind::AfterAllToAll);
+    s.hook_registry_after_reduce_scatter_registrations = count_registry_event(HookEventKind::AfterReduceScatter);
     return s;
 }
 

@@ -89,6 +89,11 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "schema_expert_parallel_param_shape_savings_bytes": 1024,
                     "hook_registry_registrations": 8,
                     "hook_registry_distribution_aware_registrations": 4,
+                    "hook_registry_after_produce_registrations": 2,
+                    "hook_registry_before_consume_registrations": 2,
+                    "hook_registry_after_all_reduce_registrations": 1,
+                    "hook_registry_after_all_to_all_registrations": 2,
+                    "hook_registry_after_reduce_scatter_registrations": 1,
                 },
             },
         }
@@ -117,6 +122,8 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["hook_target_counts"]["lora_schema_slot_slices"] == 2
     assert report["rows"][0]["hook_target_counts"]["forward_hook_schema_slot_points"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_registry_registrations"] == 8
+    assert report["rows"][0]["hook_target_counts"]["hook_registry_after_produce_registrations"] == 2
+    assert report["rows"][0]["hook_target_counts"]["hook_registry_after_all_to_all_registrations"] == 2
     assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
     assert report["rows"][0]["buffer_plan_summary"]["schema_expert_parallel_param_shape_savings_bytes"] == 1024
 

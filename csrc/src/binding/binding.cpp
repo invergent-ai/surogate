@@ -2096,6 +2096,14 @@ NB_MODULE(_surogate, m) {
                 d["hook_after_reduce_scatter_targets"] = s.hook_after_reduce_scatter_targets;
                 d["hook_registry_registrations"] = s.hook_registry_registrations;
                 d["hook_registry_distribution_aware_registrations"] = s.hook_registry_distribution_aware_registrations;
+                d["hook_registry_after_produce_registrations"] = s.hook_registry_after_produce_registrations;
+                d["hook_registry_before_consume_registrations"] = s.hook_registry_before_consume_registrations;
+                d["hook_registry_after_communication_registrations"] =
+                    s.hook_registry_after_communication_registrations;
+                d["hook_registry_after_all_reduce_registrations"] = s.hook_registry_after_all_reduce_registrations;
+                d["hook_registry_after_all_to_all_registrations"] = s.hook_registry_after_all_to_all_registrations;
+                d["hook_registry_after_reduce_scatter_registrations"] =
+                    s.hook_registry_after_reduce_scatter_registrations;
                 return d;
             },
             "BufferPlan schema/allocation diagnostics suitable for regression artifacts.")
