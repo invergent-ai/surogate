@@ -69,6 +69,7 @@
 - [x] Initial inert fusion rule declarations added for existing dense, norm, loss, Mamba, and MoE fusion families.
 - [x] Fusion registry can now build descriptor-backed `FusionContext` views from compiled ops and evaluate pattern plus eligibility matches.
 - [x] Fusion registry exposes a non-mutating compiled-op-position query for future graph-rewrite integration.
+- [x] Fusion registry exposes a non-mutating candidate-count helper for future coverage/reporting hooks.
 - [x] Dense FP8 co-located quant ready-flag mapping centralized as a first Phase 3d bridge toward generic quant-state routing.
 - [x] Mamba `out_proj` forward/backward matmul delegates now declare dense FP8/FP4 capability and CPU-stream storage compatibility.
 

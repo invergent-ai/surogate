@@ -138,4 +138,14 @@ std::vector<const FusionRule*> FusionRuleRegistry::matching_rules_at(const std::
     return out;
 }
 
+std::size_t FusionRuleRegistry::count_matching_starts(const std::vector<CompiledOp>& ops) const {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        if (!matching_rules_at(ops, i).empty()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 }  // namespace dsl

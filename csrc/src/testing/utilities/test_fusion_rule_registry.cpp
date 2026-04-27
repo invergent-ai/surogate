@@ -192,6 +192,8 @@ TEST_CASE("fusion registry finds matching rules at compiled op positions", "[fus
 
     REQUIRE(FusionRuleRegistry::instance().matching_rules_at(eligible, 1).empty());
     REQUIRE(FusionRuleRegistry::instance().matching_rules_at(eligible, eligible.size()).empty());
+    REQUIRE(FusionRuleRegistry::instance().count_matching_starts(eligible) == 1);
+    REQUIRE(FusionRuleRegistry::instance().count_matching_starts(blocked) == 0);
 }
 
 }  // namespace
