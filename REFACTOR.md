@@ -110,6 +110,14 @@ Local validation status:
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py tests/test_regression_baseline_runner.py tests/test_regression_artifact_writer.py --no-gpu` with 49 tests.
 - [ ] GPU acceptance rows are not exercised locally yet; the runner now uses Hugging Face model IDs from configs by default, with `*_MODEL_PATH` only as optional local/offline overrides.
 
+Real-model acceptance queue:
+
+- [ ] Dense FP8 single-GPU: [`qwen3-lora-fp8.yaml`](examples/sft/qwen3/qwen3-lora-fp8.yaml).
+- [ ] Dense FP8 single-GPU: [`qwen35-text-lora-fp8.yaml`](examples/sft/qwen35/qwen35-text-lora-fp8.yaml). Validation starts here.
+- [ ] Dense FP8 single-GPU: [`gemma4-e2b-lora-fp8.yaml`](examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml).
+- [ ] MoE acceptance: [`gptoss-lora-mxfp4.yaml`](examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml).
+- [ ] Multi-GPU pre-quant MoE acceptance: [`qwen36moe-lora-fp8.yaml`](examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml).
+
 ---
 
 ## 1. Prime directive and north-star
