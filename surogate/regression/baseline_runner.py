@@ -505,6 +505,35 @@ def matmul_capability_counts(descriptor_summary: dict[str, Any]) -> dict[str, An
     return {key: descriptor_summary.get(key) for key in keys}
 
 
+def descriptor_count_requirements_for_case(case: dict[str, Any]) -> list[str]:
+    recipe = case["recipe"]
+    op_kind = case["op_kind"]
+    if recipe not in {"fp8", "fp4"}:
+        return []
+
+    if op_kind == "dense":
+        if recipe == "fp8":
+            return ["matmul_fp8_forward_eligible_ops", "matmul_fp8_backward_eligible_ops"]
+        return ["matmul_fp4_forward_eligible_ops", "matmul_fp4_backward_eligible_ops"]
+
+    if op_kind == "moe_grouped":
+        if recipe == "fp8":
+            return ["forward_moe_fp8_grouped_eligible_ops"]
+        return ["forward_moe_fp4_grouped_eligible_ops"]
+
+    return []
+
+
+def descriptor_requirement_status(case: dict[str, Any], descriptor_summary: dict[str, Any]) -> tuple[str, list[str]]:
+    required_counts = descriptor_count_requirements_for_case(case)
+    if not required_counts:
+        return "not_applicable", []
+    if not descriptor_summary:
+        return "unknown", required_counts
+    missing = [key for key in required_counts if int(descriptor_summary.get(key) or 0) <= 0]
+    return ("present" if not missing else "missing"), missing
+
+
 def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     eligible = 0
@@ -514,6 +543,7 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         recipe = case["recipe"]
         metrics = result.get("metrics") or {}
         descriptor_summary = metrics.get("descriptor_summary") or {}
+        descriptor_status, missing_descriptor_counts = descriptor_requirement_status(case, descriptor_summary)
         is_quant = recipe in {"fp8", "fp4"}
         if is_quant and case.get("supported", True):
             eligible += 1
@@ -532,6 +562,8 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "required_moe_capabilities": required_moe_capabilities_for_case(case),
                 "required_matmul_capabilities": required_matmul_capabilities_for_case(case),
                 "matmul_capability_counts": matmul_capability_counts(descriptor_summary),
+                "descriptor_requirement_status": descriptor_status,
+                "missing_descriptor_counts": missing_descriptor_counts,
                 "fusion_candidate_starts": descriptor_summary.get("fusion_candidate_starts"),
             }
         )

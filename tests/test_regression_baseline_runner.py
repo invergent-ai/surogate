@@ -38,6 +38,11 @@ def test_coverage_report_counts_supported_quant_rows(tmp_path):
     assert report["coverage"] == 1.0
     assert report["rows"][0]["required_capabilities"] == ["DenseMatmul", "FP8Eligible"]
     assert report["rows"][0]["required_matmul_capabilities"] == ["FP8ForwardEligible", "FP8BackwardEligible"]
+    assert report["rows"][0]["descriptor_requirement_status"] == "unknown"
+    assert report["rows"][0]["missing_descriptor_counts"] == [
+        "matmul_fp8_forward_eligible_ops",
+        "matmul_fp8_backward_eligible_ops",
+    ]
     assert json.dumps(report)
 
 
@@ -65,7 +70,30 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["required_matmul_capabilities"] == []
     assert report["rows"][0]["matmul_capability_counts"]["forward_matmul_fp8_forward_eligible_ops"] == 4
     assert report["rows"][0]["matmul_capability_counts"]["backward_matmul_fp8_backward_eligible_ops"] == 4
+    assert report["rows"][0]["descriptor_requirement_status"] == "missing"
+    assert report["rows"][0]["missing_descriptor_counts"] == ["forward_moe_fp8_grouped_eligible_ops"]
     assert report["rows"][0]["fusion_candidate_starts"] == 3
+
+
+def test_coverage_report_marks_descriptor_requirements_present():
+    case = br.RegressionCase("m", "fp8", "single_gpu")
+    results = {
+        case.case_id: {
+            "case": br.asdict(case),
+            "status": "passed",
+            "metrics": {
+                "descriptor_summary": {
+                    "matmul_fp8_forward_eligible_ops": 8,
+                    "matmul_fp8_backward_eligible_ops": 8,
+                }
+            },
+        }
+    }
+
+    report = br.coverage_report(results)
+
+    assert report["rows"][0]["descriptor_requirement_status"] == "present"
+    assert report["rows"][0]["missing_descriptor_counts"] == []
 
 
 def test_artifact_schema_accepts_descriptor_summary():
