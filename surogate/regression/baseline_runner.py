@@ -635,10 +635,12 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
         "hook_after_produce_targets": block_schema_summary.get("hook_after_produce_targets"),
         "hook_before_consume_targets": block_schema_summary.get("hook_before_consume_targets"),
         "hook_after_all_to_all_targets": block_schema_summary.get("hook_after_all_to_all_targets"),
+        "hook_after_all_reduce_targets": block_schema_summary.get("hook_after_all_reduce_targets"),
         "hook_after_reduce_scatter_targets": block_schema_summary.get("hook_after_reduce_scatter_targets"),
         "runtime_hook_after_produce_targets": buffer_plan_summary.get("hook_after_produce_targets"),
         "runtime_hook_before_consume_targets": buffer_plan_summary.get("hook_before_consume_targets"),
         "runtime_hook_after_all_to_all_targets": buffer_plan_summary.get("hook_after_all_to_all_targets"),
+        "runtime_hook_after_all_reduce_targets": buffer_plan_summary.get("hook_after_all_reduce_targets"),
         "runtime_hook_after_reduce_scatter_targets": buffer_plan_summary.get("hook_after_reduce_scatter_targets"),
         "hook_registry_registrations": buffer_plan_summary.get("hook_registry_registrations"),
         "hook_registry_distribution_aware_registrations": buffer_plan_summary.get(
@@ -687,6 +689,8 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
     required: list[str] = []
     if case.get("storage") == "cpu_stream":
         required.append("hook_before_consume_targets")
+    if "dp" in str(case.get("distribution") or ""):
+        required.append("hook_after_all_reduce_targets")
     if "ep" in str(case.get("distribution") or ""):
         required.append("hook_after_all_to_all_targets")
     if int(counts.get("lora_slices") or 0) > 0:

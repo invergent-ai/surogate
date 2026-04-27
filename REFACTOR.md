@@ -201,6 +201,7 @@ Real-model acceptance queue:
 - [x] Compiled LoRA slices now carry diagnostic schema-slot names inferred from their structural weight inputs, and descriptor summaries report LoRA slice/schema-slot coverage including grouped MoE slices.
 - [x] North-star coverage rows now report Phase 5 hook readiness, missing hook-count diagnostics, and hook target counts alongside descriptor/schema/storage/EP readiness.
 - [x] Schema hook target collection now covers `after_produce` activation slots used by LoRA post-projection hooks (`qkv`, `att_out`, `mlp_up`, `mlp_down`, router/expert outputs), and `DslModel` seeds inert registrations for them.
+- [x] Schema hook target collection now covers `after_all_reduce` replicated/router-replicated parameter slots, so DP hook readiness is tracked alongside EP all-to-all and sharded reduce-scatter readiness.
 
 ---
 

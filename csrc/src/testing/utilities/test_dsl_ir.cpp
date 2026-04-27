@@ -607,6 +607,11 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(comm_targets[0].schema_id == "qwen3_dense");
     REQUIRE(comm_targets[0].slot_name == "permuted_input");
 
+    const auto reduce_targets = dsl::collect_schema_hook_targets(schema_records, dsl::HookEventKind::AfterAllReduce);
+    REQUIRE(reduce_targets.size() == 1);
+    REQUIRE(reduce_targets[0].schema_id == "qwen3_dense");
+    REQUIRE(reduce_targets[0].slot_name == "qkv_weight");
+
     const auto grad_targets = dsl::collect_schema_hook_targets(schema_records, dsl::HookEventKind::AfterReduceScatter);
     REQUIRE(grad_targets.size() == 1);
     REQUIRE(grad_targets[0].schema_id == "qwen3_dense");

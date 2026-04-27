@@ -338,6 +338,10 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
             if (!is_param && slot.distribution_kind == "expert_parallel") {
                 s.hook_after_all_to_all_targets += 1;
             }
+            if (is_param && (slot.distribution_kind.empty() || slot.distribution_kind == "replicated" ||
+                             slot.distribution_kind == "router_replicated")) {
+                s.hook_after_all_reduce_targets += 1;
+            }
             if (is_param && (slot.distribution_kind == "sharded_dim" || slot.distribution_kind == "expert_parallel")) {
                 s.hook_after_reduce_scatter_targets += 1;
             }

@@ -36,6 +36,11 @@ namespace {
            (slot.distribution_kind == "sharded_dim" || slot.distribution_kind == "expert_parallel");
 }
 
+[[nodiscard]] bool is_replicated_param_slot(const BlockSchemaSlotSummary& slot) {
+    return is_param_slot(slot) && (slot.distribution_kind.empty() || slot.distribution_kind == "replicated" ||
+                                   slot.distribution_kind == "router_replicated");
+}
+
 [[nodiscard]] bool is_lora_after_produce_slot(const BlockSchemaSlotSummary& slot) {
     if (is_param_slot(slot)) return false;
     return slot.name == "qkv" || slot.name == "att_out" || slot.name == "mlp_up" || slot.name == "mlp_down" ||
@@ -171,8 +176,8 @@ std::vector<HookTarget> collect_schema_hook_targets(const std::vector<BlockSchem
                 case HookEventKind::BeforeConsume: include = is_streamable_param_slot(slot); break;
                 case HookEventKind::AfterCommunication:
                 case HookEventKind::AfterAllToAll: include = is_expert_parallel_activation(slot); break;
+                case HookEventKind::AfterAllReduce: include = is_replicated_param_slot(slot); break;
                 case HookEventKind::AfterReduceScatter: include = is_sharded_param_slot(slot); break;
-                case HookEventKind::AfterAllReduce:
                 case HookEventKind::Unknown: include = false; break;
             }
             if (include) {

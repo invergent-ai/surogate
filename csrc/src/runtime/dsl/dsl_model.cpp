@@ -1161,6 +1161,10 @@ DslModel::DslModel(const PretrainedConfig& config,
             mHookRegistry.on_after_all_to_all(target, "schema_after_all_to_all");
         }
         for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllReduce)) {
+            mHookRegistry.on_after_all_reduce(target, "schema_after_all_reduce");
+        }
+        for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterReduceScatter)) {
             mHookRegistry.on_after_reduce_scatter(target, "schema_after_reduce_scatter");
         }

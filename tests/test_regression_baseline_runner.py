@@ -79,6 +79,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "hook_after_produce_targets": 2,
                     "hook_before_consume_targets": 4,
                     "hook_after_all_to_all_targets": 2,
+                    "hook_after_all_reduce_targets": 1,
                     "hook_after_reduce_scatter_targets": 2,
                 },
                 "buffer_plan_summary": {
@@ -110,6 +111,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["missing_hook_counts"] == []
     assert report["rows"][0]["hook_target_counts"]["hook_after_produce_targets"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_after_all_to_all_targets"] == 2
+    assert report["rows"][0]["hook_target_counts"]["hook_after_all_reduce_targets"] == 1
     assert report["rows"][0]["hook_target_counts"]["lora_schema_slot_slices"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_registry_registrations"] == 8
     assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
@@ -140,6 +142,7 @@ def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
     assert report["rows"][0]["hook_readiness_status"] == "missing"
     assert report["rows"][0]["missing_hook_counts"] == [
         "hook_before_consume_targets",
+        "hook_after_all_reduce_targets",
         "hook_after_all_to_all_targets",
     ]
 
