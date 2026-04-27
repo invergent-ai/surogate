@@ -115,6 +115,17 @@ TEST_CASE("MatmulContext carries optional input TensorRole metadata", "[tensor_r
     REQUIRE(ctx.has_input_role);
     REQUIRE(ctx.input_role.block_layer == 0);
     REQUIRE(ctx.input_role.quant_state == QuantState::FP8Ready);
+
+    modules::MoeMatmulContext moe_ctx{};
+    REQUIRE_FALSE(moe_ctx.has_token_role);
+    REQUIRE(moe_ctx.token_role.kind == TensorRoleKind::Unknown);
+
+    moe_ctx.token_role = infer_tensor_role_from_name("blocks[0].moe_x_flat", 0);
+    moe_ctx.has_token_role = true;
+
+    REQUIRE(moe_ctx.has_token_role);
+    REQUIRE(moe_ctx.token_role.is_moe_owned());
+    REQUIRE(moe_ctx.token_role.block_layer == 0);
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {

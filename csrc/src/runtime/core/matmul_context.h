@@ -297,6 +297,8 @@ struct MoeMatmulContext {
     dsl::MoECapabilities moe_caps{};
     dsl::EpilogueSupport epilogue_support{};
     dsl::StorageCompatibility storage_compat{};
+    dsl::TensorRole token_role{};
+    bool has_token_role = false;
 
     // =========================================================================
     // Runtime

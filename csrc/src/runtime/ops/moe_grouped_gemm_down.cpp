@@ -22,6 +22,19 @@
 #include "utilities/tensor.h"
 
 namespace dsl {
+namespace {
+
+void attach_token_role(modules::MoeMatmulContext& ctx, const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) {
+        return;
+    }
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        ctx.token_role = *role;
+        ctx.has_token_role = true;
+    }
+}
+
+}  // namespace
 
 void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
@@ -228,6 +241,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         ctx.moe_caps = op.moe_caps;
         ctx.epilogue_support = op.epilogue_support;
         ctx.storage_compat = op.storage_compat;
+        attach_token_role(ctx, mCurrentGraph, op.inputs[0]);
         attach_moe_fp8_cache(ctx, op.inputs[1].name);
         mRecipe->forward_moe_matmul(ctx);
     } else if (inp.DType == ETensorDType::BF16) {
