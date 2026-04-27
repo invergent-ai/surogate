@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .. import nn
+from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
 from ..modules import (
     GatedDeltaNetMixer,
     MoEExpertsGated,
@@ -64,6 +65,48 @@ QWEN3_5_MOE_LINEAR_BLOCK_REMAP: dict[str, str] = {
 }
 
 
+def _qwen3_5_moe_schema(block_family: str, *, has_linear_mixer: bool = False) -> BlockSchema:
+    slots: tuple[SlotDecl, ...] = (
+        SlotDecl("router_weight", kind="param", shape=("E", "C"), distribution=DistributionDecl.router_replicated()),
+        SlotDecl(
+            "experts_gate_up",
+            kind="param",
+            shape=("E", "2M", "C"),
+            residency="auto",
+            distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+            grouped=True,
+            streaming_hint=StreamingHint(prefetch_distance=1),
+        ),
+        SlotDecl(
+            "experts_down",
+            kind="param",
+            shape=("E", "C", "M"),
+            residency="auto",
+            distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+            grouped=True,
+            streaming_hint=StreamingHint(prefetch_distance=1),
+        ),
+        SlotDecl("shared_expert_gate_proj_weight", kind="param", shape=(1, "C")),
+        SlotDecl("permuted_input", shape=("dispatched_tokens", "C"), distribution=DistributionDecl.expert_parallel()),
+    )
+    if has_linear_mixer:
+        slots += (
+            SlotDecl("mixer_conv_state", shape=("B", "ConvDim", "ConvK"), save_for_backward=True),
+            SlotDecl("mixer_delta_state", shape=("B", "Hv", "Vd"), save_for_backward=True),
+        )
+    return BlockSchema(
+        slots=slots,
+        routing=RoutingSchema(
+            kind="topk_softmax",
+            topk="num_experts_per_tok",
+            norm_topk_prob=False,
+            shared_experts="shared_expert_intermediate",
+        ),
+        ep_topology=EPTopology(ep_size_param="ep_size"),
+        attrs={"block_family": block_family},
+    )
+
+
 class Qwen3_5MoEAttentionBlock(nn.Block):
     """Qwen3.5 MoE full-attention decoder block.
 
@@ -72,6 +115,7 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
     """
 
     _name_remap_ = QWEN3_5_MOE_ATTN_BLOCK_REMAP
+    schema = _qwen3_5_moe_schema("qwen3_5_moe_attention")
 
     def __init__(
         self,
@@ -179,6 +223,7 @@ class Qwen3_5MoELinearBlock(nn.Block):
     """
 
     _name_remap_ = QWEN3_5_MOE_LINEAR_BLOCK_REMAP
+    schema = _qwen3_5_moe_schema("qwen3_5_moe_linear", has_linear_mixer=True)
 
     def __init__(
         self,

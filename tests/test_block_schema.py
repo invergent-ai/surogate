@@ -1,8 +1,10 @@
 import json
 
 from surogate.dsl.block_schema import BlockSchema, DistributionDecl
+from surogate.dsl.blocks.gemma4 import Gemma4FullMoEBlock, Gemma4SharedKVBlock, Gemma4SlidingBlock
 from surogate.dsl.blocks.gpt_oss import GptOssBlock
 from surogate.dsl.blocks.nemotron_h import NemotronHMamba2Block, NemotronHMoEBlock
+from surogate.dsl.blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
 from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
 from surogate.dsl.py_lowering import lower_block_spec
 from surogate.dsl.py_compiler import _module_ir_to_dict, compile_block_spec, compile_model
@@ -71,6 +73,75 @@ def test_acceptance_moe_blocks_declare_expert_parallel_schema():
         assert spec.schema.routing.kind == "topk_softmax"
         assert spec.schema.get_slot("experts_gate_up").distribution.kind == "expert_parallel"
         assert spec.schema.get_slot("experts_down").distribution.kind == "expert_parallel"
+
+
+def test_qwen3_5_moe_blocks_declare_schema():
+    attn = Qwen3_5MoEAttentionBlock(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+        num_experts=4,
+        num_experts_per_tok=2,
+        shared_expert_intermediate=128,
+    ).compile()
+    linear = Qwen3_5MoELinearBlock(
+        d_model=256,
+        d_ff=512,
+        num_experts=4,
+        num_experts_per_tok=2,
+        shared_expert_intermediate=128,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+    ).compile()
+
+    assert attn.schema.attrs["block_family"] == "qwen3_5_moe_attention"
+    assert linear.schema.attrs["block_family"] == "qwen3_5_moe_linear"
+    assert attn.schema.routing.shared_experts == "shared_expert_intermediate"
+    assert linear.schema.get_slot("mixer_conv_state").save_for_backward is True
+    assert attn.schema.get_slot("experts_gate_up").distribution.kind == "expert_parallel"
+    assert linear.schema.get_slot("permuted_input").distribution.kind == "expert_parallel"
+
+
+def test_gemma4_blocks_declare_dense_and_moe_schema():
+    dense = Gemma4SlidingBlock(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+    ).compile()
+    shared = Gemma4SharedKVBlock(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+    ).compile()
+    moe = Gemma4FullMoEBlock(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+    ).compile()
+
+    assert dense.schema.attrs["block_family"] == "gemma4_sliding"
+    assert shared.schema.attrs["shared_kv"] is True
+    assert shared.schema.get_slot("self_attn_q_weight").kind == "param"
+    assert moe.schema.attrs["block_family"] == "gemma4_full_moe"
+    assert moe.schema.routing.kind == "topk_softmax"
+    assert moe.schema.get_slot("experts_gate_up").distribution.kind == "expert_parallel"
 
 
 def test_block_schema_lowers_to_block_ir_dict():
