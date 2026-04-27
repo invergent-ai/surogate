@@ -73,6 +73,49 @@ TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {
     REQUIRE(gate_up == OpRegistry::instance().find(CompiledOpType::MoEGroupedGemmGateUp));
     REQUIRE(gate_up->forward_fn != nullptr);
     REQUIRE(gate_up->epilogue_support.has(EpilogueSupportActivation));
+
+    const OpDescriptor* grouped_bwd = OpRegistry::instance().find_by_name("moe_grouped_gemm_backward");
+    REQUIRE(grouped_bwd != nullptr);
+    REQUIRE(grouped_bwd == OpRegistry::instance().find(CompiledOpType::MoEGroupedGemmBackward));
+    REQUIRE(grouped_bwd->backward_fn != nullptr);
+    REQUIRE(grouped_bwd->semantic_kind == OpSemanticKind::MoE);
+    REQUIRE(grouped_bwd->distribution_kind == DistributionKind::ExpertParallel);
+    REQUIRE(grouped_bwd->comm_profile.kind == CommunicationKind::ExpertParallelRouted);
+    REQUIRE(grouped_bwd->grouped_semantics.is_grouped);
+    REQUIRE(grouped_bwd->grouped_semantics.ep_aware);
+    REQUIRE(grouped_bwd->default_caps.has(OpCapabilityGroupedMatmul));
+    REQUIRE(grouped_bwd->default_caps.has(OpCapabilityMoeRouted));
+    REQUIRE(grouped_bwd->default_caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(grouped_bwd->default_caps.has(OpCapabilityWeightCacheEligible));
+}
+
+TEST_CASE("moe utility ops carry routing descriptor metadata", "[op_registry]") {
+    const OpDescriptor* router = OpRegistry::instance().find_by_name("moe_topk");
+    REQUIRE(router != nullptr);
+    REQUIRE(router == OpRegistry::instance().find(CompiledOpType::MoETopK));
+    REQUIRE(router->forward_fn != nullptr);
+    REQUIRE(router->semantic_kind == OpSemanticKind::MoE);
+    REQUIRE(router->distribution_kind == DistributionKind::RouterReplicated);
+    REQUIRE(router->comm_profile.kind == CommunicationKind::NoComm);
+    REQUIRE_FALSE(router->grouped_semantics.routes_tokens);
+
+    const OpDescriptor* permute = OpRegistry::instance().find_by_name("moe_permute");
+    REQUIRE(permute != nullptr);
+    REQUIRE(permute == OpRegistry::instance().find(CompiledOpType::MoEPermute));
+    REQUIRE(permute->forward_fn != nullptr);
+    REQUIRE(permute->distribution_kind == DistributionKind::ExpertParallel);
+    REQUIRE(permute->comm_profile.kind == CommunicationKind::NoComm);
+    REQUIRE(permute->grouped_semantics.routes_tokens);
+    REQUIRE(permute->grouped_semantics.ep_aware);
+
+    const OpDescriptor* bias = OpRegistry::instance().find_by_name("moe_expert_bias_add");
+    REQUIRE(bias != nullptr);
+    REQUIRE(bias == OpRegistry::instance().find(CompiledOpType::MoEExpertBiasAdd));
+    REQUIRE(bias->forward_fn != nullptr);
+    REQUIRE(bias->distribution_kind == DistributionKind::ExpertParallel);
+    REQUIRE(bias->comm_profile.kind == CommunicationKind::ExpertParallelRouted);
+    REQUIRE(bias->grouped_semantics.ep_aware);
+    REQUIRE(bias->epilogue_support.has(EpilogueSupportBias));
 }
 
 TEST_CASE("ep ops carry communication profile metadata", "[op_registry]") {

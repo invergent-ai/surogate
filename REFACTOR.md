@@ -53,6 +53,7 @@
 - [x] EP dispatch/combine all-to-all registrations migrated to the consolidated descriptor surface.
 - [x] Mamba/SSM and Qwen3.5 gated-delta no-comm families migrated to the consolidated descriptor surface.
 - [x] Core replicated transformer/view/elementwise/attention/loss registrations migrated to the consolidated no-comm descriptor surface.
+- [x] MoE router, token-routing, expert-bias, and grouped backward registrations migrated to consolidated descriptors.
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, distribution, capability, epilogue, and storage descriptor facets.
 - [x] `CompiledGraph` summary helpers added for descriptor communication, grouped-op, capability, epilogue, and storage-compat counts.
 
