@@ -115,6 +115,8 @@ struct MatmulContext {
     dsl::MatmulCapabilities matmul_caps{};
     dsl::EpilogueSupport epilogue_support{};
     dsl::StorageCompatibility storage_compat{};
+    dsl::TensorRole input_role{};
+    bool has_input_role = false;
 
     // =========================================================================
     // Backward-specific flags

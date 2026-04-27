@@ -46,6 +46,16 @@ bool is_router_weight_name(const std::string& weight_name) {
     return legacy_value || role_value;
 }
 
+void attach_input_role(modules::MatmulContext& ctx, const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) {
+        return;
+    }
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        ctx.input_role = *role;
+        ctx.has_input_role = true;
+    }
+}
+
 }  // namespace
 
 // flatten_bt now lives in runtime/executor/graph_executor_utils.h so it
@@ -169,6 +179,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                 ctx.matmul_caps = op.matmul_caps;
                 ctx.epilogue_support = op.epilogue_support;
                 ctx.storage_compat = op.storage_compat;
+                attach_input_role(ctx, mCurrentGraph, op.inputs[0]);
                 ctx.allow_fp8 = mRecipe->uses_fp8_forward();
                 ctx.allow_fp4 = mRecipe->uses_fp4_forward();
 
@@ -529,6 +540,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         ctx.matmul_caps = op.matmul_caps;
         ctx.epilogue_support = op.epilogue_support;
         ctx.storage_compat = op.storage_compat;
+        attach_input_role(ctx, mCurrentGraph, op.inputs[0]);
         ctx.accumulate = do_accumulate;
         ctx.skip_weight_grad = skip_weight_grad || !dB_ptr;
         ctx.allow_fp8 = allow_quant && mRecipe->uses_fp8_hybrid_backward();

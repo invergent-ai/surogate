@@ -5,6 +5,7 @@
 
 #include <string>
 
+#include "runtime/core/matmul_context.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/graph_executor_helpers.h"
@@ -100,6 +101,20 @@ TEST_CASE("FP8 ready flag mapping covers dense matmul quant producers", "[tensor
     REQUIRE(std::string(quant_state_name(QuantState::FP8Pending)) == "FP8Pending");
     REQUIRE(std::string(quant_state_name(QuantState::FP8Ready)) == "FP8Ready");
     REQUIRE(std::string(quant_state_name(QuantState::FP4Ready)) == "FP4Ready");
+}
+
+TEST_CASE("MatmulContext carries optional input TensorRole metadata", "[tensor_role][matmul]") {
+    modules::MatmulContext ctx{};
+    REQUIRE_FALSE(ctx.has_input_role);
+    REQUIRE(ctx.input_role.kind == TensorRoleKind::Unknown);
+
+    ctx.input_role = infer_tensor_role_from_name("blocks[0].ln1_out", 0);
+    ctx.input_role.quant_state = QuantState::FP8Ready;
+    ctx.has_input_role = true;
+
+    REQUIRE(ctx.has_input_role);
+    REQUIRE(ctx.input_role.block_layer == 0);
+    REQUIRE(ctx.input_role.quant_state == QuantState::FP8Ready);
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {
