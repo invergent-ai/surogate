@@ -11,6 +11,7 @@
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -169,11 +170,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                                                       static_cast<std::size_t>(local_idx) * expert_bytes;
                 }
                 llep_weight_ptrs = refreshed_native_weight_ptrs.data();
-            } else if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_gate_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
-            } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_down_name(wname) && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
-            } else if (wname.find("_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 // Separate up projection (Nemotron-H / Nemotron Nano "experts_up") — reuses
                 // gate_up_weight_ptrs since ep_dispatch populates it from whichever up-projection
                 // weight exists.
@@ -655,11 +656,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                                                       static_cast<std::size_t>(local_idx) * expert_bytes;
                 }
                 llep_weight_ptrs = refreshed_native_weight_ptrs.data();
-            } else if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_gate_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
-            } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_down_name(wname) && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
-            } else if (wname.find("_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             }
             num_experts = llep.num_merged_experts;

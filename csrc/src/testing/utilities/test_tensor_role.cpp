@@ -61,6 +61,10 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(tensor_role_is_expert_weight_name("blocks[4].expert_down"));
         REQUIRE(tensor_role_is_expert_weight_name("blocks[4].expert_up"));
         REQUIRE(tensor_role_is_expert_weight_name("blocks[4].experts_up"));
+        REQUIRE(tensor_role_is_expert_gate_up_name("blocks[4].experts_gate_up"));
+        REQUIRE(tensor_role_is_expert_up_name("blocks[4].experts_up"));
+        REQUIRE(tensor_role_is_expert_down_name("blocks[4].experts_down"));
+        REQUIRE_FALSE(tensor_role_is_expert_up_name("blocks[4].experts_gate_up"));
         REQUIRE(tensor_role_is_expert_bias_name("blocks[4].experts_down_bias"));
         REQUIRE_FALSE(tensor_role_is_expert_bias_name("blocks[4].shared_expert_up"));
     }

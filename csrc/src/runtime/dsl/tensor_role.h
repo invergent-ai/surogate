@@ -136,6 +136,11 @@ bool tensor_role_is_shared_expert_name(std::string_view name);
 /// Legacy-compatible expert weight predicate derived from TensorRole.
 bool tensor_role_is_expert_weight_name(std::string_view name);
 
+/// Expert projection predicates used by MoE grouped GEMM routing.
+bool tensor_role_is_expert_gate_up_name(std::string_view name);
+bool tensor_role_is_expert_up_name(std::string_view name);
+bool tensor_role_is_expert_down_name(std::string_view name);
+
 /// Legacy-compatible expert bias predicate derived from TensorRole.
 bool tensor_role_is_expert_bias_name(std::string_view name);
 

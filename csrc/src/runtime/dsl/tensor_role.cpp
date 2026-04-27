@@ -158,6 +158,19 @@ bool tensor_role_is_expert_weight_name(std::string_view name) {
                                          contains(name, "expert_up") || contains(name, "expert_down"));
 }
 
+bool tensor_role_is_expert_gate_up_name(std::string_view name) {
+    return tensor_role_is_expert_weight_name(name) && contains(name, "gate_up");
+}
+
+bool tensor_role_is_expert_up_name(std::string_view name) {
+    return tensor_role_is_expert_weight_name(name) && !contains(name, "shared_expert") && !contains(name, "gate_up") &&
+           contains(name, "_up");
+}
+
+bool tensor_role_is_expert_down_name(std::string_view name) {
+    return tensor_role_is_expert_weight_name(name) && contains(name, "down");
+}
+
 bool tensor_role_is_expert_bias_name(std::string_view name) {
     const TensorRole role = infer_tensor_role_from_name(name);
     return role.is_expert_parallel() && contains(name, "experts_") && contains(name, "_bias");
