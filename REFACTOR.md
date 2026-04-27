@@ -47,6 +47,7 @@
 - [x] Core transformer ops annotated with semantic descriptor metadata.
 - [x] Descriptor type definitions split into a lightweight header and copied onto `CompiledOp` during graph compilation.
 - [x] Descriptor surface extended with inert `OpCapabilities`, `EpilogueSupport`, and `StorageCompatibility` fields, with dense matmul and MoE grouped matmul annotations.
+- [x] Consolidated `REGISTER_COMPILED_OP` surface added and proven on dense matmul registrations.
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, and distribution descriptor facets.
 - [x] `CompiledGraph` summary helpers added for descriptor communication, grouped-op, capability, epilogue, and storage-compat counts.
 

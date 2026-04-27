@@ -221,8 +221,42 @@ REGISTER_OP("narrow_backward", NarrowBackward, nullptr, ::dsl::bwd_narrow);
 REGISTER_OP("concat", Concat, ::dsl::fwd_concat, ::dsl::fwd_concat);
 REGISTER_OP("add", Add, ::dsl::fwd_add, ::dsl::fwd_add);
 REGISTER_OP("add_backward", AddBackward, nullptr, ::dsl::bwd_add);
-REGISTER_OP("matmul", Matmul, ::dsl::fwd_matmul, nullptr);
-REGISTER_OP("matmul_bias", MatmulBias, ::dsl::fwd_matmul, nullptr);
+REGISTER_COMPILED_OP("matmul",
+                     Matmul,
+                     ::dsl::fwd_matmul,
+                     nullptr,
+                     Dense,
+                     Replicated,
+                     NoComm,
+                     false,
+                     0,
+                     false,
+                     false,
+                     -1,
+                     false,
+                     ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible | ::dsl::OpCapabilityFp4Eligible |
+                         ::dsl::OpCapabilityLoRACompatible | ::dsl::OpCapabilityWeightCacheEligible,
+                     ::dsl::EpilogueSupportNone,
+                     ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                     0);
+REGISTER_COMPILED_OP("matmul_bias",
+                     MatmulBias,
+                     ::dsl::fwd_matmul,
+                     nullptr,
+                     Dense,
+                     Replicated,
+                     NoComm,
+                     false,
+                     0,
+                     false,
+                     false,
+                     -1,
+                     false,
+                     ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible | ::dsl::OpCapabilityFp4Eligible |
+                         ::dsl::OpCapabilityLoRACompatible | ::dsl::OpCapabilityWeightCacheEligible,
+                     ::dsl::EpilogueSupportBias,
+                     ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                     0);
 REGISTER_OP("matmul_backward", MatmulBackward, nullptr, ::dsl::bwd_matmul);
 REGISTER_OP("bias_add", BiasAdd, ::dsl::fwd_bias_add, nullptr);
 REGISTER_OP("bias_add_backward", BiasAddBackward, nullptr, ::dsl::bwd_bias_add);
@@ -283,8 +317,6 @@ REGISTER_OP_METADATA("narrow_backward", View, Replicated, 0);
 REGISTER_OP_METADATA("concat", View, Replicated, 0);
 REGISTER_OP_METADATA("add", Elementwise, Replicated, 0);
 REGISTER_OP_METADATA("add_backward", Elementwise, Replicated, 0);
-REGISTER_OP_METADATA("matmul", Dense, Replicated, 0);
-REGISTER_OP_METADATA("matmul_bias", Dense, Replicated, 0);
 REGISTER_OP_METADATA("matmul_backward", Dense, Replicated, 0);
 REGISTER_OP_METADATA("bias_add", Elementwise, Replicated, 0);
 REGISTER_OP_METADATA("bias_add_backward", Elementwise, Replicated, 0);
@@ -324,19 +356,6 @@ REGISTER_OP_METADATA("cross_entropy_loss", Loss, Replicated, 0);
 REGISTER_OP_METADATA("cross_entropy_loss_backward", Loss, Replicated, 0);
 REGISTER_OP_METADATA("fused_lm_head_loss", Loss, Replicated, 0);
 REGISTER_OP_METADATA("fused_lm_head_loss_backward", Loss, Replicated, 0);
-
-REGISTER_OP_CAPABILITIES("matmul",
-                         ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible |
-                             ::dsl::OpCapabilityFp4Eligible | ::dsl::OpCapabilityLoRACompatible |
-                             ::dsl::OpCapabilityWeightCacheEligible,
-                         ::dsl::EpilogueSupportNone,
-                         ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
-REGISTER_OP_CAPABILITIES("matmul_bias",
-                         ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible |
-                             ::dsl::OpCapabilityFp4Eligible | ::dsl::OpCapabilityLoRACompatible |
-                             ::dsl::OpCapabilityWeightCacheEligible,
-                         ::dsl::EpilogueSupportBias,
-                         ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
 
 // MoE forward + backward
 REGISTER_OP("moe_softmax", MoESoftmax, ::dsl::fwd_moe_softmax, nullptr);

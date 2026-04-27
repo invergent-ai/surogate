@@ -134,6 +134,30 @@ inline OpDescriptor make_capability_descriptor(std::string name,
     return desc;
 }
 
+inline OpDescriptor make_compiled_op_descriptor(std::string name,
+                                                CompiledOpType type,
+                                                OpExecFn forward_fn,
+                                                OpExecFn backward_fn,
+                                                OpSemanticKind semantic_kind,
+                                                DistributionKind distribution_kind,
+                                                CommunicationProfile comm_profile,
+                                                GroupedSemantics grouped_semantics,
+                                                OpCapabilities default_caps,
+                                                EpilogueSupport epilogue_support,
+                                                StorageCompatibility storage_compat,
+                                                std::uint32_t descriptor_flags) {
+    OpDescriptor desc = make_dispatch_descriptor(std::move(name), type, forward_fn, backward_fn);
+    desc.semantic_kind = semantic_kind;
+    desc.distribution_kind = distribution_kind;
+    desc.comm_profile = comm_profile;
+    desc.grouped_semantics = grouped_semantics;
+    desc.default_caps = default_caps;
+    desc.epilogue_support = epilogue_support;
+    desc.storage_compat = storage_compat;
+    desc.descriptor_flags = descriptor_flags;
+    return desc;
+}
+
 class OpRegistry {
 public:
     static OpRegistry& instance();
@@ -191,6 +215,46 @@ private:
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) =  \
         ::dsl::OpRegistry::instance().register_op(                             \
             ::dsl::make_full_descriptor(name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn, autodiff_fn_))
+
+// Register dispatch and descriptor facets in one declaration. This is the
+// Phase-2 target surface for newly migrated ops; legacy split registration
+// macros stay available while existing families move over incrementally.
+#define REGISTER_COMPILED_OP(name_str,                                                 \
+                             op_type_enum,                                             \
+                             fwd_fn,                                                   \
+                             bwd_fn,                                                   \
+                             semantic_kind_enum,                                       \
+                             distribution_kind_enum,                                   \
+                             comm_kind_enum,                                           \
+                             can_overlap_,                                             \
+                             reduction_priority_,                                      \
+                             is_grouped_,                                              \
+                             routes_tokens_,                                           \
+                             expert_dim_,                                              \
+                             ep_aware_,                                                \
+                             caps_flags_,                                              \
+                             epilogue_flags_,                                          \
+                             storage_flags_,                                           \
+                             flags_)                                                   \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_compiled_op_reg_, __COUNTER__) = \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_compiled_op_descriptor(  \
+            name_str,                                                                  \
+            ::dsl::CompiledOpType::op_type_enum,                                       \
+            fwd_fn,                                                                    \
+            bwd_fn,                                                                    \
+            ::dsl::OpSemanticKind::semantic_kind_enum,                                 \
+            ::dsl::DistributionKind::distribution_kind_enum,                           \
+            ::dsl::CommunicationProfile{::dsl::CommunicationKind::comm_kind_enum,      \
+                                        static_cast<bool>(can_overlap_),               \
+                                        static_cast<int>(reduction_priority_)},        \
+            ::dsl::GroupedSemantics{static_cast<bool>(is_grouped_),                    \
+                                    static_cast<bool>(routes_tokens_),                 \
+                                    static_cast<int>(expert_dim_),                     \
+                                    static_cast<bool>(ep_aware_)},                     \
+            ::dsl::OpCapabilities{static_cast<std::uint32_t>(caps_flags_)},            \
+            ::dsl::EpilogueSupport{static_cast<std::uint32_t>(epilogue_flags_)},       \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(storage_flags_)},   \
+            static_cast<std::uint32_t>(flags_)))
 
 // Register an autodiff rule only — for names that don't have a
 // CompiledOpType counterpart (e.g. "softmax", "attention", "identity"

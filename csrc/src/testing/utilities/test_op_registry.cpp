@@ -101,6 +101,8 @@ TEST_CASE("mamba and gated-delta ops carry no-comm descriptor metadata", "[op_re
 TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     const OpDescriptor* matmul = OpRegistry::instance().find_by_name("matmul");
     REQUIRE(matmul != nullptr);
+    REQUIRE(matmul == OpRegistry::instance().find(CompiledOpType::Matmul));
+    REQUIRE(matmul->forward_fn != nullptr);
     REQUIRE(matmul->semantic_kind == OpSemanticKind::Dense);
     REQUIRE(matmul->comm_profile.kind == CommunicationKind::NoComm);
     REQUIRE(matmul->default_caps.has(OpCapabilityDenseMatmul));
