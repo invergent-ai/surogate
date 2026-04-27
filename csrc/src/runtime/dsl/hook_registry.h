@@ -56,6 +56,12 @@ struct HookContext {
     void* payload = nullptr;
 };
 
+struct AfterProduceHookPayload {
+    void* action_context = nullptr;
+    void (*apply_lora)(void*) = nullptr;
+    bool lora_applied = false;
+};
+
 struct BeforeConsumeHookPayload {
     DslWeightManager* weight_manager = nullptr;
     NCCLCommunicator* comm = nullptr;

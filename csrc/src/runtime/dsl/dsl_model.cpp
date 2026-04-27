@@ -1152,7 +1152,14 @@ DslModel::DslModel(const PretrainedConfig& config,
         mBlockSchemaPlanRecords = collect_block_schema_plan_records(*mModule->forward);
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterProduce)) {
-            mHookRegistry.on_after_produce(target, "schema_after_produce");
+            mHookRegistry.on_after_produce(target, "schema_lora_after_produce", [](HookContext& context) {
+                auto* payload = static_cast<AfterProduceHookPayload*>(context.payload);
+                if (!payload || payload->lora_applied || !payload->apply_lora) {
+                    return;
+                }
+                payload->apply_lora(payload->action_context);
+                payload->lora_applied = true;
+            });
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::BeforeConsume)) {

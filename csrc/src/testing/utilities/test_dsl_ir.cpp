@@ -683,5 +683,27 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     hook_ctx.payload = &after_consume_payload;
     REQUIRE(static_cast<dsl::AfterConsumeHookPayload*>(hook_ctx.payload)->current_layer_released);
 
+    bool lora_payload_applied = false;
+    dsl::AfterProduceHookPayload after_produce_payload;
+    after_produce_payload.action_context = &lora_payload_applied;
+    after_produce_payload.apply_lora = [](void* opaque) {
+        *static_cast<bool*>(opaque) = true;
+    };
+    auto produce_registry = dsl::HookRegistry{};
+    produce_registry.on_after_produce({"qwen3_dense", "qkv"}, "schema_lora_after_produce", [](dsl::HookContext& ctx) {
+        auto* payload = static_cast<dsl::AfterProduceHookPayload*>(ctx.payload);
+        if (!payload || payload->lora_applied || !payload->apply_lora) return;
+        payload->apply_lora(payload->action_context);
+        payload->lora_applied = true;
+    });
+    dsl::HookContext produce_ctx;
+    produce_ctx.layer_idx = 0;
+    produce_ctx.target = {"qwen3_dense", "qkv"};
+    produce_ctx.event = dsl::HookEventKind::AfterProduce;
+    produce_ctx.payload = &after_produce_payload;
+    REQUIRE(produce_registry.dispatch(produce_ctx) == 1);
+    REQUIRE(lora_payload_applied);
+    REQUIRE(after_produce_payload.lora_applied);
+
     REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
 }

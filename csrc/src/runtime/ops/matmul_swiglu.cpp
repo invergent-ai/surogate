@@ -34,6 +34,36 @@ void attach_input_role(modules::MatmulContext& ctx, const CompiledGraph* graph, 
     }
 }
 
+struct LoRAForwardApplyContext {
+    const std::vector<LoRASlice>* slices = nullptr;
+    int layer_idx = -1;
+    Tensor input_2d;
+    Tensor output_2d;
+    int BT = 0;
+    modules::ModularLoRAWeightsManager* weights = nullptr;
+    const modules::ModularLoRAConfig* config = nullptr;
+    modules::LoRARunState* run_state = nullptr;
+    cublasLtHandle_t handle = nullptr;
+    Tensor* workspace = nullptr;
+    cudaStream_t stream = nullptr;
+};
+
+void apply_lora_forward_payload(void* opaque) {
+    auto* ctx = static_cast<LoRAForwardApplyContext*>(opaque);
+    if (!ctx || !ctx->slices || !ctx->workspace) return;
+    modules::detail::apply_lora_slices_forward(*ctx->slices,
+                                               ctx->layer_idx,
+                                               ctx->input_2d,
+                                               ctx->output_2d,
+                                               ctx->BT,
+                                               ctx->weights,
+                                               ctx->config,
+                                               ctx->run_state,
+                                               ctx->handle,
+                                               *ctx->workspace,
+                                               ctx->stream);
+}
+
 }  // namespace
 
 void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const modules::ForwardHook* hook) {
@@ -126,31 +156,43 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
 
     (void)hook;
 
+    LoRAForwardApplyContext lora_apply_ctx;
+    AfterProduceHookPayload after_produce_payload;
+    if (!op.attrs.lora_slices.empty()) {
+        Tensor a_flat = flatten_bt(a, mB, mT);
+        Tensor up_flat = flatten_bt(up_out, mB, mT);
+        lora_apply_ctx.slices = &op.attrs.lora_slices;
+        lora_apply_ctx.layer_idx = op.attrs.layer_idx;
+        lora_apply_ctx.input_2d = a_flat;
+        lora_apply_ctx.output_2d = up_flat;
+        lora_apply_ctx.BT = static_cast<int>(a_flat.Sizes[0]);
+        lora_apply_ctx.weights = mLoRAWeights;
+        lora_apply_ctx.config = mLoRAConfig;
+        lora_apply_ctx.run_state = mLoRARunState;
+        lora_apply_ctx.handle = mRunState.CublasLtHandle;
+        lora_apply_ctx.workspace = &mRunState.CuBlasWorkspace;
+        lora_apply_ctx.stream = mRunState.MainStream;
+        after_produce_payload.action_context = &lora_apply_ctx;
+        after_produce_payload.apply_lora = apply_lora_forward_payload;
+    }
+
     // Rebind the per-layer mlp_up activation slot to the live buffer so
     // backward replays read the fresh tensor.
     if (op.attrs.forward_hook_point.has_value() && op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
         if (Tensor* mlp_up = block_activation_ptr(mRunState, op.attrs.layer_idx, TensorSlot::BlockMLPUp)) {
             mlp_up->Data = up_out.Data;
         }
+        dispatch_schema_hook(HookEventKind::AfterProduce,
+                             op.attrs.layer_idx,
+                             op.attrs.hook_schema_id,
+                             op.attrs.forward_hook_schema_slot,
+                             op.attrs.lora_slices.empty() ? nullptr : &after_produce_payload);
     }
 
     // Apply DSL-declared LoRA adapters (up/gate/...) to ``up_out`` before
     // the SwiGLU activation.
-    if (!op.attrs.lora_slices.empty()) {
-        Tensor a_flat = flatten_bt(a, mB, mT);
-        Tensor up_flat = flatten_bt(up_out, mB, mT);
-        const int BT = static_cast<int>(a_flat.Sizes[0]);
-        modules::detail::apply_lora_slices_forward(op.attrs.lora_slices,
-                                                   op.attrs.layer_idx,
-                                                   a_flat,
-                                                   up_flat,
-                                                   BT,
-                                                   mLoRAWeights,
-                                                   mLoRAConfig,
-                                                   mLoRARunState,
-                                                   mRunState.CublasLtHandle,
-                                                   mRunState.CuBlasWorkspace,
-                                                   mRunState.MainStream);
+    if (!op.attrs.lora_slices.empty() && !after_produce_payload.lora_applied) {
+        apply_lora_forward_payload(&lora_apply_ctx);
     }
 
     Tensor up_3d = view_tensor(up_out, {mB, mT, static_cast<long>(N)});
