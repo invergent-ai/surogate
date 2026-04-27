@@ -408,6 +408,25 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             }
         }
     }
+    if (p.has_dsl_layout) {
+        for (auto& layer : p.schema_layers) {
+            if (!layer.has_schema) {
+                continue;
+            }
+            for (const auto& slot : layer.slots) {
+                if (slot.kind == "param" || slot.name.empty()) {
+                    continue;
+                }
+                if (slot_registry.lookup(slot.name).has_value()) {
+                    ++layer.registry_registered_activation_slots;
+                    ++p.schema_registry_registered_activation_slots;
+                } else {
+                    ++layer.registry_missing_activation_slots;
+                    ++p.schema_registry_missing_activation_slots;
+                }
+            }
+        }
+    }
 
     // ---------------- FFN temps on stack ----------------
     // Only safe when both mlp_up and swiglu are recomputable — otherwise the

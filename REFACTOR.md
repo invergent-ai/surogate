@@ -127,6 +127,7 @@
 - [x] Model-level schema coverage tests now also lock Qwen3.5 dense and Qwen3.5 MoE per-layer block-schema metadata.
 - [x] `BufferPlan` now provides per-layer/per-slot schema lookup helpers for allocator migration without changing allocation behavior.
 - [x] `BufferPlan` now exposes a schema-vs-legacy-slot-registry parity helper for missing activation slot diagnostics.
+- [x] `BufferPlan` now computes schema-vs-slot-registry activation allocation parity counters during plan construction and reports them in debug memory output.
 
 Local validation status:
 

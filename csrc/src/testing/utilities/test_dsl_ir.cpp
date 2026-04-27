@@ -255,6 +255,8 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_cpu_pinned_stream_slots == 1);
     REQUIRE(plan.schema_cpu_pageable_slots == 0);
     REQUIRE(plan.schema_nvme_offload_slots == 0);
+    REQUIRE(plan.schema_registry_registered_activation_slots == 0);
+    REQUIRE(plan.schema_registry_missing_activation_slots == 0);
     REQUIRE(plan.schema_scoring_bias_routing_layers == 0);
     REQUIRE(plan.schema_shared_expert_routing_layers == 0);
     REQUIRE(plan.schema_weight_transfer_layers == 0);
@@ -293,6 +295,20 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     dsl::TensorSlotRegistry parity_registry;
     parity_registry.init_from_layout(layout);
     REQUIRE(plan.schema_activation_slots_missing_from_registry(parity_registry).empty());
+    const auto parity_plan = dsl::BufferPlan::build(cfg,
+                                                    runtime_config,
+                                                    options,
+                                                    parity_registry,
+                                                    /*lora_only_mode=*/false,
+                                                    /*B=*/2,
+                                                    /*T=*/3,
+                                                    ETensorDType::BF16,
+                                                    ETensorDType::BF16,
+                                                    &schema_records);
+    REQUIRE(parity_plan.schema_registry_registered_activation_slots == 1);
+    REQUIRE(parity_plan.schema_registry_missing_activation_slots == 0);
+    REQUIRE(parity_plan.schema_layers[0].registry_registered_activation_slots == 1);
+    REQUIRE(parity_plan.schema_layers[0].registry_missing_activation_slots == 0);
 
     dsl::ActivationLayoutIR missing_layout;
     dsl::TensorSlotRegistry missing_registry;
@@ -300,6 +316,20 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     const auto missing_schema_slots = plan.schema_activation_slots_missing_from_registry(missing_registry);
     REQUIRE(missing_schema_slots.size() == 1);
     REQUIRE(missing_schema_slots[0] == "layer0.permuted_input");
+    const auto missing_plan = dsl::BufferPlan::build(cfg,
+                                                     runtime_config,
+                                                     options,
+                                                     missing_registry,
+                                                     /*lora_only_mode=*/false,
+                                                     /*B=*/2,
+                                                     /*T=*/3,
+                                                     ETensorDType::BF16,
+                                                     ETensorDType::BF16,
+                                                     &schema_records);
+    REQUIRE(missing_plan.schema_registry_registered_activation_slots == 0);
+    REQUIRE(missing_plan.schema_registry_missing_activation_slots == 1);
+    REQUIRE(missing_plan.schema_layers[0].registry_registered_activation_slots == 0);
+    REQUIRE(missing_plan.schema_layers[0].registry_missing_activation_slots == 1);
     REQUIRE(plan.schema_layers[0].routing_kind == "topk_softmax");
     REQUIRE(plan.schema_layers[0].routing_topk == 2);
     REQUIRE(plan.schema_layers[0].routing_norm_topk_prob);

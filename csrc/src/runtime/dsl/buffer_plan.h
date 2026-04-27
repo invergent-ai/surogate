@@ -113,6 +113,8 @@ struct BlockSchemaLayerSummary {
     int cpu_pinned_stream_slots = 0;
     int cpu_pageable_slots = 0;
     int nvme_offload_slots = 0;
+    int registry_registered_activation_slots = 0;
+    int registry_missing_activation_slots = 0;
     std::vector<BlockSchemaSlotSummary> slots;
     std::string routing_kind;
     int routing_topk = -1;
@@ -199,6 +201,8 @@ struct BufferPlan {
     int schema_cpu_pinned_stream_slots = 0;
     int schema_cpu_pageable_slots = 0;
     int schema_nvme_offload_slots = 0;
+    int schema_registry_registered_activation_slots = 0;
+    int schema_registry_missing_activation_slots = 0;
     int schema_scoring_bias_routing_layers = 0;
     int schema_shared_expert_routing_layers = 0;
     int schema_weight_transfer_layers = 0;
