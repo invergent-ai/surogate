@@ -131,6 +131,7 @@
 - [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` now also fails early when schema activation slots are absent from the compiled slot registry.
 - [x] `BufferPlan` now preserves schema slot shape dimension tokens, preparing shape-aware allocation parity beyond rank-only diagnostics.
 - [x] `BufferPlan` now resolves schema activation shape tokens against the current layer dimensions and reports resolved/unresolved activation-shape counters.
+- [x] `BufferPlan` now computes dtype-aware byte estimates for resolved schema activation shapes, enabling numeric allocation parity checks.
 
 Local validation status:
 

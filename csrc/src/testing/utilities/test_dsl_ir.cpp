@@ -264,6 +264,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_registry_missing_activation_slots == 0);
     REQUIRE(plan.schema_resolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_unresolved_activation_shape_slots == 0);
+    REQUIRE(plan.schema_resolved_activation_shape_bytes == 96);
     REQUIRE(plan.schema_scoring_bias_routing_layers == 0);
     REQUIRE(plan.schema_shared_expert_routing_layers == 0);
     REQUIRE(plan.schema_weight_transfer_layers == 0);
@@ -287,12 +288,14 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].nvme_offload_slots == 0);
     REQUIRE(plan.schema_layers[0].resolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_layers[0].unresolved_activation_shape_slots == 0);
+    REQUIRE(plan.schema_layers[0].resolved_activation_shape_bytes == 96);
     REQUIRE(plan.schema_layers[0].slots.size() == 3);
     REQUIRE(plan.schema_layers[0].slots[1].name == "experts_gate_up");
     REQUIRE(plan.schema_layers[0].slots[1].shape_dims == std::vector<std::string>{"E", "2M", "C"});
     REQUIRE(plan.schema_layers[0].slots[2].shape_resolved);
     REQUIRE(plan.schema_layers[0].slots[2].resolved_shape == std::vector<long>{2, 3, 8});
     REQUIRE(plan.schema_layers[0].slots[2].resolved_numel == 48);
+    REQUIRE(plan.schema_layers[0].slots[2].resolved_bytes == 96);
     REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);
     REQUIRE(plan.schema_layer(1) == nullptr);
     REQUIRE(plan.schema_layer_has_slot(0, "experts_gate_up"));

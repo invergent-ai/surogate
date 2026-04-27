@@ -184,6 +184,13 @@ resolve_schema_slot_shape(const BufferPlan& plan, const BlockSchemaLayerSummary&
     return true;
 }
 
+[[nodiscard]] ETensorDType schema_slot_dtype(const BufferPlan& plan, const BlockSchemaSlotSummary& slot) {
+    if (!slot.dtype.empty()) {
+        return dtype_from_str(slot.dtype);
+    }
+    return slot.kind == "activation_grad" ? plan.grad_dtype : plan.act_dtype;
+}
+
 }  // namespace
 
 std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph) {
@@ -247,6 +254,7 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                     slot_summary.name = attr_string(*slot, "name");
                     const std::string kind = attr_string(*slot, "kind");
                     slot_summary.kind = kind;
+                    slot_summary.dtype = attr_string(*slot, "dtype");
                     slot_summary.grouped = attr_bool(*slot, "grouped");
                     slot_summary.save_for_backward = attr_bool(*slot, "save_for_backward");
                     if (const AttrValue* shape_value = find_attr(*slot, "shape")) {
@@ -515,8 +523,12 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 continue;
             }
             if (resolved) {
+                slot.resolved_bytes =
+                    slot.resolved_numel * static_cast<long>(get_dtype_size(schema_slot_dtype(p, slot)));
                 ++layer.resolved_activation_shape_slots;
                 ++p.schema_resolved_activation_shape_slots;
+                layer.resolved_activation_shape_bytes += slot.resolved_bytes;
+                p.schema_resolved_activation_shape_bytes += slot.resolved_bytes;
             } else {
                 ++layer.unresolved_activation_shape_slots;
                 ++p.schema_unresolved_activation_shape_slots;
