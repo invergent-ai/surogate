@@ -47,7 +47,33 @@
 
 namespace dsl {
 
-namespace {}  // namespace
+namespace {
+
+std::size_t parse_mib_env(const char* name, std::size_t default_mib) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return default_mib * 1024ULL * 1024ULL;
+    }
+    char* end = nullptr;
+    const unsigned long long mib = std::strtoull(value, &end, 10);
+    if (end == value) {
+        return default_mib * 1024ULL * 1024ULL;
+    }
+    return static_cast<std::size_t>(mib) * 1024ULL * 1024ULL;
+}
+
+std::size_t moe_fp8_cache_entry_bytes(int num_experts, int n, int k) {
+    if (num_experts <= 0 || n <= 0 || k <= 0) {
+        return 0;
+    }
+    const auto experts = static_cast<std::size_t>(num_experts);
+    const auto rows = static_cast<std::size_t>(n);
+    const auto cols = static_cast<std::size_t>(k);
+    return experts * rows * cols * get_dtype_size(ETensorDType::FP8_E4M3) +
+           2 * experts * get_dtype_size(ETensorDType::FP32);
+}
+
+}  // namespace
 
 // MoE compact weight information (moved out of anonymous namespace for split files)
 MoeCompactInfo build_moe_compact_info(const int* expert_offsets_dev,
@@ -791,6 +817,15 @@ void CompiledExecutor::set_fp8_cache_transposed(std::unordered_map<std::string, 
 
 void CompiledExecutor::set_moe_fp8_cache(std::unordered_map<std::string, MoEFP8WeightCacheEntry>* cache) {
     mMoEFP8Cache = cache;
+    mMoEFP8CacheBytes = 0;
+    mMoEFP8CacheBudgetBytes.reset();
+    if (mMoEFP8Cache) {
+        for (const auto& [_, entry] : *mMoEFP8Cache) {
+            mMoEFP8CacheBytes += entry.weights_e4m3.bytes();
+            mMoEFP8CacheBytes += entry.weight_amax.bytes();
+            mMoEFP8CacheBytes += entry.weight_scales.bytes();
+        }
+    }
 }
 
 void CompiledExecutor::set_fp4_cache(std::unordered_map<std::string, FP4WeightCacheEntry>* cache,
@@ -819,6 +854,21 @@ void CompiledExecutor::attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, cons
     }
     auto it = mMoEFP8Cache->find(weight_name);
     if (it == mMoEFP8Cache->end()) {
+        if (!mMoEFP8CacheBudgetBytes.has_value()) {
+            mMoEFP8CacheBudgetBytes = parse_mib_env("SUROGATE_FP8_MOE_CACHE_BUDGET_MB", 1024);
+        }
+        const std::size_t entry_bytes = moe_fp8_cache_entry_bytes(ctx.num_experts, ctx.N, ctx.K);
+        if (entry_bytes == 0 || mMoEFP8CacheBytes + entry_bytes > *mMoEFP8CacheBudgetBytes) {
+            if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
+                std::fprintf(stderr,
+                             "[FP8 MoE cache] skip %s: requested %.1f MiB, budget %.1f MiB, used %.1f MiB\n",
+                             weight_name.c_str(),
+                             static_cast<double>(entry_bytes) / (1024.0 * 1024.0),
+                             static_cast<double>(*mMoEFP8CacheBudgetBytes) / (1024.0 * 1024.0),
+                             static_cast<double>(mMoEFP8CacheBytes) / (1024.0 * 1024.0));
+            }
+            return;
+        }
         MoEFP8WeightCacheEntry entry{};
         entry.weights_e4m3 = mRunState.Allocator->allocate(ETensorDType::FP8_E4M3,
                                                            ("fp8_moe_cache_" + weight_name).c_str(),
@@ -834,6 +884,7 @@ void CompiledExecutor::attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, cons
                                                             {ctx.num_experts});
         auto [insert_it, _] = mMoEFP8Cache->emplace(weight_name, std::move(entry));
         it = insert_it;
+        mMoEFP8CacheBytes += entry_bytes;
     }
     ctx.cached_moe_weights_e4m3 = &it->second.weights_e4m3;
     ctx.cached_moe_weight_amax = &it->second.weight_amax;

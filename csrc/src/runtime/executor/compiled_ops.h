@@ -599,6 +599,8 @@ private:
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8Cache = nullptr;
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8CacheT = nullptr;
     std::unordered_map<std::string, MoEFP8WeightCacheEntry>* mMoEFP8Cache = nullptr;
+    std::size_t mMoEFP8CacheBytes = 0;
+    std::optional<std::size_t> mMoEFP8CacheBudgetBytes;
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4Cache = nullptr;
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4CacheT = nullptr;
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;

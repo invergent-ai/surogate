@@ -19,6 +19,9 @@ Tracked phases 0-5 are complete for the scoped, guarded implementation. The rema
   - [x] Keep Ada on the dense FP8 fallback until an Ada grouped path is worth the extra complexity.
 - [x] Keep `SUROGATE_FP8_MOE_WGRAD=1` as the rollout gate until parity and perf are proven.
 - [x] Preserve BF16 fallback for unsupported shapes, missing cache/state, and native-kernel rejection.
+- [x] Bound the executor-side MoE FP8 expert-weight cache so large pre-quantized MoE runs do not allocate one persistent FP8 cache per layer.
+  - Default cache budget is `1024` MiB and can be overridden with `SUROGATE_FP8_MOE_CACHE_BUDGET_MB`.
+  - Layers beyond the budget use the existing temporary quantization path, preserving correctness without the forward OOM seen on Qwen3.5 MoE.
 - [x] Add architecture-aware implementation notes for Ada, Hopper, and Blackwell based on the inspected CUTLASS grouped/FP8 examples.
   - Ada: `58_ada_fp8_gemm` is a useful dense expert fallback scaffold; `64_ada_fp8_gemm_grouped` is the grouped target when per-group scale support is needed.
   - Hopper: `57_hopper_grouped_gemm` matches the pointer-array grouped FP8 structure and supports E5M2/E4M3-style operand typing.
@@ -30,9 +33,11 @@ Acceptance:
 - [x] Per-expert FP8 wgrad max-abs delta is within `5e-2` versus BF16 reference for the focused grouped active-expert unit test.
 - [x] SM120 native grouped path passes the focused compact/non-compact MoE FP8 wgrad unit test on RTX 5090.
 - [x] SM100 native grouped path is compile-validated; runtime validation still requires B200/B300 CI hardware.
-- [ ] 5-step FP8-forward/FP8-dgrad/FP8-wgrad loss is within 5% of FP8-forward/BF16-wgrad baseline.
+- [x] 5-step FP8-forward/FP8-dgrad/FP8-wgrad loss is within 5% of FP8-forward/BF16-wgrad baseline.
+  - Validated on `qwen3_5_moe__fp8__single_gpu__gpu__moe_grouped`: final loss relative delta `0.040%`, max step relative delta `0.104%`.
 - [ ] 2-GPU DP smoke passes with FP8 wgrad enabled.
 - [ ] nsys confirms the intended FP8 wgrad path and no redundant expert weight requantization in backward.
+  - Still open: LoRA grouped wgrad calls with `beta=1` currently fall back while the native SM120 path requires `beta=0`.
 
 ## Track 2 - Promote Hook Dispatch From Opt-In To Runtime Path
 
