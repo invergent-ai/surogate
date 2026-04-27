@@ -125,6 +125,7 @@ struct DebugArenaSummary {
     //! PhaseArenas sizes (what `allocate_phase_arenas` actually cudaMalloc'd).
     std::uint64_t arena_persistent_bytes = 0;
     std::uint64_t arena_persistent_activation_bytes = 0;
+    std::uint64_t arena_model_scope_persistent_bytes = 0;
     std::uint64_t arena_accumulator_bytes = 0;
     std::uint64_t arena_fwd_stack_bytes = 0;
     std::uint64_t arena_bwd_stack_bytes = 0;

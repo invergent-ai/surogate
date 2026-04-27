@@ -79,6 +79,7 @@ class RegressionArtifacts:
     descriptor_summary: dict[str, int] = field(default_factory=dict)
     block_schema_summary: dict[str, int] = field(default_factory=dict)
     buffer_plan_summary: dict[str, int] = field(default_factory=dict)
+    arena_summary: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, path: Path) -> "RegressionArtifacts":
@@ -98,6 +99,7 @@ class RegressionArtifacts:
             "descriptor_summary": data.get("descriptor_summary", {}),
             "block_schema_summary": data.get("block_schema_summary", {}),
             "buffer_plan_summary": data.get("buffer_plan_summary", {}),
+            "arena_summary": data.get("arena_summary", {}),
         }
         return cls(**known)
 
@@ -455,6 +457,19 @@ def _compare_buffer_plan_summary(failures: list[str], case_id: str, cur: dict[st
             failures.append(f"{case_id}: buffer_plan_summary.{key} {cur_value} != {base_value}")
 
 
+def _compare_arena_summary(failures: list[str], case_id: str, cur: dict[str, Any], base: dict[str, Any]) -> None:
+    base_summary = base.get("arena_summary", {})
+    cur_summary = cur.get("arena_summary", {})
+    for key, base_value in base_summary.items():
+        if not isinstance(base_value, int):
+            continue
+        cur_value = cur_summary.get(key)
+        if cur_value is None:
+            failures.append(f"{case_id}: missing arena_summary.{key}")
+        elif cur_value != base_value:
+            failures.append(f"{case_id}: arena_summary.{key} {cur_value} != {base_value}")
+
+
 def _compare_artifacts(case_id: str, cur: dict[str, Any], base: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     case = cur.get("case", {})
@@ -493,6 +508,7 @@ def _compare_artifacts(case_id: str, cur: dict[str, Any], base: dict[str, Any]) 
     _compare_descriptor_summary(failures, case_id, cur_metrics, base_metrics)
     _compare_block_schema_summary(failures, case_id, cur_metrics, base_metrics)
     _compare_buffer_plan_summary(failures, case_id, cur_metrics, base_metrics)
+    _compare_arena_summary(failures, case_id, cur_metrics, base_metrics)
     return failures
 
 

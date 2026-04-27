@@ -1971,6 +1971,7 @@ NB_MODULE(_surogate, m) {
                 r["arenas_allocated"] = s.arenas_allocated;
                 r["arena_persistent_bytes"] = s.arena_persistent_bytes;
                 r["arena_persistent_activation_bytes"] = s.arena_persistent_activation_bytes;
+                r["arena_model_scope_persistent_bytes"] = s.arena_model_scope_persistent_bytes;
                 r["arena_accumulator_bytes"] = s.arena_accumulator_bytes;
                 r["arena_fwd_stack_bytes"] = s.arena_fwd_stack_bytes;
                 r["arena_bwd_stack_bytes"] = s.arena_bwd_stack_bytes;

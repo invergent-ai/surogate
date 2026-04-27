@@ -76,6 +76,35 @@ def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
     return flattened
 
 
+def _flatten_arena_summary(summary: dict) -> dict[str, int]:
+    flattened: dict[str, int] = {}
+    for key, value in summary.items():
+        if key in {"forward", "backward"} or isinstance(value, list):
+            continue
+        if isinstance(value, bool):
+            flattened[key] = int(value)
+        elif isinstance(value, int):
+            flattened[key] = int(value)
+    for graph_name in ("forward", "backward"):
+        graph = summary.get(graph_name)
+        if not isinstance(graph, dict):
+            continue
+        for key, value in graph.items():
+            if key == "regions" and isinstance(value, list):
+                for region in value:
+                    if not isinstance(region, dict):
+                        continue
+                    region_name = str(region.get("region") or "unknown").lower()
+                    for metric in ("tid_count", "tid_bytes"):
+                        metric_value = region.get(metric)
+                        if isinstance(metric_value, int):
+                            flattened[f"{graph_name}_region_{region_name}_{metric}"] = int(metric_value)
+                continue
+            if isinstance(value, int):
+                flattened[f"{graph_name}_{key}"] = int(value)
+    return flattened
+
+
 def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
     if not ir_json:
         return {}
@@ -669,6 +698,13 @@ class SurogateTrainerWrapper:
             except Exception as exc:
                 buffer_plan_summary = {"buffer_plan_summary_error": 1}
                 logger.warning(f"Failed to collect regression buffer-plan summary: {exc}")
+        arena_summary: dict[str, int] = {}
+        if hasattr(self.trainer, "get_debug_arena_summary"):
+            try:
+                arena_summary = _flatten_arena_summary(self.trainer.get_debug_arena_summary())
+            except Exception as exc:
+                arena_summary = {"arena_summary_error": 1}
+                logger.warning(f"Failed to collect regression arena summary: {exc}")
 
         path = Path(self._regression_artifact_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -683,6 +719,7 @@ class SurogateTrainerWrapper:
             "descriptor_summary": descriptor_summary,
             "block_schema_summary": self._block_schema_summary,
             "buffer_plan_summary": buffer_plan_summary,
+            "arena_summary": arena_summary,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 

@@ -233,6 +233,7 @@ DebugArenaSummary collect_arena_summary(const DslModel& model) {
     s.arenas_allocated = arenas.allocated;
     s.arena_persistent_bytes = static_cast<std::uint64_t>(arenas.persistent_bytes);
     s.arena_persistent_activation_bytes = static_cast<std::uint64_t>(arenas.persistent_activation_bytes);
+    s.arena_model_scope_persistent_bytes = static_cast<std::uint64_t>(arenas.model_scope_persistent_bytes);
     s.arena_accumulator_bytes = static_cast<std::uint64_t>(arenas.accumulator_bytes);
     s.arena_fwd_stack_bytes = static_cast<std::uint64_t>(arenas.fwd_stack_bytes);
     s.arena_bwd_stack_bytes = static_cast<std::uint64_t>(arenas.bwd_stack_bytes);

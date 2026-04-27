@@ -128,6 +128,9 @@ def test_artifact_schema_accepts_descriptor_summary():
                 "schema_record_count": 2,
                 "schema_activation_shape_savings_bytes": 1024,
             },
+            "arena_summary": {
+                "arena_fwd_stack_bytes": 2048,
+            },
         }
     )
 
@@ -143,6 +146,9 @@ def test_artifact_schema_accepts_descriptor_summary():
     assert artifacts.buffer_plan_summary == {
         "schema_record_count": 2,
         "schema_activation_shape_savings_bytes": 1024,
+    }
+    assert artifacts.arena_summary == {
+        "arena_fwd_stack_bytes": 2048,
     }
 
 
@@ -390,6 +396,19 @@ def test_compare_artifacts_checks_buffer_plan_summary_counts():
 
     assert f"{case.case_id}: buffer_plan_summary.schema_record_count 1 != 2" in failures
     assert f"{case.case_id}: missing buffer_plan_summary.schema_activation_shape_savings_bytes" in failures
+
+
+def test_compare_artifacts_checks_arena_summary_counts():
+    case = br.FIRST_MONTH_MATRIX[0]
+    base_metrics = {"arena_summary": {"arena_fwd_stack_bytes": 2048, "forward_region_fwdstack_tid_count": 3}}
+    cur_metrics = {"arena_summary": {"arena_fwd_stack_bytes": 1024}}
+    base = {"case": br.asdict(case), "status": "passed", "metrics": base_metrics}
+    cur = {"case": br.asdict(case), "status": "passed", "metrics": cur_metrics}
+
+    failures = br._compare_artifacts(case.case_id, cur, base)
+
+    assert f"{case.case_id}: arena_summary.arena_fwd_stack_bytes 1024 != 2048" in failures
+    assert f"{case.case_id}: missing arena_summary.forward_region_fwdstack_tid_count" in failures
 
 
 def test_run_case_loads_external_artifact(tmp_path, monkeypatch):

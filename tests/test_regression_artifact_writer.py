@@ -1,4 +1,9 @@
-from surogate.train.trainer import _flatten_descriptor_summary, _percentile_summary, _summarize_block_schemas
+from surogate.train.trainer import (
+    _flatten_arena_summary,
+    _flatten_descriptor_summary,
+    _percentile_summary,
+    _summarize_block_schemas,
+)
 
 
 def test_percentile_summary_is_stable_for_small_samples():
@@ -45,6 +50,39 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
     assert flattened["matmul_fp4_backward_eligible_ops"] == 2
     assert flattened["moe_fp8_grouped_eligible_ops"] == 4
     assert flattened["moe_fp4_grouped_eligible_ops"] == 6
+
+
+def test_flatten_arena_summary_keeps_top_level_graph_and_region_counts():
+    summary = {
+        "arenas_allocated": True,
+        "arena_fwd_stack_bytes": 1024,
+        "arena_save_for_bwd_block_bases": [0, 512],
+        "forward": {
+            "num_tensors": 10,
+            "fwd_stack_peak": 2048,
+            "regions": [
+                {"region": "FwdStack", "tid_count": 3, "tid_bytes": 4096},
+                {"region": "SaveForBwd", "tid_count": 1, "tid_bytes": 512},
+            ],
+        },
+        "backward": {
+            "num_tensors": 12,
+            "bwd_stack_peak": 3072,
+            "regions": [],
+        },
+    }
+
+    flattened = _flatten_arena_summary(summary)
+
+    assert flattened["arenas_allocated"] == 1
+    assert flattened["arena_fwd_stack_bytes"] == 1024
+    assert "arena_save_for_bwd_block_bases" not in flattened
+    assert flattened["forward_num_tensors"] == 10
+    assert flattened["forward_fwd_stack_peak"] == 2048
+    assert flattened["forward_region_fwdstack_tid_count"] == 3
+    assert flattened["forward_region_fwdstack_tid_bytes"] == 4096
+    assert flattened["forward_region_saveforbwd_tid_bytes"] == 512
+    assert flattened["backward_bwd_stack_peak"] == 3072
 
 
 def test_summarize_block_schemas_counts_layer_storage_and_distribution():
