@@ -48,6 +48,7 @@
 - [x] Dead TensorRole parity helper and `SUROGATE_TENSOR_ROLE_PARITY` runtime hook removed after call-site migration; remaining classifier diagnostics now describe the old `d_<base>` heuristic explicitly.
 - [x] Schema allocation comparison metrics renamed from `legacy` to `baseline` in runtime debug output, binding output, C++ tests, and tracked regression run artifacts.
 - [x] Follow-up TensorRole migration sweep removed the remaining local runtime classifiers for fused QKV/gate-up slice inference, router projection hook detection, Qwen3.5 MoE gate-up prequant swapping, QLoRA expert field admission, and missing-param debug filtering.
+- [x] Gradient dtype override now uses compiled `TensorKind::ParamGrad` metadata instead of the older `d_<base>` heuristic in the graph compiler; the heuristic remains only as a debug cross-check and in executor split planning where compiled metadata is not available yet.
 
 ### Phase 2 — Op registry descriptor extension — COMPLETE
 

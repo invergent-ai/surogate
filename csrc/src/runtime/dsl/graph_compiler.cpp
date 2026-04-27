@@ -4631,7 +4631,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
 }
 
 // ============================================================================
-// Tensor classification (Phase 0 of the TensorKind rollout)
+// Tensor classification
 // ============================================================================
 //
 // Populates TensorMeta::kind and the base_*_tid fields once at compile time
@@ -4639,8 +4639,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
 // replaces runtime string predicates (base_param_from_grad,
 // should_alias_autodiff_accum_name, etc.) that historically misclassified
 // intermediate gradients as parameter gradients, causing accumulator temps
-// to collide with their base tensor's buffer. Phase 0 only populates data;
-// callers still use the legacy string predicates until Phase 1 flips them.
+// to collide with their base tensor's buffer.
 
 const char* tensor_kind_name(TensorKind k) {
     switch (k) {
@@ -4822,8 +4821,8 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
         graph.tensor_meta[i].role.kind = role_kind_from_tensor_kind(graph.tensor_meta[i].kind);
     }
 
-    // Optional: dump classification on demand for debugging and for comparing
-    // against the legacy string predicates during the rollout.
+    // Optional: dump classification on demand for debugging and for validating
+    // the remaining name-only fallback paths.
     const char* dump_env = std::getenv("SUROGATE_DEBUG_TENSOR_KIND");
     const bool dump_enabled = dump_env && std::string_view(dump_env) != "0";
     if (dump_enabled) {
@@ -4845,7 +4844,7 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
                      counts[static_cast<std::size_t>(TensorKind::Scratch)]);
     }
 
-    // Cross-check: the legacy `base_param_from_grad_heuristic(name)` predicate returns
+    // Cross-check: the older `base_param_from_grad_heuristic(name)` predicate returns
     // Some(base) for ANY name starting with `d_` (after stripping
     // `_from_N`/`_accum_N`). Our classifier returns ParamGrad ONLY when the
     // base is a real parameter. For every tid where the legacy predicate says
@@ -4860,21 +4859,21 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
         for (const auto& [name, id] : graph.tensor_name_to_id) {
             if (id < 0 || static_cast<std::size_t>(id) >= graph.tensor_meta.size()) continue;
             const auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
-            auto legacy = base_param_from_grad_heuristic(name);
-            if (!legacy.has_value()) {
-                // Legacy says "not a gradient name" — classifier should agree
+            auto heuristic = base_param_from_grad_heuristic(name);
+            if (!heuristic.has_value()) {
+                // Heuristic says "not a gradient name" — classifier should agree
                 // (no ParamGrad without a `d_` prefix).
                 if (meta.kind == TensorKind::ParamGrad) {
                     std::fprintf(stderr,
                                  "[classify_tensors][DISAGREE] %s tid=%d kind=ParamGrad "
-                                 "but legacy base_param_from_grad_heuristic returned nullopt\n",
+                                 "but base_param_from_grad_heuristic returned nullopt\n",
                                  name.c_str(),
                                  id);
                     disagreements++;
                 }
                 continue;
             }
-            // The old d_<base> heuristic says this is some parameter grad. The
+            // The d_<base> heuristic says this is some parameter grad. The
             // classifier agrees IFF kind == ParamGrad and base_param_tid
             // resolves to <base>.
             const bool heuristic_is_param_grad_guess = true;
@@ -4889,18 +4888,18 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
                     std::fprintf(stderr,
                                  "[classify_tensors][HEURISTIC_OVERREACH] %s tid=%d "
                                  "heuristic_base=%s but classifier says kind=%s "
-                                 "(would-be silent misroute fixed by Phase 1)\n",
+                                 "(would-be silent misroute fixed by tensor classification)\n",
                                  name.c_str(),
                                  id,
-                                 legacy->c_str(),
+                                 heuristic->c_str(),
                                  tensor_kind_name(meta.kind));
                 }
             }
         }
         if (disagreements > 0) {
             std::fprintf(stderr,
-                         "[classify_tensors] %s: %zu legacy/classifier disagreements "
-                         "(legacy would have misclassified these as ParamGrad)\n",
+                         "[classify_tensors] %s: %zu heuristic/classifier disagreements "
+                         "(heuristic would have misclassified these as ParamGrad)\n",
                          graph.name.c_str(),
                          disagreements);
         }
@@ -6036,19 +6035,6 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                 ref.shape = {Bdim, Tdim, emb_dim};
             }
 
-            // If an explicit gradient dtype override is configured, apply it to parameter gradients.
-            if (mOptions.GradientType.has_value() && ref.is_gradient) {
-                const std::string grad_name = strip_ssa_suffix(ref.name);
-                if (auto base = base_param_from_grad_heuristic(grad_name)) {
-                    if (mWeights.has(*base)) {
-                        ref.dtype = *mOptions.GradientType;
-                        if (const char* env = std::getenv("SUROGATE_DEBUG_GRAD_DTYPE")) {
-                            fprintf(stderr, "[DEBUG_GRAD_DTYPE] %s -> %s\n", ref.name.c_str(), dtype_to_str(ref.dtype));
-                        }
-                    }
-                }
-            }
-
             if (const char* env = std::getenv("SUROGATE_DEBUG_DTYPES")) {
                 const GlobalRole dbg_role = global_role_for_name(strip_ssa_suffix(ref.name));
                 if (dbg_role == GlobalRole::FinalNormOutput || dbg_role == GlobalRole::FinalNormOutFlat) {
@@ -6134,10 +6120,21 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Classify every tensor (ForwardParam / ForwardActivation / ParamGrad /
     // ActivationGrad / AccumTemp / LossInput / Scratch) using authoritative
     // lookups against the parameter store and op producer map. Runtime code
-    // will read TensorMeta::kind instead of string-matching names.
-    // (Phase 0: data-only; callers still use legacy string predicates until
-    // Phase 1 flips them.)
+    // reads TensorMeta::kind instead of string-matching names.
     classify_tensors(result);
+
+    if (mOptions.GradientType.has_value()) {
+        for (auto& cop : result.ops) {
+            for (auto& ref : cop.outputs) {
+                if (!ref.is_gradient || ref.tensor_id < 0) continue;
+                if (!base_param_from_grad_kind(ref.tensor_id, result).has_value()) continue;
+                ref.dtype = *mOptions.GradientType;
+                if (const char* env = std::getenv("SUROGATE_DEBUG_GRAD_DTYPE")) {
+                    fprintf(stderr, "[DEBUG_GRAD_DTYPE] %s -> %s\n", ref.name.c_str(), dtype_to_str(ref.dtype));
+                }
+            }
+        }
+    }
 
     // Derive region assignment. Runs after classify_tensors so
     // TensorMeta::kind is populated.

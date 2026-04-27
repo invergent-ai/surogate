@@ -945,9 +945,8 @@ private:
 
     // Classify every tensor (kind + base_*_tid) by authoritative lookup against
     // the parameter store and the op producer map. Called after
-    // build_tensor_metadata. Replaces ad-hoc string predicates like
-    // base_param_from_grad / should_alias_autodiff_accum_name (Phase 0: data
-    // only; callers still use the legacy predicates until Phase 1 flips them).
+    // build_tensor_metadata. Replaces ad-hoc string predicates for gradient
+    // routing and autodiff accumulator aliasing.
     void classify_tensors(CompiledGraph& graph);
 };
 
