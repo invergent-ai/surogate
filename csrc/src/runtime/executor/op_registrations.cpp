@@ -289,18 +289,103 @@ REGISTER_OP("moe_expert_bias_add_backward", MoEExpertBiasAddBackward, nullptr, :
 REGISTER_OP_METADATA("moe_softmax", MoE, RouterReplicated, 0);
 REGISTER_OP_METADATA("moe_sigmoid", MoE, RouterReplicated, 0);
 REGISTER_OP_METADATA("moe_topk", MoE, RouterReplicated, 0);
-REGISTER_OP_METADATA("moe_permute", MoE, ExpertParallel, 0);
-REGISTER_OP_METADATA("moe_grouped_gemm", MoE, ExpertParallel, 0);
-REGISTER_OP_METADATA("moe_grouped_gemm_gate_up", MoE, ExpertParallel, 0);
-REGISTER_OP_METADATA("moe_grouped_gemm_down", MoE, ExpertParallel, 0);
-REGISTER_OP_METADATA("moe_unpermute", MoE, ExpertParallel, 0);
-REGISTER_OP_METADATA("moe_expert_bias_add", MoE, ExpertParallel, 0);
+REGISTER_OP_DESCRIPTOR_METADATA("moe_permute", MoE, ExpertParallel, NoComm, false, 0, false, true, -1, true, 0);
+REGISTER_OP_DESCRIPTOR_METADATA("moe_grouped_gemm",
+                                MoE,
+                                ExpertParallel,
+                                ExpertParallelRouted,
+                                false,
+                                0,
+                                true,
+                                false,
+                                0,
+                                true,
+                                0);
+REGISTER_OP_DESCRIPTOR_METADATA("moe_grouped_gemm_gate_up",
+                                MoE,
+                                ExpertParallel,
+                                ExpertParallelRouted,
+                                false,
+                                0,
+                                true,
+                                false,
+                                0,
+                                true,
+                                0);
+REGISTER_OP_DESCRIPTOR_METADATA("moe_grouped_gemm_down",
+                                MoE,
+                                ExpertParallel,
+                                ExpertParallelRouted,
+                                false,
+                                0,
+                                true,
+                                false,
+                                0,
+                                true,
+                                0);
+REGISTER_OP_DESCRIPTOR_METADATA("moe_unpermute", MoE, ExpertParallel, NoComm, false, 0, false, true, -1, true, 0);
+REGISTER_OP_DESCRIPTOR_METADATA("moe_expert_bias_add",
+                                MoE,
+                                ExpertParallel,
+                                ExpertParallelRouted,
+                                false,
+                                0,
+                                false,
+                                false,
+                                0,
+                                true,
+                                0);
 
 // Expert parallelism forward + backward
 REGISTER_OP("ep_dispatch", EpDispatch, ::dsl::fwd_ep_dispatch, nullptr);
 REGISTER_OP("ep_dispatch_backward", EpDispatchBackward, nullptr, ::dsl::bwd_ep_dispatch);
 REGISTER_OP("ep_combine", EpCombine, ::dsl::fwd_ep_combine, nullptr);
 REGISTER_OP("ep_combine_backward", EpCombineBackward, nullptr, ::dsl::bwd_ep_combine);
+
+REGISTER_OP_DESCRIPTOR_METADATA("ep_dispatch",
+                                Collective,
+                                ExpertParallel,
+                                AllToAllIn,
+                                true,
+                                0,
+                                false,
+                                true,
+                                -1,
+                                true,
+                                0);
+REGISTER_OP_DESCRIPTOR_METADATA("ep_dispatch_backward",
+                                Collective,
+                                ExpertParallel,
+                                AllToAllOut,
+                                true,
+                                0,
+                                false,
+                                true,
+                                -1,
+                                true,
+                                0);
+REGISTER_OP_DESCRIPTOR_METADATA("ep_combine",
+                                Collective,
+                                ExpertParallel,
+                                AllToAllOut,
+                                true,
+                                0,
+                                false,
+                                true,
+                                -1,
+                                true,
+                                0);
+REGISTER_OP_DESCRIPTOR_METADATA("ep_combine_backward",
+                                Collective,
+                                ExpertParallel,
+                                AllToAllIn,
+                                true,
+                                0,
+                                false,
+                                true,
+                                -1,
+                                true,
+                                0);
 
 // Mamba/SSM forward + backward
 REGISTER_OP("mamba_split_proj", MambaSplitProj, ::dsl::fwd_mamba_split_proj, nullptr);

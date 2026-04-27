@@ -21,6 +21,20 @@ const char* op_semantic_kind_name(OpSemanticKind kind) {
     return "Unknown";
 }
 
+const char* communication_kind_name(CommunicationKind kind) {
+    switch (kind) {
+        case CommunicationKind::NoComm: return "NoComm";
+        case CommunicationKind::AllReduceAfter: return "AllReduceAfter";
+        case CommunicationKind::ReduceScatterAfter: return "ReduceScatterAfter";
+        case CommunicationKind::AllToAllIn: return "AllToAllIn";
+        case CommunicationKind::AllToAllOut: return "AllToAllOut";
+        case CommunicationKind::ExpertParallelRouted: return "ExpertParallelRouted";
+        case CommunicationKind::WeightStreamFromCpu: return "WeightStreamFromCpu";
+        case CommunicationKind::WeightTransferP2P: return "WeightTransferP2P";
+    }
+    return "NoComm";
+}
+
 OpRegistry& OpRegistry::instance() {
     // Meyers singleton. Thread-safe init per C++11; we only write to it
     // during static initialization (REGISTER_OP) before any thread is
@@ -46,6 +60,14 @@ int OpRegistry::register_op(OpDescriptor desc) {
         if (desc.semantic_kind != OpSemanticKind::Unknown) existing.semantic_kind = desc.semantic_kind;
         if (desc.distribution_kind != DistributionKind::Replicated) {
             existing.distribution_kind = desc.distribution_kind;
+        }
+        if (desc.comm_profile.kind != CommunicationKind::NoComm || desc.comm_profile.can_overlap_with_compute ||
+            desc.comm_profile.reduction_priority != 0) {
+            existing.comm_profile = desc.comm_profile;
+        }
+        if (desc.grouped_semantics.is_grouped || desc.grouped_semantics.routes_tokens ||
+            desc.grouped_semantics.expert_dim >= 0 || desc.grouped_semantics.ep_aware) {
+            existing.grouped_semantics = desc.grouped_semantics;
         }
         existing.descriptor_flags |= desc.descriptor_flags;
     }

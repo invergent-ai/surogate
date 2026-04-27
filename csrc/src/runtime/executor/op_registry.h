@@ -13,10 +13,11 @@
 #ifndef SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H
 #define SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H
 
-#include <functional>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "runtime/dsl/graph_compiler.h"
@@ -67,7 +68,32 @@ enum class OpSemanticKind : std::uint8_t {
     Sequence,
 };
 
+enum class CommunicationKind : std::uint8_t {
+    NoComm = 0,
+    AllReduceAfter,
+    ReduceScatterAfter,
+    AllToAllIn,
+    AllToAllOut,
+    ExpertParallelRouted,
+    WeightStreamFromCpu,
+    WeightTransferP2P,
+};
+
+struct CommunicationProfile {
+    CommunicationKind kind = CommunicationKind::NoComm;
+    bool can_overlap_with_compute = false;
+    int reduction_priority = 0;
+};
+
+struct GroupedSemantics {
+    bool is_grouped = false;
+    bool routes_tokens = false;
+    int expert_dim = -1;
+    bool ep_aware = false;
+};
+
 const char* op_semantic_kind_name(OpSemanticKind kind);
+const char* communication_kind_name(CommunicationKind kind);
 
 struct OpDescriptor {
     std::string name;                               // e.g. "embedding", "softmax"
@@ -78,8 +104,61 @@ struct OpDescriptor {
     StackBoundFn stack_bound_fn = nullptr;          // op-internal stack bytes (optional)
     OpSemanticKind semantic_kind = OpSemanticKind::Unknown;
     DistributionKind distribution_kind = DistributionKind::Replicated;
+    CommunicationProfile comm_profile{};
+    GroupedSemantics grouped_semantics{};
     std::uint32_t descriptor_flags = 0;
 };
+
+inline OpDescriptor
+make_dispatch_descriptor(std::string name, CompiledOpType type, OpExecFn forward_fn, OpExecFn backward_fn) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.type = type;
+    desc.forward_fn = forward_fn;
+    desc.backward_fn = backward_fn;
+    return desc;
+}
+
+inline OpDescriptor make_full_descriptor(std::string name,
+                                         CompiledOpType type,
+                                         OpExecFn forward_fn,
+                                         OpExecFn backward_fn,
+                                         AutodiffFn autodiff_fn) {
+    OpDescriptor desc = make_dispatch_descriptor(std::move(name), type, forward_fn, backward_fn);
+    desc.autodiff_fn = std::move(autodiff_fn);
+    return desc;
+}
+
+inline OpDescriptor make_autodiff_descriptor(std::string name, AutodiffFn autodiff_fn) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.autodiff_fn = std::move(autodiff_fn);
+    return desc;
+}
+
+inline OpDescriptor make_stack_bound_descriptor(std::string name, CompiledOpType type, StackBoundFn stack_bound_fn) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.type = type;
+    desc.stack_bound_fn = stack_bound_fn;
+    return desc;
+}
+
+inline OpDescriptor make_metadata_descriptor(std::string name,
+                                             OpSemanticKind semantic_kind,
+                                             DistributionKind distribution_kind,
+                                             CommunicationProfile comm_profile,
+                                             GroupedSemantics grouped_semantics,
+                                             std::uint32_t descriptor_flags) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.semantic_kind = semantic_kind;
+    desc.distribution_kind = distribution_kind;
+    desc.comm_profile = comm_profile;
+    desc.grouped_semantics = grouped_semantics;
+    desc.descriptor_flags = descriptor_flags;
+    return desc;
+}
 
 class OpRegistry {
 public:
@@ -129,7 +208,7 @@ private:
 #define REGISTER_OP(name_str, op_type_enum, fwd_fn, bwd_fn)                   \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) = \
         ::dsl::OpRegistry::instance().register_op(                            \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn, {}})
+            ::dsl::make_dispatch_descriptor(name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn))
 
 // Register an op with forward/backward dispatch AND an autodiff rule.
 // Used by ops whose backward graph is derived by this rule during
@@ -137,7 +216,7 @@ private:
 #define REGISTER_OP_FULL(name_str, op_type_enum, fwd_fn, bwd_fn, autodiff_fn_) \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) =  \
         ::dsl::OpRegistry::instance().register_op(                             \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn, autodiff_fn_})
+            ::dsl::make_full_descriptor(name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn, autodiff_fn_))
 
 // Register an autodiff rule only — for names that don't have a
 // CompiledOpType counterpart (e.g. "softmax", "attention", "identity"
@@ -145,8 +224,7 @@ private:
 // Unknown so it's excluded from the type → descriptor index.
 #define REGISTER_AUTODIFF(name_str, autodiff_fn_)                             \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) = \
-        ::dsl::OpRegistry::instance().register_op(                            \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::Unknown, nullptr, nullptr, autodiff_fn_})
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_autodiff_descriptor(name_str, autodiff_fn_))
 
 // Attach a stack-bound function to an already-registered op. Pairs with a
 // prior REGISTER_OP (typically in op_registrations.cpp): the bound fn lives
@@ -155,19 +233,45 @@ private:
 #define REGISTER_STACK_BOUND(name_str, op_type_enum, stack_fn)                         \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_stack_bound_reg_, __COUNTER__) = \
         ::dsl::OpRegistry::instance().register_op(                                     \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, nullptr, nullptr, {}, stack_fn})
+            ::dsl::make_stack_bound_descriptor(name_str, ::dsl::CompiledOpType::op_type_enum, stack_fn))
 
 // Attach descriptor metadata without changing dispatch/autodiff behavior.
-#define REGISTER_OP_METADATA(name_str, semantic_kind_enum, distribution_kind_enum, flags_)                             \
-    static const int SUROGATE_OP_REG_CONCAT(_surogate_op_meta_reg_, __COUNTER__) =                                     \
-        ::dsl::OpRegistry::instance().register_op(::dsl::OpDescriptor{name_str,                                        \
-                                                                      ::dsl::CompiledOpType::Unknown,                  \
-                                                                      nullptr,                                         \
-                                                                      nullptr,                                         \
-                                                                      {},                                              \
-                                                                      nullptr,                                         \
-                                                                      ::dsl::OpSemanticKind::semantic_kind_enum,       \
-                                                                      ::dsl::DistributionKind::distribution_kind_enum, \
-                                                                      flags_})
+#define REGISTER_OP_DESCRIPTOR_METADATA(name_str,                                                                 \
+                                        semantic_kind_enum,                                                       \
+                                        distribution_kind_enum,                                                   \
+                                        comm_kind_enum,                                                           \
+                                        can_overlap_,                                                             \
+                                        reduction_priority_,                                                      \
+                                        is_grouped_,                                                              \
+                                        routes_tokens_,                                                           \
+                                        expert_dim_,                                                              \
+                                        ep_aware_,                                                                \
+                                        flags_)                                                                   \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_op_meta_reg_, __COUNTER__) =                                \
+        ::dsl::OpRegistry::instance().register_op(                                                                \
+            ::dsl::make_metadata_descriptor(name_str,                                                             \
+                                            ::dsl::OpSemanticKind::semantic_kind_enum,                            \
+                                            ::dsl::DistributionKind::distribution_kind_enum,                      \
+                                            ::dsl::CommunicationProfile{::dsl::CommunicationKind::comm_kind_enum, \
+                                                                        static_cast<bool>(can_overlap_),          \
+                                                                        static_cast<int>(reduction_priority_)},   \
+                                            ::dsl::GroupedSemantics{static_cast<bool>(is_grouped_),               \
+                                                                    static_cast<bool>(routes_tokens_),            \
+                                                                    static_cast<int>(expert_dim_),                \
+                                                                    static_cast<bool>(ep_aware_)},                \
+                                            static_cast<std::uint32_t>(flags_)))
+
+#define REGISTER_OP_METADATA(name_str, semantic_kind_enum, distribution_kind_enum, flags_) \
+    REGISTER_OP_DESCRIPTOR_METADATA(name_str,                                              \
+                                    semantic_kind_enum,                                    \
+                                    distribution_kind_enum,                                \
+                                    NoComm,                                                \
+                                    false,                                                 \
+                                    0,                                                     \
+                                    false,                                                 \
+                                    false,                                                 \
+                                    -1,                                                    \
+                                    false,                                                 \
+                                    flags_)
 
 #endif  // SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H
