@@ -1327,6 +1327,13 @@ DslModel::DslModel(const PretrainedConfig& config,
             gm.train_router = mLoRAConfig->train_router;
         }
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
+        std::vector<std::string> lora_grad_hook_schema_ids(
+            static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));
+        for (const BlockSchemaPlanRecord& record : mBlockSchemaPlanRecords) {
+            if (record.layer < 0 || record.layer >= mModelConfig.NumLayers) continue;
+            lora_grad_hook_schema_ids[static_cast<std::size_t>(record.layer)] = schema_id_for_hook_target(record);
+        }
+        mLoRAGrads->set_schema_hook_registry(&mHookRegistry, std::move(lora_grad_hook_schema_ids));
     }
 
     for (const auto& kv : mModule->hf_mapping) {

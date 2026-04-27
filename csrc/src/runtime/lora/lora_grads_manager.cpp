@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <string>
+#include <string_view>
 
 #include "kernels/kernels.h"
 #include "runtime/core/model_config.h"
+#include "runtime/dsl/hook_registry.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 
@@ -20,6 +23,10 @@ ModularLoRAGradsManager::ModularLoRAGradsManager(const Config& config,
                                                  const std::shared_ptr<TensorAllocator>& allocator)
     : mConfig(config),
       mAllocator(allocator) {
+    if (const char* env = std::getenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH")) {
+        mSchemaHookDispatchEnabled = (std::string_view(env) == "1");
+    }
+
     mFullGrads.config = config.lora_config;
     mShardedGrads.config = config.lora_config;
 
@@ -336,6 +343,12 @@ void ModularLoRAGradsManager::notify_block(int layer_idx, cudaStream_t stream, N
     // No-op for now (reduction batched in end_micro_step).
 }
 
+void ModularLoRAGradsManager::set_schema_hook_registry(const dsl::HookRegistry* registry,
+                                                       std::vector<std::string> schema_ids_by_layer) {
+    mSchemaHookRegistry = registry;
+    mHookSchemaIdsByLayer = std::move(schema_ids_by_layer);
+}
+
 void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm) {
     if (comm.world_size() == 1) return;
     const bool ep_active = comm.ep_enabled();
@@ -413,6 +426,36 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
         // Router LoRA gradients
         all_reduce_layer(block.router);
     }
+    for (int layer = 0; layer < static_cast<int>(mHookSchemaIdsByLayer.size()); ++layer) {
+        dispatch_schema_layer_hooks(layer, stream);
+    }
+}
+
+int ModularLoRAGradsManager::dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream) {
+    if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || layer_idx < 0 ||
+        layer_idx >= static_cast<int>(mHookSchemaIdsByLayer.size())) {
+        return 0;
+    }
+    const std::string& schema_id = mHookSchemaIdsByLayer[static_cast<std::size_t>(layer_idx)];
+    if (schema_id.empty()) {
+        return 0;
+    }
+    int dispatched = 0;
+    for (const dsl::HookRegistration& registration : mSchemaHookRegistry->registrations()) {
+        if (registration.event != dsl::HookEventKind::AfterAllReduce || registration.target.schema_id != schema_id) {
+            continue;
+        }
+        dsl::HookContext context;
+        context.layer_idx = layer_idx;
+        context.target = registration.target;
+        context.event = registration.event;
+        context.stream = stream;
+        if (registration.callback) {
+            registration.callback(context);
+        }
+        ++dispatched;
+    }
+    return dispatched;
 }
 
 }  // namespace modules
