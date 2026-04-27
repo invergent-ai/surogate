@@ -75,6 +75,7 @@
 - [x] FP8 ready flags now expose diagnostic names and map into the `QuantState::FP8Ready` vocabulary without changing execution.
 - [x] Mamba `out_proj` forward/backward matmul delegates now declare dense FP8/FP4 capability and CPU-stream storage compatibility.
 - [x] Regression artifact schema and north-star coverage rows now reserve descriptor-summary/fusion-candidate counts for descriptor-driven reporting.
+- [x] `QuantState` diagnostic names and compiled-graph quant-state tensor counts added for future generic quant routing/reporting.
 
 Local validation status:
 

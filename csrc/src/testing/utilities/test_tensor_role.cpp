@@ -96,6 +96,10 @@ TEST_CASE("FP8 ready flag mapping covers dense matmul quant producers", "[tensor
     REQUIRE(std::string(fp8_ready_flag_name(DslRunState::FP8Ready_Att)) == "AttnOut");
     REQUIRE(quant_state_for_fp8_ready_flag(DslRunState::FP8Ready_None) == QuantState::None);
     REQUIRE(quant_state_for_fp8_ready_flag(DslRunState::FP8Ready_SwiGLU) == QuantState::FP8Ready);
+    REQUIRE(std::string(quant_state_name(QuantState::None)) == "None");
+    REQUIRE(std::string(quant_state_name(QuantState::FP8Pending)) == "FP8Pending");
+    REQUIRE(std::string(quant_state_name(QuantState::FP8Ready)) == "FP8Ready");
+    REQUIRE(std::string(quant_state_name(QuantState::FP4Ready)) == "FP4Ready");
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {
@@ -119,6 +123,12 @@ TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][gr
     REQUIRE(graph.role_for_tensor_id(-1) == nullptr);
     REQUIRE(graph.role_for_tensor_id(2) == nullptr);
     REQUIRE(graph.role_for_name("missing") == nullptr);
+
+    graph.tensor_meta[0].role.quant_state = QuantState::FP8Ready;
+    graph.tensor_meta[1].role.quant_state = QuantState::FP4Ready;
+    REQUIRE(graph.count_tensors_with_quant_state(QuantState::FP8Ready) == 1);
+    REQUIRE(graph.count_tensors_with_quant_state(QuantState::FP4Ready) == 1);
+    REQUIRE(graph.count_tensors_with_quant_state(QuantState::FP8Pending) == 0);
 }
 
 TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]") {

@@ -48,6 +48,16 @@ const char* distribution_kind_name(DistributionKind kind) {
     return "Replicated";
 }
 
+const char* quant_state_name(QuantState state) {
+    switch (state) {
+        case QuantState::None: return "None";
+        case QuantState::FP8Pending: return "FP8Pending";
+        case QuantState::FP8Ready: return "FP8Ready";
+        case QuantState::FP4Ready: return "FP4Ready";
+    }
+    return "None";
+}
+
 TensorRole infer_tensor_role_from_name(std::string_view raw_name, int block_layer) {
     const std::string owned = strip_saved_prefix(raw_name);
     std::string_view name(owned);

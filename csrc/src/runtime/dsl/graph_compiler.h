@@ -669,6 +669,16 @@ struct CompiledGraph {
         return tid >= 0 ? role_for_tensor_id(tid) : nullptr;
     }
 
+    std::size_t count_tensors_with_quant_state(QuantState state) const {
+        std::size_t count = 0;
+        for (const auto& meta : tensor_meta) {
+            if (meta.role.quant_state == state) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     std::size_t count_ops_with_comm(CommunicationKind kind) const {
         std::size_t count = 0;
         for (const auto& op : ops) {

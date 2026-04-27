@@ -98,6 +98,7 @@ struct TensorRole {
 
 const char* tensor_ownership_name(TensorOwnership ownership);
 const char* distribution_kind_name(DistributionKind kind);
+const char* quant_state_name(QuantState state);
 
 /// Conservative month-one classifier used for parity checks. It is intentionally
 /// broader than the final structural role source because it must mirror existing
