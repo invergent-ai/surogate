@@ -42,11 +42,11 @@ bool legacy_is_expert_parallel_grad_name(const std::string& name) {
     return name.find("experts_") != std::string::npos;
 }
 
-bool use_legacy_expert_parallel_grad_route(const std::string& name, const char* context) {
+bool use_expert_parallel_grad_route(const std::string& name, const char* context) {
     const bool legacy_value = legacy_is_expert_parallel_grad_name(name);
     const bool role_value = tensor_role_is_expert_parallel_name(name);
     tensor_role_parity_check(name, legacy_value, role_value, context);
-    return legacy_value;
+    return role_value || legacy_value;
 }
 
 }  // namespace
@@ -376,7 +376,7 @@ void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
     for (auto& kv : mGrads) {
         // EP: expert weight gradients average across DP group only (same experts),
         // everything else (dense, router, norms) averages across all GPUs.
-        if (ep_active && use_legacy_expert_parallel_grad_route(kv.first, "DslGradStore::reduce_all")) {
+        if (ep_active && use_expert_parallel_grad_route(kv.first, "DslGradStore::reduce_all")) {
             comm.all_reduce_avg_dp(kv.second, stream);
         } else {
             comm.all_reduce_avg(kv.second, stream);
@@ -400,7 +400,7 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
 
     // Helper: reduce a single gradient using the appropriate communicator
     auto reduce_one = [&](const std::string& name, Tensor& grad) {
-        if (ep_active && use_legacy_expert_parallel_grad_route(name, "DslGradStore::reduce_all_async")) {
+        if (ep_active && use_expert_parallel_grad_route(name, "DslGradStore::reduce_all_async")) {
             comm.all_reduce_avg_dp(grad, stream);
         } else {
             comm.all_reduce_avg(grad, stream);
@@ -513,7 +513,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         // First pass: reduce dense/router grads via global comm transaction
         bool has_dense = false;
         for (const auto& name : grad_names) {
-            if (!use_legacy_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.has_dense")) {
+            if (!use_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.has_dense")) {
                 has_dense = true;
                 break;
             }
@@ -521,7 +521,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         if (has_dense) {
             comm.begin_transaction(stream);
             for (const auto& name : grad_names) {
-                if (use_legacy_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.dense")) continue;
+                if (use_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.dense")) continue;
                 auto it = mGrads.find(name);
                 if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
                     if (mConfig.shard_gradients) {
@@ -536,7 +536,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
 
         // Second pass: reduce expert grads via DP comm (individual calls)
         for (const auto& name : grad_names) {
-            if (!use_legacy_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.expert")) continue;
+            if (!use_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.expert")) continue;
             auto it = mGrads.find(name);
             if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
                 comm.all_reduce_avg_dp(it->second, stream);

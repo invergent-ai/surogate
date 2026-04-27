@@ -28,14 +28,14 @@ bool is_rope_param(const std::string& name) {
     const bool legacy_value = name.find("rope_freqs") != std::string::npos;
     const bool role_value = tensor_role_is_rope_name(name);
     tensor_role_parity_check(name, legacy_value, role_value, "DslParamStore::is_rope_param");
-    return legacy_value;
+    return role_value || legacy_value;
 }
 
 bool is_router_param(const std::string& name) {
     const bool legacy_value = name.find("router") != std::string::npos;
     const bool role_value = infer_tensor_role_from_name(name).dist.kind == DistributionKind::RouterReplicated;
     tensor_role_parity_check(name, legacy_value, role_value, "DslParamStore::is_router_param");
-    return legacy_value;
+    return role_value || legacy_value;
 }
 
 void augment_shape_env(ShapeEnv& env, const AttrMap& config) {

@@ -37,6 +37,7 @@
 - [x] Expert-parallel grad reduction classification parity added without changing current comm route.
 - [x] DSL stores, matmul MoE predicates, QLoRA expert filters, NorMuon router filters, and MoE expert-bias skip paths wired into role parity.
 - [x] Autodiff MoE side-channel classification centralized through TensorRole helpers.
+- [x] Param-store RoPE/router filtering and grad-store expert-parallel reduction routing now consume TensorRole-derived classifications with legacy string fallback retained.
 
 ### Phase 2 — Op registry descriptor extension — COMPLETE
 
