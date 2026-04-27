@@ -55,6 +55,7 @@ struct BlockSchemaSlotSummary {
     std::vector<long> resolved_shape;
     long resolved_numel = 0;
     long resolved_bytes = 0;
+    long resolved_local_bytes = 0;
     bool grouped = false;
     bool save_for_backward = false;
     int streaming_prefetch_distance = -1;
@@ -124,6 +125,11 @@ struct BlockSchemaLayerSummary {
     int resolved_activation_shape_slots = 0;
     int unresolved_activation_shape_slots = 0;
     long resolved_activation_shape_bytes = 0;
+    int resolved_param_shape_slots = 0;
+    int unresolved_param_shape_slots = 0;
+    int expert_parallel_param_slots = 0;
+    long resolved_param_shape_bytes = 0;
+    long resolved_param_shape_local_bytes = 0;
     std::vector<BlockSchemaSlotSummary> slots;
     std::string routing_kind;
     int routing_topk = -1;
@@ -215,6 +221,11 @@ struct BufferPlan {
     int schema_resolved_activation_shape_slots = 0;
     int schema_unresolved_activation_shape_slots = 0;
     long schema_resolved_activation_shape_bytes = 0;
+    int schema_resolved_param_shape_slots = 0;
+    int schema_unresolved_param_shape_slots = 0;
+    int schema_expert_parallel_param_slots = 0;
+    long schema_resolved_param_shape_bytes = 0;
+    long schema_resolved_param_shape_local_bytes = 0;
     int schema_scoring_bias_routing_layers = 0;
     int schema_shared_expert_routing_layers = 0;
     int schema_weight_transfer_layers = 0;
@@ -238,6 +249,7 @@ struct BufferPlan {
     long MoeMUp = 0;
     long NumExperts = 0;
     long TopK = 0;
+    int EPSize = 1;
 
     int NumLayers = 0;
 

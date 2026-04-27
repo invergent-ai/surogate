@@ -67,6 +67,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
                     "name": "qkv_weight",
                     "kind": "param",
                     "residency": "gpu",
+                    "shape": ["QKV", "C"],
                     "distribution": {"kind": "replicated"}
                   },
                   {
@@ -228,7 +229,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     cfg.IntermediateSize = 16;
     cfg.NumLayers = 1;
     dsl::DslRuntimeConfig runtime_config;
+    runtime_config.num_experts = 4;
     RuntimeOptions options;
+    options.EPSize = 2;
     dsl::TensorSlotRegistry registry;
     const auto plan = dsl::BufferPlan::build(cfg,
                                              runtime_config,
@@ -265,6 +268,11 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_resolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_unresolved_activation_shape_slots == 0);
     REQUIRE(plan.schema_resolved_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_resolved_param_shape_slots == 2);
+    REQUIRE(plan.schema_unresolved_param_shape_slots == 0);
+    REQUIRE(plan.schema_expert_parallel_param_slots == 1);
+    REQUIRE(plan.schema_resolved_param_shape_bytes == 2304);
+    REQUIRE(plan.schema_resolved_param_shape_local_bytes == 1280);
     REQUIRE(plan.schema_scoring_bias_routing_layers == 0);
     REQUIRE(plan.schema_shared_expert_routing_layers == 0);
     REQUIRE(plan.schema_weight_transfer_layers == 0);
@@ -289,9 +297,17 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].resolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_layers[0].unresolved_activation_shape_slots == 0);
     REQUIRE(plan.schema_layers[0].resolved_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_layers[0].resolved_param_shape_slots == 2);
+    REQUIRE(plan.schema_layers[0].unresolved_param_shape_slots == 0);
+    REQUIRE(plan.schema_layers[0].expert_parallel_param_slots == 1);
+    REQUIRE(plan.schema_layers[0].resolved_param_shape_bytes == 2304);
+    REQUIRE(plan.schema_layers[0].resolved_param_shape_local_bytes == 1280);
     REQUIRE(plan.schema_layers[0].slots.size() == 3);
     REQUIRE(plan.schema_layers[0].slots[1].name == "experts_gate_up");
     REQUIRE(plan.schema_layers[0].slots[1].shape_dims == std::vector<std::string>{"E", "2M", "C"});
+    REQUIRE(plan.schema_layers[0].slots[1].resolved_shape == std::vector<long>{4, 32, 8});
+    REQUIRE(plan.schema_layers[0].slots[1].resolved_bytes == 2048);
+    REQUIRE(plan.schema_layers[0].slots[1].resolved_local_bytes == 1024);
     REQUIRE(plan.schema_layers[0].slots[2].shape_resolved);
     REQUIRE(plan.schema_layers[0].slots[2].resolved_shape == std::vector<long>{2, 3, 8});
     REQUIRE(plan.schema_layers[0].slots[2].resolved_numel == 48);

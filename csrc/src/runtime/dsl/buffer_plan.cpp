@@ -418,6 +418,7 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
 
     p.NumExperts = runtime_config.num_experts;
     p.TopK = (runtime_config.num_experts_per_tok > 0) ? runtime_config.num_experts_per_tok : 1;
+    p.EPSize = std::max(options.EPSize, 1);
     p.MoeM = (runtime_config.moe_intermediate_size > 0) ? runtime_config.moe_intermediate_size : cfg.IntermediateSize;
     p.MoeMUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * p.MoeM;
     p.use_qk_norm = runtime_config.use_qk_norm;
@@ -520,11 +521,32 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
         for (auto& slot : layer.slots) {
             const bool resolved = resolve_schema_slot_shape(p, layer, slot);
             if (slot.kind == "param") {
+                if (slot.distribution_kind == "expert_parallel") {
+                    ++layer.expert_parallel_param_slots;
+                    ++p.schema_expert_parallel_param_slots;
+                }
+                if (resolved) {
+                    slot.resolved_bytes =
+                        slot.resolved_numel * static_cast<long>(get_dtype_size(schema_slot_dtype(p, slot)));
+                    slot.resolved_local_bytes = (slot.distribution_kind == "expert_parallel" && p.EPSize > 1)
+                                                    ? (slot.resolved_bytes / static_cast<long>(p.EPSize))
+                                                    : slot.resolved_bytes;
+                    ++layer.resolved_param_shape_slots;
+                    ++p.schema_resolved_param_shape_slots;
+                    layer.resolved_param_shape_bytes += slot.resolved_bytes;
+                    p.schema_resolved_param_shape_bytes += slot.resolved_bytes;
+                    layer.resolved_param_shape_local_bytes += slot.resolved_local_bytes;
+                    p.schema_resolved_param_shape_local_bytes += slot.resolved_local_bytes;
+                } else {
+                    ++layer.unresolved_param_shape_slots;
+                    ++p.schema_unresolved_param_shape_slots;
+                }
                 continue;
             }
             if (resolved) {
                 slot.resolved_bytes =
                     slot.resolved_numel * static_cast<long>(get_dtype_size(schema_slot_dtype(p, slot)));
+                slot.resolved_local_bytes = slot.resolved_bytes;
                 ++layer.resolved_activation_shape_slots;
                 ++p.schema_resolved_activation_shape_slots;
                 layer.resolved_activation_shape_bytes += slot.resolved_bytes;
