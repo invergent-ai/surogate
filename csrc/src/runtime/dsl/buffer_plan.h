@@ -260,6 +260,9 @@ struct BufferPlan {
     int schema_expert_parallel_param_slots = 0;
     long schema_resolved_param_shape_bytes = 0;
     long schema_resolved_param_shape_local_bytes = 0;
+    long schema_expert_parallel_param_shape_bytes = 0;
+    long schema_expert_parallel_param_shape_local_bytes = 0;
+    long schema_expert_parallel_param_shape_savings_bytes = 0;
     int schema_scoring_bias_routing_layers = 0;
     int schema_shared_expert_routing_layers = 0;
     int schema_weight_transfer_layers = 0;

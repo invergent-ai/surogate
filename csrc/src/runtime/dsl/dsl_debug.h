@@ -220,6 +220,9 @@ struct DebugBufferPlanSummary {
     std::uint64_t schema_expert_parallel_param_slots = 0;
     std::uint64_t schema_resolved_param_shape_bytes = 0;
     std::uint64_t schema_resolved_param_shape_local_bytes = 0;
+    std::uint64_t schema_expert_parallel_param_shape_bytes = 0;
+    std::uint64_t schema_expert_parallel_param_shape_local_bytes = 0;
+    std::uint64_t schema_expert_parallel_param_shape_savings_bytes = 0;
 };
 
 //! One pair of overlapping `(region, block_layer_idx, offset, bytes)` ranges

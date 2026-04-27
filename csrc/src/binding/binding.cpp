@@ -2080,6 +2080,10 @@ NB_MODULE(_surogate, m) {
                 d["schema_expert_parallel_param_slots"] = s.schema_expert_parallel_param_slots;
                 d["schema_resolved_param_shape_bytes"] = s.schema_resolved_param_shape_bytes;
                 d["schema_resolved_param_shape_local_bytes"] = s.schema_resolved_param_shape_local_bytes;
+                d["schema_expert_parallel_param_shape_bytes"] = s.schema_expert_parallel_param_shape_bytes;
+                d["schema_expert_parallel_param_shape_local_bytes"] = s.schema_expert_parallel_param_shape_local_bytes;
+                d["schema_expert_parallel_param_shape_savings_bytes"] =
+                    s.schema_expert_parallel_param_shape_savings_bytes;
                 return d;
             },
             "BufferPlan schema/allocation diagnostics suitable for regression artifacts.")

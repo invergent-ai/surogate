@@ -304,6 +304,9 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     s.schema_expert_parallel_param_slots = u64(p.schema_expert_parallel_param_slots);
     s.schema_resolved_param_shape_bytes = u64(p.schema_resolved_param_shape_bytes);
     s.schema_resolved_param_shape_local_bytes = u64(p.schema_resolved_param_shape_local_bytes);
+    s.schema_expert_parallel_param_shape_bytes = u64(p.schema_expert_parallel_param_shape_bytes);
+    s.schema_expert_parallel_param_shape_local_bytes = u64(p.schema_expert_parallel_param_shape_local_bytes);
+    s.schema_expert_parallel_param_shape_savings_bytes = u64(p.schema_expert_parallel_param_shape_savings_bytes);
     return s;
 }
 

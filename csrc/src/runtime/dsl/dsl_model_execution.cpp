@@ -331,6 +331,12 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             << ", block_schema_resolved_param_shape_bytes=" << initial_plan.schema_resolved_param_shape_bytes
             << ", block_schema_resolved_param_shape_local_bytes="
             << initial_plan.schema_resolved_param_shape_local_bytes
+            << ", block_schema_expert_parallel_param_shape_bytes="
+            << initial_plan.schema_expert_parallel_param_shape_bytes
+            << ", block_schema_expert_parallel_param_shape_local_bytes="
+            << initial_plan.schema_expert_parallel_param_shape_local_bytes
+            << ", block_schema_expert_parallel_param_shape_savings_bytes="
+            << initial_plan.schema_expert_parallel_param_shape_savings_bytes
             << ", block_schema_scoring_bias_layers=" << initial_plan.schema_scoring_bias_routing_layers
             << ", block_schema_shared_expert_layers=" << initial_plan.schema_shared_expert_routing_layers
             << ", block_schema_weight_transfer_layers=" << initial_plan.schema_weight_transfer_layers

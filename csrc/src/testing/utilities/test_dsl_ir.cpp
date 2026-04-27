@@ -301,6 +301,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_expert_parallel_param_slots == 1);
     REQUIRE(plan.schema_resolved_param_shape_bytes == 2304);
     REQUIRE(plan.schema_resolved_param_shape_local_bytes == 1280);
+    REQUIRE(plan.schema_expert_parallel_param_shape_bytes == 2048);
+    REQUIRE(plan.schema_expert_parallel_param_shape_local_bytes == 1024);
+    REQUIRE(plan.schema_expert_parallel_param_shape_savings_bytes == 1024);
     REQUIRE(plan.schema_scoring_bias_routing_layers == 0);
     REQUIRE(plan.schema_shared_expert_routing_layers == 0);
     REQUIRE(plan.schema_weight_transfer_layers == 0);

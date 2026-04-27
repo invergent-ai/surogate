@@ -609,6 +609,10 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                     p.schema_resolved_param_shape_bytes += slot.resolved_bytes;
                     layer.resolved_param_shape_local_bytes += slot.resolved_local_bytes;
                     p.schema_resolved_param_shape_local_bytes += slot.resolved_local_bytes;
+                    if (slot.distribution_kind == "expert_parallel") {
+                        p.schema_expert_parallel_param_shape_bytes += slot.resolved_bytes;
+                        p.schema_expert_parallel_param_shape_local_bytes += slot.resolved_local_bytes;
+                    }
                 } else {
                     ++layer.unresolved_param_shape_slots;
                     ++p.schema_unresolved_param_shape_slots;
@@ -689,6 +693,8 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
         p.schema_activation_shape_savings_bytes =
             std::max(0L, p.schema_legacy_max_activation_shape_bytes - p.schema_resolved_activation_shape_bytes);
     }
+    p.schema_expert_parallel_param_shape_savings_bytes =
+        std::max(0L, p.schema_expert_parallel_param_shape_bytes - p.schema_expert_parallel_param_shape_local_bytes);
 
     // ---------------- FFN temps on stack ----------------
     // Only safe when both mlp_up and swiglu are recomputable — otherwise the

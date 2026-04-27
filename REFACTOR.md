@@ -151,16 +151,18 @@
 - [x] Qwen3-VL dense text blocks now declare Phase 4 schema metadata for MRoPE/QK-norm activation slots with compile-time slot/save parity coverage.
 - [x] No-GPU schema coverage now fails if any Python block class lacks a `BlockSchema` declaration.
 - [x] `BufferPlan` now resolves Nemotron/Mamba schema dimension aliases (`P`, `I`, `D_conv`, `H`, `D`, `N`) from DSL runtime config.
+- [x] `BufferPlan` now reports explicit expert-parallel parameter global/local/savings bytes, exposing the per-rank allocation target separately from replicated parameter bytes.
 
 Local validation status:
 
 - [x] `make wheel-dev` passed.
 - [x] `make test-integration` passed after the unit-gate cleanup.
-- [x] Focused C++ gates passed: `[op_registry]`, `[fusion_rule]`, `[tensor_role]`, `[moe]`; latest `[op_registry],[tensor_role]` pass was 292 assertions across 11 cases.
+- [x] Focused C++ gates passed: `[op_registry]`, `[fusion_rule]`, `[tensor_role]`, `[moe]`; latest DSL IR schema-allocation pass was 235 assertions in 1 case after adding EP param byte accounting.
 - [x] Primitive DSL compiled-op golden gate passed after preserving standalone backward graph outputs across last-use pruning and final stack cleanup.
 - [x] `make test-unit` passed; FP32 flash-attention standalone/module goldens are explicitly skipped where no registered production attention backend supports that dtype.
 - [x] `make regression-smoke` passed.
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py tests/test_regression_baseline_runner.py tests/test_regression_artifact_writer.py --no-gpu` with 49 tests.
+- [x] Schema/regression Python gate passed via `uv run pytest -q tests/test_block_schema.py tests/test_regression_artifact_writer.py tests/test_regression_baseline_runner.py --no-gpu` with 46 tests after the EP allocation-accounting debug surface update.
 - [x] GPU acceptance rows exercised locally for the real-model queue below; runner uses Hugging Face model IDs from configs by default, with `*_MODEL_PATH` only as optional local/offline overrides.
 - [x] Real-model GPU acceptance default shortened to 5 steps for practical iteration; longer convergence runs remain opt-in via `--steps`/`STEPS`.
 - [x] Direct real-model run passed for [`qwen3-lora-fp8.yaml`](examples/sft/qwen3/qwen3-lora-fp8.yaml) on 2026-04-27 with `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1`; 28/28 schema records present, zero missing schema activation slots, save-for-backward schema parity clean, arena summary captured, loss moved `2.0824 -> 1.4174`, artifact saved to `regression_baselines/runs/qwen3-lora-fp8-direct-20260427.json`, log `output/log-continued-stopcodon-20260427-065012.json`.
