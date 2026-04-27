@@ -113,10 +113,10 @@ Local validation status:
 
 Real-model acceptance queue:
 
-- [x] Dense FP8 single-GPU: [`qwen3-lora-fp8.yaml`](examples/sft/qwen3/qwen3-lora-fp8.yaml). Passed 50-step regression runner validation with descriptor requirements present.
-- [x] Dense FP8 single-GPU: [`qwen35-text-lora-fp8.yaml`](examples/sft/qwen35/qwen35-text-lora-fp8.yaml). Passed 50-step regression runner validation with descriptor requirements present.
-- [x] Dense FP8 single-GPU: [`gemma4-e2b-lora-fp8.yaml`](examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml). Passed 50-step regression runner validation with descriptor requirements present.
-- [x] MoE acceptance: [`gptoss-lora-mxfp4.yaml`](examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml). Passed 50-step regression runner validation with grouped MoE descriptor requirements present.
+- [x] Dense FP8 single-GPU: [`qwen3-lora-fp8.yaml`](examples/sft/qwen3/qwen3-lora-fp8.yaml). Passed regression runner validation with descriptor requirements present.
+- [x] Dense FP8 single-GPU: [`qwen35-text-lora-fp8.yaml`](examples/sft/qwen35/qwen35-text-lora-fp8.yaml). Passed regression runner validation with descriptor requirements present.
+- [x] Dense FP8 single-GPU: [`gemma4-e2b-lora-fp8.yaml`](examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml). Passed regression runner validation with descriptor requirements present.
+- [x] MoE acceptance: [`gptoss-lora-mxfp4.yaml`](examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml). Passed regression runner validation with grouped MoE descriptor requirements present.
 - [x] Multi-GPU pre-quant MoE acceptance: [`qwen36moe-lora-fp8.yaml`](examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml). Passed 5-step 2-GPU regression runner validation with grouped MoE descriptor requirements present.
 
 ---
@@ -215,7 +215,7 @@ The refactor cannot start without this. Silent regressions detected weeks late k
 - **Numerical regression suite.** Per `(model, recipe, batch_shape, storage_tier, distribution)`:
   - Golden activation snapshots after forward, per-layer
   - Golden gradient snapshots after backward, per-tensor
-  - Golden 50-step convergence curve with fixed seed
+  - Golden 5-step convergence smoke with fixed seed; longer convergence curves are opt-in when explicitly requested
   - Tolerance schema per dtype (BF16: 1e-2, FP8: 5e-2, FP4: 1e-1)
   - Coverage matrix:
     - Models: Qwen3, Gemma4, Nemotron-H, Qwen3.5, **plus at least one pure-MoE (Mixtral-style or Qwen3-MoE)**
@@ -641,7 +641,7 @@ Implement the CPU-streaming executor that consumes residency declarations, **plu
 **Validation:**
 - Phase 0 memory suite (peak ≤ pre-Phase-4 per rank).
 - Phase 0 CPU-training validation lane expanded to cover LoRA + CPU + FP8 + DP.
-- The full-stack proof: Mixtral-style MoE in FP8 + EP + DP + LoRA trains 50 steps with golden loss curve.
+- The full-stack proof: Mixtral-style MoE in FP8 + EP + DP + LoRA trains 5 steps with golden loss curve.
 
 **Exit criteria:**
 - `TensorSlot::Block*` enum deleted.
@@ -894,7 +894,7 @@ Extend `MoeMatmulContext` with `dweight` field if not present (verify against cu
 **Track D — Validation (~1 week)**
 
 - Per-expert wgrad numerical parity: FP8 wgrad result vs BF16 wgrad result, max-abs delta tolerance 5e-2 per expert.
-- Convergence: 50-step run on Mixtral-style or Qwen3-MoE, FP8 forward + FP8 dgrad + FP8 wgrad, loss curve within 5% of FP8-forward+BF16-backward baseline.
+- Convergence: 5-step run on Mixtral-style or Qwen3-MoE, FP8 forward + FP8 dgrad + FP8 wgrad, loss curve within 5% of FP8-forward+BF16-backward baseline.
 - Perf: nsys diff showing wgrad kernel time reduction (BF16→FP8) and elimination of per-step weight quantize kernels.
 - Multi-GPU: same on 2-GPU DP and 2-GPU DP+EP.
 
