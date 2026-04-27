@@ -176,6 +176,18 @@ namespace {
         out = 2 * plan.LinearKeyHeads * plan.LinearKeyDim + plan.LinearValueHeads * plan.LinearValueDim;
     } else if (token == "PLI_D") {
         out = plan.PerLayerInputDim;
+    } else if (token == "P") {
+        out = plan.MambaProjSize;
+    } else if (token == "I") {
+        out = plan.MambaIntermediate;
+    } else if (token == "D_conv") {
+        out = plan.MambaConvDim;
+    } else if (token == "H") {
+        out = plan.MambaHeads;
+    } else if (token == "D") {
+        out = plan.MambaHeadDim;
+    } else if (token == "N") {
+        out = plan.MambaStateSize;
     } else {
         return false;
     }
@@ -462,6 +474,13 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.LinearKeyDim = runtime_config.linear_key_head_dim;
     p.LinearValueDim = runtime_config.linear_value_head_dim;
     p.PerLayerInputDim = runtime_config.d_per_layer_input;
+    p.MambaHeads = runtime_config.mamba_num_heads;
+    p.MambaHeadDim = runtime_config.mamba_head_dim;
+    p.MambaStateSize = runtime_config.ssm_state_size;
+    p.MambaGroups = runtime_config.n_groups;
+    p.MambaIntermediate = p.MambaHeads * p.MambaHeadDim;
+    p.MambaConvDim = p.MambaIntermediate + 2 * p.MambaGroups * p.MambaStateSize;
+    p.MambaProjSize = p.MambaIntermediate + p.MambaConvDim + p.MambaHeads;
     p.MoeM = (runtime_config.moe_intermediate_size > 0) ? runtime_config.moe_intermediate_size : cfg.IntermediateSize;
     p.MoeMUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * p.MoeM;
     p.use_qk_norm = runtime_config.use_qk_norm;

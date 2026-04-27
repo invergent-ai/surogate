@@ -149,6 +149,10 @@ struct DslConfigView {
     std::optional<long> linear_num_key_heads;
     std::optional<long> linear_num_value_heads;
     std::optional<long> d_per_layer_input;
+    std::optional<long> mamba_num_heads;
+    std::optional<long> mamba_head_dim;
+    std::optional<long> ssm_state_size;
+    std::optional<long> n_groups;
     std::optional<std::string> hybrid_pattern;
     std::optional<double> routed_scaling_factor;
     std::optional<std::string> mlp_activation;
@@ -291,6 +295,10 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.linear_num_value_heads = get_long_attr(cfg, "linear_num_value_heads");
     view.d_per_layer_input = get_long_attr(cfg, "d_per_layer_input");
     if (!view.d_per_layer_input) view.d_per_layer_input = get_long_attr(cfg, "hidden_size_per_layer_input");
+    view.mamba_num_heads = get_long_attr(cfg, "mamba_num_heads");
+    view.mamba_head_dim = get_long_attr(cfg, "mamba_head_dim");
+    view.ssm_state_size = get_long_attr(cfg, "ssm_state_size");
+    view.n_groups = get_long_attr(cfg, "n_groups");
     view.hybrid_pattern = get_string_attr(cfg, "hybrid_pattern");
     view.routed_scaling_factor = get_double_attr(cfg, "routed_scaling_factor");
     view.mlp_activation = get_string_attr(cfg, "mlp_activation");
@@ -329,6 +337,10 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     runtime.linear_num_key_heads = static_cast<int>(view.linear_num_key_heads.value_or(0));
     runtime.linear_num_value_heads = static_cast<int>(view.linear_num_value_heads.value_or(0));
     runtime.d_per_layer_input = static_cast<int>(view.d_per_layer_input.value_or(0));
+    runtime.mamba_num_heads = static_cast<int>(view.mamba_num_heads.value_or(0));
+    runtime.mamba_head_dim = static_cast<int>(view.mamba_head_dim.value_or(0));
+    runtime.ssm_state_size = static_cast<int>(view.ssm_state_size.value_or(0));
+    runtime.n_groups = static_cast<int>(view.n_groups.value_or(0));
 
     if (view.moe_intermediate_size.has_value()) {
         runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());

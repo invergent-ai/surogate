@@ -150,6 +150,7 @@
 - [x] LLaMA dense blocks now declare Phase 4 schema metadata with compile-time slot/save parity coverage.
 - [x] Qwen3-VL dense text blocks now declare Phase 4 schema metadata for MRoPE/QK-norm activation slots with compile-time slot/save parity coverage.
 - [x] No-GPU schema coverage now fails if any Python block class lacks a `BlockSchema` declaration.
+- [x] `BufferPlan` now resolves Nemotron/Mamba schema dimension aliases (`P`, `I`, `D_conv`, `H`, `D`, `N`) from DSL runtime config.
 
 Local validation status:
 

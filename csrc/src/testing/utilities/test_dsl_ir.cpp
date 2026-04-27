@@ -242,6 +242,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     runtime_config.linear_num_key_heads = 4;
     runtime_config.linear_num_value_heads = 8;
     runtime_config.d_per_layer_input = 12;
+    runtime_config.mamba_num_heads = 8;
+    runtime_config.mamba_head_dim = 32;
+    runtime_config.ssm_state_size = 16;
+    runtime_config.n_groups = 4;
     RuntimeOptions options;
     options.EPSize = 2;
     dsl::TensorSlotRegistry registry;
@@ -397,9 +401,37 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     dispatched_slot.shape_dims = {"dispatched_tokens", "C"};
     dispatched_slot.shape_rank = 2;
     alias_records[0].slots.push_back(dispatched_slot);
-    alias_records[0].slot_count = 7;
+    dsl::BlockSchemaSlotSummary mamba_projected_slot;
+    mamba_projected_slot.name = "projected";
+    mamba_projected_slot.kind = "activation";
+    mamba_projected_slot.distribution_kind = "replicated";
+    mamba_projected_slot.shape_dims = {"B", "T", "P"};
+    mamba_projected_slot.shape_rank = 3;
+    alias_records[0].slots.push_back(mamba_projected_slot);
+    dsl::BlockSchemaSlotSummary mamba_hidden_slot;
+    mamba_hidden_slot.name = "hidden_states";
+    mamba_hidden_slot.kind = "activation";
+    mamba_hidden_slot.distribution_kind = "replicated";
+    mamba_hidden_slot.shape_dims = {"B", "I", "T"};
+    mamba_hidden_slot.shape_rank = 3;
+    alias_records[0].slots.push_back(mamba_hidden_slot);
+    dsl::BlockSchemaSlotSummary mamba_conv_slot;
+    mamba_conv_slot.name = "conv_out";
+    mamba_conv_slot.kind = "activation";
+    mamba_conv_slot.distribution_kind = "replicated";
+    mamba_conv_slot.shape_dims = {"B", "D_conv", "T"};
+    mamba_conv_slot.shape_rank = 3;
+    alias_records[0].slots.push_back(mamba_conv_slot);
+    dsl::BlockSchemaSlotSummary mamba_state_slot;
+    mamba_state_slot.name = "ssm_state";
+    mamba_state_slot.kind = "activation";
+    mamba_state_slot.distribution_kind = "replicated";
+    mamba_state_slot.shape_dims = {"B", "H", "D", "N"};
+    mamba_state_slot.shape_rank = 4;
+    alias_records[0].slots.push_back(mamba_state_slot);
+    alias_records[0].slot_count = 11;
     alias_records[0].param_slots = 4;
-    alias_records[0].activation_slots = 3;
+    alias_records[0].activation_slots = 7;
     const auto alias_plan = dsl::BufferPlan::build(cfg,
                                                    runtime_config,
                                                    options,
@@ -417,6 +449,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(alias_plan.schema_layers[0].slots[4].resolved_shape == std::vector<long>{2, 384, 4});
     REQUIRE(alias_plan.schema_layers[0].slots[5].resolved_shape == std::vector<long>{2, 3, 12});
     REQUIRE(alias_plan.schema_layers[0].slots[6].shape_dynamic);
+    REQUIRE(alias_plan.schema_layers[0].slots[7].resolved_shape == std::vector<long>{2, 3, 648});
+    REQUIRE(alias_plan.schema_layers[0].slots[8].resolved_shape == std::vector<long>{2, 256, 3});
+    REQUIRE(alias_plan.schema_layers[0].slots[9].resolved_shape == std::vector<long>{2, 384, 3});
+    REQUIRE(alias_plan.schema_layers[0].slots[10].resolved_shape == std::vector<long>{2, 8, 32, 16});
     REQUIRE(alias_plan.schema_dynamic_activation_shape_slots == 1);
     REQUIRE(alias_plan.schema_unresolved_activation_shape_slots == 1);
 

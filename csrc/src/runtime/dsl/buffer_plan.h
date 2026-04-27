@@ -290,6 +290,13 @@ struct BufferPlan {
     long LinearKeyDim = 0;
     long LinearValueDim = 0;
     long PerLayerInputDim = 0;
+    long MambaHeads = 0;
+    long MambaHeadDim = 0;
+    long MambaStateSize = 0;
+    long MambaGroups = 0;
+    long MambaIntermediate = 0;
+    long MambaConvDim = 0;
+    long MambaProjSize = 0;
 
     int NumLayers = 0;
 

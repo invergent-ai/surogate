@@ -42,6 +42,10 @@ struct DslRuntimeConfig {
     int linear_num_key_heads = 0;
     int linear_num_value_heads = 0;
     int d_per_layer_input = 0;
+    int mamba_num_heads = 0;
+    int mamba_head_dim = 0;
+    int ssm_state_size = 0;
+    int n_groups = 0;
 
     /// Per-layer dimensions. Empty for homogeneous models (use global config).
     std::vector<BlockTypeDims> per_layer_dims;
