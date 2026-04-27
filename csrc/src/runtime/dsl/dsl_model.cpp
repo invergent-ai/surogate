@@ -1154,7 +1154,16 @@ DslModel::DslModel(const PretrainedConfig& config,
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::BeforeConsume)) {
-            mHookRegistry.on_before_consume(target, "schema_prefetch");
+            mHookRegistry.on_before_consume(target, "schema_prefetch", [](HookContext& context) {
+                auto* payload = static_cast<BeforeConsumeHookPayload*>(context.payload);
+                if (!payload || payload->current_layer_handled || payload->capturing || !payload->weight_manager ||
+                    !payload->comm || !payload->weight_manager->needs_block_gather()) {
+                    return;
+                }
+                payload->weight_manager->gather_block(context.layer_idx, *payload->comm, payload->prefetch_stream);
+                payload->weight_manager->wait_for_gather(context.layer_idx, payload->wait_stream);
+                payload->current_layer_handled = true;
+            });
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllToAll)) {

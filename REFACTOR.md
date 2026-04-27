@@ -218,6 +218,7 @@ Real-model acceptance queue:
 - [x] LoRA gradient zeroing and reduction now use the same structural target iterator; EP-active expert adapters still reduce over the DP group only, while dense/shared/router adapters keep the existing full-world reduction route.
 - [x] Legacy LoRA optimizer-state zeroing now uses the structural target iterator as well; PEFT-compatible export naming remains explicit.
 - [x] Regression/runtime artifacts now record whether schema hook dispatch was enabled for the run, so opt-in hook-boundary validation is visible alongside hook target and registration counts.
+- [x] `before_consume` schema hooks now carry a typed prefetch payload and can own the current-layer `DslWeightManager::gather_block` / `wait_for_gather` path under `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=1`; the legacy imperative path remains the default and fallback.
 
 ---
 

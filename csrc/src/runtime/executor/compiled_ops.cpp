@@ -1015,9 +1015,16 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
-    dispatch_schema_layer_hooks(HookEventKind::BeforeConsume, layer_idx);
+    BeforeConsumeHookPayload before_consume_payload;
+    before_consume_payload.weight_manager = mWeightManager;
+    before_consume_payload.comm = mComm;
+    before_consume_payload.prefetch_stream = mRunState.side_stream();
+    before_consume_payload.wait_stream = mRunState.MainStream;
+    before_consume_payload.capturing = mCapturing;
+    dispatch_schema_layer_hooks(HookEventKind::BeforeConsume, layer_idx, &before_consume_payload);
 
-    if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
+    if (!before_consume_payload.current_layer_handled && mWeightManager && mWeightManager->needs_block_gather() &&
+        !mCapturing) {
         // Ensure the current layer's weights are present in a prefetch slot.
         // For strict-reverse backward orders (Q3 pure attention), the prior
         // layer_start's prefetch already did this and gather_block(layer_idx)

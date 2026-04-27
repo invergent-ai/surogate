@@ -662,5 +662,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(hook_registry.dispatch(hook_ctx) == 2);
     REQUIRE(callback_count == 2);
 
+    dsl::BeforeConsumeHookPayload before_consume_payload;
+    before_consume_payload.capturing = true;
+    hook_ctx.payload = &before_consume_payload;
+    REQUIRE(static_cast<dsl::BeforeConsumeHookPayload*>(hook_ctx.payload)->capturing);
+
     REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
 }

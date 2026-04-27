@@ -1,12 +1,11 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Phase 5 inert hook registry scaffold.
+// Phase 5 schema hook registry scaffold.
 //
 // Hooks are declared against structural block-schema slots instead of legacy
-// enum hook points. The registry is intentionally non-mutating for execution
-// today: callers can register and query targets, but existing LoRA/offload
-// paths remain authoritative until parity checks are wired.
+// enum hook points. Dispatch remains opt-in while execution paths migrate from
+// imperative call sites to hook callbacks.
 
 #ifndef SUROGATE_SRC_RUNTIME_DSL_HOOK_REGISTRY_H
 #define SUROGATE_SRC_RUNTIME_DSL_HOOK_REGISTRY_H
@@ -20,7 +19,11 @@
 
 #include "runtime/dsl/buffer_plan.h"
 
+class NCCLCommunicator;
+
 namespace dsl {
+
+class DslWeightManager;
 
 enum class HookEventKind {
     Unknown,
@@ -49,6 +52,15 @@ struct HookContext {
     HookEventKind event = HookEventKind::Unknown;
     cudaStream_t stream = nullptr;
     void* payload = nullptr;
+};
+
+struct BeforeConsumeHookPayload {
+    DslWeightManager* weight_manager = nullptr;
+    NCCLCommunicator* comm = nullptr;
+    cudaStream_t prefetch_stream = nullptr;
+    cudaStream_t wait_stream = nullptr;
+    bool capturing = false;
+    bool current_layer_handled = false;
 };
 
 using HookCallback = std::function<void(HookContext&)>;
