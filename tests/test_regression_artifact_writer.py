@@ -104,5 +104,6 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
     assert summary["block_schema_save_for_backward_slots"] == 1
     assert summary["block_schema_grouped_slots"] == 1
     assert summary["block_schema_expert_parallel_slots"] == 1
+    assert summary["block_schema_expert_parallel_param_slots"] == 1
     assert summary["block_schema_auto_resident_slots"] == 1
     assert summary["block_schema_cpu_stream_slots"] == 1

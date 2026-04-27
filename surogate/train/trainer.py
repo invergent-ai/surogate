@@ -102,6 +102,7 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "block_schema_save_for_backward_slots": 0,
         "block_schema_grouped_slots": 0,
         "block_schema_expert_parallel_slots": 0,
+        "block_schema_expert_parallel_param_slots": 0,
         "block_schema_auto_resident_slots": 0,
         "block_schema_cpu_stream_slots": 0,
     }
@@ -160,6 +161,8 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
                 distribution = slot.get("distribution") or {}
                 if distribution.get("kind") == "expert_parallel":
                     summary["block_schema_expert_parallel_slots"] += 1
+                    if kind == "param":
+                        summary["block_schema_expert_parallel_param_slots"] += 1
                 residency = slot.get("residency")
                 if residency == "auto":
                     summary["block_schema_auto_resident_slots"] += 1
