@@ -325,6 +325,12 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
             }
         }
     }
+    const HookRegistry& hook_registry = model.hook_registry();
+    s.hook_registry_registrations = u64(hook_registry.size());
+    s.hook_registry_distribution_aware_registrations = static_cast<std::uint64_t>(
+        std::count_if(hook_registry.registrations().begin(),
+                      hook_registry.registrations().end(),
+                      [](const HookRegistration& registration) { return registration.distribution_aware; }));
     return s;
 }
 

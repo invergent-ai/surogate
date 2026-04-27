@@ -1148,6 +1148,18 @@ DslModel::DslModel(const PretrainedConfig& config,
     mModule = &pick_model_module(mIr);
     if (mModule->forward.has_value()) {
         mBlockSchemaPlanRecords = collect_block_schema_plan_records(*mModule->forward);
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::BeforeConsume)) {
+            mHookRegistry.on_before_consume(target, "schema_prefetch");
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllToAll)) {
+            mHookRegistry.on_after_all_to_all(target, "schema_after_all_to_all");
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterReduceScatter)) {
+            mHookRegistry.on_after_reduce_scatter(target, "schema_after_reduce_scatter");
+        }
     }
     validate_ir();
     apply_arch_from_hf_config(*mConfig, *mModule);

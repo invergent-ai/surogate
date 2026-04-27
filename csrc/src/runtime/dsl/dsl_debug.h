@@ -226,6 +226,8 @@ struct DebugBufferPlanSummary {
     std::uint64_t hook_before_consume_targets = 0;
     std::uint64_t hook_after_all_to_all_targets = 0;
     std::uint64_t hook_after_reduce_scatter_targets = 0;
+    std::uint64_t hook_registry_registrations = 0;
+    std::uint64_t hook_registry_distribution_aware_registrations = 0;
 };
 
 //! One pair of overlapping `(region, block_layer_idx, offset, bytes)` ranges
