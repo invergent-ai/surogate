@@ -3848,28 +3848,6 @@ void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight,
                                   bool weight_is_compact = true,
                                   int num_active_experts = -1);
 
-/// @brief FP8 MoE weight gradient: dW[e] = dout_for_e^T @ input_for_e.
-/// Input is E4M3, upstream gradient is E5M2, output gradient remains BF16.
-/// Throws if native grouped FP8 GEMM does not support the shape; callers should
-/// keep the existing BF16 path as fallback.
-void moe_grouped_gemm_weight_grad_fp8(nv_bfloat16* d_weight,
-                                      const __nv_fp8_e5m2* grad_output,
-                                      const __nv_fp8_e4m3* input,
-                                      const float* grad_output_scale,
-                                      const float* input_scale,
-                                      const int* expert_offsets,
-                                      int num_experts,
-                                      int M,
-                                      int N,
-                                      cublasHandle_t cublas_handle,
-                                      cudaStream_t stream,
-                                      const int* host_offsets,
-                                      float alpha = 1.0f,
-                                      float beta = 0.0f,
-                                      const int* active_expert_indices = nullptr,
-                                      bool weight_is_compact = true,
-                                      int num_active_experts = -1);
-
 /// @brief Grouped GEMM for MoE gate+up projection across all experts.
 /// Runs all expert GEMMs in parallel instead of sequentially.
 /// @param output Output tensor (total_tokens, 2*intermediate_size).

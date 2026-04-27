@@ -1098,21 +1098,6 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                         lora_num_active = fallback_count;
                     }
                     if (grad_output.DType == ETensorDType::BF16) {
-                        if (try_moe_fp8_weight_grad(d_weight_view,
-                                                    grad_output,
-                                                    in,
-                                                    expert_offsets_ptr->get<int>(),
-                                                    num_experts,
-                                                    M,
-                                                    N,
-                                                    host_offsets_ptr,
-                                                    lora_active_ptr,
-                                                    lora_weight_is_compact,
-                                                    lora_num_active,
-                                                    beta,
-                                                    "moe_grouped_gemm_gate_up_lora")) {
-                            return;
-                        }
                         if (d_weight_view.DType != ETensorDType::BF16) {
                             throw std::runtime_error(
                                 "MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "

@@ -847,7 +847,7 @@ void CompiledExecutor::set_save_list(const std::vector<std::string>* save_list) 
 }
 
 void CompiledExecutor::attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, const std::string& weight_name) {
-    const char* env = std::getenv("SUROGATE_FP8_MOE_WGRAD");
+    const char* env = std::getenv("SUROGATE_FP8_MOE_WEIGHT_CACHE");
     if (!env || std::string_view(env) == "0" || !mMoEFP8Cache || weight_name.empty() || ctx.num_experts <= 0 ||
         ctx.N <= 0 || ctx.K <= 0) {
         return;
@@ -859,7 +859,7 @@ void CompiledExecutor::attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, cons
         }
         const std::size_t entry_bytes = moe_fp8_cache_entry_bytes(ctx.num_experts, ctx.N, ctx.K);
         if (entry_bytes == 0 || mMoEFP8CacheBytes + entry_bytes > *mMoEFP8CacheBudgetBytes) {
-            if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
+            if (std::getenv("SUROGATE_DEBUG_FP8_MOE_CACHE")) {
                 std::fprintf(stderr,
                              "[FP8 MoE cache] skip %s: requested %.1f MiB, budget %.1f MiB, used %.1f MiB\n",
                              weight_name.c_str(),
@@ -899,111 +899,6 @@ void CompiledExecutor::invalidate_moe_fp8_cache(const std::string& weight_name) 
     auto it = mMoEFP8Cache->find(weight_name);
     if (it != mMoEFP8Cache->end()) {
         it->second.initialized = false;
-    }
-}
-
-bool CompiledExecutor::try_moe_fp8_weight_grad(Tensor& d_weight,
-                                               const Tensor& grad_output,
-                                               const Tensor& input,
-                                               const int* expert_offsets,
-                                               int num_experts,
-                                               int M,
-                                               int N,
-                                               const int* host_offsets,
-                                               const int* active_experts,
-                                               bool weight_is_compact,
-                                               int num_active,
-                                               float beta,
-                                               const char* debug_tag) {
-    const char* env = std::getenv("SUROGATE_FP8_MOE_WGRAD");
-    if (!env || std::string_view(env) == "0") {
-        return false;
-    }
-    if (grad_output.DType != ETensorDType::BF16 || input.DType != ETensorDType::BF16 ||
-        d_weight.DType != ETensorDType::BF16 || !expert_offsets || !host_offsets || !mRunState.cublas_handle() ||
-        num_experts <= 0 || M <= 0 || N <= 0 || grad_output.Rank < 2 || input.Rank < 2 ||
-        grad_output.Sizes[0] != input.Sizes[0] || grad_output.Sizes[1] != M || input.Sizes[1] != N ||
-        (beta != 0.0f && beta != 1.0f)) {
-        return false;
-    }
-    const int min_m = env_int("SUROGATE_FP8_MOE_WGRAD_MIN_M", 128);
-    const int min_n = env_int("SUROGATE_FP8_MOE_WGRAD_MIN_N", 32);
-    if ((min_m > 0 && M < min_m) || (min_n > 0 && N < min_n)) {
-        if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
-            std::fprintf(stderr,
-                         "[FP8 MoE wgrad] fallback in %s: shape M=%d N=%d below perf thresholds min_m=%d min_n=%d\n",
-                         debug_tag ? debug_tag : "unknown",
-                         M,
-                         N,
-                         min_m,
-                         min_n);
-        }
-        return false;
-    }
-
-    const long total_tokens = grad_output.Sizes[0];
-    try {
-        Tensor grad_e5m2 =
-            mRunState.temp_alloc(ETensorDType::FP8_E5M2, {total_tokens, static_cast<long>(M)}, "moe_wgrad_dout_e5m2");
-        Tensor grad_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_wgrad_dout_stats");
-        grad_e5m2.Stats = grad_stats.get<float>();
-        Tensor input_e4m3 =
-            mRunState.temp_alloc(ETensorDType::FP8_E4M3, {total_tokens, static_cast<long>(N)}, "moe_wgrad_input_e4m3");
-        Tensor input_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_wgrad_input_stats");
-        input_e4m3.Stats = input_stats.get<float>();
-        mTemps.push_back(grad_e5m2);
-        mTemps.push_back(grad_stats);
-        mTemps.push_back(input_e4m3);
-        mTemps.push_back(input_stats);
-
-        abs_max(grad_e5m2.abs_max(),
-                grad_output.get<nv_bfloat16>(),
-                total_tokens * static_cast<long>(M),
-                mRunState.DeviceProp,
-                mRunState.MainStream);
-        quantize_with_abs_max(grad_e5m2,
-                              grad_e5m2.scale(),
-                              grad_output,
-                              grad_e5m2.abs_max(),
-                              total_tokens * static_cast<long>(M),
-                              mRunState.DeviceProp,
-                              mRunState.MainStream);
-        abs_max(input_e4m3.abs_max(),
-                input.get<nv_bfloat16>(),
-                total_tokens * static_cast<long>(N),
-                mRunState.DeviceProp,
-                mRunState.MainStream);
-        quantize_with_abs_max(input_e4m3,
-                              input_e4m3.scale(),
-                              input,
-                              input_e4m3.abs_max(),
-                              total_tokens * static_cast<long>(N),
-                              mRunState.DeviceProp,
-                              mRunState.MainStream);
-
-        moe_grouped_gemm_weight_grad_fp8(d_weight.get<nv_bfloat16>(),
-                                         grad_e5m2.get<__nv_fp8_e5m2>(),
-                                         input_e4m3.get<__nv_fp8_e4m3>(),
-                                         grad_e5m2.scale(),
-                                         input_e4m3.scale(),
-                                         expert_offsets,
-                                         num_experts,
-                                         M,
-                                         N,
-                                         mRunState.cublas_handle(),
-                                         mRunState.MainStream,
-                                         host_offsets,
-                                         1.0f,
-                                         beta,
-                                         active_experts,
-                                         weight_is_compact,
-                                         num_active);
-        return true;
-    } catch (const std::exception& e) {
-        if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
-            std::fprintf(stderr, "[FP8 MoE wgrad] fallback in %s: %s\n", debug_tag ? debug_tag : "unknown", e.what());
-        }
-        return false;
     }
 }
 

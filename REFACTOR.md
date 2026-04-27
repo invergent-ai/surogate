@@ -9,9 +9,9 @@
 
 ## 0. Implementation progress
 
-### Pre-Phase 0 — FP8 MoE backward closure — COMPLETE
+### Pre-Phase 0 — FP8 MoE backward closure — REMOVED
 
-- [x] FP8 MoE weight-gradient closure scaffold landed behind `SUROGATE_FP8_MOE_WGRAD=1`, with BF16 fallback retained for unsupported paths.
+- [x] FP8 MoE weight-gradient closure scaffold was removed after the real LoRA acceptance workload showed worse end-to-end training time than the BF16 wgrad path.
 - [x] Executor-side FP8 MoE expert weight cache support landed for backward dgrad reuse, preserving frozen-weight cacheability.
 - [x] CUTLASS examples README inspected for relevant FP8/grouped GEMM paths; future candidates identified (`57_hopper_grouped_gemm`, `69_hopper_mixed_dtype_grouped_gemm`, `75_blackwell_grouped_gemm`, `81_blackwell_gemm_blockwise`, `54_hopper_fp8_warp_specialized_gemm`, `58_ada_fp8_gemm`).
 
@@ -964,9 +964,9 @@ Coordinate, don't merge.
 - **Scope:** explicit cuDNN version capability declarations; fallback path validation when cuDNN graph fails.
 - **Resource:** ~1 week + ongoing as cuDNN versions move.
 
-### 9.6 FP8 MoE backward closure ⭐ COMMITTED TACTICAL — ships before refactor
+### 9.6 FP8 MoE backward closure ⭐ REMOVED
 
-**Status:** committed 2026-04-26 as tactical pre-refactor win. Detailed spec below.
+**Status:** removed 2026-04-27. The native FP8 CUTLASS wgrad path was numerically viable, but it was slower end-to-end for the current LoRA MoE acceptance workload because the quantize/pack/setup overhead outweighed BF16 grouped wgrad. BF16 MoE wgrad remains the authoritative path.
 
 **The precise gap** (after audit of [`fp8_hybrid_recipe.cpp:708-806`](csrc/src/recipes/fp8_hybrid/fp8_hybrid_recipe.cpp#L708-L806) and [`recipe.cpp:145-174`](csrc/src/recipes/recipe.cpp#L145-L174)):
 
@@ -978,7 +978,9 @@ Coordinate, don't merge.
 | Expert weight FP8 cache forward→backward | None: backward re-quantizes weights every step ([`fp8_hybrid_recipe.cpp:760-779`](csrc/src/recipes/fp8_hybrid/fp8_hybrid_recipe.cpp#L760-L779)) | `mMoEFP8Cache` analog to dense `mFP8Cache` |
 | Permute → grouped GEMM co-located quant | BF16 permute output, quantize before GEMM | **Deferred to Phase 3 refactor** (touches permute kernel) |
 
-**Track A — Native FP8 wgrad kernel (~2 weeks)**
+**Track A — Native FP8 wgrad kernel — removed**
+
+The implementation below is retained as historical context only. It is not part of the active runtime plan.
 
 New kernel signature added to `csrc/src/kernels/`:
 
@@ -1027,9 +1029,9 @@ Wire into:
 - `backward_moe_matmul` (lines 760-779): read from cache instead of re-quantizing. Eliminates `num_experts` × {abs_max, quantize_with_abs_max} kernels per backward call.
 - Cache invalidation: parameter update step (after optimizer) flips `initialized=false`.
 
-**Track C — Recipe wiring + dweight integration (~3 days)**
+**Track C — Recipe wiring + dweight integration — removed**
 
-Extend `MoeMatmulContext` with `dweight` field if not present (verify against current state). `FP8HybridRecipe::backward_moe_matmul` calls `moe_grouped_gemm_weight_grad_fp8` when `ctx.dweight && ctx.allow_fp8 && ctx.dout_quant && cache hit`. Otherwise falls back to existing BF16 wgrad path in DSL dispatcher.
+The active recipe no longer calls the FP8 wgrad kernel. `FP8HybridRecipe::backward_moe_matmul` routes MoE `dweight` through the existing BF16 grouped wgrad implementation.
 
 **Track D — Validation (~1 week)**
 
@@ -1044,7 +1046,7 @@ Extend `MoeMatmulContext` with `dweight` field if not present (verify against cu
 
 **Post-refactor migration:** after Phase 3 lands, the cache becomes a `weight_cache_eligible` capability declaration on the MoE op; the wgrad kernel becomes a recipe specialization registered via capability predicate. Tactical implementation stays correct; only the dispatch surface changes.
 
-**Risk:** medium. New FP8 kernel implementation is contained but cuBLASLt grouped FP8 matmul with TN layout has its own quirks (alignment, scale handling). Mitigation: validate against BF16 reference per-expert; ship behind `SUROGATE_FP8_MOE_WGRAD=1` env flag for first 2 weeks of production exposure.
+**Risk:** retired with removal. The abandoned native FP8 wgrad path is retained here only as historical context.
 
 **Owner / target:** TBD. Aim to ship as a near-term tactical closure.
 

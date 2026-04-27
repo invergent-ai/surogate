@@ -22,7 +22,6 @@
 #include <cuda_runtime.h>
 
 #include "kernels/kernels.h"
-#include "kernels/moe/moe_fp8_wgrad_cutlass.h"
 #include "kernels/kernel_utils.cuh"
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"

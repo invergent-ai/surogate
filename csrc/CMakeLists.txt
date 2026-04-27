@@ -434,7 +434,6 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe/moe_losses.cu
     src/kernels/moe/moe_routing_activation.cu
     src/kernels/moe/moe_topk.cu
-    src/kernels/moe/moe_fp8_wgrad_cutlass.cu
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
     src/kernels/rope.cu

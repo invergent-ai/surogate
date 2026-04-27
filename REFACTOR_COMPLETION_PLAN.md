@@ -6,42 +6,20 @@ This document tracks the remaining implementation work needed to move from the c
 
 Tracked phases 0-5 are complete for the scoped, guarded implementation. The remaining work is mostly replacing guarded/scaffold/diagnostic paths with authoritative runtime paths, then validating the end state.
 
-## Track 1 - Finish Native FP8 MoE WGrad
+## Track 1 - Remove Native FP8 MoE WGrad
 
-- [x] Replace the current per-expert FP8 matmul loop in `moe_grouped_gemm_weight_grad_fp8` with native FP8 TN implementations.
-  - [x] Moved the FP8 wgrad implementation out of the old monolithic MoE kernel file into `csrc/src/kernels/moe/`.
-  - [x] Added a CUTLASS Hopper grouped FP8 wgrad path and an Ada dense fallback path for SM89.
-  - [x] Added a native SM120 grouped blockwise FP8 wgrad path based on the CUTLASS 87c Blackwell grouped groupwise example.
-  - [x] Route SM120 directly to the native grouped path; no hidden experimental env gate remains.
-  - [x] Added a native SM100 grouped blockwise FP8 wgrad path instead of relying on the Ada-compatible fallback on SM100.
-- [x] Use native grouped matmul where shape/alignment support is available.
-  - [x] Confirmed the supported route is CUTLASS-based for E5M2 x E4M3 wgrad; the old cuBLASLt placeholder is gone from the native path.
-  - [x] Keep Ada on the dense FP8 fallback until an Ada grouped path is worth the extra complexity.
-- [x] Keep `SUROGATE_FP8_MOE_WGRAD=1` as the rollout gate until parity and perf are proven.
-- [x] Preserve BF16 fallback for unsupported shapes, missing cache/state, and native-kernel rejection.
-- [x] Preserve BF16 fallback for low-rank MoE LoRA adapter gradients where the FP8 quantize/pack overhead is slower end-to-end.
-  - Default FP8 wgrad perf thresholds are `M >= 128` and `N >= 32`; override with `SUROGATE_FP8_MOE_WGRAD_MIN_M` and `SUROGATE_FP8_MOE_WGRAD_MIN_N`.
-- [x] Bound the executor-side MoE FP8 expert-weight cache so large pre-quantized MoE runs do not allocate one persistent FP8 cache per layer.
-  - Default cache budget is `1024` MiB and can be overridden with `SUROGATE_FP8_MOE_CACHE_BUDGET_MB`.
-  - Layers beyond the budget use the existing temporary quantization path, preserving correctness without the forward OOM seen on Qwen3.5 MoE.
-- [x] Add architecture-aware implementation notes for Ada, Hopper, and Blackwell based on the inspected CUTLASS grouped/FP8 examples.
-  - Ada: `58_ada_fp8_gemm` is a useful dense expert fallback scaffold; `64_ada_fp8_gemm_grouped` is the grouped target when per-group scale support is needed.
-  - Hopper: `57_hopper_grouped_gemm` matches the pointer-array grouped FP8 structure and supports E5M2/E4M3-style operand typing.
-  - Blackwell/SM120: the GeForce CUTLASS examples are blockwise/groupwise-scale oriented, so the native path uses a dedicated tensor-core port instead of the Ada-compatible fallback.
-  - Blackwell/SM100: the datacenter path uses the same padded E5M2 x E4M3 blockwise grouped structure with the SM100 schedule and scale config.
+- [x] Removed the native FP8 CUTLASS MoE wgrad implementation after the real LoRA acceptance workload showed it was slower end-to-end than the BF16 wgrad path.
+- [x] Deleted `csrc/src/kernels/moe/moe_fp8_wgrad_cutlass.*` and removed it from the CMake source list.
+- [x] Removed the public `moe_grouped_gemm_weight_grad_fp8` kernel API and the focused FP8 wgrad unit test.
+- [x] Removed recipe and executor routing that quantized BF16 activations/gradients into FP8 only to fall back or lose end-to-end time.
+- [x] Kept the BF16 MoE wgrad path as the authoritative implementation.
+- [x] Kept the MoE FP8 expert-weight cache as a separate dgrad optimization gate under `SUROGATE_FP8_MOE_WEIGHT_CACHE`.
 
 Acceptance:
 
-- [x] Per-expert FP8 wgrad max-abs delta is within `5e-2` versus BF16 reference for the focused grouped active-expert unit test.
-- [x] SM120 native grouped path passes the focused compact/non-compact MoE FP8 wgrad unit test on RTX 5090.
-- [x] SM100 native grouped path is compile-validated; runtime validation still requires B200/B300 CI hardware.
-- [x] 5-step FP8-forward/FP8-dgrad/FP8-wgrad loss is within 5% of FP8-forward/BF16-wgrad baseline.
-  - Validated on `qwen3_5_moe__fp8__single_gpu__gpu__moe_grouped`: final loss relative delta `0.040%`, max step relative delta `0.104%`.
-- [ ] 2-GPU DP smoke passes with FP8 wgrad enabled.
-- [ ] End-to-end 5-step FP8-forward/FP8-dgrad/FP8-wgrad training time is faster than the FP8-forward/BF16-wgrad baseline.
-  - Current measured result is not faster: FP8 wgrad mean step time `9851.4 ms` versus BF16-wgrad baseline `9446.2 ms` on `qwen3_5_moe__fp8__single_gpu__gpu__moe_grouped`.
-  - This is the Track 1 performance gate; isolated kernel speed is secondary evidence only.
-  - The native SM100/SM120 grouped path now supports `beta=1`; low-rank LoRA adapter gradients still prefer BF16 by default for end-to-end speed.
+- [x] Codebase has no callable FP8 CUTLASS MoE wgrad path.
+- [x] LoRA MoE adapter gradients route directly to BF16 grouped wgrad.
+- [ ] Re-run 5-step Qwen3.5 MoE acceptance once the local `.venv` has PyTorch restored.
 
 ## Track 2 - Promote Hook Dispatch From Opt-In To Runtime Path
 
@@ -135,7 +113,7 @@ Order:
 
 Track 6 - remove name-only grad fallback.
 Track 4 - remove descriptor capability fallbacks.
-Track 1 - finish FP8 MoE wgrad properly.
+Track 1 - remove FP8 MoE wgrad.
 Track 2 - promote hook dispatch.
 Track 3 - schema-driven allocation authoritative.
 Track 5 - activate fusion rewrites.

@@ -499,19 +499,6 @@ private:
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
     void attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, const std::string& weight_name);
     void invalidate_moe_fp8_cache(const std::string& weight_name);
-    bool try_moe_fp8_weight_grad(Tensor& d_weight,
-                                 const Tensor& grad_output,
-                                 const Tensor& input,
-                                 const int* expert_offsets,
-                                 int num_experts,
-                                 int M,
-                                 int N,
-                                 const int* host_offsets,
-                                 const int* active_experts,
-                                 bool weight_is_compact,
-                                 int num_active,
-                                 float beta,
-                                 const char* debug_tag);
 
     // Get host-side MoE expert offsets for a layer, using cache or syncing from device.
     const int* get_or_sync_moe_host_offsets(int layer_idx, const int* device_offsets, int num_experts);
