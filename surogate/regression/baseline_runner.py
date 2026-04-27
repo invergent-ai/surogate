@@ -123,8 +123,20 @@ FIRST_MONTH_MATRIX: tuple[RegressionCase, ...] = (
         config="examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml",
         env_model_path="GEMMA4_MODEL_PATH",
     ),
-    RegressionCase("nemotron_h", "bf16", "single_gpu", env_model_path="NEMOTRON_H_MODEL_PATH"),
-    RegressionCase("nemotron_h", "fp8", "single_gpu", env_model_path="NEMOTRON_H_MODEL_PATH"),
+    RegressionCase(
+        "nemotron_h",
+        "bf16",
+        "single_gpu",
+        config="examples/sft/nemotron3/nemotron-nano3-qlora-bnb.yaml",
+        env_model_path="NEMOTRON_H_MODEL_PATH",
+    ),
+    RegressionCase(
+        "nemotron_h",
+        "fp8",
+        "single_gpu",
+        config="examples/sft/nemotron3/nemotron-nano3-nvfp4.yaml",
+        env_model_path="NEMOTRON_H_MODEL_PATH",
+    ),
     RegressionCase(
         "qwen3_5",
         "bf16",

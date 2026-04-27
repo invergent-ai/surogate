@@ -1,7 +1,7 @@
 {
   "artifacts": {},
   "case": {
-    "config": null,
+    "config": "examples/sft/nemotron3/nemotron-nano3-qlora-bnb.yaml",
     "distribution": "single_gpu",
     "env_model_path": "NEMOTRON_H_MODEL_PATH",
     "model": "nemotron_h",
@@ -10,7 +10,11 @@
     "storage": "gpu",
     "supported": true
   },
-  "command": [],
+  "command": [
+    "surogate",
+    "sft",
+    "examples/sft/nemotron3/nemotron-nano3-qlora-bnb.yaml"
+  ],
   "duration_s": 0.0,
   "metrics": {},
   "reason": "not executed; pass --run to launch GPU workload",
