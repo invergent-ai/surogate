@@ -667,5 +667,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     hook_ctx.payload = &before_consume_payload;
     REQUIRE(static_cast<dsl::BeforeConsumeHookPayload*>(hook_ctx.payload)->capturing);
 
+    dsl::GradientOffloadHookPayload gradient_offload_payload;
+    gradient_offload_payload.offloaded = true;
+    hook_ctx.payload = &gradient_offload_payload;
+    REQUIRE(static_cast<dsl::GradientOffloadHookPayload*>(hook_ctx.payload)->offloaded);
+
     REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
 }

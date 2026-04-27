@@ -23,6 +23,7 @@ class NCCLCommunicator;
 
 namespace dsl {
 
+class DslGradStore;
 class DslWeightManager;
 
 enum class HookEventKind {
@@ -61,6 +62,16 @@ struct BeforeConsumeHookPayload {
     cudaStream_t wait_stream = nullptr;
     bool capturing = false;
     bool current_layer_handled = false;
+};
+
+struct GradientOffloadHookPayload {
+    DslGradStore* grads = nullptr;
+    NCCLCommunicator* comm = nullptr;
+    cudaStream_t compute_stream = nullptr;
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t sync_event = nullptr;
+    bool capturing = false;
+    bool offloaded = false;
 };
 
 using HookCallback = std::function<void(HookContext&)>;

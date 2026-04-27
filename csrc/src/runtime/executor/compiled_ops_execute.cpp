@@ -2820,12 +2820,22 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
 
             if (mGrads.is_streaming_grads()) {
-                if (mComm && mComm->world_size() > 1) {
+                GradientOffloadHookPayload offload_payload;
+                offload_payload.grads = &mGrads;
+                offload_payload.comm = mComm;
+                offload_payload.compute_stream = mRunState.MainStream;
+                offload_payload.copy_stream = mRunState.side_stream();
+                offload_payload.sync_event = mRunState.side_stream_event();
+                offload_payload.capturing = capturing;
+                dispatch_schema_layer_hooks(HookEventKind::AfterAllReduce, L, &offload_payload);
+                if (!offload_payload.offloaded && mComm && mComm->world_size() > 1) {
                     CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                     CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
                     mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
                 }
-                mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
+                if (!offload_payload.offloaded) {
+                    mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
+                }
             } else if (mComm && mComm->world_size() > 1) {
                 CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                 CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));

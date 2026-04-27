@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include "runtime/executor/graph_executor.h"
+#include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/core/qlora_provider.h"
@@ -43,6 +44,7 @@
 #include "runtime/optimizers/normuon.h"
 #include "runtime/optimizers/normuon_optimizer.h"
 #include "runtime/core/fp8_scaling_state.h"
+#include "utilities/comm.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/safetensors.h"
@@ -1171,7 +1173,20 @@ DslModel::DslModel(const PretrainedConfig& config,
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllReduce)) {
-            mHookRegistry.on_after_all_reduce(target, "schema_after_all_reduce");
+            mHookRegistry.on_after_all_reduce(target, "schema_after_all_reduce", [](HookContext& context) {
+                auto* payload = static_cast<GradientOffloadHookPayload*>(context.payload);
+                if (!payload || payload->offloaded || payload->capturing || !payload->grads ||
+                    !payload->grads->is_streaming_grads()) {
+                    return;
+                }
+                if (payload->comm && payload->comm->world_size() > 1) {
+                    CUDA_CHECK(cudaEventRecord(payload->sync_event, payload->compute_stream));
+                    CUDA_CHECK(cudaStreamWaitEvent(payload->copy_stream, payload->sync_event, 0));
+                    payload->grads->reduce_layer_grads(context.layer_idx, payload->copy_stream, *payload->comm);
+                }
+                payload->grads->offload_layer_grads(context.layer_idx, payload->compute_stream, payload->copy_stream);
+                payload->offloaded = true;
+            });
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterReduceScatter)) {

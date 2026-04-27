@@ -219,6 +219,7 @@ Real-model acceptance queue:
 - [x] Legacy LoRA optimizer-state zeroing now uses the structural target iterator as well; PEFT-compatible export naming remains explicit.
 - [x] Regression/runtime artifacts now record whether schema hook dispatch was enabled for the run, so opt-in hook-boundary validation is visible alongside hook target and registration counts.
 - [x] `before_consume` schema hooks now carry a typed prefetch payload and can own the current-layer `DslWeightManager::gather_block` / `wait_for_gather` path under `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=1`; the legacy imperative path remains the default and fallback.
+- [x] Streaming gradient offload now has a typed `after_all_reduce` hook payload; under opt-in schema dispatch, hooks can own per-layer all-reduce plus D2H offload, with the legacy imperative path retained as the default and fallback.
 
 ---
 
