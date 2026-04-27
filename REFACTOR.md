@@ -56,6 +56,7 @@
 ### Phase 3 — Capabilities and recipe predicates
 
 - [x] Descriptor capability metadata plumbed into dense and MoE matmul recipe contexts; FP8 recipe now consults `FP8Eligible` with legacy fallback for unannotated ops.
+- [x] Dense NVFP4 matmul recipe now consults `FP4Eligible` with legacy fallback; MoE FP4 fallback behavior remains unchanged.
 
 Local validation status:
 

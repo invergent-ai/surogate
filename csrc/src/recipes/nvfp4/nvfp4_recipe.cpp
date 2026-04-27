@@ -16,6 +16,13 @@
 #include "runtime/training/model.h"
 
 namespace recipes {
+namespace {
+
+bool descriptor_allows_fp4(dsl::OpCapabilities caps) {
+    return caps.flags == dsl::OpCapabilityNone || caps.has(dsl::OpCapabilityFp4Eligible);
+}
+
+}  // namespace
 
 void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     // Validate input
@@ -26,8 +33,8 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("NVFP4Recipe::forward_matmul: required tensors are null");
     }
 
-    // Fall back to BF16 matmul if FP4 is not allowed for this layer (skip_quant_first/last_layers)
-    if (!ctx.allow_fp4) {
+    // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps)) {
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -239,8 +246,8 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("NVFP4Recipe::backward_matmul: inp/weight/dout must be BF16");
     }
 
-    // Fall back to BF16 matmul if FP4 is not allowed for this layer (skip_quant_first/last_layers)
-    if (!ctx.allow_fp4) {
+    // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps)) {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;
