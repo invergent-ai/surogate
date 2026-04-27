@@ -49,7 +49,7 @@ bool is_expert_weight(const WeightLoadSpec& spec) {
     if (spec.shape.size() < 3) return false;
     const auto& n = spec.name;
     const bool legacy_value = n.find("experts") != std::string::npos || n.find("expert_gate_up") != std::string::npos ||
-                              n.find("expert_down") != std::string::npos;
+                              n.find("expert_up") != std::string::npos || n.find("expert_down") != std::string::npos;
     const bool role_value = dsl::tensor_role_is_expert_weight_name(n);
     dsl::tensor_role_parity_check(n, legacy_value, role_value, "qlora_pipeline::expert_weight");
     return legacy_value || role_value;

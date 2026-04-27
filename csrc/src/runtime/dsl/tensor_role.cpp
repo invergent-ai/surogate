@@ -137,8 +137,8 @@ bool tensor_role_is_shared_expert_name(std::string_view name) {
 
 bool tensor_role_is_expert_weight_name(std::string_view name) {
     const TensorRole role = infer_tensor_role_from_name(name);
-    return role.is_expert_parallel() &&
-           (contains(name, "experts") || contains(name, "expert_gate_up") || contains(name, "expert_down"));
+    return role.is_expert_parallel() && (contains(name, "experts") || contains(name, "expert_gate_up") ||
+                                         contains(name, "expert_up") || contains(name, "expert_down"));
 }
 
 bool tensor_role_is_expert_bias_name(std::string_view name) {

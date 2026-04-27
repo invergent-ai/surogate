@@ -977,9 +977,9 @@ create_dsl_qlora_provider(const Module& module,
     // Only slice actual expert weights (name contains "experts"), not other 3D
     // weights like conv1d in linear attention layers.
     auto is_expert_name = [](const std::string& n) {
-        const bool legacy_value = n.find("experts") != std::string::npos ||
-                                  n.find("expert_gate_up") != std::string::npos ||
-                                  n.find("expert_down") != std::string::npos;
+        const bool legacy_value =
+            n.find("experts") != std::string::npos || n.find("expert_gate_up") != std::string::npos ||
+            n.find("expert_up") != std::string::npos || n.find("expert_down") != std::string::npos;
         const bool role_value = tensor_role_is_expert_weight_name(n);
         tensor_role_parity_check(n, legacy_value, role_value, "dsl_model::ep_expert_weight_slice");
         return legacy_value || role_value;
