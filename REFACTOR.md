@@ -100,7 +100,7 @@
 - [x] MoE grouped matmul recipe contexts now carry optional routed-token `TensorRole` metadata from compiled tensor records, preparing MoE capability-plus-role predicates without changing execution.
 - [x] Shared recipe predicate helpers now include a scaffolded MoE FP8 grouped check over `MoECapabilities` plus routed-token `TensorRole`.
 
-### Phase 4 — Block schemas + storage residency + EP topology — STARTED (4a/4b/4c complete, 4d reporting started)
+### Phase 4 — Block schemas + storage residency + EP topology — FIRST-MONTH SLICE COMPLETE
 
 - [x] Python DSL `BlockSchema` declaration surface added for slot residency, distribution, streaming hints, routing schema, and EP topology metadata.
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
@@ -156,6 +156,7 @@
 - [x] Phase 4c block-family migration completed for current Python block classes with schema contract validation in both compiler lowering paths. All block schemas now require family metadata, unique shaped slots, and MoE-specific routing/EP/grouped expert declarations.
 - [x] Phase 4d reporting started: north-star coverage rows now include CPU-stream storage declaration status, EP topology declaration status, and structured BufferPlan summaries for storage/distribution acceptance triage.
 - [x] Phase 4d regression matrix seeded with an explicit Qwen3 FP8 LoRA `2gpu_dp` CPU-stream row so the CPU-stream + FP8 + DP target is tracked before execution is re-enabled.
+- [x] Scoped Phase 4 first-month acceptance closed: block-schema declarations cover the current Python block families, BufferPlan dual-path diagnostics are wired into artifacts, real-model schema parity is green across the acceptance queue, and Qwen3 MoE/Qwen36 MoE multi-GPU probes pass with the targeted EP/QLoRA ordering guard.
 
 Local validation status:
 
@@ -265,12 +266,12 @@ Phase 0: Test infrastructure first-month slice                COMPLETE
 Phase 1: TensorRole + Distribution scaffolding                COMPLETE
 Phase 2: Op registry descriptor extension scaffold            COMPLETE
 Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
-Phase 4: Block schemas + storage residency + EP topology      STARTED (4a/4b/4c complete, 4d reporting started)
+Phase 4: Block schemas + storage residency + EP topology      COMPLETE (first-month slice)
 Phase 5: Hook registry + distribution-aware + CPU offload     NOT STARTED
 ```
 
 Completion here means the scoped first-month implementation tracked in §0 is done.
-The full multi-month roadmap below remains the target architecture; Phase 4 and Phase 5 have not started.
+The full multi-month roadmap below remains the target architecture; Phase 4 and Phase 5 multi-month execution beyond the scoped first-month slices is still future work.
 
 **Critical path to "FP8/FP4 + MoE + multi-GPU generalized":** Phases 0–3 ≈ 29 weeks ≈ **6.7 months solo**, ~4 months with two engineers.
 
