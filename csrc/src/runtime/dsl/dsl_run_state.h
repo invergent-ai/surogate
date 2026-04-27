@@ -51,7 +51,8 @@ public:
                 bool lora_only_mode = false,
                 bool prequantized = false,
                 std::size_t stack_bytes = kDefaultStackBytes,
-                const ActivationLayoutIR* activation_layout = nullptr);
+                const ActivationLayoutIR* activation_layout = nullptr,
+                const std::vector<BlockSchemaPlanRecord>* block_schema_records = nullptr);
     ~DslRunState();
 
     /// Swap the backing stack buffer (used to resize the stack after the

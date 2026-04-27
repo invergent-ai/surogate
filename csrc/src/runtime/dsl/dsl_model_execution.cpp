@@ -271,7 +271,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                                       static_cast<long>(B),
                                                       static_cast<long>(T),
                                                       initial_act_dtype,
-                                                      /*grad_dtype=*/initial_act_dtype);
+                                                      /*grad_dtype=*/initial_act_dtype,
+                                                      &mBlockSchemaPlanRecords);
     long required_size = required_stack_bytes(initial_plan, /*bwd_graph=*/nullptr, mModelConfig, mOptions);
 
     if (options.DebugMemoryBreakdown && comm.rank() == 0) {
@@ -279,7 +280,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
         cudaMemGetInfo(&free_mem, &total_mem);
         std::cerr << "[DEBUG-STACK] plan_peak=" << initial_plan.plan_stack_peak_bytes() / (1024 * 1024) << " MiB"
                   << ", initial_required=" << required_size / (1024 * 1024) << " MiB"
-                  << ", block_schema_records=" << mBlockSchemaPlanRecords.size()
+                  << ", block_schema_records=" << initial_plan.schema_record_count
+                  << ", block_schema_routing_layers=" << initial_plan.schema_routing_layers
+                  << ", block_schema_ep_layers=" << initial_plan.schema_ep_layers
                   << ", GPU used=" << (total_mem - free_mem) / (1024 * 1024) << " MiB"
                   << ", free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }
@@ -293,7 +296,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                               lora_enabled(),
                                               mQLoRAConfig.is_prequantized(),
                                               static_cast<std::size_t>(required_size),
-                                              layout);
+                                              layout,
+                                              &mBlockSchemaPlanRecords);
     mRunState->WorldSize = comm.world_size();
     if (mParams) {
         mParams->set_default_stream(mRunState->MainStream);

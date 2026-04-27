@@ -86,6 +86,14 @@ struct BufferPlan {
     bool use_qk_norm = false;
     bool is_hybrid = false;
 
+    // ---------------- Schema-driven dual path ----------------
+    // Populated from graph metadata when available. These counters are
+    // diagnostics/parity inputs only until schema-driven allocation replaces
+    // the legacy TensorSlot enum path.
+    int schema_record_count = 0;
+    int schema_routing_layers = 0;
+    int schema_ep_layers = 0;
+
     // ---------------- Dimensions ----------------
     long B = 0;
     long T = 0;
@@ -161,7 +169,8 @@ struct BufferPlan {
                             long B,
                             long T,
                             ETensorDType act_dtype,
-                            ETensorDType grad_dtype);
+                            ETensorDType grad_dtype,
+                            const std::vector<BlockSchemaPlanRecord>* schema_records = nullptr);
 };
 
 // ============================================================================

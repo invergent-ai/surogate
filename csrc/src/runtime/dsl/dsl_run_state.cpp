@@ -311,7 +311,8 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          bool lora_only_mode,
                          bool prequantized,
                          std::size_t stack_bytes,
-                         const ActivationLayoutIR* activation_layout)
+                         const ActivationLayoutIR* activation_layout,
+                         const std::vector<BlockSchemaPlanRecord>* block_schema_records)
     : IRunState(config.clone(), B, T, allocator),
       mAllocator(allocator),
       mRuntimeConfig(runtime_config),
@@ -373,7 +374,8 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                                     static_cast<long>(B),
                                     static_cast<long>(T),
                                     mActivationDtype,
-                                    mGradDtype);
+                                    mGradDtype,
+                                    block_schema_records);
 
     allocate_non_block_state(config);
     allocate_simplified_quant_buffers(config, options);

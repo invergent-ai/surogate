@@ -119,7 +119,8 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                              long B,
                              long T,
                              ETensorDType act_dtype,
-                             ETensorDType grad_dtype) {
+                             ETensorDType grad_dtype,
+                             const std::vector<BlockSchemaPlanRecord>* schema_records) {
     BufferPlan p;
 
     // ---------------- Dimensions ----------------
@@ -165,6 +166,19 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.has_mlp_up_slot = p.has_dsl_layout && slot_registry.lookup(builtin_slot_name(TensorSlot::BlockMLPUp)).has_value();
     p.has_swiglu_slot =
         p.has_dsl_layout && slot_registry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
+
+    // ---------------- Schema-driven dual path ----------------
+    if (schema_records) {
+        p.schema_record_count = static_cast<int>(schema_records->size());
+        for (const auto& record : *schema_records) {
+            if (record.has_routing) {
+                ++p.schema_routing_layers;
+            }
+            if (record.has_ep_topology) {
+                ++p.schema_ep_layers;
+            }
+        }
+    }
 
     // ---------------- FFN temps on stack ----------------
     // Only safe when both mlp_up and swiglu are recomputable — otherwise the
