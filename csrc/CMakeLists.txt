@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.25...4.0)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum CMake policy version for dependencies")
 
+# Minimum supported GPU architecture is SM89 (Ada Lovelace, RTX 40x0 / L40 / L4).
+# SM80-87 (Ampere) and older are not supported.
+set(SUROGATE_MIN_CUDA_ARCH 89)
+
 # If no GPU arch has been specified, try to pick an explicit architecture (so we
 # can select feature variants like `90a`/`120a` that `-arch=native` won't). Fall
 # back to `native` if we cannot detect a GPU at configure time.
@@ -20,6 +24,13 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         if(_SUROGATE_NVIDIA_SMI_CC0 MATCHES "^[0-9]+\\.[0-9]+$")
             # Convert like "12.0" -> "120", "8.9" -> "89"
             string(REGEX REPLACE "^([0-9]+)\\.([0-9]+)$" "\\1\\2" _SUROGATE_CUDA_CC_DIGITS "${_SUROGATE_NVIDIA_SMI_CC0}")
+
+            if(_SUROGATE_CUDA_CC_DIGITS LESS SUROGATE_MIN_CUDA_ARCH)
+                message(FATAL_ERROR
+                    "Detected GPU compute capability ${_SUROGATE_NVIDIA_SMI_CC0} (SM${_SUROGATE_CUDA_CC_DIGITS}) "
+                    "is below the minimum supported architecture SM${SUROGATE_MIN_CUDA_ARCH} (Ada Lovelace). "
+                    "Surogate requires SM89 or newer (RTX 40x0 / L40 / L4 / Hopper / Blackwell).")
+            endif()
 
             # Some CUTLASS kernels use "arch-conditional" MMA instructions which
             # require targeting the feature-variant architecture (e.g. `90a`, `100a`, `103a`, `120a`).
@@ -47,6 +58,19 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES native)
         message(STATUS "Could not detect GPU compute capability; using CMAKE_CUDA_ARCHITECTURES=native")
     endif()
+else()
+    # User-supplied CMAKE_CUDA_ARCHITECTURES: validate every entry meets the SM89 minimum.
+    foreach(_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if(_ARCH STREQUAL "native" OR _ARCH STREQUAL "all" OR _ARCH STREQUAL "all-major")
+            continue()
+        endif()
+        string(REGEX REPLACE "[^0-9].*$" "" _ARCH_DIGITS "${_ARCH}")
+        if(_ARCH_DIGITS AND _ARCH_DIGITS LESS SUROGATE_MIN_CUDA_ARCH)
+            message(FATAL_ERROR
+                "CMAKE_CUDA_ARCHITECTURES contains '${_ARCH}', which is below the minimum "
+                "supported architecture SM${SUROGATE_MIN_CUDA_ARCH} (Ada Lovelace).")
+        endif()
+    endforeach()
 endif()
 
 include(FetchContent)
@@ -130,8 +154,8 @@ set(CUTLASS_ENABLE_TOOLS OFF CACHE BOOL "Enable CUTLASS tools")
 set(CUTLASS_ENABLE_PROFILER OFF CACHE BOOL "Enable CUTLASS profiler")
 # set(CUTLASS_ENABLE_LIBRARY OFF CACHE BOOL "Enable CUTLASS library")
 # set(CUTLASS_LIBRARY_KERNELS "" CACHE STRING "Comma-separated list of kernel name filters")
-# Only build for SM80+ (Ampere/Hopper/Blackwell/Next-gen): 80, 86, 87, 89, 90, 90a, 100a, 103a, 120a
-# SM80-87: Ampere, SM89: Ada, SM90/90a: Hopper, SM100a: Blackwell B200, SM103a: Blackwell B300, SM120a: RTX 50x0/DGX Spark
+# Only build for SM89+ (Ada/Hopper/Blackwell/Next-gen): 89, 90, 90a, 100a, 103a, 120a, 121a
+# SM89: Ada (RTX 40x0/L40/L4), SM90/90a: Hopper, SM100a: Blackwell B200, SM103a: Blackwell B300, SM120a: RTX 50x0/DGX Spark
 # Note: SM100/103/120 require 'a' suffix for tcgen05.mma and block-scaled MMA features (FP4)
 set(CUTLASS_NVCC_ARCHS "89;90;90a;100a;103a;120a;121a" CACHE STRING "CUDA architectures for CUTLASS")
 set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "NVCC archs to build library kernels")
