@@ -77,6 +77,7 @@
 - [x] Regression artifact schema and north-star coverage rows now reserve descriptor-summary/fusion-candidate counts for descriptor-driven reporting.
 - [x] `QuantState` diagnostic names and compiled-graph quant-state tensor counts added for future generic quant routing/reporting.
 - [x] Python trainer debug surface now exposes compiled-graph descriptor/capability summaries for regression artifact producers.
+- [x] SFT trainer emits first-month regression artifacts under `SUROGATE_REGRESSION_ARTIFACT`, including convergence, step-time, CUDA-memory, and descriptor-summary fields.
 
 Local validation status:
 

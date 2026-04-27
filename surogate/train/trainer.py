@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -30,11 +31,47 @@ from surogate.utils.tensor import to_surogate_dtype
 logger = get_logger()
 
 
+def _percentile_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    ordered = sorted(float(v) for v in values)
+
+    def pct(q: float) -> float:
+        idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+        return ordered[idx]
+
+    return {
+        "mean": float(sum(ordered) / len(ordered)),
+        "p50": pct(0.50),
+        "p95": pct(0.95),
+    }
+
+
+def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
+    flattened: dict[str, int] = {}
+    fusion_candidate_starts = 0
+    for graph_name in ("forward", "backward"):
+        graph = summary.get(graph_name)
+        if not isinstance(graph, dict):
+            continue
+        for key, value in graph.items():
+            if isinstance(value, int):
+                flattened[f"{graph_name}_{key}"] = int(value)
+                if key == "fusion_candidate_starts":
+                    fusion_candidate_starts += int(value)
+    flattened["fusion_candidate_starts"] = fusion_candidate_starts
+    return flattened
+
+
 class SurogateTrainerWrapper:
     def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config
         self._block_types = None
         self._train_vision = bool(config.train_vision and config.is_multimodal)
+        self._regression_artifact_path = os.environ.get("SUROGATE_REGRESSION_ARTIFACT")
+        self._regression_curve: list[dict[str, float]] = []
+        self._regression_step_times_ms: list[float] = []
+        self._regression_cuda_peak_memory_bytes: int | None = None
 
         # Multimodal on-the-fly training intentionally runs in eager mode.
         # Ensure runtime CUDA graph capture is disabled before constructing
@@ -416,6 +453,8 @@ class SurogateTrainerWrapper:
             else:
                 self.run_training_loop(train_logger)
 
+            self._write_regression_artifact()
+
             # Save final model
             if self.config.lora:
                 # Export LoRA adapter in PEFT-compatible format
@@ -460,6 +499,57 @@ class SurogateTrainerWrapper:
                 generate_training_plot(self.config.log_file, Path(self.config.output_dir) / "training_plot.png")
 
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
+
+    def _record_regression_step(self, metrics: StepMetrics) -> None:
+        if not self._regression_artifact_path:
+            return
+        self._regression_curve.append(
+            {
+                "step": float(metrics.step + 1),
+                "loss": float(metrics.loss),
+                "grad_norm": float(metrics.grad_norm),
+                "lr": float(metrics.lr),
+            }
+        )
+        self._regression_step_times_ms.append(float(metrics.elapsed_ms))
+        try:
+            for info in self.trainer.get_gpu_info():
+                used = (
+                    int(info.mem_reserved) if int(info.mem_reserved) > 0 else int(info.mem_total) - int(info.mem_free)
+                )
+                if used <= 0:
+                    continue
+                if self._regression_cuda_peak_memory_bytes is None:
+                    self._regression_cuda_peak_memory_bytes = used
+                else:
+                    self._regression_cuda_peak_memory_bytes = max(self._regression_cuda_peak_memory_bytes, used)
+        except Exception:
+            return
+
+    def _write_regression_artifact(self) -> None:
+        if not self._regression_artifact_path:
+            return
+        descriptor_summary: dict[str, int] = {}
+        if hasattr(self.trainer, "get_debug_descriptor_summary"):
+            try:
+                descriptor_summary = _flatten_descriptor_summary(self.trainer.get_debug_descriptor_summary())
+            except Exception as exc:
+                descriptor_summary = {"descriptor_summary_error": 1}
+                logger.warning(f"Failed to collect regression descriptor summary: {exc}")
+
+        path = Path(self._regression_artifact_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "activation_snapshots": {},
+            "gradient_snapshots": {},
+            "convergence_curve": self._regression_curve,
+            "step_time_ms": _percentile_summary(self._regression_step_times_ms),
+            "cuda_peak_memory_bytes": self._regression_cuda_peak_memory_bytes,
+            "nccl": {},
+            "descriptor_summary": descriptor_summary,
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     def run_training_loop_mm(self, train_logger: _surogate.TrainingRunLogger):
         use_full_step_graphs = False
@@ -617,6 +707,7 @@ class SurogateTrainerWrapper:
             )
             moe_monitor.step(metrics.moe, step)
             advisor.step(metrics, step)
+            self._record_regression_step(metrics)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
@@ -923,6 +1014,7 @@ class SurogateTrainerWrapper:
             )
             moe_monitor.step(metrics.moe, step)
             advisor.step(metrics, step)
+            self._record_regression_step(metrics)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
