@@ -497,6 +497,10 @@ def required_matmul_capabilities_for_case(case: dict[str, Any]) -> list[str]:
 
 def matmul_capability_counts(descriptor_summary: dict[str, Any]) -> dict[str, Any]:
     keys = (
+        "matmul_fp8_forward_eligible_ops",
+        "matmul_fp8_backward_eligible_ops",
+        "matmul_fp4_forward_eligible_ops",
+        "matmul_fp4_backward_eligible_ops",
         "forward_matmul_fp8_forward_eligible_ops",
         "backward_matmul_fp8_backward_eligible_ops",
         "forward_matmul_fp4_forward_eligible_ops",

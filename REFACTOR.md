@@ -91,6 +91,7 @@
 - [x] Fusion contexts now expose dense `MatmulCapabilities` from compiled ops so future fusion eligibility can match dedicated matmul descriptors instead of generic op flags.
 - [x] Regression artifact flattening now totals dense matmul FP8/FP4 forward/backward descriptor counts for baseline drift detection.
 - [x] North-star coverage rows now include diagnostic descriptor-requirement status and missing descriptor-count keys for supported dense and MoE quantized cases.
+- [x] North-star coverage rows now expose both aggregate and per-graph dense matmul descriptor counts for report consumers.
 
 Local validation status:
 

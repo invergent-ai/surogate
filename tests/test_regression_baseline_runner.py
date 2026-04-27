@@ -57,6 +57,8 @@ def test_coverage_report_marks_moe_grouped_capabilities():
             "reason": "missing weights",
             "metrics": {
                 "descriptor_summary": {
+                    "matmul_fp8_forward_eligible_ops": 8,
+                    "matmul_fp8_backward_eligible_ops": 8,
                     "fusion_candidate_starts": 3,
                     "forward_matmul_fp8_forward_eligible_ops": 4,
                     "backward_matmul_fp8_backward_eligible_ops": 4,
@@ -70,6 +72,8 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["required_capabilities"] == ["GroupedMatmul", "MoERouted", "FP8Eligible"]
     assert report["rows"][0]["required_moe_capabilities"] == ["GroupedGemmEligible", "FP8GroupedEligible"]
     assert report["rows"][0]["required_matmul_capabilities"] == []
+    assert report["rows"][0]["matmul_capability_counts"]["matmul_fp8_forward_eligible_ops"] == 8
+    assert report["rows"][0]["matmul_capability_counts"]["matmul_fp8_backward_eligible_ops"] == 8
     assert report["rows"][0]["matmul_capability_counts"]["forward_matmul_fp8_forward_eligible_ops"] == 4
     assert report["rows"][0]["matmul_capability_counts"]["backward_matmul_fp8_backward_eligible_ops"] == 4
     assert report["rows"][0]["descriptor_requirement_status"] == "missing"
