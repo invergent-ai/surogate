@@ -55,6 +55,19 @@ struct BlockSchemaCoverageValidation {
     std::string message;
 };
 
+struct BlockSchemaLayerSummary {
+    int layer = -1;
+    bool has_schema = false;
+    std::string block_family;
+    int slot_count = 0;
+    int param_slots = 0;
+    int activation_slots = 0;
+    int expert_parallel_slots = 0;
+    int streaming_slots = 0;
+    bool has_routing = false;
+    bool has_ep_topology = false;
+};
+
 /// Extract per-layer block schema records from a compiled graph's metadata.
 /// Malformed records are skipped; absence of metadata returns an empty vector.
 [[nodiscard]] std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph);
@@ -114,6 +127,7 @@ struct BufferPlan {
     int schema_activation_slots = 0;
     int schema_expert_parallel_slots = 0;
     int schema_streaming_slots = 0;
+    std::vector<BlockSchemaLayerSummary> schema_layers;
 
     // ---------------- Dimensions ----------------
     long B = 0;

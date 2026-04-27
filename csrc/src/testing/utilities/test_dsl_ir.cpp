@@ -203,4 +203,15 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_activation_slots == 1);
     REQUIRE(plan.schema_expert_parallel_slots == 2);
     REQUIRE(plan.schema_streaming_slots == 1);
+    REQUIRE(plan.schema_layers.size() == 1);
+    REQUIRE(plan.schema_layers[0].layer == 0);
+    REQUIRE(plan.schema_layers[0].has_schema);
+    REQUIRE(plan.schema_layers[0].block_family == "qwen3_dense");
+    REQUIRE(plan.schema_layers[0].slot_count == 3);
+    REQUIRE(plan.schema_layers[0].param_slots == 2);
+    REQUIRE(plan.schema_layers[0].activation_slots == 1);
+    REQUIRE(plan.schema_layers[0].expert_parallel_slots == 2);
+    REQUIRE(plan.schema_layers[0].streaming_slots == 1);
+    REQUIRE(plan.schema_layers[0].has_routing);
+    REQUIRE(plan.schema_layers[0].has_ep_topology);
 }

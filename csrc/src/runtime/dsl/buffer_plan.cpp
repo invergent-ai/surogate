@@ -237,6 +237,10 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
         p.has_dsl_layout && slot_registry.lookup(builtin_slot_name(TensorSlot::BlockSwiGLU)).has_value();
 
     // ---------------- Schema-driven dual path ----------------
+    p.schema_layers.resize(static_cast<std::size_t>(std::max(p.NumLayers, 0)));
+    for (int layer = 0; layer < p.NumLayers; ++layer) {
+        p.schema_layers[static_cast<std::size_t>(layer)].layer = layer;
+    }
     if (schema_records) {
         p.schema_record_count = static_cast<int>(schema_records->size());
         for (const auto& record : *schema_records) {
@@ -251,6 +255,18 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             p.schema_activation_slots += record.activation_slots;
             p.schema_expert_parallel_slots += record.expert_parallel_slots;
             p.schema_streaming_slots += record.streaming_slots;
+            if (record.layer >= 0 && record.layer < p.NumLayers) {
+                auto& layer = p.schema_layers[static_cast<std::size_t>(record.layer)];
+                layer.has_schema = true;
+                layer.block_family = record.block_family;
+                layer.slot_count = record.slot_count;
+                layer.param_slots = record.param_slots;
+                layer.activation_slots = record.activation_slots;
+                layer.expert_parallel_slots = record.expert_parallel_slots;
+                layer.streaming_slots = record.streaming_slots;
+                layer.has_routing = record.has_routing;
+                layer.has_ep_topology = record.has_ep_topology;
+            }
         }
     }
 
