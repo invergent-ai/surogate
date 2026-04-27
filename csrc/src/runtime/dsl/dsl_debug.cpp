@@ -307,6 +307,24 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     s.schema_expert_parallel_param_shape_bytes = u64(p.schema_expert_parallel_param_shape_bytes);
     s.schema_expert_parallel_param_shape_local_bytes = u64(p.schema_expert_parallel_param_shape_local_bytes);
     s.schema_expert_parallel_param_shape_savings_bytes = u64(p.schema_expert_parallel_param_shape_savings_bytes);
+    for (const BlockSchemaLayerSummary& layer : p.schema_layers) {
+        for (const BlockSchemaSlotSummary& slot : layer.slots) {
+            const bool is_param = slot.kind == "param";
+            const bool streamable_param =
+                is_param && (slot.streaming_prefetch_distance >= 0 || slot.residency == "auto" ||
+                             slot.residency == "cpu_pinned_stream" || slot.residency == "cpu_pageable" ||
+                             slot.residency == "nvme_offload");
+            if (streamable_param) {
+                s.hook_before_consume_targets += 1;
+            }
+            if (!is_param && slot.distribution_kind == "expert_parallel") {
+                s.hook_after_all_to_all_targets += 1;
+            }
+            if (is_param && (slot.distribution_kind == "sharded_dim" || slot.distribution_kind == "expert_parallel")) {
+                s.hook_after_reduce_scatter_targets += 1;
+            }
+        }
+    }
     return s;
 }
 
