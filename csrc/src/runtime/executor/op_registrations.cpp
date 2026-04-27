@@ -618,15 +618,15 @@ REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_down",
                           ::dsl::StorageCompatibilityGpuResident,
                           Routed);
 REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_backward",
-                          ::dsl::MoECapabilityGroupedGemmEligible,
+                          ::dsl::MoECapabilityGroupedGemmEligible | ::dsl::MoECapabilityFp8GroupedEligible,
                           ::dsl::StorageCompatibilityGpuResident,
                           Routed);
 REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_gate_up_backward",
-                          ::dsl::MoECapabilityGroupedGemmEligible,
+                          ::dsl::MoECapabilityGroupedGemmEligible | ::dsl::MoECapabilityFp8GroupedEligible,
                           ::dsl::StorageCompatibilityGpuResident,
                           Routed);
 REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_down_backward",
-                          ::dsl::MoECapabilityGroupedGemmEligible,
+                          ::dsl::MoECapabilityGroupedGemmEligible | ::dsl::MoECapabilityFp8GroupedEligible,
                           ::dsl::StorageCompatibilityGpuResident,
                           Routed);
 REGISTER_COMPILED_OP("moe_unpermute",

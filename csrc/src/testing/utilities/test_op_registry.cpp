@@ -106,7 +106,7 @@ TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {
     REQUIRE(grouped_bwd->default_caps.has(OpCapabilityFp8Eligible));
     REQUIRE(grouped_bwd->default_caps.has(OpCapabilityWeightCacheEligible));
     REQUIRE(grouped_bwd->moe_caps.has(MoECapabilityGroupedGemmEligible));
-    REQUIRE_FALSE(grouped_bwd->moe_caps.has(MoECapabilityFp8GroupedEligible));
+    REQUIRE(grouped_bwd->moe_caps.has(MoECapabilityFp8GroupedEligible));
     REQUIRE_FALSE(grouped_bwd->moe_caps.has(MoECapabilityFp8BackwardImplemented));
 }
 

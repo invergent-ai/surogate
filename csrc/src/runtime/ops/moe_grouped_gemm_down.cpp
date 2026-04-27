@@ -225,6 +225,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
         ctx.stream = mRunState.MainStream;
         ctx.op_caps = op.default_caps;
+        ctx.moe_caps = op.moe_caps;
         ctx.epilogue_support = op.epilogue_support;
         ctx.storage_compat = op.storage_compat;
         attach_moe_fp8_cache(ctx, op.inputs[1].name);

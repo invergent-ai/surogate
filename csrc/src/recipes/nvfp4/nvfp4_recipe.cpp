@@ -1084,7 +1084,7 @@ void NVFP4Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // (on-the-fly quantization is not worthwhile for MoE due to the large
     // aggregate weight size E*N*K — the quantization cost exceeds bandwidth savings).
 
-    if (ctx.has_fp4_weights()) {
+    if (ctx.has_fp4_weights() && descriptor_allows_moe_fp4_grouped(ctx.moe_caps, "NVFP4Recipe::forward_moe_matmul")) {
         bool success = moe_cudnn_grouped_gemm_fp4(ctx.out,
                                                   ctx.inp,
                                                   ctx.weights_fp4,

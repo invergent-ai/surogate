@@ -81,6 +81,7 @@
 - [x] Regression baseline compare now detects descriptor-summary count drift when baselines include descriptor fields.
 - [x] Dedicated inert `MoECapabilities` descriptor surface added and populated on grouped MoE GEMM forward/backward ops, explicitly leaving FP8-backward/NVFP4-no-fallback gaps unset.
 - [x] Shared recipe capability predicates now include MoE/grouped FP8, FP4, and FP8-backward capability checks with legacy fallback logging.
+- [x] MoE grouped recipe paths now receive `MoECapabilities` from compiled descriptors and consult grouped FP8/FP4 predicates before specialized paths.
 
 Local validation status:
 

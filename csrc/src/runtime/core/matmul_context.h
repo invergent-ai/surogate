@@ -291,6 +291,7 @@ struct MoeMatmulContext {
     int total_tokens = 0;  ///< Total tokens across all experts
     int layer_idx = 0;     ///< Current layer index (for delayed scaling)
     dsl::OpCapabilities op_caps{};
+    dsl::MoECapabilities moe_caps{};
     dsl::EpilogueSupport epilogue_support{};
     dsl::StorageCompatibility storage_compat{};
 

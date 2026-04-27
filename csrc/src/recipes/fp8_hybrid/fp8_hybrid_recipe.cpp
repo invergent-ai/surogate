@@ -619,7 +619,8 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // =========================================================================
     // Path 1: Pre-quantized FP8 weights (Weight-Only Quantization via cuDNN FE)
     // =========================================================================
-    if (ctx.has_fp8_weights()) {
+    if (ctx.has_fp8_weights() &&
+        descriptor_allows_moe_fp8_grouped(ctx.moe_caps, "FP8HybridRecipe::forward_moe_matmul")) {
         bool success = moe_cudnn_grouped_gemm_fp8(ctx.out,
                                                   ctx.inp,
                                                   ctx.weights_fp8,
@@ -645,7 +646,8 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // Path 2: Full FP8 Training (quantize activations + use FP8 kernels)
     // =========================================================================
 
-    if (ctx.allow_fp8 && descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::forward_moe_matmul") && ctx.inp_quant &&
+    if (ctx.allow_fp8 && descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::forward_moe_matmul") &&
+        descriptor_allows_moe_fp8_grouped(ctx.moe_caps, "FP8HybridRecipe::forward_moe_matmul") && ctx.inp_quant &&
         ctx.inp_quant->Data && ctx.run_state && ctx.cublas_handle && ctx.host_offsets) {
         IRunState& rs = *ctx.run_state;
         const long num_elements = static_cast<long>(ctx.total_tokens) * ctx.K;
@@ -781,7 +783,8 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
     }
 
     // Fall back to BF16 if FP8 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::backward_moe_matmul")) {
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::backward_moe_matmul") ||
+        !descriptor_allows_moe_fp8_grouped(ctx.moe_caps, "FP8HybridRecipe::backward_moe_matmul")) {
         Recipe::backward_moe_matmul(ctx);
         return;
     }
