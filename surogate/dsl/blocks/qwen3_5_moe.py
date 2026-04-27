@@ -91,8 +91,8 @@ def _qwen3_5_moe_schema(block_family: str, *, has_linear_mixer: bool = False) ->
     )
     if has_linear_mixer:
         slots += (
-            SlotDecl("mixer_conv_state", shape=("B", "ConvDim", "ConvK"), save_for_backward=True),
-            SlotDecl("mixer_delta_state", shape=("B", "Hv", "Vd"), save_for_backward=True),
+            SlotDecl("lin_conv_state", shape=("B", "ConvDim", "ConvK"), save_for_backward=True),
+            SlotDecl("lin_delta_state", shape=("B", "Hv", "Vd"), save_for_backward=True),
         )
     return BlockSchema(
         slots=slots,
