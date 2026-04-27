@@ -46,41 +46,13 @@ bool env_enabled(const char* name) {
     return std::string_view(value) != "0" && std::string_view(value) != "false";
 }
 
-// Gradient name parsing (compile-time heuristic, always followed by a
-// validation check against the parameter store). See header for details.
-std::optional<std::string> base_param_from_grad_heuristic(std::string_view name) {
-    if (!starts_with(name, "d_")) {
-        return std::nullopt;
-    }
-    std::string base(name.substr(2));
-    const std::string_view accum_tag = "_accum_";
-    const std::string_view from_tag = "_from_";
-    std::size_t pos = std::string::npos;
-    std::size_t pos_accum = base.find(accum_tag);
-    std::size_t pos_from = base.find(from_tag);
-    if (pos_accum != std::string::npos) {
-        pos = pos_accum;
-    }
-    if (pos_from != std::string::npos) {
-        if (pos == std::string::npos || pos_from < pos) {
-            pos = pos_from;
-        }
-    }
-    if (pos != std::string::npos) {
-        base = base.substr(0, pos);
-    }
-    return base;
-}
-
 // Classifier-backed resolution: consults TensorKind instead of guessing from
 // the name shape. Returns the param name ONLY when kind == ParamGrad AND
 // base_param_tid points to a tid in the tensor_name_to_id map. In every other
 // case — ActivationGrad, AccumTemp, Scratch, etc. — returns nullopt, which is
 // what callers that intend to route through the parameter-gradient store want.
 //
-// This is the non-guessing replacement for the heuristic `base_param_from_grad`
-// above. The heuristic should be migrated away from every call site that has
-// access to the compiled graph.
+// This is the non-guessing replacement for name-derived gradient routing.
 std::optional<std::string> base_param_from_grad_kind(int tensor_id, const CompiledGraph& graph) {
     if (tensor_id < 0 || static_cast<std::size_t>(tensor_id) >= graph.tensor_meta.size()) {
         return std::nullopt;

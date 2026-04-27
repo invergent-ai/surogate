@@ -30,21 +30,6 @@ bool ends_with(std::string_view value, std::string_view suffix);
 // Environment variable check
 bool env_enabled(const char* name);
 
-// *** COMPILE-TIME HEURISTIC ONLY — DO NOT CALL FROM RUNTIME DISPATCHERS. ***
-//
-// Returns Some(base) for ANY name starting with `d_` (after stripping
-// `_from_N` / `_accum_N`). Does NOT verify the base is a real parameter — that
-// is the caller's job (e.g. `mWeights.has(*base)` after the call). This
-// pattern (heuristic + validate) is acceptable at compile time where we have
-// no compiled graph yet. Any runtime dispatcher that has access to the
-// compiled graph MUST use `base_param_from_grad_kind()` instead; the
-// classifier is the only source of truth for "is this a parameter gradient?".
-//
-// Named `_heuristic` so greps for "base_param_from_grad(" land on the
-// authoritative classifier overload first and nobody accidentally re-
-// introduces the misclassification bug class we retired.
-std::optional<std::string> base_param_from_grad_heuristic(std::string_view name);
-
 struct CompiledGraph;  // fwd
 
 // Classifier-backed resolution. Returns the parameter name ONLY when the

@@ -4682,6 +4682,22 @@ std::pair<std::string, bool> strip_autodiff_accum_tag(const std::string& name) {
     return {name, false};
 }
 
+std::optional<std::string> debug_base_param_guess_from_grad_name(std::string_view name) {
+    if (!starts_with(name, "d_")) {
+        return std::nullopt;
+    }
+    std::string base(name.substr(2));
+    for (const char* tag : {"_from_", "_accum_"}) {
+        const std::string_view tag_view(tag);
+        const std::size_t pos = base.find(tag_view);
+        if (pos != std::string::npos) {
+            base = base.substr(0, pos);
+            break;
+        }
+    }
+    return base;
+}
+
 }  // namespace
 
 void GraphCompiler::classify_tensors(CompiledGraph& graph) {
@@ -4821,8 +4837,7 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
         graph.tensor_meta[i].role.kind = role_kind_from_tensor_kind(graph.tensor_meta[i].kind);
     }
 
-    // Optional: dump classification on demand for debugging and for validating
-    // the remaining name-only fallback paths.
+    // Optional: dump classification on demand for debugging.
     const char* dump_env = std::getenv("SUROGATE_DEBUG_TENSOR_KIND");
     const bool dump_enabled = dump_env && std::string_view(dump_env) != "0";
     if (dump_enabled) {
@@ -4844,14 +4859,12 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
                      counts[static_cast<std::size_t>(TensorKind::Scratch)]);
     }
 
-    // Cross-check: the older `base_param_from_grad_heuristic(name)` predicate returns
+    // Cross-check: the older d_<base> name heuristic would return
     // Some(base) for ANY name starting with `d_` (after stripping
     // `_from_N`/`_accum_N`). Our classifier returns ParamGrad ONLY when the
-    // base is a real parameter. For every tid where the legacy predicate says
+    // base is a real parameter. For every tid where the old heuristic says
     // "this is a param grad" but the classifier disagrees, report it — those
     // are the latent bugs (intermediate gradients misread as param grads).
-    // Callers that switch to the classifier in Phase 1 will see those cases
-    // routed correctly.
     const char* check_env = std::getenv("SUROGATE_CHECK_TENSOR_KIND");
     const bool check_enabled = dump_enabled || (check_env && std::string_view(check_env) != "0");
     if (check_enabled) {
@@ -4859,14 +4872,14 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
         for (const auto& [name, id] : graph.tensor_name_to_id) {
             if (id < 0 || static_cast<std::size_t>(id) >= graph.tensor_meta.size()) continue;
             const auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
-            auto heuristic = base_param_from_grad_heuristic(name);
+            auto heuristic = debug_base_param_guess_from_grad_name(name);
             if (!heuristic.has_value()) {
                 // Heuristic says "not a gradient name" — classifier should agree
                 // (no ParamGrad without a `d_` prefix).
                 if (meta.kind == TensorKind::ParamGrad) {
                     std::fprintf(stderr,
                                  "[classify_tensors][DISAGREE] %s tid=%d kind=ParamGrad "
-                                 "but base_param_from_grad_heuristic returned nullopt\n",
+                                 "but debug d_<base> guess returned nullopt\n",
                                  name.c_str(),
                                  id);
                     disagreements++;

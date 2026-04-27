@@ -495,11 +495,13 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
                 }
             }
 
+            std::unordered_set<std::string> param_grad_outputs;
+            param_grad_outputs.reserve(mGrads.param_names().size());
+            for (const std::string& param_name : mGrads.param_names()) {
+                param_grad_outputs.insert("d_" + param_name);
+            }
             auto is_param_grad = [&](const std::string& name) {
-                if (auto base = base_param_from_grad_heuristic(name)) {
-                    return mWeights.has(*base);
-                }
-                return false;
+                return param_grad_outputs.find(name) != param_grad_outputs.end();
             };
 
             std::vector<char> core(op_count, 0);

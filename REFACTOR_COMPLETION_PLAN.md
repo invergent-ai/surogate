@@ -77,17 +77,17 @@ Acceptance:
 - [ ] At least one dense fusion rewrite is enabled by default with numerical parity and no perf regression.
 - [ ] MoE fusion candidates remain inert until explicit parity tests exist.
 
-## Track 6 - Remove Remaining Name-Only Gradient Fallback
+## Track 6 - Remove Remaining Name-Only Gradient Fallback - COMPLETE
 
-- [ ] Replace executor split-planner use of `base_param_from_grad_heuristic` with compiled tensor metadata or an equivalent precompiled gradient-kind map.
-- [ ] Keep `base_param_from_grad_heuristic` only as a debug assertion helper while migrating.
-- [ ] Delete the heuristic once no runtime caller remains.
+- [x] Replaced executor split-planner use of `base_param_from_grad_heuristic` with an exact precomputed parameter-gradient output map derived from `DslGradStore::param_names()`.
+- [x] Kept the old `d_<base>` inference only as a private graph-compiler debug cross-check under tensor-kind diagnostics.
+- [x] Deleted the public executor heuristic utility once no runtime caller remained.
 
 Acceptance:
 
-- [ ] Runtime gradient routing never infers parameter gradients from `d_<base>` names alone.
-- [ ] Tensor-kind debug checks still catch accumulator and activation-gradient misclassification.
-- [ ] Existing CUDA graph split behavior is unchanged.
+- [x] Runtime gradient routing never infers parameter gradients from `d_<base>` names alone.
+- [x] Tensor-kind debug checks still catch accumulator and activation-gradient misclassification.
+- [x] Existing CUDA graph split behavior is unchanged by using exact grad-store names for the split-planner tail.
 
 ## Track 7 - Final Validation And Cleanup
 
@@ -108,3 +108,13 @@ Acceptance:
 - [ ] No required path depends on scaffold-only, inert-only, or diagnostic-only implementation for the refactor goals.
 - [ ] All remaining fallback paths are either explicit unsupported-mode fallbacks or documented operational safety fallbacks.
 - [ ] `git status --short` is clean after final commits.
+
+Order:
+
+Track 6 - remove name-only grad fallback.
+Track 4 - remove descriptor capability fallbacks.
+Track 1 - finish FP8 MoE wgrad properly.
+Track 2 - promote hook dispatch.
+Track 3 - schema-driven allocation authoritative.
+Track 5 - activate fusion rewrites.
+Track 7 - final validation.
