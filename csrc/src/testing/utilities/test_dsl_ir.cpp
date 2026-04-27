@@ -286,6 +286,20 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(gate_up_slot);
     REQUIRE(gate_up_slot->grouped);
     REQUIRE(gate_up_slot->streaming_prefetch_distance == 1);
+    dsl::ActivationLayoutIR layout;
+    dsl::ActivationSlotIR permuted;
+    permuted.name = "permuted_input";
+    layout.slots.push_back(permuted);
+    dsl::TensorSlotRegistry parity_registry;
+    parity_registry.init_from_layout(layout);
+    REQUIRE(plan.schema_activation_slots_missing_from_registry(parity_registry).empty());
+
+    dsl::ActivationLayoutIR missing_layout;
+    dsl::TensorSlotRegistry missing_registry;
+    missing_registry.init_from_layout(missing_layout);
+    const auto missing_schema_slots = plan.schema_activation_slots_missing_from_registry(missing_registry);
+    REQUIRE(missing_schema_slots.size() == 1);
+    REQUIRE(missing_schema_slots[0] == "layer0.permuted_input");
     REQUIRE(plan.schema_layers[0].routing_kind == "topk_softmax");
     REQUIRE(plan.schema_layers[0].routing_topk == 2);
     REQUIRE(plan.schema_layers[0].routing_norm_topk_prob);

@@ -243,6 +243,8 @@ struct BufferPlan {
     [[nodiscard]] bool schema_layer_has_slot(int i, std::string_view name) const {
         return schema_slot(i, name) != nullptr;
     }
+    [[nodiscard]] std::vector<std::string>
+    schema_activation_slots_missing_from_registry(const TensorSlotRegistry& slot_registry) const;
 
     [[nodiscard]] long layer_qkv(int i) const {
         return (has_per_layer_dims() && i < static_cast<int>(per_layer_dims.size())) ? per_layer_dims[i].qkv_channels

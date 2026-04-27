@@ -449,6 +449,28 @@ const BlockSchemaSlotSummary* BufferPlan::schema_slot(int i, std::string_view na
     return nullptr;
 }
 
+std::vector<std::string>
+BufferPlan::schema_activation_slots_missing_from_registry(const TensorSlotRegistry& slot_registry) const {
+    std::vector<std::string> missing;
+    if (!slot_registry.has_dsl_layout()) {
+        return missing;
+    }
+    for (const auto& layer : schema_layers) {
+        if (!layer.has_schema) {
+            continue;
+        }
+        for (const auto& slot : layer.slots) {
+            if (slot.kind == "param" || slot.name.empty()) {
+                continue;
+            }
+            if (!slot_registry.lookup(slot.name).has_value()) {
+                missing.push_back("layer" + std::to_string(layer.layer) + "." + slot.name);
+            }
+        }
+    }
+    return missing;
+}
+
 // ============================================================================
 // Stack sizing
 // ============================================================================
