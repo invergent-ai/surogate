@@ -105,6 +105,7 @@
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
 - [x] Initial schemas attached to Nemotron Mamba, Nemotron MoE, Qwen3-MoE, and GPT-OSS MoE blocks.
 - [x] Block schema metadata now serializes into compiled block IR dictionaries for future BufferPlan consumption.
+- [x] Legacy Python lowerer also preserves block schema metadata, keeping both DSL lowering paths aligned.
 
 Local validation status:
 

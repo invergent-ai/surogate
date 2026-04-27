@@ -2,6 +2,7 @@ from surogate.dsl.block_schema import BlockSchema, DistributionDecl
 from surogate.dsl.blocks.gpt_oss import GptOssBlock
 from surogate.dsl.blocks.nemotron_h import NemotronHMamba2Block, NemotronHMoEBlock
 from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
+from surogate.dsl.py_lowering import lower_block_spec
 from surogate.dsl.py_compiler import _module_ir_to_dict, compile_block_spec
 
 
@@ -102,3 +103,12 @@ def test_block_schema_lowers_to_block_ir_dict():
     expert_slot = next(slot for slot in payload["block_schema"]["slots"] if slot["name"] == "experts_gate_up")
     assert expert_slot["distribution"]["kind"] == "expert_parallel"
     assert expert_slot["streaming_hint"]["prefetch_distance"] == 1
+
+
+def test_legacy_lowerer_preserves_block_schema_metadata():
+    spec = NemotronHMamba2Block(d_model=256, mamba_num_heads=8, mamba_head_dim=32, n_groups=4).compile()
+
+    ir = lower_block_spec(spec)
+
+    assert ir.block_schema["attrs"]["block_family"] == "nemotron_mamba2"
+    assert ir.block_schema["slots"][0]["name"] == "ssm_state"

@@ -433,6 +433,7 @@ class ModuleIR:
     is_block: bool = False
     is_model: bool = False
     extends: str | None = None
+    block_schema: dict[str, Any] = field(default_factory=dict)
 
 
 # =============================================================================

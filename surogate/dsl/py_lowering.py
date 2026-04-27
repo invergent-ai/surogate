@@ -7,6 +7,7 @@ into the existing GraphIR/ModuleIR format for execution.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any
 
 from .graph_builder import GraphBuilder, GraphNode
@@ -162,6 +163,8 @@ class SpecLowerer:
             is_model=False,
             extends=spec.extends,
         )
+        if spec.schema:
+            ir.block_schema = asdict(spec.schema)
 
         # Lower parameters
         for param_name, param_spec in spec.params.items():
