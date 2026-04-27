@@ -118,10 +118,14 @@ TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][gr
 TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]") {
     CompiledGraph graph;
     graph.ops.resize(3);
+    graph.ops[0].type = CompiledOpType::Matmul;
     graph.ops[0].comm_profile.kind = CommunicationKind::NoComm;
+    graph.ops[0].default_caps.flags = OpCapabilityDenseMatmul | OpCapabilityFp8Eligible;
+    graph.ops[1].type = CompiledOpType::BiasAdd;
     graph.ops[1].comm_profile.kind = CommunicationKind::AllToAllIn;
     graph.ops[1].grouped_semantics.routes_tokens = true;
     graph.ops[1].storage_compat.flags |= StorageCompatibilityCpuPinnedStream;
+    graph.ops[1].default_caps.flags = OpCapabilityDenseMatmul;
     graph.ops[2].comm_profile.kind = CommunicationKind::ExpertParallelRouted;
     graph.ops[2].grouped_semantics.is_grouped = true;
     graph.ops[2].grouped_semantics.expert_dim = 0;
@@ -134,9 +138,13 @@ TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]
     REQUIRE(graph.count_ops_with_comm(CommunicationKind::AllReduceAfter) == 0);
     REQUIRE(graph.count_grouped_ops() == 1);
     REQUIRE(graph.count_ops_with_capability(OpCapabilityGroupedMatmul) == 1);
-    REQUIRE(graph.count_ops_with_capability(OpCapabilityFp8Eligible) == 1);
+    REQUIRE(graph.count_ops_with_capability(OpCapabilityFp8Eligible) == 2);
     REQUIRE(graph.count_ops_with_capability(OpCapabilityFp4Eligible) == 0);
     REQUIRE(graph.count_ops_with_epilogue(EpilogueSupportActivation) == 1);
     REQUIRE(graph.count_ops_supporting_storage(StorageTier::GpuResident) == 3);
     REQUIRE(graph.count_ops_supporting_storage(StorageTier::CpuPinnedStream) == 1);
+    REQUIRE(graph.count_fusion_candidate_starts() == 0);
+
+    graph.ops[1].comm_profile.kind = CommunicationKind::NoComm;
+    REQUIRE(graph.count_fusion_candidate_starts() == 1);
 }

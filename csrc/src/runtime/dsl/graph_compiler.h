@@ -24,6 +24,7 @@
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
 #include "runtime/dsl/tensor_role.h"
+#include "runtime/dsl/fusion_rule_registry.h"
 #include "runtime/executor/op_descriptor_types.h"
 #include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
@@ -716,6 +717,10 @@ struct CompiledGraph {
             }
         }
         return count;
+    }
+
+    std::size_t count_fusion_candidate_starts() const {
+        return FusionRuleRegistry::instance().count_matching_starts(ops);
     }
 
     /// Debuggability (P4.7): format "tid=5 name='blocks[3].ln1' region=FwdStack
