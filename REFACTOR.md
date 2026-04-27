@@ -99,6 +99,12 @@
 - [x] MoE grouped matmul recipe contexts now carry optional routed-token `TensorRole` metadata from compiled tensor records, preparing MoE capability-plus-role predicates without changing execution.
 - [x] Shared recipe predicate helpers now include a scaffolded MoE FP8 grouped check over `MoECapabilities` plus routed-token `TensorRole`.
 
+### Phase 4 — Block schemas + storage residency + EP topology — STARTED
+
+- [x] Python DSL `BlockSchema` declaration surface added for slot residency, distribution, streaming hints, routing schema, and EP topology metadata.
+- [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
+- [x] Initial schemas attached to Nemotron Mamba, Nemotron MoE, Qwen3-MoE, and GPT-OSS MoE blocks.
+
 Local validation status:
 
 - [x] `make wheel-dev` passed.
@@ -195,7 +201,7 @@ Phase 0: Test infrastructure first-month slice                COMPLETE
 Phase 1: TensorRole + Distribution scaffolding                COMPLETE
 Phase 2: Op registry descriptor extension scaffold            COMPLETE
 Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
-Phase 4: Block schemas + storage residency + EP topology      NOT STARTED
+Phase 4: Block schemas + storage residency + EP topology      STARTED
 Phase 5: Hook registry + distribution-aware + CPU offload     NOT STARTED
 ```
 

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from .. import nn
-from ..modules import GenericGQAttention, GptOssMoEExperts, RMSNorm
 from ..attention import AttentionConfig
+from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
 from ..dim import B, Dim, T
+from ..modules import GenericGQAttention, GptOssMoEExperts, RMSNorm
 from .common import DENSE_BLOCK_NAME_REMAP
 
 
@@ -44,6 +45,37 @@ class GptOssBlock(nn.Block):
     """GPT-OSS transformer block: sink-token attention + MoE experts."""
 
     _name_remap_ = GPT_OSS_BLOCK_NAME_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl(
+                "router_weight", kind="param", shape=("E", "C"), distribution=DistributionDecl.router_replicated()
+            ),
+            SlotDecl(
+                "experts_gate_up",
+                kind="param",
+                shape=("E", "2M", "C"),
+                residency="auto",
+                distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+                grouped=True,
+                streaming_hint=StreamingHint(prefetch_distance=1),
+            ),
+            SlotDecl(
+                "experts_down",
+                kind="param",
+                shape=("E", "C", "M"),
+                residency="auto",
+                distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+                grouped=True,
+                streaming_hint=StreamingHint(prefetch_distance=1),
+            ),
+            SlotDecl(
+                "permuted_input", shape=("dispatched_tokens", "C"), distribution=DistributionDecl.expert_parallel()
+            ),
+        ),
+        routing=RoutingSchema(kind="topk_softmax", topk="num_experts_per_tok", scoring_bias=True),
+        ep_topology=EPTopology(ep_size_param="ep_size"),
+        attrs={"block_family": "gpt_oss_moe"},
+    )
 
     def __init__(
         self,

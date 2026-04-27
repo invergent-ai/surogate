@@ -15,8 +15,9 @@ Each block has the structure:
 from __future__ import annotations
 
 from .. import nn
-from ..modules import Mamba2Mixer, NemotronAttention, NemotronMoEExperts, NemotronSharedExpert, RMSNorm, SimpleMLP
+from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
 from ..dim import B, Dim, T
+from ..modules import Mamba2Mixer, NemotronAttention, NemotronMoEExperts, NemotronSharedExpert, RMSNorm, SimpleMLP
 from .common import STANDARD_MODEL_NAME_REMAP
 
 # Nemotron uses the standard model scope; alias for call-site clarity.
@@ -144,6 +145,29 @@ class NemotronHMamba2Block(nn.Block):
     """Mamba2 block for Nemotron-H hybrid architecture."""
 
     _name_remap_ = NEMOTRON_MAMBA_BLOCK_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl("ssm_state", shape=("B", "T", "H", "D", "N"), save_for_backward=True),
+            SlotDecl("conv_out", shape=("B", "T", "D_conv"), save_for_backward=True),
+            SlotDecl(
+                "in_proj_weight",
+                kind="param",
+                shape=("P", "C"),
+                residency="auto",
+                distribution=DistributionDecl.sharded_dim(dim=0, mode="zero2"),
+                streaming_hint=StreamingHint(prefetch_distance=2),
+            ),
+            SlotDecl(
+                "out_proj_weight",
+                kind="param",
+                shape=("C", "I"),
+                residency="auto",
+                distribution=DistributionDecl.sharded_dim(dim=0, mode="zero2"),
+                streaming_hint=StreamingHint(prefetch_distance=2),
+            ),
+        ),
+        attrs={"block_family": "nemotron_mamba2"},
+    )
 
     def __init__(
         self,
@@ -304,6 +328,43 @@ class NemotronHMoEBlock(nn.Block):
     """MoE block for Nemotron-H hybrid architecture."""
 
     _name_remap_ = NEMOTRON_MOE_BLOCK_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl(
+                "router_weight", kind="param", shape=("E", "C"), distribution=DistributionDecl.router_replicated()
+            ),
+            SlotDecl(
+                "experts_up",
+                kind="param",
+                shape=("E", "M", "C"),
+                residency="auto",
+                distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+                grouped=True,
+                streaming_hint=StreamingHint(prefetch_distance=1),
+            ),
+            SlotDecl(
+                "experts_down",
+                kind="param",
+                shape=("E", "C", "M"),
+                residency="auto",
+                distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+                grouped=True,
+                streaming_hint=StreamingHint(prefetch_distance=1),
+            ),
+            SlotDecl(
+                "permuted_input", shape=("dispatched_tokens", "C"), distribution=DistributionDecl.expert_parallel()
+            ),
+        ),
+        routing=RoutingSchema(
+            kind="topk_sigmoid",
+            topk="num_experts_per_tok",
+            norm_topk_prob="norm_topk_prob",
+            scoring_bias=True,
+            shared_experts="use_shared_expert",
+        ),
+        ep_topology=EPTopology(ep_size_param="ep_size"),
+        attrs={"block_family": "nemotron_moe"},
+    )
 
     def __init__(
         self,
