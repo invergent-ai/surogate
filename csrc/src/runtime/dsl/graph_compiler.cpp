@@ -1254,6 +1254,15 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
             attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
+            if (!matmul_op.has_value()) {
+                std::string field;
+                if (parse_block_param(op.inputs[1], layer_idx, field) && field == "router_weight") {
+                    attrs.layer_idx = layer_idx;
+                    set_forward_hook_schema_slot(attrs,
+                                                 modules::ForwardHookPoint::AfterRouterProjection,
+                                                 "router_logits");
+                }
+            }
             if (matmul_op.has_value()) {
                 switch (*matmul_op) {
                     case modules::MatmulOp::QKV:

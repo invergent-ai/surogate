@@ -231,6 +231,7 @@ Real-model acceptance queue:
 - [x] Grouped MoE down-projection LoRA now dispatches the structural `expert_down` `after_produce` hook under opt-in schema dispatch, with the existing inline grouped-LoRA path retained as fallback.
 - [x] Grouped MoE gate/up LoRA now dispatches the structural `expert_gate_up` `after_produce` hook for fused and separate expert gate/up adapters, with the existing inline grouped-LoRA path retained as fallback.
 - [x] Generic grouped MoE up-projection LoRA now dispatches the structural `expert_up` `after_produce` hook, and hook target collection includes `expert_up` activation slots for Nemotron-style MoE blocks.
+- [x] Router matmuls now carry the structural `router_logits` `after_produce` hook slot, allowing router LoRA to use the typed after-produce payload instead of only the inline fallback.
 
 ---
 

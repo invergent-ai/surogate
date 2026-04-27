@@ -237,6 +237,7 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
                     "mlp_down",
                     "router_logits",
                     "expert_gate_up",
+                    "expert_up",
                     "expert_down",
                 }:
                     summary["hook_after_produce_targets"] += 1

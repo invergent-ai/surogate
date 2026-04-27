@@ -342,6 +342,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
             case modules::ForwardHookPoint::AfterAttnOutProjection: slot = TensorSlot::BlockAttOut; break;
             case modules::ForwardHookPoint::AfterMLPUpProjection: slot = TensorSlot::BlockMLPUp; break;
             case modules::ForwardHookPoint::AfterMLPDownProjection: slot = TensorSlot::BlockMLPDown; break;
+            case modules::ForwardHookPoint::AfterRouterProjection: slot = TensorSlot::BlockRouterLogits; break;
             default: break;
         }
         if (slot != TensorSlot::Mapped) {
