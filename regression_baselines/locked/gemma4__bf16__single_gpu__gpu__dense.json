@@ -10,10 +10,14 @@
     "storage": "gpu",
     "supported": true
   },
-  "command": [],
+  "command": [
+    "surogate",
+    "sft",
+    "examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml"
+  ],
   "duration_s": 0.0,
   "metrics": {},
-  "reason": "config not found: examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml",
+  "reason": "not executed; pass --run to launch GPU workload",
   "started_at": 0.0,
   "status": "skipped"
 }
