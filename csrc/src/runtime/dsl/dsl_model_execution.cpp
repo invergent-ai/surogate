@@ -279,6 +279,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
         cudaMemGetInfo(&free_mem, &total_mem);
         std::cerr << "[DEBUG-STACK] plan_peak=" << initial_plan.plan_stack_peak_bytes() / (1024 * 1024) << " MiB"
                   << ", initial_required=" << required_size / (1024 * 1024) << " MiB"
+                  << ", block_schema_records=" << mBlockSchemaPlanRecords.size()
                   << ", GPU used=" << (total_mem - free_mem) / (1024 * 1024) << " MiB"
                   << ", free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }

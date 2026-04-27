@@ -1115,6 +1115,9 @@ DslModel::DslModel(const PretrainedConfig& config,
         throw std::runtime_error(error_msg);
     }
     mModule = &pick_model_module(mIr);
+    if (mModule->forward.has_value()) {
+        mBlockSchemaPlanRecords = collect_block_schema_plan_records(*mModule->forward);
+    }
     validate_ir();
     apply_arch_from_hf_config(*mConfig, *mModule);
     mRuntimeConfig = build_runtime_config(*mModule, *mConfig);

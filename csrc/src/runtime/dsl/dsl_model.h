@@ -14,6 +14,7 @@
 
 #include <cublas_v2.h>
 
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/dsl_runtime_config.h"
 #include "runtime/core/model_config.h"
@@ -339,6 +340,7 @@ private:
     IRFile mIr;
     const Module* mModule = nullptr;
     DslRuntimeConfig mRuntimeConfig;
+    std::vector<BlockSchemaPlanRecord> mBlockSchemaPlanRecords;
     std::unique_ptr<DslParamStore> mParams;
     std::unique_ptr<DslGradStore> mGrads;
     std::unique_ptr<DslWeightManager> mWeightManager;  // Optional - for streaming/sharding

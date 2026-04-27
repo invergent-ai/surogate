@@ -111,6 +111,7 @@
 - [x] Expanded model graphs now preserve per-layer block schema records in forward graph metadata.
 - [x] C++ DSL IR loader now preserves forward graph metadata, including per-layer block schema records for BufferPlan dual-path consumption.
 - [x] BufferPlan-facing C++ schema record collector added as the first no-behavior-change dual path for Phase 4b.
+- [x] `DslModel` now captures schema plan records during initialization and reports them in debug memory output without changing allocator behavior.
 
 Local validation status:
 
