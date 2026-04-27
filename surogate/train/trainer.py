@@ -61,9 +61,12 @@ def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
         "moe_nvfp4_no_fallback_ops": 0,
         "lora_slices": 0,
         "lora_schema_slot_slices": 0,
+        "lora_schema_target_slices": 0,
         "grouped_lora_schema_slot_slices": 0,
+        "grouped_lora_schema_target_slices": 0,
         "forward_hook_points": 0,
         "forward_hook_schema_slot_points": 0,
+        "forward_hook_schema_target_points": 0,
     }
     for graph_name in ("forward", "backward"):
         graph = summary.get(graph_name)

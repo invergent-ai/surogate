@@ -177,9 +177,12 @@ struct DebugGraphDescriptorSummary {
     std::uint64_t fp4_ready_tensors = 0;
     std::uint64_t lora_slices = 0;
     std::uint64_t lora_schema_slot_slices = 0;
+    std::uint64_t lora_schema_target_slices = 0;
     std::uint64_t grouped_lora_schema_slot_slices = 0;
+    std::uint64_t grouped_lora_schema_target_slices = 0;
     std::uint64_t forward_hook_points = 0;
     std::uint64_t forward_hook_schema_slot_points = 0;
+    std::uint64_t forward_hook_schema_target_points = 0;
 };
 
 struct DebugDescriptorSummary {

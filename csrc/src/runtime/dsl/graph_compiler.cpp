@@ -25,6 +25,7 @@
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/lora/lora_types.h"
 
 namespace dsl {
@@ -38,6 +39,12 @@ std::string schema_slot_from_weight_name(std::string_view weight_name) {
         slot.remove_suffix(1);
     }
     return std::string(slot);
+}
+
+std::string hook_schema_id_from_record(const BlockSchemaPlanRecord& record) {
+    if (!record.block_family.empty()) return record.block_family;
+    if (!record.block_name.empty()) return record.block_name;
+    return record.block_type;
 }
 
 bool env_flag_enabled(const char* name) {
@@ -483,6 +490,12 @@ GraphCompiler::GraphCompiler(const Module& module,
     if (mModule.forward.has_value()) {
         const auto& graph = mModule.forward.value();
         const int num_layers = config.NumLayers;
+        mHookSchemaIdByLayer.assign(static_cast<std::size_t>(std::max(num_layers, 0)), std::string{});
+        for (const BlockSchemaPlanRecord& record : collect_block_schema_plan_records(graph)) {
+            if (record.layer < 0 || record.layer >= num_layers) continue;
+            mHookSchemaIdByLayer[static_cast<std::size_t>(record.layer)] = hook_schema_id_from_record(record);
+        }
+
         const long hq = config.NumQueryHeads;
         const long default_hkv = config.NumKeyValHeads;
         const long default_hs = config.head_size();
@@ -1573,7 +1586,15 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         }
     }
 
+    if (attrs.layer_idx >= 0 && static_cast<std::size_t>(attrs.layer_idx) < mHookSchemaIdByLayer.size()) {
+        attrs.hook_schema_id = mHookSchemaIdByLayer[static_cast<std::size_t>(attrs.layer_idx)];
+    }
+
     if (env_flag_enabled("SUROGATE_HOOK_SCHEMA_PARITY")) {
+        if ((attrs.forward_hook_point.has_value() || !attrs.lora_slices.empty()) && attrs.hook_schema_id.empty()) {
+            throw std::runtime_error("graph_compiler: op '" + op.name +
+                                     "' has hook schema slots without schema-id parity");
+        }
         if (attrs.forward_hook_point.has_value() && attrs.forward_hook_schema_slot.empty()) {
             throw std::runtime_error("graph_compiler: op '" + op.name +
                                      "' has legacy forward hook point without schema slot parity");

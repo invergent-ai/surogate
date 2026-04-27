@@ -201,12 +201,21 @@ void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const Compi
             out.forward_hook_points += 1;
             if (!op.attrs.forward_hook_schema_slot.empty()) {
                 out.forward_hook_schema_slot_points += 1;
+                if (!op.attrs.hook_schema_id.empty()) {
+                    out.forward_hook_schema_target_points += 1;
+                }
             }
         }
         for (const LoRASlice& slice : op.attrs.lora_slices) {
             out.lora_slices += 1;
             if (!slice.schema_slot.empty()) {
                 out.lora_schema_slot_slices += 1;
+                if (!op.attrs.hook_schema_id.empty()) {
+                    out.lora_schema_target_slices += 1;
+                    if (slice.grouped) {
+                        out.grouped_lora_schema_target_slices += 1;
+                    }
+                }
                 if (slice.grouped) {
                     out.grouped_lora_schema_slot_slices += 1;
                 }

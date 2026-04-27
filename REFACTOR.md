@@ -206,6 +206,7 @@ Real-model acceptance queue:
 - [x] Opt-in hook schema parity guard added under `SUROGATE_HOOK_SCHEMA_PARITY=1`, failing compilation if legacy forward hook attrs or LoRA slices lack structural schema-slot parity.
 - [x] Runtime and coverage artifacts now expose hook-registry registration counts per event, so Phase 5 readiness can distinguish LoRA after-produce, CPU prefetch, DP all-reduce, EP all-to-all, and reduce-scatter scaffolding.
 - [x] North-star hook readiness now requires both schema hook targets and seeded hook-registry registrations for CPU streaming, DP all-reduce, EP all-to-all, and after-produce LoRA/forward-hook paths.
+- [x] Compiled hook metadata now carries schema ids alongside schema slots for LoRA and legacy forward-hook attrs, with descriptor artifacts reporting full structural `(schema_id, slot)` target coverage.
 
 ---
 

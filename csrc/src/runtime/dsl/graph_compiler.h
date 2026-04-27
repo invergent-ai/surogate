@@ -233,6 +233,7 @@ struct CompiledAttrs {
     std::optional<modules::MatmulOp> matmul_op;
     int layer_idx = -1;
     bool allow_quant = false;
+    std::string hook_schema_id;  ///< Structural BlockSchema id for hook-target diagnostics.
 
     // Activation-slot alias point. The matmul dispatch uses this to rebind
     // block-scope slot entries (``qkv`` / ``att_out`` / ``mlp_up`` /
@@ -917,6 +918,7 @@ private:
     std::unordered_map<std::string, ETensorDType> mTensorDtypes;
     bool mDebugShapes = false;      // Set via SUROGATE_DEBUG_SHAPES env var
     bool mHasHybridBlocks = false;  // True if model uses HybridStackedBlocks
+    std::vector<std::string> mHookSchemaIdByLayer;
 
     // Per-layer dimensions for hybrid models (populated from IR param shapes)
     std::vector<BlockTypeDims> mPerLayerDims;

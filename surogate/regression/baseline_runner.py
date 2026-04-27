@@ -666,9 +666,12 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
         ),
         "lora_slices": descriptor_summary.get("lora_slices"),
         "lora_schema_slot_slices": descriptor_summary.get("lora_schema_slot_slices"),
+        "lora_schema_target_slices": descriptor_summary.get("lora_schema_target_slices"),
         "grouped_lora_schema_slot_slices": descriptor_summary.get("grouped_lora_schema_slot_slices"),
+        "grouped_lora_schema_target_slices": descriptor_summary.get("grouped_lora_schema_target_slices"),
         "forward_hook_points": descriptor_summary.get("forward_hook_points"),
         "forward_hook_schema_slot_points": descriptor_summary.get("forward_hook_schema_slot_points"),
+        "forward_hook_schema_target_points": descriptor_summary.get("forward_hook_schema_target_points"),
     }
 
 
