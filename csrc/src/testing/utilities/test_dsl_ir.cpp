@@ -146,6 +146,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].blocks_param == "blocks");
     REQUIRE(schema_records[0].block_name == "Qwen3Block");
     REQUIRE(schema_records[0].block_family == "qwen3_dense");
+    REQUIRE(schema_records[0].family_kind == dsl::BlockSchemaFamilyKind::Dense);
     REQUIRE(schema_records[0].slot_count == 3);
     REQUIRE(schema_records[0].param_slots == 2);
     REQUIRE(schema_records[0].activation_slots == 1);
@@ -198,6 +199,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_record_count == 1);
     REQUIRE(plan.schema_routing_layers == 1);
     REQUIRE(plan.schema_ep_layers == 1);
+    REQUIRE(plan.schema_dense_layers == 1);
+    REQUIRE(plan.schema_moe_layers == 0);
+    REQUIRE(plan.schema_mamba_layers == 0);
+    REQUIRE(plan.schema_linear_mixer_layers == 0);
     REQUIRE(plan.schema_slot_count == 3);
     REQUIRE(plan.schema_param_slots == 2);
     REQUIRE(plan.schema_activation_slots == 1);
@@ -207,6 +212,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].layer == 0);
     REQUIRE(plan.schema_layers[0].has_schema);
     REQUIRE(plan.schema_layers[0].block_family == "qwen3_dense");
+    REQUIRE(plan.schema_layers[0].family_kind == dsl::BlockSchemaFamilyKind::Dense);
     REQUIRE(plan.schema_layers[0].slot_count == 3);
     REQUIRE(plan.schema_layers[0].param_slots == 2);
     REQUIRE(plan.schema_layers[0].activation_slots == 1);

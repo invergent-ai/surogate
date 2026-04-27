@@ -4,7 +4,9 @@
 #include "runtime/dsl/buffer_plan.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <string_view>
 #include <utility>
 
 #include "runtime/core/model_config.h"
@@ -54,6 +56,32 @@ namespace {
     return -1;
 }
 
+[[nodiscard]] std::string lower_copy(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (const char ch : value) {
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return out;
+}
+
+[[nodiscard]] BlockSchemaFamilyKind family_kind_from_name(std::string_view block_family) {
+    const std::string lower = lower_copy(block_family);
+    if (lower.find("moe") != std::string::npos) {
+        return BlockSchemaFamilyKind::MoE;
+    }
+    if (lower.find("mamba") != std::string::npos) {
+        return BlockSchemaFamilyKind::Mamba;
+    }
+    if (lower.find("linear") != std::string::npos) {
+        return BlockSchemaFamilyKind::LinearMixer;
+    }
+    if (!lower.empty()) {
+        return BlockSchemaFamilyKind::Dense;
+    }
+    return BlockSchemaFamilyKind::Unknown;
+}
+
 }  // namespace
 
 std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph) {
@@ -87,6 +115,7 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
             const AttrValue* attrs_value = find_attr(*schema, "attrs");
             if (const AttrMap* attrs = attrs_value ? attr_map(*attrs_value) : nullptr) {
                 out.block_family = attr_string(*attrs, "block_family");
+                out.family_kind = family_kind_from_name(out.block_family);
             }
 
             const AttrValue* slots_value = find_attr(*schema, "slots");
@@ -250,6 +279,13 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             if (record.has_ep_topology) {
                 ++p.schema_ep_layers;
             }
+            switch (record.family_kind) {
+                case BlockSchemaFamilyKind::Dense: ++p.schema_dense_layers; break;
+                case BlockSchemaFamilyKind::MoE: ++p.schema_moe_layers; break;
+                case BlockSchemaFamilyKind::Mamba: ++p.schema_mamba_layers; break;
+                case BlockSchemaFamilyKind::LinearMixer: ++p.schema_linear_mixer_layers; break;
+                case BlockSchemaFamilyKind::Unknown: break;
+            }
             p.schema_slot_count += record.slot_count;
             p.schema_param_slots += record.param_slots;
             p.schema_activation_slots += record.activation_slots;
@@ -259,6 +295,7 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 auto& layer = p.schema_layers[static_cast<std::size_t>(record.layer)];
                 layer.has_schema = true;
                 layer.block_family = record.block_family;
+                layer.family_kind = record.family_kind;
                 layer.slot_count = record.slot_count;
                 layer.param_slots = record.param_slots;
                 layer.activation_slots = record.activation_slots;

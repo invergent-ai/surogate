@@ -118,6 +118,7 @@
 - [x] Model-level schema coverage tests now assert complete per-layer metadata for Qwen3, GPT-OSS, and Gemma4 compiled graphs.
 - [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` now validates unique, contiguous per-layer schema coverage instead of only checking total record count.
 - [x] `BufferPlan` now exposes per-layer schema summaries as the next allocator-facing Phase 4b dual path, without changing allocation behavior.
+- [x] `BufferPlan` now classifies schema block families into dense/MoE/Mamba/linear-mixer diagnostics for allocator parity work.
 
 Local validation status:
 

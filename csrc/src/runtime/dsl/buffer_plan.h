@@ -34,6 +34,14 @@ struct Graph;          // fwd — defined in ir.h; used by schema metadata helpe
 /// Phase 4 dual-path record derived from graph.metadata.block_schemas.
 /// The legacy enum BufferPlan remains authoritative until parity checks are
 /// wired, but this typed summary is the C++ handoff for schema-driven planning.
+enum class BlockSchemaFamilyKind {
+    Unknown,
+    Dense,
+    MoE,
+    Mamba,
+    LinearMixer,
+};
+
 struct BlockSchemaPlanRecord {
     int layer = -1;
     int block_index = -1;
@@ -41,6 +49,7 @@ struct BlockSchemaPlanRecord {
     std::string blocks_param;
     std::string block_name;
     std::string block_family;
+    BlockSchemaFamilyKind family_kind = BlockSchemaFamilyKind::Unknown;
     int slot_count = 0;
     int param_slots = 0;
     int activation_slots = 0;
@@ -59,6 +68,7 @@ struct BlockSchemaLayerSummary {
     int layer = -1;
     bool has_schema = false;
     std::string block_family;
+    BlockSchemaFamilyKind family_kind = BlockSchemaFamilyKind::Unknown;
     int slot_count = 0;
     int param_slots = 0;
     int activation_slots = 0;
@@ -122,6 +132,10 @@ struct BufferPlan {
     int schema_record_count = 0;
     int schema_routing_layers = 0;
     int schema_ep_layers = 0;
+    int schema_dense_layers = 0;
+    int schema_moe_layers = 0;
+    int schema_mamba_layers = 0;
+    int schema_linear_mixer_layers = 0;
     int schema_slot_count = 0;
     int schema_param_slots = 0;
     int schema_activation_slots = 0;
