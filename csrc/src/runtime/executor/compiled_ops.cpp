@@ -995,6 +995,7 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op, const modules::
             << ", comm=" << communication_kind_name(op.comm_profile.kind)
             << ", distribution=" << distribution_kind_name(op.distribution_kind)
             << ", caps=" << op_capability_flags_string(op.default_caps)
+            << ", matmul_caps=" << matmul_capability_flags_string(op.matmul_caps)
             << ", moe_caps=" << moe_capability_flags_string(op.moe_caps)
             << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
             << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
@@ -1011,6 +1012,7 @@ void CompiledExecutor::dispatch_backward_op(const CompiledOp& op, const modules:
             << ", comm=" << communication_kind_name(op.comm_profile.kind)
             << ", distribution=" << distribution_kind_name(op.distribution_kind)
             << ", caps=" << op_capability_flags_string(op.default_caps)
+            << ", matmul_caps=" << matmul_capability_flags_string(op.matmul_caps)
             << ", moe_caps=" << moe_capability_flags_string(op.moe_caps)
             << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
             << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";

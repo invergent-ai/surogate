@@ -84,14 +84,17 @@
 - [x] MoE grouped recipe paths now receive `MoECapabilities` from compiled descriptors and consult grouped FP8/FP4 predicates before specialized paths.
 - [x] Missing-dispatch diagnostics now print `MoECapabilities` alongside generic capability, epilogue, storage, comm, and distribution facets.
 - [x] North-star coverage rows now report required MoE/grouped capabilities separately from generic op capabilities.
+- [x] Dedicated inert `MatmulCapabilities` descriptor surface added for dense matmul FP8/FP4 forward/backward eligibility, weight-cache eligibility, epilogue support, and quant-colocation hints.
+- [x] Dense FP8/FP4 recipe predicates now consult `MatmulCapabilities` in addition to legacy generic op capability flags, preserving legacy fallback for unannotated ops.
+- [x] Compiled-graph descriptor summaries now report dense matmul FP8/FP4 forward/backward eligibility counts through the Python trainer debug surface.
 
 Local validation status:
 
 - [x] `make wheel-dev` passed.
 - [x] `make test-integration` passed.
-- [x] Focused C++ gates passed: `[op_registry]`, `[fusion_rule]`, `[tensor_role]`, `[moe]`.
+- [x] Focused C++ gates passed: `[op_registry]`, `[fusion_rule]`, `[tensor_role]`, `[moe]`; latest `[op_registry],[tensor_role]` pass was 292 assertions across 11 cases.
 - [x] `make regression-smoke` passed.
-- [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py --no-gpu`.
+- [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py --no-gpu`; latest descriptor artifact/baseline gate passed with 20 tests.
 - [ ] Full `make test-unit` is not green yet; current failures are broad-suite pre-existing/runtime issues outside the focused slices (AdamW tolerance, DSL golden stack/metadata, and one add-backward dispatch golden).
 - [ ] GPU/model-path acceptance rows are not exercised locally yet because the required `*_MODEL_PATH` env vars are missing; runner reports explicit skips.
 

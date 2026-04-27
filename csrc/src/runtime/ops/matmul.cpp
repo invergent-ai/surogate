@@ -166,6 +166,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                 ctx.layer_idx = op.attrs.layer_idx;
                 ctx.op = *op.attrs.matmul_op;
                 ctx.op_caps = op.default_caps;
+                ctx.matmul_caps = op.matmul_caps;
                 ctx.epilogue_support = op.epilogue_support;
                 ctx.storage_compat = op.storage_compat;
                 ctx.allow_fp8 = mRecipe->uses_fp8_forward();
@@ -525,6 +526,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         ctx.layer_idx = layer_idx;
         ctx.op = op.attrs.matmul_op.value_or(modules::MatmulOp::LMHead);
         ctx.op_caps = op.default_caps;
+        ctx.matmul_caps = op.matmul_caps;
         ctx.epilogue_support = op.epilogue_support;
         ctx.storage_compat = op.storage_compat;
         ctx.accumulate = do_accumulate;

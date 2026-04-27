@@ -52,6 +52,7 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
         ctx.layer_idx = op.attrs.layer_idx;
         ctx.op = *op.attrs.matmul_op;
         ctx.op_caps = op.default_caps;
+        ctx.matmul_caps = op.matmul_caps;
         ctx.epilogue_support = op.epilogue_support;
         ctx.storage_compat = op.storage_compat;
         ctx.allow_fp8 = mRecipe->uses_fp8_forward();
@@ -337,6 +338,7 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         ctx.layer_idx = layer_idx;
         ctx.op = *op.attrs.matmul_op;
         ctx.op_caps = op.default_caps;
+        ctx.matmul_caps = op.matmul_caps;
         ctx.epilogue_support = op.epilogue_support;
         ctx.storage_compat = op.storage_compat;
         ctx.accumulate = do_accumulate;

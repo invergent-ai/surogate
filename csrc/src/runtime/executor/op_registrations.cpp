@@ -272,6 +272,27 @@ REGISTER_COMPILED_OP_NO_COMM_CAPS("matmul_backward",
                                       ::dsl::OpCapabilityWeightCacheEligible,
                                   ::dsl::EpilogueSupportNone,
                                   ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
+REGISTER_MATMUL_CAPABILITIES("matmul",
+                             ::dsl::MatmulCapabilityFp8ForwardEligible | ::dsl::MatmulCapabilityFp4ForwardEligible |
+                                 ::dsl::MatmulCapabilityWeightCacheEligible,
+                             ::dsl::EpilogueSupportNone,
+                             None,
+                             ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                             0);
+REGISTER_MATMUL_CAPABILITIES("matmul_bias",
+                             ::dsl::MatmulCapabilityFp8ForwardEligible | ::dsl::MatmulCapabilityFp4ForwardEligible |
+                                 ::dsl::MatmulCapabilityWeightCacheEligible,
+                             ::dsl::EpilogueSupportBias,
+                             None,
+                             ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                             0);
+REGISTER_MATMUL_CAPABILITIES("matmul_backward",
+                             ::dsl::MatmulCapabilityFp8BackwardEligible | ::dsl::MatmulCapabilityFp4BackwardEligible |
+                                 ::dsl::MatmulCapabilityWeightCacheEligible,
+                             ::dsl::EpilogueSupportNone,
+                             None,
+                             ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                             0);
 REGISTER_COMPILED_OP_NO_COMM("bias_add", BiasAdd, ::dsl::fwd_bias_add, nullptr, Elementwise);
 REGISTER_COMPILED_OP_NO_COMM("bias_add_backward", BiasAddBackward, nullptr, ::dsl::bwd_bias_add, Elementwise);
 REGISTER_COMPILED_OP_NO_COMM("swiglu", SwiGLU, ::dsl::fwd_swiglu, nullptr, Elementwise);
@@ -322,6 +343,19 @@ REGISTER_COMPILED_OP_NO_COMM_CAPS("matmul_swiglu_backward",
                                       ::dsl::OpCapabilityWeightCacheEligible,
                                   ::dsl::EpilogueSupportActivation,
                                   ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
+REGISTER_MATMUL_CAPABILITIES("matmul_swiglu",
+                             ::dsl::MatmulCapabilityFp8ForwardEligible | ::dsl::MatmulCapabilityFp4ForwardEligible |
+                                 ::dsl::MatmulCapabilityWeightCacheEligible,
+                             ::dsl::EpilogueSupportActivation,
+                             PrecedingNorm,
+                             ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                             0);
+REGISTER_MATMUL_CAPABILITIES("matmul_swiglu_backward",
+                             ::dsl::MatmulCapabilityFp8BackwardEligible | ::dsl::MatmulCapabilityFp4BackwardEligible,
+                             ::dsl::EpilogueSupportActivation,
+                             None,
+                             ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                             0);
 REGISTER_COMPILED_OP_NO_COMM("qkv_qk_norm", QKVQKNorm, ::dsl::fwd_qkv_qk_norm, nullptr, Normalization);
 REGISTER_COMPILED_OP_NO_COMM("qkv_qk_norm_backward", QKVQKNormBackward, nullptr, ::dsl::bwd_qkv_qk_norm, Normalization);
 REGISTER_COMPILED_OP_NO_COMM("qkv_qk_norm_rope", QKVQKNormRoPE, ::dsl::fwd_qkv_qk_norm_rope, nullptr, Normalization);
@@ -823,6 +857,19 @@ REGISTER_COMPILED_OP_NO_COMM_CAPS("mamba_out_proj_backward",
                                       ::dsl::OpCapabilityWeightCacheEligible,
                                   ::dsl::EpilogueSupportNone,
                                   ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
+REGISTER_MATMUL_CAPABILITIES("mamba_out_proj",
+                             ::dsl::MatmulCapabilityFp8ForwardEligible | ::dsl::MatmulCapabilityFp4ForwardEligible |
+                                 ::dsl::MatmulCapabilityWeightCacheEligible,
+                             ::dsl::EpilogueSupportNone,
+                             PrecedingActivation,
+                             ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                             0);
+REGISTER_MATMUL_CAPABILITIES("mamba_out_proj_backward",
+                             ::dsl::MatmulCapabilityFp8BackwardEligible | ::dsl::MatmulCapabilityFp4BackwardEligible,
+                             ::dsl::EpilogueSupportNone,
+                             None,
+                             ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream,
+                             0);
 
 // Qwen3.5 gated delta rule forward + backward
 REGISTER_COMPILED_OP_NO_COMM("chunk_gated_delta_rule",

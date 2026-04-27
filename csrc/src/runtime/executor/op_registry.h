@@ -67,6 +67,7 @@ struct OpDescriptor {
     EpilogueSupport epilogue_support{};
     StorageCompatibility storage_compat{};
     MoECapabilities moe_caps{};
+    MatmulCapabilities matmul_caps{};
     CommunicationProfile comm_profile{};
     GroupedSemantics grouped_semantics{};
     std::uint32_t descriptor_flags = 0;
@@ -144,6 +145,22 @@ inline OpDescriptor make_moe_capability_descriptor(std::string name,
     desc.moe_caps = moe_caps;
     desc.moe_caps.expert_storage = expert_storage;
     desc.moe_caps.ep_awareness = ep_awareness;
+    return desc;
+}
+
+inline OpDescriptor make_matmul_capability_descriptor(std::string name,
+                                                      MatmulCapabilities matmul_caps,
+                                                      EpilogueSupport supported_epilogues,
+                                                      QuantColocation colocation,
+                                                      StorageCompatibility weight_storage,
+                                                      int recipe_priority) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.matmul_caps = matmul_caps;
+    desc.matmul_caps.supported_epilogues = supported_epilogues;
+    desc.matmul_caps.colocate_input = colocation;
+    desc.matmul_caps.weight_storage = weight_storage;
+    desc.matmul_caps.recipe_priority = recipe_priority;
     return desc;
 }
 
@@ -386,5 +403,20 @@ private:
             ::dsl::MoECapabilities{static_cast<std::uint32_t>(moe_caps_flags_)},                       \
             ::dsl::StorageCompatibility{static_cast<std::uint32_t>(expert_storage_flags_)},            \
             ::dsl::EpAwareness::ep_awareness_enum))
+
+#define REGISTER_MATMUL_CAPABILITIES(name_str,                                              \
+                                     matmul_caps_flags_,                                    \
+                                     epilogue_flags_,                                       \
+                                     colocation_enum,                                       \
+                                     weight_storage_flags_,                                 \
+                                     priority_)                                             \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_matmul_caps_reg_, __COUNTER__) =      \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_matmul_capability_descriptor( \
+            name_str,                                                                       \
+            ::dsl::MatmulCapabilities{static_cast<std::uint32_t>(matmul_caps_flags_)},      \
+            ::dsl::EpilogueSupport{static_cast<std::uint32_t>(epilogue_flags_)},            \
+            ::dsl::QuantColocation::colocation_enum,                                        \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(weight_storage_flags_)}, \
+            static_cast<int>(priority_)))
 
 #endif  // SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H

@@ -112,6 +112,7 @@ struct MatmulContext {
     int layer_idx = 0;            ///< Current transformer layer index (0-based)
     MatmulOp op = MatmulOp::QKV;  ///< Which matmul operation
     dsl::OpCapabilities op_caps{};
+    dsl::MatmulCapabilities matmul_caps{};
     dsl::EpilogueSupport epilogue_support{};
     dsl::StorageCompatibility storage_compat{};
 

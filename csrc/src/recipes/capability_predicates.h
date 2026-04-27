@@ -46,6 +46,10 @@ inline bool descriptor_allows_moe_capability(dsl::MoECapabilities caps, std::uin
     return caps.flags == dsl::MoECapabilityNone || caps.has(flag);
 }
 
+inline bool descriptor_allows_matmul_capability(dsl::MatmulCapabilities caps, std::uint32_t flag) {
+    return caps.flags == dsl::MatmulCapabilityNone || caps.has(flag);
+}
+
 inline bool descriptor_allows_moe_capability(dsl::MoECapabilities caps,
                                              std::uint32_t flag,
                                              const char* context,
@@ -62,6 +66,26 @@ inline bool descriptor_allows_moe_capability(dsl::MoECapabilities caps,
     const bool allowed = caps.has(flag);
     if (!allowed && recipe_capability_fallback_log_enabled()) {
         std::fprintf(stderr, "[recipe capability] %s disabled: MoE descriptor lacks %s\n", context, capability);
+    }
+    return allowed;
+}
+
+inline bool descriptor_allows_matmul_capability(dsl::MatmulCapabilities caps,
+                                                std::uint32_t flag,
+                                                const char* context,
+                                                const char* capability) {
+    if (caps.flags == dsl::MatmulCapabilityNone) {
+        if (recipe_capability_fallback_log_enabled()) {
+            std::fprintf(stderr,
+                         "[recipe capability] %s legacy allow: descriptor has no matmul capability metadata for %s\n",
+                         context,
+                         capability);
+        }
+        return true;
+    }
+    const bool allowed = caps.has(flag);
+    if (!allowed && recipe_capability_fallback_log_enabled()) {
+        std::fprintf(stderr, "[recipe capability] %s disabled: matmul descriptor lacks %s\n", context, capability);
     }
     return allowed;
 }
@@ -96,6 +120,34 @@ inline bool descriptor_allows_moe_fp4_grouped(dsl::MoECapabilities caps) {
 
 inline bool descriptor_allows_moe_fp4_grouped(dsl::MoECapabilities caps, const char* context) {
     return descriptor_allows_moe_capability(caps, dsl::MoECapabilityFp4GroupedEligible, context, "FP4GroupedEligible");
+}
+
+inline bool descriptor_allows_matmul_fp8_forward(dsl::MatmulCapabilities caps, const char* context) {
+    return descriptor_allows_matmul_capability(caps,
+                                               dsl::MatmulCapabilityFp8ForwardEligible,
+                                               context,
+                                               "FP8ForwardEligible");
+}
+
+inline bool descriptor_allows_matmul_fp8_backward(dsl::MatmulCapabilities caps, const char* context) {
+    return descriptor_allows_matmul_capability(caps,
+                                               dsl::MatmulCapabilityFp8BackwardEligible,
+                                               context,
+                                               "FP8BackwardEligible");
+}
+
+inline bool descriptor_allows_matmul_fp4_forward(dsl::MatmulCapabilities caps, const char* context) {
+    return descriptor_allows_matmul_capability(caps,
+                                               dsl::MatmulCapabilityFp4ForwardEligible,
+                                               context,
+                                               "FP4ForwardEligible");
+}
+
+inline bool descriptor_allows_matmul_fp4_backward(dsl::MatmulCapabilities caps, const char* context) {
+    return descriptor_allows_matmul_capability(caps,
+                                               dsl::MatmulCapabilityFp4BackwardEligible,
+                                               context,
+                                               "FP4BackwardEligible");
 }
 
 inline bool descriptor_has_moe_fp8_backward(dsl::MoECapabilities caps, const char* context) {

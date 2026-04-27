@@ -54,6 +54,15 @@ const char* ep_awareness_name(EpAwareness awareness) {
     return "None";
 }
 
+const char* quant_colocation_name(QuantColocation colocation) {
+    switch (colocation) {
+        case QuantColocation::None: return "None";
+        case QuantColocation::PrecedingNorm: return "PrecedingNorm";
+        case QuantColocation::PrecedingActivation: return "PrecedingActivation";
+    }
+    return "None";
+}
+
 std::string op_capability_flags_string(OpCapabilities caps) {
     std::string out;
     append_flag(out, caps.has(OpCapabilityDenseMatmul), "DenseMatmul");
@@ -63,6 +72,17 @@ std::string op_capability_flags_string(OpCapabilities caps) {
     append_flag(out, caps.has(OpCapabilityFp4Eligible), "FP4Eligible");
     append_flag(out, caps.has(OpCapabilityLoRACompatible), "LoRACompatible");
     append_flag(out, caps.has(OpCapabilityWeightCacheEligible), "WeightCacheEligible");
+    return out.empty() ? "None" : out;
+}
+
+std::string matmul_capability_flags_string(MatmulCapabilities caps) {
+    std::string out;
+    append_flag(out, caps.has(MatmulCapabilityFp8ForwardEligible), "FP8ForwardEligible");
+    append_flag(out, caps.has(MatmulCapabilityFp8BackwardEligible), "FP8BackwardEligible");
+    append_flag(out, caps.has(MatmulCapabilityFp4ForwardEligible), "FP4ForwardEligible");
+    append_flag(out, caps.has(MatmulCapabilityFp4BackwardEligible), "FP4BackwardEligible");
+    append_flag(out, caps.has(MatmulCapabilityWeightCacheEligible), "WeightCacheEligible");
+    append_flag(out, caps.has(MatmulCapabilityCommOverlapEligible), "CommOverlapEligible");
     return out.empty() ? "None" : out;
 }
 
@@ -130,6 +150,15 @@ int OpRegistry::register_op(OpDescriptor desc) {
         existing.moe_caps.expert_storage.flags |= desc.moe_caps.expert_storage.flags;
         if (desc.moe_caps.ep_awareness != EpAwareness::None) {
             existing.moe_caps.ep_awareness = desc.moe_caps.ep_awareness;
+        }
+        existing.matmul_caps.flags |= desc.matmul_caps.flags;
+        existing.matmul_caps.supported_epilogues.flags |= desc.matmul_caps.supported_epilogues.flags;
+        existing.matmul_caps.weight_storage.flags |= desc.matmul_caps.weight_storage.flags;
+        if (desc.matmul_caps.colocate_input != QuantColocation::None) {
+            existing.matmul_caps.colocate_input = desc.matmul_caps.colocate_input;
+        }
+        if (desc.matmul_caps.recipe_priority != 0) {
+            existing.matmul_caps.recipe_priority = desc.matmul_caps.recipe_priority;
         }
         if (desc.comm_profile.kind != CommunicationKind::NoComm || desc.comm_profile.can_overlap_with_compute ||
             desc.comm_profile.reduction_priority != 0) {

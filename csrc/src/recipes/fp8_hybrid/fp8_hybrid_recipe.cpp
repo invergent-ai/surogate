@@ -77,7 +77,8 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Fall back to BF16 matmul if FP8 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::forward_matmul")) {
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::forward_matmul") ||
+        !descriptor_allows_matmul_fp8_forward(ctx.matmul_caps, "FP8HybridRecipe::forward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -345,7 +346,8 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Fall back to BF16 matmul if FP8 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::backward_matmul")) {
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::backward_matmul") ||
+        !descriptor_allows_matmul_fp8_backward(ctx.matmul_caps, "FP8HybridRecipe::backward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;

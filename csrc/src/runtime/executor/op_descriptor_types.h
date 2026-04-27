@@ -73,11 +73,27 @@ enum MoECapabilityBits : std::uint32_t {
     MoECapabilityNvfp4NoFallback = 1u << 7,
 };
 
+enum MatmulCapabilityBits : std::uint32_t {
+    MatmulCapabilityNone = 0,
+    MatmulCapabilityFp8ForwardEligible = 1u << 0,
+    MatmulCapabilityFp8BackwardEligible = 1u << 1,
+    MatmulCapabilityFp4ForwardEligible = 1u << 2,
+    MatmulCapabilityFp4BackwardEligible = 1u << 3,
+    MatmulCapabilityWeightCacheEligible = 1u << 4,
+    MatmulCapabilityCommOverlapEligible = 1u << 5,
+};
+
 enum class EpAwareness : std::uint8_t {
     None = 0,
     Sharded,
     Routed,
     WeightTransfer,
+};
+
+enum class QuantColocation : std::uint8_t {
+    None = 0,
+    PrecedingNorm,
+    PrecedingActivation,
 };
 
 struct CommunicationProfile {
@@ -137,13 +153,27 @@ struct MoECapabilities {
     }
 };
 
+struct MatmulCapabilities {
+    std::uint32_t flags = MatmulCapabilityNone;
+    EpilogueSupport supported_epilogues{};
+    QuantColocation colocate_input = QuantColocation::None;
+    StorageCompatibility weight_storage{};
+    int recipe_priority = 0;
+
+    [[nodiscard]] bool has(std::uint32_t flag) const {
+        return (flags & flag) == flag;
+    }
+};
+
 const char* op_semantic_kind_name(OpSemanticKind kind);
 const char* communication_kind_name(CommunicationKind kind);
 const char* ep_awareness_name(EpAwareness awareness);
+const char* quant_colocation_name(QuantColocation colocation);
 std::string op_capability_flags_string(OpCapabilities caps);
 std::string epilogue_support_flags_string(EpilogueSupport support);
 std::string storage_compatibility_flags_string(StorageCompatibility compat);
 std::string moe_capability_flags_string(MoECapabilities caps);
+std::string matmul_capability_flags_string(MatmulCapabilities caps);
 
 }  // namespace dsl
 

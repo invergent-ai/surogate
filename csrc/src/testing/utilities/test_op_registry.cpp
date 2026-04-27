@@ -27,6 +27,11 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     meta.moe_caps.flags = MoECapabilityGroupedGemmEligible | MoECapabilityFp8GroupedEligible;
     meta.moe_caps.expert_storage.flags = StorageCompatibilityGpuResident;
     meta.moe_caps.ep_awareness = EpAwareness::Routed;
+    meta.matmul_caps.flags = MatmulCapabilityFp8ForwardEligible | MatmulCapabilityWeightCacheEligible;
+    meta.matmul_caps.supported_epilogues.flags = EpilogueSupportActivation;
+    meta.matmul_caps.colocate_input = QuantColocation::PrecedingNorm;
+    meta.matmul_caps.weight_storage.flags = StorageCompatibilityGpuResident | StorageCompatibilityCpuPinnedStream;
+    meta.matmul_caps.recipe_priority = 7;
     meta.comm_profile.kind = CommunicationKind::ExpertParallelRouted;
     meta.grouped_semantics.is_grouped = true;
     meta.grouped_semantics.expert_dim = 0;
@@ -48,6 +53,13 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     REQUIRE(desc->moe_caps.has(MoECapabilityFp8GroupedEligible));
     REQUIRE(desc->moe_caps.expert_storage.supports(StorageTier::GpuResident));
     REQUIRE(desc->moe_caps.ep_awareness == EpAwareness::Routed);
+    REQUIRE(desc->matmul_caps.has(MatmulCapabilityFp8ForwardEligible));
+    REQUIRE(desc->matmul_caps.has(MatmulCapabilityWeightCacheEligible));
+    REQUIRE_FALSE(desc->matmul_caps.has(MatmulCapabilityFp8BackwardEligible));
+    REQUIRE(desc->matmul_caps.supported_epilogues.has(EpilogueSupportActivation));
+    REQUIRE(desc->matmul_caps.colocate_input == QuantColocation::PrecedingNorm);
+    REQUIRE(desc->matmul_caps.weight_storage.supports(StorageTier::CpuPinnedStream));
+    REQUIRE(desc->matmul_caps.recipe_priority == 7);
     REQUIRE(desc->comm_profile.kind == CommunicationKind::ExpertParallelRouted);
     REQUIRE(desc->grouped_semantics.is_grouped);
     REQUIRE(desc->grouped_semantics.expert_dim == 0);
@@ -57,6 +69,8 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     REQUIRE(op_capability_flags_string(desc->default_caps) == "GroupedMatmul|FP8Eligible");
     REQUIRE(moe_capability_flags_string(desc->moe_caps) == "GroupedGemmEligible|FP8GroupedEligible");
     REQUIRE(std::string(ep_awareness_name(desc->moe_caps.ep_awareness)) == "Routed");
+    REQUIRE(matmul_capability_flags_string(desc->matmul_caps) == "FP8ForwardEligible|WeightCacheEligible");
+    REQUIRE(std::string(quant_colocation_name(desc->matmul_caps.colocate_input)) == "PrecedingNorm");
     REQUIRE(epilogue_support_flags_string(desc->epilogue_support) == "Activation");
     REQUIRE(storage_compatibility_flags_string(desc->storage_compat) == "GpuResident|CpuPinnedStream");
 }
@@ -173,6 +187,10 @@ TEST_CASE("mamba and gated-delta ops carry no-comm descriptor metadata", "[op_re
     REQUIRE(mamba_out->default_caps.has(OpCapabilityDenseMatmul));
     REQUIRE(mamba_out->default_caps.has(OpCapabilityFp8Eligible));
     REQUIRE(mamba_out->default_caps.has(OpCapabilityFp4Eligible));
+    REQUIRE(mamba_out->matmul_caps.has(MatmulCapabilityFp8ForwardEligible));
+    REQUIRE(mamba_out->matmul_caps.has(MatmulCapabilityFp4ForwardEligible));
+    REQUIRE(mamba_out->matmul_caps.has(MatmulCapabilityWeightCacheEligible));
+    REQUIRE(mamba_out->matmul_caps.colocate_input == QuantColocation::PrecedingActivation);
     REQUIRE(mamba_out->storage_compat.supports(StorageTier::CpuPinnedStream));
 
     const OpDescriptor* gated_delta = OpRegistry::instance().find_by_name("chunk_gated_delta_rule");
@@ -194,11 +212,16 @@ TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     REQUIRE(matmul->default_caps.has(OpCapabilityFp8Eligible));
     REQUIRE(matmul->default_caps.has(OpCapabilityFp4Eligible));
     REQUIRE(matmul->default_caps.has(OpCapabilityLoRACompatible));
+    REQUIRE(matmul->matmul_caps.has(MatmulCapabilityFp8ForwardEligible));
+    REQUIRE(matmul->matmul_caps.has(MatmulCapabilityFp4ForwardEligible));
+    REQUIRE(matmul->matmul_caps.has(MatmulCapabilityWeightCacheEligible));
+    REQUIRE(matmul->matmul_caps.colocate_input == QuantColocation::None);
     REQUIRE(matmul->storage_compat.supports(StorageTier::CpuPinnedStream));
 
     const OpDescriptor* matmul_bias = OpRegistry::instance().find_by_name("matmul_bias");
     REQUIRE(matmul_bias != nullptr);
     REQUIRE(matmul_bias->epilogue_support.has(EpilogueSupportBias));
+    REQUIRE(matmul_bias->matmul_caps.supported_epilogues.has(EpilogueSupportBias));
 
     const OpDescriptor* matmul_backward = OpRegistry::instance().find_by_name("matmul_backward");
     REQUIRE(matmul_backward != nullptr);
@@ -207,6 +230,9 @@ TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     REQUIRE(matmul_backward->default_caps.has(OpCapabilityDenseMatmul));
     REQUIRE(matmul_backward->default_caps.has(OpCapabilityFp8Eligible));
     REQUIRE(matmul_backward->default_caps.has(OpCapabilityFp4Eligible));
+    REQUIRE(matmul_backward->matmul_caps.has(MatmulCapabilityFp8BackwardEligible));
+    REQUIRE(matmul_backward->matmul_caps.has(MatmulCapabilityFp4BackwardEligible));
+    REQUIRE_FALSE(matmul_backward->matmul_caps.has(MatmulCapabilityFp8ForwardEligible));
     REQUIRE(matmul_backward->storage_compat.supports(StorageTier::CpuPinnedStream));
 
     const OpDescriptor* matmul_swiglu = OpRegistry::instance().find_by_name("matmul_swiglu");
@@ -217,6 +243,9 @@ TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     REQUIRE(matmul_swiglu->default_caps.has(OpCapabilityFp8Eligible));
     REQUIRE(matmul_swiglu->default_caps.has(OpCapabilityFp4Eligible));
     REQUIRE(matmul_swiglu->epilogue_support.has(EpilogueSupportActivation));
+    REQUIRE(matmul_swiglu->matmul_caps.has(MatmulCapabilityFp8ForwardEligible));
+    REQUIRE(matmul_swiglu->matmul_caps.supported_epilogues.has(EpilogueSupportActivation));
+    REQUIRE(matmul_swiglu->matmul_caps.colocate_input == QuantColocation::PrecedingNorm);
     REQUIRE(matmul_swiglu->storage_compat.supports(StorageTier::CpuPinnedStream));
 
     const OpDescriptor* rmsnorm = OpRegistry::instance().find_by_name("rmsnorm");
@@ -260,6 +289,19 @@ TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[o
     REQUIRE(recipes::descriptor_allows_moe_fp8_grouped(moe_forward_only));
     REQUIRE(recipes::descriptor_allows_moe_fp4_grouped(moe_forward_only));
     REQUIRE_FALSE(recipes::descriptor_has_moe_fp8_backward(moe_forward_only, "test"));
+
+    MatmulCapabilities matmul_unannotated{};
+    REQUIRE(recipes::descriptor_allows_matmul_fp8_forward(matmul_unannotated, "test"));
+    REQUIRE(recipes::descriptor_allows_matmul_fp8_backward(matmul_unannotated, "test"));
+    REQUIRE(recipes::descriptor_allows_matmul_fp4_forward(matmul_unannotated, "test"));
+    REQUIRE(recipes::descriptor_allows_matmul_fp4_backward(matmul_unannotated, "test"));
+
+    MatmulCapabilities matmul_forward_only{MatmulCapabilityFp8ForwardEligible | MatmulCapabilityFp4ForwardEligible |
+                                           MatmulCapabilityWeightCacheEligible};
+    REQUIRE(recipes::descriptor_allows_matmul_fp8_forward(matmul_forward_only, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp8_backward(matmul_forward_only, "test"));
+    REQUIRE(recipes::descriptor_allows_matmul_fp4_forward(matmul_forward_only, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp4_backward(matmul_forward_only, "test"));
 }
 
 }  // namespace

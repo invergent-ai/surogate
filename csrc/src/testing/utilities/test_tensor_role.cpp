@@ -137,6 +137,7 @@ TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]
     graph.ops[0].type = CompiledOpType::Matmul;
     graph.ops[0].comm_profile.kind = CommunicationKind::NoComm;
     graph.ops[0].default_caps.flags = OpCapabilityDenseMatmul | OpCapabilityFp8Eligible;
+    graph.ops[0].matmul_caps.flags = MatmulCapabilityFp8ForwardEligible | MatmulCapabilityWeightCacheEligible;
     graph.ops[1].type = CompiledOpType::BiasAdd;
     graph.ops[1].comm_profile.kind = CommunicationKind::AllToAllIn;
     graph.ops[1].grouped_semantics.routes_tokens = true;
@@ -157,6 +158,9 @@ TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]
     REQUIRE(graph.count_ops_with_capability(OpCapabilityGroupedMatmul) == 1);
     REQUIRE(graph.count_ops_with_capability(OpCapabilityFp8Eligible) == 2);
     REQUIRE(graph.count_ops_with_capability(OpCapabilityFp4Eligible) == 0);
+    REQUIRE(graph.count_ops_with_matmul_capability(MatmulCapabilityFp8ForwardEligible) == 1);
+    REQUIRE(graph.count_ops_with_matmul_capability(MatmulCapabilityWeightCacheEligible) == 1);
+    REQUIRE(graph.count_ops_with_matmul_capability(MatmulCapabilityFp4ForwardEligible) == 0);
     REQUIRE(graph.count_ops_with_epilogue(EpilogueSupportActivation) == 1);
     REQUIRE(graph.count_ops_with_moe_capability(MoECapabilityGroupedGemmEligible) == 1);
     REQUIRE(graph.count_ops_with_moe_capability(MoECapabilityFp8GroupedEligible) == 1);

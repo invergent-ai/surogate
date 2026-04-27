@@ -168,6 +168,14 @@ void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const Compi
     out.moe_routed_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityMoeRouted));
     out.fp8_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp8Eligible));
     out.fp4_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp4Eligible));
+    out.matmul_fp8_forward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp8ForwardEligible));
+    out.matmul_fp8_backward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp8BackwardEligible));
+    out.matmul_fp4_forward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp4ForwardEligible));
+    out.matmul_fp4_backward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp4BackwardEligible));
     out.moe_fp8_grouped_eligible_ops =
         static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityFp8GroupedEligible));
     out.moe_fp4_grouped_eligible_ops =
