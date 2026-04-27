@@ -147,6 +147,7 @@ TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]
     graph.ops[2].grouped_semantics.expert_dim = 0;
     graph.ops[2].default_caps.flags = OpCapabilityGroupedMatmul | OpCapabilityFp8Eligible;
     graph.ops[2].epilogue_support.flags = EpilogueSupportActivation;
+    graph.ops[2].moe_caps.flags = MoECapabilityGroupedGemmEligible | MoECapabilityFp8GroupedEligible;
 
     REQUIRE(graph.count_ops_with_comm(CommunicationKind::NoComm) == 1);
     REQUIRE(graph.count_ops_with_comm(CommunicationKind::AllToAllIn) == 1);
@@ -157,6 +158,9 @@ TEST_CASE("CompiledGraph summarizes op descriptor facets", "[tensor_role][graph]
     REQUIRE(graph.count_ops_with_capability(OpCapabilityFp8Eligible) == 2);
     REQUIRE(graph.count_ops_with_capability(OpCapabilityFp4Eligible) == 0);
     REQUIRE(graph.count_ops_with_epilogue(EpilogueSupportActivation) == 1);
+    REQUIRE(graph.count_ops_with_moe_capability(MoECapabilityGroupedGemmEligible) == 1);
+    REQUIRE(graph.count_ops_with_moe_capability(MoECapabilityFp8GroupedEligible) == 1);
+    REQUIRE(graph.count_ops_with_moe_capability(MoECapabilityFp8BackwardImplemented) == 0);
     REQUIRE(graph.count_ops_supporting_storage(StorageTier::GpuResident) == 3);
     REQUIRE(graph.count_ops_supporting_storage(StorageTier::CpuPinnedStream) == 1);
     REQUIRE(graph.count_fusion_candidate_starts() == 0);

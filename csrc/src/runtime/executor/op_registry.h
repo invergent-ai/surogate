@@ -66,6 +66,7 @@ struct OpDescriptor {
     OpCapabilities default_caps{};
     EpilogueSupport epilogue_support{};
     StorageCompatibility storage_compat{};
+    MoECapabilities moe_caps{};
     CommunicationProfile comm_profile{};
     GroupedSemantics grouped_semantics{};
     std::uint32_t descriptor_flags = 0;
@@ -131,6 +132,18 @@ inline OpDescriptor make_capability_descriptor(std::string name,
     desc.default_caps = default_caps;
     desc.epilogue_support = epilogue_support;
     desc.storage_compat = storage_compat;
+    return desc;
+}
+
+inline OpDescriptor make_moe_capability_descriptor(std::string name,
+                                                   MoECapabilities moe_caps,
+                                                   StorageCompatibility expert_storage,
+                                                   EpAwareness ep_awareness) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.moe_caps = moe_caps;
+    desc.moe_caps.expert_storage = expert_storage;
+    desc.moe_caps.ep_awareness = ep_awareness;
     return desc;
 }
 
@@ -365,5 +378,13 @@ private:
             ::dsl::OpCapabilities{static_cast<std::uint32_t>(caps_flags_)},              \
             ::dsl::EpilogueSupport{static_cast<std::uint32_t>(epilogue_flags_)},         \
             ::dsl::StorageCompatibility{static_cast<std::uint32_t>(storage_flags_)}))
+
+#define REGISTER_MOE_CAPABILITIES(name_str, moe_caps_flags_, expert_storage_flags_, ep_awareness_enum) \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_moe_caps_reg_, __COUNTER__) =                    \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_moe_capability_descriptor(               \
+            name_str,                                                                                  \
+            ::dsl::MoECapabilities{static_cast<std::uint32_t>(moe_caps_flags_)},                       \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(expert_storage_flags_)},            \
+            ::dsl::EpAwareness::ep_awareness_enum))
 
 #endif  // SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H

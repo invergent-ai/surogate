@@ -5086,6 +5086,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             compiled.default_caps = desc->default_caps;
             compiled.epilogue_support = desc->epilogue_support;
             compiled.storage_compat = desc->storage_compat;
+            compiled.moe_caps = desc->moe_caps;
             compiled.comm_profile = desc->comm_profile;
             compiled.grouped_semantics = desc->grouped_semantics;
             compiled.descriptor_flags = desc->descriptor_flags;

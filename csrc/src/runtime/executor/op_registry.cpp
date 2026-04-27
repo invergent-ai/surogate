@@ -44,6 +44,16 @@ const char* communication_kind_name(CommunicationKind kind) {
     return "NoComm";
 }
 
+const char* ep_awareness_name(EpAwareness awareness) {
+    switch (awareness) {
+        case EpAwareness::None: return "None";
+        case EpAwareness::Sharded: return "Sharded";
+        case EpAwareness::Routed: return "Routed";
+        case EpAwareness::WeightTransfer: return "WeightTransfer";
+    }
+    return "None";
+}
+
 std::string op_capability_flags_string(OpCapabilities caps) {
     std::string out;
     append_flag(out, caps.has(OpCapabilityDenseMatmul), "DenseMatmul");
@@ -53,6 +63,19 @@ std::string op_capability_flags_string(OpCapabilities caps) {
     append_flag(out, caps.has(OpCapabilityFp4Eligible), "FP4Eligible");
     append_flag(out, caps.has(OpCapabilityLoRACompatible), "LoRACompatible");
     append_flag(out, caps.has(OpCapabilityWeightCacheEligible), "WeightCacheEligible");
+    return out.empty() ? "None" : out;
+}
+
+std::string moe_capability_flags_string(MoECapabilities caps) {
+    std::string out;
+    append_flag(out, caps.has(MoECapabilityGroupedGemmEligible), "GroupedGemmEligible");
+    append_flag(out, caps.has(MoECapabilityFp8GroupedEligible), "FP8GroupedEligible");
+    append_flag(out, caps.has(MoECapabilityFp4GroupedEligible), "FP4GroupedEligible");
+    append_flag(out, caps.has(MoECapabilityCudnnMoeGraphEligible), "CudnnMoeGraphEligible");
+    append_flag(out, caps.has(MoECapabilityPerExpertQuant), "PerExpertQuant");
+    append_flag(out, caps.has(MoECapabilityRoutingAwareFusion), "RoutingAwareFusion");
+    append_flag(out, caps.has(MoECapabilityFp8BackwardImplemented), "FP8BackwardImplemented");
+    append_flag(out, caps.has(MoECapabilityNvfp4NoFallback), "NVFP4NoFallback");
     return out.empty() ? "None" : out;
 }
 
@@ -103,6 +126,11 @@ int OpRegistry::register_op(OpDescriptor desc) {
         existing.default_caps.flags |= desc.default_caps.flags;
         existing.epilogue_support.flags |= desc.epilogue_support.flags;
         existing.storage_compat.flags |= desc.storage_compat.flags;
+        existing.moe_caps.flags |= desc.moe_caps.flags;
+        existing.moe_caps.expert_storage.flags |= desc.moe_caps.expert_storage.flags;
+        if (desc.moe_caps.ep_awareness != EpAwareness::None) {
+            existing.moe_caps.ep_awareness = desc.moe_caps.ep_awareness;
+        }
         if (desc.comm_profile.kind != CommunicationKind::NoComm || desc.comm_profile.can_overlap_with_compute ||
             desc.comm_profile.reduction_priority != 0) {
             existing.comm_profile = desc.comm_profile;

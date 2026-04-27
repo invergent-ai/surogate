@@ -2012,6 +2012,10 @@ NB_MODULE(_surogate, m) {
                     d["moe_routed_ops"] = g.moe_routed_ops;
                     d["fp8_eligible_ops"] = g.fp8_eligible_ops;
                     d["fp4_eligible_ops"] = g.fp4_eligible_ops;
+                    d["moe_fp8_grouped_eligible_ops"] = g.moe_fp8_grouped_eligible_ops;
+                    d["moe_fp4_grouped_eligible_ops"] = g.moe_fp4_grouped_eligible_ops;
+                    d["moe_fp8_backward_implemented_ops"] = g.moe_fp8_backward_implemented_ops;
+                    d["moe_nvfp4_no_fallback_ops"] = g.moe_nvfp4_no_fallback_ops;
                     d["lora_compatible_ops"] = g.lora_compatible_ops;
                     d["weight_cache_eligible_ops"] = g.weight_cache_eligible_ops;
                     d["activation_epilogue_ops"] = g.activation_epilogue_ops;

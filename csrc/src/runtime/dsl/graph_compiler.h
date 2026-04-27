@@ -340,6 +340,7 @@ struct CompiledOp {
     OpCapabilities default_caps{};
     EpilogueSupport epilogue_support{};
     StorageCompatibility storage_compat{};
+    MoECapabilities moe_caps{};
     CommunicationProfile comm_profile{};
     GroupedSemantics grouped_semantics{};
     std::uint32_t descriptor_flags = 0;
@@ -713,6 +714,16 @@ struct CompiledGraph {
         std::size_t count = 0;
         for (const auto& op : ops) {
             if (op.epilogue_support.has(flag)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_moe_capability(std::uint32_t flag) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.moe_caps.has(flag)) {
                 ++count;
             }
         }

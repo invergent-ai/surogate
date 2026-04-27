@@ -24,6 +24,9 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     meta.default_caps.flags = OpCapabilityGroupedMatmul | OpCapabilityFp8Eligible;
     meta.epilogue_support.flags = EpilogueSupportActivation;
     meta.storage_compat.flags = StorageCompatibilityGpuResident | StorageCompatibilityCpuPinnedStream;
+    meta.moe_caps.flags = MoECapabilityGroupedGemmEligible | MoECapabilityFp8GroupedEligible;
+    meta.moe_caps.expert_storage.flags = StorageCompatibilityGpuResident;
+    meta.moe_caps.ep_awareness = EpAwareness::Routed;
     meta.comm_profile.kind = CommunicationKind::ExpertParallelRouted;
     meta.grouped_semantics.is_grouped = true;
     meta.grouped_semantics.expert_dim = 0;
@@ -41,6 +44,10 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     REQUIRE(desc->storage_compat.supports(StorageTier::GpuResident));
     REQUIRE(desc->storage_compat.supports(StorageTier::CpuPinnedStream));
     REQUIRE_FALSE(desc->storage_compat.supports(StorageTier::NvmeOffload));
+    REQUIRE(desc->moe_caps.has(MoECapabilityGroupedGemmEligible));
+    REQUIRE(desc->moe_caps.has(MoECapabilityFp8GroupedEligible));
+    REQUIRE(desc->moe_caps.expert_storage.supports(StorageTier::GpuResident));
+    REQUIRE(desc->moe_caps.ep_awareness == EpAwareness::Routed);
     REQUIRE(desc->comm_profile.kind == CommunicationKind::ExpertParallelRouted);
     REQUIRE(desc->grouped_semantics.is_grouped);
     REQUIRE(desc->grouped_semantics.expert_dim == 0);
@@ -48,6 +55,8 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     REQUIRE(std::string(op_semantic_kind_name(desc->semantic_kind)) == "Dense");
     REQUIRE(std::string(communication_kind_name(desc->comm_profile.kind)) == "ExpertParallelRouted");
     REQUIRE(op_capability_flags_string(desc->default_caps) == "GroupedMatmul|FP8Eligible");
+    REQUIRE(moe_capability_flags_string(desc->moe_caps) == "GroupedGemmEligible|FP8GroupedEligible");
+    REQUIRE(std::string(ep_awareness_name(desc->moe_caps.ep_awareness)) == "Routed");
     REQUIRE(epilogue_support_flags_string(desc->epilogue_support) == "Activation");
     REQUIRE(storage_compatibility_flags_string(desc->storage_compat) == "GpuResident|CpuPinnedStream");
 }
@@ -66,6 +75,14 @@ TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {
     REQUIRE(desc->default_caps.has(OpCapabilityMoeRouted));
     REQUIRE(desc->default_caps.has(OpCapabilityFp8Eligible));
     REQUIRE(desc->default_caps.has(OpCapabilityWeightCacheEligible));
+    REQUIRE(desc->moe_caps.has(MoECapabilityGroupedGemmEligible));
+    REQUIRE(desc->moe_caps.has(MoECapabilityFp8GroupedEligible));
+    REQUIRE(desc->moe_caps.has(MoECapabilityFp4GroupedEligible));
+    REQUIRE(desc->moe_caps.has(MoECapabilityCudnnMoeGraphEligible));
+    REQUIRE(desc->moe_caps.has(MoECapabilityPerExpertQuant));
+    REQUIRE_FALSE(desc->moe_caps.has(MoECapabilityFp8BackwardImplemented));
+    REQUIRE_FALSE(desc->moe_caps.has(MoECapabilityNvfp4NoFallback));
+    REQUIRE(desc->moe_caps.ep_awareness == EpAwareness::Routed);
     REQUIRE(desc->storage_compat.supports(StorageTier::GpuResident));
     REQUIRE_FALSE(desc->storage_compat.supports(StorageTier::CpuPinnedStream));
 
@@ -88,6 +105,9 @@ TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {
     REQUIRE(grouped_bwd->default_caps.has(OpCapabilityMoeRouted));
     REQUIRE(grouped_bwd->default_caps.has(OpCapabilityFp8Eligible));
     REQUIRE(grouped_bwd->default_caps.has(OpCapabilityWeightCacheEligible));
+    REQUIRE(grouped_bwd->moe_caps.has(MoECapabilityGroupedGemmEligible));
+    REQUIRE_FALSE(grouped_bwd->moe_caps.has(MoECapabilityFp8GroupedEligible));
+    REQUIRE_FALSE(grouped_bwd->moe_caps.has(MoECapabilityFp8BackwardImplemented));
 }
 
 TEST_CASE("moe utility ops carry routing descriptor metadata", "[op_registry]") {

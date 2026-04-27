@@ -158,6 +158,10 @@ struct DebugGraphDescriptorSummary {
     std::uint64_t moe_routed_ops = 0;
     std::uint64_t fp8_eligible_ops = 0;
     std::uint64_t fp4_eligible_ops = 0;
+    std::uint64_t moe_fp8_grouped_eligible_ops = 0;
+    std::uint64_t moe_fp4_grouped_eligible_ops = 0;
+    std::uint64_t moe_fp8_backward_implemented_ops = 0;
+    std::uint64_t moe_nvfp4_no_fallback_ops = 0;
     std::uint64_t lora_compatible_ops = 0;
     std::uint64_t weight_cache_eligible_ops = 0;
     std::uint64_t activation_epilogue_ops = 0;

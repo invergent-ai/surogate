@@ -598,6 +598,37 @@ REGISTER_COMPILED_OP("moe_grouped_gemm_down_backward",
                      ::dsl::EpilogueSupportNone,
                      ::dsl::StorageCompatibilityGpuResident,
                      0);
+
+REGISTER_MOE_CAPABILITIES("moe_grouped_gemm",
+                          ::dsl::MoECapabilityGroupedGemmEligible | ::dsl::MoECapabilityFp8GroupedEligible |
+                              ::dsl::MoECapabilityFp4GroupedEligible | ::dsl::MoECapabilityCudnnMoeGraphEligible |
+                              ::dsl::MoECapabilityPerExpertQuant,
+                          ::dsl::StorageCompatibilityGpuResident,
+                          Routed);
+REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_gate_up",
+                          ::dsl::MoECapabilityGroupedGemmEligible | ::dsl::MoECapabilityFp8GroupedEligible |
+                              ::dsl::MoECapabilityFp4GroupedEligible | ::dsl::MoECapabilityCudnnMoeGraphEligible |
+                              ::dsl::MoECapabilityPerExpertQuant,
+                          ::dsl::StorageCompatibilityGpuResident,
+                          Routed);
+REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_down",
+                          ::dsl::MoECapabilityGroupedGemmEligible | ::dsl::MoECapabilityFp8GroupedEligible |
+                              ::dsl::MoECapabilityFp4GroupedEligible | ::dsl::MoECapabilityCudnnMoeGraphEligible |
+                              ::dsl::MoECapabilityPerExpertQuant,
+                          ::dsl::StorageCompatibilityGpuResident,
+                          Routed);
+REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_backward",
+                          ::dsl::MoECapabilityGroupedGemmEligible,
+                          ::dsl::StorageCompatibilityGpuResident,
+                          Routed);
+REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_gate_up_backward",
+                          ::dsl::MoECapabilityGroupedGemmEligible,
+                          ::dsl::StorageCompatibilityGpuResident,
+                          Routed);
+REGISTER_MOE_CAPABILITIES("moe_grouped_gemm_down_backward",
+                          ::dsl::MoECapabilityGroupedGemmEligible,
+                          ::dsl::StorageCompatibilityGpuResident,
+                          Routed);
 REGISTER_COMPILED_OP("moe_unpermute",
                      MoEUnpermute,
                      ::dsl::fwd_moe_unpermute,

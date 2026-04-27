@@ -61,6 +61,25 @@ enum StorageCompatibilityBits : std::uint32_t {
     StorageCompatibilityNvmeOffload = 1u << 3,
 };
 
+enum MoECapabilityBits : std::uint32_t {
+    MoECapabilityNone = 0,
+    MoECapabilityGroupedGemmEligible = 1u << 0,
+    MoECapabilityFp8GroupedEligible = 1u << 1,
+    MoECapabilityFp4GroupedEligible = 1u << 2,
+    MoECapabilityCudnnMoeGraphEligible = 1u << 3,
+    MoECapabilityPerExpertQuant = 1u << 4,
+    MoECapabilityRoutingAwareFusion = 1u << 5,
+    MoECapabilityFp8BackwardImplemented = 1u << 6,
+    MoECapabilityNvfp4NoFallback = 1u << 7,
+};
+
+enum class EpAwareness : std::uint8_t {
+    None = 0,
+    Sharded,
+    Routed,
+    WeightTransfer,
+};
+
 struct CommunicationProfile {
     CommunicationKind kind = CommunicationKind::NoComm;
     bool can_overlap_with_compute = false;
@@ -108,11 +127,23 @@ struct StorageCompatibility {
     }
 };
 
+struct MoECapabilities {
+    std::uint32_t flags = MoECapabilityNone;
+    StorageCompatibility expert_storage{};
+    EpAwareness ep_awareness = EpAwareness::None;
+
+    [[nodiscard]] bool has(std::uint32_t flag) const {
+        return (flags & flag) == flag;
+    }
+};
+
 const char* op_semantic_kind_name(OpSemanticKind kind);
 const char* communication_kind_name(CommunicationKind kind);
+const char* ep_awareness_name(EpAwareness awareness);
 std::string op_capability_flags_string(OpCapabilities caps);
 std::string epilogue_support_flags_string(EpilogueSupport support);
 std::string storage_compatibility_flags_string(StorageCompatibility compat);
+std::string moe_capability_flags_string(MoECapabilities caps);
 
 }  // namespace dsl
 

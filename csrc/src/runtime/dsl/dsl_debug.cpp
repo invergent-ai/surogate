@@ -168,6 +168,14 @@ void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const Compi
     out.moe_routed_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityMoeRouted));
     out.fp8_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp8Eligible));
     out.fp4_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp4Eligible));
+    out.moe_fp8_grouped_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityFp8GroupedEligible));
+    out.moe_fp4_grouped_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityFp4GroupedEligible));
+    out.moe_fp8_backward_implemented_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityFp8BackwardImplemented));
+    out.moe_nvfp4_no_fallback_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityNvfp4NoFallback));
     out.lora_compatible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityLoRACompatible));
     out.weight_cache_eligible_ops =
         static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityWeightCacheEligible));

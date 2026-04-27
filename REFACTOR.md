@@ -79,6 +79,7 @@
 - [x] Python trainer debug surface now exposes compiled-graph descriptor/capability summaries for regression artifact producers.
 - [x] SFT trainer emits first-month regression artifacts under `SUROGATE_REGRESSION_ARTIFACT`, including convergence, step-time, CUDA-memory, and descriptor-summary fields.
 - [x] Regression baseline compare now detects descriptor-summary count drift when baselines include descriptor fields.
+- [x] Dedicated inert `MoECapabilities` descriptor surface added and populated on grouped MoE GEMM forward/backward ops, explicitly leaving FP8-backward/NVFP4-no-fallback gaps unset.
 
 Local validation status:
 
