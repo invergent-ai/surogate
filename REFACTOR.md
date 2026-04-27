@@ -229,6 +229,7 @@ Real-model acceptance queue:
 - [x] Non-streaming full-gradient all-reduce now also dispatches a typed `after_all_reduce` payload, so all base-gradient reduction hook boundaries carry structured reduction context.
 - [x] `after_produce` hook payloads now support local callable actions as well as opaque C callbacks, preparing grouped MoE LoRA hook migration without forcing large captured contexts through ad hoc structs.
 - [x] Grouped MoE down-projection LoRA now dispatches the structural `expert_down` `after_produce` hook under opt-in schema dispatch, with the existing inline grouped-LoRA path retained as fallback.
+- [x] Grouped MoE gate/up LoRA now dispatches the structural `expert_gate_up` `after_produce` hook for fused and separate expert gate/up adapters, with the existing inline grouped-LoRA path retained as fallback.
 
 ---
 
