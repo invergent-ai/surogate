@@ -238,6 +238,7 @@ Real-model acceptance queue:
 - [x] Expert-weight TensorRole parity now recognizes generic `expert_up` names in addition to fused `expert_gate_up` and `expert_down`, keeping Nemotron-style MoE expert slicing aligned across QLoRA and runtime helpers.
 - [x] `save_moe_layer_tensors` now reuses the compiled save-path MoE TensorRole/slot helper instead of maintaining a second substring allowlist.
 - [x] Compiled executor embedding-output fallback now has TensorRole parity around the remaining legacy `embed` substring route to the encoded activation slot.
+- [x] TensorRole now exposes an embedding predicate, and NorMuon embedding classification uses it with the legacy `embed` substring retained only as fallback.
 - [x] Runtime hook readiness reporting now reuses the hook-registry `after_produce` slot predicate instead of maintaining a shadow string list in `dsl_debug.cpp`.
 - [x] Runtime hook readiness reporting now reuses the hook-registry event predicate for all schema hook target counts, eliminating duplicated stream/comm/reduction slot logic in `dsl_debug.cpp`.
 

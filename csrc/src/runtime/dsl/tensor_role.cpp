@@ -130,6 +130,10 @@ bool tensor_role_is_router_name(std::string_view name) {
     return role.dist.kind == DistributionKind::RouterReplicated;
 }
 
+bool tensor_role_is_embedding_name(std::string_view name) {
+    return infer_tensor_role_from_name(name).ownership == TensorOwnership::Embedding;
+}
+
 bool tensor_role_is_shared_expert_name(std::string_view name) {
     const TensorRole role = infer_tensor_role_from_name(name);
     return role.is_moe_owned() && contains(name, "shared_expert");

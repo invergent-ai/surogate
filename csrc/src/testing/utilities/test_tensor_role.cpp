@@ -99,6 +99,9 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(embedding.ownership == TensorOwnership::Embedding);
         REQUIRE_FALSE(embedding.is_moe_owned());
         REQUIRE_FALSE(embedding.is_rope_freq());
+        REQUIRE(tensor_role_is_embedding_name("embed_tokens"));
+        REQUIRE(tensor_role_is_embedding_name("embed_1"));
+        REQUIRE_FALSE(tensor_role_is_embedding_name("blocks[0].attn_out"));
         REQUIRE(activation.ownership == TensorOwnership::Stack);
         REQUIRE_FALSE(activation.is_moe_owned());
         REQUIRE_FALSE(tensor_role_is_rope_name("blocks[0].attn_out"));

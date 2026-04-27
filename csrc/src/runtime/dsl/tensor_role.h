@@ -120,6 +120,9 @@ bool tensor_role_is_moe_side_channel_name(std::string_view name);
 /// Legacy-compatible router tensor predicate derived from TensorRole.
 bool tensor_role_is_router_name(std::string_view name);
 
+/// Legacy-compatible embedding tensor predicate derived from TensorRole.
+bool tensor_role_is_embedding_name(std::string_view name);
+
 /// Legacy-compatible shared-expert tensor predicate derived from TensorRole.
 bool tensor_role_is_shared_expert_name(std::string_view name);
 

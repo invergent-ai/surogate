@@ -18,8 +18,8 @@ namespace optimizers {
 /// biases, MoE routers) + NorMuon with Polar Express orthogonalization on
 /// 2D weight matrices (attention, MLP, expert MLP).
 ///
-/// Parameter classification happens at state-alloc time based on name and
-/// rank (see the internal ``is_normuon_param`` helper).
+/// Parameter classification happens at state-alloc time based on TensorRole
+/// parity, legacy name fallback, and rank (see ``is_normuon_param``).
 class NorMuonOptimizer final : public Optimizer {
 public:
     NorMuonOptimizer();
