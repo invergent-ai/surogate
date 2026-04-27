@@ -93,10 +93,10 @@ TensorRole infer_tensor_role_from_name(std::string_view raw_name, int block_laye
 
     if (name == "moe_expert_offsets" || name == "moe_gather_indices" || contains(name, "moe_") ||
         contains(name, "scatter_indices") || contains(name, "routing_weights") || contains(name, "routing_indices") ||
-        contains(name, "router_") || contains(name, "permuted") || contains(name, "expert_") ||
-        contains(name, "experts_")) {
+        contains(name, "gather_indices") || contains(name, "expert_offsets") || contains(name, "router") ||
+        contains(name, "permuted") || contains(name, "expert_") || contains(name, "experts_")) {
         role.ownership = TensorOwnership::MoE;
-        if (contains(name, "router_")) {
+        if (contains(name, "router")) {
             role.dist.kind = DistributionKind::RouterReplicated;
         } else {
             role.dist.kind = DistributionKind::ExpertParallel;

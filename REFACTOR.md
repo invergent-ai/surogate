@@ -41,6 +41,7 @@
 - [x] Weight-manager RoPE/router filtering now matches the param-store TensorRole-first classification path with legacy string fallback retained.
 - [x] RoPE parity guards in graph tensor resolution and autodiff now align `freq_cis` with `rope_freqs`, preventing false TensorRole parity aborts on alternate RoPE naming.
 - [x] Param-store and weight-manager RoPE parity guards now also align `freq_cis` with `rope_freqs`.
+- [x] TensorRole now covers plain `router`, global `gather_indices`, and `expert_offsets`; param store, weight manager, grad store, graph tensor resolution, graph parameter resolution, and autodiff non-differentiable checks now consume TensorRole predicates directly instead of local legacy substring predicates.
 
 ### Phase 2 — Op registry descriptor extension — COMPLETE
 

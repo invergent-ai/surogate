@@ -29,18 +29,11 @@ namespace dsl {
 namespace {
 
 bool is_rope_param(const std::string& name) {
-    const bool legacy_value =
-        name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos;
-    const bool role_value = tensor_role_is_rope_name(name);
-    tensor_role_parity_check(name, legacy_value, role_value, "DslWeightManager::is_rope_param");
-    return role_value || legacy_value;
+    return tensor_role_is_rope_name(name);
 }
 
 bool is_router_param(const std::string& name) {
-    const bool legacy_value = name.find("router") != std::string::npos;
-    const bool role_value = infer_tensor_role_from_name(name).dist.kind == DistributionKind::RouterReplicated;
-    tensor_role_parity_check(name, legacy_value, role_value, "DslWeightManager::is_router_param");
-    return role_value || legacy_value;
+    return tensor_role_is_router_name(name);
 }
 
 std::string_view trim_optional(std::string_view name) {

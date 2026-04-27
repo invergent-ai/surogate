@@ -227,11 +227,7 @@ Tensor& ensure_tensor(ExecState& st, const std::string& name, ETensorDType dtype
 }
 
 Tensor& resolve_param_tensor(ExecState& st, const std::string& name) {
-    const bool legacy_is_rope =
-        name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos;
-    const bool role_is_rope = tensor_role_is_rope_name(name);
-    tensor_role_parity_check(name, legacy_is_rope, role_is_rope, "graph_executor_tensors::resolve_param_tensor");
-    if (legacy_is_rope || role_is_rope) {
+    if (tensor_role_is_rope_name(name)) {
         auto& freqs = st.rs.rope_freqs(name);
         if (!freqs.Data) {
             throw std::runtime_error("DSL graph executor: RoPE frequencies not allocated");

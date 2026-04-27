@@ -38,15 +38,9 @@ bool is_lm_head_name(const std::string& name) {
     return name == "lm_head" || name == "lm_head_weight";
 }
 
-bool legacy_is_expert_parallel_grad_name(const std::string& name) {
-    return name.find("experts_") != std::string::npos;
-}
-
 bool use_expert_parallel_grad_route(const std::string& name, const char* context) {
-    const bool legacy_value = legacy_is_expert_parallel_grad_name(name);
-    const bool role_value = tensor_role_is_expert_parallel_name(name);
-    tensor_role_parity_check(name, legacy_value, role_value, context);
-    return role_value || legacy_value;
+    (void)context;
+    return tensor_role_is_expert_parallel_name(name);
 }
 
 }  // namespace
