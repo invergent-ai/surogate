@@ -674,10 +674,12 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(static_cast<dsl::BeforeConsumeHookPayload*>(hook_ctx.payload)->capturing);
 
     dsl::GradientOffloadHookPayload gradient_offload_payload;
+    gradient_offload_payload.all_reduced = true;
     gradient_offload_payload.offloaded = true;
     gradient_offload_payload.reduce_scattered = true;
     gradient_offload_payload.lora_gradients = true;
     hook_ctx.payload = &gradient_offload_payload;
+    REQUIRE(static_cast<dsl::GradientOffloadHookPayload*>(hook_ctx.payload)->all_reduced);
     REQUIRE(static_cast<dsl::GradientOffloadHookPayload*>(hook_ctx.payload)->offloaded);
     REQUIRE(static_cast<dsl::GradientOffloadHookPayload*>(hook_ctx.payload)->reduce_scattered);
     REQUIRE(static_cast<dsl::GradientOffloadHookPayload*>(hook_ctx.payload)->lora_gradients);

@@ -382,8 +382,14 @@ void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
             comm.all_reduce_avg(kv.second, stream);
         }
     }
+    GradientOffloadHookPayload payload;
+    payload.grads = this;
+    payload.comm = &comm;
+    payload.compute_stream = stream;
+    payload.copy_stream = stream;
+    payload.all_reduced = true;
     for (int layer = 0; layer < static_cast<int>(mHookSchemaIdsByLayer.size()); ++layer) {
-        dispatch_schema_layer_hooks(HookEventKind::AfterAllReduce, layer, stream);
+        dispatch_schema_layer_hooks(HookEventKind::AfterAllReduce, layer, stream, &payload);
     }
     mReducePending = false;
 }

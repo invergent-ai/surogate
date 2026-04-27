@@ -91,6 +91,7 @@ struct GradientOffloadHookPayload {
     cudaStream_t copy_stream = nullptr;
     cudaEvent_t sync_event = nullptr;
     bool capturing = false;
+    bool all_reduced = false;
     bool offloaded = false;
     bool reduce_scattered = false;
     bool sharded_accumulated = false;
