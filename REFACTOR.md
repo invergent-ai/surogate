@@ -89,6 +89,7 @@
 - [x] Compiled-graph descriptor summaries now report dense matmul FP8/FP4 forward/backward eligibility counts through the Python trainer debug surface.
 - [x] North-star coverage rows now report required dense `MatmulCapabilities` and actual dense matmul descriptor-summary counts separately from generic op capabilities.
 - [x] Fusion contexts now expose dense `MatmulCapabilities` from compiled ops so future fusion eligibility can match dedicated matmul descriptors instead of generic op flags.
+- [x] Fusion contexts now expose `MoECapabilities` from compiled ops so future MoE fusion eligibility can match grouped/MoE descriptors directly.
 - [x] Regression artifact flattening now totals dense matmul FP8/FP4 forward/backward descriptor counts for baseline drift detection.
 - [x] North-star coverage rows now include diagnostic descriptor-requirement status and missing descriptor-count keys for supported dense and MoE quantized cases.
 - [x] North-star coverage rows now expose both aggregate and per-graph dense matmul descriptor counts for report consumers.

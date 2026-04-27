@@ -25,6 +25,7 @@ struct FusionOpView {
     GroupedSemantics grouped_semantics{};
     OpCapabilities caps{};
     MatmulCapabilities matmul_caps{};
+    MoECapabilities moe_caps{};
     EpilogueSupport epilogue_support{};
     StorageCompatibility storage_compat{};
 };
@@ -36,6 +37,7 @@ struct FusionContext {
     [[nodiscard]] bool any_grouped() const;
     [[nodiscard]] bool all_support_capability(std::uint32_t capability) const;
     [[nodiscard]] bool first_supports_matmul_capability(std::uint32_t capability) const;
+    [[nodiscard]] bool any_support_moe_capability(std::uint32_t capability) const;
 };
 
 using FusionEligibleFn = bool (*)(const FusionContext&);

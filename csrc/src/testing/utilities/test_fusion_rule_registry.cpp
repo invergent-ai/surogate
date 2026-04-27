@@ -200,5 +200,22 @@ TEST_CASE("fusion registry finds matching rules at compiled op positions", "[fus
     REQUIRE(FusionRuleRegistry::instance().count_matching_starts(blocked) == 0);
 }
 
+TEST_CASE("fusion contexts expose MoE capabilities from compiled op descriptors", "[fusion_rule]") {
+    CompiledOp grouped;
+    grouped.type = CompiledOpType::MoEGroupedGemm;
+    grouped.semantic_kind = OpSemanticKind::MoE;
+    grouped.grouped_semantics.is_grouped = true;
+    grouped.moe_caps = MoECapabilities{MoECapabilityGroupedGemmEligible | MoECapabilityFp8GroupedEligible};
+
+    std::vector<CompiledOp> ops = {grouped};
+    FusionContext ctx = make_fusion_context(ops, 0, 1);
+
+    REQUIRE(ctx.ops.size() == 1);
+    REQUIRE(ctx.any_grouped());
+    REQUIRE(ctx.ops[0].moe_caps.has(MoECapabilityGroupedGemmEligible));
+    REQUIRE(ctx.any_support_moe_capability(MoECapabilityFp8GroupedEligible));
+    REQUIRE_FALSE(ctx.any_support_moe_capability(MoECapabilityFp8BackwardImplemented));
+}
+
 }  // namespace
 }  // namespace dsl

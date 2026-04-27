@@ -31,6 +31,12 @@ bool FusionContext::first_supports_matmul_capability(std::uint32_t capability) c
     return !ops.empty() && ops.front().matmul_caps.has(capability);
 }
 
+bool FusionContext::any_support_moe_capability(std::uint32_t capability) const {
+    return std::any_of(ops.begin(), ops.end(), [capability](const FusionOpView& op) {
+        return op.moe_caps.has(capability);
+    });
+}
+
 bool FusionRule::pattern_matches(const FusionContext& ctx) const {
     if (ctx.ops.size() != pattern.size()) {
         return false;
@@ -56,6 +62,7 @@ FusionOpView fusion_op_view_from_compiled(const CompiledOp& op) {
     view.grouped_semantics = op.grouped_semantics;
     view.caps = op.default_caps;
     view.matmul_caps = op.matmul_caps;
+    view.moe_caps = op.moe_caps;
     view.epilogue_support = op.epilogue_support;
     view.storage_compat = op.storage_compat;
     return view;
