@@ -487,6 +487,34 @@ int CompiledExecutor::dispatch_schema_hook(HookEventKind event,
     return mSchemaHookRegistry->dispatch(context);
 }
 
+int CompiledExecutor::dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, void* payload) {
+    if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || layer_idx < 0 ||
+        layer_idx >= static_cast<int>(mRunState.buffer_plan().schema_layers.size())) {
+        return 0;
+    }
+    const BlockSchemaLayerSummary& layer = mRunState.buffer_plan().schema_layers[static_cast<std::size_t>(layer_idx)];
+    if (!layer.has_schema || layer.block_family.empty()) {
+        return 0;
+    }
+    int dispatched = 0;
+    for (const HookRegistration& registration : mSchemaHookRegistry->registrations()) {
+        if (registration.event != event || registration.target.schema_id != layer.block_family) {
+            continue;
+        }
+        HookContext context;
+        context.layer_idx = layer_idx;
+        context.target = registration.target;
+        context.event = event;
+        context.stream = mRunState.MainStream;
+        context.payload = payload;
+        if (registration.callback) {
+            registration.callback(context);
+        }
+        ++dispatched;
+    }
+    return dispatched;
+}
+
 void CompiledExecutor::set_recompute_fn(std::function<void(int, long, long, bool)> fn) {
     mRecomputeFn = std::move(fn);
 }
@@ -964,6 +992,8 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
+    dispatch_schema_layer_hooks(HookEventKind::BeforeConsume, layer_idx);
+
     if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
         // Ensure the current layer's weights are present in a prefetch slot.
         // For strict-reverse backward orders (Q3 pure attention), the prior

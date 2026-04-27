@@ -325,6 +325,7 @@ private:
                              std::string_view schema_id,
                              std::string_view slot_name,
                              void* payload = nullptr);
+    int dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, void* payload = nullptr);
 
 public:
     // Direct dispatch functions. Public so op_registry trampolines can

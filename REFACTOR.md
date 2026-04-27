@@ -209,6 +209,7 @@ Real-model acceptance queue:
 - [x] Compiled hook metadata now carries schema ids alongside schema slots for LoRA and legacy forward-hook attrs, with descriptor artifacts reporting full structural `(schema_id, slot)` target coverage.
 - [x] Hook readiness now checks full structural target parity for LoRA slices and legacy forward-hook attrs, not only slot-name parity.
 - [x] Executor-side schema hook dispatch boundary added behind `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=1`; `GraphExecutor` now passes the inert hook registry into `CompiledExecutor`, and matmul after-produce sites can dispatch structural hook targets without changing default execution.
+- [x] Layer-start `before_consume` hook dispatch added under the same opt-in flag, establishing the CPU/offload prefetch boundary before the existing weight-gather path.
 
 ---
 
