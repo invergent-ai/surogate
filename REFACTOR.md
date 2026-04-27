@@ -114,6 +114,7 @@
 - [x] `DslModel` now captures schema plan records during initialization and reports them in debug memory output without changing allocator behavior.
 - [x] Optional `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` parity guard checks schema record coverage against `NumLayers` without changing default execution.
 - [x] `BufferPlan` now carries schema-derived record/routing/EP counters as diagnostics-only parity inputs.
+- [x] `BufferPlan` schema diagnostics now include slot, param, activation, expert-parallel, and streaming-hint counters.
 
 Local validation status:
 

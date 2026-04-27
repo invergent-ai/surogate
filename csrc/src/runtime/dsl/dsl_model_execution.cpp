@@ -283,6 +283,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                   << ", block_schema_records=" << initial_plan.schema_record_count
                   << ", block_schema_routing_layers=" << initial_plan.schema_routing_layers
                   << ", block_schema_ep_layers=" << initial_plan.schema_ep_layers
+                  << ", block_schema_slots=" << initial_plan.schema_slot_count
+                  << ", block_schema_expert_parallel_slots=" << initial_plan.schema_expert_parallel_slots
+                  << ", block_schema_streaming_slots=" << initial_plan.schema_streaming_slots
                   << ", GPU used=" << (total_mem - free_mem) / (1024 * 1024) << " MiB"
                   << ", free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }

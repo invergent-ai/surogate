@@ -88,6 +88,32 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
             if (const AttrMap* attrs = attrs_value ? attr_map(*attrs_value) : nullptr) {
                 out.block_family = attr_string(*attrs, "block_family");
             }
+
+            const AttrValue* slots_value = find_attr(*schema, "slots");
+            if (const AttrList* slots = slots_value ? attr_list(*slots_value) : nullptr) {
+                out.slot_count = static_cast<int>(slots->size());
+                for (const AttrValue& raw_slot : *slots) {
+                    const AttrMap* slot = attr_map(raw_slot);
+                    if (!slot) continue;
+                    const std::string kind = attr_string(*slot, "kind");
+                    if (kind == "param") {
+                        ++out.param_slots;
+                    } else {
+                        ++out.activation_slots;
+                    }
+                    if (const AttrValue* dist_value = find_attr(*slot, "distribution")) {
+                        if (const AttrMap* dist = attr_map(*dist_value);
+                            dist && attr_string(*dist, "kind") == "expert_parallel") {
+                            ++out.expert_parallel_slots;
+                        }
+                    }
+                    if (const AttrValue* streaming_value = find_attr(*slot, "streaming_hint")) {
+                        if (attr_map(*streaming_value)) {
+                            ++out.streaming_slots;
+                        }
+                    }
+                }
+            }
         }
 
         if (out.layer < 0 || out.block_type.empty()) continue;
@@ -177,6 +203,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             if (record.has_ep_topology) {
                 ++p.schema_ep_layers;
             }
+            p.schema_slot_count += record.slot_count;
+            p.schema_param_slots += record.param_slots;
+            p.schema_activation_slots += record.activation_slots;
+            p.schema_expert_parallel_slots += record.expert_parallel_slots;
+            p.schema_streaming_slots += record.streaming_slots;
         }
     }
 

@@ -55,6 +55,24 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
               "schema": {
                 "routing": {"kind": "none"},
                 "ep_topology": {"ep_size_param": "ep_size"},
+                "slots": [
+                  {
+                    "name": "qkv_weight",
+                    "kind": "param",
+                    "distribution": {"kind": "replicated"}
+                  },
+                  {
+                    "name": "experts_gate_up",
+                    "kind": "param",
+                    "distribution": {"kind": "expert_parallel"},
+                    "streaming_hint": {"prefetch_distance": 1}
+                  },
+                  {
+                    "name": "permuted_input",
+                    "kind": "activation",
+                    "distribution": {"kind": "expert_parallel"}
+                  }
+                ],
                 "attrs": {"block_family": "qwen3_dense"}
               }
             }
@@ -128,6 +146,11 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].blocks_param == "blocks");
     REQUIRE(schema_records[0].block_name == "Qwen3Block");
     REQUIRE(schema_records[0].block_family == "qwen3_dense");
+    REQUIRE(schema_records[0].slot_count == 3);
+    REQUIRE(schema_records[0].param_slots == 2);
+    REQUIRE(schema_records[0].activation_slots == 1);
+    REQUIRE(schema_records[0].expert_parallel_slots == 2);
+    REQUIRE(schema_records[0].streaming_slots == 1);
     REQUIRE(schema_records[0].has_routing);
     REQUIRE(schema_records[0].has_ep_topology);
 
@@ -153,4 +176,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_record_count == 1);
     REQUIRE(plan.schema_routing_layers == 1);
     REQUIRE(plan.schema_ep_layers == 1);
+    REQUIRE(plan.schema_slot_count == 3);
+    REQUIRE(plan.schema_param_slots == 2);
+    REQUIRE(plan.schema_activation_slots == 1);
+    REQUIRE(plan.schema_expert_parallel_slots == 2);
+    REQUIRE(plan.schema_streaming_slots == 1);
 }

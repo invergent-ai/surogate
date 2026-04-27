@@ -41,6 +41,11 @@ struct BlockSchemaPlanRecord {
     std::string blocks_param;
     std::string block_name;
     std::string block_family;
+    int slot_count = 0;
+    int param_slots = 0;
+    int activation_slots = 0;
+    int expert_parallel_slots = 0;
+    int streaming_slots = 0;
     bool has_routing = false;
     bool has_ep_topology = false;
 };
@@ -93,6 +98,11 @@ struct BufferPlan {
     int schema_record_count = 0;
     int schema_routing_layers = 0;
     int schema_ep_layers = 0;
+    int schema_slot_count = 0;
+    int schema_param_slots = 0;
+    int schema_activation_slots = 0;
+    int schema_expert_parallel_slots = 0;
+    int schema_streaming_slots = 0;
 
     // ---------------- Dimensions ----------------
     long B = 0;
