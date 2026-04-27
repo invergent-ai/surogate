@@ -130,4 +130,27 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].block_family == "qwen3_dense");
     REQUIRE(schema_records[0].has_routing);
     REQUIRE(schema_records[0].has_ep_topology);
+
+    PretrainedConfig cfg;
+    cfg.HiddenSize = 8;
+    cfg.NumQueryHeads = 2;
+    cfg.NumKeyValHeads = 1;
+    cfg.IntermediateSize = 16;
+    cfg.NumLayers = 1;
+    dsl::DslRuntimeConfig runtime_config;
+    RuntimeOptions options;
+    dsl::TensorSlotRegistry registry;
+    const auto plan = dsl::BufferPlan::build(cfg,
+                                             runtime_config,
+                                             options,
+                                             registry,
+                                             /*lora_only_mode=*/false,
+                                             /*B=*/2,
+                                             /*T=*/3,
+                                             ETensorDType::BF16,
+                                             ETensorDType::BF16,
+                                             &schema_records);
+    REQUIRE(plan.schema_record_count == 1);
+    REQUIRE(plan.schema_routing_layers == 1);
+    REQUIRE(plan.schema_ep_layers == 1);
 }
