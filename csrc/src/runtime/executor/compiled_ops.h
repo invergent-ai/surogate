@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -23,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/forward_plan.h"
+#include "runtime/dsl/hook_registry.h"
 #include "runtime/ep/ep_state.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
@@ -118,6 +120,7 @@ public:
     void set_weight_manager(DslWeightManager* weight_manager);
     void set_recipe(const recipes::Recipe* recipe);
     void set_hook_context(void* context);
+    void set_schema_hook_registry(const HookRegistry* registry);
     /// Set the GPU buffer that receives per-token log P(target|context) values.
     /// When non-null, dispatch_fused_lm_head_loss writes log-probs and returns early
     /// (no loss accumulation, no gradient state update).
@@ -317,6 +320,11 @@ private:
 
     // Save MoE layer tensors to persistent storage at layer boundaries
     void save_moe_layer_tensors(int layer_idx);
+    int dispatch_schema_hook(HookEventKind event,
+                             int layer_idx,
+                             std::string_view schema_id,
+                             std::string_view slot_name,
+                             void* payload = nullptr);
 
 public:
     // Direct dispatch functions. Public so op_registry trampolines can
@@ -576,6 +584,8 @@ private:
     DslWeightManager* mWeightManager = nullptr;
     const recipes::Recipe* mRecipe = nullptr;
     void* mHookContext = nullptr;
+    const HookRegistry* mSchemaHookRegistry = nullptr;
+    bool mSchemaHookDispatchEnabled = false;
     std::function<void(int, long, long, bool)> mRecomputeFn;
     bool mRecomputeEnabled = false;
     bool mRecomputeUseGraphs = true;

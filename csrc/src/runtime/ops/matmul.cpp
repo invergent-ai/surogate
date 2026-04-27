@@ -299,6 +299,11 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                 t->Data = out.Data;
             }
         }
+        dispatch_schema_hook(HookEventKind::AfterProduce,
+                             op.attrs.layer_idx,
+                             op.attrs.hook_schema_id,
+                             op.attrs.forward_hook_schema_slot,
+                             &out);
     }
 
     if (!op.attrs.lora_slices.empty()) {

@@ -660,6 +660,7 @@ void GraphExecutor::init_compiled_execution() {
         mCompiledExecutor->set_recipe(mOptions.TrainingRecipe.get());
     }
     mCompiledExecutor->set_hook_context(mHookContext);
+    mCompiledExecutor->set_schema_hook_registry(mSchemaHookRegistry);
     mCompiledExecutor->set_recompute_fn([this](int layer_idx, long B, long T, bool /*use_graph*/) {
         if (mCompiledForward) {
             // LoRA replay is slice-driven (see ``CompiledAttrs::lora_slices``).
@@ -909,6 +910,13 @@ void GraphExecutor::init_compiled_execution() {
     // Graphs will be compiled lazily on first forward when B/T are known
     mCompiledB = 0;
     mCompiledT = 0;
+}
+
+void GraphExecutor::set_schema_hook_registry(const HookRegistry* registry) {
+    mSchemaHookRegistry = registry;
+    if (mCompiledExecutor) {
+        mCompiledExecutor->set_schema_hook_registry(registry);
+    }
 }
 
 void GraphExecutor::compile_graphs(long B, long T) {

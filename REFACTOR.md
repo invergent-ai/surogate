@@ -208,6 +208,7 @@ Real-model acceptance queue:
 - [x] North-star hook readiness now requires both schema hook targets and seeded hook-registry registrations for CPU streaming, DP all-reduce, EP all-to-all, and after-produce LoRA/forward-hook paths.
 - [x] Compiled hook metadata now carries schema ids alongside schema slots for LoRA and legacy forward-hook attrs, with descriptor artifacts reporting full structural `(schema_id, slot)` target coverage.
 - [x] Hook readiness now checks full structural target parity for LoRA slices and legacy forward-hook attrs, not only slot-name parity.
+- [x] Executor-side schema hook dispatch boundary added behind `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=1`; `GraphExecutor` now passes the inert hook registry into `CompiledExecutor`, and matmul after-produce sites can dispatch structural hook targets without changing default execution.
 
 ---
 

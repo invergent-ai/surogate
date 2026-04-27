@@ -357,6 +357,9 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
       mEpStates(mEpStrategy->ep_states()),
       mLLEPStates(mEpStrategy->llep_states()),
       mEPLayerMeta(mEpStrategy->layer_meta()) {
+    if (const char* env = std::getenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH")) {
+        mSchemaHookDispatchEnabled = (std::string_view(env) == "1");
+    }
     // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);
@@ -461,6 +464,27 @@ void CompiledExecutor::set_recipe(const recipes::Recipe* recipe) {
 
 void CompiledExecutor::set_hook_context(void* context) {
     mHookContext = context;
+}
+
+void CompiledExecutor::set_schema_hook_registry(const HookRegistry* registry) {
+    mSchemaHookRegistry = registry;
+}
+
+int CompiledExecutor::dispatch_schema_hook(HookEventKind event,
+                                           int layer_idx,
+                                           std::string_view schema_id,
+                                           std::string_view slot_name,
+                                           void* payload) {
+    if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || schema_id.empty() || slot_name.empty()) {
+        return 0;
+    }
+    HookContext context;
+    context.layer_idx = layer_idx;
+    context.target = HookTarget{std::string(schema_id), std::string(slot_name)};
+    context.event = event;
+    context.stream = mRunState.MainStream;
+    context.payload = payload;
+    return mSchemaHookRegistry->dispatch(context);
 }
 
 void CompiledExecutor::set_recompute_fn(std::function<void(int, long, long, bool)> fn) {

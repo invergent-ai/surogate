@@ -401,6 +401,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     exec_opts.debug_print_backward = false;
     mExecutor =
         std::make_unique<GraphExecutor>(*mModule, *mRunState, *mParams, *mGrads, mModelConfig, mOptions, exec_opts);
+    if (auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
+        graph_exec->set_schema_hook_registry(&mHookRegistry);
+    }
     if (!mRngState.empty()) {
         mExecutor->set_rng_state(mRngState);
     }
