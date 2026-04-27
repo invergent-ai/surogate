@@ -8,7 +8,7 @@ with the C++ runtime.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .decorators import _block_registry, _model_registry, _module_registry, _primitive_registry
@@ -154,6 +154,7 @@ class ModuleIR:
     is_block: bool = False
     # Activation layout for this module (block activations or global model activations)
     activation_layout: ActivationLayoutIR | None = None
+    block_schema: dict[str, Any] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -1759,6 +1760,8 @@ def compile_block_spec(
         extends=spec.extends,
         config=config,
     )
+    if spec.schema:
+        ir.block_schema = asdict(spec.schema)
 
     # Create instance first so we can build dim_map for param resolution
     instance = None
@@ -2065,6 +2068,9 @@ def _module_ir_to_dict(ir: ModuleIR) -> dict[str, Any]:
 
     if ir.activation_layout:
         result["activation_layout"] = _activation_layout_ir_to_dict(ir.activation_layout)
+
+    if ir.block_schema:
+        result["block_schema"] = ir.block_schema
 
     return result
 

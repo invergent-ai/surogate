@@ -2,6 +2,7 @@ from surogate.dsl.block_schema import BlockSchema, DistributionDecl
 from surogate.dsl.blocks.gpt_oss import GptOssBlock
 from surogate.dsl.blocks.nemotron_h import NemotronHMamba2Block, NemotronHMoEBlock
 from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
+from surogate.dsl.py_compiler import _module_ir_to_dict, compile_block_spec
 
 
 def test_block_schema_distribution_factories():
@@ -67,3 +68,37 @@ def test_acceptance_moe_blocks_declare_expert_parallel_schema():
         assert spec.schema.routing.kind == "topk_softmax"
         assert spec.schema.get_slot("experts_gate_up").distribution.kind == "expert_parallel"
         assert spec.schema.get_slot("experts_down").distribution.kind == "expert_parallel"
+
+
+def test_block_schema_lowers_to_block_ir_dict():
+    spec = Qwen3MoEBlock(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+        num_experts=4,
+        num_experts_per_tok=2,
+    ).compile()
+
+    ir = compile_block_spec(
+        spec,
+        {
+            "d_model": 256,
+            "num_query_heads": 4,
+            "num_kv_heads": 2,
+            "head_size": 64,
+            "d_ff": 512,
+            "max_seq": 2048,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+        },
+    )
+    payload = _module_ir_to_dict(ir)
+
+    assert payload["block_schema"]["routing"]["kind"] == "topk_softmax"
+    assert payload["block_schema"]["ep_topology"]["ep_size_param"] == "ep_size"
+    expert_slot = next(slot for slot in payload["block_schema"]["slots"] if slot["name"] == "experts_gate_up")
+    assert expert_slot["distribution"]["kind"] == "expert_parallel"
+    assert expert_slot["streaming_hint"]["prefetch_distance"] == 1

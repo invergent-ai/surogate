@@ -104,6 +104,7 @@
 - [x] Python DSL `BlockSchema` declaration surface added for slot residency, distribution, streaming hints, routing schema, and EP topology metadata.
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
 - [x] Initial schemas attached to Nemotron Mamba, Nemotron MoE, Qwen3-MoE, and GPT-OSS MoE blocks.
+- [x] Block schema metadata now serializes into compiled block IR dictionaries for future BufferPlan consumption.
 
 Local validation status:
 
