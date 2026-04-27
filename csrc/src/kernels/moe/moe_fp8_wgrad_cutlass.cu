@@ -631,11 +631,6 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
                                                             const int* active_expert_indices,
                                                             bool weight_is_compact,
                                                             int num_active_experts) {
-    if (beta != 0.0f) {
-        throw std::runtime_error(std::string("moe_grouped_gemm_weight_grad_fp8 ") + arch_name +
-                                 " path currently requires beta=0");
-    }
-
     using namespace cute;
     using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
     using ElementA = cutlass::float_e5m2_t;  // grad^T (M, K)
@@ -707,6 +702,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
     std::vector<typename ProblemShape::UnderlyingProblemShape> problem_shapes_host;
     std::vector<const ElementA*> ptr_A_host;
     std::vector<const ElementB*> ptr_B_host;
+    std::vector<const ElementC*> ptr_C_host;
     std::vector<ElementC*> ptr_D_host;
     std::vector<const ElementSF*> ptr_SFA_host;
     std::vector<const ElementSF*> ptr_SFB_host;
@@ -727,6 +723,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
     problem_shapes_host.reserve(n_active);
     ptr_A_host.reserve(n_active);
     ptr_B_host.reserve(n_active);
+    ptr_C_host.reserve(n_active);
     ptr_D_host.reserve(n_active);
     ptr_SFA_host.reserve(n_active);
     ptr_SFB_host.reserve(n_active);
@@ -769,6 +766,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
         problem_shapes_host.push_back({M, N, K_pad});
         ptr_A_host.push_back(nullptr);  // packed grad pointer assigned after pack
         ptr_B_host.push_back(nullptr);  // packed input pointer assigned after pack
+        ptr_C_host.push_back(d_ptr);
         ptr_D_host.push_back(d_ptr);
         ptr_SFA_host.push_back(nullptr);  // assigned after SF allocation
         ptr_SFB_host.push_back(nullptr);
@@ -815,6 +813,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
     typename ProblemShape::UnderlyingProblemShape* d_problem_shapes = nullptr;
     const ElementA** d_ptr_A = nullptr;
     const ElementB** d_ptr_B = nullptr;
+    const ElementC** d_ptr_C = nullptr;
     ElementC** d_ptr_D = nullptr;
     const ElementSF** d_ptr_SFA = nullptr;
     const ElementSF** d_ptr_SFB = nullptr;
@@ -842,6 +841,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
                                stream));
     CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_ptr_A), sizeof(ElementA*) * gemm_count, stream));
     CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_ptr_B), sizeof(ElementB*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_ptr_C), sizeof(ElementC*) * gemm_count, stream));
     CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_ptr_D), sizeof(ElementC*) * gemm_count, stream));
     CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_ptr_SFA), sizeof(ElementSF*) * gemm_count, stream));
     CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_ptr_SFB), sizeof(ElementSF*) * gemm_count, stream));
@@ -929,6 +929,8 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
     CUDA_CHECK(
         cudaMemcpyAsync(d_ptr_B, ptr_B_host.data(), sizeof(ElementB*) * gemm_count, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(
+        cudaMemcpyAsync(d_ptr_C, ptr_C_host.data(), sizeof(ElementC*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
         cudaMemcpyAsync(d_ptr_D, ptr_D_host.data(), sizeof(ElementC*) * gemm_count, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_ptr_SFA,
                                ptr_SFA_host.data(),
@@ -990,7 +992,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {gemm_count, d_problem_shapes, problem_shapes_host.data()},
         {d_ptr_A, d_stride_A, d_ptr_B, d_stride_B, d_ptr_SFA, d_layout_SFA, d_ptr_SFB, d_layout_SFB},
-        {fusion_args, nullptr, d_stride_C, d_ptr_D, d_stride_D},
+        {fusion_args, d_ptr_C, d_stride_C, d_ptr_D, d_stride_D},
         hw_info};
 
     Gemm gemm;
@@ -1028,6 +1030,7 @@ void moe_grouped_gemm_weight_grad_fp8_cutlass_sm1xx_grouped(const char* arch_nam
     CUDA_CHECK(cudaFreeAsync(d_problem_shapes, stream));
     CUDA_CHECK(cudaFreeAsync(d_ptr_A, stream));
     CUDA_CHECK(cudaFreeAsync(d_ptr_B, stream));
+    CUDA_CHECK(cudaFreeAsync(d_ptr_C, stream));
     CUDA_CHECK(cudaFreeAsync(d_ptr_D, stream));
     CUDA_CHECK(cudaFreeAsync(d_ptr_SFA, stream));
     CUDA_CHECK(cudaFreeAsync(d_ptr_SFB, stream));

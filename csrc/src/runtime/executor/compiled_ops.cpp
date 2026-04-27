@@ -926,6 +926,20 @@ bool CompiledExecutor::try_moe_fp8_weight_grad(Tensor& d_weight,
         (beta != 0.0f && beta != 1.0f)) {
         return false;
     }
+    const int min_m = env_int("SUROGATE_FP8_MOE_WGRAD_MIN_M", 128);
+    const int min_n = env_int("SUROGATE_FP8_MOE_WGRAD_MIN_N", 32);
+    if ((min_m > 0 && M < min_m) || (min_n > 0 && N < min_n)) {
+        if (std::getenv("SUROGATE_DEBUG_FP8_MOE_WGRAD")) {
+            std::fprintf(stderr,
+                         "[FP8 MoE wgrad] fallback in %s: shape M=%d N=%d below perf thresholds min_m=%d min_n=%d\n",
+                         debug_tag ? debug_tag : "unknown",
+                         M,
+                         N,
+                         min_m,
+                         min_n);
+        }
+        return false;
+    }
 
     const long total_tokens = grad_output.Sizes[0];
     try {

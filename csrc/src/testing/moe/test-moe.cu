@@ -1232,9 +1232,12 @@ TEST_CASE("moe_grouped_gemm_weight_grad_fp8 grouped path matches quantized CPU r
         h_input[i] = __nv_fp8_e4m3(h_input_f[i]);
     }
 
-    auto compute_reference = [&](bool compact) {
+    auto compute_reference = [&](bool compact, const std::vector<nv_bfloat16>& initial_weight, float beta) {
         const int expert_stride = compact ? static_cast<int>(h_active.size()) : num_experts;
         std::vector<float> ref(static_cast<std::size_t>(expert_stride) * M * N, 0.0f);
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            ref[i] = beta * bf16_to_float(initial_weight[i]);
+        }
         for (int active_idx = 0; active_idx < static_cast<int>(h_active.size()); ++active_idx) {
             const int expert = h_active[active_idx];
             const int weight_idx = compact ? active_idx : expert;
@@ -1246,9 +1249,12 @@ TEST_CASE("moe_grouped_gemm_weight_grad_fp8 grouped path matches quantized CPU r
                     for (int t = start; t < end; ++t) {
                         sum += static_cast<float>(h_grad[t * M + m]) * static_cast<float>(h_input[t * N + n]);
                     }
-                    ref[static_cast<std::size_t>(weight_idx) * M * N + m + n * M] = sum;
+                    ref[static_cast<std::size_t>(weight_idx) * M * N + m + n * M] += sum;
                 }
             }
+        }
+        for (float& value : ref) {
+            value = bf16_to_float(make_nvbf16_from_float(value));
         }
         return ref;
     };
@@ -1263,10 +1269,14 @@ TEST_CASE("moe_grouped_gemm_weight_grad_fp8 grouped path matches quantized CPU r
     cublasHandle_t cublas_handle = nullptr;
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    auto run_case = [&](bool compact) {
+    auto run_case = [&](bool compact, float beta) {
         const int expert_stride = compact ? static_cast<int>(h_active.size()) : num_experts;
-        thrust::device_vector<nv_bfloat16> d_weight(static_cast<std::size_t>(expert_stride) * M * N);
-        thrust::fill(d_weight.begin(), d_weight.end(), make_nvbf16_from_float(0.0f));
+        std::vector<nv_bfloat16> h_initial_weight(static_cast<std::size_t>(expert_stride) * M * N);
+        for (std::size_t i = 0; i < h_initial_weight.size(); ++i) {
+            const float value = (beta == 0.0f) ? 0.0f : (static_cast<int>(i % 17) - 8) * 0.0078125f;
+            h_initial_weight[i] = make_nvbf16_from_float(value);
+        }
+        thrust::device_vector<nv_bfloat16> d_weight = to_device(h_initial_weight);
 
         moe_grouped_gemm_weight_grad_fp8(thrust::raw_pointer_cast(d_weight.data()),
                                          thrust::raw_pointer_cast(d_grad.data()),
@@ -1287,19 +1297,22 @@ TEST_CASE("moe_grouped_gemm_weight_grad_fp8 grouped path matches quantized CPU r
                                          static_cast<int>(h_active.size()));
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        const std::vector<float> ref = compute_reference(compact);
+        const std::vector<float> ref = compute_reference(compact, h_initial_weight, beta);
         const std::vector<nv_bfloat16> got_bf16 = from_device(d_weight);
         std::vector<float> got(got_bf16.size());
         for (std::size_t i = 0; i < got.size(); ++i) {
             got[i] = bf16_to_float(got_bf16[i]);
         }
         const float max_diff = max_abs_diff(got.data(), ref.data(), got.size());
-        INFO("compact=" << compact << " max_diff=" << max_diff);
-        REQUIRE(max_diff < 5e-2f);
+        INFO("compact=" << compact << " beta=" << beta << " max_diff=" << max_diff);
+        const float tolerance = (beta == 0.0f) ? 5e-2f : 8e-2f;
+        REQUIRE(max_diff < tolerance);
     };
 
-    run_case(false);
-    run_case(true);
+    run_case(false, 0.0f);
+    run_case(true, 0.0f);
+    run_case(false, 1.0f);
+    run_case(true, 1.0f);
 
     CUBLAS_CHECK(cublasDestroy(cublas_handle));
 }

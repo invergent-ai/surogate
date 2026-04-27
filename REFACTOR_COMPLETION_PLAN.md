@@ -19,6 +19,8 @@ Tracked phases 0-5 are complete for the scoped, guarded implementation. The rema
   - [x] Keep Ada on the dense FP8 fallback until an Ada grouped path is worth the extra complexity.
 - [x] Keep `SUROGATE_FP8_MOE_WGRAD=1` as the rollout gate until parity and perf are proven.
 - [x] Preserve BF16 fallback for unsupported shapes, missing cache/state, and native-kernel rejection.
+- [x] Preserve BF16 fallback for low-rank MoE LoRA adapter gradients where the FP8 quantize/pack overhead is slower end-to-end.
+  - Default FP8 wgrad perf thresholds are `M >= 128` and `N >= 32`; override with `SUROGATE_FP8_MOE_WGRAD_MIN_M` and `SUROGATE_FP8_MOE_WGRAD_MIN_N`.
 - [x] Bound the executor-side MoE FP8 expert-weight cache so large pre-quantized MoE runs do not allocate one persistent FP8 cache per layer.
   - Default cache budget is `1024` MiB and can be overridden with `SUROGATE_FP8_MOE_CACHE_BUDGET_MB`.
   - Layers beyond the budget use the existing temporary quantization path, preserving correctness without the forward OOM seen on Qwen3.5 MoE.
@@ -36,8 +38,10 @@ Acceptance:
 - [x] 5-step FP8-forward/FP8-dgrad/FP8-wgrad loss is within 5% of FP8-forward/BF16-wgrad baseline.
   - Validated on `qwen3_5_moe__fp8__single_gpu__gpu__moe_grouped`: final loss relative delta `0.040%`, max step relative delta `0.104%`.
 - [ ] 2-GPU DP smoke passes with FP8 wgrad enabled.
-- [ ] nsys confirms the intended FP8 wgrad path and no redundant expert weight requantization in backward.
-  - Still open: LoRA grouped wgrad calls with `beta=1` currently fall back while the native SM120 path requires `beta=0`.
+- [ ] End-to-end 5-step FP8-forward/FP8-dgrad/FP8-wgrad training time is faster than the FP8-forward/BF16-wgrad baseline.
+  - Current measured result is not faster: FP8 wgrad mean step time `9851.4 ms` versus BF16-wgrad baseline `9446.2 ms` on `qwen3_5_moe__fp8__single_gpu__gpu__moe_grouped`.
+  - This is the Track 1 performance gate; isolated kernel speed is secondary evidence only.
+  - The native SM100/SM120 grouped path now supports `beta=1`; low-rank LoRA adapter gradients still prefer BF16 by default for end-to-end speed.
 
 ## Track 2 - Promote Hook Dispatch From Opt-In To Runtime Path
 
