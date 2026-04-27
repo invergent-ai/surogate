@@ -26,9 +26,18 @@ inline bool descriptor_allows_capability(dsl::OpCapabilities caps,
                                          std::uint32_t flag,
                                          const char* context,
                                          const char* capability) {
-    const bool allowed = descriptor_allows_capability(caps, flag);
+    if (caps.flags == dsl::OpCapabilityNone) {
+        if (recipe_capability_fallback_log_enabled()) {
+            std::fprintf(stderr,
+                         "[recipe capability] %s legacy allow: descriptor has no capability metadata for %s\n",
+                         context,
+                         capability);
+        }
+        return true;
+    }
+    const bool allowed = caps.has(flag);
     if (!allowed && recipe_capability_fallback_log_enabled()) {
-        std::fprintf(stderr, "[recipe capability] %s fallback: descriptor lacks %s\n", context, capability);
+        std::fprintf(stderr, "[recipe capability] %s disabled: descriptor lacks %s\n", context, capability);
     }
     return allowed;
 }

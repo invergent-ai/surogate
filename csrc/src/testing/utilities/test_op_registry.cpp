@@ -5,6 +5,7 @@
 
 #include <utility>
 
+#include "recipes/capability_predicates.h"
 #include "runtime/executor/op_registry.h"
 
 namespace dsl {
@@ -205,6 +206,26 @@ TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     const OpDescriptor* loss = OpRegistry::instance().find_by_name("cross_entropy_loss");
     REQUIRE(loss != nullptr);
     REQUIRE(loss->semantic_kind == OpSemanticKind::Loss);
+}
+
+TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[op_registry]") {
+    OpCapabilities unannotated{};
+    REQUIRE(recipes::descriptor_allows_fp8(unannotated));
+    REQUIRE(recipes::descriptor_allows_fp4(unannotated));
+    REQUIRE(recipes::descriptor_allows_fp8(unannotated, "test"));
+    REQUIRE(recipes::descriptor_allows_fp4(unannotated, "test"));
+
+    OpCapabilities fp8_only{OpCapabilityFp8Eligible};
+    REQUIRE(recipes::descriptor_allows_fp8(fp8_only));
+    REQUIRE_FALSE(recipes::descriptor_allows_fp4(fp8_only));
+    REQUIRE(recipes::descriptor_allows_fp8(fp8_only, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_fp4(fp8_only, "test"));
+
+    OpCapabilities fp4_only{OpCapabilityFp4Eligible};
+    REQUIRE_FALSE(recipes::descriptor_allows_fp8(fp4_only));
+    REQUIRE(recipes::descriptor_allows_fp4(fp4_only));
+    REQUIRE_FALSE(recipes::descriptor_allows_fp8(fp4_only, "test"));
+    REQUIRE(recipes::descriptor_allows_fp4(fp4_only, "test"));
 }
 
 }  // namespace
