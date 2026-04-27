@@ -205,6 +205,14 @@ FIRST_MONTH_MATRIX: tuple[RegressionCase, ...] = (
         config="examples/sft/qwen3/qwen3-lora-bf16-1step.yaml",
         env_model_path="QWEN3_MODEL_PATH",
     ),
+    RegressionCase(
+        "qwen3",
+        "fp8",
+        "2gpu_dp",
+        storage="cpu_stream",
+        config="examples/sft/qwen3/qwen3-lora-fp8.yaml",
+        env_model_path="QWEN3_MODEL_PATH",
+    ),
     RegressionCase("qwen3", "fp4", "single_gpu", supported=False),
 )
 

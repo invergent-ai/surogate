@@ -155,6 +155,7 @@
 - [x] `BufferPlan` now reports explicit expert-parallel parameter global/local/savings bytes, exposing the per-rank allocation target separately from replicated parameter bytes.
 - [x] Phase 4c block-family migration completed for current Python block classes with schema contract validation in both compiler lowering paths. All block schemas now require family metadata, unique shaped slots, and MoE-specific routing/EP/grouped expert declarations.
 - [x] Phase 4d reporting started: north-star coverage rows now include CPU-stream storage declaration status, EP topology declaration status, and structured BufferPlan summaries for storage/distribution acceptance triage.
+- [x] Phase 4d regression matrix seeded with an explicit Qwen3 FP8 LoRA `2gpu_dp` CPU-stream row so the CPU-stream + FP8 + DP target is tracked before execution is re-enabled.
 
 Local validation status:
 
