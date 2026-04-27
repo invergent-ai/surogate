@@ -130,6 +130,18 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                     } else {
                         ++out.activation_slots;
                     }
+                    const std::string residency = attr_string(*slot, "residency");
+                    if (residency == "auto") {
+                        ++out.auto_resident_slots;
+                    } else if (residency == "cpu_pinned_stream") {
+                        ++out.cpu_pinned_stream_slots;
+                    } else if (residency == "cpu_pageable") {
+                        ++out.cpu_pageable_slots;
+                    } else if (residency == "nvme_offload") {
+                        ++out.nvme_offload_slots;
+                    } else {
+                        ++out.gpu_resident_slots;
+                    }
                     if (const AttrValue* dist_value = find_attr(*slot, "distribution")) {
                         if (const AttrMap* dist = attr_map(*dist_value);
                             dist && attr_string(*dist, "kind") == "expert_parallel") {
@@ -291,6 +303,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             p.schema_activation_slots += record.activation_slots;
             p.schema_expert_parallel_slots += record.expert_parallel_slots;
             p.schema_streaming_slots += record.streaming_slots;
+            p.schema_gpu_resident_slots += record.gpu_resident_slots;
+            p.schema_auto_resident_slots += record.auto_resident_slots;
+            p.schema_cpu_pinned_stream_slots += record.cpu_pinned_stream_slots;
+            p.schema_cpu_pageable_slots += record.cpu_pageable_slots;
+            p.schema_nvme_offload_slots += record.nvme_offload_slots;
             if (record.layer >= 0 && record.layer < p.NumLayers) {
                 auto& layer = p.schema_layers[static_cast<std::size_t>(record.layer)];
                 layer.has_schema = true;
@@ -301,6 +318,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 layer.activation_slots = record.activation_slots;
                 layer.expert_parallel_slots = record.expert_parallel_slots;
                 layer.streaming_slots = record.streaming_slots;
+                layer.gpu_resident_slots = record.gpu_resident_slots;
+                layer.auto_resident_slots = record.auto_resident_slots;
+                layer.cpu_pinned_stream_slots = record.cpu_pinned_stream_slots;
+                layer.cpu_pageable_slots = record.cpu_pageable_slots;
+                layer.nvme_offload_slots = record.nvme_offload_slots;
                 layer.has_routing = record.has_routing;
                 layer.has_ep_topology = record.has_ep_topology;
             }

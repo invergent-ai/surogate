@@ -119,6 +119,7 @@
 - [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` now validates unique, contiguous per-layer schema coverage instead of only checking total record count.
 - [x] `BufferPlan` now exposes per-layer schema summaries as the next allocator-facing Phase 4b dual path, without changing allocation behavior.
 - [x] `BufferPlan` now classifies schema block families into dense/MoE/Mamba/linear-mixer diagnostics for allocator parity work.
+- [x] `BufferPlan` now parses schema slot residency into GPU/auto/CPU-stream/NVMe diagnostics for Phase 4 storage planning.
 
 Local validation status:
 

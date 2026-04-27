@@ -55,6 +55,11 @@ struct BlockSchemaPlanRecord {
     int activation_slots = 0;
     int expert_parallel_slots = 0;
     int streaming_slots = 0;
+    int gpu_resident_slots = 0;
+    int auto_resident_slots = 0;
+    int cpu_pinned_stream_slots = 0;
+    int cpu_pageable_slots = 0;
+    int nvme_offload_slots = 0;
     bool has_routing = false;
     bool has_ep_topology = false;
 };
@@ -74,6 +79,11 @@ struct BlockSchemaLayerSummary {
     int activation_slots = 0;
     int expert_parallel_slots = 0;
     int streaming_slots = 0;
+    int gpu_resident_slots = 0;
+    int auto_resident_slots = 0;
+    int cpu_pinned_stream_slots = 0;
+    int cpu_pageable_slots = 0;
+    int nvme_offload_slots = 0;
     bool has_routing = false;
     bool has_ep_topology = false;
 };
@@ -141,6 +151,11 @@ struct BufferPlan {
     int schema_activation_slots = 0;
     int schema_expert_parallel_slots = 0;
     int schema_streaming_slots = 0;
+    int schema_gpu_resident_slots = 0;
+    int schema_auto_resident_slots = 0;
+    int schema_cpu_pinned_stream_slots = 0;
+    int schema_cpu_pageable_slots = 0;
+    int schema_nvme_offload_slots = 0;
     std::vector<BlockSchemaLayerSummary> schema_layers;
 
     // ---------------- Dimensions ----------------
