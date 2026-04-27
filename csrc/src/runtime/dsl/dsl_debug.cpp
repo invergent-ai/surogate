@@ -346,27 +346,21 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     s.schema_hook_dispatch_enabled = env_flag_enabled("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH") ? 1 : 0;
     for (const BlockSchemaLayerSummary& layer : p.schema_layers) {
         for (const BlockSchemaSlotSummary& slot : layer.slots) {
-            const bool is_param = slot.kind == "param";
-            if (schema_slot_is_lora_after_produce_target(slot)) {
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterProduce)) {
                 s.hook_after_produce_targets += 1;
             }
-            const bool streamable_param =
-                is_param && (slot.streaming_prefetch_distance >= 0 || slot.residency == "auto" ||
-                             slot.residency == "cpu_pinned_stream" || slot.residency == "cpu_pageable" ||
-                             slot.residency == "nvme_offload");
-            if (streamable_param) {
+            if (schema_slot_matches_hook_event(slot, HookEventKind::BeforeConsume)) {
                 s.hook_before_consume_targets += 1;
                 s.hook_after_consume_targets += 1;
             }
-            if (!is_param && slot.distribution_kind == "expert_parallel") {
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterCommunication)) {
                 s.hook_after_communication_targets += 1;
                 s.hook_after_all_to_all_targets += 1;
             }
-            if (is_param && (slot.distribution_kind.empty() || slot.distribution_kind == "replicated" ||
-                             slot.distribution_kind == "router_replicated")) {
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterAllReduce)) {
                 s.hook_after_all_reduce_targets += 1;
             }
-            if (is_param && (slot.distribution_kind == "sharded_dim" || slot.distribution_kind == "expert_parallel")) {
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterReduceScatter)) {
                 s.hook_after_reduce_scatter_targets += 1;
             }
         }

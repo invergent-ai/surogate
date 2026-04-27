@@ -169,6 +169,20 @@ bool schema_slot_is_lora_after_produce_target(const BlockSchemaSlotSummary& slot
            slot.name == "expert_down";
 }
 
+bool schema_slot_matches_hook_event(const BlockSchemaSlotSummary& slot, HookEventKind event) {
+    switch (event) {
+        case HookEventKind::AfterProduce: return schema_slot_is_lora_after_produce_target(slot);
+        case HookEventKind::BeforeConsume: return is_streamable_param_slot(slot);
+        case HookEventKind::AfterConsume: return is_streamable_param_slot(slot);
+        case HookEventKind::AfterCommunication:
+        case HookEventKind::AfterAllToAll: return is_expert_parallel_activation(slot);
+        case HookEventKind::AfterAllReduce: return is_replicated_param_slot(slot);
+        case HookEventKind::AfterReduceScatter: return is_sharded_param_slot(slot);
+        case HookEventKind::Unknown: return false;
+    }
+    return false;
+}
+
 std::vector<HookTarget> collect_schema_hook_targets(const std::vector<BlockSchemaPlanRecord>& records,
                                                     HookEventKind event) {
     std::vector<HookTarget> targets;
@@ -176,18 +190,7 @@ std::vector<HookTarget> collect_schema_hook_targets(const std::vector<BlockSchem
         const std::string schema_id = schema_id_for_hook_target(record);
         if (schema_id.empty()) continue;
         for (const BlockSchemaSlotSummary& slot : record.slots) {
-            bool include = false;
-            switch (event) {
-                case HookEventKind::AfterProduce: include = schema_slot_is_lora_after_produce_target(slot); break;
-                case HookEventKind::BeforeConsume: include = is_streamable_param_slot(slot); break;
-                case HookEventKind::AfterConsume: include = is_streamable_param_slot(slot); break;
-                case HookEventKind::AfterCommunication:
-                case HookEventKind::AfterAllToAll: include = is_expert_parallel_activation(slot); break;
-                case HookEventKind::AfterAllReduce: include = is_replicated_param_slot(slot); break;
-                case HookEventKind::AfterReduceScatter: include = is_sharded_param_slot(slot); break;
-                case HookEventKind::Unknown: include = false; break;
-            }
-            if (include) {
+            if (schema_slot_matches_hook_event(slot, event)) {
                 targets.push_back(HookTarget{schema_id, slot.name});
             }
         }
