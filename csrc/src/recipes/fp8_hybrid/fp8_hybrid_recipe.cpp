@@ -77,7 +77,7 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Fall back to BF16 matmul if FP8 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps)) {
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::forward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -345,7 +345,7 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Fall back to BF16 matmul if FP8 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps)) {
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::backward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;
@@ -645,8 +645,8 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // Path 2: Full FP8 Training (quantize activations + use FP8 kernels)
     // =========================================================================
 
-    if (ctx.allow_fp8 && descriptor_allows_fp8(ctx.op_caps) && ctx.inp_quant && ctx.inp_quant->Data && ctx.run_state &&
-        ctx.cublas_handle && ctx.host_offsets) {
+    if (ctx.allow_fp8 && descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::forward_moe_matmul") && ctx.inp_quant &&
+        ctx.inp_quant->Data && ctx.run_state && ctx.cublas_handle && ctx.host_offsets) {
         IRunState& rs = *ctx.run_state;
         const long num_elements = static_cast<long>(ctx.total_tokens) * ctx.K;
 
@@ -781,7 +781,7 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
     }
 
     // Fall back to BF16 if FP8 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps)) {
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps, "FP8HybridRecipe::backward_moe_matmul")) {
         Recipe::backward_moe_matmul(ctx);
         return;
     }

@@ -28,7 +28,7 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps)) {
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4Recipe::forward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -241,7 +241,7 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
-    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps)) {
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4Recipe::backward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;
