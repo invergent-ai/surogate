@@ -64,6 +64,7 @@ struct HookContext {
 struct AfterProduceHookPayload {
     void* action_context = nullptr;
     void (*apply_lora)(void*) = nullptr;
+    std::function<void()> apply_lora_action;
     bool lora_applied = false;
 };
 

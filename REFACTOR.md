@@ -227,6 +227,7 @@ Real-model acceptance queue:
 - [x] Regression/runtime artifacts now expose `after_communication` hook target counts and EP hook readiness requires both generic communication and all-to-all hook coverage.
 - [x] LoRA gradient reduction now uses the typed `after_all_reduce` hook payload per layer; under opt-in schema dispatch, callbacks can own LoRA all-reduce/DP-only expert reduction, with the previous reduction path retained as fallback.
 - [x] Non-streaming full-gradient all-reduce now also dispatches a typed `after_all_reduce` payload, so all base-gradient reduction hook boundaries carry structured reduction context.
+- [x] `after_produce` hook payloads now support local callable actions as well as opaque C callbacks, preparing grouped MoE LoRA hook migration without forcing large captured contexts through ad hoc structs.
 
 ---
 

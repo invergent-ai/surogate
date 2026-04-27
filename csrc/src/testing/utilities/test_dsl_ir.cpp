@@ -698,8 +698,14 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     auto produce_registry = dsl::HookRegistry{};
     produce_registry.on_after_produce({"qwen3_dense", "qkv"}, "schema_lora_after_produce", [](dsl::HookContext& ctx) {
         auto* payload = static_cast<dsl::AfterProduceHookPayload*>(ctx.payload);
-        if (!payload || payload->lora_applied || !payload->apply_lora) return;
-        payload->apply_lora(payload->action_context);
+        if (!payload || payload->lora_applied) return;
+        if (payload->apply_lora) {
+            payload->apply_lora(payload->action_context);
+        } else if (payload->apply_lora_action) {
+            payload->apply_lora_action();
+        } else {
+            return;
+        }
         payload->lora_applied = true;
     });
     dsl::HookContext produce_ctx;
@@ -710,6 +716,16 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(produce_registry.dispatch(produce_ctx) == 1);
     REQUIRE(lora_payload_applied);
     REQUIRE(after_produce_payload.lora_applied);
+
+    bool lora_callable_applied = false;
+    dsl::AfterProduceHookPayload after_produce_callable_payload;
+    after_produce_callable_payload.apply_lora_action = [&]() {
+        lora_callable_applied = true;
+    };
+    produce_ctx.payload = &after_produce_callable_payload;
+    REQUIRE(produce_registry.dispatch(produce_ctx) == 1);
+    REQUIRE(lora_callable_applied);
+    REQUIRE(after_produce_callable_payload.lora_applied);
 
     dsl::CommunicationHookPayload comm_payload;
     comm_payload.token_all_to_all_completed = true;
