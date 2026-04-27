@@ -9,10 +9,14 @@
 
 ## 0. First-month implementation progress
 
-Completed in the first implementation pass:
+### Pre-Phase 0 — FP8 MoE backward closure
 
 - [x] FP8 MoE weight-gradient closure scaffold landed behind `SUROGATE_FP8_MOE_WGRAD=1`, with BF16 fallback retained for unsupported paths.
 - [x] Executor-side FP8 MoE expert weight cache support landed for backward dgrad reuse, preserving frozen-weight cacheability.
+- [x] CUTLASS examples README inspected for relevant FP8/grouped GEMM paths; future candidates identified (`57_hopper_grouped_gemm`, `69_hopper_mixed_dtype_grouped_gemm`, `75_blackwell_grouped_gemm`, `81_blackwell_gemm_blockwise`, `54_hopper_fp8_warp_specialized_gemm`, `58_ada_fp8_gemm`).
+
+### Phase 0 — Regression baseline infrastructure
+
 - [x] First-month regression harness added with tracked JSON baselines under `regression_baselines/locked`.
 - [x] Baseline compare/update/report commands added, including north-star coverage JSON.
 - [x] First-month matrix seeded for Qwen3, Gemma4, Nemotron-H, Qwen3.5, and Qwen3.5-MoE rows; FP4 rows are explicitly unsupported/skipped where not stable.
@@ -20,6 +24,9 @@ Completed in the first implementation pass:
 - [x] Regression runner materializes per-run configs and injects local model paths from env vars.
 - [x] Regression case filtering and `--list-cases` command added for CI/on-demand selection.
 - [x] CI workflow and Make targets added for no-GPU regression smoke and self-hosted GPU regression lane.
+
+### Phase 1 — TensorRole and Distribution scaffolding
+
 - [x] `TensorRole`, `Distribution`, `StorageTier`, `QuantState`, and conservative name-to-role inference introduced.
 - [x] TensorRole metadata attached to compiled graph tensor records and role lookup helpers added.
 - [x] Dual-path TensorRole parity helper added under `SUROGATE_TENSOR_ROLE_PARITY`; `abort` mode supported.
@@ -28,6 +35,9 @@ Completed in the first implementation pass:
 - [x] Expert-parallel grad reduction classification parity added without changing current comm route.
 - [x] DSL stores, matmul MoE predicates, QLoRA expert filters, NorMuon router filters, and MoE expert-bias skip paths wired into role parity.
 - [x] Autodiff MoE side-channel classification centralized through TensorRole helpers.
+
+### Phase 2 — Op registry descriptor extension
+
 - [x] Existing op dispatch/autodiff registry preserved; descriptor metadata extension started instead of rebuilding the registry.
 - [x] MoE op registry descriptors annotated with first-month semantic/distribution metadata.
 - [x] Registry descriptor surface extended with `CommunicationProfile` and `GroupedSemantics`.
@@ -38,7 +48,6 @@ Completed in the first implementation pass:
 - [x] Descriptor type definitions split into a lightweight header and copied onto `CompiledOp` during graph compilation.
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, and distribution descriptor facets.
 - [x] `CompiledGraph` summary helpers added for descriptor communication counts and grouped-op counts.
-- [x] CUTLASS examples README inspected for relevant FP8/grouped GEMM paths; future candidates identified (`57_hopper_grouped_gemm`, `69_hopper_mixed_dtype_grouped_gemm`, `75_blackwell_grouped_gemm`, `81_blackwell_gemm_blockwise`, `54_hopper_fp8_warp_specialized_gemm`, `58_ada_fp8_gemm`).
 
 Local validation status:
 
