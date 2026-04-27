@@ -94,27 +94,6 @@ std::optional<bool> is_mapped_slot(const TensorSlotRegistry* registry, const std
     return std::nullopt;
 }
 
-bool legacy_is_moe_tensor_name(const std::string& n) {
-    bool legacy_slot = false;
-    switch (resolve_block_slot(n)) {
-        case TensorSlot::BlockRouterLogits:
-        case TensorSlot::BlockRouterProbs:
-        case TensorSlot::BlockRoutingWeights:
-        case TensorSlot::BlockRoutingIndices:
-        case TensorSlot::BlockPermutedInput:
-        case TensorSlot::BlockScatterIndices:
-        case TensorSlot::BlockExpertGateUp:
-        case TensorSlot::BlockExpertAct:
-        case TensorSlot::BlockExpertDown:
-        case TensorSlot::BlockMoeOut: legacy_slot = true; break;
-        default: break;
-    }
-    // Global MoE side-channels (not modelled as per-block slots).
-    const std::string probe = strip_ssa_suffix(n);
-    const bool legacy_tail = probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
-    return legacy_slot || legacy_tail;
-}
-
 std::optional<bool> moe_role_from_tensor_id(const CompiledGraph* graph, int tid) {
     if (!graph) return std::nullopt;
     if (const TensorRole* role = graph->role_for_tensor_id(tid)) {
@@ -124,21 +103,13 @@ std::optional<bool> moe_role_from_tensor_id(const CompiledGraph* graph, int tid)
 }
 
 bool is_moe_tensor_name(const std::string& n, const char* context = "compiled_ops_save::is_moe_tensor_name") {
-    const bool legacy_value = legacy_is_moe_tensor_name(n);
-    const bool role_value = tensor_role_is_moe_name(n);
-    tensor_role_parity_check(n, legacy_value, role_value, context);
-    return legacy_value || role_value;
+    (void)context;
+    return tensor_role_is_moe_name(n);
 }
 
 bool classify_moe_tensor(const CompiledGraph* graph, int tid, const std::string& name, const char* context) {
-    const bool legacy_value = legacy_is_moe_tensor_name(name);
-    const bool role_value = moe_role_from_tensor_id(graph, tid).value_or(tensor_role_is_moe_name(name));
-    tensor_role_parity_check(name, legacy_value, role_value, context);
-    return legacy_value || role_value;
-}
-
-bool legacy_is_rope_name(const std::string& name) {
-    return name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos;
+    (void)context;
+    return moe_role_from_tensor_id(graph, tid).value_or(tensor_role_is_moe_name(name));
 }
 
 std::optional<bool> rope_role_from_name(const CompiledGraph* graph, const std::string& name) {
@@ -150,10 +121,8 @@ std::optional<bool> rope_role_from_name(const CompiledGraph* graph, const std::s
 }
 
 bool is_rope_freq_name(const CompiledGraph* graph, const std::string& name, const char* context) {
-    const bool legacy_value = legacy_is_rope_name(name);
-    const bool role_value = rope_role_from_name(graph, name).value_or(tensor_role_is_rope_name(name));
-    tensor_role_parity_check(name, legacy_value, role_value, context);
-    return legacy_value || role_value;
+    (void)context;
+    return rope_role_from_name(graph, name).value_or(tensor_role_is_rope_name(name));
 }
 
 }  // namespace

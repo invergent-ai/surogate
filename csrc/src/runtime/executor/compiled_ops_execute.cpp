@@ -53,10 +53,6 @@ namespace dsl {
 
 namespace {
 
-bool legacy_is_rope_name(const std::string& name) {
-    return name.find("freq_cis") != std::string::npos || name.find("rope_freqs") != std::string::npos;
-}
-
 std::optional<bool> rope_role_from_ref(const CompiledGraph* graph, const TensorRef& ref) {
     if (!graph) return std::nullopt;
     if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
@@ -71,12 +67,8 @@ std::optional<bool> rope_role_from_ref(const CompiledGraph* graph, const TensorR
 }
 
 bool is_rope_freq_ref(const CompiledGraph* graph, const TensorRef& ref, const char* context) {
-    const bool legacy_value = !ref.name.empty() && legacy_is_rope_name(ref.name);
-    const bool role_value = rope_role_from_ref(graph, ref).value_or(tensor_role_is_rope_name(ref.name));
-    if (!ref.name.empty()) {
-        tensor_role_parity_check(ref.name, legacy_value, role_value, context);
-    }
-    return legacy_value || role_value;
+    (void)context;
+    return rope_role_from_ref(graph, ref).value_or(tensor_role_is_rope_name(ref.name));
 }
 
 bool is_moe_ep_sync_boundary(CompiledOpType type) {
@@ -302,17 +294,11 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                 fill_zero(resolved, mRunState.MainStream);
             }
 
-            // Embedding output (embed_1, embed_0, …) — substring match because
-            // this family of names isn't (yet) in the slot registry. Routes to
-            // the Encoded slot buffer.
-            if (!resolved.Data && !inp.name.empty()) {
-                const bool legacy_embed = inp.name.find("embed") != std::string::npos;
-                const bool role_embed = infer_tensor_role_from_name(inp.name).ownership == TensorOwnership::Embedding;
-                tensor_role_parity_check(inp.name, legacy_embed, role_embed, "compiled_ops_execute::resolve_embed");
-                if (legacy_embed || role_embed) {
-                    if (Tensor* gp = global_activation_ptr(mRunState, TensorSlot::Encoded)) {
-                        resolved = *gp;
-                    }
+            // Embedding output (embed_1, embed_0, ...) routes to the Encoded
+            // slot buffer via TensorRole while the slot registry catches up.
+            if (!resolved.Data && !inp.name.empty() && tensor_role_is_embedding_name(inp.name)) {
+                if (Tensor* gp = global_activation_ptr(mRunState, TensorSlot::Encoded)) {
+                    resolved = *gp;
                 }
             }
 
@@ -2343,10 +2329,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Build the set of gradients that require accumulation (not the first micro-step).
     // Also bind parameter gradient tensors so they're used instead of temporaries.
     for (const auto& param_name : mGrads.param_names()) {
-        const bool legacy_is_rope = legacy_is_rope_name(param_name);
-        const bool role_is_rope = tensor_role_is_rope_name(param_name);
-        tensor_role_parity_check(param_name, legacy_is_rope, role_is_rope, "compiled_ops_execute::bind_param_grads");
-        if (legacy_is_rope || role_is_rope) {
+        if (tensor_role_is_rope_name(param_name)) {
             continue;
         }
         bool accumulate = false;

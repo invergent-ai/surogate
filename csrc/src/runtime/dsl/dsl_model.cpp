@@ -79,10 +79,7 @@ bool graph_has_kernel(const Module& module, std::string_view kernel) {
 bool is_qlora_param_name(std::string_view name) {
     const std::string_view clean = trim_optional(name);
     // Router weights are always kept full precision (not quantized in QLoRA).
-    const bool legacy_router = clean.find("router") != std::string_view::npos;
-    const bool role_router = tensor_role_is_router_name(clean);
-    tensor_role_parity_check(clean, legacy_router, role_router, "dsl_model::qlora_router_skip");
-    if (legacy_router || role_router) {
+    if (tensor_role_is_router_name(clean)) {
         return false;
     }
     int layer_idx = -1;
@@ -919,10 +916,7 @@ int count_router_fp_weights(const Module& module) {
     for (const auto& kv : module.forward->params) {
         const std::string& name = kv.first;
         const TensorInfo& info = kv.second;
-        const bool legacy_router = name.find("router") != std::string::npos;
-        const bool role_router = tensor_role_is_router_name(name);
-        tensor_role_parity_check(name, legacy_router, role_router, "dsl_model::router_fp_count");
-        if (!legacy_router && !role_router) {
+        if (!tensor_role_is_router_name(name)) {
             continue;
         }
         if (!info.quantizable) {
@@ -974,15 +968,10 @@ create_dsl_qlora_provider(const Module& module,
     config.ep_size = options.EPSize;
 
     // Adjust expert weight specs to local dimensions when EP is active.
-    // Only slice actual expert weights (name contains "experts"), not other 3D
-    // weights like conv1d in linear attention layers.
+    // Only slice actual expert weights, not other 3D weights like conv1d in
+    // linear attention layers.
     auto is_expert_name = [](const std::string& n) {
-        const bool legacy_value =
-            n.find("experts") != std::string::npos || n.find("expert_gate_up") != std::string::npos ||
-            n.find("expert_up") != std::string::npos || n.find("expert_down") != std::string::npos;
-        const bool role_value = tensor_role_is_expert_weight_name(n);
-        tensor_role_parity_check(n, legacy_value, role_value, "dsl_model::ep_expert_weight_slice");
-        return legacy_value || role_value;
+        return tensor_role_is_expert_weight_name(n);
     };
     if (config.ep_size > 1) {
         for (auto& spec : config.weight_specs) {

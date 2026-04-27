@@ -227,14 +227,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     }
 
     // GPT-OSS uses per-expert bias tensors; skip backward to avoid unstable CUDA errors for now.
-    const bool legacy_expert_bias = op.outputs[1].name.find("experts_") != std::string::npos &&
-                                    op.outputs[1].name.find("_bias") != std::string::npos;
-    const bool role_expert_bias = tensor_role_is_expert_bias_name(op.outputs[1].name);
-    tensor_role_parity_check(op.outputs[1].name,
-                             legacy_expert_bias,
-                             role_expert_bias,
-                             "moe_expert_bias_add::expert_bias_skip");
-    if (legacy_expert_bias || role_expert_bias) {
+    if (tensor_role_is_expert_bias_name(op.outputs[1].name)) {
         if (mCurrentGraph) {
             if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
                 bool grad_accum = false;

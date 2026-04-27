@@ -23,6 +23,7 @@
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/dsl/buffer_plan.h"
@@ -188,9 +189,7 @@ GlobalRole global_role_for_name(std::string_view name) {
     if (name == "xF_flat") return GlobalRole::FinalNormOutFlat;
     if (name == "ln_final_flat") return GlobalRole::FinalNormOutput;
     if (name == "labels") return GlobalRole::LossBatch;
-    // Substring matches for rope frequencies (handles qualified names like
-    // "blocks[0].rope_freqs" when they surface at the global level).
-    if (name.find("rope_freqs") != std::string_view::npos || name.find("freq_cis") != std::string_view::npos) {
+    if (tensor_role_is_rope_name(name)) {
         return GlobalRole::RopeFreqs;
     }
     return GlobalRole::None;

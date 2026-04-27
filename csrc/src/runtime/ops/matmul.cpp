@@ -32,18 +32,11 @@ namespace dsl {
 namespace {
 
 bool is_shared_expert_weight_name(const std::string& weight_name) {
-    const bool legacy_value = (weight_name.find("shared_expert_up") != std::string::npos) ||
-                              (weight_name.find("shared_expert_down") != std::string::npos);
-    const bool role_value = tensor_role_is_shared_expert_name(weight_name);
-    tensor_role_parity_check(weight_name, legacy_value, role_value, "matmul::shared_expert_weight");
-    return legacy_value || role_value;
+    return tensor_role_is_shared_expert_name(weight_name);
 }
 
 bool is_router_weight_name(const std::string& weight_name) {
-    const bool legacy_value = weight_name.find("router_weight") != std::string::npos;
-    const bool role_value = tensor_role_is_router_name(weight_name);
-    tensor_role_parity_check(weight_name, legacy_value, role_value, "matmul::router_weight");
-    return legacy_value || role_value;
+    return tensor_role_is_router_name(weight_name);
 }
 
 void attach_input_role(modules::MatmulContext& ctx, const CompiledGraph* graph, const TensorRef& ref) {
