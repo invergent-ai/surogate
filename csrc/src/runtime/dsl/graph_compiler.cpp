@@ -3200,7 +3200,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          int num_layers,
                          std::size_t stack_bytes,
                          std::size_t bwd_cross_layer_bytes,
-                         std::size_t moe_saved_bytes) {
+                         std::size_t moe_saved_bytes,
+                         const BufferPlan* schema_plan) {
     // UnifiedStack arena sizing. The design calls for Stack to be backed
     // by the phase-arena bookkeeping, but the adoption sequence
     // (cudaMalloc → memcpy-rebase → free original) briefly holds two
@@ -3213,6 +3214,18 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.unified_stack_bytes = 0;
     arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
     arenas.moe_saved_bytes = moe_saved_bytes;
+    arenas.schema_allocation_authoritative = schema_plan && schema_plan->schema_allocation_authoritative;
+    if (schema_plan) {
+        arenas.schema_frame_arena_bytes = static_cast<std::size_t>(schema_plan->schema_authoritative_frame_arena_bytes);
+        arenas.schema_save_for_bwd_arena_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_save_for_backward_arena_bytes);
+        arenas.schema_persistent_activation_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_persistent_activation_bytes);
+        arenas.schema_host_stream_activation_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_host_stream_activation_bytes);
+        arenas.schema_total_activation_arena_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_total_activation_arena_bytes);
+    }
 
     // Persistent (weights) + Accumulator (grads): both default-on. The
     // executor clamps each to what its owner can actually rebind —

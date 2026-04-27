@@ -298,6 +298,14 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_frame_activation_slots == 1);
     REQUIRE(plan.schema_save_for_backward_activation_bytes == 0);
     REQUIRE(plan.schema_frame_activation_bytes == 96);
+    REQUIRE(plan.schema_allocation_authoritative);
+    REQUIRE(plan.schema_allocation_authoritative_layers == 1);
+    REQUIRE(plan.schema_allocation_unresolved_slots == 0);
+    REQUIRE(plan.schema_authoritative_frame_arena_bytes == 96);
+    REQUIRE(plan.schema_authoritative_save_for_backward_arena_bytes == 0);
+    REQUIRE(plan.schema_authoritative_persistent_activation_bytes == 0);
+    REQUIRE(plan.schema_authoritative_host_stream_activation_bytes == 96);
+    REQUIRE(plan.schema_authoritative_total_activation_arena_bytes == 96);
     REQUIRE(plan.schema_max_layer_activation_shape_bytes == 96);
     REQUIRE(plan.schema_baseline_max_activation_shape_bytes == 96);
     REQUIRE(plan.schema_activation_shape_savings_bytes == 0);
@@ -342,6 +350,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].frame_activation_slots == 1);
     REQUIRE(plan.schema_layers[0].save_for_backward_activation_bytes == 0);
     REQUIRE(plan.schema_layers[0].frame_activation_bytes == 96);
+    REQUIRE(plan.schema_layers[0].authoritative_frame_arena_bytes == 96);
+    REQUIRE(plan.schema_layers[0].authoritative_save_for_backward_arena_bytes == 0);
+    REQUIRE(plan.schema_layers[0].authoritative_host_stream_activation_bytes == 96);
     REQUIRE(plan.schema_layers[0].resolved_param_shape_slots == 2);
     REQUIRE(plan.schema_layers[0].unresolved_param_shape_slots == 0);
     REQUIRE(plan.schema_layers[0].expert_parallel_param_slots == 1);
@@ -357,6 +368,12 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].slots[2].resolved_shape == std::vector<long>{2, 3, 8});
     REQUIRE(plan.schema_layers[0].slots[2].resolved_numel == 48);
     REQUIRE(plan.schema_layers[0].slots[2].resolved_bytes == 96);
+    REQUIRE(plan.schema_layers[0].slots[2].allocation_lifetime == "frame");
+    REQUIRE(plan.schema_layers[0].slots[2].allocation_residency == "cpu_pinned_stream");
+    REQUIRE(plan.schema_layers[0].slots[2].allocation_bytes == 96);
+    REQUIRE(plan.schema_layers[0].slots[2].allocation_authoritative);
+    REQUIRE(plan.schema_layers[0].slots[1].allocation_lifetime == "persistent_param_local");
+    REQUIRE(plan.schema_layers[0].slots[1].allocation_local_bytes == 1024);
 
     auto alias_records = schema_records;
     alias_records[0].slots.clear();
@@ -463,6 +480,8 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(alias_plan.schema_layers[0].slots[10].resolved_shape == std::vector<long>{2, 8, 32, 16});
     REQUIRE(alias_plan.schema_dynamic_activation_shape_slots == 1);
     REQUIRE(alias_plan.schema_unresolved_activation_shape_slots == 1);
+    REQUIRE_FALSE(alias_plan.schema_allocation_authoritative);
+    REQUIRE(alias_plan.schema_allocation_unresolved_slots == 1);
 
     auto savings_records = schema_records;
     savings_records.push_back(schema_records[0]);
@@ -492,6 +511,8 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
                                                      &savings_records);
     REQUIRE(savings_plan.schema_resolved_activation_shape_bytes == 144);
     REQUIRE(savings_plan.schema_max_layer_activation_shape_bytes == 96);
+    REQUIRE(savings_plan.schema_authoritative_frame_arena_bytes == 96);
+    REQUIRE(savings_plan.schema_authoritative_total_activation_arena_bytes == 96);
     REQUIRE(savings_plan.schema_baseline_max_activation_shape_bytes == 192);
     REQUIRE(savings_plan.schema_activation_shape_savings_bytes == 48);
 
@@ -548,6 +569,8 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
                                                   &save_records);
     REQUIRE(save_plan.schema_registry_save_for_backward_activation_slots == 1);
     REQUIRE(save_plan.schema_registry_save_for_backward_mismatch_slots == 0);
+    REQUIRE(save_plan.schema_authoritative_frame_arena_bytes == 0);
+    REQUIRE(save_plan.schema_authoritative_save_for_backward_arena_bytes == 96);
     dsl::TensorSlotRegistry no_save_registry;
     no_save_registry.init_from_layout(layout);
     const auto save_mismatch_plan = dsl::BufferPlan::build(cfg,

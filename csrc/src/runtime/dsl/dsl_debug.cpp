@@ -269,6 +269,14 @@ DebugArenaSummary collect_arena_summary(const DslModel& model) {
     s.arena_unified_stack_bytes = static_cast<std::uint64_t>(arenas.unified_stack_bytes);
     s.arena_bwd_cross_layer_bytes = static_cast<std::uint64_t>(arenas.bwd_cross_layer_bytes);
     s.arena_moe_saved_bytes = static_cast<std::uint64_t>(arenas.moe_saved_bytes);
+    s.arena_schema_allocation_authoritative = arenas.schema_allocation_authoritative ? 1 : 0;
+    s.arena_schema_frame_arena_bytes = static_cast<std::uint64_t>(arenas.schema_frame_arena_bytes);
+    s.arena_schema_save_for_bwd_arena_bytes = static_cast<std::uint64_t>(arenas.schema_save_for_bwd_arena_bytes);
+    s.arena_schema_persistent_activation_bytes = static_cast<std::uint64_t>(arenas.schema_persistent_activation_bytes);
+    s.arena_schema_host_stream_activation_bytes =
+        static_cast<std::uint64_t>(arenas.schema_host_stream_activation_bytes);
+    s.arena_schema_total_activation_arena_bytes =
+        static_cast<std::uint64_t>(arenas.schema_total_activation_arena_bytes);
     s.arena_save_for_bwd_block_bases.assign(arenas.save_for_bwd_block_bases.begin(),
                                             arenas.save_for_bwd_block_bases.end());
     fill_graph_arena(s.forward, exec->compiled_forward(), arenas, DebugGraphKind::Forward);
@@ -324,6 +332,14 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     s.schema_frame_activation_slots = u64(p.schema_frame_activation_slots);
     s.schema_save_for_backward_activation_bytes = u64(p.schema_save_for_backward_activation_bytes);
     s.schema_frame_activation_bytes = u64(p.schema_frame_activation_bytes);
+    s.schema_allocation_authoritative = p.schema_allocation_authoritative ? 1 : 0;
+    s.schema_allocation_authoritative_layers = u64(p.schema_allocation_authoritative_layers);
+    s.schema_allocation_unresolved_slots = u64(p.schema_allocation_unresolved_slots);
+    s.schema_authoritative_frame_arena_bytes = u64(p.schema_authoritative_frame_arena_bytes);
+    s.schema_authoritative_save_for_backward_arena_bytes = u64(p.schema_authoritative_save_for_backward_arena_bytes);
+    s.schema_authoritative_persistent_activation_bytes = u64(p.schema_authoritative_persistent_activation_bytes);
+    s.schema_authoritative_host_stream_activation_bytes = u64(p.schema_authoritative_host_stream_activation_bytes);
+    s.schema_authoritative_total_activation_arena_bytes = u64(p.schema_authoritative_total_activation_arena_bytes);
     s.schema_max_layer_activation_shape_bytes = u64(p.schema_max_layer_activation_shape_bytes);
     s.schema_baseline_max_activation_shape_bytes = u64(p.schema_baseline_max_activation_shape_bytes);
     s.schema_activation_shape_savings_bytes = u64(p.schema_activation_shape_savings_bytes);

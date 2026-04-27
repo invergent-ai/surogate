@@ -91,6 +91,11 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                 },
                 "buffer_plan_summary": {
                     "schema_record_count": 2,
+                    "schema_allocation_authoritative": 1,
+                    "schema_allocation_unresolved_slots": 0,
+                    "schema_authoritative_frame_arena_bytes": 2048,
+                    "schema_authoritative_save_for_backward_arena_bytes": 1024,
+                    "schema_authoritative_total_activation_arena_bytes": 3072,
                     "schema_expert_parallel_param_shape_savings_bytes": 1024,
                     "hook_registry_registrations": 12,
                     "schema_hook_dispatch_enabled": 1,
@@ -121,6 +126,8 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["fusion_candidate_starts"] == 3
     assert report["rows"][0]["block_schema_status"] == "present"
     assert report["rows"][0]["storage_declaration_status"] == "present"
+    assert report["rows"][0]["schema_allocation_status"] == "present"
+    assert report["rows"][0]["missing_schema_allocation_counts"] == []
     assert report["rows"][0]["ep_topology_status"] == "present"
     assert report["rows"][0]["hook_readiness_status"] == "present"
     assert report["rows"][0]["missing_hook_counts"] == []
@@ -140,6 +147,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["hook_target_counts"]["hook_registry_after_communication_registrations"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_registry_after_all_to_all_registrations"] == 2
     assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
+    assert report["rows"][0]["buffer_plan_summary"]["schema_authoritative_total_activation_arena_bytes"] == 3072
     assert report["rows"][0]["buffer_plan_summary"]["schema_expert_parallel_param_shape_savings_bytes"] == 1024
 
 

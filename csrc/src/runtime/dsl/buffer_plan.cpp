@@ -227,6 +227,49 @@ resolve_schema_slot_shape(const BufferPlan& plan, const BlockSchemaLayerSummary&
     return slot.kind == "activation_grad" ? plan.grad_dtype : plan.act_dtype;
 }
 
+[[nodiscard]] bool is_host_stream_resident(const BlockSchemaSlotSummary& slot) {
+    return slot.residency == "cpu_pinned_stream" || slot.residency == "cpu_pageable" ||
+           slot.residency == "nvme_offload";
+}
+
+[[nodiscard]] bool is_persistent_activation_lifetime(const BlockSchemaSlotSummary& slot) {
+    return slot.lifetime == "model" || slot.lifetime == "persistent";
+}
+
+void assign_schema_allocation_decision(const BufferPlan& plan,
+                                       const BlockSchemaLayerSummary& layer,
+                                       BlockSchemaSlotSummary& slot) {
+    if (!slot.shape_resolved) {
+        slot.allocation_lifetime = "unresolved";
+        slot.allocation_residency = slot.residency;
+        slot.allocation_bytes = 0;
+        slot.allocation_local_bytes = 0;
+        slot.allocation_authoritative = false;
+        return;
+    }
+
+    slot.allocation_residency = slot.residency.empty() ? "gpu" : slot.residency;
+    slot.allocation_bytes = slot.resolved_bytes;
+    slot.allocation_local_bytes = slot.resolved_local_bytes > 0 ? slot.resolved_local_bytes : slot.resolved_bytes;
+    slot.allocation_authoritative = true;
+
+    if (slot.kind == "param") {
+        slot.allocation_lifetime = slot.distribution_kind == "expert_parallel" && plan.EPSize > 1
+                                       ? "persistent_param_local"
+                                       : "persistent_param";
+        return;
+    }
+    if (slot.save_for_backward) {
+        slot.allocation_lifetime = "save_for_backward";
+    } else if (is_persistent_activation_lifetime(slot)) {
+        slot.allocation_lifetime = "persistent_activation";
+    } else {
+        slot.allocation_lifetime = "frame";
+    }
+
+    (void)layer;
+}
+
 }  // namespace
 
 std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph) {
@@ -603,6 +646,7 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                     slot.resolved_local_bytes = (slot.distribution_kind == "expert_parallel" && p.EPSize > 1)
                                                     ? (slot.resolved_bytes / static_cast<long>(p.EPSize))
                                                     : slot.resolved_bytes;
+                    assign_schema_allocation_decision(p, layer, slot);
                     ++layer.resolved_param_shape_slots;
                     ++p.schema_resolved_param_shape_slots;
                     layer.resolved_param_shape_bytes += slot.resolved_bytes;
@@ -614,6 +658,7 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                         p.schema_expert_parallel_param_shape_local_bytes += slot.resolved_local_bytes;
                     }
                 } else {
+                    assign_schema_allocation_decision(p, layer, slot);
                     ++layer.unresolved_param_shape_slots;
                     ++p.schema_unresolved_param_shape_slots;
                 }
@@ -630,6 +675,7 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 slot.resolved_bytes =
                     slot.resolved_numel * static_cast<long>(get_dtype_size(schema_slot_dtype(p, slot)));
                 slot.resolved_local_bytes = slot.resolved_bytes;
+                assign_schema_allocation_decision(p, layer, slot);
                 ++layer.resolved_activation_shape_slots;
                 ++p.schema_resolved_activation_shape_slots;
                 layer.resolved_activation_shape_bytes += slot.resolved_bytes;
@@ -637,11 +683,21 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 if (slot.save_for_backward) {
                     layer.save_for_backward_activation_bytes += slot.resolved_bytes;
                     p.schema_save_for_backward_activation_bytes += slot.resolved_bytes;
+                    layer.authoritative_save_for_backward_arena_bytes += slot.allocation_bytes;
                 } else {
                     layer.frame_activation_bytes += slot.resolved_bytes;
                     p.schema_frame_activation_bytes += slot.resolved_bytes;
+                    if (is_persistent_activation_lifetime(slot)) {
+                        layer.authoritative_persistent_activation_bytes += slot.allocation_bytes;
+                    } else {
+                        layer.authoritative_frame_arena_bytes += slot.allocation_bytes;
+                    }
+                }
+                if (is_host_stream_resident(slot)) {
+                    layer.authoritative_host_stream_activation_bytes += slot.allocation_bytes;
                 }
             } else {
+                assign_schema_allocation_decision(p, layer, slot);
                 if (slot.shape_dynamic) {
                     ++layer.dynamic_activation_shape_slots;
                     ++p.schema_dynamic_activation_shape_slots;
@@ -686,7 +742,27 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
         }
         p.schema_max_layer_activation_shape_bytes =
             std::max(p.schema_max_layer_activation_shape_bytes, layer.resolved_activation_shape_bytes);
+        p.schema_authoritative_frame_arena_bytes =
+            std::max(p.schema_authoritative_frame_arena_bytes, layer.authoritative_frame_arena_bytes);
+        p.schema_authoritative_save_for_backward_arena_bytes += layer.authoritative_save_for_backward_arena_bytes;
+        p.schema_authoritative_persistent_activation_bytes += layer.authoritative_persistent_activation_bytes;
+        p.schema_authoritative_host_stream_activation_bytes += layer.authoritative_host_stream_activation_bytes;
     }
+    p.schema_allocation_unresolved_slots =
+        p.schema_unresolved_activation_shape_slots + p.schema_unresolved_param_shape_slots;
+    p.schema_authoritative_total_activation_arena_bytes = p.schema_authoritative_frame_arena_bytes +
+                                                          p.schema_authoritative_save_for_backward_arena_bytes +
+                                                          p.schema_authoritative_persistent_activation_bytes;
+    p.schema_allocation_authoritative_layers = static_cast<int>(
+        std::count_if(p.schema_layers.begin(), p.schema_layers.end(), [](const BlockSchemaLayerSummary& layer) {
+            return layer.has_schema && layer.unresolved_activation_shape_slots == 0 &&
+                   layer.unresolved_param_shape_slots == 0 && layer.registry_missing_activation_slots == 0 &&
+                   layer.registry_save_for_backward_mismatch_slots == 0;
+        }));
+    p.schema_allocation_authoritative =
+        p.schema_record_count == p.NumLayers && p.NumLayers > 0 &&
+        p.schema_allocation_authoritative_layers == p.NumLayers && p.schema_allocation_unresolved_slots == 0 &&
+        p.schema_registry_missing_activation_slots == 0 && p.schema_registry_save_for_backward_mismatch_slots == 0;
     if (p.schema_record_count == p.NumLayers && p.NumLayers > 0 && p.schema_max_layer_activation_shape_bytes > 0) {
         p.schema_baseline_max_activation_shape_bytes =
             p.schema_max_layer_activation_shape_bytes * static_cast<long>(p.NumLayers);

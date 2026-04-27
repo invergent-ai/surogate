@@ -58,6 +58,11 @@ struct BlockSchemaSlotSummary {
     long resolved_numel = 0;
     long resolved_bytes = 0;
     long resolved_local_bytes = 0;
+    std::string allocation_lifetime;
+    std::string allocation_residency;
+    long allocation_bytes = 0;
+    long allocation_local_bytes = 0;
+    bool allocation_authoritative = false;
     bool grouped = false;
     bool save_for_backward = false;
     int streaming_prefetch_distance = -1;
@@ -144,6 +149,10 @@ struct BlockSchemaLayerSummary {
     int frame_activation_slots = 0;
     long save_for_backward_activation_bytes = 0;
     long frame_activation_bytes = 0;
+    long authoritative_frame_arena_bytes = 0;
+    long authoritative_save_for_backward_arena_bytes = 0;
+    long authoritative_persistent_activation_bytes = 0;
+    long authoritative_host_stream_activation_bytes = 0;
     int resolved_param_shape_slots = 0;
     int unresolved_param_shape_slots = 0;
     int expert_parallel_param_slots = 0;
@@ -252,6 +261,14 @@ struct BufferPlan {
     int schema_frame_activation_slots = 0;
     long schema_save_for_backward_activation_bytes = 0;
     long schema_frame_activation_bytes = 0;
+    bool schema_allocation_authoritative = false;
+    int schema_allocation_authoritative_layers = 0;
+    int schema_allocation_unresolved_slots = 0;
+    long schema_authoritative_frame_arena_bytes = 0;
+    long schema_authoritative_save_for_backward_arena_bytes = 0;
+    long schema_authoritative_persistent_activation_bytes = 0;
+    long schema_authoritative_host_stream_activation_bytes = 0;
+    long schema_authoritative_total_activation_arena_bytes = 0;
     long schema_max_layer_activation_shape_bytes = 0;
     long schema_baseline_max_activation_shape_bytes = 0;
     long schema_activation_shape_savings_bytes = 0;

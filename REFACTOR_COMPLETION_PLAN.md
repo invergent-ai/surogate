@@ -45,18 +45,25 @@ Acceptance:
 
 ## Track 3 - Make Schema-Driven Allocation Authoritative
 
-- [ ] Replace enum-driven `BufferPlan` allocation decisions with schema-derived per-layer/per-slot allocation plans.
-- [ ] Use schema shape, lifetime, residency, distribution, and save-for-backward metadata as the primary allocator inputs.
-- [ ] Keep the current TensorSlot/legacy enum plan as a parity comparator during rollout.
+- [x] Replace enum-driven `BufferPlan` allocation decisions with schema-derived per-layer/per-slot allocation plans.
+- [x] Use schema shape, lifetime, residency, distribution, and save-for-backward metadata as the primary allocator inputs.
+- [x] Keep the current TensorSlot/legacy enum plan as a parity comparator during rollout.
 - [ ] Remove or narrow legacy safety slacks after schema allocation parity is validated.
 - [ ] Preserve capture safety for CUDA graph paths and arena fallback diagnostics.
+
+Completed subphase:
+
+- `BufferPlan` now assigns each block-schema slot an explicit allocation decision: lifetime, residency, full/local bytes, and whether that decision is authoritative.
+- Runtime debug and regression artifacts expose authoritative schema arena totals for frame, save-for-backward, persistent activation, host-stream activation, and total activation arena bytes.
+- Phase arena summaries carry the same schema-authoritative totals alongside the compiled-region arena sizes, making the compiled layout the rollout parity comparator.
+- Coverage reports now mark schema allocation readiness separately from schema presence, storage declaration, hook readiness, and descriptor readiness.
 
 Acceptance:
 
 - [ ] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` is green across the real-model queue.
-- [ ] Schema allocation bytes are authoritative in runtime debug and regression artifacts.
+- [x] Schema allocation bytes are authoritative in runtime debug and regression artifacts.
 - [ ] Peak CUDA memory does not regress; Gemma4 and MoE acceptance rows show the expected allocation savings.
-- [ ] Save-for-backward and frame-local arena summaries match schema lifetime declarations.
+- [x] Save-for-backward and frame-local arena summaries match schema lifetime declarations.
 
 ## Track 4 - Remove Descriptor Capability Fallbacks - COMPLETE
 

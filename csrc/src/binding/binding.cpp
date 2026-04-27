@@ -1979,6 +1979,12 @@ NB_MODULE(_surogate, m) {
                 r["arena_unified_stack_bytes"] = s.arena_unified_stack_bytes;
                 r["arena_bwd_cross_layer_bytes"] = s.arena_bwd_cross_layer_bytes;
                 r["arena_moe_saved_bytes"] = s.arena_moe_saved_bytes;
+                r["arena_schema_allocation_authoritative"] = s.arena_schema_allocation_authoritative;
+                r["arena_schema_frame_arena_bytes"] = s.arena_schema_frame_arena_bytes;
+                r["arena_schema_save_for_bwd_arena_bytes"] = s.arena_schema_save_for_bwd_arena_bytes;
+                r["arena_schema_persistent_activation_bytes"] = s.arena_schema_persistent_activation_bytes;
+                r["arena_schema_host_stream_activation_bytes"] = s.arena_schema_host_stream_activation_bytes;
+                r["arena_schema_total_activation_arena_bytes"] = s.arena_schema_total_activation_arena_bytes;
                 nb::list bases;
                 for (auto b : s.arena_save_for_bwd_block_bases) {
                     bases.append(b);
@@ -2080,6 +2086,18 @@ NB_MODULE(_surogate, m) {
                 d["schema_frame_activation_slots"] = s.schema_frame_activation_slots;
                 d["schema_save_for_backward_activation_bytes"] = s.schema_save_for_backward_activation_bytes;
                 d["schema_frame_activation_bytes"] = s.schema_frame_activation_bytes;
+                d["schema_allocation_authoritative"] = s.schema_allocation_authoritative;
+                d["schema_allocation_authoritative_layers"] = s.schema_allocation_authoritative_layers;
+                d["schema_allocation_unresolved_slots"] = s.schema_allocation_unresolved_slots;
+                d["schema_authoritative_frame_arena_bytes"] = s.schema_authoritative_frame_arena_bytes;
+                d["schema_authoritative_save_for_backward_arena_bytes"] =
+                    s.schema_authoritative_save_for_backward_arena_bytes;
+                d["schema_authoritative_persistent_activation_bytes"] =
+                    s.schema_authoritative_persistent_activation_bytes;
+                d["schema_authoritative_host_stream_activation_bytes"] =
+                    s.schema_authoritative_host_stream_activation_bytes;
+                d["schema_authoritative_total_activation_arena_bytes"] =
+                    s.schema_authoritative_total_activation_arena_bytes;
                 d["schema_max_layer_activation_shape_bytes"] = s.schema_max_layer_activation_shape_bytes;
                 d["schema_baseline_max_activation_shape_bytes"] = s.schema_baseline_max_activation_shape_bytes;
                 d["schema_activation_shape_savings_bytes"] = s.schema_activation_shape_savings_bytes;

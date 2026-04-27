@@ -39,6 +39,7 @@ enum class BackwardHookPoint;
 struct RuntimeOptions;
 
 namespace dsl {
+struct BufferPlan;
 
 // Helper function to strip SSA-style numeric suffixes from tensor names
 std::string strip_ssa_suffix(const std::string& field);
@@ -1029,6 +1030,13 @@ struct PhaseArenas {
     std::byte* moe_saved_ptr = nullptr;
     std::size_t moe_saved_bytes = 0;
 
+    bool schema_allocation_authoritative = false;
+    std::size_t schema_frame_arena_bytes = 0;
+    std::size_t schema_save_for_bwd_arena_bytes = 0;
+    std::size_t schema_persistent_activation_bytes = 0;
+    std::size_t schema_host_stream_activation_bytes = 0;
+    std::size_t schema_total_activation_arena_bytes = 0;
+
     bool allocated = false;
 };
 
@@ -1040,7 +1048,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          int num_layers,
                          std::size_t stack_bytes = 0,
                          std::size_t bwd_cross_layer_bytes = 0,
-                         std::size_t moe_saved_bytes = 0);
+                         std::size_t moe_saved_bytes = 0,
+                         const BufferPlan* schema_plan = nullptr);
 
 /// Static upper bound on bytes the BwdCrossLayer arena needs across one
 /// backward call. Mirrors the runtime persist logic in

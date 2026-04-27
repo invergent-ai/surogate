@@ -799,6 +799,23 @@ def ep_topology_status(case: dict[str, Any], block_schema_summary: dict[str, Any
     return "present" if int(block_schema_summary.get("block_schema_ep_layers") or 0) > 0 else "missing"
 
 
+def schema_allocation_status(buffer_plan_summary: dict[str, Any]) -> tuple[str, list[str]]:
+    if not buffer_plan_summary:
+        return "unknown", ["schema_allocation_authoritative"]
+    if int(buffer_plan_summary.get("schema_record_count") or 0) <= 0:
+        return "not_applicable", []
+    missing: list[str] = []
+    if int(buffer_plan_summary.get("schema_allocation_authoritative") or 0) <= 0:
+        missing.append("schema_allocation_authoritative")
+    if int(buffer_plan_summary.get("schema_allocation_unresolved_slots") or 0) > 0:
+        missing.append("schema_allocation_unresolved_slots")
+    if int(buffer_plan_summary.get("schema_registry_missing_activation_slots") or 0) > 0:
+        missing.append("schema_registry_missing_activation_slots")
+    if int(buffer_plan_summary.get("schema_registry_save_for_backward_mismatch_slots") or 0) > 0:
+        missing.append("schema_registry_save_for_backward_mismatch_slots")
+    return ("present" if not missing else "missing"), missing
+
+
 def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     eligible = 0
@@ -809,8 +826,10 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         metrics = result.get("metrics") or {}
         descriptor_summary = metrics.get("descriptor_summary") or {}
         block_schema_summary = metrics.get("block_schema_summary") or {}
+        buffer_plan_summary = metrics.get("buffer_plan_summary") or {}
         descriptor_status, missing_descriptor_counts = descriptor_requirement_status(case, descriptor_summary)
         hook_status, missing_hook_counts = hook_readiness_status(case, metrics)
+        allocation_status, missing_allocation_counts = schema_allocation_status(buffer_plan_summary)
         is_quant = recipe in {"fp8", "fp4"}
         if is_quant and case.get("supported", True):
             eligible += 1
@@ -834,12 +853,14 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "fusion_candidate_starts": descriptor_summary.get("fusion_candidate_starts"),
                 "block_schema_status": block_schema_status(block_schema_summary),
                 "storage_declaration_status": storage_declaration_status(case, block_schema_summary),
+                "schema_allocation_status": allocation_status,
+                "missing_schema_allocation_counts": missing_allocation_counts,
                 "ep_topology_status": ep_topology_status(case, block_schema_summary),
                 "hook_readiness_status": hook_status,
                 "missing_hook_counts": missing_hook_counts,
                 "hook_target_counts": hook_target_counts(metrics),
                 "block_schema_summary": block_schema_summary,
-                "buffer_plan_summary": metrics.get("buffer_plan_summary") or {},
+                "buffer_plan_summary": buffer_plan_summary,
             }
         )
     return {

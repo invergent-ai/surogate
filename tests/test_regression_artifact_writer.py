@@ -75,6 +75,8 @@ def test_flatten_arena_summary_keeps_top_level_graph_and_region_counts():
     summary = {
         "arenas_allocated": True,
         "arena_fwd_stack_bytes": 1024,
+        "arena_schema_allocation_authoritative": 1,
+        "arena_schema_total_activation_arena_bytes": 1536,
         "arena_save_for_bwd_block_bases": [0, 512],
         "forward": {
             "num_tensors": 10,
@@ -95,6 +97,8 @@ def test_flatten_arena_summary_keeps_top_level_graph_and_region_counts():
 
     assert flattened["arenas_allocated"] == 1
     assert flattened["arena_fwd_stack_bytes"] == 1024
+    assert flattened["arena_schema_allocation_authoritative"] == 1
+    assert flattened["arena_schema_total_activation_arena_bytes"] == 1536
     assert "arena_save_for_bwd_block_bases" not in flattened
     assert flattened["forward_num_tensors"] == 10
     assert flattened["forward_fwd_stack_peak"] == 2048

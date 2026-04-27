@@ -320,6 +320,18 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             << ", block_schema_save_for_backward_activation_bytes="
             << initial_plan.schema_save_for_backward_activation_bytes
             << ", block_schema_frame_activation_bytes=" << initial_plan.schema_frame_activation_bytes
+            << ", block_schema_allocation_authoritative=" << (initial_plan.schema_allocation_authoritative ? 1 : 0)
+            << ", block_schema_allocation_authoritative_layers=" << initial_plan.schema_allocation_authoritative_layers
+            << ", block_schema_allocation_unresolved_slots=" << initial_plan.schema_allocation_unresolved_slots
+            << ", block_schema_authoritative_frame_arena_bytes=" << initial_plan.schema_authoritative_frame_arena_bytes
+            << ", block_schema_authoritative_save_for_backward_arena_bytes="
+            << initial_plan.schema_authoritative_save_for_backward_arena_bytes
+            << ", block_schema_authoritative_persistent_activation_bytes="
+            << initial_plan.schema_authoritative_persistent_activation_bytes
+            << ", block_schema_authoritative_host_stream_activation_bytes="
+            << initial_plan.schema_authoritative_host_stream_activation_bytes
+            << ", block_schema_authoritative_total_activation_arena_bytes="
+            << initial_plan.schema_authoritative_total_activation_arena_bytes
             << ", block_schema_max_layer_activation_shape_bytes="
             << initial_plan.schema_max_layer_activation_shape_bytes
             << ", block_schema_baseline_max_activation_shape_bytes="

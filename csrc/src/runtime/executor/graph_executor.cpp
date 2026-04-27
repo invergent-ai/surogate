@@ -1050,7 +1050,8 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                          static_cast<int>(mConfig.NumLayers),
                                          stack_bytes,
                                          bwd_cross_layer_bytes,
-                                         moe_saved_bytes);
+                                         moe_saved_bytes,
+                                         &mRunState.buffer_plan());
                 // Persistent arena holds only weight-like storage (weights,
                 // WM master/work/prefetch, LoRA master/work, non-graph extras)
                 // in four slabs:

@@ -133,6 +133,12 @@ struct DebugArenaSummary {
     std::uint64_t arena_unified_stack_bytes = 0;
     std::uint64_t arena_bwd_cross_layer_bytes = 0;
     std::uint64_t arena_moe_saved_bytes = 0;
+    std::uint64_t arena_schema_allocation_authoritative = 0;
+    std::uint64_t arena_schema_frame_arena_bytes = 0;
+    std::uint64_t arena_schema_save_for_bwd_arena_bytes = 0;
+    std::uint64_t arena_schema_persistent_activation_bytes = 0;
+    std::uint64_t arena_schema_host_stream_activation_bytes = 0;
+    std::uint64_t arena_schema_total_activation_arena_bytes = 0;
     std::vector<std::uint64_t> arena_save_for_bwd_block_bases;
     bool arenas_allocated = false;
     DebugGraphArena forward;
@@ -220,6 +226,14 @@ struct DebugBufferPlanSummary {
     std::uint64_t schema_frame_activation_slots = 0;
     std::uint64_t schema_save_for_backward_activation_bytes = 0;
     std::uint64_t schema_frame_activation_bytes = 0;
+    std::uint64_t schema_allocation_authoritative = 0;
+    std::uint64_t schema_allocation_authoritative_layers = 0;
+    std::uint64_t schema_allocation_unresolved_slots = 0;
+    std::uint64_t schema_authoritative_frame_arena_bytes = 0;
+    std::uint64_t schema_authoritative_save_for_backward_arena_bytes = 0;
+    std::uint64_t schema_authoritative_persistent_activation_bytes = 0;
+    std::uint64_t schema_authoritative_host_stream_activation_bytes = 0;
+    std::uint64_t schema_authoritative_total_activation_arena_bytes = 0;
     std::uint64_t schema_max_layer_activation_shape_bytes = 0;
     std::uint64_t schema_baseline_max_activation_shape_bytes = 0;
     std::uint64_t schema_activation_shape_savings_bytes = 0;
