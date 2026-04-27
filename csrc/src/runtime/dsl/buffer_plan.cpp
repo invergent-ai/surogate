@@ -143,10 +143,22 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                         ++out.gpu_resident_slots;
                     }
                     if (const AttrValue* dist_value = find_attr(*slot, "distribution")) {
-                        if (const AttrMap* dist = attr_map(*dist_value);
-                            dist && attr_string(*dist, "kind") == "expert_parallel") {
-                            ++out.expert_parallel_slots;
+                        if (const AttrMap* dist = attr_map(*dist_value)) {
+                            const std::string dist_kind = attr_string(*dist, "kind");
+                            if (dist_kind == "expert_parallel") {
+                                ++out.expert_parallel_slots;
+                            } else if (dist_kind == "sharded_dim") {
+                                ++out.sharded_dim_slots;
+                            } else if (dist_kind == "router_replicated") {
+                                ++out.router_replicated_slots;
+                            } else {
+                                ++out.replicated_slots;
+                            }
+                        } else {
+                            ++out.replicated_slots;
                         }
+                    } else {
+                        ++out.replicated_slots;
                     }
                     if (const AttrValue* streaming_value = find_attr(*slot, "streaming_hint")) {
                         if (attr_map(*streaming_value)) {
@@ -301,6 +313,9 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             p.schema_slot_count += record.slot_count;
             p.schema_param_slots += record.param_slots;
             p.schema_activation_slots += record.activation_slots;
+            p.schema_replicated_slots += record.replicated_slots;
+            p.schema_sharded_dim_slots += record.sharded_dim_slots;
+            p.schema_router_replicated_slots += record.router_replicated_slots;
             p.schema_expert_parallel_slots += record.expert_parallel_slots;
             p.schema_streaming_slots += record.streaming_slots;
             p.schema_gpu_resident_slots += record.gpu_resident_slots;
@@ -316,6 +331,9 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 layer.slot_count = record.slot_count;
                 layer.param_slots = record.param_slots;
                 layer.activation_slots = record.activation_slots;
+                layer.replicated_slots = record.replicated_slots;
+                layer.sharded_dim_slots = record.sharded_dim_slots;
+                layer.router_replicated_slots = record.router_replicated_slots;
                 layer.expert_parallel_slots = record.expert_parallel_slots;
                 layer.streaming_slots = record.streaming_slots;
                 layer.gpu_resident_slots = record.gpu_resident_slots;

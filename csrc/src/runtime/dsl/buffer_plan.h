@@ -53,6 +53,9 @@ struct BlockSchemaPlanRecord {
     int slot_count = 0;
     int param_slots = 0;
     int activation_slots = 0;
+    int replicated_slots = 0;
+    int sharded_dim_slots = 0;
+    int router_replicated_slots = 0;
     int expert_parallel_slots = 0;
     int streaming_slots = 0;
     int gpu_resident_slots = 0;
@@ -77,6 +80,9 @@ struct BlockSchemaLayerSummary {
     int slot_count = 0;
     int param_slots = 0;
     int activation_slots = 0;
+    int replicated_slots = 0;
+    int sharded_dim_slots = 0;
+    int router_replicated_slots = 0;
     int expert_parallel_slots = 0;
     int streaming_slots = 0;
     int gpu_resident_slots = 0;
@@ -149,6 +155,9 @@ struct BufferPlan {
     int schema_slot_count = 0;
     int schema_param_slots = 0;
     int schema_activation_slots = 0;
+    int schema_replicated_slots = 0;
+    int schema_sharded_dim_slots = 0;
+    int schema_router_replicated_slots = 0;
     int schema_expert_parallel_slots = 0;
     int schema_streaming_slots = 0;
     int schema_gpu_resident_slots = 0;

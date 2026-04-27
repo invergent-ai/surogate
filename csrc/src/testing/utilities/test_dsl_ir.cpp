@@ -153,6 +153,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].slot_count == 3);
     REQUIRE(schema_records[0].param_slots == 2);
     REQUIRE(schema_records[0].activation_slots == 1);
+    REQUIRE(schema_records[0].replicated_slots == 1);
+    REQUIRE(schema_records[0].sharded_dim_slots == 0);
+    REQUIRE(schema_records[0].router_replicated_slots == 0);
     REQUIRE(schema_records[0].expert_parallel_slots == 2);
     REQUIRE(schema_records[0].streaming_slots == 1);
     REQUIRE(schema_records[0].gpu_resident_slots == 1);
@@ -214,6 +217,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_slot_count == 3);
     REQUIRE(plan.schema_param_slots == 2);
     REQUIRE(plan.schema_activation_slots == 1);
+    REQUIRE(plan.schema_replicated_slots == 1);
+    REQUIRE(plan.schema_sharded_dim_slots == 0);
+    REQUIRE(plan.schema_router_replicated_slots == 0);
     REQUIRE(plan.schema_expert_parallel_slots == 2);
     REQUIRE(plan.schema_streaming_slots == 1);
     REQUIRE(plan.schema_gpu_resident_slots == 1);
@@ -229,6 +235,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].slot_count == 3);
     REQUIRE(plan.schema_layers[0].param_slots == 2);
     REQUIRE(plan.schema_layers[0].activation_slots == 1);
+    REQUIRE(plan.schema_layers[0].replicated_slots == 1);
+    REQUIRE(plan.schema_layers[0].sharded_dim_slots == 0);
+    REQUIRE(plan.schema_layers[0].router_replicated_slots == 0);
     REQUIRE(plan.schema_layers[0].expert_parallel_slots == 2);
     REQUIRE(plan.schema_layers[0].streaming_slots == 1);
     REQUIRE(plan.schema_layers[0].gpu_resident_slots == 1);

@@ -120,6 +120,7 @@
 - [x] `BufferPlan` now exposes per-layer schema summaries as the next allocator-facing Phase 4b dual path, without changing allocation behavior.
 - [x] `BufferPlan` now classifies schema block families into dense/MoE/Mamba/linear-mixer diagnostics for allocator parity work.
 - [x] `BufferPlan` now parses schema slot residency into GPU/auto/CPU-stream/NVMe diagnostics for Phase 4 storage planning.
+- [x] `BufferPlan` now parses schema slot distribution into replicated/sharded-dim/router-replicated/expert-parallel diagnostics.
 
 Local validation status:
 

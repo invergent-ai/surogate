@@ -288,6 +288,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                   << ", block_schema_mamba_layers=" << initial_plan.schema_mamba_layers
                   << ", block_schema_linear_mixer_layers=" << initial_plan.schema_linear_mixer_layers
                   << ", block_schema_slots=" << initial_plan.schema_slot_count
+                  << ", block_schema_sharded_dim_slots=" << initial_plan.schema_sharded_dim_slots
+                  << ", block_schema_router_replicated_slots=" << initial_plan.schema_router_replicated_slots
                   << ", block_schema_expert_parallel_slots=" << initial_plan.schema_expert_parallel_slots
                   << ", block_schema_streaming_slots=" << initial_plan.schema_streaming_slots
                   << ", block_schema_auto_resident_slots=" << initial_plan.schema_auto_resident_slots
