@@ -5,6 +5,8 @@
 
 #include "runtime/qlora/generic_qlora_provider.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <fmt/format.h>
@@ -38,6 +40,16 @@ int parse_layer_index(std::string_view name) {
     } catch (...) {
         return -1;
     }
+}
+
+bool env_flag_enabled(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw) return false;
+    std::string value(raw);
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
 }  // anonymous namespace
@@ -250,6 +262,16 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     if (!mWeightMgr) return;
     auto* om = mWeightMgr->offload_manager();
     if (!om || om->num_groups() == 0 || om->max_resident_groups() == 0) return;
+
+    if (env_flag_enabled("SUROGATE_QLORA_OFFLOAD_AUTOTUNE_DISABLE")) {
+        return;
+    }
+    if (mEPSize > 1 && !env_flag_enabled("SUROGATE_QLORA_EP_OFFLOAD_AUTOTUNE")) {
+        fprintf(stderr,
+                "[QLoRA] Offload auto-tune skipped for EP offload run "
+                "(set SUROGATE_QLORA_EP_OFFLOAD_AUTOTUNE=1 to opt in)\n");
+        return;
+    }
 
     // If called before the first training step, defer to after step 0
     // when all lazy runtime allocations are settled.

@@ -140,6 +140,16 @@ inline bool graph_has_capture_unsafe_ops(const CompiledGraph* g) {
     return false;
 }
 
+inline bool env_flag_enabled(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw) return false;
+    std::string value(raw);
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
 inline void sync_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
     if (!stream_is_capturing(stream)) {
         CUDA_CHECK(cudaEventSynchronize(event));
@@ -1312,7 +1322,10 @@ void GraphExecutor::execute_forward(long B,
     const bool doc_masking_active = doc_masking_active_raw && !force_full_capture;
     const bool has_tiled_mlp = mCompiledForward && !mCompiledForward->mlp_tile_groups.empty();
     const bool needs_split = doc_masking_active || has_capture_unsafe_ops || has_tiled_mlp;
-    const bool use_split_attention = needs_split && mOptions.UseCudaGraphs && !in_capture;
+    const bool capture_unsafe_split_allowed =
+        !has_capture_unsafe_ops || env_flag_enabled("SUROGATE_ENABLE_CAPTURE_UNSAFE_SPLIT_GRAPHS");
+    const bool use_split_attention =
+        needs_split && capture_unsafe_split_allowed && mOptions.UseCudaGraphs && !in_capture;
     const bool use_graphs = mGraphsEnabled && !in_capture && !needs_split;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
@@ -1431,7 +1444,10 @@ void GraphExecutor::execute_backward(long B,
     const bool has_capture_unsafe_bwd = has_capture_unsafe_ops;
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
-    const bool use_split_attention_bwd = needs_split_bwd && mOptions.UseCudaGraphs && !in_capture;
+    const bool capture_unsafe_split_allowed_bwd =
+        !has_capture_unsafe_bwd || env_flag_enabled("SUROGATE_ENABLE_CAPTURE_UNSAFE_SPLIT_GRAPHS");
+    const bool use_split_attention_bwd =
+        needs_split_bwd && capture_unsafe_split_allowed_bwd && mOptions.UseCudaGraphs && !in_capture;
     const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture && !needs_split_bwd;
     mCompiledExecutor->set_split_attention_graphs(use_split_attention_bwd);
     if (use_graphs && (mGraphB != B || mGraphT != T)) {

@@ -79,6 +79,30 @@ bool is_rope_freq_ref(const CompiledGraph* graph, const TensorRef& ref, const ch
     return legacy_value || role_value;
 }
 
+bool is_moe_ep_sync_boundary(CompiledOpType type) {
+    switch (type) {
+        case CompiledOpType::MoETopK:
+        case CompiledOpType::MoEPermute:
+        case CompiledOpType::MoEGroupedGemm:
+        case CompiledOpType::MoEGroupedGemmGateUp:
+        case CompiledOpType::MoEGroupedGemmDown:
+        case CompiledOpType::MoEUnpermute:
+        case CompiledOpType::MoEExpertBiasAdd:
+        case CompiledOpType::MoETopKBackward:
+        case CompiledOpType::MoEPermuteBackward:
+        case CompiledOpType::MoEGroupedGemmBackward:
+        case CompiledOpType::MoEGroupedGemmGateUpBackward:
+        case CompiledOpType::MoEGroupedGemmDownBackward:
+        case CompiledOpType::MoEUnpermuteBackward:
+        case CompiledOpType::MoEExpertBiasAddBackward:
+        case CompiledOpType::EpDispatch:
+        case CompiledOpType::EpCombine:
+        case CompiledOpType::EpDispatchBackward:
+        case CompiledOpType::EpCombineBackward: return true;
+        default: return false;
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1181,16 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Main dispatch loop - no string comparisons, direct function pointer dispatch
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const char* op_trace_sync_env = std::getenv("SUROGATE_OP_TRACE_SYNC");
+    const bool op_trace_sync = op_trace_sync_env && std::string(op_trace_sync_env) != "0";
+    const bool sync_moe_ep_ops =
+        env_int("SUROGATE_SYNC_CAPTURE_UNSAFE_OPS",
+                (mWeights.qlora_provider() && mWeights.qlora_provider()->has_offloading()) ? 1 : 0) != 0;
+    auto sync_after_forward_op = [&](const CompiledOp& op) {
+        if (op_trace_sync || (sync_moe_ep_ops && is_moe_ep_sync_boundary(op.type))) {
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+    };
     const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
     const bool debug_nonfinite_forward = (debug_nonfinite_mode & 0x1) != 0;
     const char* watch_tensor_env = std::getenv("SUROGATE_DEBUG_WATCH_TENSOR");
@@ -1455,6 +1489,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             }
                             try {
                                 op.fn(*this, op, static_cast<const void*>(hook));
+                                sync_after_forward_op(op);
                             } catch (const std::exception& e) {
                                 std::ostringstream oss;
                                 oss << "execute_forward stream op=" << i << " type=" << op_type_to_string(op.type)
@@ -1673,6 +1708,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
             check_op_io_aliasing(op, idx, "fwd");
             op.fn(*this, op, static_cast<const void*>(hook));
+            sync_after_forward_op(op);
             check_nonfinite_refs(op, op.outputs);
             if (watch_tensor_enabled) {
                 bool watch_post_valid = false;
@@ -2523,6 +2559,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const char* op_trace_sync_env = std::getenv("SUROGATE_OP_TRACE_SYNC");
+    const bool op_trace_sync = op_trace_sync_env && std::string(op_trace_sync_env) != "0";
+    const bool sync_moe_ep_ops =
+        env_int("SUROGATE_SYNC_CAPTURE_UNSAFE_OPS",
+                (mWeights.qlora_provider() && mWeights.qlora_provider()->has_offloading()) ? 1 : 0) != 0;
+    auto sync_after_backward_op = [&](const CompiledOp& op) {
+        if (op_trace_sync || (sync_moe_ep_ops && is_moe_ep_sync_boundary(op.type))) {
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+    };
     const char* bwd_filter_env = std::getenv("SUROGATE_DEBUG_BWD_FILTER");
     const std::string bwd_filter = bwd_filter_env ? std::string(bwd_filter_env) : std::string();
     const bool bwd_filter_enabled = !bwd_filter.empty();
@@ -2856,7 +2902,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         }
 
                         check_op_io_aliasing(op, i, "bwd");
-                        op.fn(*this, op, static_cast<const void*>(hook));
+                        if (op_trace) {
+                            std::cerr << "[BWD OP " << i << "] " << op_type_to_string(op.type) << " id=" << op.op_id
+                                      << std::endl;
+                        }
+                        try {
+                            op.fn(*this, op, static_cast<const void*>(hook));
+                            sync_after_backward_op(op);
+                        } catch (const std::exception& e) {
+                            std::ostringstream oss;
+                            oss << "execute_backward stream op=" << i << " type=" << op_type_to_string(op.type)
+                                << " id=" << op.op_id << ": " << e.what();
+                            throw std::runtime_error(oss.str());
+                        }
                         // LM-head post-dispatch cleanup: free the d_logits payload
                         // after the first matmul_backward (see line ~2372 comment).
                         if (op.type == CompiledOpType::MatmulBackward && i == 1) {
@@ -3055,7 +3113,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 throw std::runtime_error(oss.str());
             }
             check_op_io_aliasing(op, idx, "bwd");
+            if (op_trace) {
+                std::cerr << "[BWD OP " << idx << "] " << op_type_to_string(op.type) << " id=" << op.op_id << std::endl;
+            }
             op.fn(*this, op, static_cast<const void*>(hook));
+            sync_after_backward_op(op);
             if (bwd_filter_matched && bwd_filter_dump && mDebugDumpFn) {
                 std::vector<std::string> dump_names;
                 dump_names.reserve(op.inputs.size() + op.outputs.size());

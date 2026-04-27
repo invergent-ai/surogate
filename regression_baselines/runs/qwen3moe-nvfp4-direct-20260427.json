@@ -1,0 +1,62 @@
+{
+  "acceptance": {
+    "status": "pass",
+    "notes": [
+      "Direct .venv 4-GPU EP Qwen3 MoE NVFP4 validation completed 5 steps on 2026-04-27.",
+      "EP QLoRA offload auto-tune was skipped by default.",
+      "MoE/EP capture-unsafe boundary synchronization was enabled by default for QLoRA offload."
+    ]
+  },
+  "command": {
+    "env": {
+      "SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT": "1"
+    },
+    "entrypoint": ".venv/bin/surogate sft",
+    "source_config": "examples/sft/qwen3moe/qwen3moe-nvfp4.yaml",
+    "temp_config": "/tmp/qwen3moe-nvfp4-5step-targetsync.7IrxdK.yaml"
+  },
+  "convergence_curve": [
+    {
+      "grad_norm": 0.16173796,
+      "loss": 2.578426,
+      "lr": 0.0002,
+      "step": 0
+    },
+    {
+      "grad_norm": 0.19543594,
+      "loss": 3.1737576,
+      "lr": 0.00016,
+      "step": 1
+    },
+    {
+      "grad_norm": 0.18855272,
+      "loss": 2.6452813,
+      "lr": 0.00012,
+      "step": 2
+    },
+    {
+      "grad_norm": 0.1628739,
+      "loss": 2.463957,
+      "lr": 8e-05,
+      "step": 3
+    },
+    {
+      "grad_norm": 0.154473,
+      "loss": 2.5385354,
+      "lr": 4e-05,
+      "step": 4
+    }
+  ],
+  "distribution": {
+    "ep_size": 4,
+    "gpus": 4
+  },
+  "log_file": "output_moe_5step_targetsync/log-short-farad-20260427-081449.json",
+  "model": "nvidia/Qwen3-30B-A3B-NVFP4",
+  "recipe": "fp8-hybrid",
+  "storage": {
+    "qlora_offload_experts": true,
+    "strategy": "prequant_nvfp4"
+  },
+  "steps": 5
+}
