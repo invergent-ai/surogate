@@ -305,9 +305,14 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // Embedding output (embed_1, embed_0, …) — substring match because
             // this family of names isn't (yet) in the slot registry. Routes to
             // the Encoded slot buffer.
-            if (!resolved.Data && !inp.name.empty() && inp.name.find("embed") != std::string::npos) {
-                if (Tensor* gp = global_activation_ptr(mRunState, TensorSlot::Encoded)) {
-                    resolved = *gp;
+            if (!resolved.Data && !inp.name.empty()) {
+                const bool legacy_embed = inp.name.find("embed") != std::string::npos;
+                const bool role_embed = infer_tensor_role_from_name(inp.name).ownership == TensorOwnership::Embedding;
+                tensor_role_parity_check(inp.name, legacy_embed, role_embed, "compiled_ops_execute::resolve_embed");
+                if (legacy_embed || role_embed) {
+                    if (Tensor* gp = global_activation_ptr(mRunState, TensorSlot::Encoded)) {
+                        resolved = *gp;
+                    }
                 }
             }
 
