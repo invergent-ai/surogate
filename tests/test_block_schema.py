@@ -522,3 +522,42 @@ def test_llama_model_emits_dense_block_schema_metadata():
 
     assert missing == []
     assert save_mismatches == []
+
+
+def test_qwen3_vl_model_emits_dense_block_schema_metadata():
+    from surogate.dsl.models.qwen3_vl import Qwen3VLModel  # noqa: F401
+
+    config = {
+        "vocab_size": 32000,
+        "d_model": 256,
+        "n_layers": 2,
+        "num_query_heads": 4,
+        "num_kv_heads": 2,
+        "d_ff": 512,
+        "max_seq": 2048,
+        "head_size": 64,
+        "deepstack_visual_indexes": [1],
+    }
+
+    payload = json.loads(compile_model("Qwen3VLModel", config, raise_on_error=True))
+    module = payload["modules"][0]
+    records = module["forward"]["metadata"]["block_schemas"]
+    layout_names = _compiled_activation_slot_names(module)
+    layout_save_names = _compiled_save_for_backward_slot_names(module)
+
+    assert [record["layer"] for record in records] == [0, 1]
+    assert [record["schema"]["attrs"]["block_family"] for record in records] == [
+        "qwen3_vl_dense",
+        "qwen3_vl_dense",
+    ]
+    missing = []
+    save_mismatches = []
+    for record in records:
+        for slot in record["schema"]["slots"]:
+            if slot["kind"] != "param" and slot["name"] not in layout_names:
+                missing.append(f"layer{record['layer']}.{slot['name']}")
+            if slot.get("save_for_backward") and slot["name"] not in layout_save_names:
+                save_mismatches.append(f"layer{record['layer']}.{slot['name']}")
+
+    assert missing == []
+    assert save_mismatches == []
