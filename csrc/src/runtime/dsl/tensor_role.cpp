@@ -3,6 +3,7 @@
 
 #include "runtime/dsl/tensor_role.h"
 
+#include <cctype>
 #include <string>
 
 namespace dsl {
@@ -10,6 +11,24 @@ namespace {
 
 bool contains(std::string_view s, std::string_view needle) {
     return s.find(needle) != std::string_view::npos;
+}
+
+bool contains_ci(std::string_view s, std::string_view needle) {
+    if (needle.empty()) return true;
+    if (needle.size() > s.size()) return false;
+    for (std::size_t i = 0; i + needle.size() <= s.size(); ++i) {
+        bool match = true;
+        for (std::size_t j = 0; j < needle.size(); ++j) {
+            const auto a = static_cast<unsigned char>(s[i + j]);
+            const auto b = static_cast<unsigned char>(needle[j]);
+            if (std::tolower(a) != std::tolower(b)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 std::string strip_saved_prefix(std::string_view name) {
@@ -92,7 +111,8 @@ TensorRole infer_tensor_role_from_name(std::string_view raw_name, int block_laye
     if (name == "moe_expert_offsets" || name == "moe_gather_indices" || contains(name, "moe_") ||
         contains(name, "scatter_indices") || contains(name, "routing_weights") || contains(name, "routing_indices") ||
         contains(name, "gather_indices") || contains(name, "expert_offsets") || contains(name, "router") ||
-        contains(name, "permuted") || contains(name, "expert_") || contains(name, "experts_")) {
+        contains(name, "permuted") || contains(name, "expert_") || contains(name, "experts_") ||
+        contains(name, "experts.")) {
         role.ownership = TensorOwnership::MoE;
         if (contains(name, "router")) {
             role.dist.kind = DistributionKind::RouterReplicated;
@@ -172,6 +192,14 @@ bool tensor_role_is_expert_down_name(std::string_view name) {
 bool tensor_role_is_expert_bias_name(std::string_view name) {
     const TensorRole role = infer_tensor_role_from_name(name);
     return role.is_expert_parallel() && contains(name, "experts_") && contains(name, "_bias");
+}
+
+bool tensor_role_is_fused_qkv_name(std::string_view name) {
+    return contains_ci(name, "qkv");
+}
+
+bool tensor_role_is_fused_mlp_up_name(std::string_view name) {
+    return contains_ci(name, "mlp_up") || contains_ci(name, "gate_up");
 }
 
 }  // namespace dsl

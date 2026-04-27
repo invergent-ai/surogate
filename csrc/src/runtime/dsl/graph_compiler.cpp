@@ -1255,7 +1255,7 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
             if (!matmul_op.has_value()) {
                 std::string field;
-                if (parse_block_param(op.inputs[1], layer_idx, field) && field == "router_weight") {
+                if (parse_block_param(op.inputs[1], layer_idx, field) && tensor_role_is_router_name(field)) {
                     attrs.layer_idx = layer_idx;
                     set_forward_hook_schema_slot(attrs,
                                                  modules::ForwardHookPoint::AfterRouterProjection,

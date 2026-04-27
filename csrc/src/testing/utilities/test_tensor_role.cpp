@@ -62,6 +62,7 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(tensor_role_is_expert_weight_name("blocks[4].expert_up"));
         REQUIRE(tensor_role_is_expert_weight_name("blocks[4].experts_up"));
         REQUIRE(tensor_role_is_expert_gate_up_name("blocks[4].experts_gate_up"));
+        REQUIRE(tensor_role_is_expert_gate_up_name("model.layers.4.mlp.experts.gate_up_proj.weight"));
         REQUIRE(tensor_role_is_expert_up_name("blocks[4].experts_up"));
         REQUIRE(tensor_role_is_expert_down_name("blocks[4].experts_down"));
         REQUIRE_FALSE(tensor_role_is_expert_up_name("blocks[4].experts_gate_up"));
@@ -116,6 +117,9 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE_FALSE(tensor_role_is_lm_head_name("blocks[0].attn_out"));
         REQUIRE(tensor_role_is_standalone_gate_name("gate_weight"));
         REQUIRE_FALSE(tensor_role_is_standalone_gate_name("mlp_gate_weight"));
+        REQUIRE(tensor_role_is_fused_qkv_name("blocks[0].QKV_weight"));
+        REQUIRE(tensor_role_is_fused_mlp_up_name("blocks[0].gate_up"));
+        REQUIRE(tensor_role_is_fused_mlp_up_name("blocks[0].mlp_up_weight"));
         REQUIRE(activation.ownership == TensorOwnership::Stack);
         REQUIRE_FALSE(activation.is_moe_owned());
         REQUIRE_FALSE(tensor_role_is_rope_name("blocks[0].attn_out"));

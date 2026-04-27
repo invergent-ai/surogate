@@ -516,7 +516,7 @@ bool should_swap_qwen3_5_moe_gate_up_halves(const dsl::MappingSpec& mspec,
     }
 
     const std::string& source = mspec.source.empty() ? internal_name : mspec.source;
-    return source.find("experts.gate_up_proj") != std::string::npos;
+    return dsl::tensor_role_is_expert_gate_up_name(source);
 }
 
 /// Substitute {layer} and {expert} placeholders in HF name template.

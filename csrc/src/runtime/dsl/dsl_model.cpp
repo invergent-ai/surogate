@@ -91,8 +91,7 @@ bool is_qlora_param_name(std::string_view name) {
         if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" || field == "mlp_up_weight" ||
             field == "mlp_down_weight" || field == "up_weight" || field == "down_weight" || field == "ln1_weight" ||
             field == "ln2_weight" || field == "q_norm_weight" || field == "k_norm_weight" ||
-            field == "experts_gate_up" || field == "experts_up" || field == "experts_down" ||
-            field == "shared_expert_gate" || field == "shared_expert_up" || field == "shared_expert_down") {
+            tensor_role_is_expert_weight_name(field) || tensor_role_is_shared_expert_name(field)) {
             return true;
         }
         if (ends_with(field, "in_proj_weight") || ends_with(field, "in_proj_bias") ||

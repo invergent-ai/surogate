@@ -222,10 +222,10 @@ Tensor& DslParamStore::get(const std::string& name) {
     auto it = mParams.find(name);
     if (it == mParams.end()) {
         std::cerr << "[ERROR] DslParamStore::get: parameter '" << name << "' not found. Available params: ";
+        std::size_t printed = 0;
         for (auto& p : mParams) {
-            if (p.first.find("mlp_up") != std::string::npos || p.first.find("experts") != std::string::npos) {
-                std::cerr << p.first << ", ";
-            }
+            if (printed++ >= 32) break;
+            std::cerr << p.first << ", ";
         }
         std::cerr << std::endl;
         throw std::runtime_error("DslParamStore: missing parameter " + name);
