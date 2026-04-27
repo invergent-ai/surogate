@@ -19,7 +19,7 @@ inline bool recipe_capability_fallback_log_enabled() {
 }
 
 inline bool descriptor_allows_capability(dsl::OpCapabilities caps, std::uint32_t flag) {
-    return caps.flags == dsl::OpCapabilityNone || caps.has(flag);
+    return caps.has(flag);
 }
 
 inline bool descriptor_allows_capability(dsl::OpCapabilities caps,
@@ -29,11 +29,11 @@ inline bool descriptor_allows_capability(dsl::OpCapabilities caps,
     if (caps.flags == dsl::OpCapabilityNone) {
         if (recipe_capability_fallback_log_enabled()) {
             std::fprintf(stderr,
-                         "[recipe capability] %s legacy allow: descriptor has no capability metadata for %s\n",
+                         "[recipe capability] %s disabled: descriptor has no capability metadata for %s\n",
                          context,
                          capability);
         }
-        return true;
+        return false;
     }
     const bool allowed = caps.has(flag);
     if (!allowed && recipe_capability_fallback_log_enabled()) {
@@ -43,11 +43,11 @@ inline bool descriptor_allows_capability(dsl::OpCapabilities caps,
 }
 
 inline bool descriptor_allows_moe_capability(dsl::MoECapabilities caps, std::uint32_t flag) {
-    return caps.flags == dsl::MoECapabilityNone || caps.has(flag);
+    return caps.has(flag);
 }
 
 inline bool descriptor_allows_matmul_capability(dsl::MatmulCapabilities caps, std::uint32_t flag) {
-    return caps.flags == dsl::MatmulCapabilityNone || caps.has(flag);
+    return caps.has(flag);
 }
 
 inline bool descriptor_allows_moe_capability(dsl::MoECapabilities caps,
@@ -57,11 +57,11 @@ inline bool descriptor_allows_moe_capability(dsl::MoECapabilities caps,
     if (caps.flags == dsl::MoECapabilityNone) {
         if (recipe_capability_fallback_log_enabled()) {
             std::fprintf(stderr,
-                         "[recipe capability] %s legacy allow: descriptor has no MoE capability metadata for %s\n",
+                         "[recipe capability] %s disabled: descriptor has no MoE capability metadata for %s\n",
                          context,
                          capability);
         }
-        return true;
+        return false;
     }
     const bool allowed = caps.has(flag);
     if (!allowed && recipe_capability_fallback_log_enabled()) {
@@ -77,11 +77,11 @@ inline bool descriptor_allows_matmul_capability(dsl::MatmulCapabilities caps,
     if (caps.flags == dsl::MatmulCapabilityNone) {
         if (recipe_capability_fallback_log_enabled()) {
             std::fprintf(stderr,
-                         "[recipe capability] %s legacy allow: descriptor has no matmul capability metadata for %s\n",
+                         "[recipe capability] %s disabled: descriptor has no matmul capability metadata for %s\n",
                          context,
                          capability);
         }
-        return true;
+        return false;
     }
     const bool allowed = caps.has(flag);
     if (!allowed && recipe_capability_fallback_log_enabled()) {

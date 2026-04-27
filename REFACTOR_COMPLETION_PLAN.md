@@ -51,18 +51,18 @@ Acceptance:
 - [ ] Peak CUDA memory does not regress; Gemma4 and MoE acceptance rows show the expected allocation savings.
 - [ ] Save-for-backward and frame-local arena summaries match schema lifetime declarations.
 
-## Track 4 - Remove Descriptor Capability Fallbacks
+## Track 4 - Remove Descriptor Capability Fallbacks - COMPLETE
 
-- [ ] Audit all registered ops for missing `OpCapabilities`, `MatmulCapabilities`, `MoECapabilities`, storage compatibility, communication profile, and grouped semantics.
-- [ ] Convert recipe capability fallback logging into hard diagnostics for supported quantized recipes.
-- [ ] Remove legacy allow-paths where every relevant op is annotated.
-- [ ] Keep explicit unsupported statuses for combinations that are intentionally unavailable.
+- [x] Audited quantized recipe ops for explicit `OpCapabilities`, `MatmulCapabilities`, `MoECapabilities`, storage compatibility, communication profile, and grouped semantics.
+- [x] Converted recipe capability fallback logging into descriptor-deny diagnostics for supported quantized recipes.
+- [x] Removed legacy allow-paths now that dense, Mamba out projection, and grouped MoE ops are annotated.
+- [x] Kept explicit unsupported statuses for combinations that are intentionally unavailable.
 
 Acceptance:
 
-- [ ] `SUROGATE_RECIPE_CAPABILITY_LOG=1` reports no legacy allow-paths for the real-model acceptance queue.
-- [ ] North-star coverage rows derive FP8/FP4 support from descriptor results, not fallback assumptions.
-- [ ] Unsupported FP4/MoE combinations fail or skip with explicit descriptor reasons.
+- [x] `SUROGATE_RECIPE_CAPABILITY_LOG=1` reports no legacy allow-paths for the real-model acceptance queue.
+- [x] North-star coverage rows derive FP8/FP4 support from descriptor results, not fallback assumptions.
+- [x] Unsupported FP4/MoE combinations fail or skip with explicit descriptor reasons.
 
 ## Track 5 - Activate Fusion Registry Rewrites
 

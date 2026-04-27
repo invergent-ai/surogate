@@ -3,6 +3,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstdint>
 #include <utility>
 
 #include "recipes/capability_predicates.h"
@@ -261,12 +263,65 @@ TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
     REQUIRE(loss->semantic_kind == OpSemanticKind::Loss);
 }
 
-TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[op_registry]") {
+TEST_CASE("quantized recipe ops have explicit descriptor capability metadata", "[op_registry]") {
+    struct MatmulCase {
+        const char* name;
+        std::uint32_t required_matmul_caps;
+    };
+    constexpr std::array<MatmulCase, 7> matmul_cases{{
+        {"matmul", MatmulCapabilityFp8ForwardEligible | MatmulCapabilityFp4ForwardEligible},
+        {"matmul_bias", MatmulCapabilityFp8ForwardEligible | MatmulCapabilityFp4ForwardEligible},
+        {"matmul_backward", MatmulCapabilityFp8BackwardEligible | MatmulCapabilityFp4BackwardEligible},
+        {"matmul_swiglu", MatmulCapabilityFp8ForwardEligible | MatmulCapabilityFp4ForwardEligible},
+        {"matmul_swiglu_backward", MatmulCapabilityFp8BackwardEligible | MatmulCapabilityFp4BackwardEligible},
+        {"mamba_out_proj", MatmulCapabilityFp8ForwardEligible | MatmulCapabilityFp4ForwardEligible},
+        {"mamba_out_proj_backward", MatmulCapabilityFp8BackwardEligible | MatmulCapabilityFp4BackwardEligible},
+    }};
+    for (const MatmulCase& item : matmul_cases) {
+        const OpDescriptor* desc = OpRegistry::instance().find_by_name(item.name);
+        INFO(item.name);
+        REQUIRE(desc != nullptr);
+        REQUIRE(desc->semantic_kind == OpSemanticKind::Dense);
+        REQUIRE(desc->default_caps.has(OpCapabilityDenseMatmul));
+        REQUIRE(desc->default_caps.has(OpCapabilityFp8Eligible));
+        REQUIRE(desc->default_caps.has(OpCapabilityFp4Eligible));
+        REQUIRE(desc->matmul_caps.has(item.required_matmul_caps));
+        REQUIRE(desc->storage_compat.supports(StorageTier::GpuResident));
+        REQUIRE(desc->matmul_caps.weight_storage.supports(StorageTier::GpuResident));
+    }
+
+    constexpr std::array<const char*, 6> moe_cases{{
+        "moe_grouped_gemm",
+        "moe_grouped_gemm_gate_up",
+        "moe_grouped_gemm_down",
+        "moe_grouped_gemm_backward",
+        "moe_grouped_gemm_gate_up_backward",
+        "moe_grouped_gemm_down_backward",
+    }};
+    for (const char* name : moe_cases) {
+        const OpDescriptor* desc = OpRegistry::instance().find_by_name(name);
+        INFO(name);
+        REQUIRE(desc != nullptr);
+        REQUIRE(desc->semantic_kind == OpSemanticKind::MoE);
+        REQUIRE(desc->distribution_kind == DistributionKind::ExpertParallel);
+        REQUIRE(desc->comm_profile.kind == CommunicationKind::ExpertParallelRouted);
+        REQUIRE(desc->grouped_semantics.is_grouped);
+        REQUIRE(desc->grouped_semantics.ep_aware);
+        REQUIRE(desc->default_caps.has(OpCapabilityGroupedMatmul));
+        REQUIRE(desc->default_caps.has(OpCapabilityMoeRouted));
+        REQUIRE(desc->default_caps.has(OpCapabilityFp8Eligible));
+        REQUIRE(desc->moe_caps.has(MoECapabilityGroupedGemmEligible));
+        REQUIRE(desc->moe_caps.has(MoECapabilityFp8GroupedEligible));
+        REQUIRE(desc->moe_caps.expert_storage.supports(StorageTier::GpuResident));
+    }
+}
+
+TEST_CASE("recipe capability predicates require explicit descriptor metadata", "[op_registry]") {
     OpCapabilities unannotated{};
-    REQUIRE(recipes::descriptor_allows_fp8(unannotated));
-    REQUIRE(recipes::descriptor_allows_fp4(unannotated));
-    REQUIRE(recipes::descriptor_allows_fp8(unannotated, "test"));
-    REQUIRE(recipes::descriptor_allows_fp4(unannotated, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_fp8(unannotated));
+    REQUIRE_FALSE(recipes::descriptor_allows_fp4(unannotated));
+    REQUIRE_FALSE(recipes::descriptor_allows_fp8(unannotated, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_fp4(unannotated, "test"));
 
     OpCapabilities fp8_only{OpCapabilityFp8Eligible};
     REQUIRE(recipes::descriptor_allows_fp8(fp8_only));
@@ -281,9 +336,9 @@ TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[o
     REQUIRE(recipes::descriptor_allows_fp4(fp4_only, "test"));
 
     MoECapabilities moe_unannotated{};
-    REQUIRE(recipes::descriptor_allows_moe_fp8_grouped(moe_unannotated));
-    REQUIRE(recipes::descriptor_allows_moe_fp4_grouped(moe_unannotated));
-    REQUIRE(recipes::descriptor_has_moe_fp8_backward(moe_unannotated, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_moe_fp8_grouped(moe_unannotated));
+    REQUIRE_FALSE(recipes::descriptor_allows_moe_fp4_grouped(moe_unannotated));
+    REQUIRE_FALSE(recipes::descriptor_has_moe_fp8_backward(moe_unannotated, "test"));
 
     MoECapabilities moe_forward_only{MoECapabilityFp8GroupedEligible | MoECapabilityFp4GroupedEligible};
     REQUIRE(recipes::descriptor_allows_moe_fp8_grouped(moe_forward_only));
@@ -297,10 +352,10 @@ TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[o
     REQUIRE_FALSE(recipes::descriptor_allows_moe_fp8_grouped_for_role(moe_forward_only, nullptr, "test"));
 
     MatmulCapabilities matmul_unannotated{};
-    REQUIRE(recipes::descriptor_allows_matmul_fp8_forward(matmul_unannotated, "test"));
-    REQUIRE(recipes::descriptor_allows_matmul_fp8_backward(matmul_unannotated, "test"));
-    REQUIRE(recipes::descriptor_allows_matmul_fp4_forward(matmul_unannotated, "test"));
-    REQUIRE(recipes::descriptor_allows_matmul_fp4_backward(matmul_unannotated, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp8_forward(matmul_unannotated, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp8_backward(matmul_unannotated, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp4_forward(matmul_unannotated, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_matmul_fp4_backward(matmul_unannotated, "test"));
 
     MatmulCapabilities matmul_forward_only{MatmulCapabilityFp8ForwardEligible | MatmulCapabilityFp4ForwardEligible |
                                            MatmulCapabilityWeightCacheEligible};
