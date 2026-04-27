@@ -36,6 +36,7 @@ Completed in the first implementation pass:
 - [x] Mamba/SSM and Qwen3.5 gated-delta op families annotated as no-comm sequence/dense/view descriptors.
 - [x] Core transformer ops annotated with semantic descriptor metadata.
 - [x] Descriptor type definitions split into a lightweight header and copied onto `CompiledOp` during graph compilation.
+- [x] Missing-dispatch diagnostics now include compiled semantic, communication, and distribution descriptor facets.
 - [x] CUTLASS examples README inspected for relevant FP8/grouped GEMM paths; future candidates identified (`57_hopper_grouped_gemm`, `69_hopper_mixed_dtype_grouped_gemm`, `75_blackwell_grouped_gemm`, `81_blackwell_gemm_blockwise`, `54_hopper_fp8_warp_specialized_gemm`, `58_ada_fp8_gemm`).
 
 Local validation status:
