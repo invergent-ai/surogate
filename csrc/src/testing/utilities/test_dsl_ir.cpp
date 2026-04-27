@@ -154,6 +154,28 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].has_routing);
     REQUIRE(schema_records[0].has_ep_topology);
 
+    auto coverage = dsl::validate_block_schema_plan_coverage(schema_records, /*num_layers=*/1);
+    REQUIRE(coverage.ok);
+    coverage = dsl::validate_block_schema_plan_coverage({}, /*num_layers=*/1);
+    REQUIRE(coverage.ok);
+
+    auto duplicate_records = schema_records;
+    duplicate_records.push_back(schema_records[0]);
+    coverage = dsl::validate_block_schema_plan_coverage(duplicate_records, /*num_layers=*/2);
+    REQUIRE_FALSE(coverage.ok);
+    REQUIRE(coverage.message.find("duplicate block schema layer 0") != std::string::npos);
+
+    auto missing_records = schema_records;
+    coverage = dsl::validate_block_schema_plan_coverage(missing_records, /*num_layers=*/2);
+    REQUIRE_FALSE(coverage.ok);
+    REQUIRE(coverage.message.find("record count 1 != NumLayers 2") != std::string::npos);
+
+    auto out_of_range_records = schema_records;
+    out_of_range_records[0].layer = 2;
+    coverage = dsl::validate_block_schema_plan_coverage(out_of_range_records, /*num_layers=*/1);
+    REQUIRE_FALSE(coverage.ok);
+    REQUIRE(coverage.message.find("outside [0, 1)") != std::string::npos);
+
     PretrainedConfig cfg;
     cfg.HiddenSize = 8;
     cfg.NumQueryHeads = 2;

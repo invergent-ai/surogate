@@ -123,6 +123,49 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
     return records;
 }
 
+BlockSchemaCoverageValidation validate_block_schema_plan_coverage(const std::vector<BlockSchemaPlanRecord>& records,
+                                                                  int num_layers) {
+    BlockSchemaCoverageValidation result;
+    if (records.empty()) {
+        return result;
+    }
+    if (num_layers < 0) {
+        result.ok = false;
+        result.message = "NumLayers is negative";
+        return result;
+    }
+    if (records.size() != static_cast<std::size_t>(num_layers)) {
+        result.ok = false;
+        result.message = "block schema plan record count " + std::to_string(records.size()) + " != NumLayers " +
+                         std::to_string(num_layers);
+        return result;
+    }
+
+    std::vector<bool> seen(static_cast<std::size_t>(num_layers), false);
+    for (const auto& record : records) {
+        if (record.layer < 0 || record.layer >= num_layers) {
+            result.ok = false;
+            result.message = "block schema layer " + std::to_string(record.layer) + " outside [0, " +
+                             std::to_string(num_layers) + ")";
+            return result;
+        }
+        if (seen[static_cast<std::size_t>(record.layer)]) {
+            result.ok = false;
+            result.message = "duplicate block schema layer " + std::to_string(record.layer);
+            return result;
+        }
+        seen[static_cast<std::size_t>(record.layer)] = true;
+    }
+    for (int layer = 0; layer < num_layers; ++layer) {
+        if (!seen[static_cast<std::size_t>(layer)]) {
+            result.ok = false;
+            result.message = "missing block schema layer " + std::to_string(layer);
+            return result;
+        }
+    }
+    return result;
+}
+
 int resolve_mlp_up_factor(const PretrainedConfig& cfg) {
     if (auto* mc = dynamic_cast<const modules::ModelConfig*>(&cfg)) {
         return mc->mlp_up_factor();

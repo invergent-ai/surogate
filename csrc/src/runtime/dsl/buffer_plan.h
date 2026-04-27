@@ -50,9 +50,20 @@ struct BlockSchemaPlanRecord {
     bool has_ep_topology = false;
 };
 
+struct BlockSchemaCoverageValidation {
+    bool ok = true;
+    std::string message;
+};
+
 /// Extract per-layer block schema records from a compiled graph's metadata.
 /// Malformed records are skipped; absence of metadata returns an empty vector.
 [[nodiscard]] std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph);
+
+/// Validate that schema records describe exactly one block for every model
+/// layer. Empty record sets are valid here; callers can decide whether absence
+/// of schema metadata should be an error.
+[[nodiscard]] BlockSchemaCoverageValidation
+validate_block_schema_plan_coverage(const std::vector<BlockSchemaPlanRecord>& records, int num_layers);
 
 // Model-config helpers shared by the plan builder and runtime allocators.
 // Both handle the case where the passed PretrainedConfig is actually a
