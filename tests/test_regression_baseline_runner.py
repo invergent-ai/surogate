@@ -233,6 +233,27 @@ def test_main_list_cases_prints_json(capsys):
     assert [row["case_id"] for row in rows] == [br.FIRST_MONTH_MATRIX[0].case_id]
 
 
+def test_supported_first_month_cases_have_configs():
+    missing = [case.case_id for case in br.FIRST_MONTH_MATRIX if case.supported and not case.config]
+
+    assert missing == []
+
+
+def test_main_defaults_to_five_steps(tmp_path, monkeypatch):
+    captured = []
+
+    def fake_run_case(case, *, run, steps, artifact_dir):
+        captured.append((case.case_id, run, steps, artifact_dir))
+        return br.RegressionResult(case=br.asdict(case), status="skipped")
+
+    monkeypatch.setattr(br, "run_case", fake_run_case)
+
+    rc = br.main(["--case", br.FIRST_MONTH_MATRIX[0].case_id, "--out", str(tmp_path)])
+
+    assert rc == 0
+    assert captured == [(br.FIRST_MONTH_MATRIX[0].case_id, False, 5, tmp_path)]
+
+
 def test_compare_artifacts_respects_recipe_tolerance():
     case = br.RegressionCase("m", "fp8", "single_gpu")
     base = {
