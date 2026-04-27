@@ -114,7 +114,7 @@ Real-model acceptance queue:
 
 - [x] Dense FP8 single-GPU: [`qwen3-lora-fp8.yaml`](examples/sft/qwen3/qwen3-lora-fp8.yaml). Passed 50-step regression runner validation with descriptor requirements present.
 - [x] Dense FP8 single-GPU: [`qwen35-text-lora-fp8.yaml`](examples/sft/qwen35/qwen35-text-lora-fp8.yaml). Passed 50-step regression runner validation with descriptor requirements present.
-- [ ] Dense FP8 single-GPU: [`gemma4-e2b-lora-fp8.yaml`](examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml).
+- [x] Dense FP8 single-GPU: [`gemma4-e2b-lora-fp8.yaml`](examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml). Passed 50-step regression runner validation with descriptor requirements present.
 - [ ] MoE acceptance: [`gptoss-lora-mxfp4.yaml`](examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml).
 - [ ] Multi-GPU pre-quant MoE acceptance: [`qwen36moe-lora-fp8.yaml`](examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml).
 
