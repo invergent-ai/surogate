@@ -198,6 +198,7 @@ Real-model acceptance queue:
 - [x] Regression block-schema summaries now expose Phase 5 hook-target coverage counts for before-consume prefetch, after-all-to-all communication, and after-reduce-scatter gradient/offload migration points.
 - [x] Runtime `BufferPlan` debug summaries now expose the same Phase 5 hook-target coverage counts from resolved schema layer summaries, keeping artifact-level and runtime-level diagnostics aligned.
 - [x] `DslModel` now owns an inert schema hook registry seeded from block-schema records for stream prefetch, all-to-all, and reduce-scatter targets; debug summaries report total and distribution-aware registrations without dispatching them in execution.
+- [x] Compiled LoRA slices now carry diagnostic schema-slot names inferred from their structural weight inputs, and descriptor summaries report LoRA slice/schema-slot coverage including grouped MoE slices.
 
 ---
 

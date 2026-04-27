@@ -51,10 +51,11 @@ std::string strip_ssa_suffix(const std::string& field);
 /// unknown (for dropout-seed hashing + error messages).
 struct LoRASlice {
     modules::LoRATargetId id = modules::LoRATargetId::Unknown;
-    std::string name;      ///< Raw target name; only read when id == Unknown or on error.
-    int offset = 0;        ///< Element offset on the output dim (0 for unfused).
-    int size = 0;          ///< Output slice size in elements (0 = full output dim).
-    bool grouped = false;  ///< True for MoE batched-expert LoRA (uses grouped GEMM path).
+    std::string name;         ///< Raw target name; only read when id == Unknown or on error.
+    std::string schema_slot;  ///< Structural BlockSchema param slot inferred from the weight name; diagnostics only.
+    int offset = 0;           ///< Element offset on the output dim (0 for unfused).
+    int size = 0;             ///< Output slice size in elements (0 = full output dim).
+    bool grouped = false;     ///< True for MoE batched-expert LoRA (uses grouped GEMM path).
 };
 
 class DslRunState;

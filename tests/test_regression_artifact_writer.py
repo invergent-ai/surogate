@@ -24,6 +24,8 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
             "matmul_fp4_forward_eligible_ops": 3,
             "moe_fp8_grouped_eligible_ops": 1,
             "moe_fp4_grouped_eligible_ops": 2,
+            "lora_slices": 3,
+            "lora_schema_slot_slices": 3,
             "name": "forward",
         },
         "backward": {
@@ -33,6 +35,9 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
             "matmul_fp4_backward_eligible_ops": 2,
             "moe_fp8_grouped_eligible_ops": 3,
             "moe_fp4_grouped_eligible_ops": 4,
+            "lora_slices": 2,
+            "lora_schema_slot_slices": 2,
+            "grouped_lora_schema_slot_slices": 1,
             "name": "backward",
         },
     }
@@ -50,6 +55,9 @@ def test_flatten_descriptor_summary_totals_fusion_candidates():
     assert flattened["matmul_fp4_backward_eligible_ops"] == 2
     assert flattened["moe_fp8_grouped_eligible_ops"] == 4
     assert flattened["moe_fp4_grouped_eligible_ops"] == 6
+    assert flattened["lora_slices"] == 5
+    assert flattened["lora_schema_slot_slices"] == 5
+    assert flattened["grouped_lora_schema_slot_slices"] == 1
 
 
 def test_flatten_arena_summary_keeps_top_level_graph_and_region_counts():

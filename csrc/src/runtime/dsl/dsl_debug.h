@@ -175,6 +175,9 @@ struct DebugGraphDescriptorSummary {
     std::uint64_t fp8_pending_tensors = 0;
     std::uint64_t fp8_ready_tensors = 0;
     std::uint64_t fp4_ready_tensors = 0;
+    std::uint64_t lora_slices = 0;
+    std::uint64_t lora_schema_slot_slices = 0;
+    std::uint64_t grouped_lora_schema_slot_slices = 0;
 };
 
 struct DebugDescriptorSummary {

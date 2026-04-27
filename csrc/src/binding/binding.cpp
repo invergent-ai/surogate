@@ -2029,6 +2029,9 @@ NB_MODULE(_surogate, m) {
                     d["fp8_pending_tensors"] = g.fp8_pending_tensors;
                     d["fp8_ready_tensors"] = g.fp8_ready_tensors;
                     d["fp4_ready_tensors"] = g.fp4_ready_tensors;
+                    d["lora_slices"] = g.lora_slices;
+                    d["lora_schema_slot_slices"] = g.lora_schema_slot_slices;
+                    d["grouped_lora_schema_slot_slices"] = g.grouped_lora_schema_slot_slices;
                     return d;
                 };
                 nb::dict r;

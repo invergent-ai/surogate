@@ -31,6 +31,15 @@ namespace dsl {
 
 namespace {
 
+std::string schema_slot_from_weight_name(std::string_view weight_name) {
+    const std::size_t dot = weight_name.rfind('.');
+    std::string_view slot = (dot == std::string_view::npos) ? weight_name : weight_name.substr(dot + 1);
+    if (!slot.empty() && slot.back() == '?') {
+        slot.remove_suffix(1);
+    }
+    return std::string(slot);
+}
+
 TensorRoleKind role_kind_from_tensor_kind(TensorKind kind) {
     switch (kind) {
         case TensorKind::ForwardParam: return TensorRoleKind::Param;
@@ -1027,6 +1036,7 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             if (slice.id == modules::LoRATargetId::Unknown) {
                 slice.name = t.name;
             }
+            slice.schema_slot = schema_slot_from_weight_name(weight_name);
             slice.offset = t.offset;
             slice.size = t.size;
             slice.grouped = t.grouped;
