@@ -99,7 +99,7 @@
 - [x] MoE grouped matmul recipe contexts now carry optional routed-token `TensorRole` metadata from compiled tensor records, preparing MoE capability-plus-role predicates without changing execution.
 - [x] Shared recipe predicate helpers now include a scaffolded MoE FP8 grouped check over `MoECapabilities` plus routed-token `TensorRole`.
 
-### Phase 4 — Block schemas + storage residency + EP topology — STARTED
+### Phase 4 — Block schemas + storage residency + EP topology — STARTED (4a complete, 4b started)
 
 - [x] Python DSL `BlockSchema` declaration surface added for slot residency, distribution, streaming hints, routing schema, and EP topology metadata.
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
@@ -563,6 +563,8 @@ Declare capabilities on every existing matmul-emitting and grouped-emitting op:
 
 #### 4a. Block schema contract (weeks 1–2)
 
+**Status: COMPLETE.** Python block schema declarations, standalone block serialization, model graph metadata, and C++ IR preservation are implemented for the current first-month acceptance families.
+
 ```python
 class NemotronHMamba2Block(nn.Block):
     schema = BlockSchema([
@@ -613,6 +615,8 @@ class NemotronHMoEBlock(nn.Block):
 The `RoutingSchema` and `EPTopology` declarations make per-architecture MoE differences (sigmoid vs softmax, shared experts present/absent, scoring bias, weight transfer) **structural**. Today this is implicit in op composition + recipe paths.
 
 #### 4b. BufferPlan migration (weeks 3–4)
+
+**Status: STARTED.** The C++ runtime now collects per-layer schema records and exposes an opt-in coverage parity guard; allocator decisions still use the legacy enum-driven `BufferPlan`.
 
 Parallel `BufferPlan` path consumes schemas. Old enum-driven path stays. Both run, allocation parity-checked.
 
