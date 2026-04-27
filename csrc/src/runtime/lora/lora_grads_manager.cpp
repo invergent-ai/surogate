@@ -23,9 +23,7 @@ ModularLoRAGradsManager::ModularLoRAGradsManager(const Config& config,
                                                  const std::shared_ptr<TensorAllocator>& allocator)
     : mConfig(config),
       mAllocator(allocator) {
-    if (const char* env = std::getenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH")) {
-        mSchemaHookDispatchEnabled = (std::string_view(env) == "1");
-    }
+    mSchemaHookDispatchEnabled = dsl::schema_hook_dispatch_enabled();
 
     mFullGrads.config = config.lora_config;
     mShardedGrads.config = config.lora_config;

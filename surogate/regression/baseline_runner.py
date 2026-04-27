@@ -750,6 +750,7 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
         add_required("forward_hook_schema_target_points")
     if not required:
         return "not_applicable", []
+    add_required("schema_hook_dispatch_enabled")
     if not metrics:
         return "unknown", required
     missing: list[str] = []

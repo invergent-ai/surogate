@@ -58,9 +58,7 @@ DslGradStore::DslGradStore(const DslParamStore& params,
       mCpuTraining(cpu_training),
       mOffloadAlloc(offload_alloc),
       mGradDtypeOverride(grad_dtype_override) {
-    if (const char* env = std::getenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH")) {
-        mSchemaHookDispatchEnabled = (std::string_view(env) == "1");
-    }
+    mSchemaHookDispatchEnabled = schema_hook_dispatch_enabled();
 
     if (!mAllocator) {
         throw std::runtime_error("DslGradStore: allocator is null");

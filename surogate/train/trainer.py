@@ -31,6 +31,13 @@ from surogate.utils.tensor import to_surogate_dtype
 logger = get_logger()
 
 
+def _schema_hook_dispatch_enabled() -> int:
+    value = os.environ.get("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH")
+    if value is None:
+        return 1
+    return int(value.lower() not in {"0", "false", "off"})
+
+
 def _percentile_summary(values: list[float]) -> dict[str, float]:
     if not values:
         return {}
@@ -154,7 +161,7 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "hook_after_all_to_all_targets": 0,
         "hook_after_all_reduce_targets": 0,
         "hook_after_reduce_scatter_targets": 0,
-        "schema_hook_dispatch_enabled": 0,
+        "schema_hook_dispatch_enabled": _schema_hook_dispatch_enabled(),
     }
     for module in root.get("modules", []):
         forward = module.get("forward") or {}

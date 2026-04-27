@@ -3,6 +3,7 @@
 //
 // Unit tests for DSL IR JSON loader + shape resolution.
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -772,4 +773,25 @@ TEST_CASE("Grouped MoE LoRA hook slots prefer structural activation slots") {
     op.outputs[0].name = "moe_gemm_0";
     REQUIRE(dsl::grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertGateUp, "legacy") == "legacy");
     REQUIRE(dsl::grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertDown, "expert_down").empty());
+}
+
+TEST_CASE("Schema hook dispatch defaults on with env opt-out") {
+    const char* previous = std::getenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH");
+    const std::string saved = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+
+    unsetenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH");
+    REQUIRE(dsl::schema_hook_dispatch_enabled());
+
+    setenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH", "0", 1);
+    REQUIRE_FALSE(dsl::schema_hook_dispatch_enabled());
+
+    setenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH", "1", 1);
+    REQUIRE(dsl::schema_hook_dispatch_enabled());
+
+    if (had_previous) {
+        setenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH", saved.c_str(), 1);
+    } else {
+        unsetenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH");
+    }
 }

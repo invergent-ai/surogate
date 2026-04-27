@@ -4,8 +4,8 @@
 // Phase 5 schema hook registry scaffold.
 //
 // Hooks are declared against structural block-schema slots instead of legacy
-// enum hook points. Dispatch remains opt-in while execution paths migrate from
-// imperative call sites to hook callbacks.
+// enum hook points. Dispatch is the default runtime path; imperative call sites
+// remain as compatibility fallbacks for graphs without structural metadata.
 
 #ifndef SUROGATE_SRC_RUNTIME_DSL_HOOK_REGISTRY_H
 #define SUROGATE_SRC_RUNTIME_DSL_HOOK_REGISTRY_H
@@ -43,6 +43,7 @@ enum class HookEventKind {
 };
 
 [[nodiscard]] const char* hook_event_name(HookEventKind event);
+[[nodiscard]] bool schema_hook_dispatch_enabled();
 
 struct HookTarget {
     std::string schema_id;

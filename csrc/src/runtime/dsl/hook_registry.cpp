@@ -4,6 +4,7 @@
 #include "runtime/dsl/hook_registry.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -91,6 +92,15 @@ const char* hook_event_name(HookEventKind event) {
         case HookEventKind::Unknown: return "unknown";
     }
     return "unknown";
+}
+
+bool schema_hook_dispatch_enabled() {
+    const char* value = std::getenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH");
+    if (!value) {
+        return true;
+    }
+    const std::string_view text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
 }
 
 void HookRegistry::register_hook(HookRegistration registration) {

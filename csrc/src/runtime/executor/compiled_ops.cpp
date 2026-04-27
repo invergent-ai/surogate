@@ -383,9 +383,7 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
       mEpStates(mEpStrategy->ep_states()),
       mLLEPStates(mEpStrategy->llep_states()),
       mEPLayerMeta(mEpStrategy->layer_meta()) {
-    if (const char* env = std::getenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH")) {
-        mSchemaHookDispatchEnabled = (std::string_view(env) == "1");
-    }
+    mSchemaHookDispatchEnabled = schema_hook_dispatch_enabled();
     // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);

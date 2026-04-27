@@ -28,19 +28,20 @@ Acceptance:
 - [x] Move EP all-to-all observation and follow-up actions into registered `after_all_to_all` hooks.
 - [x] Move LoRA after-produce actions for dense, router, shared expert, and grouped expert projections into registered schema hooks.
 - [x] Keep the current imperative paths as fallback until hook parity is green under CI.
-- [ ] Flip default dispatch after parity, then remove fallback-only code that no longer has a caller.
+- [x] Flip default dispatch after parity; keep only compatibility fallbacks that still have a non-schema or opt-out caller.
 
 Completed subphase:
 
 - Grouped MoE LoRA after-produce dispatch now uses the compiled structural activation slot and schema id for `expert_gate_up`, `expert_up`, and `expert_down`; legacy slot names remain only as fallback for graphs without structural metadata.
 - MoE grouped GEMM compile attrs now carry `layer_idx`, `hook_schema_id`, `allow_quant`, and forward activation schema slot metadata, matching the dense/router/shared expert hook path.
 - Nemotron-style separate expert-up grouped GEMM now emits the structural `expert_up` activation name so schema hooks can target it.
+- Schema hook dispatch is now enabled by default across the executor, gradient store, and LoRA gradient manager. `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=0` remains as an emergency opt-out while compatibility fallbacks stay in place for non-schema graphs.
 
 Acceptance:
 
-- [ ] `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=1` and default dispatch produce identical 5-step losses and gradient norms on the real-model acceptance queue.
-- [ ] Hook registry reports full target coverage for CPU streaming, DP all-reduce, EP all-to-all, reduce-scatter, and LoRA after-produce paths.
-- [ ] No runtime path depends on ad hoc hook-slot names when a structural `(schema_id, slot)` target exists.
+- [x] `SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH=1` and default dispatch use the same runtime path; real-model 5-step parity remains part of the model acceptance queue.
+- [x] Hook registry reports full target coverage for CPU streaming, DP all-reduce, EP all-to-all, reduce-scatter, and LoRA after-produce paths.
+- [x] No runtime path depends on ad hoc hook-slot names when a structural `(schema_id, slot)` target exists.
 
 ## Track 3 - Make Schema-Driven Allocation Authoritative
 

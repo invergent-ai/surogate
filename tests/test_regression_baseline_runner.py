@@ -176,6 +176,7 @@ def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
         "hook_registry_after_communication_registrations",
         "hook_after_all_to_all_targets",
         "hook_registry_after_all_to_all_registrations",
+        "schema_hook_dispatch_enabled",
     ]
 
 
@@ -204,6 +205,7 @@ def test_coverage_report_requires_reduce_scatter_hooks_for_sharded_distribution(
     assert report["rows"][0]["missing_hook_counts"] == [
         "hook_after_reduce_scatter_targets",
         "hook_registry_after_reduce_scatter_registrations",
+        "schema_hook_dispatch_enabled",
     ]
 
 
@@ -228,7 +230,7 @@ def test_coverage_report_requires_full_hook_structural_targets():
     report = br.coverage_report(results)
 
     assert report["rows"][0]["hook_readiness_status"] == "missing"
-    assert report["rows"][0]["missing_hook_counts"] == ["lora_schema_target_slices"]
+    assert report["rows"][0]["missing_hook_counts"] == ["lora_schema_target_slices", "schema_hook_dispatch_enabled"]
 
 
 def test_coverage_report_marks_descriptor_requirements_present():
