@@ -110,6 +110,8 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(tensor_role_is_lm_head_name("lm_head"));
         REQUIRE(tensor_role_is_lm_head_name("model.lm_head.weight"));
         REQUIRE_FALSE(tensor_role_is_lm_head_name("blocks[0].attn_out"));
+        REQUIRE(tensor_role_is_standalone_gate_name("gate_weight"));
+        REQUIRE_FALSE(tensor_role_is_standalone_gate_name("mlp_gate_weight"));
         REQUIRE(activation.ownership == TensorOwnership::Stack);
         REQUIRE_FALSE(activation.is_moe_owned());
         REQUIRE_FALSE(tensor_role_is_rope_name("blocks[0].attn_out"));

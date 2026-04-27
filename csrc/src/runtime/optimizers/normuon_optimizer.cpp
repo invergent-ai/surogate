@@ -52,7 +52,7 @@ bool is_normuon_param(const std::string& name, const Tensor& param) {
 
     // MoE router gates use AdamW (special case from study implementation).
     if (dsl::tensor_role_is_router_name(lower)) return false;
-    if (lower.find("gate") != std::string::npos && lower.find("mlp") == std::string::npos) return false;
+    if (dsl::tensor_role_is_standalone_gate_name(lower)) return false;
 
     return true;
 }

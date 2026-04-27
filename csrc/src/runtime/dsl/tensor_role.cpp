@@ -143,6 +143,10 @@ bool tensor_role_is_lm_head_name(std::string_view name) {
     return infer_tensor_role_from_name(name).ownership == TensorOwnership::LMHead;
 }
 
+bool tensor_role_is_standalone_gate_name(std::string_view name) {
+    return contains(name, "gate") && !contains(name, "mlp");
+}
+
 bool tensor_role_is_shared_expert_name(std::string_view name) {
     const TensorRole role = infer_tensor_role_from_name(name);
     return role.is_moe_owned() && contains(name, "shared_expert");

@@ -127,6 +127,9 @@ bool tensor_role_is_embedding_name(std::string_view name);
 /// Legacy-compatible LM-head tensor predicate derived from TensorRole.
 bool tensor_role_is_lm_head_name(std::string_view name);
 
+/// Standalone gate predicate for optimizer routing; excludes MLP gate weights.
+bool tensor_role_is_standalone_gate_name(std::string_view name);
+
 /// Legacy-compatible shared-expert tensor predicate derived from TensorRole.
 bool tensor_role_is_shared_expert_name(std::string_view name);
 

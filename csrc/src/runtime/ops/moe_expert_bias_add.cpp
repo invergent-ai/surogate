@@ -55,10 +55,10 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
         auto it_saved = mMoeSavedBuffers.find(key);
         std::string size_key = key;
         if (it_saved == mMoeSavedBuffers.end()) {
-            const std::string legacy_key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-            it_saved = mMoeSavedBuffers.find(legacy_key);
+            const std::string compat_key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+            it_saved = mMoeSavedBuffers.find(compat_key);
             if (it_saved != mMoeSavedBuffers.end()) {
-                size_key = legacy_key;
+                size_key = compat_key;
             }
         }
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
