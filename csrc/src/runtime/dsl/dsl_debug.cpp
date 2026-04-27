@@ -362,6 +362,7 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
                 s.hook_after_consume_targets += 1;
             }
             if (!is_param && slot.distribution_kind == "expert_parallel") {
+                s.hook_after_communication_targets += 1;
                 s.hook_after_all_to_all_targets += 1;
             }
             if (is_param && (slot.distribution_kind.empty() || slot.distribution_kind == "replicated" ||

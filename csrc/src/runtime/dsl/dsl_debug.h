@@ -234,6 +234,7 @@ struct DebugBufferPlanSummary {
     std::uint64_t hook_after_produce_targets = 0;
     std::uint64_t hook_before_consume_targets = 0;
     std::uint64_t hook_after_consume_targets = 0;
+    std::uint64_t hook_after_communication_targets = 0;
     std::uint64_t hook_after_all_to_all_targets = 0;
     std::uint64_t hook_after_all_reduce_targets = 0;
     std::uint64_t hook_after_reduce_scatter_targets = 0;

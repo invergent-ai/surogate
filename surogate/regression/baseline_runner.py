@@ -635,12 +635,14 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
         "hook_after_produce_targets": block_schema_summary.get("hook_after_produce_targets"),
         "hook_before_consume_targets": block_schema_summary.get("hook_before_consume_targets"),
         "hook_after_consume_targets": block_schema_summary.get("hook_after_consume_targets"),
+        "hook_after_communication_targets": block_schema_summary.get("hook_after_communication_targets"),
         "hook_after_all_to_all_targets": block_schema_summary.get("hook_after_all_to_all_targets"),
         "hook_after_all_reduce_targets": block_schema_summary.get("hook_after_all_reduce_targets"),
         "hook_after_reduce_scatter_targets": block_schema_summary.get("hook_after_reduce_scatter_targets"),
         "runtime_hook_after_produce_targets": buffer_plan_summary.get("hook_after_produce_targets"),
         "runtime_hook_before_consume_targets": buffer_plan_summary.get("hook_before_consume_targets"),
         "runtime_hook_after_consume_targets": buffer_plan_summary.get("hook_after_consume_targets"),
+        "runtime_hook_after_communication_targets": buffer_plan_summary.get("hook_after_communication_targets"),
         "runtime_hook_after_all_to_all_targets": buffer_plan_summary.get("hook_after_all_to_all_targets"),
         "runtime_hook_after_all_reduce_targets": buffer_plan_summary.get("hook_after_all_reduce_targets"),
         "runtime_hook_after_reduce_scatter_targets": buffer_plan_summary.get("hook_after_reduce_scatter_targets"),
@@ -730,6 +732,8 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
         add_required("hook_after_all_reduce_targets")
         add_required("hook_registry_after_all_reduce_registrations")
     if "ep" in str(case.get("distribution") or ""):
+        add_required("hook_after_communication_targets")
+        add_required("hook_registry_after_communication_registrations")
         add_required("hook_after_all_to_all_targets")
         add_required("hook_registry_after_all_to_all_registrations")
     distribution = str(case.get("distribution") or "")

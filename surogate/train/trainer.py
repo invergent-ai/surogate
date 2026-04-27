@@ -150,6 +150,7 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "hook_after_produce_targets": 0,
         "hook_before_consume_targets": 0,
         "hook_after_consume_targets": 0,
+        "hook_after_communication_targets": 0,
         "hook_after_all_to_all_targets": 0,
         "hook_after_all_reduce_targets": 0,
         "hook_after_reduce_scatter_targets": 0,
@@ -247,6 +248,7 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
                     summary["hook_before_consume_targets"] += 1
                     summary["hook_after_consume_targets"] += 1
                 if kind != "param" and distribution_kind == "expert_parallel":
+                    summary["hook_after_communication_targets"] += 1
                     summary["hook_after_all_to_all_targets"] += 1
                 if kind == "param" and distribution_kind in {None, "", "replicated", "router_replicated"}:
                     summary["hook_after_all_reduce_targets"] += 1

@@ -2095,6 +2095,7 @@ NB_MODULE(_surogate, m) {
                 d["hook_after_produce_targets"] = s.hook_after_produce_targets;
                 d["hook_before_consume_targets"] = s.hook_before_consume_targets;
                 d["hook_after_consume_targets"] = s.hook_after_consume_targets;
+                d["hook_after_communication_targets"] = s.hook_after_communication_targets;
                 d["hook_after_all_to_all_targets"] = s.hook_after_all_to_all_targets;
                 d["hook_after_all_reduce_targets"] = s.hook_after_all_reduce_targets;
                 d["hook_after_reduce_scatter_targets"] = s.hook_after_reduce_scatter_targets;

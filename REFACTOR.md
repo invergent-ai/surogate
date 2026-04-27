@@ -224,6 +224,7 @@ Real-model acceptance queue:
 - [x] Dense projection LoRA after-produce now has a typed hook payload; under opt-in schema dispatch, registered `after_produce` callbacks can own LoRA slice application for matmul and fused matmul+SwiGLU projections, with the inline path retained as fallback.
 - [x] EP token all-to-all now dispatches typed `after_all_to_all` / `after_communication` payloads at the actual token-A2A completion point inside `EPStrategy`, instead of from the outer op trampoline after all EP post-processing.
 - [x] ZeRO-2 reduced-shard accumulation now routes through the typed `after_reduce_scatter` hook payload under opt-in dispatch, with the existing imperative accumulation retained as fallback.
+- [x] Regression/runtime artifacts now expose `after_communication` hook target counts and EP hook readiness requires both generic communication and all-to-all hook coverage.
 
 ---
 

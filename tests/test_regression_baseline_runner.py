@@ -84,6 +84,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "hook_after_produce_targets": 2,
                     "hook_before_consume_targets": 4,
                     "hook_after_consume_targets": 4,
+                    "hook_after_communication_targets": 2,
                     "hook_after_all_to_all_targets": 2,
                     "hook_after_all_reduce_targets": 1,
                     "hook_after_reduce_scatter_targets": 2,
@@ -91,12 +92,13 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                 "buffer_plan_summary": {
                     "schema_record_count": 2,
                     "schema_expert_parallel_param_shape_savings_bytes": 1024,
-                    "hook_registry_registrations": 8,
+                    "hook_registry_registrations": 12,
                     "schema_hook_dispatch_enabled": 1,
                     "hook_registry_distribution_aware_registrations": 4,
                     "hook_registry_after_produce_registrations": 2,
                     "hook_registry_before_consume_registrations": 2,
                     "hook_registry_after_consume_registrations": 2,
+                    "hook_registry_after_communication_registrations": 2,
                     "hook_registry_after_all_reduce_registrations": 1,
                     "hook_registry_after_all_to_all_registrations": 2,
                     "hook_registry_after_reduce_scatter_registrations": 1,
@@ -124,16 +126,18 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["missing_hook_counts"] == []
     assert report["rows"][0]["hook_target_counts"]["hook_after_produce_targets"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_after_consume_targets"] == 4
+    assert report["rows"][0]["hook_target_counts"]["hook_after_communication_targets"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_after_all_to_all_targets"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_after_all_reduce_targets"] == 1
     assert report["rows"][0]["hook_target_counts"]["lora_schema_slot_slices"] == 2
     assert report["rows"][0]["hook_target_counts"]["lora_schema_target_slices"] == 2
     assert report["rows"][0]["hook_target_counts"]["forward_hook_schema_slot_points"] == 2
     assert report["rows"][0]["hook_target_counts"]["forward_hook_schema_target_points"] == 2
-    assert report["rows"][0]["hook_target_counts"]["hook_registry_registrations"] == 8
+    assert report["rows"][0]["hook_target_counts"]["hook_registry_registrations"] == 12
     assert report["rows"][0]["hook_target_counts"]["schema_hook_dispatch_enabled"] == 1
     assert report["rows"][0]["hook_target_counts"]["hook_registry_after_produce_registrations"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_registry_after_consume_registrations"] == 2
+    assert report["rows"][0]["hook_target_counts"]["hook_registry_after_communication_registrations"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_registry_after_all_to_all_registrations"] == 2
     assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
     assert report["rows"][0]["buffer_plan_summary"]["schema_expert_parallel_param_shape_savings_bytes"] == 1024
@@ -168,6 +172,8 @@ def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
         "hook_registry_after_consume_registrations",
         "hook_after_all_reduce_targets",
         "hook_registry_after_all_reduce_registrations",
+        "hook_after_communication_targets",
+        "hook_registry_after_communication_registrations",
         "hook_after_all_to_all_targets",
         "hook_registry_after_all_to_all_registrations",
     ]
