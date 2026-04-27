@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "runtime/dsl/fusion_rule_registry.h"
+#include "runtime/dsl/graph_compiler.h"
 
 namespace dsl {
 namespace {
@@ -121,6 +122,43 @@ TEST_CASE("built-in fusion rule declarations are registered inertly", "[fusion_r
         return rule->name == "matmul_bias";
     });
     REQUIRE(found != matmul_rules.end());
+}
+
+TEST_CASE("fusion contexts can be built from compiled op descriptors", "[fusion_rule]") {
+    CompiledOp matmul;
+    matmul.type = CompiledOpType::Matmul;
+    matmul.semantic_kind = OpSemanticKind::Dense;
+    matmul.comm_profile = CommunicationProfile{CommunicationKind::NoComm, false, 0};
+    matmul.default_caps = OpCapabilities{OpCapabilityDenseMatmul | OpCapabilityFp8Eligible};
+    matmul.storage_compat = StorageCompatibility{StorageCompatibilityGpuResident | StorageCompatibilityCpuPinnedStream};
+
+    CompiledOp bias_add;
+    bias_add.type = CompiledOpType::BiasAdd;
+    bias_add.semantic_kind = OpSemanticKind::Elementwise;
+    bias_add.comm_profile = CommunicationProfile{CommunicationKind::NoComm, false, 0};
+    bias_add.default_caps = OpCapabilities{OpCapabilityDenseMatmul};
+    bias_add.epilogue_support = EpilogueSupport{EpilogueSupportBias};
+
+    std::vector<CompiledOp> ops = {matmul, bias_add};
+    FusionContext ctx = make_fusion_context(ops, 0, 2);
+    REQUIRE(ctx.ops.size() == 2);
+    REQUIRE(ctx.ops[0].name == "matmul");
+    REQUIRE(ctx.ops[0].semantic_kind == OpSemanticKind::Dense);
+    REQUIRE(ctx.ops[0].caps.has(OpCapabilityDenseMatmul));
+    REQUIRE(ctx.ops[0].caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(ctx.ops[0].storage_compat.supports(StorageTier::CpuPinnedStream));
+    REQUIRE(ctx.ops[1].name == "bias_add");
+    REQUIRE(ctx.ops[1].epilogue_support.has(EpilogueSupportBias));
+    REQUIRE(ctx.all_no_comm());
+
+    const FusionRule* matmul_bias = FusionRuleRegistry::instance().find_by_name("matmul_bias");
+    REQUIRE(matmul_bias != nullptr);
+    REQUIRE(matmul_bias->pattern_matches(ctx));
+    REQUIRE(matmul_bias->matches(ctx));
+
+    FusionContext truncated = make_fusion_context(ops, 1, 4);
+    REQUIRE(truncated.ops.size() == 1);
+    REQUIRE_FALSE(matmul_bias->pattern_matches(truncated));
 }
 
 }  // namespace

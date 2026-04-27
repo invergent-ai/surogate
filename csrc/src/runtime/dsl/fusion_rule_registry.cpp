@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <utility>
 
+#include "runtime/dsl/graph_compiler.h"
+#include "runtime/executor/compiled_ops.h"
+
 namespace dsl {
 
 bool FusionContext::all_no_comm() const {
@@ -22,6 +25,48 @@ bool FusionContext::all_support_capability(std::uint32_t capability) const {
     return std::all_of(ops.begin(), ops.end(), [capability](const FusionOpView& op) {
         return op.caps.has(capability);
     });
+}
+
+bool FusionRule::pattern_matches(const FusionContext& ctx) const {
+    if (ctx.ops.size() != pattern.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        if (ctx.ops[i].name != pattern[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool FusionRule::matches(const FusionContext& ctx) const {
+    return pattern_matches(ctx) && eligible(ctx);
+}
+
+FusionOpView fusion_op_view_from_compiled(const CompiledOp& op) {
+    FusionOpView view;
+    view.name = op_type_to_string(op.type);
+    view.semantic_kind = op.semantic_kind;
+    view.distribution_kind = op.distribution_kind;
+    view.comm_profile = op.comm_profile;
+    view.grouped_semantics = op.grouped_semantics;
+    view.caps = op.default_caps;
+    view.epilogue_support = op.epilogue_support;
+    view.storage_compat = op.storage_compat;
+    return view;
+}
+
+FusionContext make_fusion_context(const std::vector<CompiledOp>& ops, std::size_t start, std::size_t count) {
+    FusionContext ctx;
+    if (start >= ops.size() || count == 0) {
+        return ctx;
+    }
+    const std::size_t end = std::min(ops.size(), start + count);
+    ctx.ops.reserve(end - start);
+    for (std::size_t i = start; i < end; ++i) {
+        ctx.ops.push_back(fusion_op_view_from_compiled(ops[i]));
+    }
+    return ctx;
 }
 
 FusionRuleRegistry& FusionRuleRegistry::instance() {

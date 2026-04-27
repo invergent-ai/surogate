@@ -4,6 +4,7 @@
 #ifndef SUROGATE_SRC_RUNTIME_DSL_FUSION_RULE_REGISTRY_H
 #define SUROGATE_SRC_RUNTIME_DSL_FUSION_RULE_REGISTRY_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -13,6 +14,8 @@
 #include "runtime/executor/op_descriptor_types.h"
 
 namespace dsl {
+
+struct CompiledOp;
 
 struct FusionOpView {
     std::string name;
@@ -42,10 +45,18 @@ struct FusionRule {
     int priority = 0;
     bool comm_aware = true;
 
+    [[nodiscard]] bool pattern_matches(const FusionContext& ctx) const;
+
     [[nodiscard]] bool eligible(const FusionContext& ctx) const {
         return eligible_fn == nullptr || eligible_fn(ctx);
     }
+
+    [[nodiscard]] bool matches(const FusionContext& ctx) const;
 };
+
+[[nodiscard]] FusionOpView fusion_op_view_from_compiled(const CompiledOp& op);
+[[nodiscard]] FusionContext
+make_fusion_context(const std::vector<CompiledOp>& ops, std::size_t start, std::size_t count);
 
 class FusionRuleRegistry {
 public:
