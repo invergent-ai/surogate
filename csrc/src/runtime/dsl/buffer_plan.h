@@ -50,6 +50,9 @@ struct BlockSchemaSlotSummary {
     std::string distribution_kind;
     int shape_rank = 0;
     std::vector<std::string> shape_dims;
+    bool shape_resolved = false;
+    std::vector<long> resolved_shape;
+    long resolved_numel = 0;
     bool grouped = false;
     bool save_for_backward = false;
     int streaming_prefetch_distance = -1;
@@ -116,6 +119,8 @@ struct BlockSchemaLayerSummary {
     int nvme_offload_slots = 0;
     int registry_registered_activation_slots = 0;
     int registry_missing_activation_slots = 0;
+    int resolved_activation_shape_slots = 0;
+    int unresolved_activation_shape_slots = 0;
     std::vector<BlockSchemaSlotSummary> slots;
     std::string routing_kind;
     int routing_topk = -1;
@@ -204,6 +209,8 @@ struct BufferPlan {
     int schema_nvme_offload_slots = 0;
     int schema_registry_registered_activation_slots = 0;
     int schema_registry_missing_activation_slots = 0;
+    int schema_resolved_activation_shape_slots = 0;
+    int schema_unresolved_activation_shape_slots = 0;
     int schema_scoring_bias_routing_layers = 0;
     int schema_shared_expert_routing_layers = 0;
     int schema_weight_transfer_layers = 0;

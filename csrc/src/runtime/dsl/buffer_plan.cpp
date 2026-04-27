@@ -107,6 +107,83 @@ namespace {
     return BlockSchemaFamilyKind::Unknown;
 }
 
+[[nodiscard]] bool parse_positive_long(std::string_view token, long& out) {
+    if (token.empty()) {
+        return false;
+    }
+    long value = 0;
+    for (const char ch : token) {
+        if (!std::isdigit(static_cast<unsigned char>(ch))) {
+            return false;
+        }
+        value = value * 10 + static_cast<long>(ch - '0');
+    }
+    out = value;
+    return true;
+}
+
+[[nodiscard]] bool resolve_schema_dim_token(const BufferPlan& plan,
+                                            const BlockSchemaLayerSummary& layer,
+                                            std::string_view token,
+                                            long& out) {
+    if (parse_positive_long(token, out)) {
+        return true;
+    }
+    const bool moe_layer = layer.family_kind == BlockSchemaFamilyKind::MoE;
+    const long layer_m = moe_layer && plan.MoeM > 0 ? plan.MoeM : plan.layer_intermediate(layer.layer);
+    const long layer_m_up = moe_layer && plan.MoeMUp > 0 ? plan.MoeMUp : plan.layer_mlp_up(layer.layer);
+    if (token == "B") {
+        out = plan.B;
+    } else if (token == "T") {
+        out = plan.T;
+    } else if (token == "C") {
+        out = plan.C;
+    } else if (token == "QKV") {
+        out = plan.layer_qkv(layer.layer);
+    } else if (token == "AttnDim" || token == "QProjDim") {
+        out = plan.layer_attn_dim(layer.layer);
+    } else if (token == "M") {
+        out = layer_m;
+    } else if (token == "2M" || token == "MUp") {
+        out = layer_m_up;
+    } else if (token == "E") {
+        out = plan.NumExperts;
+    } else if (token == "TopK") {
+        out = plan.TopK;
+    } else if (token == "Hq") {
+        out = plan.Hq;
+    } else if (token == "Hkv") {
+        out = plan.Hkv;
+    } else {
+        return false;
+    }
+    return out > 0;
+}
+
+[[nodiscard]] bool
+resolve_schema_slot_shape(const BufferPlan& plan, const BlockSchemaLayerSummary& layer, BlockSchemaSlotSummary& slot) {
+    if (slot.shape_dims.empty()) {
+        return false;
+    }
+    slot.resolved_shape.clear();
+    slot.resolved_shape.reserve(slot.shape_dims.size());
+    long numel = 1;
+    for (const auto& dim : slot.shape_dims) {
+        long resolved = 0;
+        if (!resolve_schema_dim_token(plan, layer, dim, resolved)) {
+            slot.resolved_shape.clear();
+            slot.resolved_numel = 0;
+            slot.shape_resolved = false;
+            return false;
+        }
+        slot.resolved_shape.push_back(resolved);
+        numel *= resolved;
+    }
+    slot.resolved_numel = numel;
+    slot.shape_resolved = true;
+    return true;
+}
+
 }  // namespace
 
 std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph) {
@@ -425,6 +502,24 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 layer.ep_weight_transfer_eligible = record.ep_weight_transfer_eligible;
                 layer.has_routing = record.has_routing;
                 layer.has_ep_topology = record.has_ep_topology;
+            }
+        }
+    }
+    for (auto& layer : p.schema_layers) {
+        if (!layer.has_schema) {
+            continue;
+        }
+        for (auto& slot : layer.slots) {
+            const bool resolved = resolve_schema_slot_shape(p, layer, slot);
+            if (slot.kind == "param") {
+                continue;
+            }
+            if (resolved) {
+                ++layer.resolved_activation_shape_slots;
+                ++p.schema_resolved_activation_shape_slots;
+            } else {
+                ++layer.unresolved_activation_shape_slots;
+                ++p.schema_unresolved_activation_shape_slots;
             }
         }
     }

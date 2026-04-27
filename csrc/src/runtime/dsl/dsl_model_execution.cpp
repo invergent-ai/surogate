@@ -299,6 +299,10 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                   << initial_plan.schema_registry_registered_activation_slots
                   << ", block_schema_registry_missing_activation_slots="
                   << initial_plan.schema_registry_missing_activation_slots
+                  << ", block_schema_resolved_activation_shape_slots="
+                  << initial_plan.schema_resolved_activation_shape_slots
+                  << ", block_schema_unresolved_activation_shape_slots="
+                  << initial_plan.schema_unresolved_activation_shape_slots
                   << ", block_schema_scoring_bias_layers=" << initial_plan.schema_scoring_bias_routing_layers
                   << ", block_schema_shared_expert_layers=" << initial_plan.schema_shared_expert_routing_layers
                   << ", block_schema_weight_transfer_layers=" << initial_plan.schema_weight_transfer_layers
