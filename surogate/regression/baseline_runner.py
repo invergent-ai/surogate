@@ -1,4 +1,4 @@
-"""First-month refactor regression baseline runner.
+"""Refactor regression baseline runner.
 
 This module intentionally keeps execution policy simple: it records structured
 JSON artifacts for known model/recipe/distribution cases, compares runs against
@@ -223,7 +223,7 @@ def _case_path(case: RegressionCase, directory: Path) -> Path:
 
 def _missing_reason(case: RegressionCase) -> str | None:
     if not case.supported:
-        return "unsupported in first-month matrix"
+        return "unsupported in regression matrix"
     if case.config and not (REPO_ROOT / case.config).exists():
         return f"config not found: {case.config}"
     return None
@@ -627,6 +627,27 @@ def matmul_capability_counts(descriptor_summary: dict[str, Any]) -> dict[str, An
     return {key: descriptor_summary.get(key) for key in keys}
 
 
+def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
+    descriptor_summary = metrics.get("descriptor_summary") or {}
+    block_schema_summary = metrics.get("block_schema_summary") or {}
+    buffer_plan_summary = metrics.get("buffer_plan_summary") or {}
+    return {
+        "hook_before_consume_targets": block_schema_summary.get("hook_before_consume_targets"),
+        "hook_after_all_to_all_targets": block_schema_summary.get("hook_after_all_to_all_targets"),
+        "hook_after_reduce_scatter_targets": block_schema_summary.get("hook_after_reduce_scatter_targets"),
+        "runtime_hook_before_consume_targets": buffer_plan_summary.get("hook_before_consume_targets"),
+        "runtime_hook_after_all_to_all_targets": buffer_plan_summary.get("hook_after_all_to_all_targets"),
+        "runtime_hook_after_reduce_scatter_targets": buffer_plan_summary.get("hook_after_reduce_scatter_targets"),
+        "hook_registry_registrations": buffer_plan_summary.get("hook_registry_registrations"),
+        "hook_registry_distribution_aware_registrations": buffer_plan_summary.get(
+            "hook_registry_distribution_aware_registrations"
+        ),
+        "lora_slices": descriptor_summary.get("lora_slices"),
+        "lora_schema_slot_slices": descriptor_summary.get("lora_schema_slot_slices"),
+        "grouped_lora_schema_slot_slices": descriptor_summary.get("grouped_lora_schema_slot_slices"),
+    }
+
+
 def descriptor_count_requirements_for_case(case: dict[str, Any]) -> list[str]:
     if not case.get("supported", True):
         return []
@@ -656,6 +677,30 @@ def descriptor_requirement_status(case: dict[str, Any], descriptor_summary: dict
     if not descriptor_summary:
         return "unknown", required_counts
     missing = [key for key in required_counts if int(descriptor_summary.get(key) or 0) <= 0]
+    return ("present" if not missing else "missing"), missing
+
+
+def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tuple[str, list[str]]:
+    counts = hook_target_counts(metrics)
+    required: list[str] = []
+    if case.get("storage") == "cpu_stream":
+        required.append("hook_before_consume_targets")
+    if "ep" in str(case.get("distribution") or ""):
+        required.append("hook_after_all_to_all_targets")
+    if int(counts.get("lora_slices") or 0) > 0:
+        required.append("lora_schema_slot_slices")
+    if not required:
+        return "not_applicable", []
+    if not metrics:
+        return "unknown", required
+    missing: list[str] = []
+    for key in required:
+        value = int(counts.get(key) or 0)
+        if key == "lora_schema_slot_slices":
+            if value < int(counts.get("lora_slices") or 0):
+                missing.append(key)
+        elif value <= 0:
+            missing.append(key)
     return ("present" if not missing else "missing"), missing
 
 
@@ -702,6 +747,7 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         descriptor_summary = metrics.get("descriptor_summary") or {}
         block_schema_summary = metrics.get("block_schema_summary") or {}
         descriptor_status, missing_descriptor_counts = descriptor_requirement_status(case, descriptor_summary)
+        hook_status, missing_hook_counts = hook_readiness_status(case, metrics)
         is_quant = recipe in {"fp8", "fp4"}
         if is_quant and case.get("supported", True):
             eligible += 1
@@ -726,6 +772,9 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "block_schema_status": block_schema_status(block_schema_summary),
                 "storage_declaration_status": storage_declaration_status(case, block_schema_summary),
                 "ep_topology_status": ep_topology_status(case, block_schema_summary),
+                "hook_readiness_status": hook_status,
+                "missing_hook_counts": missing_hook_counts,
+                "hook_target_counts": hook_target_counts(metrics),
                 "block_schema_summary": block_schema_summary,
                 "buffer_plan_summary": metrics.get("buffer_plan_summary") or {},
             }
@@ -793,7 +842,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--update-baseline", action="store_true")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--report", action="store_true")
-    parser.add_argument("--list-cases", action="store_true", help="Print the first-month matrix and exit")
+    parser.add_argument("--list-cases", action="store_true", help="Print the regression matrix and exit")
     args = parser.parse_args(argv)
 
     if args.list_cases:

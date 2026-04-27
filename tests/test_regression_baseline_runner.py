@@ -43,6 +43,8 @@ def test_coverage_report_counts_supported_quant_rows(tmp_path):
         "matmul_fp8_forward_eligible_ops",
         "matmul_fp8_backward_eligible_ops",
     ]
+    assert report["rows"][0]["hook_readiness_status"] == "not_applicable"
+    assert report["rows"][0]["missing_hook_counts"] == []
     assert report["rows"][1]["descriptor_requirement_status"] == "not_applicable"
     assert report["rows"][1]["missing_descriptor_counts"] == []
     assert json.dumps(report)
@@ -63,6 +65,9 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "fusion_candidate_starts": 3,
                     "forward_matmul_fp8_forward_eligible_ops": 4,
                     "backward_matmul_fp8_backward_eligible_ops": 4,
+                    "lora_slices": 2,
+                    "lora_schema_slot_slices": 2,
+                    "grouped_lora_schema_slot_slices": 2,
                 },
                 "block_schema_summary": {
                     "block_schema_records": 2,
@@ -71,10 +76,15 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "block_schema_moe_layers": 2,
                     "block_schema_ep_layers": 2,
                     "block_schema_auto_resident_slots": 4,
+                    "hook_before_consume_targets": 4,
+                    "hook_after_all_to_all_targets": 2,
+                    "hook_after_reduce_scatter_targets": 2,
                 },
                 "buffer_plan_summary": {
                     "schema_record_count": 2,
                     "schema_expert_parallel_param_shape_savings_bytes": 1024,
+                    "hook_registry_registrations": 8,
+                    "hook_registry_distribution_aware_registrations": 4,
                 },
             },
         }
@@ -95,6 +105,11 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["block_schema_status"] == "present"
     assert report["rows"][0]["storage_declaration_status"] == "present"
     assert report["rows"][0]["ep_topology_status"] == "present"
+    assert report["rows"][0]["hook_readiness_status"] == "present"
+    assert report["rows"][0]["missing_hook_counts"] == []
+    assert report["rows"][0]["hook_target_counts"]["hook_after_all_to_all_targets"] == 2
+    assert report["rows"][0]["hook_target_counts"]["lora_schema_slot_slices"] == 2
+    assert report["rows"][0]["hook_target_counts"]["hook_registry_registrations"] == 8
     assert report["rows"][0]["block_schema_summary"]["block_schema_moe_layers"] == 2
     assert report["rows"][0]["buffer_plan_summary"]["schema_expert_parallel_param_shape_savings_bytes"] == 1024
 
@@ -120,6 +135,11 @@ def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
     assert report["rows"][0]["block_schema_status"] == "present"
     assert report["rows"][0]["storage_declaration_status"] == "missing"
     assert report["rows"][0]["ep_topology_status"] == "missing"
+    assert report["rows"][0]["hook_readiness_status"] == "missing"
+    assert report["rows"][0]["missing_hook_counts"] == [
+        "hook_before_consume_targets",
+        "hook_after_all_to_all_targets",
+    ]
 
 
 def test_coverage_report_marks_descriptor_requirements_present():
