@@ -880,6 +880,9 @@ def _inline_stacked_blocks(
     ) -> None:
         if block_spec.schema is None:
             return
+        errors = block_spec.schema.contract_errors()
+        if errors:
+            raise DSLSyntaxError(f"invalid block schema for {block_spec.name}: {'; '.join(errors)}")
         block_schema_records.append(
             {
                 "layer": layer_idx,
@@ -1801,6 +1804,9 @@ def compile_block_spec(
         config=config,
     )
     if spec.schema:
+        errors = spec.schema.contract_errors()
+        if errors:
+            raise DSLSyntaxError(f"invalid block schema for {spec.name}: {'; '.join(errors)}")
         ir.block_schema = asdict(spec.schema)
 
     # Create instance first so we can build dim_map for param resolution

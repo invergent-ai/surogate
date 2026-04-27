@@ -100,7 +100,7 @@
 - [x] MoE grouped matmul recipe contexts now carry optional routed-token `TensorRole` metadata from compiled tensor records, preparing MoE capability-plus-role predicates without changing execution.
 - [x] Shared recipe predicate helpers now include a scaffolded MoE FP8 grouped check over `MoECapabilities` plus routed-token `TensorRole`.
 
-### Phase 4 — Block schemas + storage residency + EP topology — STARTED (4a/4b complete, 4c started)
+### Phase 4 — Block schemas + storage residency + EP topology — STARTED (4a/4b/4c complete, 4d not started)
 
 - [x] Python DSL `BlockSchema` declaration surface added for slot residency, distribution, streaming hints, routing schema, and EP topology metadata.
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
@@ -153,6 +153,7 @@
 - [x] No-GPU schema coverage now fails if any Python block class lacks a `BlockSchema` declaration.
 - [x] `BufferPlan` now resolves Nemotron/Mamba schema dimension aliases (`P`, `I`, `D_conv`, `H`, `D`, `N`) from DSL runtime config.
 - [x] `BufferPlan` now reports explicit expert-parallel parameter global/local/savings bytes, exposing the per-rank allocation target separately from replicated parameter bytes.
+- [x] Phase 4c block-family migration completed for current Python block classes with schema contract validation in both compiler lowering paths. All block schemas now require family metadata, unique shaped slots, and MoE-specific routing/EP/grouped expert declarations.
 
 Local validation status:
 
@@ -259,7 +260,7 @@ Phase 0: Test infrastructure first-month slice                COMPLETE
 Phase 1: TensorRole + Distribution scaffolding                COMPLETE
 Phase 2: Op registry descriptor extension scaffold            COMPLETE
 Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
-Phase 4: Block schemas + storage residency + EP topology      STARTED (4a/4b complete)
+Phase 4: Block schemas + storage residency + EP topology      STARTED (4a/4b/4c complete)
 Phase 5: Hook registry + distribution-aware + CPU offload     NOT STARTED
 ```
 

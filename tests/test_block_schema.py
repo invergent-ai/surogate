@@ -3,13 +3,27 @@ import json
 from pathlib import Path
 
 from surogate.dsl.block_schema import BlockSchema, DistributionDecl
-from surogate.dsl.blocks.gemma4 import Gemma4FullMoEBlock, Gemma4SharedKVBlock, Gemma4SlidingBlock
+from surogate.dsl.blocks.gemma4 import (
+    Gemma4FullBlock,
+    Gemma4FullMoEBlock,
+    Gemma4SharedKVBlock,
+    Gemma4SlidingBlock,
+    Gemma4SlidingMoEBlock,
+)
 from surogate.dsl.blocks.gpt_oss import GptOssBlock
-from surogate.dsl.blocks.nemotron_h import NemotronHMamba2Block, NemotronHMoEBlock
+from surogate.dsl.blocks.llama import LlamaBlock
+from surogate.dsl.blocks.nemotron_h import (
+    NemotronHAttentionBlock,
+    NemotronHMamba2Block,
+    NemotronHMLPBlock,
+    NemotronHMoEBlock,
+)
 from surogate.dsl.blocks.qwen3 import Qwen3Block
 from surogate.dsl.blocks.qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
 from surogate.dsl.blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
 from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
+from surogate.dsl.blocks.qwen3_vl import Qwen3VLBlock
+from surogate.dsl.errors import DSLSyntaxError
 from surogate.dsl.py_lowering import lower_block_spec
 from surogate.dsl.py_compiler import _module_ir_to_dict, compile_block_spec, compile_model
 
@@ -153,6 +167,73 @@ def test_all_python_block_classes_declare_schema_metadata():
                 missing.append(f"{path.name}:{node.name}")
 
     assert missing == []
+
+
+def test_all_python_block_schemas_satisfy_phase4_contract():
+    block_classes = (
+        Gemma4FullBlock,
+        Gemma4FullMoEBlock,
+        Gemma4SharedKVBlock,
+        Gemma4SlidingBlock,
+        Gemma4SlidingMoEBlock,
+        GptOssBlock,
+        LlamaBlock,
+        NemotronHAttentionBlock,
+        NemotronHMamba2Block,
+        NemotronHMLPBlock,
+        NemotronHMoEBlock,
+        Qwen3Block,
+        Qwen3_5AttentionBlock,
+        Qwen3_5LinearBlock,
+        Qwen3_5MoEAttentionBlock,
+        Qwen3_5MoELinearBlock,
+        Qwen3MoEBlock,
+        Qwen3VLBlock,
+    )
+
+    failures = {cls.__name__: cls.schema.contract_errors() for cls in block_classes}
+
+    assert failures == {cls.__name__: () for cls in block_classes}
+
+
+def test_block_schema_contract_rejects_incomplete_moe_schema():
+    schema = BlockSchema(attrs={"block_family": "broken_moe"})
+
+    errors = schema.contract_errors()
+
+    assert "MoE schema 'broken_moe' must declare routing metadata" in errors
+    assert "MoE schema 'broken_moe' must declare EP topology metadata" in errors
+    assert "MoE schema 'broken_moe' must declare grouped expert-parallel param slots" in errors
+
+
+def test_block_compiler_rejects_invalid_schema_contract():
+    spec = Qwen3Block(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+    ).compile()
+    spec.schema = BlockSchema(attrs={"block_family": "broken_moe"})
+
+    try:
+        compile_block_spec(
+            spec,
+            {
+                "d_model": 256,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "head_size": 64,
+                "d_ff": 512,
+                "max_seq": 2048,
+            },
+        )
+    except DSLSyntaxError as exc:
+        assert "invalid block schema for Qwen3Block" in str(exc)
+        assert "broken_moe" in str(exc)
+    else:
+        raise AssertionError("expected invalid block schema to fail compilation")
 
 
 def test_nemotron_mamba_schema_attaches_to_block_spec():

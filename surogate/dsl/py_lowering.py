@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from .errors import DSLSyntaxError
 from .graph_builder import GraphBuilder, GraphNode
 from .ir import (
     CompilationContext,
@@ -164,6 +165,9 @@ class SpecLowerer:
             extends=spec.extends,
         )
         if spec.schema:
+            errors = spec.schema.contract_errors()
+            if errors:
+                raise DSLSyntaxError(f"invalid block schema for {spec.name}: {'; '.join(errors)}")
             ir.block_schema = asdict(spec.schema)
 
         # Lower parameters

@@ -89,3 +89,46 @@ class BlockSchema:
             if slot.name == name:
                 return slot
         return None
+
+    def contract_errors(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        block_family = self.attrs.get("block_family")
+        if not isinstance(block_family, str) or not block_family:
+            errors.append("schema attrs.block_family must be a non-empty string")
+
+        seen_slots: set[str] = set()
+        for slot in self.slots:
+            if not slot.name:
+                errors.append("schema slots must have non-empty names")
+            elif slot.name in seen_slots:
+                errors.append(f"duplicate schema slot '{slot.name}'")
+            seen_slots.add(slot.name)
+            if not slot.shape:
+                errors.append(f"schema slot '{slot.name}' must declare a non-empty shape")
+
+        family = block_family.lower() if isinstance(block_family, str) else ""
+        is_moe = "moe" in family
+        if is_moe:
+            if self.routing is None or self.routing.kind == "none":
+                errors.append(f"MoE schema '{block_family}' must declare routing metadata")
+            if self.ep_topology is None:
+                errors.append(f"MoE schema '{block_family}' must declare EP topology metadata")
+            grouped_expert_params = [
+                slot
+                for slot in self.slots
+                if slot.kind == "param" and slot.grouped and slot.distribution.kind == "expert_parallel"
+            ]
+            if not grouped_expert_params:
+                errors.append(f"MoE schema '{block_family}' must declare grouped expert-parallel param slots")
+            router = self.get_slot("router_weight")
+            if router is not None and router.distribution.kind != "router_replicated":
+                errors.append(f"MoE schema '{block_family}' router_weight must be router_replicated")
+        elif self.routing is not None and self.routing.kind != "none":
+            errors.append(f"non-MoE schema '{block_family}' must not declare routing metadata")
+
+        return tuple(errors)
+
+    def validate_contract(self) -> None:
+        errors = self.contract_errors()
+        if errors:
+            raise ValueError("; ".join(errors))
