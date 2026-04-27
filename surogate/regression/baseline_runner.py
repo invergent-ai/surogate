@@ -727,11 +727,11 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
     if int(counts.get("lora_slices") or 0) > 0:
         add_required("hook_after_produce_targets")
         add_required("hook_registry_after_produce_registrations")
-        add_required("lora_schema_slot_slices")
+        add_required("lora_schema_target_slices")
     if int(counts.get("forward_hook_points") or 0) > 0:
         add_required("hook_after_produce_targets")
         add_required("hook_registry_after_produce_registrations")
-        add_required("forward_hook_schema_slot_points")
+        add_required("forward_hook_schema_target_points")
     if not required:
         return "not_applicable", []
     if not metrics:
@@ -739,10 +739,10 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
     missing: list[str] = []
     for key in required:
         value = int(counts.get(key) or 0)
-        if key == "lora_schema_slot_slices":
+        if key == "lora_schema_slot_slices" or key == "lora_schema_target_slices":
             if value < int(counts.get("lora_slices") or 0):
                 missing.append(key)
-        elif key == "forward_hook_schema_slot_points":
+        elif key == "forward_hook_schema_slot_points" or key == "forward_hook_schema_target_points":
             if value < int(counts.get("forward_hook_points") or 0):
                 missing.append(key)
         elif value <= 0:

@@ -207,6 +207,7 @@ Real-model acceptance queue:
 - [x] Runtime and coverage artifacts now expose hook-registry registration counts per event, so Phase 5 readiness can distinguish LoRA after-produce, CPU prefetch, DP all-reduce, EP all-to-all, and reduce-scatter scaffolding.
 - [x] North-star hook readiness now requires both schema hook targets and seeded hook-registry registrations for CPU streaming, DP all-reduce, EP all-to-all, and after-produce LoRA/forward-hook paths.
 - [x] Compiled hook metadata now carries schema ids alongside schema slots for LoRA and legacy forward-hook attrs, with descriptor artifacts reporting full structural `(schema_id, slot)` target coverage.
+- [x] Hook readiness now checks full structural target parity for LoRA slices and legacy forward-hook attrs, not only slot-name parity.
 
 ---
 

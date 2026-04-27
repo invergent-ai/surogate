@@ -165,6 +165,30 @@ def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
     ]
 
 
+def test_coverage_report_requires_full_hook_structural_targets():
+    case = br.RegressionCase("m", "fp8", "single_gpu")
+    results = {
+        case.case_id: {
+            "case": br.asdict(case),
+            "status": "passed",
+            "metrics": {
+                "descriptor_summary": {
+                    "lora_slices": 2,
+                    "lora_schema_slot_slices": 2,
+                    "lora_schema_target_slices": 1,
+                },
+                "block_schema_summary": {"hook_after_produce_targets": 1},
+                "buffer_plan_summary": {"hook_registry_after_produce_registrations": 1},
+            },
+        }
+    }
+
+    report = br.coverage_report(results)
+
+    assert report["rows"][0]["hook_readiness_status"] == "missing"
+    assert report["rows"][0]["missing_hook_counts"] == ["lora_schema_target_slices"]
+
+
 def test_coverage_report_marks_descriptor_requirements_present():
     case = br.RegressionCase("m", "fp8", "single_gpu")
     results = {
