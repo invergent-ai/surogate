@@ -22,9 +22,6 @@ namespace dsl {
 
 void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     mEpStrategy->dispatch_forward(*this, op);
-    const int layer_idx = schema_hook_layer_idx(op);
-    dispatch_schema_layer_hooks(HookEventKind::AfterAllToAll, layer_idx);
-    dispatch_schema_layer_hooks(HookEventKind::AfterCommunication, layer_idx);
 }
 
 void CompiledExecutor::dispatch_ep_dispatch_backward(const CompiledOp& op) {

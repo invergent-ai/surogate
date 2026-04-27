@@ -1160,6 +1160,15 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
     void* recv_hidden_ptr = nullptr;
     std::size_t recv_hidden_bytes = 0;
     Tensor recv_hidden = run_token_a2a(exec, ctx, *send_ptr, recv_hidden_ptr, recv_hidden_bytes);
+    dsl::CommunicationHookPayload comm_payload;
+    comm_payload.send_tensor = send_ptr;
+    comm_payload.recv_tensor = &recv_hidden;
+    comm_payload.ep_size = ctx.ep_size;
+    comm_payload.total_send = ctx.total_send;
+    comm_payload.total_recv = ctx.total_recv;
+    comm_payload.token_all_to_all_completed = true;
+    exec.dispatch_schema_layer_hooks(dsl::HookEventKind::AfterAllToAll, ctx.layer_idx, &comm_payload);
+    exec.dispatch_schema_layer_hooks(dsl::HookEventKind::AfterCommunication, ctx.layer_idx, &comm_payload);
 
     // Build recv-side merged IDs, re-permute, and persist send_order / recv_reorder.
     Tensor sorted_recv;

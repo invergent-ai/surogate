@@ -20,6 +20,7 @@
 #include "runtime/dsl/buffer_plan.h"
 
 class NCCLCommunicator;
+struct Tensor;
 
 namespace dsl {
 
@@ -86,6 +87,17 @@ struct GradientOffloadHookPayload {
     cudaEvent_t sync_event = nullptr;
     bool capturing = false;
     bool offloaded = false;
+};
+
+struct CommunicationHookPayload {
+    const Tensor* send_tensor = nullptr;
+    const Tensor* recv_tensor = nullptr;
+    int ep_size = 1;
+    int total_send = 0;
+    int total_recv = 0;
+    bool token_all_to_all_completed = false;
+    bool after_all_to_all_observed = false;
+    bool after_communication_observed = false;
 };
 
 using HookCallback = std::function<void(HookContext&)>;

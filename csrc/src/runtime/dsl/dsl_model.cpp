@@ -1188,7 +1188,23 @@ DslModel::DslModel(const PretrainedConfig& config,
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllToAll)) {
-            mHookRegistry.on_after_all_to_all(target, "schema_after_all_to_all");
+            mHookRegistry.on_after_all_to_all(target, "schema_after_all_to_all", [](HookContext& context) {
+                auto* payload = static_cast<CommunicationHookPayload*>(context.payload);
+                if (!payload || !payload->token_all_to_all_completed) {
+                    return;
+                }
+                payload->after_all_to_all_observed = true;
+            });
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterCommunication)) {
+            mHookRegistry.on_after_communication(target, "schema_after_communication", [](HookContext& context) {
+                auto* payload = static_cast<CommunicationHookPayload*>(context.payload);
+                if (!payload || !payload->token_all_to_all_completed) {
+                    return;
+                }
+                payload->after_communication_observed = true;
+            });
         }
         for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllReduce)) {

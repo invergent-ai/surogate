@@ -705,5 +705,24 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(lora_payload_applied);
     REQUIRE(after_produce_payload.lora_applied);
 
+    dsl::CommunicationHookPayload comm_payload;
+    comm_payload.token_all_to_all_completed = true;
+    auto communication_registry = dsl::HookRegistry{};
+    communication_registry.on_after_all_to_all({"qwen3_dense", "permuted_input"},
+                                               "schema_after_all_to_all",
+                                               [](dsl::HookContext& ctx) {
+                                                   auto* payload =
+                                                       static_cast<dsl::CommunicationHookPayload*>(ctx.payload);
+                                                   if (!payload || !payload->token_all_to_all_completed) return;
+                                                   payload->after_all_to_all_observed = true;
+                                               });
+    dsl::HookContext all_to_all_ctx;
+    all_to_all_ctx.layer_idx = 0;
+    all_to_all_ctx.target = {"qwen3_dense", "permuted_input"};
+    all_to_all_ctx.event = dsl::HookEventKind::AfterAllToAll;
+    all_to_all_ctx.payload = &comm_payload;
+    REQUIRE(communication_registry.dispatch(all_to_all_ctx) == 1);
+    REQUIRE(comm_payload.after_all_to_all_observed);
+
     REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
 }
