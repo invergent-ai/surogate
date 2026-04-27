@@ -243,6 +243,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
         ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
         ctx.stream = mRunState.MainStream;
+        ctx.op_caps = op.default_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
         ctx.host_offsets = host_offsets_ptr;
         ctx.active_experts = active_ptr;
         ctx.num_active = num_active;
@@ -741,6 +744,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         ctx.cublas_handle = mRunState.cublas_handle();
         ctx.cublaslt_handle = mRunState.CublasLtHandle;
         ctx.stream = mRunState.MainStream;
+        ctx.op_caps = op.default_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
         ctx.host_offsets = host_offsets_ptr;
         ctx.active_experts = active_ptr;
         ctx.num_active = num_active;

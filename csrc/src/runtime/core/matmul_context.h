@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
+#include "runtime/executor/op_descriptor_types.h"
 #include "utilities/tensor.h"
 
 // Forward declaration of the global IRunState (defined in runtime/training/model.h)
@@ -110,6 +111,9 @@ struct MatmulContext {
 
     int layer_idx = 0;            ///< Current transformer layer index (0-based)
     MatmulOp op = MatmulOp::QKV;  ///< Which matmul operation
+    dsl::OpCapabilities op_caps{};
+    dsl::EpilogueSupport epilogue_support{};
+    dsl::StorageCompatibility storage_compat{};
 
     // =========================================================================
     // Backward-specific flags
@@ -286,6 +290,9 @@ struct MoeMatmulContext {
     int K = 0;             ///< Input dimension per expert
     int total_tokens = 0;  ///< Total tokens across all experts
     int layer_idx = 0;     ///< Current layer index (for delayed scaling)
+    dsl::OpCapabilities op_caps{};
+    dsl::EpilogueSupport epilogue_support{};
+    dsl::StorageCompatibility storage_compat{};
 
     // =========================================================================
     // Runtime

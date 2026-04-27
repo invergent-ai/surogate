@@ -53,6 +53,10 @@
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, distribution, capability, epilogue, and storage descriptor facets.
 - [x] `CompiledGraph` summary helpers added for descriptor communication, grouped-op, capability, epilogue, and storage-compat counts.
 
+### Phase 3 — Capabilities and recipe predicates
+
+- [x] Descriptor capability metadata plumbed into dense and MoE matmul recipe contexts; FP8 recipe now consults `FP8Eligible` with legacy fallback for unannotated ops.
+
 Local validation status:
 
 - [x] `make wheel-dev` passed.

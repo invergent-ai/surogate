@@ -23,6 +23,10 @@ bool fp8_moe_wgrad_enabled() {
     return env && std::string_view(env) != "0";
 }
 
+bool descriptor_allows_fp8(dsl::OpCapabilities caps) {
+    return caps.flags == dsl::OpCapabilityNone || caps.has(dsl::OpCapabilityFp8Eligible);
+}
+
 bool has_moe_fp8_weight_cache(const modules::MoeMatmulContext& ctx) {
     return ctx.cached_moe_weights_e4m3 && ctx.cached_moe_weights_e4m3->Data && ctx.cached_moe_weight_amax &&
            ctx.cached_moe_weight_amax->Data && ctx.cached_moe_weight_scales && ctx.cached_moe_weight_scales->Data &&
@@ -75,8 +79,8 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("FP8HybridRecipe::forward_matmul: required tensors are null");
     }
 
-    // Fall back to BF16 matmul if FP8 is not allowed for this layer (skip_quant_first/last_layers)
-    if (!ctx.allow_fp8) {
+    // Fall back to BF16 matmul if FP8 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps)) {
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -343,8 +347,8 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("FP8HybridRecipe::backward_matmul: required tensors are null");
     }
 
-    // Fall back to BF16 matmul if FP8 is not allowed for this layer (skip_quant_first/last_layers)
-    if (!ctx.allow_fp8) {
+    // Fall back to BF16 matmul if FP8 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps)) {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;
@@ -644,8 +648,8 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // Path 2: Full FP8 Training (quantize activations + use FP8 kernels)
     // =========================================================================
 
-    if (ctx.allow_fp8 && ctx.inp_quant && ctx.inp_quant->Data && ctx.run_state && ctx.cublas_handle &&
-        ctx.host_offsets) {
+    if (ctx.allow_fp8 && descriptor_allows_fp8(ctx.op_caps) && ctx.inp_quant && ctx.inp_quant->Data && ctx.run_state &&
+        ctx.cublas_handle && ctx.host_offsets) {
         IRunState& rs = *ctx.run_state;
         const long num_elements = static_cast<long>(ctx.total_tokens) * ctx.K;
 
@@ -779,8 +783,8 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
         throw std::runtime_error("FP8HybridRecipe::backward_moe_matmul: required tensors are null");
     }
 
-    // Fall back to BF16 if FP8 is not allowed for this layer
-    if (!ctx.allow_fp8) {
+    // Fall back to BF16 if FP8 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp8 || !descriptor_allows_fp8(ctx.op_caps)) {
         Recipe::backward_moe_matmul(ctx);
         return;
     }

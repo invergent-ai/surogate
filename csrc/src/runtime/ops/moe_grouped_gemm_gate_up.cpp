@@ -293,6 +293,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
         ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
         ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
         ctx.stream = mRunState.MainStream;
+        ctx.op_caps = op.default_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
         attach_moe_fp8_cache(ctx, op.inputs[1].name);
         mRecipe->forward_moe_matmul(ctx);
     } else if (weights.DType == ETensorDType::BF16) {
