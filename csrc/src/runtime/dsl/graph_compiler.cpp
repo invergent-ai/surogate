@@ -4874,20 +4874,21 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
                 }
                 continue;
             }
-            // Legacy says "this is some d_<base>". The classifier agrees IFF
-            // kind == ParamGrad AND base_param_tid resolves to <base>.
-            const bool legacy_is_param_grad_guess = true;  // legacy always assumes this
+            // The old d_<base> heuristic says this is some parameter grad. The
+            // classifier agrees IFF kind == ParamGrad and base_param_tid
+            // resolves to <base>.
+            const bool heuristic_is_param_grad_guess = true;
             const bool classifier_says_param_grad = (meta.kind == TensorKind::ParamGrad);
-            if (legacy_is_param_grad_guess && !classifier_says_param_grad) {
-                // Most common case: legacy returns a base string for an
+            if (heuristic_is_param_grad_guess && !classifier_says_param_grad) {
+                // Most common case: the heuristic returns a base string for an
                 // intermediate / activation gradient / accum temp. Classifier
                 // correctly refuses to call it a ParamGrad. This is exactly
                 // the bug class we're eliminating.
                 disagreements++;
                 if (disagreements <= 10) {
                     std::fprintf(stderr,
-                                 "[classify_tensors][LEGACY_OVERREACH] %s tid=%d "
-                                 "legacy_base=%s but classifier says kind=%s "
+                                 "[classify_tensors][HEURISTIC_OVERREACH] %s tid=%d "
+                                 "heuristic_base=%s but classifier says kind=%s "
                                  "(would-be silent misroute fixed by Phase 1)\n",
                                  name.c_str(),
                                  id,

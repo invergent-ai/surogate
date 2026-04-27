@@ -144,10 +144,6 @@ bool tensor_role_is_expert_down_name(std::string_view name);
 /// Legacy-compatible expert bias predicate derived from TensorRole.
 bool tensor_role_is_expert_bias_name(std::string_view name);
 
-/// When SUROGATE_TENSOR_ROLE_PARITY is set, log or abort on mismatches between
-/// legacy and role-derived decisions. Set it to "abort" for fatal assertions.
-void tensor_role_parity_check(std::string_view name, bool legacy_value, bool role_value, const char* context);
-
 }  // namespace dsl
 
 #endif  // SUROGATE_SRC_RUNTIME_DSL_TENSOR_ROLE_H

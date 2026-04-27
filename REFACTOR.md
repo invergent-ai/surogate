@@ -45,6 +45,7 @@
 - [x] Matmul shared-expert/router classification, QLoRA expert-weight filtering, MoE expert-bias skip logic, DSL model router/expert filters, compiled save/execute RoPE/MoE/embedding checks, graph compiler RoPE global-role detection, and NorMuon embedding/LM-head/router exclusions now consume TensorRole predicates directly instead of local legacy fallbacks.
 - [x] NorMuon standalone-gate exclusion now routes through a TensorRole predicate, and MoE saved-buffer compatibility lookups no longer carry `legacy_key` local names.
 - [x] Grouped MoE forward/backward EP weight-pointer routing now uses TensorRole expert projection predicates (`expert_gate_up`, `expert_up`, `expert_down`) instead of local substring checks.
+- [x] Dead TensorRole parity helper and `SUROGATE_TENSOR_ROLE_PARITY` runtime hook removed after call-site migration; remaining classifier diagnostics now describe the old `d_<base>` heuristic explicitly.
 
 ### Phase 2 — Op registry descriptor extension — COMPLETE
 

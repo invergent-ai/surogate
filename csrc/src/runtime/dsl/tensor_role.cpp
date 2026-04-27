@@ -3,8 +3,6 @@
 
 #include "runtime/dsl/tensor_role.h"
 
-#include <cstdio>
-#include <cstdlib>
 #include <string>
 
 namespace dsl {
@@ -174,26 +172,6 @@ bool tensor_role_is_expert_down_name(std::string_view name) {
 bool tensor_role_is_expert_bias_name(std::string_view name) {
     const TensorRole role = infer_tensor_role_from_name(name);
     return role.is_expert_parallel() && contains(name, "experts_") && contains(name, "_bias");
-}
-
-void tensor_role_parity_check(std::string_view name, bool legacy_value, bool role_value, const char* context) {
-    const char* env = std::getenv("SUROGATE_TENSOR_ROLE_PARITY");
-    if (!env || std::string_view(env) == "0") {
-        return;
-    }
-    if (legacy_value == role_value) {
-        return;
-    }
-    std::fprintf(stderr,
-                 "[TensorRole parity] context=%s name=%.*s legacy=%d role=%d\n",
-                 context ? context : "unknown",
-                 static_cast<int>(name.size()),
-                 name.data(),
-                 legacy_value ? 1 : 0,
-                 role_value ? 1 : 0);
-    if (std::string_view(env) == "abort") {
-        std::abort();
-    }
 }
 
 }  // namespace dsl
