@@ -13,7 +13,7 @@
   "command": [],
   "duration_s": 0.0,
   "metrics": {},
-  "reason": "missing GEMMA4_MODEL_PATH",
+  "reason": "config not found: examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml",
   "started_at": 0.0,
   "status": "skipped"
 }

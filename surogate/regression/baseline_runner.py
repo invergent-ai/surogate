@@ -225,10 +225,10 @@ def _materialize_case_config(case: RegressionCase, *, steps: int, directory: Pat
 
 
 def _command_for_case(case: RegressionCase, config_path: Path | None = None) -> list[str]:
-    path = config_path or ((REPO_ROOT / case.config) if case.config else None)
+    path: str | None = str(config_path) if config_path else case.config
     if not path:
         return []
-    return ["surogate", "sft", str(path)]
+    return ["surogate", "sft", path]
 
 
 def _artifact_path(case: RegressionCase, directory: Path) -> Path:

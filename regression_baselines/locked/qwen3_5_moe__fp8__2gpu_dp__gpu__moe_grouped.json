@@ -10,10 +10,14 @@
     "storage": "gpu",
     "supported": true
   },
-  "command": [],
+  "command": [
+    "surogate",
+    "sft",
+    "examples/sft/qwen35moe/qwen35moe-lora-fp8.yaml"
+  ],
   "duration_s": 0.0,
   "metrics": {},
-  "reason": "missing QWEN3_5_MOE_MODEL_PATH",
+  "reason": "not executed; pass --run to launch GPU workload",
   "started_at": 0.0,
   "status": "skipped"
 }

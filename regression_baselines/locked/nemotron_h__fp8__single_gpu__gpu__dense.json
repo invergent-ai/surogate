@@ -13,7 +13,7 @@
   "command": [],
   "duration_s": 0.0,
   "metrics": {},
-  "reason": "missing NEMOTRON_H_MODEL_PATH",
+  "reason": "not executed; pass --run to launch GPU workload",
   "started_at": 0.0,
   "status": "skipped"
 }

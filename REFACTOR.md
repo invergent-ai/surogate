@@ -108,7 +108,7 @@ Local validation status:
 - [x] `make test-unit` passed; FP32 flash-attention standalone/module goldens are explicitly skipped where no registered production attention backend supports that dtype.
 - [x] `make regression-smoke` passed.
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py tests/test_regression_baseline_runner.py tests/test_regression_artifact_writer.py --no-gpu` with 49 tests.
-- [ ] GPU acceptance rows are not exercised locally yet; the runner now uses Hugging Face model IDs from configs by default, with `*_MODEL_PATH` only as optional local/offline overrides.
+- [x] GPU acceptance rows exercised locally for the real-model queue below; runner uses Hugging Face model IDs from configs by default, with `*_MODEL_PATH` only as optional local/offline overrides.
 
 Real-model acceptance queue:
 
