@@ -64,6 +64,12 @@ TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {
     REQUIRE(desc->default_caps.has(OpCapabilityWeightCacheEligible));
     REQUIRE(desc->storage_compat.supports(StorageTier::GpuResident));
     REQUIRE_FALSE(desc->storage_compat.supports(StorageTier::CpuPinnedStream));
+
+    const OpDescriptor* gate_up = OpRegistry::instance().find_by_name("moe_grouped_gemm_gate_up");
+    REQUIRE(gate_up != nullptr);
+    REQUIRE(gate_up == OpRegistry::instance().find(CompiledOpType::MoEGroupedGemmGateUp));
+    REQUIRE(gate_up->forward_fn != nullptr);
+    REQUIRE(gate_up->epilogue_support.has(EpilogueSupportActivation));
 }
 
 TEST_CASE("ep ops carry communication profile metadata", "[op_registry]") {
