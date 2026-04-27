@@ -286,6 +286,8 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     s.schema_persistent_lifetime_slots = u64(p.schema_persistent_lifetime_slots);
     s.schema_registry_registered_activation_slots = u64(p.schema_registry_registered_activation_slots);
     s.schema_registry_missing_activation_slots = u64(p.schema_registry_missing_activation_slots);
+    s.schema_registry_save_for_backward_activation_slots = u64(p.schema_registry_save_for_backward_activation_slots);
+    s.schema_registry_save_for_backward_mismatch_slots = u64(p.schema_registry_save_for_backward_mismatch_slots);
     s.schema_resolved_activation_shape_slots = u64(p.schema_resolved_activation_shape_slots);
     s.schema_unresolved_activation_shape_slots = u64(p.schema_unresolved_activation_shape_slots);
     s.schema_dynamic_activation_shape_slots = u64(p.schema_dynamic_activation_shape_slots);

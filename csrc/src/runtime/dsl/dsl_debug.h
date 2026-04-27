@@ -202,6 +202,8 @@ struct DebugBufferPlanSummary {
     std::uint64_t schema_persistent_lifetime_slots = 0;
     std::uint64_t schema_registry_registered_activation_slots = 0;
     std::uint64_t schema_registry_missing_activation_slots = 0;
+    std::uint64_t schema_registry_save_for_backward_activation_slots = 0;
+    std::uint64_t schema_registry_save_for_backward_mismatch_slots = 0;
     std::uint64_t schema_resolved_activation_shape_slots = 0;
     std::uint64_t schema_unresolved_activation_shape_slots = 0;
     std::uint64_t schema_dynamic_activation_shape_slots = 0;

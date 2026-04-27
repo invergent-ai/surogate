@@ -377,23 +377,37 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                                     mGradDtype,
                                     block_schema_records);
     if (const char* assert_schema = std::getenv("SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT");
-        assert_schema && std::string(assert_schema) == "1" &&
-        mBufferPlan.schema_registry_missing_activation_slots > 0) {
-        std::string missing;
-        const auto missing_slots = mBufferPlan.schema_activation_slots_missing_from_registry(mSlotRegistry);
-        for (std::size_t i = 0; i < missing_slots.size() && i < 8; ++i) {
-            if (!missing.empty()) {
-                missing += ", ";
+        assert_schema && std::string(assert_schema) == "1") {
+        auto format_slots = [](const std::vector<std::string>& slots) {
+            std::string out;
+            for (std::size_t i = 0; i < slots.size() && i < 8; ++i) {
+                if (!out.empty()) {
+                    out += ", ";
+                }
+                out += slots[i];
             }
-            missing += missing_slots[i];
+            if (slots.size() > 8) {
+                out += ", ...";
+            }
+            return out;
+        };
+        if (mBufferPlan.schema_registry_missing_activation_slots > 0) {
+            const auto missing_slots = mBufferPlan.schema_activation_slots_missing_from_registry(mSlotRegistry);
+            const std::string missing = format_slots(missing_slots);
+            throw std::runtime_error("DSL run state: block schema references " +
+                                     std::to_string(mBufferPlan.schema_registry_missing_activation_slots) +
+                                     " activation slot(s) absent from the compiled slot registry" +
+                                     (missing.empty() ? std::string{} : (": " + missing)));
         }
-        if (missing_slots.size() > 8) {
-            missing += ", ...";
+        if (mBufferPlan.schema_registry_save_for_backward_mismatch_slots > 0) {
+            const auto mismatched_slots =
+                mBufferPlan.schema_save_for_backward_slots_not_saved_in_registry(mSlotRegistry);
+            const std::string mismatched = format_slots(mismatched_slots);
+            throw std::runtime_error("DSL run state: block schema marks " +
+                                     std::to_string(mBufferPlan.schema_registry_save_for_backward_mismatch_slots) +
+                                     " activation slot(s) save_for_backward but compiled layout does not" +
+                                     (mismatched.empty() ? std::string{} : (": " + mismatched)));
         }
-        throw std::runtime_error("DSL run state: block schema references " +
-                                 std::to_string(mBufferPlan.schema_registry_missing_activation_slots) +
-                                 " activation slot(s) absent from the compiled slot registry" +
-                                 (missing.empty() ? std::string{} : (": " + missing)));
     }
 
     allocate_non_block_state(config);

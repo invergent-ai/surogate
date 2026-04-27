@@ -478,8 +478,50 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
                                                     &schema_records);
     REQUIRE(parity_plan.schema_registry_registered_activation_slots == 1);
     REQUIRE(parity_plan.schema_registry_missing_activation_slots == 0);
+    REQUIRE(parity_plan.schema_registry_save_for_backward_activation_slots == 0);
+    REQUIRE(parity_plan.schema_registry_save_for_backward_mismatch_slots == 0);
     REQUIRE(parity_plan.schema_layers[0].registry_registered_activation_slots == 1);
     REQUIRE(parity_plan.schema_layers[0].registry_missing_activation_slots == 0);
+    REQUIRE(parity_plan.schema_layers[0].registry_save_for_backward_activation_slots == 0);
+    REQUIRE(parity_plan.schema_layers[0].registry_save_for_backward_mismatch_slots == 0);
+
+    auto save_records = schema_records;
+    save_records[0].slots[2].save_for_backward = true;
+    save_records[0].slots[2].lifetime = "block";
+    auto save_layout = layout;
+    save_layout.slots[0].save_for_backward = true;
+    dsl::TensorSlotRegistry save_registry;
+    save_registry.init_from_layout(save_layout);
+    const auto save_plan = dsl::BufferPlan::build(cfg,
+                                                  runtime_config,
+                                                  options,
+                                                  save_registry,
+                                                  /*lora_only_mode=*/false,
+                                                  /*B=*/2,
+                                                  /*T=*/3,
+                                                  ETensorDType::BF16,
+                                                  ETensorDType::BF16,
+                                                  &save_records);
+    REQUIRE(save_plan.schema_registry_save_for_backward_activation_slots == 1);
+    REQUIRE(save_plan.schema_registry_save_for_backward_mismatch_slots == 0);
+    dsl::TensorSlotRegistry no_save_registry;
+    no_save_registry.init_from_layout(layout);
+    const auto save_mismatch_plan = dsl::BufferPlan::build(cfg,
+                                                           runtime_config,
+                                                           options,
+                                                           no_save_registry,
+                                                           /*lora_only_mode=*/false,
+                                                           /*B=*/2,
+                                                           /*T=*/3,
+                                                           ETensorDType::BF16,
+                                                           ETensorDType::BF16,
+                                                           &save_records);
+    REQUIRE(save_mismatch_plan.schema_registry_save_for_backward_activation_slots == 0);
+    REQUIRE(save_mismatch_plan.schema_registry_save_for_backward_mismatch_slots == 1);
+    const auto save_mismatches =
+        save_mismatch_plan.schema_save_for_backward_slots_not_saved_in_registry(no_save_registry);
+    REQUIRE(save_mismatches.size() == 1);
+    REQUIRE(save_mismatches[0] == "layer0.permuted_input");
 
     dsl::ActivationLayoutIR missing_layout;
     dsl::TensorSlotRegistry missing_registry;

@@ -134,6 +134,8 @@ struct BlockSchemaLayerSummary {
     int nvme_offload_slots = 0;
     int registry_registered_activation_slots = 0;
     int registry_missing_activation_slots = 0;
+    int registry_save_for_backward_activation_slots = 0;
+    int registry_save_for_backward_mismatch_slots = 0;
     int resolved_activation_shape_slots = 0;
     int unresolved_activation_shape_slots = 0;
     int dynamic_activation_shape_slots = 0;
@@ -240,6 +242,8 @@ struct BufferPlan {
     int schema_nvme_offload_slots = 0;
     int schema_registry_registered_activation_slots = 0;
     int schema_registry_missing_activation_slots = 0;
+    int schema_registry_save_for_backward_activation_slots = 0;
+    int schema_registry_save_for_backward_mismatch_slots = 0;
     int schema_resolved_activation_shape_slots = 0;
     int schema_unresolved_activation_shape_slots = 0;
     int schema_dynamic_activation_shape_slots = 0;
@@ -309,6 +313,8 @@ struct BufferPlan {
     }
     [[nodiscard]] std::vector<std::string>
     schema_activation_slots_missing_from_registry(const TensorSlotRegistry& slot_registry) const;
+    [[nodiscard]] std::vector<std::string>
+    schema_save_for_backward_slots_not_saved_in_registry(const TensorSlotRegistry& slot_registry) const;
 
     [[nodiscard]] long layer_qkv(int i) const {
         return (has_per_layer_dims() && i < static_cast<int>(per_layer_dims.size())) ? per_layer_dims[i].qkv_channels

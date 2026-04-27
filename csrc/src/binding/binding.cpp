@@ -2060,6 +2060,10 @@ NB_MODULE(_surogate, m) {
                 d["schema_persistent_lifetime_slots"] = s.schema_persistent_lifetime_slots;
                 d["schema_registry_registered_activation_slots"] = s.schema_registry_registered_activation_slots;
                 d["schema_registry_missing_activation_slots"] = s.schema_registry_missing_activation_slots;
+                d["schema_registry_save_for_backward_activation_slots"] =
+                    s.schema_registry_save_for_backward_activation_slots;
+                d["schema_registry_save_for_backward_mismatch_slots"] =
+                    s.schema_registry_save_for_backward_mismatch_slots;
                 d["schema_resolved_activation_shape_slots"] = s.schema_resolved_activation_shape_slots;
                 d["schema_unresolved_activation_shape_slots"] = s.schema_unresolved_activation_shape_slots;
                 d["schema_dynamic_activation_shape_slots"] = s.schema_dynamic_activation_shape_slots;

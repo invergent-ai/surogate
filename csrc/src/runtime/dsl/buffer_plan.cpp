@@ -637,9 +637,19 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 if (slot.kind == "param" || slot.name.empty()) {
                     continue;
                 }
-                if (slot_registry.lookup(slot.name).has_value()) {
+                const auto registry_entry = slot_registry.lookup(slot.name);
+                if (registry_entry.has_value()) {
                     ++layer.registry_registered_activation_slots;
                     ++p.schema_registry_registered_activation_slots;
+                    if (slot.save_for_backward) {
+                        if (registry_entry->save_for_backward) {
+                            ++layer.registry_save_for_backward_activation_slots;
+                            ++p.schema_registry_save_for_backward_activation_slots;
+                        } else {
+                            ++layer.registry_save_for_backward_mismatch_slots;
+                            ++p.schema_registry_save_for_backward_mismatch_slots;
+                        }
+                    }
                 } else {
                     ++layer.registry_missing_activation_slots;
                     ++p.schema_registry_missing_activation_slots;
@@ -721,6 +731,29 @@ BufferPlan::schema_activation_slots_missing_from_registry(const TensorSlotRegist
         }
     }
     return missing;
+}
+
+std::vector<std::string>
+BufferPlan::schema_save_for_backward_slots_not_saved_in_registry(const TensorSlotRegistry& slot_registry) const {
+    std::vector<std::string> mismatched;
+    if (!slot_registry.has_dsl_layout()) {
+        return mismatched;
+    }
+    for (const auto& layer : schema_layers) {
+        if (!layer.has_schema) {
+            continue;
+        }
+        for (const auto& slot : layer.slots) {
+            if (slot.kind == "param" || slot.name.empty() || !slot.save_for_backward) {
+                continue;
+            }
+            const auto registry_entry = slot_registry.lookup(slot.name);
+            if (registry_entry.has_value() && !registry_entry->save_for_backward) {
+                mismatched.push_back("layer" + std::to_string(layer.layer) + "." + slot.name);
+            }
+        }
+    }
+    return mismatched;
 }
 
 // ============================================================================
