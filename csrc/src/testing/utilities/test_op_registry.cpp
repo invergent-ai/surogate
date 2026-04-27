@@ -82,5 +82,24 @@ TEST_CASE("mamba and gated-delta ops carry no-comm descriptor metadata", "[op_re
     REQUIRE(gated_delta->comm_profile.kind == CommunicationKind::NoComm);
 }
 
+TEST_CASE("core transformer ops carry descriptor metadata", "[op_registry]") {
+    const OpDescriptor* matmul = OpRegistry::instance().find_by_name("matmul");
+    REQUIRE(matmul != nullptr);
+    REQUIRE(matmul->semantic_kind == OpSemanticKind::Dense);
+    REQUIRE(matmul->comm_profile.kind == CommunicationKind::NoComm);
+
+    const OpDescriptor* rmsnorm = OpRegistry::instance().find_by_name("rmsnorm");
+    REQUIRE(rmsnorm != nullptr);
+    REQUIRE(rmsnorm->semantic_kind == OpSemanticKind::Normalization);
+
+    const OpDescriptor* flash = OpRegistry::instance().find_by_name("flash_attention");
+    REQUIRE(flash != nullptr);
+    REQUIRE(flash->semantic_kind == OpSemanticKind::Attention);
+
+    const OpDescriptor* loss = OpRegistry::instance().find_by_name("cross_entropy_loss");
+    REQUIRE(loss != nullptr);
+    REQUIRE(loss->semantic_kind == OpSemanticKind::Loss);
+}
+
 }  // namespace
 }  // namespace dsl
