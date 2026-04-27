@@ -1,4 +1,6 @@
+import ast
 import json
+from pathlib import Path
 
 from surogate.dsl.block_schema import BlockSchema, DistributionDecl
 from surogate.dsl.blocks.gemma4 import Gemma4FullMoEBlock, Gemma4SharedKVBlock, Gemma4SlidingBlock
@@ -132,6 +134,25 @@ def test_block_schema_distribution_factories():
     assert sharded.mode == "zero2"
     assert expert.kind == "expert_parallel"
     assert expert.experts_per_rank == "auto"
+
+
+def test_all_python_block_classes_declare_schema_metadata():
+    missing = []
+    blocks_dir = Path(__file__).resolve().parents[1] / "surogate" / "dsl" / "blocks"
+    for path in sorted(blocks_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not node.name.endswith("Block"):
+                continue
+            has_schema = any(
+                isinstance(stmt, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "schema" for target in stmt.targets)
+                for stmt in node.body
+            )
+            if not has_schema:
+                missing.append(f"{path.name}:{node.name}")
+
+    assert missing == []
 
 
 def test_nemotron_mamba_schema_attaches_to_block_spec():
