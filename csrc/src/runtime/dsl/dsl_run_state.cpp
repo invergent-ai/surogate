@@ -376,6 +376,25 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                                     mActivationDtype,
                                     mGradDtype,
                                     block_schema_records);
+    if (const char* assert_schema = std::getenv("SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT");
+        assert_schema && std::string(assert_schema) == "1" &&
+        mBufferPlan.schema_registry_missing_activation_slots > 0) {
+        std::string missing;
+        const auto missing_slots = mBufferPlan.schema_activation_slots_missing_from_registry(mSlotRegistry);
+        for (std::size_t i = 0; i < missing_slots.size() && i < 8; ++i) {
+            if (!missing.empty()) {
+                missing += ", ";
+            }
+            missing += missing_slots[i];
+        }
+        if (missing_slots.size() > 8) {
+            missing += ", ...";
+        }
+        throw std::runtime_error("DSL run state: block schema references " +
+                                 std::to_string(mBufferPlan.schema_registry_missing_activation_slots) +
+                                 " activation slot(s) absent from the compiled slot registry" +
+                                 (missing.empty() ? std::string{} : (": " + missing)));
+    }
 
     allocate_non_block_state(config);
     allocate_simplified_quant_buffers(config, options);

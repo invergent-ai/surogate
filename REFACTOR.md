@@ -128,6 +128,7 @@
 - [x] `BufferPlan` now provides per-layer/per-slot schema lookup helpers for allocator migration without changing allocation behavior.
 - [x] `BufferPlan` now exposes a schema-vs-legacy-slot-registry parity helper for missing activation slot diagnostics.
 - [x] `BufferPlan` now computes schema-vs-slot-registry activation allocation parity counters during plan construction and reports them in debug memory output.
+- [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` now also fails early when schema activation slots are absent from the compiled slot registry.
 
 Local validation status:
 
