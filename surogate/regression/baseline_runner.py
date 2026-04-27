@@ -46,6 +46,7 @@ class RegressionCase:
     storage: str = "gpu"
     op_kind: str = "dense"
     config: str | None = None
+    # Optional local/offline override for the config's Hugging Face model id.
     env_model_path: str | None = None
     supported: bool = True
 
@@ -182,8 +183,6 @@ def _missing_reason(case: RegressionCase) -> str | None:
         return "unsupported in first-month matrix"
     if case.config and not (REPO_ROOT / case.config).exists():
         return f"config not found: {case.config}"
-    if case.env_model_path and not os.environ.get(case.env_model_path):
-        return f"missing {case.env_model_path}"
     return None
 
 
@@ -195,7 +194,7 @@ def _materialize_case_config(case: RegressionCase, *, steps: int, directory: Pat
     data["max_steps"] = steps
     data["eval_steps"] = 0
     data["output_dir"] = str(directory / "runs" / case.case_id)
-    if case.env_model_path:
+    if case.env_model_path and os.environ.get(case.env_model_path):
         data["model"] = os.environ[case.env_model_path]
     if case.distribution == "2gpu_dp":
         data["gpus"] = 2

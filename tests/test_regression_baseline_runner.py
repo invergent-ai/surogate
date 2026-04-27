@@ -4,13 +4,13 @@ import sys
 from surogate.regression import baseline_runner as br
 
 
-def test_runner_records_skips_without_gpu(tmp_path, monkeypatch):
+def test_runner_uses_config_model_without_local_override(tmp_path, monkeypatch):
     monkeypatch.delenv("QWEN3_MODEL_PATH", raising=False)
 
     result = br.run_case(br.FIRST_MONTH_MATRIX[0], run=False, steps=1)
 
     assert result.status == "skipped"
-    assert "missing QWEN3_MODEL_PATH" in result.reason
+    assert result.reason == "not executed; pass --run to launch GPU workload"
 
 
 def test_compare_detects_status_drift():
@@ -169,6 +169,20 @@ def test_materialize_case_config_applies_runner_overrides(tmp_path, monkeypatch)
     assert data["gpus"] == 2
     assert data["ep_size"] == 1
     assert data["cpu_training"] is True
+
+
+def test_materialize_case_config_keeps_hf_model_without_local_override(tmp_path, monkeypatch):
+    source = tmp_path / "case.yaml"
+    source.write_text("model: org/model\nmax_steps: 100\n")
+    monkeypatch.setattr(br, "REPO_ROOT", tmp_path)
+    monkeypatch.delenv("MODEL_PATH", raising=False)
+    case = br.RegressionCase("m", "bf16", "single_gpu", config="case.yaml", env_model_path="MODEL_PATH")
+
+    materialized = br._materialize_case_config(case, steps=3, directory=tmp_path / "out")
+
+    data = br.yaml.safe_load(materialized.read_text())
+    assert data["model"] == "org/model"
+    assert data["max_steps"] == 3
 
 
 def test_select_cases_accepts_case_id_and_model_filters():
