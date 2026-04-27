@@ -141,6 +141,7 @@
 - [x] `BufferPlan` now separates dynamic MoE `dispatched_tokens` schema shapes from other unresolved shape aliases in diagnostics.
 - [x] `BufferPlan` now reports schema-derived per-layer activation bytes, legacy max-layer activation-byte estimates, and potential schema allocation savings for Phase 4b allocator parity.
 - [x] Regression artifacts now include structured `buffer_plan_summary` metrics for Phase 4b schema allocation parity and baseline drift checks.
+- [x] Qwen3.5, Qwen3.5-MoE, and Gemma4 schemas now exclude non-emitted block inputs/state slots so `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` enforces real slot-registry parity across the acceptance queue.
 
 Local validation status:
 

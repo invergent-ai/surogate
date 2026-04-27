@@ -12,6 +12,104 @@ from surogate.dsl.py_lowering import lower_block_spec
 from surogate.dsl.py_compiler import _module_ir_to_dict, compile_block_spec, compile_model
 
 
+def _acceptance_schema_cases():
+    return [
+        (
+            "Qwen3Model",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+            },
+            ["qwen3_dense", "qwen3_dense"],
+        ),
+        (
+            "GptOssModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+            },
+            ["gpt_oss_moe", "gpt_oss_moe"],
+        ),
+        (
+            "Qwen3_5CausalModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "full_attention_interval": 2,
+            },
+            ["qwen3_5_linear", "qwen3_5_attention"],
+        ),
+        (
+            "Qwen3_5MoECausalModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "full_attention_interval": 2,
+            },
+            ["qwen3_5_moe_linear", "qwen3_5_moe_attention"],
+        ),
+        (
+            "Gemma4CausalModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "sliding_window": 512,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "global_head_dim": 64,
+                "global_num_kv_heads": 2,
+                "d_per_layer_input": 0,
+            },
+            ["gemma4_sliding", "gemma4_full"],
+        ),
+    ]
+
+
+def _compiled_activation_slot_names(module_payload):
+    layout = module_payload["activation_layout"]
+    names = set()
+    for slot in layout.get("slots") or []:
+        names.add(slot["name"])
+        names.update(slot.get("aliases") or [])
+    for slot in layout.get("gradient_slots") or []:
+        names.add(slot["name"])
+        names.update(slot.get("aliases") or [])
+    return names
+
+
 def test_block_schema_distribution_factories():
     replicated = DistributionDecl.replicated()
     sharded = DistributionDecl.sharded_dim(dim=0, mode="zero2", num_shards="dp_size")
@@ -264,91 +362,7 @@ def test_acceptance_model_graphs_emit_complete_block_schema_metadata():
     from surogate.dsl.models.qwen3_5 import Qwen3_5CausalModel  # noqa: F401
     from surogate.dsl.models.qwen3_5_moe import Qwen3_5MoECausalModel  # noqa: F401
 
-    cases = [
-        (
-            "Qwen3Model",
-            {
-                "vocab_size": 32000,
-                "d_model": 256,
-                "n_layers": 2,
-                "num_query_heads": 4,
-                "num_kv_heads": 2,
-                "d_ff": 512,
-                "max_seq": 2048,
-                "head_size": 64,
-            },
-            ["qwen3_dense", "qwen3_dense"],
-        ),
-        (
-            "GptOssModel",
-            {
-                "vocab_size": 32000,
-                "d_model": 256,
-                "n_layers": 2,
-                "num_query_heads": 4,
-                "num_kv_heads": 2,
-                "d_ff": 512,
-                "max_seq": 2048,
-                "head_size": 64,
-                "num_experts": 4,
-                "num_experts_per_tok": 2,
-            },
-            ["gpt_oss_moe", "gpt_oss_moe"],
-        ),
-        (
-            "Qwen3_5CausalModel",
-            {
-                "vocab_size": 32000,
-                "d_model": 256,
-                "n_layers": 2,
-                "num_query_heads": 4,
-                "num_kv_heads": 2,
-                "d_ff": 512,
-                "max_seq": 2048,
-                "head_size": 64,
-                "full_attention_interval": 2,
-            },
-            ["qwen3_5_linear", "qwen3_5_attention"],
-        ),
-        (
-            "Qwen3_5MoECausalModel",
-            {
-                "vocab_size": 32000,
-                "d_model": 256,
-                "n_layers": 2,
-                "num_query_heads": 4,
-                "num_kv_heads": 2,
-                "d_ff": 512,
-                "max_seq": 2048,
-                "head_size": 64,
-                "num_experts": 4,
-                "num_experts_per_tok": 2,
-                "full_attention_interval": 2,
-            },
-            ["qwen3_5_moe_linear", "qwen3_5_moe_attention"],
-        ),
-        (
-            "Gemma4CausalModel",
-            {
-                "vocab_size": 32000,
-                "d_model": 256,
-                "n_layers": 2,
-                "num_query_heads": 4,
-                "num_kv_heads": 2,
-                "d_ff": 512,
-                "max_seq": 2048,
-                "head_size": 64,
-                "sliding_window": 512,
-                "layer_types": ["sliding_attention", "full_attention"],
-                "global_head_dim": 64,
-                "global_num_kv_heads": 2,
-                "d_per_layer_input": 0,
-            },
-            ["gemma4_sliding", "gemma4_full"],
-        ),
-    ]
-
-    for model_name, config, expected_families in cases:
+    for model_name, config, expected_families in _acceptance_schema_cases():
         payload = json.loads(compile_model(model_name, config, raise_on_error=True))
         records = payload["modules"][0]["forward"]["metadata"]["block_schemas"]
 
@@ -363,3 +377,27 @@ def test_acceptance_model_graphs_emit_complete_block_schema_metadata():
                 assert slot["kind"] in {"activation", "param", "scratch", "param_grad", "activation_grad"}
                 assert isinstance(slot.get("shape"), list)
                 assert slot["shape"]
+
+
+def test_acceptance_model_schema_activation_slots_exist_in_compiled_layout():
+    from surogate.dsl.models.gemma4 import Gemma4CausalModel  # noqa: F401
+    from surogate.dsl.models.gpt_oss import GptOssModel  # noqa: F401
+    from surogate.dsl.models.qwen3 import Qwen3Model  # noqa: F401
+    from surogate.dsl.models.qwen3_5 import Qwen3_5CausalModel  # noqa: F401
+    from surogate.dsl.models.qwen3_5_moe import Qwen3_5MoECausalModel  # noqa: F401
+
+    for model_name, config, _expected_families in _acceptance_schema_cases():
+        payload = json.loads(compile_model(model_name, config, raise_on_error=True))
+        module = payload["modules"][0]
+        layout_names = _compiled_activation_slot_names(module)
+        missing = []
+
+        records = module["forward"]["metadata"]["block_schemas"]
+        for record in records:
+            for slot in record["schema"]["slots"]:
+                if slot["kind"] == "param":
+                    continue
+                if slot["name"] not in layout_names:
+                    missing.append(f"layer{record['layer']}.{slot['name']}")
+
+        assert missing == [], f"{model_name} schema references non-emitted activation slots: {missing}"
