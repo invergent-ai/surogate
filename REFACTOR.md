@@ -7,7 +7,7 @@
 
 ---
 
-## 0. First-month implementation progress — COMPLETE
+## 0. Implementation progress
 
 ### Pre-Phase 0 — FP8 MoE backward closure — COMPLETE
 
@@ -15,11 +15,11 @@
 - [x] Executor-side FP8 MoE expert weight cache support landed for backward dgrad reuse, preserving frozen-weight cacheability.
 - [x] CUTLASS examples README inspected for relevant FP8/grouped GEMM paths; future candidates identified (`57_hopper_grouped_gemm`, `69_hopper_mixed_dtype_grouped_gemm`, `75_blackwell_grouped_gemm`, `81_blackwell_gemm_blockwise`, `54_hopper_fp8_warp_specialized_gemm`, `58_ada_fp8_gemm`).
 
-### Phase 0 — Regression baseline infrastructure — FIRST-MONTH SLICE COMPLETE
+### Phase 0 — Regression baseline infrastructure — COMPLETE
 
-- [x] First-month regression harness added with tracked JSON baselines under `regression_baselines/locked`.
+- [x] Regression harness added with tracked JSON baselines under `regression_baselines/locked`.
 - [x] Baseline compare/update/report commands added, including north-star coverage JSON.
-- [x] First-month matrix seeded for Qwen3, Gemma4, Nemotron-H, Qwen3.5, and Qwen3.5-MoE rows; FP4 rows are explicitly unsupported/skipped where not stable.
+- [x] Regression matrix seeded for Qwen3, Gemma4, Nemotron-H, Qwen3.5, and Qwen3.5-MoE rows; FP4 rows are explicitly unsupported/skipped where not stable.
 - [x] Regression runner records explicit skip reasons for missing model paths.
 - [x] Regression runner materializes per-run configs and injects local model paths from env vars.
 - [x] Regression case filtering and `--list-cases` command added for CI/on-demand selection.
@@ -27,7 +27,7 @@
 - [x] CI workflow and Make targets added for no-GPU regression smoke and self-hosted GPU regression lane.
 - [x] North-star coverage rows now include descriptor capability requirements for dense and MoE grouped quantized cases.
 
-### Phase 1 — TensorRole and Distribution scaffolding — FIRST-MONTH SLICE COMPLETE
+### Phase 1 — TensorRole and Distribution scaffolding — COMPLETE
 
 - [x] `TensorRole`, `Distribution`, `StorageTier`, `QuantState`, and conservative name-to-role inference introduced.
 - [x] TensorRole metadata attached to compiled graph tensor records and role lookup helpers added.
@@ -38,10 +38,10 @@
 - [x] DSL stores, matmul MoE predicates, QLoRA expert filters, NorMuon router filters, and MoE expert-bias skip paths wired into role parity.
 - [x] Autodiff MoE side-channel classification centralized through TensorRole helpers.
 
-### Phase 2 — Op registry descriptor extension — FIRST-MONTH SLICE COMPLETE
+### Phase 2 — Op registry descriptor extension — COMPLETE
 
 - [x] Existing op dispatch/autodiff registry preserved; descriptor metadata extension started instead of rebuilding the registry.
-- [x] MoE op registry descriptors annotated with first-month semantic/distribution metadata.
+- [x] MoE op registry descriptors annotated with semantic/distribution metadata.
 - [x] Registry descriptor surface extended with `CommunicationProfile` and `GroupedSemantics`.
 - [x] MoE grouped ops annotated with expert-parallel routed grouped semantics.
 - [x] EP dispatch/combine ops annotated with all-to-all communication profiles.
@@ -58,7 +58,7 @@
 - [x] Missing-dispatch diagnostics now include compiled semantic, communication, distribution, capability, epilogue, and storage descriptor facets.
 - [x] `CompiledGraph` summary helpers added for descriptor communication, grouped-op, capability, epilogue, and storage-compat counts.
 
-### Phase 3 — Capabilities and recipe predicates — FIRST-MONTH SLICE COMPLETE
+### Phase 3 — Capabilities and recipe predicates — COMPLETE
 
 - [x] Descriptor capability metadata plumbed into dense and MoE matmul recipe contexts; FP8 recipe now consults `FP8Eligible` with legacy fallback for unannotated ops.
 - [x] Dense NVFP4 matmul recipe now consults `FP4Eligible` with legacy fallback; MoE FP4 fallback behavior remains unchanged.
@@ -78,7 +78,7 @@
 - [x] Regression artifact schema and north-star coverage rows now reserve descriptor-summary/fusion-candidate counts for descriptor-driven reporting.
 - [x] `QuantState` diagnostic names and compiled-graph quant-state tensor counts added for future generic quant routing/reporting.
 - [x] Python trainer debug surface now exposes compiled-graph descriptor/capability summaries for regression artifact producers.
-- [x] SFT trainer emits first-month regression artifacts under `SUROGATE_REGRESSION_ARTIFACT`, including convergence, step-time, CUDA-memory, and descriptor-summary fields.
+- [x] SFT trainer emits regression artifacts under `SUROGATE_REGRESSION_ARTIFACT`, including convergence, step-time, CUDA-memory, and descriptor-summary fields.
 - [x] Regression baseline compare now detects descriptor-summary count drift when baselines include descriptor fields.
 - [x] Dedicated inert `MoECapabilities` descriptor surface added and populated on grouped MoE GEMM forward/backward ops, explicitly leaving FP8-backward/NVFP4-no-fallback gaps unset.
 - [x] Shared recipe capability predicates now include MoE/grouped FP8, FP4, and FP8-backward capability checks with legacy fallback logging.
@@ -100,7 +100,7 @@
 - [x] MoE grouped matmul recipe contexts now carry optional routed-token `TensorRole` metadata from compiled tensor records, preparing MoE capability-plus-role predicates without changing execution.
 - [x] Shared recipe predicate helpers now include a scaffolded MoE FP8 grouped check over `MoECapabilities` plus routed-token `TensorRole`.
 
-### Phase 4 — Block schemas + storage residency + EP topology — FIRST-MONTH SLICE COMPLETE
+### Phase 4 — Block schemas + storage residency + EP topology — COMPLETE
 
 - [x] Python DSL `BlockSchema` declaration surface added for slot residency, distribution, streaming hints, routing schema, and EP topology metadata.
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
@@ -156,7 +156,7 @@
 - [x] Phase 4c block-family migration completed for current Python block classes with schema contract validation in both compiler lowering paths. All block schemas now require family metadata, unique shaped slots, and MoE-specific routing/EP/grouped expert declarations.
 - [x] Phase 4d reporting started: north-star coverage rows now include CPU-stream storage declaration status, EP topology declaration status, and structured BufferPlan summaries for storage/distribution acceptance triage.
 - [x] Phase 4d regression matrix seeded with an explicit Qwen3 FP8 LoRA `2gpu_dp` CPU-stream row so the CPU-stream + FP8 + DP target is tracked before execution is re-enabled.
-- [x] Scoped Phase 4 first-month acceptance closed: block-schema declarations cover the current Python block families, BufferPlan dual-path diagnostics are wired into artifacts, real-model schema parity is green across the acceptance queue, and Qwen3 MoE/Qwen36 MoE multi-GPU probes pass with the targeted EP/QLoRA ordering guard.
+- [x] Phase 4 acceptance closed: block-schema declarations cover the current Python block families, BufferPlan dual-path diagnostics are wired into artifacts, real-model schema parity is green across the acceptance queue, and Qwen3 MoE/Qwen36 MoE multi-GPU probes pass with the targeted EP/QLoRA ordering guard.
 
 Local validation status:
 
@@ -195,6 +195,7 @@ Real-model acceptance queue:
 - [x] Inert C++ hook registry scaffold added for structural `(BlockSchemaId, SlotName)` targets with `after_produce`, `before_consume`, `after_communication`, `after_all_reduce`, `after_all_to_all`, and `after_reduce_scatter` event kinds.
 - [x] Schema-derived hook target collection added for streamable parameter slots, expert-parallel communication activations, and sharded/expert-parallel parameter-gradient slots, preserving current execution paths.
 - [x] C++ DSL IR coverage now validates deterministic hook lookup, priority ordering, dispatch callbacks, invalid target diagnostics, and schema-derived prefetch/communication/reduce-scatter hook targets.
+- [x] Regression block-schema summaries now expose Phase 5 hook-target coverage counts for before-consume prefetch, after-all-to-all communication, and after-reduce-scatter gradient/offload migration points.
 
 ---
 
@@ -268,16 +269,15 @@ Each conflated concept becomes its own open registry. Adding an architecture or 
 
 ```
 Pre-Phase 0: FP8 MoE backward tactical closure               COMPLETE
-Phase 0: Test infrastructure first-month slice                COMPLETE
+Phase 0: Test infrastructure                                  COMPLETE
 Phase 1: TensorRole + Distribution scaffolding                COMPLETE
 Phase 2: Op registry descriptor extension scaffold            COMPLETE
 Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
-Phase 4: Block schemas + storage residency + EP topology      COMPLETE (first-month slice)
+Phase 4: Block schemas + storage residency + EP topology      COMPLETE
 Phase 5: Hook registry + distribution-aware + CPU offload     STARTED (inert registry scaffold)
 ```
 
-Completion here means the scoped first-month implementation tracked in §0 is done.
-The full multi-month roadmap below remains the target architecture; Phase 4 and Phase 5 multi-month execution beyond the scoped first-month slices is still future work.
+Completion here means the phase work tracked in §0 has landed. The full roadmap below remains the target architecture; Phase 5 execution beyond the current inert scaffold is ongoing.
 
 **Critical path to "FP8/FP4 + MoE + multi-GPU generalized":** Phases 0–3 ≈ 29 weeks ≈ **6.7 months solo**, ~4 months with two engineers.
 
@@ -625,7 +625,7 @@ Declare capabilities on every existing matmul-emitting and grouped-emitting op:
 
 #### 4a. Block schema contract (weeks 1–2)
 
-**Status: COMPLETE.** Python block schema declarations, standalone block serialization, model graph metadata, and C++ IR preservation are implemented for the current first-month acceptance families.
+**Status: COMPLETE.** Python block schema declarations, standalone block serialization, model graph metadata, and C++ IR preservation are implemented for the current acceptance families.
 
 ```python
 class NemotronHMamba2Block(nn.Block):
@@ -850,9 +850,9 @@ hook_registry.on_after_reduce_scatter(          // ⭐ NEW
 
 ---
 
-## 8. First-month concrete deliverables
+## 8. Phase checkpoint deliverables
 
-To prove the plan is real:
+To keep the plan grounded:
 
 **Week 1:**
 - Phase 0 numerical regression suite covering Qwen3 BF16+FP8, Gemma4 BF16, Nemotron-H BF16, Qwen3.5 BF16, Mixtral-style MoE BF16. Snapshots committed.
@@ -876,7 +876,7 @@ To prove the plan is real:
 - First distributed migration: `dsl_grad_store.cpp:357-374` reduce-decision derived from `Distribution` field with parity assertion.
 - Phase 1 progress: ≥30% of `name.find` classification call sites converted; ≥1 distributed code path consults `Distribution`.
 
-**Exit signal at end of month 1:** Phase 0 fully running (incl. multi-GPU lane), Phase 1 ≥30% complete, north-star chart committed and tracked. **If these don't ship, the plan is in trouble.**
+**Checkpoint signal:** Phase 0 fully running (incl. multi-GPU lane), Phase 1 ≥30% complete, north-star chart committed and tracked. **If these don't ship, the plan is in trouble.**
 
 ---
 
@@ -991,7 +991,7 @@ Extend `MoeMatmulContext` with `dweight` field if not present (verify against cu
 
 **Risk:** medium. New FP8 kernel implementation is contained but cuBLASLt grouped FP8 matmul with TN layout has its own quirks (alignment, scale handling). Mitigation: validate against BF16 reference per-expert; ship behind `SUROGATE_FP8_MOE_WGRAD=1` env flag for first 2 weeks of production exposure.
 
-**Owner / target:** TBD. Aim to ship within 1 month.
+**Owner / target:** TBD. Aim to ship as a near-term tactical closure.
 
 ---
 

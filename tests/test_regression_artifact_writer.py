@@ -105,6 +105,7 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
                     "kind": "param",
                     "shape": ["E", "2M", "C"],
                     "residency": "auto",
+                    "streaming_hint": {"prefetch_distance": 1},
                     "distribution": {"kind": "expert_parallel"},
                     "grouped": true
                   },
@@ -113,7 +114,7 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
                     "lifetime": "block",
                     "shape": ["B", "T", "C"],
                     "residency": "cpu_pinned_stream",
-                    "distribution": {"kind": "replicated"},
+                    "distribution": {"kind": "expert_parallel"},
                     "save_for_backward": true
                   }
                 ]
@@ -144,7 +145,10 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
     assert summary["block_schema_activation_shape_slots"] == 1
     assert summary["block_schema_save_for_backward_slots"] == 1
     assert summary["block_schema_grouped_slots"] == 1
-    assert summary["block_schema_expert_parallel_slots"] == 1
+    assert summary["block_schema_expert_parallel_slots"] == 2
     assert summary["block_schema_expert_parallel_param_slots"] == 1
     assert summary["block_schema_auto_resident_slots"] == 1
     assert summary["block_schema_cpu_stream_slots"] == 1
+    assert summary["hook_before_consume_targets"] == 1
+    assert summary["hook_after_all_to_all_targets"] == 1
+    assert summary["hook_after_reduce_scatter_targets"] == 1

@@ -139,6 +139,9 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "block_schema_expert_parallel_param_slots": 0,
         "block_schema_auto_resident_slots": 0,
         "block_schema_cpu_stream_slots": 0,
+        "hook_before_consume_targets": 0,
+        "hook_after_all_to_all_targets": 0,
+        "hook_after_reduce_scatter_targets": 0,
     }
     for module in root.get("modules", []):
         forward = module.get("forward") or {}
@@ -204,7 +207,8 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
                 if slot.get("grouped"):
                     summary["block_schema_grouped_slots"] += 1
                 distribution = slot.get("distribution") or {}
-                if distribution.get("kind") == "expert_parallel":
+                distribution_kind = distribution.get("kind")
+                if distribution_kind == "expert_parallel":
                     summary["block_schema_expert_parallel_slots"] += 1
                     if kind == "param":
                         summary["block_schema_expert_parallel_param_slots"] += 1
@@ -213,6 +217,16 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
                     summary["block_schema_auto_resident_slots"] += 1
                 elif residency == "cpu_pinned_stream":
                     summary["block_schema_cpu_stream_slots"] += 1
+                streaming_hint = slot.get("streaming_hint") or {}
+                has_prefetch = isinstance(streaming_hint, dict) and streaming_hint.get("prefetch_distance") is not None
+                if kind == "param" and (
+                    has_prefetch or residency in {"auto", "cpu_pinned_stream", "cpu_pageable", "nvme_offload"}
+                ):
+                    summary["hook_before_consume_targets"] += 1
+                if kind != "param" and distribution_kind == "expert_parallel":
+                    summary["hook_after_all_to_all_targets"] += 1
+                if kind == "param" and distribution_kind in {"sharded_dim", "expert_parallel"}:
+                    summary["hook_after_reduce_scatter_targets"] += 1
     return summary
 
 
