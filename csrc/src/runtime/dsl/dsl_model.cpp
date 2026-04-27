@@ -1248,6 +1248,12 @@ DslModel::DslModel(const PretrainedConfig& config,
                                             mConfig->TiedWordEmbeddings,
                                             grad_dtype_override,
                                             options.CpuTraining);
+    std::vector<std::string> grad_hook_schema_ids(static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));
+    for (const BlockSchemaPlanRecord& record : mBlockSchemaPlanRecords) {
+        if (record.layer < 0 || record.layer >= mModelConfig.NumLayers) continue;
+        grad_hook_schema_ids[static_cast<std::size_t>(record.layer)] = schema_id_for_hook_target(record);
+    }
+    mGrads->set_schema_hook_registry(&mHookRegistry, std::move(grad_hook_schema_ids));
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {
