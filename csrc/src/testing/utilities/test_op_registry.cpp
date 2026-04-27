@@ -290,6 +290,12 @@ TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[o
     REQUIRE(recipes::descriptor_allows_moe_fp4_grouped(moe_forward_only));
     REQUIRE_FALSE(recipes::descriptor_has_moe_fp8_backward(moe_forward_only, "test"));
 
+    TensorRole routed_token = infer_tensor_role_from_name("blocks[0].moe_x_flat", 0);
+    TensorRole dense_token = infer_tensor_role_from_name("blocks[0].attn_out", 0);
+    REQUIRE(recipes::descriptor_allows_moe_fp8_grouped_for_role(moe_forward_only, &routed_token, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_moe_fp8_grouped_for_role(moe_forward_only, &dense_token, "test"));
+    REQUIRE_FALSE(recipes::descriptor_allows_moe_fp8_grouped_for_role(moe_forward_only, nullptr, "test"));
+
     MatmulCapabilities matmul_unannotated{};
     REQUIRE(recipes::descriptor_allows_matmul_fp8_forward(matmul_unannotated, "test"));
     REQUIRE(recipes::descriptor_allows_matmul_fp8_backward(matmul_unannotated, "test"));

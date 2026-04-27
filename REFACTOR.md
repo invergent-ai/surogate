@@ -96,6 +96,7 @@
 - [x] Dense matmul recipe contexts now carry optional input `TensorRole` metadata from compiled tensor records, preparing capability-plus-role recipe predicates without changing execution.
 - [x] Shared recipe predicate helpers now include a scaffolded dense FP8 co-located-forward check over `MatmulCapabilities` plus input `TensorRole`.
 - [x] MoE grouped matmul recipe contexts now carry optional routed-token `TensorRole` metadata from compiled tensor records, preparing MoE capability-plus-role predicates without changing execution.
+- [x] Shared recipe predicate helpers now include a scaffolded MoE FP8 grouped check over `MoECapabilities` plus routed-token `TensorRole`.
 
 Local validation status:
 

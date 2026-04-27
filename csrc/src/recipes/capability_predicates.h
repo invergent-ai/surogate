@@ -114,6 +114,30 @@ inline bool descriptor_allows_moe_fp8_grouped(dsl::MoECapabilities caps, const c
     return descriptor_allows_moe_capability(caps, dsl::MoECapabilityFp8GroupedEligible, context, "FP8GroupedEligible");
 }
 
+inline bool descriptor_allows_moe_fp8_grouped_for_role(dsl::MoECapabilities caps,
+                                                       const dsl::TensorRole* token_role,
+                                                       const char* context) {
+    if (!descriptor_allows_moe_fp8_grouped(caps, context)) {
+        return false;
+    }
+    if (!token_role) {
+        if (recipe_capability_fallback_log_enabled()) {
+            std::fprintf(stderr,
+                         "[recipe capability] %s disabled: MoE descriptor requires routed token role metadata\n",
+                         context);
+        }
+        return false;
+    }
+    const bool routed = token_role->is_moe_owned();
+    if (!routed && recipe_capability_fallback_log_enabled()) {
+        std::fprintf(stderr,
+                     "[recipe capability] %s disabled: MoE descriptor requires routed token role, ownership=%s\n",
+                     context,
+                     dsl::tensor_ownership_name(token_role->ownership));
+    }
+    return routed;
+}
+
 inline bool descriptor_allows_moe_fp4_grouped(dsl::MoECapabilities caps) {
     return descriptor_allows_moe_capability(caps, dsl::MoECapabilityFp4GroupedEligible);
 }
