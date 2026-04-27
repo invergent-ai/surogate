@@ -29,7 +29,8 @@ namespace dsl {
 namespace {
 
 bool is_rope_param(const std::string& name) {
-    const bool legacy_value = name.find("rope_freqs") != std::string::npos;
+    const bool legacy_value =
+        name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos;
     const bool role_value = tensor_role_is_rope_name(name);
     tensor_role_parity_check(name, legacy_value, role_value, "DslWeightManager::is_rope_param");
     return role_value || legacy_value;
