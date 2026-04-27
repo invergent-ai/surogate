@@ -148,7 +148,7 @@ bool is_non_diff_dtype(ETensorDType dtype) {
 }
 
 bool legacy_is_rope_name(const std::string& name) {
-    return name.find("rope_freqs") != std::string::npos;
+    return name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos;
 }
 
 bool legacy_is_moe_side_channel_name(const std::string& name) {

@@ -39,6 +39,7 @@
 - [x] Autodiff MoE side-channel classification centralized through TensorRole helpers.
 - [x] Param-store RoPE/router filtering and grad-store expert-parallel reduction routing now consume TensorRole-derived classifications with legacy string fallback retained.
 - [x] Weight-manager RoPE/router filtering now matches the param-store TensorRole-first classification path with legacy string fallback retained.
+- [x] RoPE parity guards in graph tensor resolution and autodiff now align `freq_cis` with `rope_freqs`, preventing false TensorRole parity aborts on alternate RoPE naming.
 
 ### Phase 2 — Op registry descriptor extension — COMPLETE
 
