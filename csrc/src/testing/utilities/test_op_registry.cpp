@@ -46,6 +46,9 @@ TEST_CASE("op registry descriptor metadata merges without dispatch churn", "[op_
     REQUIRE(desc->descriptor_flags == 0x4);
     REQUIRE(std::string(op_semantic_kind_name(desc->semantic_kind)) == "Dense");
     REQUIRE(std::string(communication_kind_name(desc->comm_profile.kind)) == "ExpertParallelRouted");
+    REQUIRE(op_capability_flags_string(desc->default_caps) == "GroupedMatmul|FP8Eligible");
+    REQUIRE(epilogue_support_flags_string(desc->epilogue_support) == "Activation");
+    REQUIRE(storage_compatibility_flags_string(desc->storage_compat) == "GpuResident|CpuPinnedStream");
 }
 
 TEST_CASE("moe ops carry first-month descriptor metadata", "[op_registry]") {

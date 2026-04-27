@@ -4,6 +4,15 @@
 #include "runtime/executor/op_registry.h"
 
 namespace dsl {
+namespace {
+
+void append_flag(std::string& out, bool enabled, const char* name) {
+    if (!enabled) return;
+    if (!out.empty()) out += "|";
+    out += name;
+}
+
+}  // namespace
 
 const char* op_semantic_kind_name(OpSemanticKind kind) {
     switch (kind) {
@@ -33,6 +42,36 @@ const char* communication_kind_name(CommunicationKind kind) {
         case CommunicationKind::WeightTransferP2P: return "WeightTransferP2P";
     }
     return "NoComm";
+}
+
+std::string op_capability_flags_string(OpCapabilities caps) {
+    std::string out;
+    append_flag(out, caps.has(OpCapabilityDenseMatmul), "DenseMatmul");
+    append_flag(out, caps.has(OpCapabilityGroupedMatmul), "GroupedMatmul");
+    append_flag(out, caps.has(OpCapabilityMoeRouted), "MoERouted");
+    append_flag(out, caps.has(OpCapabilityFp8Eligible), "FP8Eligible");
+    append_flag(out, caps.has(OpCapabilityFp4Eligible), "FP4Eligible");
+    append_flag(out, caps.has(OpCapabilityLoRACompatible), "LoRACompatible");
+    append_flag(out, caps.has(OpCapabilityWeightCacheEligible), "WeightCacheEligible");
+    return out.empty() ? "None" : out;
+}
+
+std::string epilogue_support_flags_string(EpilogueSupport support) {
+    std::string out;
+    append_flag(out, support.has(EpilogueSupportBias), "Bias");
+    append_flag(out, support.has(EpilogueSupportActivation), "Activation");
+    append_flag(out, support.has(EpilogueSupportResidual), "Residual");
+    append_flag(out, support.has(EpilogueSupportNormalization), "Normalization");
+    return out.empty() ? "None" : out;
+}
+
+std::string storage_compatibility_flags_string(StorageCompatibility compat) {
+    std::string out;
+    append_flag(out, compat.supports(StorageTier::GpuResident), "GpuResident");
+    append_flag(out, compat.supports(StorageTier::CpuPinnedStream), "CpuPinnedStream");
+    append_flag(out, compat.supports(StorageTier::CpuPageable), "CpuPageable");
+    append_flag(out, compat.supports(StorageTier::NvmeOffload), "NvmeOffload");
+    return out.empty() ? "None" : out;
 }
 
 OpRegistry& OpRegistry::instance() {

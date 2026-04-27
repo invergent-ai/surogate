@@ -5,6 +5,7 @@
 #define SUROGATE_SRC_EXECUTOR_OP_DESCRIPTOR_TYPES_H
 
 #include <cstdint>
+#include <string>
 
 #include "runtime/dsl/tensor_role.h"
 
@@ -109,6 +110,9 @@ struct StorageCompatibility {
 
 const char* op_semantic_kind_name(OpSemanticKind kind);
 const char* communication_kind_name(CommunicationKind kind);
+std::string op_capability_flags_string(OpCapabilities caps);
+std::string epilogue_support_flags_string(EpilogueSupport support);
+std::string storage_compatibility_flags_string(StorageCompatibility compat);
 
 }  // namespace dsl
 

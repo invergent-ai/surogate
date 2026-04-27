@@ -616,9 +616,8 @@ std::byte* CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
     const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
     if (capturing) {
         std::ostringstream oss;
-        oss << "allocate_bwd_cross_layer: arena exhausted under CUDA graph capture "
-            << "(req=" << nbytes << " bytes, used=" << mBwdCrossLayerBumpOffset
-            << ", cap=" << mPhaseArenas->bwd_cross_layer_bytes
+        oss << "allocate_bwd_cross_layer: arena exhausted under CUDA graph capture " << "(req=" << nbytes
+            << " bytes, used=" << mBwdCrossLayerBumpOffset << ", cap=" << mPhaseArenas->bwd_cross_layer_bytes
             << "). Set SUROGATE_BWD_CROSS_LAYER_MB above the eager high-water mark.";
         throw std::runtime_error(oss.str());
     }
@@ -994,7 +993,10 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op, const modules::
         oss << "dispatch_forward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
             << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
             << ", comm=" << communication_kind_name(op.comm_profile.kind)
-            << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
+            << ", distribution=" << distribution_kind_name(op.distribution_kind)
+            << ", caps=" << op_capability_flags_string(op.default_caps)
+            << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+            << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
         throw std::runtime_error(oss.str());
     }
     op.fn(*this, op, static_cast<const void*>(hook));
@@ -1006,7 +1008,10 @@ void CompiledExecutor::dispatch_backward_op(const CompiledOp& op, const modules:
         oss << "dispatch_backward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
             << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
             << ", comm=" << communication_kind_name(op.comm_profile.kind)
-            << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
+            << ", distribution=" << distribution_kind_name(op.distribution_kind)
+            << ", caps=" << op_capability_flags_string(op.default_caps)
+            << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+            << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
         throw std::runtime_error(oss.str());
     }
     op.fn(*this, op, static_cast<const void*>(hook));

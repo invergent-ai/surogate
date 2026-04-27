@@ -1652,7 +1652,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 oss << "CompiledExecutor: no dispatch fn for forward op type " << op_type_to_string(op.type)
                     << " (semantic=" << op_semantic_kind_name(op.semantic_kind)
                     << ", comm=" << communication_kind_name(op.comm_profile.kind)
-                    << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
+                    << ", distribution=" << distribution_kind_name(op.distribution_kind)
+                    << ", caps=" << op_capability_flags_string(op.default_caps)
+                    << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+                    << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
                 throw std::runtime_error(oss.str());
             }
             check_op_io_aliasing(op, idx, "fwd");
@@ -2909,8 +2912,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 };
                 std::cerr << "[BWD_FILTER] idx=" << idx << " op_id=" << op.op_id
                           << " type=" << op_type_to_string(op.type) << " layer_start=" << op.layer_start
-                          << " layer_end=" << op.layer_end << " inputs=[" << dump_refs(op.inputs) << "]"
-                          << " outputs=[" << dump_refs(op.outputs) << "]" << std::endl;
+                          << " layer_end=" << op.layer_end << " inputs=[" << dump_refs(op.inputs) << "]" << " outputs=["
+                          << dump_refs(op.outputs) << "]" << std::endl;
             }
         }
 
@@ -3011,7 +3014,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
                     << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
                     << ", comm=" << communication_kind_name(op.comm_profile.kind)
-                    << ", distribution=" << distribution_kind_name(op.distribution_kind) << ")";
+                    << ", distribution=" << distribution_kind_name(op.distribution_kind)
+                    << ", caps=" << op_capability_flags_string(op.default_caps)
+                    << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+                    << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
                 throw std::runtime_error(oss.str());
             }
             check_op_io_aliasing(op, idx, "bwd");
