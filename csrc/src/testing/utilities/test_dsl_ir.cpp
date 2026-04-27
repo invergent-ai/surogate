@@ -3,6 +3,7 @@
 //
 // Unit tests for DSL IR JSON loader + shape resolution.
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/dsl/hook_registry.h"
 #include "runtime/dsl/ir.h"
 
 TEST_CASE("DSL IR loader parses module and resolves shapes") {
@@ -591,4 +593,58 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE_FALSE(plan.schema_layers[0].ep_weight_transfer_eligible);
     REQUIRE(plan.schema_layers[0].has_routing);
     REQUIRE(plan.schema_layers[0].has_ep_topology);
+
+    REQUIRE(dsl::hook_event_name(dsl::HookEventKind::AfterAllToAll) == std::string("after_all_to_all"));
+    REQUIRE(dsl::schema_id_for_hook_target(schema_records[0]) == "qwen3_dense");
+
+    const auto prefetch_targets = dsl::collect_schema_hook_targets(schema_records, dsl::HookEventKind::BeforeConsume);
+    REQUIRE(prefetch_targets.size() == 1);
+    REQUIRE(prefetch_targets[0].schema_id == "qwen3_dense");
+    REQUIRE(prefetch_targets[0].slot_name == "experts_gate_up");
+
+    const auto comm_targets = dsl::collect_schema_hook_targets(schema_records, dsl::HookEventKind::AfterAllToAll);
+    REQUIRE(comm_targets.size() == 1);
+    REQUIRE(comm_targets[0].schema_id == "qwen3_dense");
+    REQUIRE(comm_targets[0].slot_name == "permuted_input");
+
+    const auto grad_targets = dsl::collect_schema_hook_targets(schema_records, dsl::HookEventKind::AfterReduceScatter);
+    REQUIRE(grad_targets.size() == 1);
+    REQUIRE(grad_targets[0].schema_id == "qwen3_dense");
+    REQUIRE(grad_targets[0].slot_name == "experts_gate_up");
+
+    dsl::HookRegistry hook_registry;
+    int callback_count = 0;
+    const dsl::HookTarget comm_target{"qwen3_dense", "permuted_input"};
+    hook_registry.on_after_all_to_all(
+        comm_target,
+        "post_dispatch_quantize",
+        [&](dsl::HookContext& ctx) {
+            REQUIRE(ctx.layer_idx == 0);
+            REQUIRE(ctx.target.schema_id == "qwen3_dense");
+            REQUIRE(ctx.target.slot_name == "permuted_input");
+            ++callback_count;
+        },
+        /*priority=*/10);
+    hook_registry.on_after_all_to_all(
+        comm_target,
+        "offload_accounting",
+        [&](dsl::HookContext&) { ++callback_count; },
+        /*priority=*/0);
+    hook_registry.on_before_consume({"qwen3_dense", "experts_gate_up"}, "ensure_streamed");
+
+    REQUIRE(hook_registry.size() == 3);
+    const auto matches = hook_registry.find(dsl::HookEventKind::AfterAllToAll, "qwen3_dense", "permuted_input");
+    REQUIRE(matches.size() == 2);
+    REQUIRE(matches[0]->name == "post_dispatch_quantize");
+    REQUIRE(matches[0]->distribution_aware);
+    REQUIRE(matches[1]->name == "offload_accounting");
+
+    dsl::HookContext hook_ctx;
+    hook_ctx.layer_idx = 0;
+    hook_ctx.target = comm_target;
+    hook_ctx.event = dsl::HookEventKind::AfterAllToAll;
+    REQUIRE(hook_registry.dispatch(hook_ctx) == 2);
+    REQUIRE(callback_count == 2);
+
+    REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
 }

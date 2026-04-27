@@ -190,6 +190,12 @@ Real-model acceptance queue:
 - [x] Multi-GPU pre-quant MoE acceptance: [`qwen36moe-lora-fp8.yaml`](examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml). Passed 5-step `.venv` validation; descriptor/schema requirements are present and pre-clip norm volatility is explained by gradient clipping semantics.
 - [x] Multi-GPU Qwen3 MoE NVFP4 acceptance: [`qwen3moe-nvfp4.yaml`](examples/sft/qwen3moe/qwen3moe-nvfp4.yaml). Passed 5-step `.venv` validation with EP QLoRA offload auto-tune skipped and targeted MoE/EP boundary sync enabled by default.
 
+### Phase 5 — Hook registry + distribution-aware CPU/offload hooks — STARTED
+
+- [x] Inert C++ hook registry scaffold added for structural `(BlockSchemaId, SlotName)` targets with `after_produce`, `before_consume`, `after_communication`, `after_all_reduce`, `after_all_to_all`, and `after_reduce_scatter` event kinds.
+- [x] Schema-derived hook target collection added for streamable parameter slots, expert-parallel communication activations, and sharded/expert-parallel parameter-gradient slots, preserving current execution paths.
+- [x] C++ DSL IR coverage now validates deterministic hook lookup, priority ordering, dispatch callbacks, invalid target diagnostics, and schema-derived prefetch/communication/reduce-scatter hook targets.
+
 ---
 
 ## 1. Prime directive and north-star
@@ -267,7 +273,7 @@ Phase 1: TensorRole + Distribution scaffolding                COMPLETE
 Phase 2: Op registry descriptor extension scaffold            COMPLETE
 Phase 3: Capabilities + recipe predicate scaffolding          COMPLETE
 Phase 4: Block schemas + storage residency + EP topology      COMPLETE (first-month slice)
-Phase 5: Hook registry + distribution-aware + CPU offload     NOT STARTED
+Phase 5: Hook registry + distribution-aware + CPU offload     STARTED (inert registry scaffold)
 ```
 
 Completion here means the scoped first-month implementation tracked in §0 is done.
