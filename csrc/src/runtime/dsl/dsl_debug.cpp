@@ -145,6 +145,41 @@ void fill_graph_arena(DebugGraphArena& out,
     });
 }
 
+void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const CompiledGraph* graph, DebugGraphKind kind) {
+    out.graph = kind;
+    if (!graph) {
+        return;
+    }
+    out.name = graph->name;
+    out.num_tensors = static_cast<std::uint64_t>(graph->num_tensors);
+    out.num_ops = static_cast<std::uint64_t>(graph->ops.size());
+    out.no_comm_ops = static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::NoComm));
+    out.all_reduce_after_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::AllReduceAfter));
+    out.reduce_scatter_after_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::ReduceScatterAfter));
+    out.all_to_all_in_ops = static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::AllToAllIn));
+    out.all_to_all_out_ops = static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::AllToAllOut));
+    out.expert_parallel_routed_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::ExpertParallelRouted));
+    out.grouped_ops = static_cast<std::uint64_t>(graph->count_grouped_ops());
+    out.dense_matmul_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityDenseMatmul));
+    out.grouped_matmul_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityGroupedMatmul));
+    out.moe_routed_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityMoeRouted));
+    out.fp8_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp8Eligible));
+    out.fp4_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp4Eligible));
+    out.lora_compatible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityLoRACompatible));
+    out.weight_cache_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityWeightCacheEligible));
+    out.activation_epilogue_ops = static_cast<std::uint64_t>(graph->count_ops_with_epilogue(EpilogueSupportActivation));
+    out.cpu_pinned_stream_ops =
+        static_cast<std::uint64_t>(graph->count_ops_supporting_storage(StorageTier::CpuPinnedStream));
+    out.fusion_candidate_starts = static_cast<std::uint64_t>(graph->count_fusion_candidate_starts());
+    out.fp8_pending_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP8Pending));
+    out.fp8_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP8Ready));
+    out.fp4_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP4Ready));
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -191,6 +226,17 @@ DebugArenaSummary collect_arena_summary(const DslModel& model) {
                                             arenas.save_for_bwd_block_bases.end());
     fill_graph_arena(s.forward, exec->compiled_forward(), arenas, DebugGraphKind::Forward);
     fill_graph_arena(s.backward, exec->compiled_backward(), arenas, DebugGraphKind::Backward);
+    return s;
+}
+
+DebugDescriptorSummary collect_descriptor_summary(const DslModel& model) {
+    DebugDescriptorSummary s{};
+    const GraphExecutor* exec = model.graph_executor();
+    if (!exec) {
+        return s;
+    }
+    fill_graph_descriptor_summary(s.forward, exec->compiled_forward(), DebugGraphKind::Forward);
+    fill_graph_descriptor_summary(s.backward, exec->compiled_backward(), DebugGraphKind::Backward);
     return s;
 }
 

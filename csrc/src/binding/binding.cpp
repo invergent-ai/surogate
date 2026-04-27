@@ -1991,6 +1991,45 @@ NB_MODULE(_surogate, m) {
             "Returns dict with `arena_*_bytes` (what was cudaMalloc'd) plus `forward`\n"
             "and `backward` sub-dicts containing per-graph stats.")
         .def(
+            "get_debug_descriptor_summary",
+            [](MultiGPUPyTrainer* trainer) {
+                auto s = trainer->get_debug_descriptor_summary();
+                auto graph_descriptor_to_dict = [](const dsl::DebugGraphDescriptorSummary& g) {
+                    nb::dict d;
+                    d["graph"] = dsl::debug_graph_kind_name(g.graph);
+                    d["name"] = g.name;
+                    d["num_tensors"] = g.num_tensors;
+                    d["num_ops"] = g.num_ops;
+                    d["no_comm_ops"] = g.no_comm_ops;
+                    d["all_reduce_after_ops"] = g.all_reduce_after_ops;
+                    d["reduce_scatter_after_ops"] = g.reduce_scatter_after_ops;
+                    d["all_to_all_in_ops"] = g.all_to_all_in_ops;
+                    d["all_to_all_out_ops"] = g.all_to_all_out_ops;
+                    d["expert_parallel_routed_ops"] = g.expert_parallel_routed_ops;
+                    d["grouped_ops"] = g.grouped_ops;
+                    d["dense_matmul_ops"] = g.dense_matmul_ops;
+                    d["grouped_matmul_ops"] = g.grouped_matmul_ops;
+                    d["moe_routed_ops"] = g.moe_routed_ops;
+                    d["fp8_eligible_ops"] = g.fp8_eligible_ops;
+                    d["fp4_eligible_ops"] = g.fp4_eligible_ops;
+                    d["lora_compatible_ops"] = g.lora_compatible_ops;
+                    d["weight_cache_eligible_ops"] = g.weight_cache_eligible_ops;
+                    d["activation_epilogue_ops"] = g.activation_epilogue_ops;
+                    d["cpu_pinned_stream_ops"] = g.cpu_pinned_stream_ops;
+                    d["fusion_candidate_starts"] = g.fusion_candidate_starts;
+                    d["fp8_pending_tensors"] = g.fp8_pending_tensors;
+                    d["fp8_ready_tensors"] = g.fp8_ready_tensors;
+                    d["fp4_ready_tensors"] = g.fp4_ready_tensors;
+                    return d;
+                };
+                nb::dict r;
+                r["forward"] = graph_descriptor_to_dict(s.forward);
+                r["backward"] = graph_descriptor_to_dict(s.backward);
+                return r;
+            },
+            "Descriptor/capability counts for forward + backward compiled graphs.\n"
+            "Returns count-only sub-dicts suitable for regression artifacts.")
+        .def(
             "get_debug_phase_tree",
             [](MultiGPUPyTrainer* trainer, bool is_backward) {
                 auto t = trainer->get_debug_phase_tree(is_backward);

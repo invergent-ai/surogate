@@ -1688,6 +1688,25 @@ dsl::DebugArenaSummary MultiGPUPyTrainer::get_debug_arena_summary() {
     return result;
 }
 
+dsl::DebugDescriptorSummary MultiGPUPyTrainer::get_debug_descriptor_summary() {
+    dsl::DebugDescriptorSummary result{};
+    const long b = B;
+    const long t = T;
+    run_work(
+        [&result, b, t](sThreadContext& ctx) {
+            auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!m) {
+                return;
+            }
+            if (auto* exec = m->graph_executor()) {
+                exec->ensure_graphs_compiled(b, t);
+            }
+            result = dsl::collect_descriptor_summary(*m);
+        },
+        /*gpu_id=*/0);
+    return result;
+}
+
 dsl::DebugPhaseTree MultiGPUPyTrainer::get_debug_phase_tree(bool is_backward) {
     dsl::DebugPhaseTree result;
     const long b = B;

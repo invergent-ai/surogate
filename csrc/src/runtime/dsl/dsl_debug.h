@@ -138,6 +138,41 @@ struct DebugArenaSummary {
     DebugGraphArena backward;
 };
 
+//! Descriptor/capability summary for one compiled graph. This is intentionally
+//! count-based so regression artifacts can track descriptor coverage without
+//! depending on enum dumps or graph-specific op ordering.
+struct DebugGraphDescriptorSummary {
+    DebugGraphKind graph = DebugGraphKind::Forward;
+    std::string name;
+    std::uint64_t num_tensors = 0;
+    std::uint64_t num_ops = 0;
+    std::uint64_t no_comm_ops = 0;
+    std::uint64_t all_reduce_after_ops = 0;
+    std::uint64_t reduce_scatter_after_ops = 0;
+    std::uint64_t all_to_all_in_ops = 0;
+    std::uint64_t all_to_all_out_ops = 0;
+    std::uint64_t expert_parallel_routed_ops = 0;
+    std::uint64_t grouped_ops = 0;
+    std::uint64_t dense_matmul_ops = 0;
+    std::uint64_t grouped_matmul_ops = 0;
+    std::uint64_t moe_routed_ops = 0;
+    std::uint64_t fp8_eligible_ops = 0;
+    std::uint64_t fp4_eligible_ops = 0;
+    std::uint64_t lora_compatible_ops = 0;
+    std::uint64_t weight_cache_eligible_ops = 0;
+    std::uint64_t activation_epilogue_ops = 0;
+    std::uint64_t cpu_pinned_stream_ops = 0;
+    std::uint64_t fusion_candidate_starts = 0;
+    std::uint64_t fp8_pending_tensors = 0;
+    std::uint64_t fp8_ready_tensors = 0;
+    std::uint64_t fp4_ready_tensors = 0;
+};
+
+struct DebugDescriptorSummary {
+    DebugGraphDescriptorSummary forward;
+    DebugGraphDescriptorSummary backward;
+};
+
 //! One pair of overlapping `(region, block_layer_idx, offset, bytes)` ranges
 //! in the same CompiledGraph. Under correct compilation, the only overlaps
 //! are intentional aliases validated at compile time. Unexpected overlaps
@@ -185,6 +220,9 @@ std::vector<DebugTensorEntry> collect_tensor_layout(const DslModel& model);
 
 //! Aggregate arena sizes + coverage across both graphs and the PhaseArenas.
 DebugArenaSummary collect_arena_summary(const DslModel& model);
+
+//! Aggregate descriptor/capability counts across both compiled graphs.
+DebugDescriptorSummary collect_descriptor_summary(const DslModel& model);
 
 //! Collect the phase tree + instruction stream for one graph.
 //! `DebugPhaseTree::present == false` if the graph has no phase tree
