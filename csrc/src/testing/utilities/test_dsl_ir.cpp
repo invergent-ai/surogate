@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/ir.h"
 
 TEST_CASE("DSL IR loader parses module and resolves shapes") {
@@ -47,8 +48,13 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
           "block_schemas": [
             {
               "layer": 0,
+              "block_index": 0,
               "block_type": "Qwen3Block",
+              "blocks_param": "blocks",
+              "block_name": "Qwen3Block",
               "schema": {
+                "routing": {"kind": "none"},
+                "ep_topology": {"ep_size_param": "ep_size"},
                 "attrs": {"block_family": "qwen3_dense"}
               }
             }
@@ -113,4 +119,15 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(attrs_ptr);
     REQUIRE(*attrs_ptr);
     REQUIRE(std::get<std::string>((**attrs_ptr).at("block_family").value) == "qwen3_dense");
+
+    const auto schema_records = dsl::collect_block_schema_plan_records(*module.forward);
+    REQUIRE(schema_records.size() == 1);
+    REQUIRE(schema_records[0].layer == 0);
+    REQUIRE(schema_records[0].block_index == 0);
+    REQUIRE(schema_records[0].block_type == "Qwen3Block");
+    REQUIRE(schema_records[0].blocks_param == "blocks");
+    REQUIRE(schema_records[0].block_name == "Qwen3Block");
+    REQUIRE(schema_records[0].block_family == "qwen3_dense");
+    REQUIRE(schema_records[0].has_routing);
+    REQUIRE(schema_records[0].has_ep_topology);
 }

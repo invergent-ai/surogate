@@ -16,6 +16,7 @@
 #ifndef SUROGATE_SRC_DSL_BUFFER_PLAN_H
 #define SUROGATE_SRC_DSL_BUFFER_PLAN_H
 
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -28,6 +29,25 @@
 namespace dsl {
 
 struct CompiledGraph;  // fwd — defined in graph_compiler.h; used by stack-sizing helpers.
+struct Graph;          // fwd — defined in ir.h; used by schema metadata helpers.
+
+/// Phase 4 dual-path record derived from graph.metadata.block_schemas.
+/// The legacy enum BufferPlan remains authoritative until parity checks are
+/// wired, but this typed summary is the C++ handoff for schema-driven planning.
+struct BlockSchemaPlanRecord {
+    int layer = -1;
+    int block_index = -1;
+    std::string block_type;
+    std::string blocks_param;
+    std::string block_name;
+    std::string block_family;
+    bool has_routing = false;
+    bool has_ep_topology = false;
+};
+
+/// Extract per-layer block schema records from a compiled graph's metadata.
+/// Malformed records are skipped; absence of metadata returns an empty vector.
+[[nodiscard]] std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph);
 
 // Model-config helpers shared by the plan builder and runtime allocators.
 // Both handle the case where the passed PretrainedConfig is actually a

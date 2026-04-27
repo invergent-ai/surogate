@@ -5,13 +5,97 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <utility>
 
 #include "runtime/core/model_config.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/dsl/ir.h"
 #include "runtime/executor/op_registry.h"
 #include "utilities/stack.h"
 
 namespace dsl {
+
+namespace {
+
+[[nodiscard]] const AttrMap* attr_map(const AttrValue& value) {
+    if (const auto* ptr = std::get_if<AttrValue::MapPtr>(&value.value)) {
+        return ptr->get();
+    }
+    return nullptr;
+}
+
+[[nodiscard]] const AttrList* attr_list(const AttrValue& value) {
+    if (const auto* ptr = std::get_if<AttrValue::ListPtr>(&value.value)) {
+        return ptr->get();
+    }
+    return nullptr;
+}
+
+[[nodiscard]] const AttrValue* find_attr(const AttrMap& map, const std::string& key) {
+    const auto it = map.find(key);
+    return (it == map.end()) ? nullptr : &it->second;
+}
+
+[[nodiscard]] std::string attr_string(const AttrMap& map, const std::string& key) {
+    const auto* value = find_attr(map, key);
+    if (!value) return {};
+    if (const auto* text = std::get_if<std::string>(&value->value)) {
+        return *text;
+    }
+    return {};
+}
+
+[[nodiscard]] int attr_int(const AttrMap& map, const std::string& key) {
+    const auto* value = find_attr(map, key);
+    if (!value) return -1;
+    if (const auto* v = std::get_if<std::int64_t>(&value->value)) {
+        return static_cast<int>(*v);
+    }
+    return -1;
+}
+
+}  // namespace
+
+std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph& graph) {
+    std::vector<BlockSchemaPlanRecord> records;
+    const auto meta_it = graph.metadata.find("block_schemas");
+    if (meta_it == graph.metadata.end()) return records;
+
+    const AttrList* raw_records = attr_list(meta_it->second);
+    if (!raw_records) return records;
+
+    records.reserve(raw_records->size());
+    for (const AttrValue& raw_record : *raw_records) {
+        const AttrMap* record = attr_map(raw_record);
+        if (!record) continue;
+
+        BlockSchemaPlanRecord out;
+        out.layer = attr_int(*record, "layer");
+        out.block_index = attr_int(*record, "block_index");
+        out.block_type = attr_string(*record, "block_type");
+        out.blocks_param = attr_string(*record, "blocks_param");
+        out.block_name = attr_string(*record, "block_name");
+
+        const AttrValue* schema_value = find_attr(*record, "schema");
+        const AttrMap* schema = schema_value ? attr_map(*schema_value) : nullptr;
+        if (schema) {
+            const AttrValue* routing_value = find_attr(*schema, "routing");
+            out.has_routing = routing_value && attr_map(*routing_value) != nullptr;
+            const AttrValue* ep_value = find_attr(*schema, "ep_topology");
+            out.has_ep_topology = ep_value && attr_map(*ep_value) != nullptr;
+
+            const AttrValue* attrs_value = find_attr(*schema, "attrs");
+            if (const AttrMap* attrs = attrs_value ? attr_map(*attrs_value) : nullptr) {
+                out.block_family = attr_string(*attrs, "block_family");
+            }
+        }
+
+        if (out.layer < 0 || out.block_type.empty()) continue;
+        records.push_back(std::move(out));
+    }
+
+    return records;
+}
 
 int resolve_mlp_up_factor(const PretrainedConfig& cfg) {
     if (auto* mc = dynamic_cast<const modules::ModelConfig*>(&cfg)) {
