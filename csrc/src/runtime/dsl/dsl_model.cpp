@@ -1149,6 +1149,10 @@ DslModel::DslModel(const PretrainedConfig& config,
     if (mModule->forward.has_value()) {
         mBlockSchemaPlanRecords = collect_block_schema_plan_records(*mModule->forward);
         for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterProduce)) {
+            mHookRegistry.on_after_produce(target, "schema_after_produce");
+        }
+        for (const HookTarget& target :
              collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::BeforeConsume)) {
             mHookRegistry.on_before_consume(target, "schema_prefetch");
         }

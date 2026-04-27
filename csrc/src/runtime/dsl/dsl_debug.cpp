@@ -321,6 +321,13 @@ DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
     for (const BlockSchemaLayerSummary& layer : p.schema_layers) {
         for (const BlockSchemaSlotSummary& slot : layer.slots) {
             const bool is_param = slot.kind == "param";
+            const bool lora_after_produce =
+                !is_param &&
+                (slot.name == "qkv" || slot.name == "att_out" || slot.name == "mlp_up" || slot.name == "mlp_down" ||
+                 slot.name == "router_logits" || slot.name == "expert_gate_up" || slot.name == "expert_down");
+            if (lora_after_produce) {
+                s.hook_after_produce_targets += 1;
+            }
             const bool streamable_param =
                 is_param && (slot.streaming_prefetch_distance >= 0 || slot.residency == "auto" ||
                              slot.residency == "cpu_pinned_stream" || slot.residency == "cpu_pageable" ||

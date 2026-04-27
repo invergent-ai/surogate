@@ -142,6 +142,7 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "block_schema_expert_parallel_param_slots": 0,
         "block_schema_auto_resident_slots": 0,
         "block_schema_cpu_stream_slots": 0,
+        "hook_after_produce_targets": 0,
         "hook_before_consume_targets": 0,
         "hook_after_all_to_all_targets": 0,
         "hook_after_reduce_scatter_targets": 0,
@@ -220,6 +221,16 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
                     summary["block_schema_auto_resident_slots"] += 1
                 elif residency == "cpu_pinned_stream":
                     summary["block_schema_cpu_stream_slots"] += 1
+                if kind != "param" and slot.get("name") in {
+                    "qkv",
+                    "att_out",
+                    "mlp_up",
+                    "mlp_down",
+                    "router_logits",
+                    "expert_gate_up",
+                    "expert_down",
+                }:
+                    summary["hook_after_produce_targets"] += 1
                 streaming_hint = slot.get("streaming_hint") or {}
                 has_prefetch = isinstance(streaming_hint, dict) and streaming_hint.get("prefetch_distance") is not None
                 if kind == "param" and (

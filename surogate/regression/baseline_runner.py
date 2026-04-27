@@ -632,9 +632,11 @@ def hook_target_counts(metrics: dict[str, Any]) -> dict[str, Any]:
     block_schema_summary = metrics.get("block_schema_summary") or {}
     buffer_plan_summary = metrics.get("buffer_plan_summary") or {}
     return {
+        "hook_after_produce_targets": block_schema_summary.get("hook_after_produce_targets"),
         "hook_before_consume_targets": block_schema_summary.get("hook_before_consume_targets"),
         "hook_after_all_to_all_targets": block_schema_summary.get("hook_after_all_to_all_targets"),
         "hook_after_reduce_scatter_targets": block_schema_summary.get("hook_after_reduce_scatter_targets"),
+        "runtime_hook_after_produce_targets": buffer_plan_summary.get("hook_after_produce_targets"),
         "runtime_hook_before_consume_targets": buffer_plan_summary.get("hook_before_consume_targets"),
         "runtime_hook_after_all_to_all_targets": buffer_plan_summary.get("hook_after_all_to_all_targets"),
         "runtime_hook_after_reduce_scatter_targets": buffer_plan_summary.get("hook_after_reduce_scatter_targets"),
@@ -688,6 +690,7 @@ def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tupl
     if "ep" in str(case.get("distribution") or ""):
         required.append("hook_after_all_to_all_targets")
     if int(counts.get("lora_slices") or 0) > 0:
+        required.append("hook_after_produce_targets")
         required.append("lora_schema_slot_slices")
     if not required:
         return "not_applicable", []

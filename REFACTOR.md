@@ -200,6 +200,7 @@ Real-model acceptance queue:
 - [x] `DslModel` now owns an inert schema hook registry seeded from block-schema records for stream prefetch, all-to-all, and reduce-scatter targets; debug summaries report total and distribution-aware registrations without dispatching them in execution.
 - [x] Compiled LoRA slices now carry diagnostic schema-slot names inferred from their structural weight inputs, and descriptor summaries report LoRA slice/schema-slot coverage including grouped MoE slices.
 - [x] North-star coverage rows now report Phase 5 hook readiness, missing hook-count diagnostics, and hook target counts alongside descriptor/schema/storage/EP readiness.
+- [x] Schema hook target collection now covers `after_produce` activation slots used by LoRA post-projection hooks (`qkv`, `att_out`, `mlp_up`, `mlp_down`, router/expert outputs), and `DslModel` seeds inert registrations for them.
 
 ---
 

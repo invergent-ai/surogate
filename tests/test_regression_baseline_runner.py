@@ -76,6 +76,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
                     "block_schema_moe_layers": 2,
                     "block_schema_ep_layers": 2,
                     "block_schema_auto_resident_slots": 4,
+                    "hook_after_produce_targets": 2,
                     "hook_before_consume_targets": 4,
                     "hook_after_all_to_all_targets": 2,
                     "hook_after_reduce_scatter_targets": 2,
@@ -107,6 +108,7 @@ def test_coverage_report_marks_moe_grouped_capabilities():
     assert report["rows"][0]["ep_topology_status"] == "present"
     assert report["rows"][0]["hook_readiness_status"] == "present"
     assert report["rows"][0]["missing_hook_counts"] == []
+    assert report["rows"][0]["hook_target_counts"]["hook_after_produce_targets"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_after_all_to_all_targets"] == 2
     assert report["rows"][0]["hook_target_counts"]["lora_schema_slot_slices"] == 2
     assert report["rows"][0]["hook_target_counts"]["hook_registry_registrations"] == 8

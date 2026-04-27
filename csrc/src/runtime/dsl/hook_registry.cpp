@@ -36,6 +36,12 @@ namespace {
            (slot.distribution_kind == "sharded_dim" || slot.distribution_kind == "expert_parallel");
 }
 
+[[nodiscard]] bool is_lora_after_produce_slot(const BlockSchemaSlotSummary& slot) {
+    if (is_param_slot(slot)) return false;
+    return slot.name == "qkv" || slot.name == "att_out" || slot.name == "mlp_up" || slot.name == "mlp_down" ||
+           slot.name == "router_logits" || slot.name == "expert_gate_up" || slot.name == "expert_down";
+}
+
 [[nodiscard]] bool registration_less(const HookRegistration& a, const HookRegistration& b) {
     if (a.event != b.event) return static_cast<int>(a.event) < static_cast<int>(b.event);
     if (a.target.schema_id != b.target.schema_id) return a.target.schema_id < b.target.schema_id;
@@ -161,11 +167,11 @@ std::vector<HookTarget> collect_schema_hook_targets(const std::vector<BlockSchem
         for (const BlockSchemaSlotSummary& slot : record.slots) {
             bool include = false;
             switch (event) {
+                case HookEventKind::AfterProduce: include = is_lora_after_produce_slot(slot); break;
                 case HookEventKind::BeforeConsume: include = is_streamable_param_slot(slot); break;
                 case HookEventKind::AfterCommunication:
                 case HookEventKind::AfterAllToAll: include = is_expert_parallel_activation(slot); break;
                 case HookEventKind::AfterReduceScatter: include = is_sharded_param_slot(slot); break;
-                case HookEventKind::AfterProduce:
                 case HookEventKind::AfterAllReduce:
                 case HookEventKind::Unknown: include = false; break;
             }

@@ -612,6 +612,17 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(grad_targets[0].schema_id == "qwen3_dense");
     REQUIRE(grad_targets[0].slot_name == "experts_gate_up");
 
+    auto produce_records = schema_records;
+    dsl::BlockSchemaSlotSummary qkv_activation_slot;
+    qkv_activation_slot.name = "qkv";
+    qkv_activation_slot.kind = "activation";
+    qkv_activation_slot.distribution_kind = "replicated";
+    produce_records[0].slots.push_back(qkv_activation_slot);
+    const auto produce_targets = dsl::collect_schema_hook_targets(produce_records, dsl::HookEventKind::AfterProduce);
+    REQUIRE(produce_targets.size() == 1);
+    REQUIRE(produce_targets[0].schema_id == "qwen3_dense");
+    REQUIRE(produce_targets[0].slot_name == "qkv");
+
     dsl::HookRegistry hook_registry;
     int callback_count = 0;
     const dsl::HookTarget comm_target{"qwen3_dense", "permuted_input"};
