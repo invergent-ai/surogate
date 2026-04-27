@@ -3850,8 +3850,8 @@ void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight,
 
 /// @brief FP8 MoE weight gradient: dW[e] = dout_for_e^T @ input_for_e.
 /// Input is E4M3, upstream gradient is E5M2, output gradient remains BF16.
-/// Throws if cuBLASLt does not support the shape; callers should keep the
-/// existing BF16 path as fallback.
+/// Throws if native grouped FP8 GEMM does not support the shape; callers should
+/// keep the existing BF16 path as fallback.
 void moe_grouped_gemm_weight_grad_fp8(nv_bfloat16* d_weight,
                                       const __nv_fp8_e5m2* grad_output,
                                       const __nv_fp8_e4m3* input,
@@ -3861,7 +3861,7 @@ void moe_grouped_gemm_weight_grad_fp8(nv_bfloat16* d_weight,
                                       int num_experts,
                                       int M,
                                       int N,
-                                      cublasLtHandle_t cublas_handle,
+                                      cublasHandle_t cublas_handle,
                                       cudaStream_t stream,
                                       const int* host_offsets,
                                       float alpha = 1.0f,

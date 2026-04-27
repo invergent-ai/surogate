@@ -869,7 +869,7 @@ bool CompiledExecutor::try_moe_fp8_weight_grad(Tensor& d_weight,
         return false;
     }
     if (grad_output.DType != ETensorDType::BF16 || input.DType != ETensorDType::BF16 ||
-        d_weight.DType != ETensorDType::BF16 || !expert_offsets || !host_offsets || !mRunState.CublasLtHandle ||
+        d_weight.DType != ETensorDType::BF16 || !expert_offsets || !host_offsets || !mRunState.cublas_handle() ||
         num_experts <= 0 || M <= 0 || N <= 0 || grad_output.Rank < 2 || input.Rank < 2 ||
         grad_output.Sizes[0] != input.Sizes[0] || grad_output.Sizes[1] != M || input.Sizes[1] != N ||
         (beta != 0.0f && beta != 1.0f)) {
@@ -925,7 +925,7 @@ bool CompiledExecutor::try_moe_fp8_weight_grad(Tensor& d_weight,
                                          num_experts,
                                          M,
                                          N,
-                                         mRunState.CublasLtHandle,
+                                         mRunState.cublas_handle(),
                                          mRunState.MainStream,
                                          host_offsets,
                                          1.0f,

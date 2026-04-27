@@ -9,14 +9,21 @@ Tracked phases 0-5 are complete for the scoped, guarded implementation. The rema
 ## Track 1 - Finish Native FP8 MoE WGrad
 
 - [ ] Replace the current per-expert FP8 matmul loop in `moe_grouped_gemm_weight_grad_fp8` with a true grouped FP8 TN implementation.
+  - [x] Moved the FP8 wgrad implementation out of the old monolithic MoE kernel file into `csrc/src/kernels/moe/`.
+  - [x] Added a CUTLASS Hopper grouped FP8 wgrad path and an Ada-compatible dense fallback path for SM89/SM120 bring-up.
+  - [ ] Finish the native Blackwell grouped/blockwise-scale path instead of relying on the Ada-compatible fallback on SM120.
 - [ ] Use cuBLASLt grouped matmul where shape/alignment support is available.
+  - [x] Confirmed the currently available route is CUTLASS-based for E5M2 x E4M3 wgrad; the old cuBLASLt placeholder is gone from the native path.
 - [ ] Keep `SUROGATE_FP8_MOE_WGRAD=1` as the rollout gate until parity and perf are proven.
 - [ ] Preserve BF16 fallback for unsupported shapes, missing cache/state, and cuBLASLt rejection.
-- [ ] Add architecture-aware implementation notes for Ada, Hopper, and Blackwell based on the inspected CUTLASS grouped/FP8 examples.
+- [x] Add architecture-aware implementation notes for Ada, Hopper, and Blackwell based on the inspected CUTLASS grouped/FP8 examples.
+  - Ada: `58_ada_fp8_gemm` is a useful dense expert fallback scaffold; `64_ada_fp8_gemm_grouped` is the grouped target when per-group scale support is needed.
+  - Hopper: `57_hopper_grouped_gemm` matches the pointer-array grouped FP8 structure and supports E5M2/E4M3-style operand typing.
+  - Blackwell/SM120: the GeForce CUTLASS examples are blockwise/groupwise-scale oriented, so the native path needs a dedicated tensor-core port instead of the current Ada-compatible fallback.
 
 Acceptance:
 
-- [ ] Per-expert FP8 wgrad max-abs delta is within `5e-2` versus BF16 reference.
+- [x] Per-expert FP8 wgrad max-abs delta is within `5e-2` versus BF16 reference for the focused grouped active-expert unit test.
 - [ ] 5-step FP8-forward/FP8-dgrad/FP8-wgrad loss is within 5% of FP8-forward/BF16-wgrad baseline.
 - [ ] 2-GPU DP smoke passes with FP8 wgrad enabled.
 - [ ] nsys confirms the intended FP8 wgrad path and no redundant expert weight requantization in backward.

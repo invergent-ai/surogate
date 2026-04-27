@@ -10,6 +10,7 @@
 #include <numeric>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cublas_v2.h>
 
 #include <thrust/device_vector.h>
@@ -263,6 +264,12 @@ static float max_abs_diff(const float* a, const float* b, size_t n) {
         max_diff = std::max(max_diff, std::fabs(a[i] - b[i]));
     }
     return max_diff;
+}
+
+static float bf16_to_float(nv_bfloat16 value) {
+    uint16_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bf16_bits_to_float(bits);
 }
 
 }  // namespace
@@ -1196,4 +1203,103 @@ TEST_CASE("moe_grouped_gemm_down FP32", "[moe][grouped_gemm]") {
     REQUIRE(max_diff < 1e-4f);
 
     cublasDestroy(cublas_handle);
+}
+
+TEST_CASE("moe_grouped_gemm_weight_grad_fp8 grouped path matches quantized CPU reference", "[moe][grouped_gemm][fp8]") {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
+    if (props.major * 10 + props.minor < 89) {
+        SKIP("FP8 grouped GEMM requires Ada/Hopper/Blackwell class tensor cores");
+    }
+
+    constexpr int num_experts = 4;
+    constexpr int M = 32;
+    constexpr int N = 32;
+    const std::vector<int> h_offsets{0, 16, 16, 32, 48};
+    constexpr int total_tokens = 48;
+    const std::vector<int> h_active{0, 2, 3};
+
+    std::vector<float> h_grad_f = uniform_host(total_tokens * M, -0.5f, 0.5f, 4242ull);
+    std::vector<float> h_input_f = uniform_host(total_tokens * N, -0.5f, 0.5f, 4243ull);
+    std::vector<__nv_fp8_e5m2> h_grad(total_tokens * M);
+    std::vector<__nv_fp8_e4m3> h_input(total_tokens * N);
+    for (std::size_t i = 0; i < h_grad.size(); ++i) {
+        h_grad[i] = __nv_fp8_e5m2(h_grad_f[i]);
+    }
+    for (std::size_t i = 0; i < h_input.size(); ++i) {
+        h_input[i] = __nv_fp8_e4m3(h_input_f[i]);
+    }
+
+    auto compute_reference = [&](bool compact) {
+        const int expert_stride = compact ? static_cast<int>(h_active.size()) : num_experts;
+        std::vector<float> ref(static_cast<std::size_t>(expert_stride) * M * N, 0.0f);
+        for (int active_idx = 0; active_idx < static_cast<int>(h_active.size()); ++active_idx) {
+            const int expert = h_active[active_idx];
+            const int weight_idx = compact ? active_idx : expert;
+            const int start = h_offsets[expert];
+            const int end = h_offsets[expert + 1];
+            for (int m = 0; m < M; ++m) {
+                for (int n = 0; n < N; ++n) {
+                    float sum = 0.0f;
+                    for (int t = start; t < end; ++t) {
+                        sum += static_cast<float>(h_grad[t * M + m]) * static_cast<float>(h_input[t * N + n]);
+                    }
+                    ref[static_cast<std::size_t>(weight_idx) * M * N + m + n * M] = sum;
+                }
+            }
+        }
+        return ref;
+    };
+
+    thrust::device_vector<__nv_fp8_e5m2> d_grad = to_device(h_grad);
+    thrust::device_vector<__nv_fp8_e4m3> d_input = to_device(h_input);
+    thrust::device_vector<int> d_offsets = to_device(h_offsets);
+    thrust::device_vector<int> d_active = to_device(h_active);
+    thrust::device_vector<float> d_scale_grad(1, 1.0f);
+    thrust::device_vector<float> d_scale_input(1, 1.0f);
+
+    cublasHandle_t cublas_handle = nullptr;
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+
+    auto run_case = [&](bool compact) {
+        const int expert_stride = compact ? static_cast<int>(h_active.size()) : num_experts;
+        thrust::device_vector<nv_bfloat16> d_weight(static_cast<std::size_t>(expert_stride) * M * N);
+        thrust::fill(d_weight.begin(), d_weight.end(), make_nvbf16_from_float(0.0f));
+
+        moe_grouped_gemm_weight_grad_fp8(thrust::raw_pointer_cast(d_weight.data()),
+                                         thrust::raw_pointer_cast(d_grad.data()),
+                                         thrust::raw_pointer_cast(d_input.data()),
+                                         thrust::raw_pointer_cast(d_scale_grad.data()),
+                                         thrust::raw_pointer_cast(d_scale_input.data()),
+                                         thrust::raw_pointer_cast(d_offsets.data()),
+                                         num_experts,
+                                         M,
+                                         N,
+                                         cublas_handle,
+                                         0,
+                                         h_offsets.data(),
+                                         1.0f,
+                                         0.0f,
+                                         h_active.data(),
+                                         compact,
+                                         static_cast<int>(h_active.size()));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        const std::vector<float> ref = compute_reference(compact);
+        const std::vector<nv_bfloat16> got_bf16 = from_device(d_weight);
+        std::vector<float> got(got_bf16.size());
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            got[i] = bf16_to_float(got_bf16[i]);
+        }
+        const float max_diff = max_abs_diff(got.data(), ref.data(), got.size());
+        INFO("compact=" << compact << " max_diff=" << max_diff);
+        REQUIRE(max_diff < 5e-2f);
+    };
+
+    run_case(false);
+    run_case(true);
+
+    CUBLAS_CHECK(cublasDestroy(cublas_handle));
 }

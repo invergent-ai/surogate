@@ -422,7 +422,19 @@ target_sources(surogate-common PRIVATE
     src/kernels/gelu_glu.cu
     src/kernels/activation.cu
     src/kernels/fast_lora_silu.cu
-    src/kernels/moe_kernels.cu
+    src/kernels/moe/moe_backward_dispatch.cu
+    src/kernels/moe/moe_diagnostics.cu
+    src/kernels/moe/moe_dispatch_permute.cu
+    src/kernels/moe/moe_expert_bias.cu
+    src/kernels/moe/moe_fp8_grouped_gemm.cu
+    src/kernels/moe/moe_gpt_oss_activation.cu
+    src/kernels/moe/moe_grouped_gemm_backward.cu
+    src/kernels/moe/moe_grouped_gemm_core.cu
+    src/kernels/moe/moe_grouped_gemm_expert.cu
+    src/kernels/moe/moe_losses.cu
+    src/kernels/moe/moe_routing_activation.cu
+    src/kernels/moe/moe_topk.cu
+    src/kernels/moe/moe_fp8_wgrad_cutlass.cu
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
     src/kernels/rope.cu

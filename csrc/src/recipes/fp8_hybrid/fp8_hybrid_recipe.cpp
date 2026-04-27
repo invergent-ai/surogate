@@ -903,7 +903,7 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
                                                  ctx.num_experts,
                                                  ctx.N,
                                                  ctx.K,
-                                                 moe_cublaslt_handle(ctx),
+                                                 reinterpret_cast<cublasHandle_t>(ctx.cublas_handle),
                                                  ctx.stream,
                                                  ctx.host_offsets,
                                                  1.0f,
