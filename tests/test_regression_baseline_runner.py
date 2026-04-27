@@ -152,8 +152,11 @@ def test_coverage_report_marks_missing_storage_and_ep_schema_statuses():
     assert report["rows"][0]["hook_readiness_status"] == "missing"
     assert report["rows"][0]["missing_hook_counts"] == [
         "hook_before_consume_targets",
+        "hook_registry_before_consume_registrations",
         "hook_after_all_reduce_targets",
+        "hook_registry_after_all_reduce_registrations",
         "hook_after_all_to_all_targets",
+        "hook_registry_after_all_to_all_registrations",
     ]
 
 

@@ -707,17 +707,28 @@ def descriptor_requirement_status(case: dict[str, Any], descriptor_summary: dict
 def hook_readiness_status(case: dict[str, Any], metrics: dict[str, Any]) -> tuple[str, list[str]]:
     counts = hook_target_counts(metrics)
     required: list[str] = []
+
+    def add_required(key: str) -> None:
+        if key not in required:
+            required.append(key)
+
     if case.get("storage") == "cpu_stream":
-        required.append("hook_before_consume_targets")
+        add_required("hook_before_consume_targets")
+        add_required("hook_registry_before_consume_registrations")
     if "dp" in str(case.get("distribution") or ""):
-        required.append("hook_after_all_reduce_targets")
+        add_required("hook_after_all_reduce_targets")
+        add_required("hook_registry_after_all_reduce_registrations")
     if "ep" in str(case.get("distribution") or ""):
-        required.append("hook_after_all_to_all_targets")
+        add_required("hook_after_all_to_all_targets")
+        add_required("hook_registry_after_all_to_all_registrations")
     if int(counts.get("lora_slices") or 0) > 0:
-        required.append("hook_after_produce_targets")
-        required.append("lora_schema_slot_slices")
+        add_required("hook_after_produce_targets")
+        add_required("hook_registry_after_produce_registrations")
+        add_required("lora_schema_slot_slices")
     if int(counts.get("forward_hook_points") or 0) > 0:
-        required.append("forward_hook_schema_slot_points")
+        add_required("hook_after_produce_targets")
+        add_required("hook_registry_after_produce_registrations")
+        add_required("forward_hook_schema_slot_points")
     if not required:
         return "not_applicable", []
     if not metrics:
