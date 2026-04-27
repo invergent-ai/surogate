@@ -97,6 +97,11 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
         "block_schema_slots": 0,
         "block_schema_param_slots": 0,
         "block_schema_activation_slots": 0,
+        "block_schema_op_lifetime_slots": 0,
+        "block_schema_layer_lifetime_slots": 0,
+        "block_schema_block_lifetime_slots": 0,
+        "block_schema_model_lifetime_slots": 0,
+        "block_schema_persistent_lifetime_slots": 0,
         "block_schema_shape_slots": 0,
         "block_schema_activation_shape_slots": 0,
         "block_schema_save_for_backward_slots": 0,
@@ -149,6 +154,17 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
                     summary["block_schema_param_slots"] += 1
                 else:
                     summary["block_schema_activation_slots"] += 1
+                lifetime = slot.get("lifetime") or "layer"
+                if lifetime == "op":
+                    summary["block_schema_op_lifetime_slots"] += 1
+                elif lifetime == "block":
+                    summary["block_schema_block_lifetime_slots"] += 1
+                elif lifetime == "model":
+                    summary["block_schema_model_lifetime_slots"] += 1
+                elif lifetime == "persistent":
+                    summary["block_schema_persistent_lifetime_slots"] += 1
+                else:
+                    summary["block_schema_layer_lifetime_slots"] += 1
                 shape = slot.get("shape") or []
                 if isinstance(shape, list) and shape:
                     summary["block_schema_shape_slots"] += 1

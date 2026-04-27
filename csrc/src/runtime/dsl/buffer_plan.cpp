@@ -279,6 +279,8 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                     const std::string kind = attr_string(*slot, "kind");
                     slot_summary.kind = kind;
                     slot_summary.dtype = attr_string(*slot, "dtype");
+                    const std::string lifetime = attr_string(*slot, "lifetime");
+                    slot_summary.lifetime = lifetime.empty() ? "layer" : lifetime;
                     slot_summary.grouped = attr_bool(*slot, "grouped");
                     slot_summary.save_for_backward = attr_bool(*slot, "save_for_backward");
                     if (const AttrValue* shape_value = find_attr(*slot, "shape")) {
@@ -294,6 +296,17 @@ std::vector<BlockSchemaPlanRecord> collect_block_schema_plan_records(const Graph
                         ++out.param_slots;
                     } else {
                         ++out.activation_slots;
+                    }
+                    if (slot_summary.lifetime == "op") {
+                        ++out.op_lifetime_slots;
+                    } else if (slot_summary.lifetime == "block") {
+                        ++out.block_lifetime_slots;
+                    } else if (slot_summary.lifetime == "model") {
+                        ++out.model_lifetime_slots;
+                    } else if (slot_summary.lifetime == "persistent") {
+                        ++out.persistent_lifetime_slots;
+                    } else {
+                        ++out.layer_lifetime_slots;
                     }
                     const std::string residency = attr_string(*slot, "residency");
                     slot_summary.residency = residency.empty() ? "gpu" : residency;
@@ -491,6 +504,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
             p.schema_slot_count += record.slot_count;
             p.schema_param_slots += record.param_slots;
             p.schema_activation_slots += record.activation_slots;
+            p.schema_op_lifetime_slots += record.op_lifetime_slots;
+            p.schema_layer_lifetime_slots += record.layer_lifetime_slots;
+            p.schema_block_lifetime_slots += record.block_lifetime_slots;
+            p.schema_model_lifetime_slots += record.model_lifetime_slots;
+            p.schema_persistent_lifetime_slots += record.persistent_lifetime_slots;
             p.schema_replicated_slots += record.replicated_slots;
             p.schema_sharded_dim_slots += record.sharded_dim_slots;
             p.schema_router_replicated_slots += record.router_replicated_slots;
@@ -518,6 +536,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 layer.slot_count = record.slot_count;
                 layer.param_slots = record.param_slots;
                 layer.activation_slots = record.activation_slots;
+                layer.op_lifetime_slots = record.op_lifetime_slots;
+                layer.layer_lifetime_slots = record.layer_lifetime_slots;
+                layer.block_lifetime_slots = record.block_lifetime_slots;
+                layer.model_lifetime_slots = record.model_lifetime_slots;
+                layer.persistent_lifetime_slots = record.persistent_lifetime_slots;
                 layer.replicated_slots = record.replicated_slots;
                 layer.sharded_dim_slots = record.sharded_dim_slots;
                 layer.router_replicated_slots = record.router_replicated_slots;
@@ -573,6 +596,13 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 }
                 continue;
             }
+            if (slot.save_for_backward) {
+                ++layer.save_for_backward_activation_slots;
+                ++p.schema_save_for_backward_activation_slots;
+            } else {
+                ++layer.frame_activation_slots;
+                ++p.schema_frame_activation_slots;
+            }
             if (resolved) {
                 slot.resolved_bytes =
                     slot.resolved_numel * static_cast<long>(get_dtype_size(schema_slot_dtype(p, slot)));
@@ -581,6 +611,13 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 ++p.schema_resolved_activation_shape_slots;
                 layer.resolved_activation_shape_bytes += slot.resolved_bytes;
                 p.schema_resolved_activation_shape_bytes += slot.resolved_bytes;
+                if (slot.save_for_backward) {
+                    layer.save_for_backward_activation_bytes += slot.resolved_bytes;
+                    p.schema_save_for_backward_activation_bytes += slot.resolved_bytes;
+                } else {
+                    layer.frame_activation_bytes += slot.resolved_bytes;
+                    p.schema_frame_activation_bytes += slot.resolved_bytes;
+                }
             } else {
                 if (slot.shape_dynamic) {
                     ++layer.dynamic_activation_shape_slots;

@@ -47,6 +47,7 @@ struct BlockSchemaSlotSummary {
     std::string name;
     std::string kind;
     std::string dtype;
+    std::string lifetime;
     std::string residency;
     std::string distribution_kind;
     int shape_rank = 0;
@@ -73,6 +74,11 @@ struct BlockSchemaPlanRecord {
     int slot_count = 0;
     int param_slots = 0;
     int activation_slots = 0;
+    int op_lifetime_slots = 0;
+    int layer_lifetime_slots = 0;
+    int block_lifetime_slots = 0;
+    int model_lifetime_slots = 0;
+    int persistent_lifetime_slots = 0;
     int replicated_slots = 0;
     int sharded_dim_slots = 0;
     int router_replicated_slots = 0;
@@ -111,6 +117,11 @@ struct BlockSchemaLayerSummary {
     int slot_count = 0;
     int param_slots = 0;
     int activation_slots = 0;
+    int op_lifetime_slots = 0;
+    int layer_lifetime_slots = 0;
+    int block_lifetime_slots = 0;
+    int model_lifetime_slots = 0;
+    int persistent_lifetime_slots = 0;
     int replicated_slots = 0;
     int sharded_dim_slots = 0;
     int router_replicated_slots = 0;
@@ -127,6 +138,10 @@ struct BlockSchemaLayerSummary {
     int unresolved_activation_shape_slots = 0;
     int dynamic_activation_shape_slots = 0;
     long resolved_activation_shape_bytes = 0;
+    int save_for_backward_activation_slots = 0;
+    int frame_activation_slots = 0;
+    long save_for_backward_activation_bytes = 0;
+    long frame_activation_bytes = 0;
     int resolved_param_shape_slots = 0;
     int unresolved_param_shape_slots = 0;
     int expert_parallel_param_slots = 0;
@@ -208,6 +223,11 @@ struct BufferPlan {
     int schema_slot_count = 0;
     int schema_param_slots = 0;
     int schema_activation_slots = 0;
+    int schema_op_lifetime_slots = 0;
+    int schema_layer_lifetime_slots = 0;
+    int schema_block_lifetime_slots = 0;
+    int schema_model_lifetime_slots = 0;
+    int schema_persistent_lifetime_slots = 0;
     int schema_replicated_slots = 0;
     int schema_sharded_dim_slots = 0;
     int schema_router_replicated_slots = 0;
@@ -224,6 +244,10 @@ struct BufferPlan {
     int schema_unresolved_activation_shape_slots = 0;
     int schema_dynamic_activation_shape_slots = 0;
     long schema_resolved_activation_shape_bytes = 0;
+    int schema_save_for_backward_activation_slots = 0;
+    int schema_frame_activation_slots = 0;
+    long schema_save_for_backward_activation_bytes = 0;
+    long schema_frame_activation_bytes = 0;
     long schema_max_layer_activation_shape_bytes = 0;
     long schema_legacy_max_activation_shape_bytes = 0;
     long schema_activation_shape_savings_bytes = 0;

@@ -72,6 +72,7 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
                   },
                   {
                     "kind": "activation",
+                    "lifetime": "block",
                     "shape": ["B", "T", "C"],
                     "residency": "cpu_pinned_stream",
                     "distribution": {"kind": "replicated"},
@@ -99,6 +100,8 @@ def test_summarize_block_schemas_counts_layer_storage_and_distribution():
     assert summary["block_schema_slots"] == 2
     assert summary["block_schema_param_slots"] == 1
     assert summary["block_schema_activation_slots"] == 1
+    assert summary["block_schema_layer_lifetime_slots"] == 1
+    assert summary["block_schema_block_lifetime_slots"] == 1
     assert summary["block_schema_shape_slots"] == 2
     assert summary["block_schema_activation_shape_slots"] == 1
     assert summary["block_schema_save_for_backward_slots"] == 1

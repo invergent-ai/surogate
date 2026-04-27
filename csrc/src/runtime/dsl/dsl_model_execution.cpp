@@ -289,6 +289,11 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             << ", block_schema_mamba_layers=" << initial_plan.schema_mamba_layers
             << ", block_schema_linear_mixer_layers=" << initial_plan.schema_linear_mixer_layers
             << ", block_schema_slots=" << initial_plan.schema_slot_count
+            << ", block_schema_op_lifetime_slots=" << initial_plan.schema_op_lifetime_slots
+            << ", block_schema_layer_lifetime_slots=" << initial_plan.schema_layer_lifetime_slots
+            << ", block_schema_block_lifetime_slots=" << initial_plan.schema_block_lifetime_slots
+            << ", block_schema_model_lifetime_slots=" << initial_plan.schema_model_lifetime_slots
+            << ", block_schema_persistent_lifetime_slots=" << initial_plan.schema_persistent_lifetime_slots
             << ", block_schema_sharded_dim_slots=" << initial_plan.schema_sharded_dim_slots
             << ", block_schema_router_replicated_slots=" << initial_plan.schema_router_replicated_slots
             << ", block_schema_expert_parallel_slots=" << initial_plan.schema_expert_parallel_slots
@@ -305,6 +310,12 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             << initial_plan.schema_unresolved_activation_shape_slots
             << ", block_schema_dynamic_activation_shape_slots=" << initial_plan.schema_dynamic_activation_shape_slots
             << ", block_schema_resolved_activation_shape_bytes=" << initial_plan.schema_resolved_activation_shape_bytes
+            << ", block_schema_save_for_backward_activation_slots="
+            << initial_plan.schema_save_for_backward_activation_slots
+            << ", block_schema_frame_activation_slots=" << initial_plan.schema_frame_activation_slots
+            << ", block_schema_save_for_backward_activation_bytes="
+            << initial_plan.schema_save_for_backward_activation_bytes
+            << ", block_schema_frame_activation_bytes=" << initial_plan.schema_frame_activation_bytes
             << ", block_schema_max_layer_activation_shape_bytes="
             << initial_plan.schema_max_layer_activation_shape_bytes
             << ", block_schema_legacy_max_activation_shape_bytes="

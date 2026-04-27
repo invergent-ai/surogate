@@ -165,6 +165,11 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].slot_count == 3);
     REQUIRE(schema_records[0].param_slots == 2);
     REQUIRE(schema_records[0].activation_slots == 1);
+    REQUIRE(schema_records[0].op_lifetime_slots == 0);
+    REQUIRE(schema_records[0].layer_lifetime_slots == 3);
+    REQUIRE(schema_records[0].block_lifetime_slots == 0);
+    REQUIRE(schema_records[0].model_lifetime_slots == 0);
+    REQUIRE(schema_records[0].persistent_lifetime_slots == 0);
     REQUIRE(schema_records[0].replicated_slots == 1);
     REQUIRE(schema_records[0].sharded_dim_slots == 0);
     REQUIRE(schema_records[0].router_replicated_slots == 0);
@@ -178,6 +183,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(schema_records[0].slots.size() == 3);
     REQUIRE(schema_records[0].slots[1].name == "experts_gate_up");
     REQUIRE(schema_records[0].slots[1].kind == "param");
+    REQUIRE(schema_records[0].slots[1].lifetime == "layer");
     REQUIRE(schema_records[0].slots[1].residency == "auto");
     REQUIRE(schema_records[0].slots[1].distribution_kind == "expert_parallel");
     REQUIRE(schema_records[0].slots[1].shape_rank == 3);
@@ -259,6 +265,11 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_slot_count == 3);
     REQUIRE(plan.schema_param_slots == 2);
     REQUIRE(plan.schema_activation_slots == 1);
+    REQUIRE(plan.schema_op_lifetime_slots == 0);
+    REQUIRE(plan.schema_layer_lifetime_slots == 3);
+    REQUIRE(plan.schema_block_lifetime_slots == 0);
+    REQUIRE(plan.schema_model_lifetime_slots == 0);
+    REQUIRE(plan.schema_persistent_lifetime_slots == 0);
     REQUIRE(plan.schema_replicated_slots == 1);
     REQUIRE(plan.schema_sharded_dim_slots == 0);
     REQUIRE(plan.schema_router_replicated_slots == 0);
@@ -274,6 +285,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_resolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_unresolved_activation_shape_slots == 0);
     REQUIRE(plan.schema_resolved_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_save_for_backward_activation_slots == 0);
+    REQUIRE(plan.schema_frame_activation_slots == 1);
+    REQUIRE(plan.schema_save_for_backward_activation_bytes == 0);
+    REQUIRE(plan.schema_frame_activation_bytes == 96);
     REQUIRE(plan.schema_max_layer_activation_shape_bytes == 96);
     REQUIRE(plan.schema_legacy_max_activation_shape_bytes == 96);
     REQUIRE(plan.schema_activation_shape_savings_bytes == 0);
@@ -293,6 +308,11 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].slot_count == 3);
     REQUIRE(plan.schema_layers[0].param_slots == 2);
     REQUIRE(plan.schema_layers[0].activation_slots == 1);
+    REQUIRE(plan.schema_layers[0].op_lifetime_slots == 0);
+    REQUIRE(plan.schema_layers[0].layer_lifetime_slots == 3);
+    REQUIRE(plan.schema_layers[0].block_lifetime_slots == 0);
+    REQUIRE(plan.schema_layers[0].model_lifetime_slots == 0);
+    REQUIRE(plan.schema_layers[0].persistent_lifetime_slots == 0);
     REQUIRE(plan.schema_layers[0].replicated_slots == 1);
     REQUIRE(plan.schema_layers[0].sharded_dim_slots == 0);
     REQUIRE(plan.schema_layers[0].router_replicated_slots == 0);
@@ -306,6 +326,10 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(plan.schema_layers[0].resolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_layers[0].unresolved_activation_shape_slots == 0);
     REQUIRE(plan.schema_layers[0].resolved_activation_shape_bytes == 96);
+    REQUIRE(plan.schema_layers[0].save_for_backward_activation_slots == 0);
+    REQUIRE(plan.schema_layers[0].frame_activation_slots == 1);
+    REQUIRE(plan.schema_layers[0].save_for_backward_activation_bytes == 0);
+    REQUIRE(plan.schema_layers[0].frame_activation_bytes == 96);
     REQUIRE(plan.schema_layers[0].resolved_param_shape_slots == 2);
     REQUIRE(plan.schema_layers[0].unresolved_param_shape_slots == 0);
     REQUIRE(plan.schema_layers[0].expert_parallel_param_slots == 1);
