@@ -305,6 +305,11 @@ inline constexpr std::array<LoRATargetId, 2> kSharedLoRALayerTargets = {
     LoRATargetId::SharedDown,
 };
 
+inline constexpr bool lora_target_is_expert(LoRATargetId id) {
+    return id == LoRATargetId::ExpertGate || id == LoRATargetId::ExpertGateUp || id == LoRATargetId::ExpertUp ||
+           id == LoRATargetId::ExpertDown;
+}
+
 template <typename TTensor, typename Fn>
 inline void for_each_lora_layer_weight(LoRABlockWeights<TTensor>& block, Fn&& fn) {
     for (LoRATargetId id : kBaseLoRALayerTargets) {

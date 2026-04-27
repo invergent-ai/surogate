@@ -268,42 +268,11 @@ void ModularLoRAGradsManager::zero_all(cudaStream_t stream) {
     if (!mConfig.lora_config.enabled()) return;
 
     for (auto& block : mFullGrads.blocks) {
-        auto zero_layer = [stream](auto& opt_layer) {
-            if (!opt_layer.has_value()) return;
-            if (opt_layer->A.Data) fill_zero(opt_layer->A, stream);
-            if (opt_layer->B.Data) fill_zero(opt_layer->B, stream);
+        auto zero_layer = [stream](auto, auto& layer) {
+            if (layer.A.Data) fill_zero(layer.A, stream);
+            if (layer.B.Data) fill_zero(layer.B, stream);
         };
-        zero_layer(block.attention.q);
-        zero_layer(block.attention.k);
-        zero_layer(block.attention.v);
-        zero_layer(block.attention.o);
-        zero_layer(block.mlp.gate);
-        zero_layer(block.mlp.gate_up);
-        zero_layer(block.mlp.up);
-        zero_layer(block.mlp.down);
-
-        if (block.moe.use_grouped) {
-            zero_layer(block.moe.grouped.gate);
-            zero_layer(block.moe.grouped.gate_up);
-            zero_layer(block.moe.grouped.up);
-            zero_layer(block.moe.grouped.down);
-        } else {
-            // MoE expert LoRA gradients
-            for (auto& expert : block.moe.experts) {
-                zero_layer(expert.gate);
-                zero_layer(expert.gate_up);
-                zero_layer(expert.up);
-                zero_layer(expert.down);
-            }
-        }
-
-        if (block.moe.shared.has_value()) {
-            zero_layer(block.moe.shared->up);
-            zero_layer(block.moe.shared->down);
-        }
-
-        // Router LoRA gradients
-        zero_layer(block.router);
+        for_each_lora_layer_weight(block, zero_layer);
     }
 }
 
@@ -353,78 +322,19 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
     if (comm.world_size() == 1) return;
     const bool ep_active = comm.ep_enabled();
 
-    auto all_reduce_layer = [&](std::optional<LoRALayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
-    };
-
-    auto all_reduce_layer_dp = [&](std::optional<LoRALayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg_dp(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg_dp(layer->B, stream);
-    };
-
-    auto all_reduce_grouped_layer = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
-    };
-
-    auto all_reduce_grouped_layer_dp = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg_dp(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg_dp(layer->B, stream);
+    auto all_reduce_layer = [&](LoRATargetId id, auto& layer) {
+        // Expert adapters are EP-sharded; reducing them over the full world would mix experts.
+        const bool reduce_dp_only = ep_active && lora_target_is_expert(id);
+        if (layer.A.Data) {
+            reduce_dp_only ? comm.all_reduce_avg_dp(layer.A, stream) : comm.all_reduce_avg(layer.A, stream);
+        }
+        if (layer.B.Data) {
+            reduce_dp_only ? comm.all_reduce_avg_dp(layer.B, stream) : comm.all_reduce_avg(layer.B, stream);
+        }
     };
 
     for (auto& block : mFullGrads.blocks) {
-        all_reduce_layer(block.attention.q);
-        all_reduce_layer(block.attention.k);
-        all_reduce_layer(block.attention.v);
-        all_reduce_layer(block.attention.o);
-        all_reduce_layer(block.mlp.gate);
-        all_reduce_layer(block.mlp.gate_up);
-        all_reduce_layer(block.mlp.up);
-        all_reduce_layer(block.mlp.down);
-
-        if (block.moe.use_grouped) {
-            // Expert LoRA tensors are sharded by EP rank. Reducing across the full world
-            // would mix different experts; reduce across DP group only when EP is active.
-            if (ep_active) {
-                all_reduce_grouped_layer_dp(block.moe.grouped.gate);
-                all_reduce_grouped_layer_dp(block.moe.grouped.gate_up);
-                all_reduce_grouped_layer_dp(block.moe.grouped.up);
-                all_reduce_grouped_layer_dp(block.moe.grouped.down);
-            } else {
-                all_reduce_grouped_layer(block.moe.grouped.gate);
-                all_reduce_grouped_layer(block.moe.grouped.gate_up);
-                all_reduce_grouped_layer(block.moe.grouped.up);
-                all_reduce_grouped_layer(block.moe.grouped.down);
-            }
-        } else {
-            // MoE expert LoRA gradients
-            for (auto& expert : block.moe.experts) {
-                if (ep_active) {
-                    all_reduce_layer_dp(expert.gate);
-                    all_reduce_layer_dp(expert.gate_up);
-                    all_reduce_layer_dp(expert.up);
-                    all_reduce_layer_dp(expert.down);
-                } else {
-                    all_reduce_layer(expert.gate);
-                    all_reduce_layer(expert.gate_up);
-                    all_reduce_layer(expert.up);
-                    all_reduce_layer(expert.down);
-                }
-            }
-        }
-
-        if (block.moe.shared.has_value()) {
-            all_reduce_layer(block.moe.shared->up);
-            all_reduce_layer(block.moe.shared->down);
-        }
-
-        // Router LoRA gradients
-        all_reduce_layer(block.router);
+        for_each_lora_layer_weight(block, all_reduce_layer);
     }
     for (int layer = 0; layer < static_cast<int>(mHookSchemaIdsByLayer.size()); ++layer) {
         dispatch_schema_layer_hooks(layer, stream);

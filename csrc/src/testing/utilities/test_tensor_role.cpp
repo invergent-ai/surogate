@@ -200,6 +200,9 @@ TEST_CASE("LoRA target iteration follows structural block order", "[tensor_role]
                        modules::LoRATargetId::ExpertGateUp,
                        modules::LoRATargetId::Router,
                    });
+
+    REQUIRE(modules::lora_target_is_expert(modules::LoRATargetId::ExpertGateUp));
+    REQUIRE_FALSE(modules::lora_target_is_expert(modules::LoRATargetId::Router));
 }
 
 TEST_CASE("CompiledGraph exposes tensor roles by id and name", "[tensor_role][graph]") {
