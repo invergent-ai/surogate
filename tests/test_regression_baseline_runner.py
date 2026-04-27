@@ -43,6 +43,8 @@ def test_coverage_report_counts_supported_quant_rows(tmp_path):
         "matmul_fp8_forward_eligible_ops",
         "matmul_fp8_backward_eligible_ops",
     ]
+    assert report["rows"][1]["descriptor_requirement_status"] == "not_applicable"
+    assert report["rows"][1]["missing_descriptor_counts"] == []
     assert json.dumps(report)
 
 

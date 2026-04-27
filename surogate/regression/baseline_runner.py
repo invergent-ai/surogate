@@ -506,6 +506,9 @@ def matmul_capability_counts(descriptor_summary: dict[str, Any]) -> dict[str, An
 
 
 def descriptor_count_requirements_for_case(case: dict[str, Any]) -> list[str]:
+    if not case.get("supported", True):
+        return []
+
     recipe = case["recipe"]
     op_kind = case["op_kind"]
     if recipe not in {"fp8", "fp4"}:
