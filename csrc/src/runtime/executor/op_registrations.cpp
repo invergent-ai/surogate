@@ -772,12 +772,26 @@ REGISTER_COMPILED_OP_NO_COMM("mamba_gated_rmsnorm_backward",
                              nullptr,
                              ::dsl::bwd_mamba_gated_rmsnorm,
                              Normalization);
-REGISTER_COMPILED_OP_NO_COMM("mamba_out_proj", MambaOutProj, ::dsl::fwd_mamba_out_proj, nullptr, Dense);
-REGISTER_COMPILED_OP_NO_COMM("mamba_out_proj_backward",
-                             MambaOutProjBackward,
-                             nullptr,
-                             ::dsl::bwd_mamba_out_proj,
-                             Dense);
+REGISTER_COMPILED_OP_NO_COMM_CAPS("mamba_out_proj",
+                                  MambaOutProj,
+                                  ::dsl::fwd_mamba_out_proj,
+                                  nullptr,
+                                  Dense,
+                                  ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible |
+                                      ::dsl::OpCapabilityFp4Eligible | ::dsl::OpCapabilityLoRACompatible |
+                                      ::dsl::OpCapabilityWeightCacheEligible,
+                                  ::dsl::EpilogueSupportNone,
+                                  ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
+REGISTER_COMPILED_OP_NO_COMM_CAPS("mamba_out_proj_backward",
+                                  MambaOutProjBackward,
+                                  nullptr,
+                                  ::dsl::bwd_mamba_out_proj,
+                                  Dense,
+                                  ::dsl::OpCapabilityDenseMatmul | ::dsl::OpCapabilityFp8Eligible |
+                                      ::dsl::OpCapabilityFp4Eligible | ::dsl::OpCapabilityLoRACompatible |
+                                      ::dsl::OpCapabilityWeightCacheEligible,
+                                  ::dsl::EpilogueSupportNone,
+                                  ::dsl::StorageCompatibilityGpuResident | ::dsl::StorageCompatibilityCpuPinnedStream);
 
 // Qwen3.5 gated delta rule forward + backward
 REGISTER_COMPILED_OP_NO_COMM("chunk_gated_delta_rule",

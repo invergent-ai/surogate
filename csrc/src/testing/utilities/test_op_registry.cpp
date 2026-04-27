@@ -150,6 +150,10 @@ TEST_CASE("mamba and gated-delta ops carry no-comm descriptor metadata", "[op_re
     REQUIRE(mamba_out != nullptr);
     REQUIRE(mamba_out->semantic_kind == OpSemanticKind::Dense);
     REQUIRE(mamba_out->comm_profile.kind == CommunicationKind::NoComm);
+    REQUIRE(mamba_out->default_caps.has(OpCapabilityDenseMatmul));
+    REQUIRE(mamba_out->default_caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(mamba_out->default_caps.has(OpCapabilityFp4Eligible));
+    REQUIRE(mamba_out->storage_compat.supports(StorageTier::CpuPinnedStream));
 
     const OpDescriptor* gated_delta = OpRegistry::instance().find_by_name("chunk_gated_delta_rule");
     REQUIRE(gated_delta != nullptr);
