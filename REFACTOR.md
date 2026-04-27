@@ -30,6 +30,11 @@ Completed in the first implementation pass:
 - [x] Autodiff MoE side-channel classification centralized through TensorRole helpers.
 - [x] Existing op dispatch/autodiff registry preserved; descriptor metadata extension started instead of rebuilding the registry.
 - [x] MoE op registry descriptors annotated with first-month semantic/distribution metadata.
+- [x] Registry descriptor surface extended with `CommunicationProfile` and `GroupedSemantics`.
+- [x] MoE grouped ops annotated with expert-parallel routed grouped semantics.
+- [x] EP dispatch/combine ops annotated with all-to-all communication profiles.
+- [x] Mamba/SSM and Qwen3.5 gated-delta op families annotated as no-comm sequence/dense/view descriptors.
+- [x] Core transformer ops annotated with semantic descriptor metadata.
 - [x] CUTLASS examples README inspected for relevant FP8/grouped GEMM paths; future candidates identified (`57_hopper_grouped_gemm`, `69_hopper_mixed_dtype_grouped_gemm`, `75_blackwell_grouped_gemm`, `81_blackwell_gemm_blockwise`, `54_hopper_fp8_warp_specialized_gemm`, `58_ada_fp8_gemm`).
 
 Local validation status:
