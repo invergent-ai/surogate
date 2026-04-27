@@ -250,6 +250,16 @@ TEST_CASE("recipe capability predicates preserve legacy fallback semantics", "[o
     REQUIRE(recipes::descriptor_allows_fp4(fp4_only));
     REQUIRE_FALSE(recipes::descriptor_allows_fp8(fp4_only, "test"));
     REQUIRE(recipes::descriptor_allows_fp4(fp4_only, "test"));
+
+    MoECapabilities moe_unannotated{};
+    REQUIRE(recipes::descriptor_allows_moe_fp8_grouped(moe_unannotated));
+    REQUIRE(recipes::descriptor_allows_moe_fp4_grouped(moe_unannotated));
+    REQUIRE(recipes::descriptor_has_moe_fp8_backward(moe_unannotated, "test"));
+
+    MoECapabilities moe_forward_only{MoECapabilityFp8GroupedEligible | MoECapabilityFp4GroupedEligible};
+    REQUIRE(recipes::descriptor_allows_moe_fp8_grouped(moe_forward_only));
+    REQUIRE(recipes::descriptor_allows_moe_fp4_grouped(moe_forward_only));
+    REQUIRE_FALSE(recipes::descriptor_has_moe_fp8_backward(moe_forward_only, "test"));
 }
 
 }  // namespace
