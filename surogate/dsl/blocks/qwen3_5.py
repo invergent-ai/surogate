@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .. import nn
+from ..block_schema import BlockSchema, SlotDecl
 from ..modules import GatedDeltaNetMixer, GenericMLP, Qwen3_5Attention, RMSNormPlus1, _resolve_rotary_dim
 
 
@@ -152,6 +153,19 @@ class Qwen3_5AttentionBlock(nn.Block):
     """
 
     _name_remap_ = QWEN3_5_ATTN_BLOCK_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl("full_q_proj_weight", kind="param", shape=("QProjDim", "C")),
+            SlotDecl("full_k_proj_weight", kind="param", shape=("KVDim", "C")),
+            SlotDecl("full_v_proj_weight", kind="param", shape=("KVDim", "C")),
+            SlotDecl("full_out_weight", kind="param", shape=("C", "QProjDim")),
+            SlotDecl("mlp_up_weight", kind="param", shape=("2M", "C"), residency="auto"),
+            SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
+            SlotDecl("res_att", shape=("B", "T", "C"), save_for_backward=True),
+            SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
+        ),
+        attrs={"block_family": "qwen3_5_attention"},
+    )
 
     def __init__(
         self,
@@ -230,6 +244,22 @@ class Qwen3_5LinearBlock(nn.Block):
     """
 
     _name_remap_ = QWEN3_5_LINEAR_BLOCK_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl("lin_in_proj_qkv_weight", kind="param", shape=("ConvDim", "C")),
+            SlotDecl("lin_in_proj_z_weight", kind="param", shape=("ValueDim", "C")),
+            SlotDecl("lin_in_proj_b_weight", kind="param", shape=("Hk", "C")),
+            SlotDecl("lin_in_proj_a_weight", kind="param", shape=("Hk", "C")),
+            SlotDecl("lin_conv_weight", kind="param", shape=("ConvDim", 1, "ConvK")),
+            SlotDecl("lin_out_weight", kind="param", shape=("C", "ValueDim")),
+            SlotDecl("mlp_up_weight", kind="param", shape=("2M", "C"), residency="auto"),
+            SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
+            SlotDecl("lin_conv_state", shape=("B", "ConvDim", "ConvK"), save_for_backward=True),
+            SlotDecl("lin_delta_state", shape=("B", "Hv", "Vd"), save_for_backward=True),
+            SlotDecl("res_att", shape=("B", "T", "C"), save_for_backward=True),
+        ),
+        attrs={"block_family": "qwen3_5_linear"},
+    )
 
     def __init__(
         self,

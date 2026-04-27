@@ -105,6 +105,7 @@
 - [x] `BlockSpec` now carries optional schema metadata without changing lowering or runtime allocation behavior.
 - [x] Initial schemas attached to Nemotron Mamba, Nemotron MoE, Qwen3-MoE, and GPT-OSS MoE blocks.
 - [x] Gemma4 dense/shared-KV/MoE and Qwen3.5 MoE block families now declare Phase 4 schema metadata.
+- [x] Qwen3 and Qwen3.5 dense attention/linear block families now declare Phase 4 schema metadata.
 - [x] Block schema metadata now serializes into compiled block IR dictionaries for future BufferPlan consumption.
 - [x] Legacy Python lowerer also preserves block schema metadata, keeping both DSL lowering paths aligned.
 - [x] Expanded model graphs now preserve per-layer block schema records in forward graph metadata.

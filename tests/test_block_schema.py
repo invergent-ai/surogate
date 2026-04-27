@@ -4,6 +4,8 @@ from surogate.dsl.block_schema import BlockSchema, DistributionDecl
 from surogate.dsl.blocks.gemma4 import Gemma4FullMoEBlock, Gemma4SharedKVBlock, Gemma4SlidingBlock
 from surogate.dsl.blocks.gpt_oss import GptOssBlock
 from surogate.dsl.blocks.nemotron_h import NemotronHMamba2Block, NemotronHMoEBlock
+from surogate.dsl.blocks.qwen3 import Qwen3Block
+from surogate.dsl.blocks.qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
 from surogate.dsl.blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
 from surogate.dsl.blocks.qwen3_moe import Qwen3MoEBlock
 from surogate.dsl.py_lowering import lower_block_spec
@@ -142,6 +144,40 @@ def test_gemma4_blocks_declare_dense_and_moe_schema():
     assert moe.schema.attrs["block_family"] == "gemma4_full_moe"
     assert moe.schema.routing.kind == "topk_softmax"
     assert moe.schema.get_slot("experts_gate_up").distribution.kind == "expert_parallel"
+
+
+def test_qwen3_and_qwen3_5_dense_blocks_declare_schema():
+    qwen3 = Qwen3Block(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+    ).compile()
+    qwen35_attn = Qwen3_5AttentionBlock(
+        d_model=256,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        d_ff=512,
+        max_seq=2048,
+    ).compile()
+    qwen35_linear = Qwen3_5LinearBlock(
+        d_model=256,
+        d_ff=512,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+    ).compile()
+
+    assert qwen3.schema.attrs["block_family"] == "qwen3_dense"
+    assert qwen3.schema.get_slot("qkv_weight").kind == "param"
+    assert qwen35_attn.schema.attrs["block_family"] == "qwen3_5_attention"
+    assert qwen35_attn.schema.get_slot("full_q_proj_weight").kind == "param"
+    assert qwen35_linear.schema.attrs["block_family"] == "qwen3_5_linear"
+    assert qwen35_linear.schema.get_slot("lin_conv_state").save_for_backward is True
 
 
 def test_block_schema_lowers_to_block_ir_dict():
