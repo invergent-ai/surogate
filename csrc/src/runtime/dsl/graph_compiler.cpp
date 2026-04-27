@@ -3243,7 +3243,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
     // each layer's activations into the arena just-in-time before
     // backward ops read, matching `Recomputed[i]` in
     // design/buffer-runtime-v4.md.
-    arenas.fwd_stack_bytes = fwd.fwd_stack_peak;
+    arenas.compiled_fwd_stack_bytes = fwd.fwd_stack_peak;
+    arenas.fwd_stack_bytes = arenas.compiled_fwd_stack_bytes;
     arenas.bwd_stack_bytes = bwd.bwd_stack_peak;
 
     // SaveForBwd: per-block slots persist across the fwd-exit / bwd-entry
@@ -3258,7 +3259,32 @@ void compute_arena_sizes(PhaseArenas& arenas,
         arenas.save_for_bwd_block_bases[idx] = total;
         total += std::max(fwd_bytes, bwd_bytes);
     }
-    arenas.save_for_bwd_bytes = total;
+    arenas.compiled_save_for_bwd_bytes = total;
+    arenas.save_for_bwd_bytes = arenas.compiled_save_for_bwd_bytes;
+
+    if (arenas.schema_allocation_authoritative) {
+        if (arenas.schema_frame_arena_bytes > 0) {
+            arenas.fwd_stack_bytes = std::max(arenas.compiled_fwd_stack_bytes, arenas.schema_frame_arena_bytes);
+            if (arenas.compiled_fwd_stack_bytes > arenas.schema_frame_arena_bytes) {
+                arenas.schema_frame_arena_safety_bytes =
+                    arenas.compiled_fwd_stack_bytes - arenas.schema_frame_arena_bytes;
+            } else {
+                arenas.schema_frame_arena_extra_bytes =
+                    arenas.schema_frame_arena_bytes - arenas.compiled_fwd_stack_bytes;
+            }
+        }
+        if (arenas.schema_save_for_bwd_arena_bytes > 0) {
+            arenas.save_for_bwd_bytes =
+                std::max(arenas.compiled_save_for_bwd_bytes, arenas.schema_save_for_bwd_arena_bytes);
+            if (arenas.compiled_save_for_bwd_bytes > arenas.schema_save_for_bwd_arena_bytes) {
+                arenas.schema_save_for_bwd_safety_bytes =
+                    arenas.compiled_save_for_bwd_bytes - arenas.schema_save_for_bwd_arena_bytes;
+            } else {
+                arenas.schema_save_for_bwd_extra_bytes =
+                    arenas.schema_save_for_bwd_arena_bytes - arenas.compiled_save_for_bwd_bytes;
+            }
+        }
+    }
 }
 
 std::size_t estimate_bwd_cross_layer_bytes(const CompiledGraph& bwd) {
@@ -3549,6 +3575,18 @@ void release_phase_arenas(PhaseArenas& arenas) {
     arenas.unified_stack_bytes = 0;
     arenas.bwd_cross_layer_bytes = 0;
     arenas.moe_saved_bytes = 0;
+    arenas.schema_allocation_authoritative = false;
+    arenas.compiled_fwd_stack_bytes = 0;
+    arenas.compiled_save_for_bwd_bytes = 0;
+    arenas.schema_frame_arena_bytes = 0;
+    arenas.schema_save_for_bwd_arena_bytes = 0;
+    arenas.schema_persistent_activation_bytes = 0;
+    arenas.schema_host_stream_activation_bytes = 0;
+    arenas.schema_total_activation_arena_bytes = 0;
+    arenas.schema_frame_arena_safety_bytes = 0;
+    arenas.schema_save_for_bwd_safety_bytes = 0;
+    arenas.schema_frame_arena_extra_bytes = 0;
+    arenas.schema_save_for_bwd_extra_bytes = 0;
     arenas.save_for_bwd_block_bases.clear();
     arenas.allocated = false;
 }

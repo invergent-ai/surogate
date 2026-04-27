@@ -1980,11 +1980,17 @@ NB_MODULE(_surogate, m) {
                 r["arena_bwd_cross_layer_bytes"] = s.arena_bwd_cross_layer_bytes;
                 r["arena_moe_saved_bytes"] = s.arena_moe_saved_bytes;
                 r["arena_schema_allocation_authoritative"] = s.arena_schema_allocation_authoritative;
+                r["arena_compiled_fwd_stack_bytes"] = s.arena_compiled_fwd_stack_bytes;
+                r["arena_compiled_save_for_bwd_bytes"] = s.arena_compiled_save_for_bwd_bytes;
                 r["arena_schema_frame_arena_bytes"] = s.arena_schema_frame_arena_bytes;
                 r["arena_schema_save_for_bwd_arena_bytes"] = s.arena_schema_save_for_bwd_arena_bytes;
                 r["arena_schema_persistent_activation_bytes"] = s.arena_schema_persistent_activation_bytes;
                 r["arena_schema_host_stream_activation_bytes"] = s.arena_schema_host_stream_activation_bytes;
                 r["arena_schema_total_activation_arena_bytes"] = s.arena_schema_total_activation_arena_bytes;
+                r["arena_schema_frame_arena_safety_bytes"] = s.arena_schema_frame_arena_safety_bytes;
+                r["arena_schema_save_for_bwd_safety_bytes"] = s.arena_schema_save_for_bwd_safety_bytes;
+                r["arena_schema_frame_arena_extra_bytes"] = s.arena_schema_frame_arena_extra_bytes;
+                r["arena_schema_save_for_bwd_extra_bytes"] = s.arena_schema_save_for_bwd_extra_bytes;
                 nb::list bases;
                 for (auto b : s.arena_save_for_bwd_block_bases) {
                     bases.append(b);

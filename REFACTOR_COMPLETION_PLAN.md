@@ -48,8 +48,8 @@ Acceptance:
 - [x] Replace enum-driven `BufferPlan` allocation decisions with schema-derived per-layer/per-slot allocation plans.
 - [x] Use schema shape, lifetime, residency, distribution, and save-for-backward metadata as the primary allocator inputs.
 - [x] Keep the current TensorSlot/legacy enum plan as a parity comparator during rollout.
-- [ ] Remove or narrow legacy safety slacks after schema allocation parity is validated.
-- [ ] Preserve capture safety for CUDA graph paths and arena fallback diagnostics.
+- [x] Remove or narrow legacy safety slacks after schema allocation parity is validated.
+- [x] Preserve capture safety for CUDA graph paths and arena fallback diagnostics.
 
 Completed subphase:
 
@@ -57,6 +57,8 @@ Completed subphase:
 - Runtime debug and regression artifacts expose authoritative schema arena totals for frame, save-for-backward, persistent activation, host-stream activation, and total activation arena bytes.
 - Phase arena summaries carry the same schema-authoritative totals alongside the compiled-region arena sizes, making the compiled layout the rollout parity comparator.
 - Coverage reports now mark schema allocation readiness separately from schema presence, storage declaration, hook readiness, and descriptor readiness.
+- Schema-authoritative phase arenas now expose compiled-vs-schema safety/extra bytes and size frame/save-for-backward arenas with the schema plan while retaining compiled-layout coverage as the capture-safe floor.
+- Non-MoE authoritative schema plans use a narrower upfront stack heuristic; MoE keeps the conservative slack until its op-internal temps are fully stack-bound.
 
 Acceptance:
 

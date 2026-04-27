@@ -407,8 +407,10 @@ struct BufferPlan {
 [[nodiscard]] long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan& plan);
 
 /// Total DSL stack size required for training, combining plan-level and
-/// graph-level peaks with the safety / MoE / CUDA-graph / architecture
-/// slack margins inherited from the legacy heuristic sizing.
+/// graph-level peaks with safety / MoE / CUDA-graph / architecture margins.
+/// Complete non-MoE block schemas narrow the provisional plan-only margin;
+/// MoE keeps the conservative legacy slack until its op-internal temps are
+/// fully stack-bound.
 ///
 /// `bwd_graph == nullptr` is allowed: returns a provisional size driven by
 /// the plan only (used to allocate the stack *before* the backward graph is

@@ -134,11 +134,17 @@ struct DebugArenaSummary {
     std::uint64_t arena_bwd_cross_layer_bytes = 0;
     std::uint64_t arena_moe_saved_bytes = 0;
     std::uint64_t arena_schema_allocation_authoritative = 0;
+    std::uint64_t arena_compiled_fwd_stack_bytes = 0;
+    std::uint64_t arena_compiled_save_for_bwd_bytes = 0;
     std::uint64_t arena_schema_frame_arena_bytes = 0;
     std::uint64_t arena_schema_save_for_bwd_arena_bytes = 0;
     std::uint64_t arena_schema_persistent_activation_bytes = 0;
     std::uint64_t arena_schema_host_stream_activation_bytes = 0;
     std::uint64_t arena_schema_total_activation_arena_bytes = 0;
+    std::uint64_t arena_schema_frame_arena_safety_bytes = 0;
+    std::uint64_t arena_schema_save_for_bwd_safety_bytes = 0;
+    std::uint64_t arena_schema_frame_arena_extra_bytes = 0;
+    std::uint64_t arena_schema_save_for_bwd_extra_bytes = 0;
     std::vector<std::uint64_t> arena_save_for_bwd_block_bases;
     bool arenas_allocated = false;
     DebugGraphArena forward;

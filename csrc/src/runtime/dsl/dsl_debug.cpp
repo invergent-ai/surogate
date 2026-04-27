@@ -270,6 +270,8 @@ DebugArenaSummary collect_arena_summary(const DslModel& model) {
     s.arena_bwd_cross_layer_bytes = static_cast<std::uint64_t>(arenas.bwd_cross_layer_bytes);
     s.arena_moe_saved_bytes = static_cast<std::uint64_t>(arenas.moe_saved_bytes);
     s.arena_schema_allocation_authoritative = arenas.schema_allocation_authoritative ? 1 : 0;
+    s.arena_compiled_fwd_stack_bytes = static_cast<std::uint64_t>(arenas.compiled_fwd_stack_bytes);
+    s.arena_compiled_save_for_bwd_bytes = static_cast<std::uint64_t>(arenas.compiled_save_for_bwd_bytes);
     s.arena_schema_frame_arena_bytes = static_cast<std::uint64_t>(arenas.schema_frame_arena_bytes);
     s.arena_schema_save_for_bwd_arena_bytes = static_cast<std::uint64_t>(arenas.schema_save_for_bwd_arena_bytes);
     s.arena_schema_persistent_activation_bytes = static_cast<std::uint64_t>(arenas.schema_persistent_activation_bytes);
@@ -277,6 +279,10 @@ DebugArenaSummary collect_arena_summary(const DslModel& model) {
         static_cast<std::uint64_t>(arenas.schema_host_stream_activation_bytes);
     s.arena_schema_total_activation_arena_bytes =
         static_cast<std::uint64_t>(arenas.schema_total_activation_arena_bytes);
+    s.arena_schema_frame_arena_safety_bytes = static_cast<std::uint64_t>(arenas.schema_frame_arena_safety_bytes);
+    s.arena_schema_save_for_bwd_safety_bytes = static_cast<std::uint64_t>(arenas.schema_save_for_bwd_safety_bytes);
+    s.arena_schema_frame_arena_extra_bytes = static_cast<std::uint64_t>(arenas.schema_frame_arena_extra_bytes);
+    s.arena_schema_save_for_bwd_extra_bytes = static_cast<std::uint64_t>(arenas.schema_save_for_bwd_extra_bytes);
     s.arena_save_for_bwd_block_bases.assign(arenas.save_for_bwd_block_bases.begin(),
                                             arenas.save_for_bwd_block_bases.end());
     fill_graph_arena(s.forward, exec->compiled_forward(), arenas, DebugGraphKind::Forward);

@@ -1027,6 +1027,15 @@ qwen3_hybrid_lora_floor(const BufferPlan& plan, const PretrainedConfig& cfg, con
     return std::max({BT * plan.C, BT * plan.QKV, BT * plan.MUp}) * dtype_bytes;
 }
 
+[[nodiscard]] bool schema_allocation_can_tighten_stack(const BufferPlan& plan) {
+    // MoE still has large op-internal temps that are not fully represented by
+    // stack-bound descriptors, so keep the legacy MoE slack until those are
+    // modeled. Non-MoE authoritative schemas can use the compiled graph pass
+    // as the safety net and avoid the old plan_peak * 2 upfront estimate.
+    return plan.schema_allocation_authoritative && !plan.has_moe() &&
+           plan.schema_authoritative_total_activation_arena_bytes > 0;
+}
+
 }  // namespace
 
 // Heuristic sizing from the plan-level peak alone. The 2x multiplier
@@ -1039,17 +1048,23 @@ static long heuristic_required_bytes(const BufferPlan& plan,
                                      const RuntimeOptions& options,
                                      long moe_stack_slack) {
     const long plan_peak = plan.plan_stack_peak_bytes();
-    const long base_multiplier = options.CpuTraining ? 1L : 2L;
+    const bool schema_tight_stack = schema_allocation_can_tighten_stack(plan);
+    const long base_multiplier = (options.CpuTraining || schema_tight_stack) ? 1L : 2L;
     const long moe_extra = moe_op_internal_estimate(plan);
-    const long safety_floor = plan.lora_only ? (32L * 1024 * 1024) : (64L * 1024 * 1024);
+    const long safety_floor = schema_tight_stack ? (32L * 1024 * 1024)
+                              : plan.lora_only   ? (32L * 1024 * 1024)
+                                                 : (64L * 1024 * 1024);
     const long safety_bytes = std::max(safety_floor, plan_peak / 8);
     const long extra_tmp = unmodeled_bwd_tmp(plan);
 
     long required = std::max(1024L * 1024, plan_peak * base_multiplier + moe_extra + safety_bytes + extra_tmp);
 
-    const long slack_bytes = options.CpuTraining ? (128L * 1024 * 1024)
-                             : plan.lora_only    ? (256L * 1024 * 1024)
-                                                 : (512L * 1024 * 1024);
+    const long slack_bytes = schema_tight_stack    ? (options.CpuTraining ? (64L * 1024 * 1024)
+                                                      : plan.lora_only    ? (128L * 1024 * 1024)
+                                                                          : (256L * 1024 * 1024))
+                             : options.CpuTraining ? (128L * 1024 * 1024)
+                             : plan.lora_only      ? (256L * 1024 * 1024)
+                                                   : (512L * 1024 * 1024);
     required += slack_bytes;
 
     if (is_qwen3_hybrid_lora(plan, cfg)) {

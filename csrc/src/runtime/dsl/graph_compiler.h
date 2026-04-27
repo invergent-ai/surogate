@@ -1031,11 +1031,17 @@ struct PhaseArenas {
     std::size_t moe_saved_bytes = 0;
 
     bool schema_allocation_authoritative = false;
+    std::size_t compiled_fwd_stack_bytes = 0;
+    std::size_t compiled_save_for_bwd_bytes = 0;
     std::size_t schema_frame_arena_bytes = 0;
     std::size_t schema_save_for_bwd_arena_bytes = 0;
     std::size_t schema_persistent_activation_bytes = 0;
     std::size_t schema_host_stream_activation_bytes = 0;
     std::size_t schema_total_activation_arena_bytes = 0;
+    std::size_t schema_frame_arena_safety_bytes = 0;
+    std::size_t schema_save_for_bwd_safety_bytes = 0;
+    std::size_t schema_frame_arena_extra_bytes = 0;
+    std::size_t schema_save_for_bwd_extra_bytes = 0;
 
     bool allocated = false;
 };
