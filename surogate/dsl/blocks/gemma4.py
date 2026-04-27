@@ -157,7 +157,6 @@ def _gemma4_dense_schema(block_family: str, *, shared_kv: bool = False) -> Block
             SlotDecl("layer_scalar", kind="param", shape=(1,), dtype="bf16"),
             SlotDecl("res_att", shape=("B", "T", "C"), save_for_backward=True),
             SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
-            SlotDecl("per_layer_input", shape=("B", "T", "PLI_D"), residency="gpu"),
         ),
         attrs={"block_family": block_family, "shared_kv": shared_kv},
     )
