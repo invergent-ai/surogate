@@ -105,7 +105,7 @@ class RegressionArtifacts:
         return cls(**known)
 
 
-FIRST_MONTH_MATRIX: tuple[RegressionCase, ...] = (
+REGRESSION_MATRIX: tuple[RegressionCase, ...] = (
     RegressionCase(
         "qwen3",
         "bf16",
@@ -790,11 +790,11 @@ def coverage_report(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
 def select_cases(case_filters: list[str] | None = None) -> tuple[RegressionCase, ...]:
     if not case_filters:
-        return FIRST_MONTH_MATRIX
+        return REGRESSION_MATRIX
     selected: list[RegressionCase] = []
     requested = set(case_filters)
     matched: set[str] = set()
-    for case in FIRST_MONTH_MATRIX:
+    for case in REGRESSION_MATRIX:
         if case.case_id in requested or case.model in requested:
             selected.append(case)
             if case.case_id in requested:
@@ -807,7 +807,7 @@ def select_cases(case_filters: list[str] | None = None) -> tuple[RegressionCase,
     return tuple(selected)
 
 
-def case_listing(cases: tuple[RegressionCase, ...] = FIRST_MONTH_MATRIX) -> list[dict[str, Any]]:
+def case_listing(cases: tuple[RegressionCase, ...] = REGRESSION_MATRIX) -> list[dict[str, Any]]:
     return [
         {
             "case_id": case.case_id,

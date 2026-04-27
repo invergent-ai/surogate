@@ -7,14 +7,14 @@ from surogate.regression import baseline_runner as br
 def test_runner_uses_config_model_without_local_override(tmp_path, monkeypatch):
     monkeypatch.delenv("QWEN3_MODEL_PATH", raising=False)
 
-    result = br.run_case(br.FIRST_MONTH_MATRIX[0], run=False, steps=1)
+    result = br.run_case(br.REGRESSION_MATRIX[0], run=False, steps=1)
 
     assert result.status == "skipped"
     assert result.reason == "not executed; pass --run to launch GPU workload"
 
 
 def test_compare_detects_status_drift():
-    case = br.FIRST_MONTH_MATRIX[0]
+    case = br.REGRESSION_MATRIX[0]
     base = {case.case_id: {"case": br.asdict(case), "status": "passed"}}
     cur = {case.case_id: {"case": br.asdict(case), "status": "failed"}}
 
@@ -205,7 +205,7 @@ def test_artifact_schema_accepts_descriptor_summary():
 
 
 def test_load_results_ignores_report_artifacts(tmp_path):
-    case = br.FIRST_MONTH_MATRIX[0]
+    case = br.REGRESSION_MATRIX[0]
     br.write_results([br.RegressionResult(case=br.asdict(case), status="skipped")], tmp_path)
     (tmp_path / "north_star_coverage.json").write_text(json.dumps({"metric": "fp8_fp4_coverage"}))
 
@@ -215,7 +215,7 @@ def test_load_results_ignores_report_artifacts(tmp_path):
 
 
 def test_write_results_can_normalize_volatile_baseline_fields(tmp_path):
-    case = br.FIRST_MONTH_MATRIX[0]
+    case = br.REGRESSION_MATRIX[0]
     result = br.RegressionResult(case=br.asdict(case), status="skipped", started_at=123.0, duration_s=4.5)
 
     br.write_results([result], tmp_path, stable=True)
@@ -270,7 +270,7 @@ def test_materialize_case_config_keeps_hf_model_without_local_override(tmp_path,
 
 
 def test_select_cases_accepts_case_id_and_model_filters():
-    case = br.FIRST_MONTH_MATRIX[0]
+    case = br.REGRESSION_MATRIX[0]
 
     by_id = br.select_cases([case.case_id])
     by_model = br.select_cases([case.model])
@@ -290,7 +290,7 @@ def test_select_cases_rejects_unknown_filters():
 
 
 def test_case_listing_exposes_case_ids():
-    case = br.FIRST_MONTH_MATRIX[0]
+    case = br.REGRESSION_MATRIX[0]
 
     rows = br.case_listing((case,))
 
@@ -310,15 +310,15 @@ def test_case_listing_exposes_case_ids():
 
 
 def test_main_list_cases_prints_json(capsys):
-    rc = br.main(["--list-cases", "--case", br.FIRST_MONTH_MATRIX[0].case_id])
+    rc = br.main(["--list-cases", "--case", br.REGRESSION_MATRIX[0].case_id])
 
     assert rc == 0
     rows = json.loads(capsys.readouterr().out)
-    assert [row["case_id"] for row in rows] == [br.FIRST_MONTH_MATRIX[0].case_id]
+    assert [row["case_id"] for row in rows] == [br.REGRESSION_MATRIX[0].case_id]
 
 
 def test_supported_first_month_cases_have_configs():
-    missing = [case.case_id for case in br.FIRST_MONTH_MATRIX if case.supported and not case.config]
+    missing = [case.case_id for case in br.REGRESSION_MATRIX if case.supported and not case.config]
 
     assert missing == []
 
@@ -332,10 +332,10 @@ def test_main_defaults_to_five_steps_and_timeout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(br, "run_case", fake_run_case)
 
-    rc = br.main(["--case", br.FIRST_MONTH_MATRIX[0].case_id, "--out", str(tmp_path)])
+    rc = br.main(["--case", br.REGRESSION_MATRIX[0].case_id, "--out", str(tmp_path)])
 
     assert rc == 0
-    assert captured == [(br.FIRST_MONTH_MATRIX[0].case_id, False, 5, tmp_path, br.DEFAULT_RUN_TIMEOUT_S)]
+    assert captured == [(br.REGRESSION_MATRIX[0].case_id, False, 5, tmp_path, br.DEFAULT_RUN_TIMEOUT_S)]
 
 
 def test_main_accepts_timeout_override(tmp_path, monkeypatch):
@@ -347,7 +347,7 @@ def test_main_accepts_timeout_override(tmp_path, monkeypatch):
 
     monkeypatch.setattr(br, "run_case", fake_run_case)
 
-    rc = br.main(["--case", br.FIRST_MONTH_MATRIX[0].case_id, "--out", str(tmp_path), "--timeout-s", "7"])
+    rc = br.main(["--case", br.REGRESSION_MATRIX[0].case_id, "--out", str(tmp_path), "--timeout-s", "7"])
 
     assert rc == 0
     assert captured == [7]
@@ -466,7 +466,7 @@ def test_compare_artifacts_checks_buffer_plan_summary_counts():
 
 
 def test_compare_artifacts_checks_arena_summary_counts():
-    case = br.FIRST_MONTH_MATRIX[0]
+    case = br.REGRESSION_MATRIX[0]
     base_metrics = {"arena_summary": {"arena_fwd_stack_bytes": 2048, "forward_region_fwdstack_tid_count": 3}}
     cur_metrics = {"arena_summary": {"arena_fwd_stack_bytes": 1024}}
     base = {"case": br.asdict(case), "status": "passed", "metrics": base_metrics}
