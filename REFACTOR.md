@@ -72,7 +72,7 @@ Local validation status:
 
 - [x] `make wheel-dev` passed.
 - [x] `make test-integration` passed.
-- [x] Focused C++ gates passed: `[op_registry]`, `[tensor_role]`, `[moe]`.
+- [x] Focused C++ gates passed: `[op_registry]`, `[fusion_rule]`, `[tensor_role]`, `[moe]`.
 - [x] `make regression-smoke` passed.
 - [x] No-distributed Python gate passed via `uv run pytest -q tests/test_moe_monitor.py --no-gpu`.
 - [ ] Full `make test-unit` is not green yet; current failures are broad-suite pre-existing/runtime issues outside the focused slices (AdamW tolerance, DSL golden stack/metadata, and one add-backward dispatch golden).
