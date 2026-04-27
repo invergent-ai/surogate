@@ -130,6 +130,7 @@ TEST_CASE("fusion contexts can be built from compiled op descriptors", "[fusion_
     matmul.semantic_kind = OpSemanticKind::Dense;
     matmul.comm_profile = CommunicationProfile{CommunicationKind::NoComm, false, 0};
     matmul.default_caps = OpCapabilities{OpCapabilityDenseMatmul | OpCapabilityFp8Eligible};
+    matmul.matmul_caps = MatmulCapabilities{MatmulCapabilityFp8ForwardEligible | MatmulCapabilityWeightCacheEligible};
     matmul.storage_compat = StorageCompatibility{StorageCompatibilityGpuResident | StorageCompatibilityCpuPinnedStream};
 
     CompiledOp bias_add;
@@ -146,6 +147,9 @@ TEST_CASE("fusion contexts can be built from compiled op descriptors", "[fusion_
     REQUIRE(ctx.ops[0].semantic_kind == OpSemanticKind::Dense);
     REQUIRE(ctx.ops[0].caps.has(OpCapabilityDenseMatmul));
     REQUIRE(ctx.ops[0].caps.has(OpCapabilityFp8Eligible));
+    REQUIRE(ctx.ops[0].matmul_caps.has(MatmulCapabilityFp8ForwardEligible));
+    REQUIRE(ctx.first_supports_matmul_capability(MatmulCapabilityFp8ForwardEligible));
+    REQUIRE_FALSE(ctx.first_supports_matmul_capability(MatmulCapabilityFp8BackwardEligible));
     REQUIRE(ctx.ops[0].storage_compat.supports(StorageTier::CpuPinnedStream));
     REQUIRE(ctx.ops[1].name == "bias_add");
     REQUIRE(ctx.ops[1].epilogue_support.has(EpilogueSupportBias));
