@@ -262,6 +262,8 @@ def test_acceptance_model_graphs_emit_complete_block_schema_metadata():
     from surogate.dsl.models.gemma4 import Gemma4CausalModel  # noqa: F401
     from surogate.dsl.models.gpt_oss import GptOssModel  # noqa: F401
     from surogate.dsl.models.qwen3 import Qwen3Model  # noqa: F401
+    from surogate.dsl.models.qwen3_5 import Qwen3_5CausalModel  # noqa: F401
+    from surogate.dsl.models.qwen3_5_moe import Qwen3_5MoECausalModel  # noqa: F401
 
     cases = [
         (
@@ -293,6 +295,38 @@ def test_acceptance_model_graphs_emit_complete_block_schema_metadata():
                 "num_experts_per_tok": 2,
             },
             ["gpt_oss_moe", "gpt_oss_moe"],
+        ),
+        (
+            "Qwen3_5CausalModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "full_attention_interval": 2,
+            },
+            ["qwen3_5_linear", "qwen3_5_attention"],
+        ),
+        (
+            "Qwen3_5MoECausalModel",
+            {
+                "vocab_size": 32000,
+                "d_model": 256,
+                "n_layers": 2,
+                "num_query_heads": 4,
+                "num_kv_heads": 2,
+                "d_ff": 512,
+                "max_seq": 2048,
+                "head_size": 64,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "full_attention_interval": 2,
+            },
+            ["qwen3_5_moe_linear", "qwen3_5_moe_attention"],
         ),
         (
             "Gemma4CausalModel",
