@@ -138,6 +138,7 @@
 - [x] Regression block-schema summaries now distinguish expert-parallel parameter slots from activation/storage slots.
 - [x] `BufferPlan` schema shape resolution now covers Qwen3.5 `QProjDim` and `KVDim` aliases with C++ parity coverage.
 - [x] C++ runtime config now carries Qwen3.5 linear-attention and Gemma per-layer-input dimensions so `BufferPlan` can resolve `ConvDim`, `ValueDim`, `ConvK`, `Hk`, `Hv`, `Vd`, and `PLI_D` schema aliases.
+- [x] `BufferPlan` now separates dynamic MoE `dispatched_tokens` schema shapes from other unresolved shape aliases in diagnostics.
 
 Local validation status:
 

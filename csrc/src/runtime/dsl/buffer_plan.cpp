@@ -122,6 +122,10 @@ namespace {
     return true;
 }
 
+[[nodiscard]] bool is_dynamic_schema_dim_token(std::string_view token) {
+    return token == "dispatched_tokens";
+}
+
 [[nodiscard]] bool resolve_schema_dim_token(const BufferPlan& plan,
                                             const BlockSchemaLayerSummary& layer,
                                             std::string_view token,
@@ -192,6 +196,7 @@ resolve_schema_slot_shape(const BufferPlan& plan, const BlockSchemaLayerSummary&
             slot.resolved_shape.clear();
             slot.resolved_numel = 0;
             slot.shape_resolved = false;
+            slot.shape_dynamic = is_dynamic_schema_dim_token(dim);
             return false;
         }
         slot.resolved_shape.push_back(resolved);
@@ -199,6 +204,7 @@ resolve_schema_slot_shape(const BufferPlan& plan, const BlockSchemaLayerSummary&
     }
     slot.resolved_numel = numel;
     slot.shape_resolved = true;
+    slot.shape_dynamic = false;
     return true;
 }
 
@@ -576,6 +582,10 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
                 layer.resolved_activation_shape_bytes += slot.resolved_bytes;
                 p.schema_resolved_activation_shape_bytes += slot.resolved_bytes;
             } else {
+                if (slot.shape_dynamic) {
+                    ++layer.dynamic_activation_shape_slots;
+                    ++p.schema_dynamic_activation_shape_slots;
+                }
                 ++layer.unresolved_activation_shape_slots;
                 ++p.schema_unresolved_activation_shape_slots;
             }

@@ -52,6 +52,7 @@ struct BlockSchemaSlotSummary {
     int shape_rank = 0;
     std::vector<std::string> shape_dims;
     bool shape_resolved = false;
+    bool shape_dynamic = false;
     std::vector<long> resolved_shape;
     long resolved_numel = 0;
     long resolved_bytes = 0;
@@ -124,6 +125,7 @@ struct BlockSchemaLayerSummary {
     int registry_missing_activation_slots = 0;
     int resolved_activation_shape_slots = 0;
     int unresolved_activation_shape_slots = 0;
+    int dynamic_activation_shape_slots = 0;
     long resolved_activation_shape_bytes = 0;
     int resolved_param_shape_slots = 0;
     int unresolved_param_shape_slots = 0;
@@ -220,6 +222,7 @@ struct BufferPlan {
     int schema_registry_missing_activation_slots = 0;
     int schema_resolved_activation_shape_slots = 0;
     int schema_unresolved_activation_shape_slots = 0;
+    int schema_dynamic_activation_shape_slots = 0;
     long schema_resolved_activation_shape_bytes = 0;
     int schema_resolved_param_shape_slots = 0;
     int schema_unresolved_param_shape_slots = 0;

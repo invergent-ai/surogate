@@ -363,9 +363,16 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     pli_slot.shape_dims = {"B", "T", "PLI_D"};
     pli_slot.shape_rank = 3;
     alias_records[0].slots.push_back(pli_slot);
-    alias_records[0].slot_count = 6;
+    dsl::BlockSchemaSlotSummary dispatched_slot;
+    dispatched_slot.name = "permuted_input";
+    dispatched_slot.kind = "activation";
+    dispatched_slot.distribution_kind = "expert_parallel";
+    dispatched_slot.shape_dims = {"dispatched_tokens", "C"};
+    dispatched_slot.shape_rank = 2;
+    alias_records[0].slots.push_back(dispatched_slot);
+    alias_records[0].slot_count = 7;
     alias_records[0].param_slots = 4;
-    alias_records[0].activation_slots = 2;
+    alias_records[0].activation_slots = 3;
     const auto alias_plan = dsl::BufferPlan::build(cfg,
                                                    runtime_config,
                                                    options,
@@ -382,6 +389,9 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(alias_plan.schema_layers[0].slots[3].resolved_shape == std::vector<long>{8, 128});
     REQUIRE(alias_plan.schema_layers[0].slots[4].resolved_shape == std::vector<long>{2, 384, 4});
     REQUIRE(alias_plan.schema_layers[0].slots[5].resolved_shape == std::vector<long>{2, 3, 12});
+    REQUIRE(alias_plan.schema_layers[0].slots[6].shape_dynamic);
+    REQUIRE(alias_plan.schema_dynamic_activation_shape_slots == 1);
+    REQUIRE(alias_plan.schema_unresolved_activation_shape_slots == 1);
     REQUIRE(plan.schema_layer(0) == &plan.schema_layers[0]);
     REQUIRE(plan.schema_layer(1) == nullptr);
     REQUIRE(plan.schema_layer_has_slot(0, "experts_gate_up"));

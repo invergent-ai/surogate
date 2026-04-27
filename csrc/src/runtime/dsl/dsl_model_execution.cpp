@@ -303,6 +303,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                   << initial_plan.schema_resolved_activation_shape_slots
                   << ", block_schema_unresolved_activation_shape_slots="
                   << initial_plan.schema_unresolved_activation_shape_slots
+                  << ", block_schema_dynamic_activation_shape_slots="
+                  << initial_plan.schema_dynamic_activation_shape_slots
                   << ", block_schema_resolved_activation_shape_bytes="
                   << initial_plan.schema_resolved_activation_shape_bytes
                   << ", block_schema_resolved_param_shape_slots=" << initial_plan.schema_resolved_param_shape_slots
