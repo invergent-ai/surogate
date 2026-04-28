@@ -31,6 +31,7 @@ import verifiers as vf
 from transformers import AutoProcessor, AutoTokenizer
 
 from surogate.core.config.grpo_orch_config import GRPOBufferConfig, GRPOOrchestratorConfig
+from surogate.utils.dict import DictDefault
 from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.grpo.orchestrator.ckpt import Progress, setup_ckpt_manager
 from surogate.grpo.orchestrator.eval_utils import evaluate_env
@@ -285,7 +286,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     train_dataset = train_env_group.get_dataset(seed=config.buffer.seed)
     buffer = Buffer(train_dataset, train_env_group.env_names, config.buffer)
     if config.val is not None:
-        val_buffer_config = GRPOBufferConfig(env_ratios=config.buffer.env_ratios)
+        val_buffer_config = GRPOBufferConfig(DictDefault({"env_ratios": config.buffer.env_ratios}))
         val_dataset = train_env_group.get_eval_dataset(seed=val_buffer_config.seed)
         val_buffer = Buffer(val_dataset, train_env_group.env_names, val_buffer_config)
     else:
