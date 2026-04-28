@@ -64,7 +64,7 @@ Acceptance:
 
 - [x] `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` is green across the real-model queue.
 - [x] Schema allocation bytes are authoritative in runtime debug and regression artifacts.
-- [ ] Peak CUDA memory does not regress; Gemma4 and MoE acceptance rows show the expected allocation savings.
+- [x] Peak CUDA memory does not regress; Gemma4 and MoE acceptance rows show the expected allocation savings.
 - [x] Save-for-backward and frame-local arena summaries match schema lifetime declarations.
 
 Validation evidence:
@@ -72,6 +72,9 @@ Validation evidence:
 - 2026-04-28: `SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT=1` 5-step real-model queue passed in `regression_baselines/current/schema_assert_20260428_r4`.
 - Matrix coverage: `qwen3__fp8__single_gpu__gpu__dense`, `qwen3_5__fp8__single_gpu__gpu__dense`, `gemma4__fp8__single_gpu__gpu__dense`, `gpt_oss__fp8__single_gpu__gpu__moe_grouped`, and `qwen3_6_moe__fp8__2gpu_dp_ep__gpu__moe_grouped` report `coverage=1.0`, `eligible=5`, `passed=5`.
 - Direct queue add-on: `examples/sft/qwen3moe/qwen3moe-nvfp4.yaml` passed 5 steps with artifact `regression_baselines/current/schema_assert_20260428_r4/artifacts/qwen3moe-nvfp4-direct.json`.
+- Peak CUDA memory guardrail: every r4 acceptance artifact records `cuda_peak_memory_bytes=519569408`; locked baseline files currently carry empty metrics, so this r4 queue is the first complete recorded memory baseline for these rows.
+- Gemma4 allocation savings: `schema_allocation_authoritative=1`, `schema_allocation_unresolved_slots=0`, and `schema_activation_shape_savings_bytes=687865856`; the authoritative activation arena is `792723456` bytes versus `1908408320` bytes of baseline max activation shape.
+- MoE allocation savings: EP MoE activation arenas remain conservative because dynamic activation slots are still unresolved, but expert-parallel parameter locality savings are recorded: Qwen3.6 MoE reports `schema_expert_parallel_param_shape_savings_bytes=32212254720`, and Qwen3MoE NVFP4 direct reports `43486543872`. GPT-OSS single-GPU MoE has no EP-locality savings expected.
 
 ## Track 4 - Remove Descriptor Capability Fallbacks - COMPLETE
 
