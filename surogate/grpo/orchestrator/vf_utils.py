@@ -50,6 +50,12 @@ def _install_subprocess_log_forwarding(log_queue: "mp.Queue", log_prefix: str) -
     root.addHandler(qh)
     root.setLevel(logging.DEBUG)
 
+    # Silence per-request HTTP chatter from httpx/httpcore/openai. With one
+    # rollout making many chat-completion calls, INFO-level "HTTP Request: POST
+    # ... 200 OK" lines drown out actual env logs in the parent's stream.
+    for _noisy in ("httpx", "httpcore", "openai._base_client"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     _orig_setup = _vf_log_mod.setup_logging
 
     def _patched_setup_logging(*args, **kwargs):

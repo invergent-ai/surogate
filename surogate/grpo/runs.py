@@ -290,7 +290,7 @@ class MultiRunManager:
         error_path = config_dir / "config_validation_error.txt"
 
         if not config_path.exists():
-            logger.error(f"Run {run_id}: No orchestrator config found at {config_path}")
+            logger.warning(f"Run {run_id}: No orchestrator config found at {config_path}")
             return None
 
         try:
