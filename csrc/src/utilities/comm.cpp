@@ -553,22 +553,47 @@ void NCCLCommunicator::all_to_all_single(const std::byte* send,
         throw std::runtime_error("all_to_all_single: EP comm not initialized (call init_ep_groups first)");
     }
 
+    _launch_queue_throttle_sync();
     ncclCheck(ncclGroupStart());
     std::size_t send_offset = 0;
     std::size_t recv_offset = 0;
     for (int peer = 0; peer < mEPSize; ++peer) {
         std::size_t send_bytes = static_cast<std::size_t>(send_splits[peer]) * elem_size;
         std::size_t recv_bytes = static_cast<std::size_t>(recv_splits[peer]) * elem_size;
-        if (send_bytes > 0) {
+        if (peer == mEPRank) {
+            if (send_bytes != recv_bytes) {
+                throw std::runtime_error("all_to_all_single: self send/recv byte mismatch");
+            }
+        } else if (send_bytes > 0) {
             ncclCheck(ncclSend(send + send_offset, send_bytes, ncclInt8, peer, mEPComm, stream));
         }
-        if (recv_bytes > 0) {
+        if (peer != mEPRank && recv_bytes > 0) {
             ncclCheck(ncclRecv(recv + recv_offset, recv_bytes, ncclInt8, peer, mEPComm, stream));
         }
         send_offset += send_bytes;
         recv_offset += recv_bytes;
     }
     ncclCheck(ncclGroupEnd());
+
+    send_offset = 0;
+    recv_offset = 0;
+    for (int peer = 0; peer < mEPSize; ++peer) {
+        const std::size_t send_bytes = static_cast<std::size_t>(send_splits[peer]) * elem_size;
+        const std::size_t recv_bytes = static_cast<std::size_t>(recv_splits[peer]) * elem_size;
+        if (peer == mEPRank && send_bytes > 0) {
+            if (send + send_offset != recv + recv_offset) {
+                CUDA_CHECK(cudaMemcpyAsync(recv + recv_offset,
+                                           send + send_offset,
+                                           send_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           stream));
+            }
+            break;
+        }
+        send_offset += send_bytes;
+        recv_offset += recv_bytes;
+    }
+    _launch_queue_throttle_sync();
 }
 
 /**
@@ -582,7 +607,9 @@ void NCCLCommunicator::all_to_all_single(const std::byte* send,
  */
 void NCCLCommunicator::all_reduce_sum_int_ep(int* values, int n, cudaStream_t stream) {
     if (!mEPComm || mEPSize <= 1) return;
+    _launch_queue_throttle_sync();
     ncclCheck(ncclAllReduce(values, values, n, ncclInt32, ncclSum, mEPComm, stream));
+    _launch_queue_throttle_sync();
 }
 
 /**
@@ -996,9 +1023,10 @@ void NCCLCommunicatorImpl::barrier() {
 }
 
 void NCCLCommunicatorImpl::_launch_queue_throttle_sync() {
-    // For multi-node training: synchronize local threads to prevent launch queue exhaustion
-    // For single-node training: skip barrier to avoid unnecessary CPU synchronization overhead
-    if (mShare->NumNodes > 1) {
+    // Direct EP collectives/P2P are issued from one worker thread per local GPU.
+    // Keep local launch order aligned before any worker performs host-visible
+    // CUDA work that can block behind a pending NCCL operation.
+    if (mShare->LocalGPUs > 1) {
         local_barrier();
     }
 }
