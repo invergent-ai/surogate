@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import multiprocessing as mp
 import random
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -169,6 +170,9 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     )
     env_ids = [strip_env_version(env.id) for env in config.env]
     train_env_names = [env.name or env_id for env_id, env in zip(env_ids, config.env)]
+    for env in config.env:
+        if env.path and env.path not in sys.path:
+            sys.path.insert(0, env.path)
     train_env_group = vf.EnvGroup(
         envs=[vf.load_environment(env_id, **env.args) for env_id, env in zip(env_ids, config.env)],
         env_names=train_env_names,
@@ -202,6 +206,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 env_id=env_id,
                 env_args=env.args,
                 extra_env_kwargs=env.extra_env_kwargs,
+                env_path=env.path,
                 log_level="CRITICAL",
                 log_file=(get_log_dir(Path(config.output_dir)) / "train" / f"{env_name}.log").as_posix(),
                 log_file_level=config.log.vf_level,
@@ -232,6 +237,9 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
     if config.eval:
         env_ids = [strip_env_version(env.id) for env in config.eval.env]
+        for env in config.eval.env:
+            if env.path and env.path not in sys.path:
+                sys.path.insert(0, env.path)
         eval_envs = [vf.load_environment(env_id, **env.args) for env_id, env in zip(env_ids, config.eval.env)]
         eval_env_names = [env.name or env_id for env_id, env in zip(env_ids, config.eval.env)]
         eval_sampling_args = get_eval_sampling_args(config.eval.sampling)
@@ -243,6 +251,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     env_id=env_id,
                     env_args=env.args,
                     extra_env_kwargs=env.extra_env_kwargs,
+                    env_path=env.path,
                     log_level="CRITICAL",
                     log_file=(get_log_dir(Path(config.output_dir)) / "eval" / f"{eval_env_name}.log").as_posix(),
                     log_file_level=config.log.vf_level,

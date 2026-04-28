@@ -147,6 +147,7 @@ class GRPOEnvConfig:
         address: Address of the environment server. If None, will spawn an environment server in a subprocess automatically.If given, will try to connect an environment client to the environment server at this address.
         extra_env_kwargs: Extra kwargs passed to an env (e.g. seq_len, score_rollouts). This field is auto-populated with the seq_len, and score_rollouts for training envs on the orchestrator. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server.
         max_retries: Maximum number of times the environment will retry a failed rollout.
+        path: Optional directory prepended to sys.path before importing the env module. Useful when the env is checked out locally (e.g. .../my-envs/<id>) and not pip-installed. The directory must contain a Python package named after `id` (with dashes converted to underscores) that exposes a top-level `load_environment` function.
     """
 
     id: str | None = None
@@ -155,6 +156,7 @@ class GRPOEnvConfig:
     address: str | None = None
     extra_env_kwargs: dict[str, Any] | None = field(default_factory=dict)
     max_retries: int | None = 0
+    path: str | None = None
 
     @property
     def resolved_name(self) -> str:
@@ -167,6 +169,7 @@ class GRPOEnvConfig:
         self.address = cfg.get("address", self.address)
         self.extra_env_kwargs = cfg.get("extra_env_kwargs", {})
         self.max_retries = cfg.get("max_retries", self.max_retries)
+        self.path = cfg.get("path", self.path)
 
         if self.resolved_name == "all":
             raise ValueError(

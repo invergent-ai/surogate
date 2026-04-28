@@ -17,11 +17,20 @@ REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
 DEFAULT_STATE_COLUMNS = []
 
 
+def _run_env_server_with_path(env_path: str | None, *args, **kwargs):
+    if env_path:
+        import sys
+
+        sys.path.insert(0, env_path)
+    ZMQEnvServer.run_server(*args, **kwargs)
+
+
 def spawn_env_server(
     env_id: str,
     env_args: dict[str, Any],
     extra_env_kwargs: dict[str, Any],
     address: str | None = None,
+    env_path: str | None = None,
     # logging configs
     log_level: str | None = None,
     log_file: str | None = None,
@@ -38,8 +47,9 @@ def spawn_env_server(
     # the parent process, which has caused hangs when multiple env server
     # subprocesses share the same fds.
     process = mp.get_context("spawn").Process(
-        target=ZMQEnvServer.run_server,
+        target=_run_env_server_with_path,
         args=(
+            env_path,
             env_id,
             env_args,
             extra_env_kwargs,
