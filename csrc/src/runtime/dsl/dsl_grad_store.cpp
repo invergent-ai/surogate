@@ -218,10 +218,10 @@ void DslGradStore::build_layer_grad_map() {
 void DslGradStore::build_zero_segments() {
     // Free previous segment arrays if they exist (e.g., rebuild after enable_streaming)
     if (mZeroPtrs.Data) {
-        cudaFree(mZeroPtrs.Data);
+        mAllocator->free(mZeroPtrs);
     }
     if (mZeroSizes.Data) {
-        cudaFree(mZeroSizes.Data);
+        mAllocator->free(mZeroSizes);
     }
     mZeroPtrs = {};
     mZeroSizes = {};
